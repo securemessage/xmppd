@@ -5,3 +5,4 @@ zig-cache/
 *.a
 *.so
 *.dylib
+*.core

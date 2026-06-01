@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_mod.addImport("xml", xml_mod);
 
+    _ = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- Tests ---
 
     const xml_test_mod = b.createModule(.{
@@ -34,6 +40,12 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_test_mod.addImport("xml", xml_mod);
 
+    const sasl_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xml_tests = b.addTest(.{
         .name = "xml-tests",
         .root_module = xml_test_mod,
@@ -44,10 +56,17 @@ pub fn build(b: *std.Build) void {
         .root_module = xmpp_test_mod,
     });
 
+    const sasl_tests = b.addTest(.{
+        .name = "sasl-tests",
+        .root_module = sasl_test_mod,
+    });
+
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
+    const run_sasl_tests = b.addRunArtifact(sasl_tests);
 
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
+    test_step.dependOn(&run_sasl_tests.step);
 }
