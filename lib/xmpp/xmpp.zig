@@ -1,8 +1,12 @@
 pub const jid = @import("jid.zig");
 pub const stanza = @import("stanza.zig");
+pub const stream = @import("stream.zig");
 
 pub const Jid = jid.Jid;
 pub const Stanza = stanza.Stanza;
+pub const Stream = stream.Stream;
+pub const StreamState = stream.StreamState;
+pub const StreamAction = stream.StreamAction;
 pub const StanzaType = stanza.StanzaType;
 pub const Message = stanza.Message;
 pub const MessageType = stanza.MessageType;
@@ -20,4 +24,5 @@ pub const serializeIq = stanza.serializeIq;
 test {
     _ = jid;
     _ = stanza;
+    _ = stream;
 }
