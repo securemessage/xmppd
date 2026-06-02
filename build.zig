@@ -272,6 +272,21 @@ pub fn build(b: *std.Build) void {
 
     const run_auth_handler_tests = b.addRunArtifact(auth_handler_tests);
 
+    // --- Roster store tests ---
+
+    const roster_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/roster_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const roster_store_tests = b.addTest(.{
+        .name = "roster-store-tests",
+        .root_module = roster_store_test_mod,
+    });
+
+    const run_roster_store_tests = b.addRunArtifact(roster_store_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -429,4 +444,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_auth_handler_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
+    test_step.dependOn(&run_roster_store_tests.step);
 }
