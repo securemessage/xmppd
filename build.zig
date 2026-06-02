@@ -380,6 +380,21 @@ pub fn build(b: *std.Build) void {
 
     const run_s2s_dane_tests = b.addRunArtifact(s2s_dane_tests);
 
+    // --- S2S dialback tests ---
+
+    const s2s_dialback_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/s2s/dialback.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const s2s_dialback_tests = b.addTest(.{
+        .name = "s2s-dialback-tests",
+        .root_module = s2s_dialback_test_mod,
+    });
+
+    const run_s2s_dialback_tests = b.addRunArtifact(s2s_dialback_tests);
+
     // --- S2S session tests ---
 
     const s2s_session_test_mod = b.createModule(.{
@@ -609,6 +624,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);
     test_step.dependOn(&run_s2s_dane_tests.step);
+    test_step.dependOn(&run_s2s_dialback_tests.step);
     test_step.dependOn(&run_s2s_session_tests.step);
     test_step.dependOn(&run_s2s_main_tests.step);
 }
