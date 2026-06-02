@@ -287,6 +287,21 @@ pub fn build(b: *std.Build) void {
 
     const run_roster_store_tests = b.addRunArtifact(roster_store_tests);
 
+    // --- Session registry tests ---
+
+    const session_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/session_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const session_registry_tests = b.addTest(.{
+        .name = "session-registry-tests",
+        .root_module = session_registry_test_mod,
+    });
+
+    const run_session_registry_tests = b.addRunArtifact(session_registry_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -445,4 +460,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
+    test_step.dependOn(&run_session_registry_tests.step);
 }
