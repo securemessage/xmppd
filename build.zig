@@ -234,6 +234,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const offline_store_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/core/offline_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -242,6 +247,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
     server_test_mod.addImport("session_registry", session_registry_mod_for_server);
+    server_test_mod.addImport("offline_store", offline_store_mod_for_server);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -314,6 +320,21 @@ pub fn build(b: *std.Build) void {
 
     const run_session_registry_tests = b.addRunArtifact(session_registry_tests);
 
+    // --- Offline store tests ---
+
+    const offline_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/offline_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const offline_store_tests = b.addTest(.{
+        .name = "offline-store-tests",
+        .root_module = offline_store_test_mod,
+    });
+
+    const run_offline_store_tests = b.addRunArtifact(offline_store_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -346,6 +367,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
     core_mod.addImport("session_registry", session_registry_mod_for_server);
+    core_mod.addImport("offline_store", offline_store_mod_for_server);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -475,4 +497,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_registry_tests.step);
+    test_step.dependOn(&run_offline_store_tests.step);
 }

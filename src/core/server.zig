@@ -46,6 +46,9 @@ const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
 const RosterStore = @import("roster_store").RosterStore;
 const SessionRegistry = @import("session_registry").SessionRegistry;
+const offline_store_mod = @import("offline_store");
+const OfflineStore = offline_store_mod.OfflineStore;
+const OfflineMessage = offline_store_mod.OfflineMessage;
 
 const log = std.log.scoped(.xmppd);
 
@@ -202,6 +205,9 @@ pub const Server = struct {
     /// Roster store — per-user contact lists with subscription states.
     roster: ?*RosterStore = null,
 
+    /// Offline message store — messages for unavailable recipients.
+    offline: ?*OfflineStore = null,
+
     /// Initialize the server.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
@@ -246,6 +252,12 @@ pub const Server = struct {
     pub fn configureRoster(self: *Server, roster_store: *RosterStore) void {
         self.roster = roster_store;
         log.info("roster store configured ({d} items)", .{roster_store.items.items.len});
+    }
+
+    /// Configure the offline message store.
+    pub fn configureOffline(self: *Server, offline_store: *OfflineStore) void {
+        self.offline = offline_store;
+        log.info("offline store configured ({d} pending messages)", .{offline_store.messages.items.len});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -1080,6 +1092,24 @@ pub const Server = struct {
         } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
 
         if (target_count == 0) {
+            // Only messages get offline storage (not presence stanzas)
+            if (session.stanza_kind == .message) {
+                if (self.offline) |store| {
+                    // Build recipient bare JID
+                    var recip_buf: [256]u8 = undefined;
+                    var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                    recip_fbs.writer().writeAll(to_jid.local) catch {};
+                    recip_fbs.writer().writeByte('@') catch {};
+                    recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                    const recipient_bare = recip_fbs.getWritten();
+
+                    if (store.storeMessage(recipient_bare, from_str, type_str, id_str, inner_xml)) {
+                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
+                        return;
+                    }
+                }
+            }
+            // No offline store configured or store full — bounce
             log.info("connection {d} message to {s} — recipient unavailable", .{ session.conn.id, to_str });
             self.sendServiceUnavailable(session, id_str, to_str, from_str);
             if (session.conn.hasPendingWrite()) {
@@ -1163,6 +1193,9 @@ pub const Server = struct {
 
                 // Send presence probes to contacts we're subscribed to
                 self.sendPresenceProbes(session, bound.local, bound.domain, changes);
+
+                // Deliver any offline messages queued for this user
+                self.deliverOfflineMessages(session, bound.local, bound.domain, changes);
 
                 log.info("connection {d} now available: {s}@{s}/{s}", .{
                     session.conn.id, bound.local, bound.domain, bound.resource,
@@ -1534,6 +1567,9 @@ pub const Server = struct {
             w.writeAll("<feature var='http://jabber.org/protocol/disco#items'/>") catch return;
             w.writeAll("<feature var='urn:xmpp:ping'/>") catch return;
             w.writeAll("<feature var='jabber:iq:roster'/>") catch return;
+            w.writeAll("<feature var='vcard-temp'/>") catch return;
+            w.writeAll("<feature var='jabber:iq:version'/>") catch return;
+            w.writeAll("<feature var='msgoffline'/>") catch return;
             w.writeAll("</query></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1582,6 +1618,40 @@ pub const Server = struct {
                 w.writeByte('\'') catch return;
             }
             w.writeAll("/>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            return;
+        }
+
+        // vCard-temp (XEP-0054) — return empty vCard
+        if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (iq_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(iq_id) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            return;
+        }
+
+        // Software Version (XEP-0092)
+        if (std.mem.eql(u8, child_ns, xml.ns.version) and std.mem.eql(u8, iq_type, "get")) {
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (iq_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(iq_id) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("><query xmlns='jabber:iq:version'>") catch return;
+            w.writeAll("<name>xmppd</name>") catch return;
+            w.writeAll("<version>0.1.0</version>") catch return;
+            w.writeAll("<os>FreeBSD</os>") catch return;
+            w.writeAll("</query></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
         }
@@ -1897,6 +1967,92 @@ pub const Server = struct {
         w.writeAll(from_str) catch return;
         w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
+    }
+
+    /// Deliver queued offline messages to a user who just became available.
+    fn deliverOfflineMessages(self: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+        const store = self.offline orelse return;
+
+        // Build bare JID for lookup
+        var bare_buf: [256]u8 = undefined;
+        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+        bare_fbs.writer().writeAll(local) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(domain) catch return;
+        const bare_jid = bare_fbs.getWritten();
+
+        const count = store.countMessages(bare_jid);
+        if (count == 0) return;
+
+        // Retrieve and deliver messages (max 100 per user)
+        var msg_buf: [100]OfflineMessage = undefined;
+        const msg_count = store.getMessages(bare_jid, &msg_buf);
+
+        for (msg_buf[0..msg_count]) |msg| {
+            // Build the full <message> stanza for delivery
+            var out_buf: [20480]u8 = undefined;
+            var out_fbs = std.io.fixedBufferStream(&out_buf);
+            const w = out_fbs.writer();
+
+            w.writeAll("<message from='") catch continue;
+            w.writeAll(msg.from) catch continue;
+            w.writeAll("' to='") catch continue;
+            w.writeAll(bare_jid) catch continue;
+            w.writeByte('\'') catch continue;
+            if (msg.msg_type.len > 0 and !std.mem.eql(u8, msg.msg_type, "normal")) {
+                w.writeAll(" type='") catch continue;
+                w.writeAll(msg.msg_type) catch continue;
+                w.writeByte('\'') catch continue;
+            }
+            if (msg.msg_id.len > 0) {
+                w.writeAll(" id='") catch continue;
+                w.writeAll(msg.msg_id) catch continue;
+                w.writeByte('\'') catch continue;
+            }
+
+            if (msg.inner_xml.len == 0) {
+                w.writeAll("/>") catch continue;
+            } else {
+                w.writeByte('>') catch continue;
+                w.writeAll(msg.inner_xml) catch continue;
+                // Add delay stamp (XEP-0203) to indicate this is a delayed message
+                w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
+                w.writeAll(self.server_host) catch continue;
+                w.writeAll("' stamp='") catch continue;
+                self.writeTimestamp(w, msg.timestamp) catch continue;
+                w.writeAll("'/>") catch continue;
+                w.writeAll("</message>") catch continue;
+            }
+
+            session.conn.queueSend(out_fbs.getWritten()) catch continue;
+        }
+
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+
+        // Clear delivered messages
+        store.clearMessages(bare_jid);
+        log.info("delivered {d} offline messages to {s}", .{ msg_count, bare_jid });
+    }
+
+    /// Write an ISO 8601 timestamp from a unix timestamp.
+    fn writeTimestamp(_: *Server, writer: anytype, timestamp: i64) !void {
+        // Simple UTC timestamp: YYYY-MM-DDThh:mm:ssZ
+        const epoch_secs: u64 = @intCast(if (timestamp < 0) 0 else timestamp);
+        const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+        const day = epoch.getDaySeconds();
+        const year_day = epoch.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,
+            @as(u32, @intFromEnum(month_day.month)),
+            @as(u32, month_day.day_index) + 1,
+            day.getHoursIntoDay(),
+            day.getMinutesIntoHour(),
+            day.getSecondsIntoMinute(),
+        });
     }
 
     fn handleBind(self: *Server, session: *Session, resource: []const u8, _: *ChangeList) void {

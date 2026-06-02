@@ -23,6 +23,9 @@ pub const ns = struct {
     pub const carbons = "urn:xmpp:carbons:2";
     pub const mam = "urn:xmpp:mam:2";
     pub const sm = "urn:xmpp:sm:3";
+    pub const vcard_temp = "vcard-temp";
+    pub const version = "jabber:iq:version";
+    pub const delay = "urn:xmpp:delay";
 };
 
 /// An XML element with its attributes and namespace context.

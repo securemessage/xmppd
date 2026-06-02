@@ -24,6 +24,7 @@
 const std = @import("std");
 const Server = @import("server.zig").Server;
 const RosterStore = @import("roster_store").RosterStore;
+const OfflineStore = @import("offline_store").OfflineStore;
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -131,6 +132,21 @@ pub fn main() !void {
             log.warn("failed to load roster: {}", .{err});
         };
         server.configureRoster(&roster_store.?);
+    }
+
+    // Load offline message store from same directory as user DB
+    var offline_store: ?OfflineStore = null;
+    if (db_path) |db| {
+        var offline_path_buf: [1024]u8 = undefined;
+        const offline_path = std.fmt.bufPrint(&offline_path_buf, "{s}.offline", .{db}) catch {
+            log.err("db path too long", .{});
+            return error.InvalidArgs;
+        };
+        offline_store = OfflineStore.init(allocator, offline_path);
+        offline_store.?.load() catch |err| {
+            log.warn("failed to load offline store: {}", .{err});
+        };
+        server.configureOffline(&offline_store.?);
     }
 
     log.info("listening on {s}:{d}", .{ address, port });
