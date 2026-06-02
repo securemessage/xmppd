@@ -195,5 +195,7 @@ fn printUsage() void {
         \\  --help, -h         Show this help
         \\
     ;
-    _ = posix.write(posix.STDOUT_FILENO, usage) catch {};
+    var buf: [0]u8 = .{};
+    var stdout = std.fs.File.stdout().writer(&buf);
+    stdout.interface.writeAll(usage) catch {};
 }
