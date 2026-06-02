@@ -1,0 +1,412 @@
+//! # S2S Session — Per-connection state for inbound S2S federation
+//!
+//! Wraps a TCP connection with an XML reader, S2S stream FSM, and
+//! connection-level state for a single inbound federation session.
+//!
+//! Mirrors `src/core/server.zig`'s Session struct but for `jabber:server`
+//! namespace. The xmppd-s2s daemon manages a table of these.
+
+const std = @import("std");
+const posix = std.posix;
+const stream_mod = @import("stream.zig");
+const S2sStream = stream_mod.S2sStream;
+const S2sStreamState = stream_mod.S2sStreamState;
+const S2sStreamAction = stream_mod.S2sStreamAction;
+const S2sFeatureSet = stream_mod.S2sFeatureSet;
+const Role = stream_mod.Role;
+const connector_mod = @import("connector.zig");
+const DaneStatus = connector_mod.DaneStatus;
+
+/// TLS handshake state for non-blocking integration with kqueue.
+pub const TlsState = enum {
+    handshake_want_read,
+    handshake_want_write,
+    established,
+};
+
+/// Read buffer size — 8KB per connection.
+const READ_BUF_SIZE = 8192;
+
+/// Write buffer size — 16KB per connection.
+const WRITE_BUF_SIZE = 16384;
+
+/// An inbound S2S federation session.
+pub const S2sSession = struct {
+    /// Socket file descriptor.
+    fd: posix.fd_t,
+    /// Unique session ID (used as kqueue udata).
+    id: usize,
+    /// S2S stream FSM (receiving role).
+    stream: S2sStream,
+    /// Whether the connection is closed.
+    closed: bool = false,
+    /// TLS state.
+    tls_state: ?TlsState = null,
+    /// Read buffer.
+    read_buf: [READ_BUF_SIZE]u8 = undefined,
+    read_start: usize = 0,
+    read_end: usize = 0,
+    /// Write buffer.
+    write_buf: [WRITE_BUF_SIZE]u8 = undefined,
+    write_start: usize = 0,
+    write_end: usize = 0,
+    /// DANE verification status for the peer.
+    dane_status: DaneStatus = .pending,
+    /// Remote domain (set from stream open).
+    remote_domain_buf: [256]u8 = undefined,
+    remote_domain_len: usize = 0,
+    /// Stream ID we assign to this session.
+    stream_id_buf: [32]u8 = undefined,
+    stream_id_len: usize = 0,
+
+    pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
+        var session = S2sSession{
+            .fd = fd,
+            .id = id,
+            .stream = S2sStream.init(.receiving, local_domain),
+        };
+        // Generate a simple stream ID
+        const id_str = std.fmt.bufPrint(&session.stream_id_buf, "s2s-{d}-{d}", .{ id, std.time.milliTimestamp() }) catch "s2s-0";
+        session.stream_id_len = id_str.len;
+        return session;
+    }
+
+    pub fn deinit(self: *S2sSession) void {
+        if (!self.closed) {
+            posix.close(self.fd);
+            self.closed = true;
+        }
+    }
+
+    /// Get the stream ID string.
+    pub fn getStreamId(self: *const S2sSession) []const u8 {
+        return self.stream_id_buf[0..self.stream_id_len];
+    }
+
+    /// Get the remote domain (set after stream open).
+    pub fn getRemoteDomain(self: *const S2sSession) []const u8 {
+        return self.remote_domain_buf[0..self.remote_domain_len];
+    }
+
+    /// Set the remote domain from the stream open.
+    pub fn setRemoteDomain(self: *S2sSession, domain: []const u8) void {
+        const copy_len = @min(domain.len, self.remote_domain_buf.len);
+        @memcpy(self.remote_domain_buf[0..copy_len], domain[0..copy_len]);
+        self.remote_domain_len = copy_len;
+    }
+
+    /// Whether the session is authenticated and established.
+    pub fn isEstablished(self: *const S2sSession) bool {
+        return self.stream.isEstablished();
+    }
+
+    /// Whether TLS handshake is in progress.
+    pub fn isTlsHandshaking(self: *const S2sSession) bool {
+        if (self.tls_state) |state| {
+            return state != .established;
+        }
+        return false;
+    }
+
+    /// Receive data from the socket into the read buffer.
+    /// Returns number of bytes read, 0 for EOF.
+    pub fn recv(self: *S2sSession) !usize {
+        if (self.closed) return error.ConnectionClosed;
+        // Compact if needed
+        if (self.read_start > 0) {
+            const remaining = self.read_end - self.read_start;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.read_buf[0..remaining], self.read_buf[self.read_start..self.read_end]);
+            }
+            self.read_end = remaining;
+            self.read_start = 0;
+        }
+        if (self.read_end >= self.read_buf.len) return error.BufferFull;
+
+        const n = posix.read(self.fd, self.read_buf[self.read_end..]) catch |err| {
+            return switch (err) {
+                error.WouldBlock => error.WouldBlock,
+                else => error.ConnectionReset,
+            };
+        };
+        if (n == 0) return 0; // EOF
+        self.read_end += n;
+        return n;
+    }
+
+    /// Get the readable portion of the read buffer.
+    pub fn readableSlice(self: *const S2sSession) []const u8 {
+        return self.read_buf[self.read_start..self.read_end];
+    }
+
+    /// Mark bytes as consumed from the read buffer.
+    pub fn consume(self: *S2sSession, n: usize) void {
+        self.read_start += n;
+    }
+
+    /// Queue data to the write buffer.
+    pub fn queueWrite(self: *S2sSession, data: []const u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        const available = self.write_buf.len - self.write_end;
+        if (data.len > available) return error.BufferFull;
+        @memcpy(self.write_buf[self.write_end .. self.write_end + data.len], data);
+        self.write_end += data.len;
+    }
+
+    /// Flush the write buffer to the socket.
+    /// Returns true if all data was flushed.
+    pub fn flushWrite(self: *S2sSession) !bool {
+        if (self.closed) return error.ConnectionClosed;
+        if (self.write_start >= self.write_end) return true; // Nothing to write
+
+        const n = posix.write(self.fd, self.write_buf[self.write_start..self.write_end]) catch |err| {
+            return switch (err) {
+                error.WouldBlock => false,
+                else => error.ConnectionReset,
+            };
+        };
+        self.write_start += n;
+        if (self.write_start >= self.write_end) {
+            self.write_start = 0;
+            self.write_end = 0;
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether there is pending write data.
+    pub fn hasPendingWrite(self: *const S2sSession) bool {
+        return self.write_start < self.write_end;
+    }
+
+    /// Close the session.
+    pub fn close(self: *S2sSession) void {
+        if (!self.closed) {
+            posix.close(self.fd);
+            self.closed = true;
+        }
+    }
+
+    /// Build the stream open response XML for an inbound connection.
+    pub fn buildStreamOpenResponse(self: *const S2sSession, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
+        try writer.writeAll(self.stream.local_domain);
+        try writer.writeAll("' to='");
+        try writer.writeAll(self.getRemoteDomain());
+        try writer.writeAll("' id='");
+        try writer.writeAll(self.getStreamId());
+        try writer.writeAll("' version='1.0'>");
+        return fbs.getWritten();
+    }
+
+    /// Build stream features XML for the current state.
+    pub fn buildFeatures(self: *const S2sSession, buf: []u8) ![]const u8 {
+        const features = self.stream.getFeatures() orelse return buf[0..0];
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<stream:features>");
+        if (features.starttls_required) {
+            try writer.writeAll("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>");
+        }
+        if (features.sasl_external) {
+            try writer.writeAll("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>");
+        }
+        if (features.dialback) {
+            try writer.writeAll("<db:features><db:dialback/></db:features>");
+        }
+        try writer.writeAll("</stream:features>");
+        return fbs.getWritten();
+    }
+
+    /// Build a SASL success response.
+    pub fn buildSaslSuccess(_: *const S2sSession, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+        return fbs.getWritten();
+    }
+
+    /// Build a SASL failure response.
+    pub fn buildSaslFailure(_: *const S2sSession, buf: []u8, reason: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><");
+        try writer.writeAll(reason);
+        try writer.writeAll("/></failure>");
+        return fbs.getWritten();
+    }
+
+    /// Build a STARTTLS proceed response.
+    pub fn buildTlsProceed(_: *const S2sSession, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+        return fbs.getWritten();
+    }
+
+    /// Build a stream error response.
+    pub fn buildStreamError(_: *const S2sSession, buf: []u8, error_name: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        try writer.writeAll("<stream:error><");
+        try writer.writeAll(error_name);
+        try writer.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
+        return fbs.getWritten();
+    }
+};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "S2sSession: init and basic state" {
+    var session = S2sSession.init(-1, 42, "a.example");
+    try std.testing.expectEqual(@as(usize, 42), session.id);
+    try std.testing.expect(!session.isEstablished());
+    try std.testing.expect(!session.isTlsHandshaking());
+    try std.testing.expect(session.getStreamId().len > 0);
+    session.closed = true; // prevent close() on invalid fd
+}
+
+test "S2sSession: set and get remote domain" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    session.setRemoteDomain("b.example");
+    try std.testing.expectEqualStrings("b.example", session.getRemoteDomain());
+}
+
+test "S2sSession: buildStreamOpenResponse" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    session.setRemoteDomain("b.example");
+    var buf: [1024]u8 = undefined;
+    const xml = try session.buildStreamOpenResponse(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns='jabber:server'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "from='a.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "to='b.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "version='1.0'") != null);
+}
+
+test "S2sSession: buildFeatures — TLS required" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    // Set stream to features_tls state
+    _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
+    var buf: [1024]u8 = undefined;
+    const xml = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<starttls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<required/>") != null);
+}
+
+test "S2sSession: buildFeatures — auth with DANE" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
+    _ = session.stream.handleStarttls();
+    session.stream.tlsEstablished();
+    session.stream.setDaneVerified(true);
+    _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
+    var buf: [1024]u8 = undefined;
+    const xml = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "EXTERNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "dialback") == null);
+}
+
+test "S2sSession: buildFeatures — auth without DANE" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
+    _ = session.stream.handleStarttls();
+    session.stream.tlsEstablished();
+    session.stream.setDaneVerified(false);
+    _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
+    var buf: [1024]u8 = undefined;
+    const xml = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "dialback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "EXTERNAL") == null);
+}
+
+test "S2sSession: buildSaslSuccess" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    var buf: [256]u8 = undefined;
+    const xml = try session.buildSaslSuccess(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<success") != null);
+}
+
+test "S2sSession: buildSaslFailure" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    var buf: [256]u8 = undefined;
+    const xml = try session.buildSaslFailure(&buf, "not-authorized");
+    try std.testing.expect(std.mem.indexOf(u8, xml, "not-authorized") != null);
+}
+
+test "S2sSession: buildTlsProceed" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    var buf: [256]u8 = undefined;
+    const xml = try session.buildTlsProceed(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<proceed") != null);
+}
+
+test "S2sSession: buildStreamError" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    var buf: [512]u8 = undefined;
+    const xml = try session.buildStreamError(&buf, "host-unknown");
+    try std.testing.expect(std.mem.indexOf(u8, xml, "host-unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "</stream:stream>") != null);
+}
+
+test "S2sSession: write buffer operations" {
+    // Use a socketpair for testing
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+
+    var session = S2sSession.init(fds[0], 1, "a.example");
+    defer session.close();
+
+    try session.queueWrite("hello");
+    try std.testing.expect(session.hasPendingWrite());
+
+    const flushed = try session.flushWrite();
+    try std.testing.expect(flushed);
+    try std.testing.expect(!session.hasPendingWrite());
+}
+
+test "S2sSession: recv into read buffer" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+
+    var session = S2sSession.init(fds[0], 1, "a.example");
+    defer session.close();
+
+    // Write to the other end
+    _ = try posix.write(fds[1], "test data");
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    const n = try session.recv();
+    try std.testing.expect(n > 0);
+    const data = session.readableSlice();
+    try std.testing.expectEqualStrings("test data", data[0..9]);
+    session.consume(9);
+}
+
+test "S2sSession: isTlsHandshaking" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true;
+    try std.testing.expect(!session.isTlsHandshaking());
+
+    session.tls_state = .handshake_want_read;
+    try std.testing.expect(session.isTlsHandshaking());
+
+    session.tls_state = .established;
+    try std.testing.expect(!session.isTlsHandshaking());
+}
