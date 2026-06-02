@@ -276,7 +276,7 @@ pub const S2sDaemon = struct {
     /// Initiate an outbound connection: DNS SRV → TCP connect → kqueue registration.
     fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
         // DNS SRV resolution (blocking — acceptable for initial impl)
-        const targets = dns.resolveXmpp(self.allocator, domain, true) catch {
+        const targets = dns.resolver.resolveXmpp(self.allocator, domain, true) catch {
             log.err("DNS SRV resolution failed for {s}", .{domain});
             conn.fail("dns-resolution-failed");
             return;
@@ -365,13 +365,16 @@ pub const S2sDaemon = struct {
     /// Flush queued stanzas on an established outbound connection.
     fn flushOutboundStanzas(self: *S2sDaemon, conn: *OutboundConnection) void {
         for (conn.pending_stanzas.items) |stanza| {
-            _ = posix.write(conn.fd, stanza.xml) catch {
-                log.err("outbound write failed for {s}", .{conn.remote_domain});
-                return;
+            conn.queueWrite(stanza.xml) catch {
+                log.err("outbound write buffer full for {s}", .{conn.remote_domain});
+                break;
             };
             self.allocator.free(stanza.xml);
         }
         conn.pending_stanzas.clearRetainingCapacity();
+        _ = conn.flushWrite() catch {
+            log.err("outbound write failed for {s}", .{conn.remote_domain});
+        };
     }
 
     /// Find the outbound slot for a given connection pointer.
@@ -550,11 +553,11 @@ fn resolveHostnameIPv4(hostname: []const u8) !u32 {
 
     var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
     hints.family = posix.AF.INET;
-    hints.sock_type = posix.SOCK.STREAM;
+    hints.socktype = posix.SOCK.STREAM;
 
     var result: ?*std.c.addrinfo = null;
     const rc = std.c.getaddrinfo(@ptrCast(&name_buf), null, &hints, &result);
-    if (rc != 0 or result == null) return error.ResolutionFailed;
+    if (@intFromEnum(rc) != 0 or result == null) return error.ResolutionFailed;
     defer std.c.freeaddrinfo(result.?);
 
     const addr_in: *const std.c.sockaddr.in = @ptrCast(@alignCast(result.?.addr.?));
@@ -1018,7 +1021,8 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
         .connecting => {
             // TCP connect completed — check for errors
             var err_opt: c_int = 0;
-            const rc = std.c.getsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &@as(posix.socklen_t, @sizeOf(c_int)));
+            var optlen: posix.socklen_t = @sizeOf(c_int);
+            const rc = std.c.getsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &optlen);
             if (rc != 0 or err_opt != 0) {
                 log.err("outbound TCP connect failed for {s}", .{conn.remote_domain});
                 conn.fail("tcp-connect-failed");
@@ -1033,23 +1037,41 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 // Direct TLS — start handshake immediately
                 startOutboundTls(daemon, batch, slot, conn);
             } else {
-                // STARTTLS path — send stream open first
+                // STARTTLS path — send stream open first via write buffer
                 var buf: [2048]u8 = undefined;
                 const stream_open = conn.buildStreamOpen(&buf) catch return;
-                _ = posix.write(conn.fd, stream_open) catch {
+                conn.queueWrite(stream_open) catch {
+                    conn.fail("write-failed");
+                    daemon.closeOutbound(slot);
+                    return;
+                };
+                _ = conn.flushWrite() catch {
                     conn.fail("write-failed");
                     daemon.closeOutbound(slot);
                     return;
                 };
                 // Wait for remote stream open + features
                 batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+                if (conn.hasPendingWrite()) {
+                    batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+                }
             }
         },
         .tls_handshake => {
             // TLS handshake wants to write
             continueOutboundTls(daemon, batch, slot, conn);
         },
-        else => {},
+        else => {
+            // Flush pending write buffer
+            _ = conn.flushWrite() catch {
+                conn.fail("write-failed");
+                daemon.closeOutbound(slot);
+                return;
+            };
+            if (conn.hasPendingWrite()) {
+                batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+            }
+        },
     }
 }
 
@@ -1058,15 +1080,12 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     if (slot >= MAX_OUTBOUND_CONNS) return;
     const conn = daemon.outbound[slot] orelse return;
 
-    if (conn.state == .tls_handshake) {
-        // TLS handshake wants to read
+    if (conn.isTlsHandshaking()) {
         continueOutboundTls(daemon, batch, slot, conn);
         return;
     }
 
-    // Read data from the outbound socket
-    var buf: [8192]u8 = undefined;
-    const n = posix.read(conn.fd, &buf) catch |err| {
+    const n = conn.recv() catch |err| {
         switch (err) {
             error.WouldBlock => return,
             else => {
@@ -1082,10 +1101,10 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
         return;
     }
 
-    // Parse XML from the received data
+    // Parse XML from the persistent read buffer
     const reader = daemon.outbound_readers[slot] orelse return;
+    const data = conn.readableSlice();
     var pos: usize = 0;
-    const data = buf[0..n];
 
     while (true) {
         const event = reader.next(data, &pos) catch {
@@ -1099,6 +1118,17 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
 
         // Connection may have been closed
         if (daemon.outbound[slot] == null) return;
+
+        // After STARTTLS, stop processing pre-TLS buffer
+        if (conn.isTlsHandshaking()) break;
+    }
+
+    // Mark consumed bytes
+    if (pos > 0) conn.consume(pos);
+
+    // Request write notification if there's data to flush
+    if (conn.hasPendingWrite()) {
+        batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
     }
 }
 
@@ -1160,9 +1190,9 @@ fn processOutboundEvent(
                 daemon.closeOutbound(slot);
             }
         },
-        .element_end => |elem| {
+        .element_end => |name| {
             // End of <stream:features> — decide what to do
-            if (std.mem.eql(u8, elem.local_name, "features")) {
+            if (std.mem.eql(u8, name, "features")) {
                 const action = conn.handleRemoteFeatures(
                     conn.stream.dane_verified,
                     !conn.stream.dane_verified,
@@ -1171,12 +1201,14 @@ fn processOutboundEvent(
                     .send_starttls => {
                         var act_buf: [256]u8 = undefined;
                         const starttls = conn.buildStarttls(&act_buf) catch return;
-                        _ = posix.write(conn.fd, starttls) catch return;
+                        conn.queueWrite(starttls) catch return;
+                        _ = conn.flushWrite() catch return;
                     },
                     .send_sasl_external => {
                         var act_buf: [512]u8 = undefined;
                         const ext = conn.buildSaslExternal(&act_buf) catch return;
-                        _ = posix.write(conn.fd, ext) catch return;
+                        conn.queueWrite(ext) catch return;
+                        _ = conn.flushWrite() catch return;
                     },
                     .begin_dialback => {
                         log.info("outbound dialback needed for {s} (not yet implemented)", .{conn.remote_domain});
@@ -1203,21 +1235,11 @@ fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *
         return;
     };
 
-    // Create client-side TLS connection with SNI
-    var hostname_buf: [256:0]u8 = undefined;
-    if (conn.remote_domain.len >= hostname_buf.len) {
-        conn.fail("hostname-too-long");
-        return;
-    }
-    @memcpy(hostname_buf[0..conn.remote_domain.len], conn.remote_domain);
-    hostname_buf[conn.remote_domain.len] = 0;
-
-    const tls_conn = SslConn.initClient(ctx, conn.fd, &hostname_buf) catch {
+    conn.upgradeToTls(ctx) catch {
         conn.fail("tls-init-failed");
         daemon.closeOutbound(slot);
         return;
     };
-    _ = tls_conn;
 
     conn.state = .tls_handshake;
     continueOutboundTls(daemon, batch, slot, conn);
@@ -1225,25 +1247,136 @@ fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *
 
 /// Continue a non-blocking outbound TLS handshake.
 fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
-    // For now, TLS handshake is driven by the OutboundConnection's stream state.
-    // The actual SslConn is not yet stored on OutboundConnection — this will be
-    // completed when we add an SslConn field to OutboundConnection (similar to S2sSession).
-    // Placeholder: transition immediately to established for testing.
-    _ = batch;
-    log.info("outbound TLS handshake placeholder for {s}", .{conn.remote_domain});
-    conn.tlsHandshakeComplete();
-
-    // TODO: DANE check here using daemon.allocator + dns.queryTlsa + dane.verifyDane
-    conn.setDaneResult(.no_records); // Placeholder — fall back to dialback
-
-    // After DANE, send post-TLS stream open
-    var buf: [2048]u8 = undefined;
-    const stream_open = conn.buildStreamOpen(&buf) catch return;
-    _ = posix.write(conn.fd, stream_open) catch {
-        conn.fail("write-failed");
+    const complete = conn.continueHandshake() catch {
+        log.err("outbound TLS handshake failed for {s}", .{conn.remote_domain});
+        conn.fail("tls-handshake-failed");
         daemon.closeOutbound(slot);
         return;
     };
+
+    if (complete) {
+        log.info("outbound TLS handshake complete for {s}", .{conn.remote_domain});
+        conn.tlsHandshakeComplete();
+
+        // Reset XML reader for post-TLS stream restart
+        if (daemon.outbound_readers[slot]) |reader| reader.reset();
+        // Clear stale pre-TLS data from the read buffer
+        conn.read_start = 0;
+        conn.read_end = 0;
+
+        // DANE verification
+        performOutboundDane(daemon, slot, conn);
+
+        // If DANE failed, connection was closed
+        if (conn.isFailed()) return;
+
+        // Send post-TLS stream open
+        var buf: [2048]u8 = undefined;
+        const stream_open = conn.buildStreamOpen(&buf) catch return;
+        conn.queueWrite(stream_open) catch {
+            conn.fail("write-failed");
+            daemon.closeOutbound(slot);
+            return;
+        };
+        _ = conn.flushWrite() catch {
+            conn.fail("write-failed");
+            daemon.closeOutbound(slot);
+            return;
+        };
+
+        // Wait for remote stream open + features
+        batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+        if (conn.hasPendingWrite()) {
+            batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+        }
+    } else {
+        // Re-arm the appropriate kqueue filter for next handshake step
+        if (conn.tls_state) |state| {
+            switch (state) {
+                .handshake_want_read => batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
+                .handshake_want_write => batch.addWrite(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
+                .established => {},
+            }
+        }
+    }
+}
+
+/// Perform DANE verification after outbound TLS handshake.
+fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnection) void {
+    const dane_mod = @import("dane.zig");
+
+    // Query TLSA records for the target host/port
+    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, conn.target_port, conn.target_host) catch |err| {
+        log.warn("TLSA query failed for {s}:{d}: {}", .{ conn.target_host, conn.target_port, err });
+        conn.setDaneResult(.no_records);
+        return;
+    };
+    defer {
+        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
+        daemon.allocator.free(tlsa_records);
+    }
+
+    if (tlsa_records.len == 0) {
+        log.info("no TLSA records for {s}:{d} — will use dialback", .{ conn.target_host, conn.target_port });
+        conn.setDaneResult(.no_records);
+        return;
+    }
+
+    // Extract peer certificate chain from TLS connection
+    if (conn.tls_conn) |*tls| {
+        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
+            conn.setDaneResult(.no_records);
+            return;
+        };
+        if (leaf_der == null) {
+            log.warn("no peer certificate for {s}", .{conn.remote_domain});
+            conn.setDaneResult(.no_records);
+            return;
+        }
+        defer daemon.allocator.free(leaf_der.?);
+
+        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
+            conn.setDaneResult(.no_records);
+            return;
+        };
+        defer {
+            for (chain_der) |cert| daemon.allocator.free(cert);
+            daemon.allocator.free(chain_der);
+        }
+
+        // Convert dns.TlsaRecord → dane.DnsTlsaRecord for the bridge
+        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
+            conn.setDaneResult(.no_records);
+            return;
+        };
+        defer daemon.allocator.free(dane_records);
+        for (tlsa_records, 0..) |rec, i| {
+            dane_records[i] = .{
+                .usage = rec.usage,
+                .selector = rec.selector,
+                .matching_type = rec.matching_type,
+                .association_data = rec.association_data,
+            };
+        }
+
+        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
+        log.info("DANE result for {s}: {s}", .{
+            conn.remote_domain,
+            switch (status) {
+                .verified => "verified",
+                .no_records => "no-records",
+                .failed => "FAILED",
+                .pending => "pending",
+            },
+        });
+        conn.setDaneResult(status);
+
+        if (conn.isFailed()) {
+            daemon.closeOutbound(slot);
+        }
+    } else {
+        conn.setDaneResult(.no_records);
+    }
 }
 
 // ============================================================================

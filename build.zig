@@ -356,7 +356,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/s2s/connector.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_connector_tests = b.addTest(.{
         .name = "s2s-connector-tests",
@@ -371,7 +375,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/s2s/dane.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    s2s_dane_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dane_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_dane_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_dane_tests = b.addTest(.{
         .name = "s2s-dane-tests",

@@ -21,6 +21,11 @@ const S2sStream = stream_mod.S2sStream;
 const S2sStreamState = stream_mod.S2sStreamState;
 const S2sStreamAction = stream_mod.S2sStreamAction;
 const Role = stream_mod.Role;
+const ssl_mod = @import("ssl");
+const SslConn = ssl_mod.SslConn;
+const SslContext = ssl_mod.SslContext;
+const session_mod = @import("session.zig");
+const TlsState = session_mod.TlsState;
 
 /// Outbound connection establishment state.
 pub const OutboundState = enum {
@@ -83,7 +88,21 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
+    /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
+    tls_conn: ?SslConn = null,
+    /// TLS handshake state for kqueue integration.
+    tls_state: ?TlsState = null,
+    /// Persistent read buffer (survives across kqueue events).
+    read_buf: [READ_BUF_SIZE]u8 = undefined,
+    read_start: usize = 0,
+    read_end: usize = 0,
+    /// Write buffer for TLS-aware output.
+    write_buf: [WRITE_BUF_SIZE]u8 = undefined,
+    write_start: usize = 0,
+    write_end: usize = 0,
 
+    const READ_BUF_SIZE = 8192;
+    const WRITE_BUF_SIZE = 16384;
     const PendingQueue = std.ArrayList(PendingStanza);
 
     pub fn init(
@@ -106,10 +125,164 @@ pub const OutboundConnection = struct {
             allocator.free(stanza.xml);
         }
         self.pending_stanzas.deinit(allocator);
+        if (self.tls_conn) |*tls| {
+            tls.shutdown();
+            tls.deinit();
+            self.tls_conn = null;
+        }
         if (self.fd >= 0) {
             posix.close(self.fd);
             self.fd = -1;
         }
+    }
+
+    /// Whether TLS handshake is in progress.
+    pub fn isTlsHandshaking(self: *const OutboundConnection) bool {
+        if (self.tls_state) |s| {
+            return s != .established;
+        }
+        return false;
+    }
+
+    /// Upgrade this connection to TLS using the client-side context.
+    /// Initiates a non-blocking handshake.
+    pub fn upgradeToTls(self: *OutboundConnection, ctx: SslContext) !void {
+        // Build null-terminated SNI hostname
+        var hostname_buf: [256:0]u8 = undefined;
+        if (self.remote_domain.len >= hostname_buf.len) return error.HostnameTooLong;
+        @memcpy(hostname_buf[0..self.remote_domain.len], self.remote_domain);
+        hostname_buf[self.remote_domain.len] = 0;
+
+        self.tls_conn = SslConn.initClient(ctx, self.fd, &hostname_buf) catch return error.TlsInitFailed;
+        self.tls_state = .handshake_want_read;
+    }
+
+    /// Continue a non-blocking TLS handshake.
+    /// Returns true when the handshake is complete.
+    pub fn continueHandshake(self: *OutboundConnection) !bool {
+        if (self.tls_conn) |*tls| {
+            const result = tls.doHandshake() catch return error.HandshakeFailed;
+            switch (result) {
+                .complete => {
+                    self.tls_state = .established;
+                    return true;
+                },
+                .want_read => {
+                    self.tls_state = .handshake_want_read;
+                    return false;
+                },
+                .want_write => {
+                    self.tls_state = .handshake_want_write;
+                    return false;
+                },
+            }
+        }
+        return error.NoTlsConnection;
+    }
+
+    /// Receive data from the socket into the persistent read buffer.
+    /// Returns number of bytes read, 0 for EOF.
+    pub fn recv(self: *OutboundConnection) !usize {
+        // Compact if needed
+        if (self.read_start > 0) {
+            const remaining = self.read_end - self.read_start;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.read_buf[0..remaining], self.read_buf[self.read_start..self.read_end]);
+            }
+            self.read_end = remaining;
+            self.read_start = 0;
+        }
+        if (self.read_end >= self.read_buf.len) return error.BufferFull;
+
+        const buf = self.read_buf[self.read_end..];
+
+        if (self.tls_conn) |*tls| {
+            const result = tls.read(buf) catch |err| {
+                return switch (err) {
+                    ssl_mod.SslError.ConnectionClosed => @as(usize, 0),
+                    else => error.ConnectionReset,
+                };
+            };
+            return switch (result) {
+                .ok => |n| blk: {
+                    self.read_end += n;
+                    break :blk n;
+                },
+                .want_read => error.WouldBlock,
+                .want_write => error.WouldBlock,
+            };
+        }
+
+        const n = posix.read(self.fd, buf) catch |err| {
+            return switch (err) {
+                error.WouldBlock => error.WouldBlock,
+                else => error.ConnectionReset,
+            };
+        };
+        if (n == 0) return 0; // EOF
+        self.read_end += n;
+        return n;
+    }
+
+    /// Get the readable portion of the read buffer.
+    pub fn readableSlice(self: *const OutboundConnection) []const u8 {
+        return self.read_buf[self.read_start..self.read_end];
+    }
+
+    /// Mark bytes as consumed from the read buffer.
+    pub fn consume(self: *OutboundConnection, n: usize) void {
+        self.read_start += n;
+    }
+
+    /// Queue data to the write buffer.
+    pub fn queueWrite(self: *OutboundConnection, data: []const u8) !void {
+        const available = self.write_buf.len - self.write_end;
+        if (data.len > available) return error.BufferFull;
+        @memcpy(self.write_buf[self.write_end .. self.write_end + data.len], data);
+        self.write_end += data.len;
+    }
+
+    /// Flush the write buffer to the socket (TLS-aware).
+    /// Returns true if all data was flushed.
+    pub fn flushWrite(self: *OutboundConnection) !bool {
+        if (self.write_start >= self.write_end) return true;
+
+        const data = self.write_buf[self.write_start..self.write_end];
+
+        if (self.tls_conn) |*tls| {
+            const result = tls.write(data) catch return error.ConnectionReset;
+            switch (result) {
+                .ok => |n| {
+                    self.write_start += n;
+                    if (self.write_start >= self.write_end) {
+                        self.write_start = 0;
+                        self.write_end = 0;
+                        return true;
+                    }
+                    return false;
+                },
+                .want_read, .want_write => return false,
+            }
+        }
+
+        const n = posix.write(self.fd, data) catch |err| {
+            return switch (err) {
+                error.WouldBlock => false,
+                else => error.ConnectionReset,
+            };
+        };
+        self.write_start += n;
+        if (self.write_start >= self.write_end) {
+            self.write_start = 0;
+            self.write_end = 0;
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether there is pending write data.
+    pub fn hasPendingWrite(self: *const OutboundConnection) bool {
+        return self.write_start < self.write_end;
     }
 
     /// Queue a stanza for delivery once the connection is established.
@@ -211,6 +384,8 @@ pub const OutboundConnection = struct {
 
     /// STARTTLS proceed received — start TLS handshake.
     pub fn handleStarttlsProceed(self: *OutboundConnection) void {
+        // Flush any pending plaintext writes before upgrading
+        _ = self.flushWrite() catch {};
         self.state = .tls_handshake;
     }
 

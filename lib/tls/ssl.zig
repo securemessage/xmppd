@@ -280,7 +280,7 @@ pub const SslConn = struct {
     pub fn getPeerChainDer(self: *SslConn, alloc: std.mem.Allocator) SslError![][]u8 {
         const chain = c.SSL_get_peer_cert_chain(self.ssl) orelse return &.{};
 
-        const num: usize = @intCast(c.sk_X509_num(chain));
+        const num: usize = @intCast(c.OPENSSL_sk_num(@ptrCast(chain)));
         if (num == 0) return &.{};
 
         const result = alloc.alloc([]u8, num) catch return SslError.OutOfMemory;
@@ -291,7 +291,10 @@ pub const SslConn = struct {
         }
 
         for (0..num) |i| {
-            const x509 = c.sk_X509_value(chain, @intCast(i)) orelse continue;
+            // Use OPENSSL_sk_value instead of sk_X509_value to avoid
+            // Zig C translator issue with [*c] pointer to opaque X509 type.
+            const x509_raw = c.OPENSSL_sk_value(@ptrCast(chain), @intCast(i)) orelse continue;
+            const x509: *c.X509 = @ptrCast(@alignCast(x509_raw));
 
             const der_len = c.i2d_X509(x509, null);
             if (der_len <= 0) continue;
