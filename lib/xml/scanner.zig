@@ -108,6 +108,18 @@ pub const Scanner = struct {
         _ = self.token_arena.reset(.retain_capacity);
     }
 
+    /// Full reset for stream restart (e.g., after STARTTLS or SASL success).
+    /// Clears all accumulated state so the scanner can parse a fresh XML stream.
+    pub fn reset(self: *Scanner) void {
+        self.state = .content;
+        self.buf.clearRetainingCapacity();
+        self.val_buf.clearRetainingCapacity();
+        self.quote_char = 0;
+        self.saw_slash = false;
+        self.pending.clearRetainingCapacity();
+        _ = self.token_arena.reset(.retain_capacity);
+    }
+
     const ally = struct {
         inline fn get(self: *Scanner) std.mem.Allocator {
             return self.allocator;

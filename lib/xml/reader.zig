@@ -230,14 +230,20 @@ pub const Reader = struct {
         return try self.arena.allocator().dupe(u8, s);
     }
 
-    /// Reset the reader for a new stream (e.g., after STARTTLS reset).
+    /// Reset the reader for a new stream (e.g., after STARTTLS or SASL reset).
+    /// Clears both the Reader state and the underlying Scanner so a fresh
+    /// XML stream can be parsed from scratch.
     pub fn reset(self: *Reader) void {
         self.depth = 0;
         self.stream_opened = false;
         self.default_ns = "";
         self.ns_binding_count = 0;
+        self.current_element_name = "";
+        self.current_element_prefix = "";
+        self.current_element_local = "";
         self.attrs.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
+        self.scan.reset();
     }
 };
 

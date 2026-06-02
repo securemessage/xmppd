@@ -374,10 +374,25 @@ pub const Server = struct {
 
         if (complete) {
             log.info("connection {d} TLS handshake complete", .{id});
+            // Notify the stream FSM that TLS is established
+            session.stream.tlsEstablished();
             // Reset XML reader for stream restart after STARTTLS
             session.reader.reset();
-            // Ensure we're watching for reads (client will send new stream open)
-            changes.addRead(session.conn.fd, id) catch {};
+            // Clear any stale pre-TLS data from the read buffer
+            session.conn.read_start = 0;
+            session.conn.read_end = 0;
+
+            // OpenSSL may have buffered application data internally during
+            // the handshake (client pipelines Finished + new stream open).
+            // kqueue won't fire for data already consumed from the socket.
+            // Try reading immediately to drain any buffered TLS app data.
+            self.handleReadable(id, changes);
+
+            // If the session is still alive and we didn't get data yet,
+            // ensure kqueue will notify us when new data arrives.
+            if (self.sessions[id] != null and !session.conn.isClosed()) {
+                changes.addRead(session.conn.fd, id) catch {};
+            }
         } else {
             // Re-arm the appropriate kqueue filter
             if (session.conn.tls_state) |state| {
@@ -445,6 +460,8 @@ pub const Server = struct {
             events_processed += 1;
 
             if (session.conn.isClosed()) break;
+            // After STARTTLS upgrade, stop processing pre-TLS buffer
+            if (session.conn.isTlsHandshaking()) break;
         }
 
         // Consume processed bytes
