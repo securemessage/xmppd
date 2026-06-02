@@ -193,7 +193,7 @@ def test_e2e():
         assert '<body>' in resp, f"Bob: no <body> in message: {resp}"
         assert 'Hello Bob! This is a test message.' in resp, \
             f"Bob: body content missing: {resp}"
-        assert "from='alice@localhost/default'" in resp, \
+        assert "from='alice@localhost/desktop'" in resp, \
             f"Bob: wrong from JID: {resp}"
         assert '<thread>test-thread-1</thread>' in resp, \
             f"Bob: thread element missing: {resp}"
@@ -214,10 +214,10 @@ def test_e2e():
         assert '<body>' in resp, f"Alice: no <body> in reply: {resp}"
         assert 'Hi Alice! Got your message.' in resp, \
             f"Alice: reply body missing: {resp}"
-        assert "from='bob@localhost/default'" in resp, \
+        assert "from='bob@localhost/mobile'" in resp, \
             f"Alice: wrong from JID: {resp}"
         print("    ✓ Reply received with full body!")
-        print(f"    ✓ from='bob@localhost/default'")
+        print(f"    ✓ from='bob@localhost/mobile'")
         print(f"    ✓ <body>Hi Alice! Got your message.</body>")
 
         # --- Test special characters ---

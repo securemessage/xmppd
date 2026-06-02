@@ -131,6 +131,13 @@ const Session = struct {
     stanza_id: []const u8 = "",
     stanza_type: []const u8 = "",
 
+    /// Bind IQ accumulation — deferred until </iq> so <resource> text is parsed.
+    bind_iq_id: []const u8 = "",
+    bind_resource_buf: [256]u8 = undefined,
+    bind_resource_len: usize = 0,
+    bind_collecting_resource: bool = false,
+    bind_pending: bool = false,
+
     /// IQ stanza accumulation — tracks child element namespace for dispatching.
     iq_active: bool = false,
     iq_type: []const u8 = "",
@@ -580,10 +587,28 @@ pub const Server = struct {
             return;
         }
 
-        // Bind namespace
+        // Bind namespace — defer to </iq> so <resource> text is parsed
         if (std.mem.eql(u8, ns, xml.ns.bind)) {
             if (std.mem.eql(u8, elem.local_name, "bind")) {
-                self.handleBind(session, elem, changes);
+                session.bind_pending = true;
+                session.bind_resource_len = 0;
+                session.bind_collecting_resource = false;
+            } else if (std.mem.eql(u8, elem.local_name, "resource") and session.bind_pending) {
+                session.bind_collecting_resource = true;
+                session.bind_resource_len = 0;
+            }
+            return;
+        }
+
+        // Pre-bind IQ wrapper — capture the IQ id for the bind result
+        if (!session.stream.isActive() and session.stream.state == .features_bind) {
+            if (std.mem.eql(u8, elem.local_name, "iq")) {
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "id")) {
+                        session.bind_iq_id = attr.value;
+                        break;
+                    }
+                }
             }
             return;
         }
@@ -617,6 +642,17 @@ pub const Server = struct {
             return;
         }
 
+        // Bind resource text accumulation
+        if (session.bind_collecting_resource) {
+            const remaining = session.bind_resource_buf.len - session.bind_resource_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.bind_resource_buf[session.bind_resource_len .. session.bind_resource_len + to_copy], text[0..to_copy]);
+                session.bind_resource_len += to_copy;
+            }
+            return;
+        }
+
         if (session.sasl_collecting == .none) return;
 
         // Accumulate text into SASL buffer
@@ -637,6 +673,26 @@ pub const Server = struct {
             } else {
                 // Stanza complete (depth back to stream level) — route to targets
                 self.dispatchStanza(session, changes);
+            }
+            return;
+        }
+
+        // Bind accumulation — stop resource collection, dispatch on </iq>
+        if (session.bind_pending) {
+            if (session.bind_collecting_resource) {
+                session.bind_collecting_resource = false;
+            }
+            if (session.reader.depth == 1) {
+                // </iq> at stream-child level — perform bind with collected resource
+                const resource = session.bind_resource_buf[0..session.bind_resource_len];
+                self.handleBind(session, resource, changes);
+                session.bind_pending = false;
+                session.bind_resource_len = 0;
+                session.bind_iq_id = "";
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                }
+                return;
             }
             return;
         }
@@ -1462,6 +1518,42 @@ pub const Server = struct {
             }
         }
 
+        // Service Discovery — disco#info (XEP-0030)
+        if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (iq_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(iq_id) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+            w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
+            w.writeAll("<feature var='http://jabber.org/protocol/disco#info'/>") catch return;
+            w.writeAll("<feature var='http://jabber.org/protocol/disco#items'/>") catch return;
+            w.writeAll("<feature var='urn:xmpp:ping'/>") catch return;
+            w.writeAll("<feature var='jabber:iq:roster'/>") catch return;
+            w.writeAll("</query></iq>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            return;
+        }
+
+        // Service Discovery — disco#items (XEP-0030)
+        if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (iq_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(iq_id) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            return;
+        }
+
         // XMPP Ping (XEP-0199)
         if (std.mem.eql(u8, child_ns, xml.ns.ping) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
@@ -1807,10 +1899,8 @@ pub const Server = struct {
         session.conn.queueSend(fbs.getWritten()) catch return;
     }
 
-    fn handleBind(self: *Server, session: *Session, _: xml.Element, _: *ChangeList) void {
-        // Extract requested resource from bind element
-        // TODO: parse <resource>name</resource> child element
-        const action = session.stream.handleBind("");
+    fn handleBind(self: *Server, session: *Session, resource: []const u8, _: *ChangeList) void {
+        const action = session.stream.handleBind(resource);
         self.executeAction(session, action);
 
         if (session.stream.isActive()) {
@@ -1884,7 +1974,13 @@ pub const Server = struct {
                 session.conn.queueSend(fbs.getWritten()) catch return;
             },
             .send_bind_result => |bound_jid| {
-                writer.writeAll("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>") catch return;
+                writer.writeAll("<iq type='result'") catch return;
+                if (session.bind_iq_id.len > 0) {
+                    writer.writeAll(" id='") catch return;
+                    writer.writeAll(session.bind_iq_id) catch return;
+                    writer.writeByte('\'') catch return;
+                }
+                writer.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>") catch return;
                 if (bound_jid.local.len > 0) {
                     writer.writeAll(bound_jid.local) catch return;
                     writer.writeByte('@') catch return;
