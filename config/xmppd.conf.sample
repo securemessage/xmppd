@@ -1,0 +1,28 @@
+# xmppd configuration
+#
+# Copy to xmppd.conf and edit for your deployment.
+
+# XMPP virtual host domain
+hostname = example.com
+
+# TLS certificate and key (PEM format)
+tls_cert = /usr/local/etc/xmppd/server.pem
+tls_key = /usr/local/etc/xmppd/server.key
+
+# STARTTLS port (default: 5222)
+c2s_port = 5222
+
+# Direct TLS port (default: 5223)
+# c2s_tls_port = 5223
+
+# Bind address (default: 0.0.0.0)
+# bind_address = 0.0.0.0
+
+# User to run as after binding ports (requires root to start)
+# user = xmppd
+
+# PID file
+# pidfile = /var/run/xmppd/xmppd.pid
+
+# Path to xmppd-core binary (default: alongside xmppd)
+# core_path = /usr/local/libexec/xmppd/xmppd-core

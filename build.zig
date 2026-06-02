@@ -193,6 +193,58 @@ pub fn build(b: *std.Build) void {
 
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    // --- Supervisor tests ---
+
+    const supervisor_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/master/supervisor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const supervisor_tests = b.addTest(.{
+        .name = "supervisor-tests",
+        .root_module = supervisor_test_mod,
+    });
+
+    const run_supervisor_tests = b.addRunArtifact(supervisor_tests);
+
+    // --- Executables ---
+
+    // xmppd-core: the connection handler worker
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    core_mod.addImport("xml", xml_mod);
+    core_mod.addImport("xmpp", xmpp_mod);
+    core_mod.addImport("sasl", sasl_mod);
+    core_mod.addImport("ssl", ssl_test_mod);
+    core_mod.linkSystemLibrary("ssl", .{});
+    core_mod.linkSystemLibrary("crypto", .{});
+
+    const core_exe = b.addExecutable(.{
+        .name = "xmppd-core",
+        .root_module = core_mod,
+    });
+    b.installArtifact(core_exe);
+
+    // xmppd: the master supervisor
+    const master_mod = b.createModule(.{
+        .root_source_file = b.path("src/master/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const master_exe = b.addExecutable(.{
+        .name = "xmppd",
+        .root_module = master_mod,
+    });
+    b.installArtifact(master_exe);
+
+    // --- Test step ---
+
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
@@ -204,4 +256,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_connection_tests.step);
     test_step.dependOn(&run_listener_tests.step);
     test_step.dependOn(&run_server_tests.step);
+    test_step.dependOn(&run_supervisor_tests.step);
 }
