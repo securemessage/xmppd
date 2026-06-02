@@ -44,6 +44,8 @@ const Event = @import("event_loop.zig").Event;
 const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
+const RosterStore = @import("roster_store").RosterStore;
+const SessionRegistry = @import("session_registry").SessionRegistry;
 
 const log = std.log.scoped(.xmppd);
 
@@ -147,6 +149,12 @@ pub const Server = struct {
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
 
+    /// Session registry — maps bound JIDs to session IDs.
+    registry: SessionRegistry = .{},
+
+    /// Roster store — per-user contact lists with subscription states.
+    roster: ?*RosterStore = null,
+
     /// Initialize the server.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
@@ -184,6 +192,13 @@ pub const Server = struct {
             return error.AuthConfigFailed;
         };
         log.info("connected to auth daemon at {s}", .{socket_path});
+    }
+
+    /// Configure the roster store. The roster file lives in the same
+    /// directory as the user database.
+    pub fn configureRoster(self: *Server, roster_store: *RosterStore) void {
+        self.roster = roster_store;
+        log.info("roster store configured ({d} items)", .{roster_store.items.items.len});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -508,14 +523,14 @@ pub const Server = struct {
             return;
         }
 
-        // Active state — stanzas
+        // Active state — stanzas (message, presence, iq)
         if (session.stream.isActive()) {
-            if (std.mem.eql(u8, elem.local_name, "message") or
-                std.mem.eql(u8, elem.local_name, "presence") or
-                std.mem.eql(u8, elem.local_name, "iq"))
-            {
-                // Phase 5: just log active stanzas
-                log.info("connection {d} active stanza: <{s}>", .{ session.conn.id, elem.local_name });
+            if (std.mem.eql(u8, elem.local_name, "message")) {
+                self.handleMessage(session, elem, changes);
+            } else if (std.mem.eql(u8, elem.local_name, "presence")) {
+                self.handlePresence(session, elem, changes);
+            } else if (std.mem.eql(u8, elem.local_name, "iq")) {
+                self.handleIq(session, elem, changes);
             }
         }
     }
@@ -755,6 +770,345 @@ pub const Server = struct {
         }
     }
 
+    // ========================================================================
+    // Stanza handlers (Phase 7: message routing + presence + IQ)
+    // ========================================================================
+
+    fn handleMessage(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        // Extract 'to' attribute for routing
+        var to_str: []const u8 = "";
+        var id_str: []const u8 = "";
+        var type_str: []const u8 = "normal";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
+        }
+
+        if (to_str.len == 0) {
+            // Messages without 'to' are handled by the server (ignored for now)
+            return;
+        }
+
+        // Parse target JID
+        const to_jid = xmpp.Jid.parse(to_str) catch {
+            log.warn("connection {d} message with invalid 'to': {s}", .{ session.conn.id, to_str });
+            return;
+        };
+
+        // Get the sender's bound JID
+        const from_jid = session.stream.bound_jid orelse return;
+
+        // Build the from string
+        var from_buf: [256]u8 = undefined;
+        var from_fbs = std.io.fixedBufferStream(&from_buf);
+        const from_w = from_fbs.writer();
+        from_w.writeAll(from_jid.local) catch return;
+        from_w.writeByte('@') catch return;
+        from_w.writeAll(from_jid.domain) catch return;
+        if (from_jid.resource.len > 0) {
+            from_w.writeByte('/') catch return;
+            from_w.writeAll(from_jid.resource) catch return;
+        }
+        const from_str = from_fbs.getWritten();
+
+        // Route: find target session(s)
+        // If full JID specified, deliver to that resource; otherwise deliver to all available
+        var target_ids: [16]usize = undefined;
+        const target_count = if (to_jid.resource.len > 0)
+            // Full JID — find specific resource
+            blk: {
+                if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
+                    target_ids[0] = entry.id;
+                    break :blk @as(usize, 1);
+                }
+                break :blk @as(usize, 0);
+            } else
+            // Bare JID — deliver to all available resources
+            self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
+
+        if (target_count == 0) {
+            // TODO: offline message storage. For now, bounce with error.
+            log.info("connection {d} message to {s} — recipient unavailable", .{ session.conn.id, to_str });
+            self.sendServiceUnavailable(session, id_str, to_str, from_str);
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+            return;
+        }
+
+        // Forward the message to target session(s) — rewrite 'from' to sender's full JID
+        for (target_ids[0..target_count]) |tid| {
+            const target_session = self.sessions[tid] orelse continue;
+            var msg_buf: [4096]u8 = undefined;
+            var msg_fbs = std.io.fixedBufferStream(&msg_buf);
+            const mw = msg_fbs.writer();
+            mw.writeAll("<message from='") catch continue;
+            mw.writeAll(from_str) catch continue;
+            mw.writeAll("' to='") catch continue;
+            mw.writeAll(to_str) catch continue;
+            mw.writeByte('\'') catch continue;
+            if (!std.mem.eql(u8, type_str, "normal")) {
+                mw.writeAll(" type='") catch continue;
+                mw.writeAll(type_str) catch continue;
+                mw.writeByte('\'') catch continue;
+            }
+            if (id_str.len > 0) {
+                mw.writeAll(" id='") catch continue;
+                mw.writeAll(id_str) catch continue;
+                mw.writeByte('\'') catch continue;
+            }
+            // For now, self-close (we don't yet accumulate body).
+            // TODO: Phase 7 refinement — accumulate full stanza XML and forward verbatim
+            mw.writeAll("/>") catch continue;
+            target_session.conn.queueSend(msg_fbs.getWritten()) catch continue;
+            if (target_session.conn.hasPendingWrite()) {
+                changes.addWrite(target_session.conn.fd, tid) catch {};
+            }
+        }
+    }
+
+    fn handlePresence(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        var type_str: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "type")) {
+                type_str = attr.value;
+                break;
+            }
+        }
+
+        const ptype = xmpp.PresenceType.fromString(type_str);
+        const bound = session.stream.bound_jid orelse return;
+
+        switch (ptype) {
+            .available => {
+                // Initial presence — mark session as available, broadcast to subscribers
+                self.registry.setPresenceAvailable(session.conn.id, true);
+                self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
+
+                // Send presence probes to contacts we're subscribed to
+                self.sendPresenceProbes(session, bound.local, bound.domain, changes);
+
+                log.info("connection {d} now available: {s}@{s}/{s}", .{
+                    session.conn.id, bound.local, bound.domain, bound.resource,
+                });
+            },
+            .unavailable => {
+                self.registry.setPresenceAvailable(session.conn.id, false);
+                self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
+            },
+            else => {
+                // subscribe/subscribed/unsubscribe/unsubscribed — Phase 7g
+                // For now, log
+                log.info("connection {d} presence type={s} (subscription not yet implemented)", .{
+                    session.conn.id, type_str,
+                });
+            },
+        }
+    }
+
+    fn handleIq(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        _ = self;
+        _ = changes;
+        var type_str: []const u8 = "";
+        var id_str: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+        }
+
+        // For now, handle roster get/set in Phase 7f.
+        // Return empty result for session IQ (legacy session establishment)
+        if (std.mem.eql(u8, type_str, "set")) {
+            // Legacy session — just ack it
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (id_str.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(id_str) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("/>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+        } else if (std.mem.eql(u8, type_str, "get")) {
+            // Roster query and other gets — respond with empty result for now
+            var fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const w = fbs.writer();
+            w.writeAll("<iq type='result'") catch return;
+            if (id_str.len > 0) {
+                w.writeAll(" id='") catch return;
+                w.writeAll(id_str) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("/>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+        }
+    }
+
+    /// Broadcast available presence to all roster subscribers.
+    fn broadcastPresence(self: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
+        const roster = self.roster orelse return;
+
+        // Build the from JID string
+        var from_buf: [256]u8 = undefined;
+        var from_fbs = std.io.fixedBufferStream(&from_buf);
+        const fw = from_fbs.writer();
+        fw.writeAll(local) catch return;
+        fw.writeByte('@') catch return;
+        fw.writeAll(domain) catch return;
+        fw.writeByte('/') catch return;
+        fw.writeAll(resource) catch return;
+        const from_str = from_fbs.getWritten();
+
+        // Build bare JID for roster lookup
+        var bare_buf: [256]u8 = undefined;
+        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+        bare_fbs.writer().writeAll(local) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(domain) catch return;
+        const bare_jid = bare_fbs.getWritten();
+
+        // Find subscribers (contacts with "from" or "both" in our roster)
+        var subscriber_jids: [128][]const u8 = undefined;
+        const sub_count = roster.getPresenceSubscribers(bare_jid, &subscriber_jids);
+
+        // Build presence stanza
+        var pres_buf: [512]u8 = undefined;
+        var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+        const pw = pres_fbs.writer();
+        pw.writeAll("<presence from='") catch return;
+        pw.writeAll(from_str) catch return;
+        pw.writeAll("'/>") catch return;
+        const presence_xml = pres_fbs.getWritten();
+
+        // Deliver to each subscriber that has an active session
+        for (subscriber_jids[0..sub_count]) |sub_bare_jid| {
+            // Parse the subscriber bare JID to get local/domain
+            const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
+            const sub_local = sub_bare_jid[0..at_pos];
+            const sub_domain = sub_bare_jid[at_pos + 1 ..];
+
+            var target_ids: [16]usize = undefined;
+            const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
+            for (target_ids[0..target_count]) |tid| {
+                const target_session = self.sessions[tid] orelse continue;
+                target_session.conn.queueSend(presence_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, tid) catch {};
+                }
+            }
+        }
+    }
+
+    /// Broadcast unavailable presence to roster subscribers.
+    fn broadcastUnavailable(self: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
+        const roster = self.roster orelse return;
+
+        var from_buf: [256]u8 = undefined;
+        var from_fbs = std.io.fixedBufferStream(&from_buf);
+        const fw = from_fbs.writer();
+        fw.writeAll(local) catch return;
+        fw.writeByte('@') catch return;
+        fw.writeAll(domain) catch return;
+        fw.writeByte('/') catch return;
+        fw.writeAll(resource) catch return;
+        const from_str = from_fbs.getWritten();
+
+        var bare_buf: [256]u8 = undefined;
+        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+        bare_fbs.writer().writeAll(local) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(domain) catch return;
+        const bare_jid = bare_fbs.getWritten();
+
+        var subscriber_jids: [128][]const u8 = undefined;
+        const sub_count = roster.getPresenceSubscribers(bare_jid, &subscriber_jids);
+
+        var pres_buf: [512]u8 = undefined;
+        var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+        const pw = pres_fbs.writer();
+        pw.writeAll("<presence from='") catch return;
+        pw.writeAll(from_str) catch return;
+        pw.writeAll("' type='unavailable'/>") catch return;
+        const presence_xml = pres_fbs.getWritten();
+
+        for (subscriber_jids[0..sub_count]) |sub_bare_jid| {
+            const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
+            const sub_local = sub_bare_jid[0..at_pos];
+            const sub_domain = sub_bare_jid[at_pos + 1 ..];
+
+            var target_ids: [16]usize = undefined;
+            const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
+            for (target_ids[0..target_count]) |tid| {
+                const target_session = self.sessions[tid] orelse continue;
+                target_session.conn.queueSend(presence_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, tid) catch {};
+                }
+            }
+        }
+
+        log.info("{s}@{s}/{s} now unavailable", .{ local, domain, resource });
+    }
+
+    /// Send presence probes to contacts we're subscribed to (to get their current status).
+    fn sendPresenceProbes(self: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+        _ = changes;
+        const roster = self.roster orelse return;
+
+        var bare_buf: [256]u8 = undefined;
+        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+        bare_fbs.writer().writeAll(local) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(domain) catch return;
+        const bare_jid = bare_fbs.getWritten();
+
+        // Get contacts whose presence we should receive (to/both)
+        var contact_jids: [128][]const u8 = undefined;
+        const count = roster.getPresenceSubscriptions(bare_jid, &contact_jids);
+
+        // For each subscribed contact, check if they're online and send their presence
+        for (contact_jids[0..count]) |contact_bare| {
+            const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
+            const contact_local = contact_bare[0..at_pos];
+            const contact_domain = contact_bare[at_pos + 1 ..];
+
+            // If the contact has available sessions, send their presence to us
+            var target_ids: [16]usize = undefined;
+            const target_count = self.registry.findAvailableByBareJid(contact_local, contact_domain, &target_ids);
+            if (target_count > 0) {
+                // Send presence from contact to our session
+                var pres_buf: [512]u8 = undefined;
+                var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+                const pw = pres_fbs.writer();
+                pw.writeAll("<presence from='") catch continue;
+                pw.writeAll(contact_bare) catch continue;
+                pw.writeAll("'/>") catch continue;
+                session.conn.queueSend(pres_fbs.getWritten()) catch continue;
+            }
+        }
+    }
+
+    /// Send a service-unavailable error for a message that can't be delivered.
+    fn sendServiceUnavailable(self: *Server, session: *Session, id_str: []const u8, to_str: []const u8, from_str: []const u8) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<message type='error'") catch return;
+        if (id_str.len > 0) {
+            w.writeAll(" id='") catch return;
+            w.writeAll(id_str) catch return;
+            w.writeByte('\'') catch return;
+        }
+        w.writeAll(" from='") catch return;
+        w.writeAll(to_str) catch return;
+        w.writeAll("' to='") catch return;
+        w.writeAll(from_str) catch return;
+        w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+    }
+
     fn handleBind(self: *Server, session: *Session, _: xml.Element, _: *ChangeList) void {
         // Extract requested resource from bind element
         // TODO: parse <resource>name</resource> child element
@@ -762,10 +1116,16 @@ pub const Server = struct {
         self.executeAction(session, action);
 
         if (session.stream.isActive()) {
-            log.info("connection {d} session established: {s}", .{
-                session.conn.id,
-                if (session.stream.bound_jid) |jid| jid.local else "unknown",
-            });
+            if (session.stream.bound_jid) |bound| {
+                // Register in session registry
+                self.registry.bind(session.conn.id, bound.local, bound.domain, bound.resource) catch |err| {
+                    log.err("connection {d} registry bind failed: {}", .{ session.conn.id, err });
+                    return;
+                };
+                log.info("connection {d} session established: {s}@{s}/{s}", .{
+                    session.conn.id, bound.local, bound.domain, bound.resource,
+                });
+            }
         }
     }
 
@@ -894,6 +1254,13 @@ pub const Server = struct {
 
     fn closeSession(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+
+        // Unregister from session registry and broadcast unavailable presence
+        if (self.registry.unbind(id)) |bound| {
+            if (bound.presence_available) {
+                self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
+            }
+        }
 
         // Remove from kqueue (closing fd does this implicitly, but be explicit)
         changes.removeRead(session.conn.fd) catch {};

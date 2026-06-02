@@ -224,12 +224,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const roster_store_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/core/roster_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const session_registry_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/core/session_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
     server_test_mod.addImport("ssl", ssl_test_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
+    server_test_mod.addImport("roster_store", roster_store_mod_for_server);
+    server_test_mod.addImport("session_registry", session_registry_mod_for_server);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -332,6 +344,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ssl", ssl_test_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
+    core_mod.addImport("roster_store", roster_store_mod_for_server);
+    core_mod.addImport("session_registry", session_registry_mod_for_server);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
