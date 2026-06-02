@@ -396,6 +396,24 @@ pub fn build(b: *std.Build) void {
 
     const run_s2s_session_tests = b.addRunArtifact(s2s_session_tests);
 
+    // --- S2S main (daemon) tests ---
+
+    const s2s_main_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/s2s/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    s2s_main_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    s2s_main_test_mod.addImport("ipc_server", ipc_server_test_mod);
+
+    const s2s_main_tests = b.addTest(.{
+        .name = "s2s-main-tests",
+        .root_module = s2s_main_test_mod,
+    });
+
+    const run_s2s_main_tests = b.addRunArtifact(s2s_main_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -498,6 +516,35 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(auth_exe);
 
+    // xmppd-s2s: the S2S federation daemon
+    const s2s_ipc_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const s2s_ipc_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    s2s_ipc_server_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
+
+    const s2s_main_mod = b.createModule(.{
+        .root_source_file = b.path("src/s2s/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    s2s_main_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
+    s2s_main_mod.addImport("ipc_server", s2s_ipc_server_mod);
+
+    const s2s_exe = b.addExecutable(.{
+        .name = "xmppd-s2s",
+        .root_module = s2s_main_mod,
+    });
+    b.installArtifact(s2s_exe);
+
     // xmppctl: user management CLI
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/user_store.zig"),
@@ -563,4 +610,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_connector_tests.step);
     test_step.dependOn(&run_s2s_dane_tests.step);
     test_step.dependOn(&run_s2s_session_tests.step);
+    test_step.dependOn(&run_s2s_main_tests.step);
 }
