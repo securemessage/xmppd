@@ -173,27 +173,7 @@ pub fn build(b: *std.Build) void {
 
     const run_listener_tests = b.addRunArtifact(listener_tests);
 
-    const server_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    server_test_mod.addImport("xml", xml_mod);
-    server_test_mod.addImport("xmpp", xmpp_mod);
-    server_test_mod.addImport("sasl", sasl_mod);
-    server_test_mod.addImport("ssl", ssl_test_mod);
-    server_test_mod.linkSystemLibrary("ssl", .{});
-    server_test_mod.linkSystemLibrary("crypto", .{});
-
-    const server_tests = b.addTest(.{
-        .name = "server-tests",
-        .root_module = server_test_mod,
-    });
-
-    const run_server_tests = b.addRunArtifact(server_tests);
-
-    // --- IPC tests ---
+    // --- IPC tests (before server tests — server depends on IPC modules) ---
 
     const ipc_protocol_test_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),
@@ -235,6 +215,30 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_ipc_server_tests = b.addRunArtifact(ipc_server_tests);
+
+    // --- Server tests (depends on IPC modules) ---
+
+    const server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    server_test_mod.addImport("xml", xml_mod);
+    server_test_mod.addImport("xmpp", xmpp_mod);
+    server_test_mod.addImport("sasl", sasl_mod);
+    server_test_mod.addImport("ssl", ssl_test_mod);
+    server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    server_test_mod.addImport("ipc_client", ipc_client_test_mod);
+    server_test_mod.linkSystemLibrary("ssl", .{});
+    server_test_mod.linkSystemLibrary("crypto", .{});
+
+    const server_tests = b.addTest(.{
+        .name = "server-tests",
+        .root_module = server_test_mod,
+    });
+
+    const run_server_tests = b.addRunArtifact(server_tests);
 
     // --- Auth tests ---
 
@@ -296,6 +300,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("xmpp", xmpp_mod);
     core_mod.addImport("sasl", sasl_mod);
     core_mod.addImport("ssl", ssl_test_mod);
+    core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 

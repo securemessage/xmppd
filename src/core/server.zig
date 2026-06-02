@@ -42,6 +42,8 @@ const Listener = @import("listener.zig").Listener;
 const Event = @import("event_loop.zig").Event;
 
 const ssl = @import("ssl");
+const IpcClient = @import("ipc_client").IpcClient;
+const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.xmppd);
 
@@ -50,6 +52,9 @@ const MAX_SESSIONS = 1024;
 
 /// Sentinel value for listener fd in kqueue udata.
 const LISTENER_UDATA = std.math.maxInt(usize);
+
+/// Sentinel value for auth IPC fd in kqueue udata.
+const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
 
 /// Maximum changelist entries per event loop iteration.
 const CHANGE_BUF_SIZE = 256;
@@ -67,15 +72,41 @@ const MAX_EVENTS_PER_TICK = 100;
 /// Connection is terminated with a stream error if exceeded.
 const MAX_ELEMENT_DEPTH = 50;
 
+/// Auth IPC exchange state per connection.
+const AuthState = enum {
+    /// No auth exchange in progress.
+    none,
+    /// Sent AuthRequest to auth daemon, awaiting AuthChallenge or AuthSuccess/Failure.
+    awaiting_challenge,
+    /// Sent SaslResponse to auth daemon, awaiting AuthSuccess/Failure.
+    awaiting_result,
+};
+
+/// Which SASL element's text content we're currently accumulating.
+const SaslCollecting = enum {
+    none,
+    auth,
+    response,
+};
+
 /// Per-connection session state. Bundles a Connection with its XML parser,
 /// XMPP stream FSM, and SASL state.
 const Session = struct {
     conn: Connection,
     reader: xml.Reader,
     stream: xmpp.Stream,
-    scram: ?sasl.ScramServer = null,
     /// Buffer for building XML responses within a single event handler call.
     write_scratch: [4096]u8 = undefined,
+
+    /// Auth daemon IPC exchange state.
+    auth_state: AuthState = .none,
+    /// Which SASL element we're collecting text content for.
+    sasl_collecting: SaslCollecting = .none,
+    /// Buffer for accumulating SASL text content (base64 from XML).
+    sasl_buf: [4096]u8 = undefined,
+    sasl_buf_len: usize = 0,
+    /// Mechanism name from the last <auth> element.
+    sasl_mechanism: []const u8 = "",
 
     fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -87,8 +118,14 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         self.reader.deinit();
-        if (self.scram) |*s| s.deinit();
         if (!self.conn.isClosed()) self.conn.close();
+    }
+
+    fn resetSasl(self: *Session) void {
+        self.sasl_collecting = .none;
+        self.sasl_buf_len = 0;
+        self.sasl_mechanism = "";
+        self.auth_state = .none;
     }
 };
 
@@ -104,11 +141,11 @@ pub const Server = struct {
     sessions: [MAX_SESSIONS]?*Session = [_]?*Session{null} ** MAX_SESSIONS,
     next_id: usize = 1, // 0 reserved
 
-    /// Hardcoded test credentials (Phase 5 only — auth daemon in Phase 6).
-    test_creds: sasl.StoredCredentials,
-
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
+
+    /// IPC client for auth daemon communication.
+    ipc: IpcClient = .{},
 
     /// Initialize the server.
     ///
@@ -130,17 +167,23 @@ pub const Server = struct {
 
         const listener = try Listener.init(address, port, false, 128);
 
-        // Derive test credentials for hardcoded user
-        const test_salt = [_]u8{0x42} ** 32;
-        const test_creds = sasl.StoredCredentials.derive("testpassword", test_salt, 4096);
-
         return Server{
             .loop = loop,
             .listener = listener,
             .allocator = allocator,
             .server_host = host,
-            .test_creds = test_creds,
         };
+    }
+
+    /// Connect to the auth daemon IPC socket.
+    /// Must be called before `run()`. Without this, SASL auth requests
+    /// will receive temporary-auth-failure.
+    pub fn configureAuth(self: *Server, socket_path: []const u8) !void {
+        self.ipc.connect(socket_path) catch |err| {
+            log.err("failed to connect to auth daemon at {s}: {}", .{ socket_path, err });
+            return error.AuthConfigFailed;
+        };
+        log.info("connected to auth daemon at {s}", .{socket_path});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -164,6 +207,7 @@ pub const Server = struct {
         self.listener.deinit();
         self.loop.deinit();
         if (self.ssl_ctx) |*ctx| ctx.deinit();
+        if (self.ipc.connected) self.ipc.close();
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -171,8 +215,13 @@ pub const Server = struct {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
         var changes = ChangeList.init(&change_buf);
 
-        // Initial registration: listener for read + SIGTERM
+        // Initial registration: listener for read
         try changes.addRead(self.listener.fd, LISTENER_UDATA);
+
+        // Register auth IPC fd for reads if connected
+        if (self.ipc.connected and self.ipc.fd >= 0) {
+            try changes.addRead(self.ipc.fd, IPC_AUTH_UDATA);
+        }
 
         while (self.running) {
             const events = try self.loop.submitAndPoll(changes.slice(), null);
@@ -183,12 +232,18 @@ pub const Server = struct {
                     .fd_readable => |e| {
                         if (e.udata == LISTENER_UDATA) {
                             self.acceptConnections(&changes);
+                        } else if (e.udata == IPC_AUTH_UDATA) {
+                            self.handleIpcReadable(&changes);
                         } else {
                             self.handleReadableOrHandshake(e.udata, &changes);
                         }
                     },
                     .fd_writable => |e| {
-                        self.handleWritableOrHandshake(e.udata, &changes);
+                        if (e.udata == IPC_AUTH_UDATA) {
+                            self.flushIpc(&changes);
+                        } else {
+                            self.handleWritableOrHandshake(e.udata, &changes);
+                        }
                     },
                     .signal => |s| {
                         if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
@@ -196,7 +251,7 @@ pub const Server = struct {
                         }
                     },
                     .fd_error => |e| {
-                        if (e.udata != LISTENER_UDATA) {
+                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA) {
                             self.closeSession(e.udata, &changes);
                         }
                     },
@@ -396,11 +451,10 @@ pub const Server = struct {
                 self.handleElementStart(session, elem, changes);
             },
             .element_end => {
-                // Handled by element_start for self-closing; stanza boundaries tracked by depth
+                self.handleElementEnd(session, changes);
             },
             .text => |text| {
-                // Accumulate text content for current element (SASL auth/response base64 data)
-                _ = text;
+                self.handleText(session, text);
             },
         }
     }
@@ -439,9 +493,9 @@ pub const Server = struct {
             if (std.mem.eql(u8, elem.local_name, "auth")) {
                 self.handleSaslAuth(session, elem);
             } else if (std.mem.eql(u8, elem.local_name, "response")) {
-                // SCRAM response — text content will follow
-                // For now, we handle it when we see the full stanza
-                // TODO: accumulate text and process on element_end
+                // Start collecting SCRAM response text
+                session.sasl_collecting = .response;
+                session.sasl_buf_len = 0;
             }
             return;
         }
@@ -467,7 +521,32 @@ pub const Server = struct {
     }
 
     // ========================================================================
-    // SASL handling (in-process, hardcoded test user)
+    // Text content accumulation for SASL elements
+    // ========================================================================
+
+    fn handleText(self: *Server, session: *Session, text: []const u8) void {
+        _ = self;
+        if (session.sasl_collecting == .none) return;
+
+        // Accumulate text into SASL buffer
+        const remaining = session.sasl_buf.len - session.sasl_buf_len;
+        const to_copy = @min(text.len, remaining);
+        if (to_copy > 0) {
+            @memcpy(session.sasl_buf[session.sasl_buf_len .. session.sasl_buf_len + to_copy], text[0..to_copy]);
+            session.sasl_buf_len += to_copy;
+        }
+    }
+
+    fn handleElementEnd(self: *Server, session: *Session, changes: *ChangeList) void {
+        switch (session.sasl_collecting) {
+            .auth => self.processSaslAuthComplete(session, changes),
+            .response => self.processSaslResponseComplete(session, changes),
+            .none => {},
+        }
+    }
+
+    // ========================================================================
+    // SASL handling (via auth daemon IPC)
     // ========================================================================
 
     fn handleSaslAuth(self: *Server, session: *Session, elem: xml.Element) void {
@@ -483,46 +562,197 @@ pub const Server = struct {
         // Tell the stream FSM we're starting SASL
         const action = session.stream.handleSaslAuth(mechanism);
         switch (action) {
-            .begin_sasl => |mech_name| {
-                if (std.mem.eql(u8, mech_name, "PLAIN")) {
-                    self.handleSaslPlain(session, elem);
-                } else if (std.mem.eql(u8, mech_name, "SCRAM-SHA-256")) {
-                    self.handleSaslScramInit(session, elem);
-                } else {
-                    // Unsupported mechanism
-                    const fail_action = session.stream.saslFailure();
-                    self.executeAction(session, fail_action);
-                }
+            .begin_sasl => {
+                // Start collecting the initial response text content
+                session.sasl_collecting = .auth;
+                session.sasl_buf_len = 0;
+                session.sasl_mechanism = mechanism;
             },
             else => self.executeAction(session, action),
         }
     }
 
-    fn handleSaslPlain(self: *Server, session: *Session, elem: xml.Element) void {
-        // For PLAIN, the initial response is in the element content.
-        // In a self-closing <auth/> there's no content — that's an error.
-        // For now, check if we can find inline base64 in attributes (simplified).
-        // TODO: Proper text content accumulation from element_start → text → element_end
-        _ = elem;
+    /// Called when </auth> is reached — we have the full base64 payload.
+    fn processSaslAuthComplete(self: *Server, session: *Session, changes: *ChangeList) void {
+        session.sasl_collecting = .none;
 
-        // PLAIN auth with hardcoded test user
-        // In a real implementation, we'd decode the base64 content.
-        // For Phase 5, accept any PLAIN auth as "testuser"
-        const success_action = session.stream.saslSuccess("testuser", "");
-        self.executeAction(session, success_action);
+        if (!self.ipc.connected) {
+            log.warn("connection {d} auth request but no auth daemon", .{session.conn.id});
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        }
+
+        // Decode base64 from XML into raw SASL payload
+        const b64_data = session.sasl_buf[0..session.sasl_buf_len];
+        var decoded_buf: [3072]u8 = undefined;
+        const decoded = b64Decode(b64_data, &decoded_buf) orelse {
+            log.warn("connection {d} invalid base64 in SASL auth", .{session.conn.id});
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        };
+
+        // Determine mechanism ID
+        const mech_id = ipc_protocol.MechanismId.fromName(session.sasl_mechanism) orelse {
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        };
+
+        // Send AuthRequest to auth daemon
+        self.ipc.send(.{
+            .auth_request = .{
+                .conn_id = @intCast(session.conn.id),
+                .mechanism = mech_id,
+                .username = "", // auth daemon extracts from payload
+                .payload = decoded,
+            },
+        }) catch {
+            log.err("connection {d} failed to send auth request via IPC", .{session.conn.id});
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        };
+
+        session.auth_state = .awaiting_challenge;
+
+        // Ensure we watch for IPC writes if needed
+        if (self.ipc.hasPendingSend()) {
+            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        }
     }
 
-    fn handleSaslScramInit(self: *Server, session: *Session, _: xml.Element) void {
-        // TODO: Decode base64 initial response from element text content
-        // For Phase 5, we create the SCRAM server but can't process without
-        // the actual base64 text content (requires text accumulation).
-        // Send a placeholder failure for now.
-        _ = self;
-        _ = session.stream.saslFailure();
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const writer = fbs.writer();
-        writer.writeAll("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><temporary-auth-failure/></failure>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+    /// Called when </response> is reached — we have the full SCRAM response.
+    fn processSaslResponseComplete(self: *Server, session: *Session, changes: *ChangeList) void {
+        session.sasl_collecting = .none;
+
+        if (!self.ipc.connected) {
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        }
+
+        // Decode base64
+        const b64_data = session.sasl_buf[0..session.sasl_buf_len];
+        var decoded_buf: [3072]u8 = undefined;
+        const decoded = b64Decode(b64_data, &decoded_buf) orelse {
+            log.warn("connection {d} invalid base64 in SASL response", .{session.conn.id});
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        };
+
+        // Send SaslResponse to auth daemon
+        self.ipc.send(.{ .sasl_response = .{
+            .conn_id = @intCast(session.conn.id),
+            .payload = decoded,
+        } }) catch {
+            log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
+            const fail_action = session.stream.saslFailure();
+            self.executeAction(session, fail_action);
+            return;
+        };
+
+        session.auth_state = .awaiting_result;
+
+        if (self.ipc.hasPendingSend()) {
+            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        }
+    }
+
+    // ========================================================================
+    // IPC response handling — auth daemon responses dispatched to sessions
+    // ========================================================================
+
+    fn handleIpcReadable(self: *Server, changes: *ChangeList) void {
+        _ = self.ipc.recv() catch {
+            log.err("auth daemon IPC recv error", .{});
+            self.ipc.close();
+            return;
+        };
+
+        // Process all complete messages
+        while (true) {
+            const msg = self.ipc.nextMessage() catch {
+                log.err("auth daemon IPC decode error", .{});
+                break;
+            };
+            if (msg == null) break;
+            self.dispatchAuthResponse(msg.?, changes);
+        }
+    }
+
+    fn flushIpc(self: *Server, changes: *ChangeList) void {
+        _ = self.ipc.flush() catch {
+            log.err("auth daemon IPC flush error", .{});
+            return;
+        };
+        if (self.ipc.hasPendingSend()) {
+            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        }
+    }
+
+    fn dispatchAuthResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+        const conn_id: usize = switch (msg) {
+            .auth_challenge => |m| m.conn_id,
+            .auth_success => |m| m.conn_id,
+            .auth_failure => |m| m.conn_id,
+            else => return,
+        };
+
+        const session = self.sessions[conn_id] orelse {
+            log.warn("auth response for unknown connection {d}", .{conn_id});
+            return;
+        };
+
+        switch (msg) {
+            .auth_challenge => |m| {
+                // Base64-encode the challenge and send as <challenge>
+                var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                const w = fbs.writer();
+                w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
+                b64EncodeWrite(w, m.challenge) catch return;
+                w.writeAll("</challenge>") catch return;
+                session.conn.queueSend(fbs.getWritten()) catch return;
+                session.auth_state = .none;
+
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+            },
+            .auth_success => |m| {
+                // Base64-encode server_final for the <success> element
+                var b64_buf: [2048]u8 = undefined;
+                var server_final_b64: []const u8 = "";
+                if (m.server_final.len > 0) {
+                    const encoder = std.base64.standard.Encoder;
+                    const enc_len = encoder.calcSize(m.server_final.len);
+                    if (enc_len <= b64_buf.len) {
+                        server_final_b64 = encoder.encode(b64_buf[0..enc_len], m.server_final);
+                    }
+                }
+
+                const success_action = session.stream.saslSuccess(m.username, server_final_b64);
+                self.executeAction(session, success_action);
+                session.resetSasl();
+
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+            },
+            .auth_failure => |m| {
+                log.info("connection {d} auth failed: {s}", .{ conn_id, m.reason });
+                const fail_action = session.stream.saslFailure();
+                self.executeAction(session, fail_action);
+                session.resetSasl();
+
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+            },
+            else => {},
+        }
     }
 
     fn handleBind(self: *Server, session: *Session, _: xml.Element, _: *ChangeList) void {
@@ -692,6 +922,29 @@ pub const Server = struct {
         // No-op — slot is freed in closeSession by setting to null
     }
 };
+
+// ============================================================================
+// Base64 helpers for SASL XML payloads
+// ============================================================================
+
+/// Decode base64 into a fixed buffer. Returns the decoded slice or null on error.
+fn b64Decode(input: []const u8, output: []u8) ?[]const u8 {
+    const decoder = std.base64.standard.Decoder;
+    const upper_bound = decoder.calcSizeUpperBound(input.len) catch return null;
+    if (upper_bound > output.len) return null;
+    decoder.decode(output[0..upper_bound], input) catch return null;
+    return output[0..upper_bound];
+}
+
+/// Base64-encode data and write directly to a writer.
+fn b64EncodeWrite(writer: anytype, data: []const u8) !void {
+    const encoder = std.base64.standard.Encoder;
+    var buf: [4096]u8 = undefined;
+    const enc_len = encoder.calcSize(data.len);
+    if (enc_len > buf.len) return error.BufferTooSmall;
+    const encoded = encoder.encode(buf[0..enc_len], data);
+    try writer.writeAll(encoded);
+}
 
 // ============================================================================
 // Tests

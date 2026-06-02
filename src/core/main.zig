@@ -40,6 +40,7 @@ pub fn main() !void {
     var port: u16 = 15222;
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
+    var auth_socket: ?[]const u8 = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -74,6 +75,11 @@ pub fn main() !void {
                 log.err("--key requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--auth-socket")) {
+            auth_socket = args.next() orelse {
+                log.err("--auth-socket requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -97,6 +103,13 @@ pub fn main() !void {
         log.info("TLS configured: cert={s} key={s}", .{ cert, key });
     }
 
+    // Connect to auth daemon if socket path is provided
+    if (auth_socket) |socket_path| {
+        server.configureAuth(socket_path) catch {
+            log.warn("auth daemon not available, SASL auth will fail", .{});
+        };
+    }
+
     log.info("listening on {s}:{d}", .{ address, port });
     try server.run();
     log.info("shutdown complete", .{});
@@ -112,6 +125,7 @@ fn printUsage() void {
         \\  --port PORT      TCP port (default: 15222)
         \\  --cert PATH      TLS certificate file (PEM)
         \\  --key PATH       TLS private key file (PEM)
+        \\  --auth-socket PATH  Auth daemon IPC socket
         \\  --help, -h       Show this help
         \\
     ;
