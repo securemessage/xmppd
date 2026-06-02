@@ -26,6 +26,8 @@ pub const ns = struct {
     pub const vcard_temp = "vcard-temp";
     pub const version = "jabber:iq:version";
     pub const delay = "urn:xmpp:delay";
+    pub const dialback = "jabber:server:dialback";
+    pub const db = "urn:xmpp:features:dialback";
 };
 
 /// An XML element with its attributes and namespace context.
