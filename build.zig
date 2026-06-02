@@ -365,6 +365,21 @@ pub fn build(b: *std.Build) void {
 
     const run_s2s_connector_tests = b.addRunArtifact(s2s_connector_tests);
 
+    // --- S2S DANE tests ---
+
+    const s2s_dane_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/s2s/dane.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const s2s_dane_tests = b.addTest(.{
+        .name = "s2s-dane-tests",
+        .root_module = s2s_dane_test_mod,
+    });
+
+    const run_s2s_dane_tests = b.addRunArtifact(s2s_dane_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -530,4 +545,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);
+    test_step.dependOn(&run_s2s_dane_tests.step);
 }
