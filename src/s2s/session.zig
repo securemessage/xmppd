@@ -16,6 +16,9 @@ const S2sFeatureSet = stream_mod.S2sFeatureSet;
 const Role = stream_mod.Role;
 const connector_mod = @import("connector.zig");
 const DaneStatus = connector_mod.DaneStatus;
+const ssl = @import("ssl");
+const SslConn = ssl.SslConn;
+const SslContext = ssl.SslContext;
 
 /// TLS handshake state for non-blocking integration with kqueue.
 pub const TlsState = enum {
@@ -40,8 +43,10 @@ pub const S2sSession = struct {
     stream: S2sStream,
     /// Whether the connection is closed.
     closed: bool = false,
-    /// TLS state.
+    /// TLS handshake state for kqueue integration.
     tls_state: ?TlsState = null,
+    /// TLS connection — null for plain TCP, set after STARTTLS.
+    tls_conn: ?SslConn = null,
     /// Read buffer.
     read_buf: [READ_BUF_SIZE]u8 = undefined,
     read_start: usize = 0,
@@ -73,6 +78,11 @@ pub const S2sSession = struct {
 
     pub fn deinit(self: *S2sSession) void {
         if (!self.closed) {
+            if (self.tls_conn) |*tls| {
+                tls.shutdown();
+                tls.deinit();
+                self.tls_conn = null;
+            }
             posix.close(self.fd);
             self.closed = true;
         }
@@ -123,7 +133,26 @@ pub const S2sSession = struct {
         }
         if (self.read_end >= self.read_buf.len) return error.BufferFull;
 
-        const n = posix.read(self.fd, self.read_buf[self.read_end..]) catch |err| {
+        const buf = self.read_buf[self.read_end..];
+
+        if (self.tls_conn) |*tls| {
+            const result = tls.read(buf) catch |err| {
+                return switch (err) {
+                    ssl.SslError.ConnectionClosed => @as(usize, 0),
+                    else => error.ConnectionReset,
+                };
+            };
+            return switch (result) {
+                .ok => |n| blk: {
+                    self.read_end += n;
+                    break :blk n;
+                },
+                .want_read => error.WouldBlock,
+                .want_write => error.WouldBlock,
+            };
+        }
+
+        const n = posix.read(self.fd, buf) catch |err| {
             return switch (err) {
                 error.WouldBlock => error.WouldBlock,
                 else => error.ConnectionReset,
@@ -159,7 +188,30 @@ pub const S2sSession = struct {
         if (self.closed) return error.ConnectionClosed;
         if (self.write_start >= self.write_end) return true; // Nothing to write
 
-        const n = posix.write(self.fd, self.write_buf[self.write_start..self.write_end]) catch |err| {
+        const data = self.write_buf[self.write_start..self.write_end];
+
+        if (self.tls_conn) |*tls| {
+            const result = tls.write(data) catch |err| {
+                return switch (err) {
+                    ssl.SslError.WriteFailed => error.ConnectionReset,
+                    else => error.ConnectionReset,
+                };
+            };
+            switch (result) {
+                .ok => |n| {
+                    self.write_start += n;
+                    if (self.write_start >= self.write_end) {
+                        self.write_start = 0;
+                        self.write_end = 0;
+                        return true;
+                    }
+                    return false;
+                },
+                .want_read, .want_write => return false,
+            }
+        }
+
+        const n = posix.write(self.fd, data) catch |err| {
             return switch (err) {
                 error.WouldBlock => false,
                 else => error.ConnectionReset,
@@ -179,9 +231,44 @@ pub const S2sSession = struct {
         return self.write_start < self.write_end;
     }
 
+    /// Upgrade this session to TLS using the server-side context.
+    /// Initiates a non-blocking handshake.
+    pub fn upgradeToTls(self: *S2sSession, ctx: SslContext) !void {
+        self.tls_conn = SslConn.init(ctx, self.fd) catch return error.TlsInitFailed;
+        self.tls_state = .handshake_want_read;
+    }
+
+    /// Continue a non-blocking TLS handshake.
+    /// Returns true when the handshake is complete.
+    pub fn continueHandshake(self: *S2sSession) !bool {
+        if (self.tls_conn) |*tls| {
+            const result = tls.doHandshake() catch return error.HandshakeFailed;
+            switch (result) {
+                .complete => {
+                    self.tls_state = .established;
+                    return true;
+                },
+                .want_read => {
+                    self.tls_state = .handshake_want_read;
+                    return false;
+                },
+                .want_write => {
+                    self.tls_state = .handshake_want_write;
+                    return false;
+                },
+            }
+        }
+        return error.NoTlsConnection;
+    }
+
     /// Close the session.
     pub fn close(self: *S2sSession) void {
         if (!self.closed) {
+            if (self.tls_conn) |*tls| {
+                tls.shutdown();
+                tls.deinit();
+                self.tls_conn = null;
+            }
             posix.close(self.fd);
             self.closed = true;
         }

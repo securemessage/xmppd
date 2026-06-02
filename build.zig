@@ -403,6 +403,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    s2s_session_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_session_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_session_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_session_tests = b.addTest(.{
         .name = "s2s-session-tests",

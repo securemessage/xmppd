@@ -52,7 +52,9 @@ const log = std.log.scoped(.@"xmppd-s2s");
 
 /// Sentinel udata values for kqueue events.
 const LISTENER_UDATA: usize = std.math.maxInt(usize);
-const IPC_CORE_UDATA: usize = LISTENER_UDATA - 1;
+const IPC_LISTEN_UDATA: usize = LISTENER_UDATA - 1;
+/// Base udata for IPC client connections (16 slots).
+const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - 17;
 
 /// Base udata for inbound S2S sessions.
 const INBOUND_UDATA_BASE: usize = 0x10000;
@@ -458,6 +460,11 @@ pub fn main() !void {
         try loop.addFd(daemon.listener_fd, .read, LISTENER_UDATA);
     }
 
+    // Register IPC listener for core connections
+    if (daemon.ipc.listen_fd >= 0) {
+        try loop.addFd(daemon.ipc.listen_fd, .read, IPC_LISTEN_UDATA);
+    }
+
     // Register signals (automatically blocked from default delivery)
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
@@ -496,13 +503,21 @@ pub fn main() !void {
                             const session = daemon.getInbound(slot.?) orelse continue;
                             batch.addRead(session.fd, INBOUND_UDATA_BASE + slot.?) catch break;
                         }
+                    } else if (e.udata == IPC_LISTEN_UDATA) {
+                        handleIpcAccept(&daemon, &batch);
+                    } else if (e.udata >= IPC_CLIENT_UDATA_BASE and e.udata < LISTENER_UDATA) {
+                        const ipc_slot = e.udata - IPC_CLIENT_UDATA_BASE;
+                        handleIpcReadable(&daemon, &batch, ipc_slot);
                     } else if (e.udata >= INBOUND_UDATA_BASE) {
                         const slot = e.udata - INBOUND_UDATA_BASE;
                         handleInboundReadable(&daemon, &batch, slot);
                     }
                 },
                 .fd_writable => |e| {
-                    if (e.udata >= INBOUND_UDATA_BASE) {
+                    if (e.udata >= IPC_CLIENT_UDATA_BASE and e.udata < LISTENER_UDATA) {
+                        const ipc_slot = e.udata - IPC_CLIENT_UDATA_BASE;
+                        handleIpcWritable(&daemon, &batch, ipc_slot);
+                    } else if (e.udata >= INBOUND_UDATA_BASE) {
                         const slot = e.udata - INBOUND_UDATA_BASE;
                         handleInboundWritable(&daemon, &batch, slot);
                     }
@@ -517,11 +532,23 @@ pub fn main() !void {
 
 fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
     const session = daemon.getInbound(slot) orelse return;
+
+    // If TLS handshake is in progress, drive it instead of parsing XML
+    if (session.isTlsHandshaking()) {
+        continueTlsHandshake(daemon, batch, slot, session);
+        return;
+    }
+
     const reader = daemon.readers[slot] orelse return;
 
-    const n = session.recv() catch {
-        daemon.closeInbound(slot);
-        return;
+    const n = session.recv() catch |err| {
+        switch (err) {
+            error.WouldBlock => return,
+            else => {
+                daemon.closeInbound(slot);
+                return;
+            },
+        }
     };
 
     if (n == 0) {
@@ -546,6 +573,12 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         if (event == null) break;
 
         processInboundEvent(daemon, session, reader, event.?);
+
+        // Session may have been closed by processInboundEvent
+        if (daemon.getInbound(slot) == null) return;
+
+        // After STARTTLS, stop processing pre-TLS buffer
+        if (session.isTlsHandshaking()) break;
     }
 
     // Mark consumed bytes
@@ -557,9 +590,48 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     }
 }
 
+/// Continue a non-blocking TLS handshake for an inbound session.
+fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, session: *S2sSession) void {
+    const complete = session.continueHandshake() catch {
+        log.err("inbound S2S id={d} TLS handshake failed", .{slot});
+        daemon.closeInbound(slot);
+        return;
+    };
+
+    if (complete) {
+        log.info("inbound S2S id={d} TLS handshake complete", .{slot});
+        // Notify the stream FSM that TLS is established
+        session.stream.tlsEstablished();
+        // Reset XML reader for stream restart after STARTTLS
+        if (daemon.readers[slot]) |reader| reader.reset();
+        // Clear any stale pre-TLS data from the read buffer
+        session.read_start = 0;
+        session.read_end = 0;
+
+        // OpenSSL may have buffered application data internally during
+        // the handshake (client pipelines Finished + new stream open).
+        // kqueue won't fire for data already consumed from the socket.
+        // Try reading immediately to drain any buffered TLS app data.
+        handleInboundReadable(daemon, batch, slot);
+
+        // If the session is still alive, ensure kqueue re-arms
+        if (daemon.getInbound(slot) != null) {
+            batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+        }
+    } else {
+        // Re-arm the appropriate kqueue filter
+        if (session.tls_state) |state| {
+            switch (state) {
+                .handshake_want_read => batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {},
+                .handshake_want_write => batch.addWrite(session.fd, INBOUND_UDATA_BASE + slot) catch {},
+                .established => {},
+            }
+        }
+    }
+}
+
 /// Process a single XML event for an inbound S2S session.
 fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlReader, event: XmlEvent) void {
-    _ = daemon;
     switch (event) {
         .stream_open => |elem| {
             // Extract 'from' and 'to' attributes
@@ -574,12 +646,12 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
 
             session.setRemoteDomain(from);
             const action = session.stream.handleStreamOpen(from, to, version);
-            executeAction(session, action);
+            executeAction(daemon, session, action);
 
             // After stream open response, send features
             if (session.stream.getFeatures()) |_| {
                 const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
-                executeAction(session, features_action);
+                executeAction(daemon, session, features_action);
             }
         },
         .element_start => |elem| {
@@ -588,7 +660,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 std.mem.eql(u8, elem.local_name, "starttls"))
             {
                 const action = session.stream.handleStarttls();
-                executeAction(session, action);
+                executeAction(daemon, session, action);
             }
             // Handle SASL auth
             else if (std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl) and
@@ -601,7 +673,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 }
                 if (std.mem.eql(u8, mechanism, "EXTERNAL")) {
                     const action = session.stream.handleSaslExternal();
-                    executeAction(session, action);
+                    executeAction(daemon, session, action);
                     // After successful SASL, the remote will restart the stream
                     if (session.stream.isEstablished()) {
                         reader.reset();
@@ -624,7 +696,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
 }
 
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
-fn executeAction(session: *S2sSession, action: S2sStreamAction) void {
+fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction) void {
     var buf: [2048]u8 = undefined;
 
     switch (action) {
@@ -645,8 +717,20 @@ fn executeAction(session: *S2sSession, action: S2sStreamAction) void {
         .send_tls_proceed => {
             const proceed = session.buildTlsProceed(&buf) catch return;
             session.queueWrite(proceed) catch {};
-            // TODO: Initiate TLS handshake on this fd
-            session.tls_state = .handshake_want_read;
+
+            // Flush the proceed XML before upgrading to TLS
+            _ = session.flushWrite() catch {};
+
+            // Start TLS handshake
+            if (daemon.tls_ctx) |ctx| {
+                session.upgradeToTls(ctx) catch {
+                    log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
+                    return;
+                };
+                log.info("inbound S2S id={d} starting TLS handshake", .{session.id});
+            } else {
+                log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+            }
         },
         .send_sasl_success => {
             const success = session.buildSaslSuccess(&buf) catch return;
@@ -685,6 +769,12 @@ fn sendStreamError(session: *S2sSession, err: StreamError) void {
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
     const session = daemon.getInbound(slot) orelse return;
 
+    // If TLS handshake wants to write, drive the handshake
+    if (session.isTlsHandshaking()) {
+        continueTlsHandshake(daemon, batch, slot, session);
+        return;
+    }
+
     _ = session.flushWrite() catch {
         daemon.closeInbound(slot);
         return;
@@ -693,6 +783,66 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     // If still more to write, re-register for another one-shot write event
     if (session.hasPendingWrite()) {
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+    }
+}
+
+// ============================================================================
+// IPC event handlers
+// ============================================================================
+
+/// Accept a new IPC connection from xmppd-core.
+fn handleIpcAccept(daemon: *S2sDaemon, batch: *ChangeList) void {
+    const slot = daemon.ipc.accept() catch return;
+    if (slot == null) return;
+
+    const client = daemon.ipc.getClient(slot.?) orelse return;
+    batch.addRead(client.fd, IPC_CLIENT_UDATA_BASE + slot.?) catch {};
+    log.info("core connected via IPC slot={d}", .{slot.?});
+}
+
+/// Handle readable data on an IPC client connection.
+fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
+    const client = daemon.ipc.getClient(ipc_slot) orelse return;
+
+    const n = client.recv() catch {
+        daemon.ipc.closeClient(ipc_slot);
+        return;
+    };
+    if (n == 0) {
+        // EOF — core disconnected
+        log.info("core disconnected from IPC slot={d}", .{ipc_slot});
+        daemon.ipc.closeClient(ipc_slot);
+        return;
+    }
+
+    // Process all complete messages in the buffer
+    while (true) {
+        const msg = client.nextMessage() catch {
+            log.err("IPC decode error on slot={d}", .{ipc_slot});
+            daemon.ipc.closeClient(ipc_slot);
+            return;
+        };
+        if (msg == null) break;
+        daemon.handleCoreMessage(msg.?);
+    }
+
+    // If there's IPC response data to send, request write notification
+    if (client.hasPendingSend()) {
+        batch.addWriteOnce(client.fd, IPC_CLIENT_UDATA_BASE + ipc_slot) catch {};
+    }
+}
+
+/// Handle writable IPC client connection (flush pending send data).
+fn handleIpcWritable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
+    const client = daemon.ipc.getClient(ipc_slot) orelse return;
+
+    _ = client.flush() catch {
+        daemon.ipc.closeClient(ipc_slot);
+        return;
+    };
+
+    if (client.hasPendingSend()) {
+        batch.addWriteOnce(client.fd, IPC_CLIENT_UDATA_BASE + ipc_slot) catch {};
     }
 }
 
