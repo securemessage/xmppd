@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const ssl = @import("ssl");
 
 /// Create a non-blocking Unix socketpair. Used in tests.
 fn makeSocketPair() ![2]posix.fd_t {
@@ -37,9 +38,15 @@ fn makeSocketPair() ![2]posix.fd_t {
     return fds;
 }
 
-/// Opaque TLS connection handle — implemented in step 5f (lib/tls/ssl.zig).
-/// For now this is a placeholder type; Connection compiles and works without TLS.
-pub const TlsConn = opaque {};
+/// TLS handshake state for non-blocking integration with kqueue.
+pub const TlsState = enum {
+    /// TLS handshake in progress — waiting for socket readability.
+    handshake_want_read,
+    /// TLS handshake in progress — waiting for socket writability.
+    handshake_want_write,
+    /// TLS handshake complete — connection is encrypted.
+    established,
+};
 
 /// Read buffer size — 8KB per connection.
 /// XMPP stanzas are typically small (<4KB); 8KB handles even large presence payloads.
@@ -71,8 +78,11 @@ pub const Connection = struct {
     /// End of buffered data in write_buf (next append position).
     write_end: usize = 0,
 
-    /// TLS state — null for plain TCP, set after STARTTLS upgrade.
-    tls: ?*TlsConn = null,
+    /// TLS connection — null for plain TCP, set after STARTTLS upgrade.
+    tls_conn: ?ssl.SslConn = null,
+
+    /// TLS handshake progress — only meaningful when tls_conn is set.
+    tls_state: ?TlsState = null,
 
     /// Unique connection ID (for use as kqueue udata).
     id: usize,
@@ -122,9 +132,21 @@ pub const Connection = struct {
 
         const buf = self.read_buf[self.read_end..READ_BUF_SIZE];
 
-        if (self.tls) |_| {
-            // TLS read — implemented in step 5g
-            @panic("TLS not yet implemented");
+        if (self.tls_conn) |*tls| {
+            const result = tls.read(buf) catch |err| {
+                return switch (err) {
+                    ssl.SslError.ConnectionClosed => @as(usize, 0), // EOF
+                    else => error.ConnectionReset,
+                };
+            };
+            return switch (result) {
+                .ok => |n| blk: {
+                    self.read_end += n;
+                    break :blk n;
+                },
+                .want_read => error.WouldBlock,
+                .want_write => error.WouldBlock,
+            };
         }
 
         // Plain TCP read
@@ -194,9 +216,22 @@ pub const Connection = struct {
 
         const data = self.write_buf[self.write_start..self.write_end];
 
-        if (self.tls) |_| {
-            // TLS write — implemented in step 5g
-            @panic("TLS not yet implemented");
+        if (self.tls_conn) |*tls| {
+            const result = tls.write(data) catch {
+                return error.ConnectionReset;
+            };
+            return switch (result) {
+                .ok => |n| blk: {
+                    self.write_start += n;
+                    if (self.write_start == self.write_end) {
+                        self.write_start = 0;
+                        self.write_end = 0;
+                    }
+                    break :blk n;
+                },
+                .want_read => error.WouldBlock,
+                .want_write => error.WouldBlock,
+            };
         }
 
         const n = posix.write(self.fd, data) catch |err| {
@@ -220,9 +255,64 @@ pub const Connection = struct {
         return n;
     }
 
+    /// Upgrade the connection to TLS.
+    ///
+    /// Creates an SSL session from the given context and begins a non-blocking
+    /// TLS handshake. The caller must then call `continueHandshake()` when
+    /// kqueue signals the appropriate filter (read or write).
+    ///
+    /// After the handshake completes, `recv()` and `flushSend()` transparently
+    /// use the TLS layer.
+    pub fn upgradeToTls(self: *Connection, ctx: ssl.SslContext) !void {
+        self.tls_conn = ssl.SslConn.init(ctx, self.fd) catch return error.ConnectionReset;
+        self.tls_state = .handshake_want_read; // Start expecting readable
+    }
+
+    /// Continue a non-blocking TLS handshake.
+    ///
+    /// Returns `true` when the handshake is complete. Returns `false` if
+    /// more I/O is needed (check `tls_state` for the required kqueue filter).
+    pub fn continueHandshake(self: *Connection) !bool {
+        var tls = &(self.tls_conn orelse return error.ConnectionReset);
+        const result = tls.doHandshake() catch return error.ConnectionReset;
+        switch (result) {
+            .complete => {
+                self.tls_state = .established;
+                return true;
+            },
+            .want_read => {
+                self.tls_state = .handshake_want_read;
+                return false;
+            },
+            .want_write => {
+                self.tls_state = .handshake_want_write;
+                return false;
+            },
+        }
+    }
+
+    /// Returns true if TLS is active (handshake complete).
+    pub fn isTlsEstablished(self: *const Connection) bool {
+        return self.tls_state == .established;
+    }
+
+    /// Returns true if a TLS handshake is in progress.
+    pub fn isTlsHandshaking(self: *const Connection) bool {
+        if (self.tls_state) |state| {
+            return state == .handshake_want_read or state == .handshake_want_write;
+        }
+        return false;
+    }
+
     /// Close the connection and release resources.
     pub fn close(self: *Connection) void {
         if (!self.closed) {
+            if (self.tls_conn) |*tls| {
+                tls.shutdown();
+                tls.deinit();
+                self.tls_conn = null;
+                self.tls_state = null;
+            }
             posix.close(self.fd);
             self.closed = true;
         }

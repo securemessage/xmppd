@@ -41,6 +41,8 @@ const Connection = @import("connection.zig").Connection;
 const Listener = @import("listener.zig").Listener;
 const Event = @import("event_loop.zig").Event;
 
+const ssl = @import("ssl");
+
 const log = std.log.scoped(.xmppd);
 
 /// Maximum simultaneous connections.
@@ -105,6 +107,9 @@ pub const Server = struct {
     /// Hardcoded test credentials (Phase 5 only — auth daemon in Phase 6).
     test_creds: sasl.StoredCredentials,
 
+    /// TLS context — shared across all connections. Null if TLS is not configured.
+    ssl_ctx: ?ssl.SslContext = null,
+
     /// Initialize the server.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
@@ -138,6 +143,15 @@ pub const Server = struct {
         };
     }
 
+    /// Configure TLS with a certificate and key file.
+    /// Must be called before `run()`. Without this, STARTTLS is advertised
+    /// but upgrade requests fail.
+    pub fn configureTls(self: *Server, cert_path: [*:0]const u8, key_path: [*:0]const u8) !void {
+        self.ssl_ctx = ssl.SslContext.initServer(cert_path, key_path) catch {
+            return error.TlsConfigFailed;
+        };
+    }
+
     pub fn deinit(self: *Server) void {
         // Close all sessions
         for (&self.sessions) |*slot| {
@@ -149,6 +163,7 @@ pub const Server = struct {
         }
         self.listener.deinit();
         self.loop.deinit();
+        if (self.ssl_ctx) |*ctx| ctx.deinit();
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -169,11 +184,11 @@ pub const Server = struct {
                         if (e.udata == LISTENER_UDATA) {
                             self.acceptConnections(&changes);
                         } else {
-                            self.handleReadable(e.udata, &changes);
+                            self.handleReadableOrHandshake(e.udata, &changes);
                         }
                     },
                     .fd_writable => |e| {
-                        self.handleWritable(e.udata, &changes);
+                        self.handleWritableOrHandshake(e.udata, &changes);
                     },
                     .signal => |s| {
                         if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
@@ -240,6 +255,57 @@ pub const Server = struct {
             };
 
             log.info("accepted connection id={d} fd={d}", .{ id, conn.fd });
+        }
+    }
+
+    // ========================================================================
+    // Read handler — XML parsing → stream FSM → response
+    // ========================================================================
+
+    // ========================================================================
+    // TLS handshake dispatch
+    // ========================================================================
+
+    fn handleReadableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
+        const session = self.sessions[id] orelse return;
+        if (session.conn.isTlsHandshaking()) {
+            self.continueTlsHandshake(id, session, changes);
+            return;
+        }
+        self.handleReadable(id, changes);
+    }
+
+    fn handleWritableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
+        const session = self.sessions[id] orelse return;
+        if (session.conn.isTlsHandshaking()) {
+            self.continueTlsHandshake(id, session, changes);
+            return;
+        }
+        self.handleWritable(id, changes);
+    }
+
+    fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+        const complete = session.conn.continueHandshake() catch {
+            log.err("connection {d} TLS handshake failed", .{id});
+            self.closeSession(id, changes);
+            return;
+        };
+
+        if (complete) {
+            log.info("connection {d} TLS handshake complete", .{id});
+            // Reset XML reader for stream restart after STARTTLS
+            session.reader.reset();
+            // Ensure we're watching for reads (client will send new stream open)
+            changes.addRead(session.conn.fd, id) catch {};
+        } else {
+            // Re-arm the appropriate kqueue filter
+            if (session.conn.tls_state) |state| {
+                switch (state) {
+                    .handshake_want_read => changes.addRead(session.conn.fd, id) catch {},
+                    .handshake_want_write => changes.addWrite(session.conn.fd, id) catch {},
+                    .established => {},
+                }
+            }
         }
     }
 
@@ -478,7 +544,6 @@ pub const Server = struct {
     // ========================================================================
 
     fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction) void {
-        _ = self;
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const writer = fbs.writer();
 
@@ -498,10 +563,23 @@ pub const Server = struct {
                 xmpp.stream.writeFeatures(writer, features) catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
             },
-            .send_tls_proceed => {
+            .send_tls_proceed, .start_tls => {
                 writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
-                // TLS handshake wiring comes in step 5g
+
+                // Flush the proceed XML before upgrading to TLS
+                _ = session.conn.flushSend() catch {};
+
+                // Start TLS handshake
+                if (self.ssl_ctx) |ctx| {
+                    session.conn.upgradeToTls(ctx) catch {
+                        log.err("connection {d} TLS upgrade failed", .{session.conn.id});
+                        return;
+                    };
+                    log.info("connection {d} starting TLS handshake", .{session.conn.id});
+                } else {
+                    log.warn("connection {d} STARTTLS requested but no TLS configured", .{session.conn.id});
+                }
             },
             .send_sasl_success => |server_final| {
                 writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -542,7 +620,7 @@ pub const Server = struct {
                 writer.writeAll("</stream:stream>") catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
             },
-            .none, .begin_sasl, .send_sasl_challenge, .start_tls => {},
+            .none, .begin_sasl, .send_sasl_challenge => {},
         }
     }
 

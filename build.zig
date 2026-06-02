@@ -32,6 +32,13 @@ pub fn build(b: *std.Build) void {
     });
 
     _ = b.createModule(.{
+        .root_source_file = b.path("lib/tls/ssl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    _ = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
         .target = target,
         .optimize = optimize,
@@ -64,6 +71,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const ssl_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tls/ssl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ssl_test_mod.linkSystemLibrary("ssl", .{});
+    ssl_test_mod.linkSystemLibrary("crypto", .{});
+
     const dns_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
         .target = target,
@@ -91,6 +107,11 @@ pub fn build(b: *std.Build) void {
         .root_module = tls_test_mod,
     });
 
+    const ssl_tests = b.addTest(.{
+        .name = "ssl-tests",
+        .root_module = ssl_test_mod,
+    });
+
     const dns_tests = b.addTest(.{
         .name = "dns-tests",
         .root_module = dns_test_mod,
@@ -100,6 +121,7 @@ pub fn build(b: *std.Build) void {
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
+    const run_ssl_tests = b.addRunArtifact(ssl_tests);
     const run_dns_tests = b.addRunArtifact(dns_tests);
 
     // --- Core daemon tests ---
@@ -121,7 +143,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/connection.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    connection_test_mod.addImport("ssl", ssl_test_mod);
+    connection_test_mod.linkSystemLibrary("ssl", .{});
+    connection_test_mod.linkSystemLibrary("crypto", .{});
 
     const connection_tests = b.addTest(.{
         .name = "connection-tests",
@@ -134,7 +160,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/listener.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    listener_test_mod.addImport("ssl", ssl_test_mod);
+    listener_test_mod.linkSystemLibrary("ssl", .{});
+    listener_test_mod.linkSystemLibrary("crypto", .{});
 
     const listener_tests = b.addTest(.{
         .name = "listener-tests",
@@ -147,10 +177,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/server.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
+    server_test_mod.addImport("ssl", ssl_test_mod);
+    server_test_mod.linkSystemLibrary("ssl", .{});
+    server_test_mod.linkSystemLibrary("crypto", .{});
 
     const server_tests = b.addTest(.{
         .name = "server-tests",
@@ -164,6 +198,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
+    test_step.dependOn(&run_ssl_tests.step);
     test_step.dependOn(&run_dns_tests.step);
     test_step.dependOn(&run_event_loop_tests.step);
     test_step.dependOn(&run_connection_tests.step);
