@@ -33,11 +33,20 @@ const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
 const Event = event_loop_mod.Event;
+const xml = @import("xml");
+const XmlReader = xml.Reader;
+const XmlEvent = xml.Event;
+const ssl = @import("ssl");
+const SslContext = ssl.SslContext;
+const SslConn = ssl.SslConn;
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
 const session_mod = @import("session.zig");
 const S2sSession = session_mod.S2sSession;
+const stream_mod = @import("stream.zig");
+const S2sStreamAction = stream_mod.S2sStreamAction;
+const StreamError = stream_mod.StreamError;
 
 const log = std.log.scoped(.@"xmppd-s2s");
 
@@ -60,11 +69,16 @@ pub const S2sDaemon = struct {
     /// IPC server for communication with xmppd-core.
     ipc: IpcServer = .{},
 
+    /// TLS context for inbound connections (server-side).
+    tls_ctx: ?SslContext = null,
+
     /// Outbound connection pool.
     pool: ConnectionPool,
 
     /// Inbound session table.
     inbound: [MAX_INBOUND_SESSIONS]?*S2sSession = [_]?*S2sSession{null} ** MAX_INBOUND_SESSIONS,
+    /// Per-session XML readers (parallel to inbound table).
+    readers: [MAX_INBOUND_SESSIONS]?*XmlReader = [_]?*XmlReader{null} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
@@ -82,8 +96,13 @@ pub const S2sDaemon = struct {
     }
 
     pub fn deinit(self: *S2sDaemon) void {
-        // Close all inbound sessions
-        for (&self.inbound) |*slot| {
+        // Close all inbound sessions and their readers
+        for (&self.inbound, &self.readers) |*slot, *reader_slot| {
+            if (reader_slot.*) |reader| {
+                reader.deinit();
+                self.allocator.destroy(reader);
+                reader_slot.* = null;
+            }
             if (slot.*) |session| {
                 session.deinit();
                 self.allocator.destroy(session);
@@ -91,6 +110,7 @@ pub const S2sDaemon = struct {
             }
         }
 
+        if (self.tls_ctx) |*ctx| ctx.deinit();
         self.pool.deinit();
         self.ipc.deinit();
 
@@ -164,6 +184,16 @@ pub const S2sDaemon = struct {
         session.* = S2sSession.init(client_fd, slot, self.local_domain);
         self.inbound[slot] = session;
 
+        // Create XML reader for this session
+        const reader = self.allocator.create(XmlReader) catch {
+            session.deinit();
+            self.allocator.destroy(session);
+            self.inbound[slot] = null;
+            return null;
+        };
+        reader.* = XmlReader.init(self.allocator);
+        self.readers[slot] = reader;
+
         log.info("accepted inbound S2S connection id={d} fd={d}", .{ slot, client_fd });
         return slot;
     }
@@ -214,14 +244,30 @@ pub const S2sDaemon = struct {
 
     /// Send a delivery failure notification back to xmppd-core.
     fn sendDeliveryFailed(self: *S2sDaemon, from: []const u8, to: []const u8, reason: []const u8) void {
-        _ = self;
-        // In the full implementation, this encodes and sends via IPC
-        log.info("delivery failed: from={s} to={s} reason={s}", .{ from, to, reason });
+        const msg = protocol.Message{ .s2s_delivery_failed = .{
+            .from_jid = from,
+            .to_jid = to,
+            .error_type = reason,
+        } };
+        // Send to all connected core clients
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            if (self.ipc.getClient(i)) |client| {
+                client.queueSend(msg) catch {
+                    log.err("failed to queue delivery-failed to IPC client {d}", .{i});
+                };
+            }
+        }
     }
 
     /// Close an inbound session.
     pub fn closeInbound(self: *S2sDaemon, slot: usize) void {
         if (slot >= MAX_INBOUND_SESSIONS) return;
+        if (self.readers[slot]) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+            self.readers[slot] = null;
+        }
         if (self.inbound[slot]) |session| {
             log.info("closing inbound S2S session id={d}", .{slot});
             session.deinit();
@@ -377,7 +423,10 @@ pub fn main() !void {
     if (cert_path) |cert| {
         if (key_path) |key| {
             log.info("TLS configured: cert={s} key={s}", .{ cert, key });
-            // TODO: Initialize SslContext for S2S connections
+            daemon.tls_ctx = SslContext.initServer(cert, key) catch |err| {
+                log.err("failed to initialize TLS context: {}", .{err});
+                return error.InvalidArgs;
+            };
         } else {
             log.err("--cert requires --key", .{});
             return error.InvalidArgs;
@@ -468,6 +517,7 @@ pub fn main() !void {
 
 fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
     const session = daemon.getInbound(slot) orelse return;
+    const reader = daemon.readers[slot] orelse return;
 
     const n = session.recv() catch {
         daemon.closeInbound(slot);
@@ -479,15 +529,157 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         return;
     }
 
-    // For now, just log received data size.
-    // Full XML parsing + S2S stream FSM integration comes with the
-    // complete event loop wiring (needs XML reader integration).
-    log.debug("inbound S2S id={d} received {d} bytes", .{ slot, n });
+    // Parse XML from the read buffer and drive the S2S stream FSM
+    const data = session.readableSlice();
+    var pos: usize = 0;
+
+    while (true) {
+        const event = reader.next(data, &pos) catch |err| {
+            log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
+            sendStreamError(session, .not_well_formed);
+            if (session.hasPendingWrite()) {
+                batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+            }
+            // Close after flushing error
+            return;
+        };
+        if (event == null) break;
+
+        processInboundEvent(daemon, session, reader, event.?);
+    }
+
+    // Mark consumed bytes
+    if (pos > 0) session.consume(pos);
 
     // Request one-shot write notification when there's data to flush
     if (session.hasPendingWrite()) {
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
     }
+}
+
+/// Process a single XML event for an inbound S2S session.
+fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlReader, event: XmlEvent) void {
+    _ = daemon;
+    switch (event) {
+        .stream_open => |elem| {
+            // Extract 'from' and 'to' attributes
+            var from: []const u8 = "";
+            var to: []const u8 = "";
+            var version: []const u8 = "";
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "from")) from = attr.value;
+                if (std.mem.eql(u8, attr.local_name, "to")) to = attr.value;
+                if (std.mem.eql(u8, attr.local_name, "version")) version = attr.value;
+            }
+
+            session.setRemoteDomain(from);
+            const action = session.stream.handleStreamOpen(from, to, version);
+            executeAction(session, action);
+
+            // After stream open response, send features
+            if (session.stream.getFeatures()) |_| {
+                const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
+                executeAction(session, features_action);
+            }
+        },
+        .element_start => |elem| {
+            // Handle STARTTLS request
+            if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls) and
+                std.mem.eql(u8, elem.local_name, "starttls"))
+            {
+                const action = session.stream.handleStarttls();
+                executeAction(session, action);
+            }
+            // Handle SASL auth
+            else if (std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl) and
+                std.mem.eql(u8, elem.local_name, "auth"))
+            {
+                // Check mechanism attribute
+                var mechanism: []const u8 = "";
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "mechanism")) mechanism = attr.value;
+                }
+                if (std.mem.eql(u8, mechanism, "EXTERNAL")) {
+                    const action = session.stream.handleSaslExternal();
+                    executeAction(session, action);
+                    // After successful SASL, the remote will restart the stream
+                    if (session.stream.isEstablished()) {
+                        reader.reset();
+                    }
+                } else {
+                    // Unsupported mechanism
+                    sendStreamError(session, .not_authorized);
+                }
+            }
+        },
+        .stream_close => {
+            _ = session.stream.handleClose();
+            // Send closing </stream:stream>
+            session.queueWrite("</stream:stream>") catch {};
+        },
+        .xml_declaration => {},
+        .element_end => {},
+        .text => {},
+    }
+}
+
+/// Execute an S2sStreamAction by building and queuing the appropriate XML response.
+fn executeAction(session: *S2sSession, action: S2sStreamAction) void {
+    var buf: [2048]u8 = undefined;
+
+    switch (action) {
+        .send_stream_open => {
+            const response = session.buildStreamOpenResponse(&buf) catch {
+                log.err("failed to build stream open response", .{});
+                return;
+            };
+            session.queueWrite(response) catch {};
+        },
+        .send_features => {
+            const features = session.buildFeatures(&buf) catch {
+                log.err("failed to build features", .{});
+                return;
+            };
+            session.queueWrite(features) catch {};
+        },
+        .send_tls_proceed => {
+            const proceed = session.buildTlsProceed(&buf) catch return;
+            session.queueWrite(proceed) catch {};
+            // TODO: Initiate TLS handshake on this fd
+            session.tls_state = .handshake_want_read;
+        },
+        .send_sasl_success => {
+            const success = session.buildSaslSuccess(&buf) catch return;
+            session.queueWrite(success) catch {};
+            log.info("inbound S2S authenticated: remote={s}", .{session.getRemoteDomain()});
+        },
+        .send_sasl_failure => |reason| {
+            const failure = session.buildSaslFailure(&buf, reason) catch return;
+            session.queueWrite(failure) catch {};
+        },
+        .send_error => |err| {
+            const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
+            session.queueWrite(error_xml) catch {};
+        },
+        .stream_established => {
+            log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
+        },
+        .close => {
+            session.queueWrite("</stream:stream>") catch {};
+        },
+        .none => {},
+        .start_tls => {},
+        .send_starttls => {},
+        .send_sasl_external => {},
+        .begin_dialback => {},
+    }
+}
+
+/// Send a stream error and close.
+fn sendStreamError(session: *S2sSession, err: StreamError) void {
+    var buf: [512]u8 = undefined;
+    const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
+    session.queueWrite(error_xml) catch {};
 }
 
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {

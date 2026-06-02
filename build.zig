@@ -428,6 +428,10 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     s2s_main_test_mod.addImport("ipc_server", ipc_server_test_mod);
     s2s_main_test_mod.addImport("event_loop", s2s_event_loop_mod);
+    s2s_main_test_mod.addImport("xml", xml_mod);
+    s2s_main_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_main_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_main_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_main_tests = b.addTest(.{
         .name = "s2s-main-tests",
@@ -581,6 +585,10 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
     s2s_main_mod.addImport("ipc_server", s2s_ipc_server_mod);
     s2s_main_mod.addImport("event_loop", s2s_event_loop_exe_mod);
+    s2s_main_mod.addImport("xml", xml_mod);
+    s2s_main_mod.addImport("ssl", ssl_test_mod);
+    s2s_main_mod.linkSystemLibrary("ssl", .{});
+    s2s_main_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_exe = b.addExecutable(.{
         .name = "xmppd-s2s",

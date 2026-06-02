@@ -112,15 +112,18 @@ else
 fi
 
 # --- Test 4: S2S stream open to xmppd ---
-# NOTE: xmppd-s2s accepts connections but does not yet wire the XML reader
-# to the S2S stream FSM in the event loop. This test documents the gap.
-info "Test 4: S2S stream open to xmppd (known limitation: event loop XML wiring pending)"
+info "Test 4: S2S stream open to xmppd"
 RESPONSE=$(echo "<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='prosody.test' to='xmppd.test' version='1.0'>" | \
     nc -w 3 127.0.0.1 ${XMPPD_S2S_PORT} 2>/dev/null || true)
 if echo "$RESPONSE" | grep -q "stream:stream"; then
     pass "xmppd responds to S2S stream open"
 else
-    info "EXPECTED: xmppd-s2s event loop XML processing not yet wired (accepts connection, no stream response)"
+    fail "xmppd did not respond to S2S stream open"
+fi
+if echo "$RESPONSE" | grep -q "stream:features"; then
+    pass "xmppd sends stream features (STARTTLS required)"
+else
+    fail "xmppd did not send stream features"
 fi
 
 # --- Test 5: DNS SRV resolution ---
