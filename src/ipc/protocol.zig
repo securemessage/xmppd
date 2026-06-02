@@ -31,13 +31,19 @@ pub const MAX_PAYLOAD_SIZE: u32 = 65536;
 /// Frame header size (4-byte LE length).
 pub const HEADER_SIZE: usize = 4;
 
-/// Message tags for the auth IPC protocol.
+/// Message tags for the IPC protocol.
 pub const Tag = enum(u8) {
+    // Auth IPC (0x01–0x05)
     auth_request = 0x01,
     auth_challenge = 0x02,
     auth_success = 0x03,
     auth_failure = 0x04,
     sasl_response = 0x05,
+
+    // S2S IPC (0x10–0x12)
+    s2s_deliver = 0x10,
+    s2s_inbound = 0x11,
+    s2s_delivery_failed = 0x12,
 };
 
 /// SASL mechanism identifier byte.
@@ -59,7 +65,7 @@ pub const MechanismId = enum(u8) {
     }
 };
 
-/// Auth IPC message — tagged union of all message types.
+/// IPC message — tagged union of all message types.
 pub const Message = union(enum) {
     /// Core→Auth: start authentication for a connection.
     auth_request: AuthRequest,
@@ -71,6 +77,13 @@ pub const Message = union(enum) {
     auth_failure: AuthFailure,
     /// Core→Auth: SASL response (SCRAM client-final-message).
     sasl_response: SaslResponse,
+
+    /// Core→S2S: deliver a stanza to a remote domain.
+    s2s_deliver: S2sDeliver,
+    /// S2S→Core: inbound stanza from a remote domain for a local user.
+    s2s_inbound: S2sInbound,
+    /// S2S→Core: stanza delivery to remote domain failed.
+    s2s_delivery_failed: S2sDeliveryFailed,
 };
 
 pub const AuthRequest = struct {
@@ -103,6 +116,37 @@ pub const AuthFailure = struct {
 pub const SaslResponse = struct {
     conn_id: u32,
     payload: []const u8,
+};
+
+// ============================================================================
+// S2S IPC message types
+// ============================================================================
+
+pub const S2sDeliver = struct {
+    /// Sender's full JID (local@domain/resource).
+    from_jid: []const u8,
+    /// Recipient's JID (local@domain or local@domain/resource).
+    to_jid: []const u8,
+    /// Full serialized stanza XML (opaque bytes — core serializes, s2s forwards verbatim).
+    stanza_xml: []const u8,
+};
+
+pub const S2sInbound = struct {
+    /// Sender's full JID on the remote server.
+    from_jid: []const u8,
+    /// Recipient's JID on this server.
+    to_jid: []const u8,
+    /// Full serialized stanza XML.
+    stanza_xml: []const u8,
+};
+
+pub const S2sDeliveryFailed = struct {
+    /// Original sender's JID.
+    from_jid: []const u8,
+    /// Intended recipient's JID.
+    to_jid: []const u8,
+    /// Error type (e.g., "remote-server-not-found", "remote-server-timeout").
+    error_type: []const u8,
 };
 
 // ============================================================================
@@ -160,6 +204,27 @@ pub fn encode(msg: Message, buf: []u8) !usize {
             std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
             pos += 4;
             pos = try writeField(buf, pos, r.payload);
+        },
+        .s2s_deliver => |d| {
+            buf[pos] = @intFromEnum(Tag.s2s_deliver);
+            pos += 1;
+            pos = try writeField(buf, pos, d.from_jid);
+            pos = try writeField(buf, pos, d.to_jid);
+            pos = try writeField(buf, pos, d.stanza_xml);
+        },
+        .s2s_inbound => |d| {
+            buf[pos] = @intFromEnum(Tag.s2s_inbound);
+            pos += 1;
+            pos = try writeField(buf, pos, d.from_jid);
+            pos = try writeField(buf, pos, d.to_jid);
+            pos = try writeField(buf, pos, d.stanza_xml);
+        },
+        .s2s_delivery_failed => |d| {
+            buf[pos] = @intFromEnum(Tag.s2s_delivery_failed);
+            pos += 1;
+            pos = try writeField(buf, pos, d.from_jid);
+            pos = try writeField(buf, pos, d.to_jid);
+            pos = try writeField(buf, pos, d.error_type);
         },
     }
 
@@ -234,6 +299,39 @@ pub fn decode(payload: []const u8) !Message {
             break :blk Message{ .sasl_response = .{
                 .conn_id = conn_id,
                 .payload = resp_payload,
+            } };
+        },
+        @intFromEnum(Tag.s2s_deliver) => blk: {
+            var pos: usize = 0;
+            const from_jid = try readField(data, &pos);
+            const to_jid = try readField(data, &pos);
+            const stanza_xml = try readField(data, &pos);
+            break :blk Message{ .s2s_deliver = .{
+                .from_jid = from_jid,
+                .to_jid = to_jid,
+                .stanza_xml = stanza_xml,
+            } };
+        },
+        @intFromEnum(Tag.s2s_inbound) => blk: {
+            var pos: usize = 0;
+            const from_jid = try readField(data, &pos);
+            const to_jid = try readField(data, &pos);
+            const stanza_xml = try readField(data, &pos);
+            break :blk Message{ .s2s_inbound = .{
+                .from_jid = from_jid,
+                .to_jid = to_jid,
+                .stanza_xml = stanza_xml,
+            } };
+        },
+        @intFromEnum(Tag.s2s_delivery_failed) => blk: {
+            var pos: usize = 0;
+            const from_jid = try readField(data, &pos);
+            const to_jid = try readField(data, &pos);
+            const error_type = try readField(data, &pos);
+            break :blk Message{ .s2s_delivery_failed = .{
+                .from_jid = from_jid,
+                .to_jid = to_jid,
+                .error_type = error_type,
             } };
         },
         else => error.UnknownTag,
@@ -465,4 +563,60 @@ test "MechanismId fromName/toName roundtrip" {
     try std.testing.expect(MechanismId.fromName("BOGUS") == null);
     try std.testing.expectEqualStrings("PLAIN", MechanismId.plain.toName());
     try std.testing.expectEqualStrings("SCRAM-SHA-256", MechanismId.scram_sha_256.toName());
+}
+
+test "S2sDeliver encode/decode roundtrip" {
+    var buf: [4096]u8 = undefined;
+
+    const stanza = "<message from='alice@a.example/res' to='bob@b.example' id='msg1'><body>hello</body></message>";
+    const msg = Message{ .s2s_deliver = .{
+        .from_jid = "alice@a.example/res",
+        .to_jid = "bob@b.example",
+        .stanza_xml = stanza,
+    } };
+
+    const written = try encode(msg, &buf);
+    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const decoded = try decode(frame.payload);
+    const d = decoded.s2s_deliver;
+    try std.testing.expectEqualStrings("alice@a.example/res", d.from_jid);
+    try std.testing.expectEqualStrings("bob@b.example", d.to_jid);
+    try std.testing.expectEqualStrings(stanza, d.stanza_xml);
+}
+
+test "S2sInbound encode/decode roundtrip" {
+    var buf: [4096]u8 = undefined;
+
+    const stanza = "<message from='carol@remote.example' to='dave@local.example'><body>hi</body></message>";
+    const msg = Message{ .s2s_inbound = .{
+        .from_jid = "carol@remote.example",
+        .to_jid = "dave@local.example",
+        .stanza_xml = stanza,
+    } };
+
+    const written = try encode(msg, &buf);
+    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const decoded = try decode(frame.payload);
+    const d = decoded.s2s_inbound;
+    try std.testing.expectEqualStrings("carol@remote.example", d.from_jid);
+    try std.testing.expectEqualStrings("dave@local.example", d.to_jid);
+    try std.testing.expectEqualStrings(stanza, d.stanza_xml);
+}
+
+test "S2sDeliveryFailed encode/decode roundtrip" {
+    var buf: [1024]u8 = undefined;
+
+    const msg = Message{ .s2s_delivery_failed = .{
+        .from_jid = "alice@a.example/res",
+        .to_jid = "bob@b.example",
+        .error_type = "remote-server-not-found",
+    } };
+
+    const written = try encode(msg, &buf);
+    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const decoded = try decode(frame.payload);
+    const d = decoded.s2s_delivery_failed;
+    try std.testing.expectEqualStrings("alice@a.example/res", d.from_jid);
+    try std.testing.expectEqualStrings("bob@b.example", d.to_jid);
+    try std.testing.expectEqualStrings("remote-server-not-found", d.error_type);
 }

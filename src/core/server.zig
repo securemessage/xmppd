@@ -61,6 +61,9 @@ const LISTENER_UDATA = std.math.maxInt(usize);
 /// Sentinel value for auth IPC fd in kqueue udata.
 const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
 
+/// Sentinel value for S2S IPC fd in kqueue udata.
+const IPC_S2S_UDATA = LISTENER_UDATA - 2;
+
 /// Maximum changelist entries per event loop iteration.
 const CHANGE_BUF_SIZE = 256;
 
@@ -199,6 +202,9 @@ pub const Server = struct {
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
 
+    /// IPC client for S2S daemon communication (federation).
+    s2s_ipc: IpcClient = .{},
+
     /// Session registry — maps bound JIDs to session IDs.
     registry: SessionRegistry = .{},
 
@@ -254,6 +260,16 @@ pub const Server = struct {
         log.info("roster store configured ({d} items)", .{roster_store.items.items.len});
     }
 
+    /// Connect to the S2S federation daemon IPC socket.
+    /// Optional — without this, stanzas to remote domains are bounced.
+    pub fn configureS2s(self: *Server, socket_path: []const u8) !void {
+        self.s2s_ipc.connect(socket_path) catch |err| {
+            log.err("failed to connect to S2S daemon at {s}: {}", .{ socket_path, err });
+            return error.S2sConfigFailed;
+        };
+        log.info("connected to S2S daemon at {s}", .{socket_path});
+    }
+
     /// Configure the offline message store.
     pub fn configureOffline(self: *Server, offline_store: *OfflineStore) void {
         self.offline = offline_store;
@@ -282,6 +298,7 @@ pub const Server = struct {
         self.loop.deinit();
         if (self.ssl_ctx) |*ctx| ctx.deinit();
         if (self.ipc.connected) self.ipc.close();
+        if (self.s2s_ipc.connected) self.s2s_ipc.close();
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -297,6 +314,11 @@ pub const Server = struct {
             try changes.addRead(self.ipc.fd, IPC_AUTH_UDATA);
         }
 
+        // Register S2S IPC fd for reads if connected
+        if (self.s2s_ipc.connected and self.s2s_ipc.fd >= 0) {
+            try changes.addRead(self.s2s_ipc.fd, IPC_S2S_UDATA);
+        }
+
         while (self.running) {
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
@@ -308,6 +330,8 @@ pub const Server = struct {
                             self.acceptConnections(&changes);
                         } else if (e.udata == IPC_AUTH_UDATA) {
                             self.handleIpcReadable(&changes);
+                        } else if (e.udata == IPC_S2S_UDATA) {
+                            self.handleS2sIpcReadable(&changes);
                         } else {
                             self.handleReadableOrHandshake(e.udata, &changes);
                         }
@@ -315,6 +339,8 @@ pub const Server = struct {
                     .fd_writable => |e| {
                         if (e.udata == IPC_AUTH_UDATA) {
                             self.flushIpc(&changes);
+                        } else if (e.udata == IPC_S2S_UDATA) {
+                            self.flushS2sIpc(&changes);
                         } else {
                             self.handleWritableOrHandshake(e.udata, &changes);
                         }
@@ -325,7 +351,7 @@ pub const Server = struct {
                         }
                     },
                     .fd_error => |e| {
-                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA) {
+                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA and e.udata != IPC_S2S_UDATA) {
                             self.closeSession(e.udata, &changes);
                         }
                     },
@@ -949,6 +975,196 @@ pub const Server = struct {
     }
 
     // ========================================================================
+    // S2S IPC — federation stanza forwarding
+    // ========================================================================
+
+    /// Forward a stanza to a remote domain via the S2S daemon IPC.
+    /// Serializes the full stanza XML and sends an S2sDeliver message.
+    fn forwardToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, type_str: []const u8, id_str: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
+        if (!self.s2s_ipc.connected) {
+            log.info("connection {d} stanza to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
+            self.sendServiceUnavailable(session, id_str, to_str, from_str);
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+            return;
+        }
+
+        const tag_name: []const u8 = switch (session.stanza_kind) {
+            .message => "message",
+            .presence => "presence",
+            .none => return,
+        };
+
+        // Serialize the full stanza XML into a buffer
+        var stanza_buf: [20480]u8 = undefined;
+        var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
+        const sw = stanza_fbs.writer();
+
+        sw.writeByte('<') catch return;
+        sw.writeAll(tag_name) catch return;
+        sw.writeAll(" from='") catch return;
+        sw.writeAll(from_str) catch return;
+        sw.writeAll("' to='") catch return;
+        sw.writeAll(to_str) catch return;
+        sw.writeByte('\'') catch return;
+        if (type_str.len > 0) {
+            if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
+                sw.writeAll(" type='") catch return;
+                sw.writeAll(type_str) catch return;
+                sw.writeByte('\'') catch return;
+            }
+        }
+        if (id_str.len > 0) {
+            sw.writeAll(" id='") catch return;
+            sw.writeAll(id_str) catch return;
+            sw.writeByte('\'') catch return;
+        }
+        if (inner_xml.len == 0) {
+            sw.writeAll("/>") catch return;
+        } else {
+            sw.writeByte('>') catch return;
+            sw.writeAll(inner_xml) catch return;
+            sw.writeAll("</") catch return;
+            sw.writeAll(tag_name) catch return;
+            sw.writeByte('>') catch return;
+        }
+
+        const stanza_xml = stanza_fbs.getWritten();
+
+        self.s2s_ipc.send(.{ .s2s_deliver = .{
+            .from_jid = from_str,
+            .to_jid = to_str,
+            .stanza_xml = stanza_xml,
+        } }) catch {
+            log.err("connection {d} failed to forward stanza to S2S daemon", .{session.conn.id});
+            self.sendServiceUnavailable(session, id_str, to_str, from_str);
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+            return;
+        };
+
+        if (self.s2s_ipc.hasPendingSend()) {
+            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        }
+
+        log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
+    }
+
+    fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
+        _ = self.s2s_ipc.recv() catch {
+            log.err("S2S daemon IPC recv error", .{});
+            self.s2s_ipc.close();
+            return;
+        };
+
+        while (true) {
+            const msg = self.s2s_ipc.nextMessage() catch {
+                log.err("S2S daemon IPC decode error", .{});
+                break;
+            };
+            if (msg == null) break;
+            self.dispatchS2sResponse(msg.?, changes);
+        }
+    }
+
+    fn flushS2sIpc(self: *Server, changes: *ChangeList) void {
+        _ = self.s2s_ipc.flush() catch {
+            log.err("S2S daemon IPC flush error", .{});
+            return;
+        };
+        if (self.s2s_ipc.hasPendingSend()) {
+            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        }
+    }
+
+    fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+        switch (msg) {
+            .s2s_inbound => |m| {
+                // Inbound stanza from remote — deliver to local session(s) by
+                // writing the stanza XML directly to the target connection(s).
+                const to_jid = xmpp.Jid.parse(m.to_jid) catch {
+                    log.warn("S2S inbound: invalid to_jid: {s}", .{m.to_jid});
+                    return;
+                };
+
+                var target_ids: [16]usize = undefined;
+                const target_count = if (to_jid.resource.len > 0) blk: {
+                    if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
+                        target_ids[0] = entry.id;
+                        break :blk @as(usize, 1);
+                    }
+                    break :blk @as(usize, 0);
+                } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
+
+                if (target_count == 0) {
+                    // Try offline storage for messages
+                    if (self.offline) |store| {
+                        var recip_buf: [256]u8 = undefined;
+                        var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                        recip_fbs.writer().writeAll(to_jid.local) catch {};
+                        recip_fbs.writer().writeByte('@') catch {};
+                        recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                        const recipient_bare = recip_fbs.getWritten();
+
+                        // For S2S inbound, stanza_xml is the complete stanza —
+                        // store it using the from/to from the IPC message.
+                        if (store.storeMessage(recipient_bare, m.from_jid, "", "", m.stanza_xml)) {
+                            log.info("S2S inbound to {s} stored offline", .{m.to_jid});
+                            return;
+                        }
+                    }
+                    log.info("S2S inbound to {s} — recipient unavailable, no offline", .{m.to_jid});
+                    return;
+                }
+
+                for (target_ids[0..target_count]) |tid| {
+                    const target_session = self.sessions[tid] orelse continue;
+                    target_session.conn.queueSend(m.stanza_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                    }
+                }
+                log.info("S2S inbound from {s} delivered to {d} local session(s)", .{ m.from_jid, target_count });
+            },
+            .s2s_delivery_failed => |m| {
+                // Delivery to remote failed — bounce error to original sender
+                const from_jid = xmpp.Jid.parse(m.from_jid) catch return;
+
+                var sender_ids: [16]usize = undefined;
+                const sender_count = if (from_jid.resource.len > 0) blk: {
+                    if (self.registry.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |entry| {
+                        sender_ids[0] = entry.id;
+                        break :blk @as(usize, 1);
+                    }
+                    break :blk @as(usize, 0);
+                } else self.registry.findAvailableByBareJid(from_jid.local, from_jid.domain, &sender_ids);
+
+                for (sender_ids[0..sender_count]) |sid| {
+                    const sender_session = self.sessions[sid] orelse continue;
+                    var err_buf: [1024]u8 = undefined;
+                    var err_fbs = std.io.fixedBufferStream(&err_buf);
+                    const ew = err_fbs.writer();
+                    ew.writeAll("<message type='error' from='") catch continue;
+                    ew.writeAll(m.to_jid) catch continue;
+                    ew.writeAll("' to='") catch continue;
+                    ew.writeAll(m.from_jid) catch continue;
+                    ew.writeAll("'><error type='cancel'><") catch continue;
+                    ew.writeAll(m.error_type) catch continue;
+                    ew.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch continue;
+                    sender_session.conn.queueSend(err_fbs.getWritten()) catch continue;
+                    if (sender_session.conn.hasPendingWrite()) {
+                        changes.addWrite(sender_session.conn.fd, sid) catch {};
+                    }
+                }
+                log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
+            },
+            else => {},
+        }
+    }
+
+    // ========================================================================
     // Stanza handlers (Phase 7: message routing + presence + IQ)
     // ========================================================================
 
@@ -1080,6 +1296,12 @@ pub const Server = struct {
             from_w.writeAll(from_jid.resource) catch return;
         }
         const from_str = from_fbs.getWritten();
+
+        // Remote domain? Forward via S2S IPC instead of local delivery.
+        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
+            self.forwardToS2s(session, from_str, to_str, type_str, id_str, inner_xml, changes);
+            return;
+        }
 
         // Route: find target session(s)
         var target_ids: [16]usize = undefined;

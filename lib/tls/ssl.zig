@@ -114,6 +114,22 @@ pub const SslContext = struct {
         return SslContext{ .ctx = ctx };
     }
 
+    /// Initialize a client-side TLS context for outbound connections.
+    ///
+    /// No certificate or key is needed — the connecting party doesn't present
+    /// a client cert (unless mutual TLS is required, which is handled separately).
+    /// PKIX verification is disabled because we use DANE verification ourselves.
+    pub fn initClient() SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        // Disable OpenSSL's built-in certificate verification — we do DANE ourselves
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
+
+        return SslContext{ .ctx = ctx };
+    }
+
     /// Release the SSL_CTX. All SslConns created from this context must be
     /// freed first.
     pub fn deinit(self: *SslContext) void {
@@ -131,7 +147,7 @@ pub const SslContext = struct {
 pub const SslConn = struct {
     ssl: *c.SSL,
 
-    /// Create a new TLS connection from an SSL_CTX and a socket fd.
+    /// Create a new server-side TLS connection from an SSL_CTX and a socket fd.
     ///
     /// The fd must already be connected and set to non-blocking mode.
     /// After init, call `doHandshake()` to perform the TLS handshake.
@@ -146,6 +162,31 @@ pub const SslConn = struct {
 
         // Server mode — we accept connections
         c.SSL_set_accept_state(ssl);
+
+        return SslConn{ .ssl = ssl };
+    }
+
+    /// Create a new client-side TLS connection for outbound use.
+    ///
+    /// Sets `SSL_set_connect_state` (client role) and optionally sets the
+    /// SNI hostname via `SSL_set_tlsext_host_name` for virtual hosting.
+    /// After init, call `doHandshake()` to perform the TLS handshake.
+    pub fn initClient(ctx: SslContext, fd: std.posix.fd_t, hostname: ?[*:0]const u8) SslError!SslConn {
+        const ssl = c.SSL_new(ctx.ctx) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_free(ssl);
+
+        if (c.SSL_set_fd(ssl, @intCast(fd)) != 1) {
+            return SslError.SslInitFailed;
+        }
+
+        // Client mode — we initiate connections
+        c.SSL_set_connect_state(ssl);
+
+        // Set SNI hostname if provided
+        if (hostname) |h| {
+            // SSL_set_tlsext_host_name is a macro in C; use the underlying ctrl call
+            _ = c.SSL_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(h)));
+        }
 
         return SslConn{ .ssl = ssl };
     }
@@ -299,6 +340,12 @@ pub const SslConn = struct {
 test "SslContext: initServer fails with bad cert path" {
     const result = SslContext.initServer("/nonexistent/cert.pem", "/nonexistent/key.pem");
     try std.testing.expectError(SslError.CertLoadFailed, result);
+}
+
+test "SslContext: initClient succeeds without cert/key" {
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+    // Client context created successfully — no cert/key needed
 }
 
 test "HandshakeResult: enum values" {

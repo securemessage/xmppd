@@ -43,6 +43,7 @@ pub fn main() !void {
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
     var auth_socket: ?[]const u8 = null;
+    var s2s_socket: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
 
     // Skip argv[0]
@@ -83,6 +84,11 @@ pub fn main() !void {
                 log.err("--auth-socket requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--s2s-socket")) {
+            s2s_socket = args.next() orelse {
+                log.err("--s2s-socket requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--db")) {
             db_path = args.next() orelse {
                 log.err("--db requires a value", .{});
@@ -115,6 +121,13 @@ pub fn main() !void {
     if (auth_socket) |socket_path| {
         server.configureAuth(socket_path) catch {
             log.warn("auth daemon not available, SASL auth will fail", .{});
+        };
+    }
+
+    // Connect to S2S daemon if socket path is provided
+    if (s2s_socket) |socket_path| {
+        server.configureS2s(socket_path) catch {
+            log.warn("S2S daemon not available, remote delivery will bounce", .{});
         };
     }
 
@@ -165,6 +178,7 @@ fn printUsage() void {
         \\  --cert PATH      TLS certificate file (PEM)
         \\  --key PATH       TLS private key file (PEM)
         \\  --auth-socket PATH  Auth daemon IPC socket
+        \\  --s2s-socket PATH   S2S federation daemon IPC socket
         \\  --db PATH        User database path (roster stored alongside)
         \\  --help, -h       Show this help
         \\
