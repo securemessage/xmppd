@@ -39,6 +39,7 @@ const XmlEvent = xml.Event;
 const ssl = @import("ssl");
 const SslContext = ssl.SslContext;
 const SslConn = ssl.SslConn;
+const dns = @import("dns");
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
@@ -58,9 +59,13 @@ const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - 17;
 
 /// Base udata for inbound S2S sessions.
 const INBOUND_UDATA_BASE: usize = 0x10000;
+/// Base udata for outbound S2S connections.
+const OUTBOUND_UDATA_BASE: usize = 0x20000;
 
 /// Maximum inbound S2S sessions.
 const MAX_INBOUND_SESSIONS = 256;
+/// Maximum outbound S2S connections.
+const MAX_OUTBOUND_CONNS = 128;
 
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
@@ -74,8 +79,17 @@ pub const S2sDaemon = struct {
     /// TLS context for inbound connections (server-side).
     tls_ctx: ?SslContext = null,
 
-    /// Outbound connection pool.
+    /// Outbound connection pool (maps domain → OutboundConnection).
     pool: ConnectionPool,
+
+    /// Outbound slot table — maps slot indices to pool entries for kqueue dispatch.
+    /// Parallel to outbound_readers.
+    outbound: [MAX_OUTBOUND_CONNS]?*OutboundConnection = [_]?*OutboundConnection{null} ** MAX_OUTBOUND_CONNS,
+    outbound_readers: [MAX_OUTBOUND_CONNS]?*XmlReader = [_]?*XmlReader{null} ** MAX_OUTBOUND_CONNS,
+    next_outbound_id: usize = 0,
+
+    /// TLS context for outbound connections (client-side).
+    tls_client_ctx: ?SslContext = null,
 
     /// Inbound session table.
     inbound: [MAX_INBOUND_SESSIONS]?*S2sSession = [_]?*S2sSession{null} ** MAX_INBOUND_SESSIONS,
@@ -112,7 +126,18 @@ pub const S2sDaemon = struct {
             }
         }
 
+        // Clean up outbound readers (connections owned by pool)
+        for (&self.outbound_readers, &self.outbound) |*reader_slot, *ob_slot| {
+            if (reader_slot.*) |reader| {
+                reader.deinit();
+                self.allocator.destroy(reader);
+                reader_slot.* = null;
+            }
+            ob_slot.* = null;
+        }
+
         if (self.tls_ctx) |*ctx| ctx.deinit();
+        if (self.tls_client_ctx) |*ctx| ctx.deinit();
         self.pool.deinit();
         self.ipc.deinit();
 
@@ -201,10 +226,10 @@ pub const S2sDaemon = struct {
     }
 
     /// Process an IPC message from xmppd-core.
-    pub fn handleCoreMessage(self: *S2sDaemon, msg: protocol.Message) void {
+    pub fn handleCoreMessage(self: *S2sDaemon, batch: *ChangeList, msg: protocol.Message) void {
         switch (msg) {
             .s2s_deliver => |d| {
-                self.handleDelivery(d.from_jid, d.to_jid, d.stanza_xml);
+                self.handleDelivery(batch, d.from_jid, d.to_jid, d.stanza_xml);
             },
             else => {
                 log.warn("unexpected IPC message from core", .{});
@@ -213,7 +238,9 @@ pub const S2sDaemon = struct {
     }
 
     /// Handle a stanza delivery request from xmppd-core.
-    fn handleDelivery(self: *S2sDaemon, from: []const u8, to: []const u8, stanza_xml: []const u8) void {
+    /// If an established connection exists, deliver immediately.
+    /// Otherwise, initiate a new outbound connection (DNS → TCP → TLS → auth).
+    fn handleDelivery(self: *S2sDaemon, batch: *ChangeList, from: []const u8, to: []const u8, stanza_xml: []const u8) void {
         // Extract the target domain from the 'to' JID
         const domain = extractDomain(to);
         if (domain.len == 0) {
@@ -228,20 +255,160 @@ pub const S2sDaemon = struct {
             return;
         };
 
+        // Queue the stanza first (delivery happens when connection is established)
+        conn.queueStanza(self.allocator, from, to, stanza_xml) catch {
+            self.sendDeliveryFailed(from, to, "internal-error");
+            return;
+        };
+
         if (conn.isEstablished()) {
-            // Connection ready — deliver immediately
-            // (In the full implementation, this would write to the connection's socket.
-            // For now, the stanza is queued and the event loop handles actual delivery.)
-            log.info("delivering stanza to {s} via established connection", .{domain});
+            // Connection ready — flush queued stanzas
+            self.flushOutboundStanzas(conn);
         } else if (conn.isFailed()) {
             self.sendDeliveryFailed(from, to, conn.error_msg);
+        } else if (conn.state == .connecting and conn.fd < 0) {
+            // New connection — initiate DNS + TCP connect
+            self.initiateOutbound(batch, conn, domain);
+        }
+        // else: connection is in progress (TLS, auth, etc.) — stanza is queued
+    }
+
+    /// Initiate an outbound connection: DNS SRV → TCP connect → kqueue registration.
+    fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
+        // DNS SRV resolution (blocking — acceptable for initial impl)
+        const targets = dns.resolveXmpp(self.allocator, domain, true) catch {
+            log.err("DNS SRV resolution failed for {s}", .{domain});
+            conn.fail("dns-resolution-failed");
+            return;
+        };
+        defer self.allocator.free(targets);
+
+        if (targets.len == 0) {
+            log.warn("no SRV targets for {s}", .{domain});
+            conn.fail("no-srv-records");
             return;
         }
 
-        // Queue the stanza (whether established or still connecting)
-        conn.queueStanza(self.allocator, from, to, stanza_xml) catch {
-            self.sendDeliveryFailed(from, to, "internal-error");
+        // Try the first target (TODO: iterate on failure)
+        const target = targets[0];
+        conn.target_host = target.host;
+        conn.target_port = target.port;
+        conn.is_direct_tls = target.is_direct_tls;
+
+        log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
+            target.host, target.port, domain, target.is_direct_tls,
+        });
+
+        // Non-blocking TCP connect
+        const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
+            conn.fail("socket-creation-failed");
+            return;
         };
+
+        // Resolve hostname to IP (simple A record via getaddrinfo)
+        var addr = std.c.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, target.port),
+            .addr = 0,
+        };
+
+        // For test infrastructure, handle known addresses
+        if (parseIPv4(target.host)) |ip| {
+            addr.addr = ip;
+        } else {
+            // Use getaddrinfo for hostname resolution
+            const ip = resolveHostnameIPv4(target.host) catch {
+                posix.close(sock);
+                conn.fail("hostname-resolution-failed");
+                return;
+            };
+            addr.addr = ip;
+        }
+
+        // Non-blocking connect
+        posix.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
+            switch (err) {
+                error.WouldBlock => {}, // Expected — connect in progress
+                else => {
+                    posix.close(sock);
+                    conn.fail("tcp-connect-failed");
+                    return;
+                },
+            }
+        };
+
+        conn.fd = sock;
+
+        // Allocate an outbound slot for kqueue dispatch
+        const slot = self.allocateOutboundSlot() orelse {
+            posix.close(sock);
+            conn.fd = -1;
+            conn.fail("outbound-slots-exhausted");
+            return;
+        };
+        self.outbound[slot] = conn;
+
+        // Create XML reader for this outbound connection
+        const reader = self.allocator.create(XmlReader) catch {
+            self.outbound[slot] = null;
+            posix.close(sock);
+            conn.fd = -1;
+            conn.fail("internal-error");
+            return;
+        };
+        reader.* = XmlReader.init(self.allocator);
+        self.outbound_readers[slot] = reader;
+
+        // Register for write events (connect completion signals writable)
+        batch.addWrite(sock, OUTBOUND_UDATA_BASE + slot) catch {};
+    }
+
+    /// Flush queued stanzas on an established outbound connection.
+    fn flushOutboundStanzas(self: *S2sDaemon, conn: *OutboundConnection) void {
+        for (conn.pending_stanzas.items) |stanza| {
+            _ = posix.write(conn.fd, stanza.xml) catch {
+                log.err("outbound write failed for {s}", .{conn.remote_domain});
+                return;
+            };
+            self.allocator.free(stanza.xml);
+        }
+        conn.pending_stanzas.clearRetainingCapacity();
+    }
+
+    /// Find the outbound slot for a given connection pointer.
+    fn findOutboundSlot(self: *S2sDaemon, conn: *OutboundConnection) ?usize {
+        for (self.outbound, 0..) |slot, i| {
+            if (slot) |c| {
+                if (c == conn) return i;
+            }
+        }
+        return null;
+    }
+
+    /// Close an outbound connection slot.
+    fn closeOutbound(self: *S2sDaemon, slot: usize) void {
+        if (slot >= MAX_OUTBOUND_CONNS) return;
+        if (self.outbound_readers[slot]) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+            self.outbound_readers[slot] = null;
+        }
+        if (self.outbound[slot]) |conn| {
+            log.info("closing outbound S2S to {s}", .{conn.remote_domain});
+            self.pool.remove(conn.remote_domain);
+        }
+        self.outbound[slot] = null;
+    }
+
+    fn allocateOutboundSlot(self: *S2sDaemon) ?usize {
+        var i: usize = 0;
+        while (i < MAX_OUTBOUND_CONNS) : (i += 1) {
+            const idx = (self.next_outbound_id + i) % MAX_OUTBOUND_CONNS;
+            if (self.outbound[idx] == null) {
+                self.next_outbound_id = (idx + 1) % MAX_OUTBOUND_CONNS;
+                return idx;
+            }
+        }
+        return null;
     }
 
     /// Send a delivery failure notification back to xmppd-core.
@@ -352,7 +519,46 @@ fn parseIPv4(address: []const u8) ?u32 {
     if (std.mem.eql(u8, address, "127.0.0.1")) {
         return std.mem.nativeToBig(u32, 0x7f000001);
     }
-    return null;
+    // Try to parse dotted-decimal IPv4
+    var octets: [4]u8 = undefined;
+    var octet_idx: usize = 0;
+    var i: usize = 0;
+    while (i < address.len and octet_idx < 4) {
+        var val: u16 = 0;
+        var digits: usize = 0;
+        while (i < address.len and address[i] != '.') : (i += 1) {
+            if (address[i] < '0' or address[i] > '9') return null;
+            val = val * 10 + @as(u16, address[i] - '0');
+            digits += 1;
+        }
+        if (digits == 0 or val > 255) return null;
+        octets[octet_idx] = @intCast(val);
+        octet_idx += 1;
+        if (i < address.len and address[i] == '.') i += 1;
+    }
+    if (octet_idx != 4) return null;
+    return @as(u32, octets[0]) | (@as(u32, octets[1]) << 8) | (@as(u32, octets[2]) << 16) | (@as(u32, octets[3]) << 24);
+}
+
+/// Resolve a hostname to an IPv4 address using getaddrinfo.
+fn resolveHostnameIPv4(hostname: []const u8) !u32 {
+    // Null-terminate the hostname for C API
+    var name_buf: [256]u8 = undefined;
+    if (hostname.len >= name_buf.len) return error.NameTooLong;
+    @memcpy(name_buf[0..hostname.len], hostname);
+    name_buf[hostname.len] = 0;
+
+    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+    hints.family = posix.AF.INET;
+    hints.sock_type = posix.SOCK.STREAM;
+
+    var result: ?*std.c.addrinfo = null;
+    const rc = std.c.getaddrinfo(@ptrCast(&name_buf), null, &hints, &result);
+    if (rc != 0 or result == null) return error.ResolutionFailed;
+    defer std.c.freeaddrinfo(result.?);
+
+    const addr_in: *const std.c.sockaddr.in = @ptrCast(@alignCast(result.?.addr.?));
+    return addr_in.addr;
 }
 
 pub fn main() !void {
@@ -435,6 +641,12 @@ pub fn main() !void {
         }
     }
 
+    // Initialize client TLS context for outbound connections
+    daemon.tls_client_ctx = SslContext.initClient() catch |err| {
+        log.err("failed to initialize client TLS context: {}", .{err});
+        return err;
+    };
+
     // Start inbound listener
     daemon.listen(address, port) catch |err| {
         log.err("failed to bind S2S listener: {}", .{err});
@@ -508,7 +720,10 @@ pub fn main() !void {
                     } else if (e.udata >= IPC_CLIENT_UDATA_BASE and e.udata < LISTENER_UDATA) {
                         const ipc_slot = e.udata - IPC_CLIENT_UDATA_BASE;
                         handleIpcReadable(&daemon, &batch, ipc_slot);
-                    } else if (e.udata >= INBOUND_UDATA_BASE) {
+                    } else if (e.udata >= OUTBOUND_UDATA_BASE and e.udata < IPC_CLIENT_UDATA_BASE) {
+                        const slot = e.udata - OUTBOUND_UDATA_BASE;
+                        handleOutboundReadable(&daemon, &batch, slot);
+                    } else if (e.udata >= INBOUND_UDATA_BASE and e.udata < OUTBOUND_UDATA_BASE) {
                         const slot = e.udata - INBOUND_UDATA_BASE;
                         handleInboundReadable(&daemon, &batch, slot);
                     }
@@ -517,7 +732,10 @@ pub fn main() !void {
                     if (e.udata >= IPC_CLIENT_UDATA_BASE and e.udata < LISTENER_UDATA) {
                         const ipc_slot = e.udata - IPC_CLIENT_UDATA_BASE;
                         handleIpcWritable(&daemon, &batch, ipc_slot);
-                    } else if (e.udata >= INBOUND_UDATA_BASE) {
+                    } else if (e.udata >= OUTBOUND_UDATA_BASE and e.udata < IPC_CLIENT_UDATA_BASE) {
+                        const slot = e.udata - OUTBOUND_UDATA_BASE;
+                        handleOutboundWritable(&daemon, &batch, slot);
+                    } else if (e.udata >= INBOUND_UDATA_BASE and e.udata < OUTBOUND_UDATA_BASE) {
                         const slot = e.udata - INBOUND_UDATA_BASE;
                         handleInboundWritable(&daemon, &batch, slot);
                     }
@@ -787,6 +1005,248 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
 }
 
 // ============================================================================
+// Outbound connection event handlers
+// ============================================================================
+
+/// Handle a writable event on an outbound connection.
+/// First writable event means TCP connect completed. Then drive the stream protocol.
+fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
+    if (slot >= MAX_OUTBOUND_CONNS) return;
+    const conn = daemon.outbound[slot] orelse return;
+
+    switch (conn.state) {
+        .connecting => {
+            // TCP connect completed — check for errors
+            var err_opt: c_int = 0;
+            const rc = std.c.getsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &@as(posix.socklen_t, @sizeOf(c_int)));
+            if (rc != 0 or err_opt != 0) {
+                log.err("outbound TCP connect failed for {s}", .{conn.remote_domain});
+                conn.fail("tcp-connect-failed");
+                daemon.closeOutbound(slot);
+                return;
+            }
+
+            log.info("outbound TCP connected to {s}:{d}", .{ conn.target_host, conn.target_port });
+            conn.tcpConnected();
+
+            if (conn.is_direct_tls) {
+                // Direct TLS — start handshake immediately
+                startOutboundTls(daemon, batch, slot, conn);
+            } else {
+                // STARTTLS path — send stream open first
+                var buf: [2048]u8 = undefined;
+                const stream_open = conn.buildStreamOpen(&buf) catch return;
+                _ = posix.write(conn.fd, stream_open) catch {
+                    conn.fail("write-failed");
+                    daemon.closeOutbound(slot);
+                    return;
+                };
+                // Wait for remote stream open + features
+                batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+            }
+        },
+        .tls_handshake => {
+            // TLS handshake wants to write
+            continueOutboundTls(daemon, batch, slot, conn);
+        },
+        else => {},
+    }
+}
+
+/// Handle a readable event on an outbound connection.
+fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
+    if (slot >= MAX_OUTBOUND_CONNS) return;
+    const conn = daemon.outbound[slot] orelse return;
+
+    if (conn.state == .tls_handshake) {
+        // TLS handshake wants to read
+        continueOutboundTls(daemon, batch, slot, conn);
+        return;
+    }
+
+    // Read data from the outbound socket
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(conn.fd, &buf) catch |err| {
+        switch (err) {
+            error.WouldBlock => return,
+            else => {
+                conn.fail("read-failed");
+                daemon.closeOutbound(slot);
+                return;
+            },
+        }
+    };
+    if (n == 0) {
+        log.info("outbound connection to {s} closed by peer", .{conn.remote_domain});
+        daemon.closeOutbound(slot);
+        return;
+    }
+
+    // Parse XML from the received data
+    const reader = daemon.outbound_readers[slot] orelse return;
+    var pos: usize = 0;
+    const data = buf[0..n];
+
+    while (true) {
+        const event = reader.next(data, &pos) catch {
+            conn.fail("xml-parse-error");
+            daemon.closeOutbound(slot);
+            return;
+        };
+        if (event == null) break;
+
+        processOutboundEvent(daemon, batch, slot, conn, reader, event.?);
+
+        // Connection may have been closed
+        if (daemon.outbound[slot] == null) return;
+    }
+}
+
+/// Process a single XML event from a remote server on an outbound connection.
+fn processOutboundEvent(
+    daemon: *S2sDaemon,
+    batch: *ChangeList,
+    slot: usize,
+    conn: *OutboundConnection,
+    reader: *XmlReader,
+    event: XmlEvent,
+) void {
+    switch (event) {
+        .stream_open => |elem| {
+            // Extract remote stream ID and from
+            var from: []const u8 = "";
+            var id: []const u8 = "";
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "from")) from = attr.value;
+                if (std.mem.eql(u8, attr.local_name, "id")) id = attr.value;
+            }
+            conn.handleRemoteStreamOpen(from, id);
+        },
+        .element_start => |elem| {
+            // <starttls> features
+            if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls)) {
+                if (std.mem.eql(u8, elem.local_name, "proceed")) {
+                    log.info("outbound STARTTLS proceed from {s}", .{conn.remote_domain});
+                    conn.handleStarttlsProceed();
+                    reader.reset();
+                    startOutboundTls(daemon, batch, slot, conn);
+                }
+            }
+            // <stream:features> children
+            else if (std.mem.eql(u8, elem.local_name, "mechanisms") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
+            {
+                // Will parse mechanisms from child elements
+            } else if (std.mem.eql(u8, elem.local_name, "mechanism") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
+            {
+                // Individual mechanism — text content in next event
+            } else if (std.mem.eql(u8, elem.local_name, "starttls") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.tls))
+            {
+                // Remote offers STARTTLS
+            } else if (std.mem.eql(u8, elem.local_name, "success") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
+            {
+                log.info("outbound SASL success from {s}", .{conn.remote_domain});
+                conn.handleAuthSuccess();
+                // Flush queued stanzas
+                daemon.flushOutboundStanzas(conn);
+            } else if (std.mem.eql(u8, elem.local_name, "failure") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
+            {
+                log.warn("outbound SASL failure from {s}", .{conn.remote_domain});
+                conn.handleAuthFailure();
+                daemon.closeOutbound(slot);
+            }
+        },
+        .element_end => |elem| {
+            // End of <stream:features> — decide what to do
+            if (std.mem.eql(u8, elem.local_name, "features")) {
+                const action = conn.handleRemoteFeatures(
+                    conn.stream.dane_verified,
+                    !conn.stream.dane_verified,
+                );
+                switch (action) {
+                    .send_starttls => {
+                        var act_buf: [256]u8 = undefined;
+                        const starttls = conn.buildStarttls(&act_buf) catch return;
+                        _ = posix.write(conn.fd, starttls) catch return;
+                    },
+                    .send_sasl_external => {
+                        var act_buf: [512]u8 = undefined;
+                        const ext = conn.buildSaslExternal(&act_buf) catch return;
+                        _ = posix.write(conn.fd, ext) catch return;
+                    },
+                    .begin_dialback => {
+                        log.info("outbound dialback needed for {s} (not yet implemented)", .{conn.remote_domain});
+                        // TODO: wire dialback here
+                    },
+                    .none => {},
+                }
+            }
+        },
+        .stream_close => {
+            log.info("outbound stream closed by {s}", .{conn.remote_domain});
+            daemon.closeOutbound(slot);
+        },
+        .xml_declaration => {},
+        .text => {},
+    }
+}
+
+/// Start an outbound TLS handshake using the client context.
+fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
+    const ctx = daemon.tls_client_ctx orelse {
+        conn.fail("no-client-tls-context");
+        daemon.closeOutbound(slot);
+        return;
+    };
+
+    // Create client-side TLS connection with SNI
+    var hostname_buf: [256:0]u8 = undefined;
+    if (conn.remote_domain.len >= hostname_buf.len) {
+        conn.fail("hostname-too-long");
+        return;
+    }
+    @memcpy(hostname_buf[0..conn.remote_domain.len], conn.remote_domain);
+    hostname_buf[conn.remote_domain.len] = 0;
+
+    const tls_conn = SslConn.initClient(ctx, conn.fd, &hostname_buf) catch {
+        conn.fail("tls-init-failed");
+        daemon.closeOutbound(slot);
+        return;
+    };
+    _ = tls_conn;
+
+    conn.state = .tls_handshake;
+    continueOutboundTls(daemon, batch, slot, conn);
+}
+
+/// Continue a non-blocking outbound TLS handshake.
+fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
+    // For now, TLS handshake is driven by the OutboundConnection's stream state.
+    // The actual SslConn is not yet stored on OutboundConnection — this will be
+    // completed when we add an SslConn field to OutboundConnection (similar to S2sSession).
+    // Placeholder: transition immediately to established for testing.
+    _ = batch;
+    log.info("outbound TLS handshake placeholder for {s}", .{conn.remote_domain});
+    conn.tlsHandshakeComplete();
+
+    // TODO: DANE check here using daemon.allocator + dns.queryTlsa + dane.verifyDane
+    conn.setDaneResult(.no_records); // Placeholder — fall back to dialback
+
+    // After DANE, send post-TLS stream open
+    var buf: [2048]u8 = undefined;
+    const stream_open = conn.buildStreamOpen(&buf) catch return;
+    _ = posix.write(conn.fd, stream_open) catch {
+        conn.fail("write-failed");
+        daemon.closeOutbound(slot);
+        return;
+    };
+}
+
+// ============================================================================
 // IPC event handlers
 // ============================================================================
 
@@ -823,7 +1283,7 @@ fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
             return;
         };
         if (msg == null) break;
-        daemon.handleCoreMessage(msg.?);
+        daemon.handleCoreMessage(batch, msg.?);
     }
 
     // If there's IPC response data to send, request write notification
