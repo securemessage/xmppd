@@ -58,8 +58,14 @@ const State = enum {
     close_tag_name,
     /// After `?` in `<?xml`, reading declaration
     xml_decl,
+    /// After `<!`, waiting for `--` to confirm comment
+    bang_start,
     /// Reading a comment `<!-- ... -->`
     comment,
+    /// Reading an entity reference (`&...;`) in text content
+    entity_content,
+    /// Reading an entity reference (`&...;`) in attribute value
+    entity_attr,
 };
 
 /// Streaming XML scanner for XMPP streams.
@@ -136,6 +142,9 @@ pub const Scanner = struct {
                             };
                         }
                         self.state = .tag_start;
+                    } else if (c == '&') {
+                        // Entity reference in text content
+                        self.state = .entity_content;
                     } else {
                         try self.buf.append(a, c);
                     }
@@ -146,8 +155,9 @@ pub const Scanner = struct {
                     } else if (c == '?') {
                         self.state = .xml_decl;
                     } else if (c == '!') {
-                        // Comment or CDATA — for XMPP we only handle comments
-                        self.state = .comment;
+                        // Must be followed by `--` for a comment.
+                        // DOCTYPE, ENTITY, CDATA are forbidden in XMPP (RFC 6120 §11.1).
+                        self.state = .bang_start;
                     } else {
                         try self.buf.append(a, c);
                         self.state = .tag_name;
@@ -258,6 +268,10 @@ pub const Scanner = struct {
                                 .local_name = parsed.local,
                             };
                         }
+                    } else if (c == '&') {
+                        // Entity reference in attribute value
+                        self.buf.clearRetainingCapacity();
+                        self.state = .entity_attr;
                     } else {
                         try self.val_buf.append(a, c);
                     }
@@ -291,6 +305,23 @@ pub const Scanner = struct {
                         try self.buf.append(a, c);
                     }
                 },
+                .bang_start => {
+                    // After `<!`, expect `--` for comment start.
+                    // Anything else (DOCTYPE, ENTITY, CDATA) is forbidden in XMPP.
+                    try self.buf.append(a, c);
+                    if (self.buf.items.len == 2) {
+                        if (self.buf.items[0] == '-' and self.buf.items[1] == '-') {
+                            // Valid comment start `<!--`
+                            self.buf.clearRetainingCapacity();
+                            self.state = .comment;
+                        } else {
+                            // Forbidden: <!DOCTYPE, <!ENTITY, <![CDATA[, etc.
+                            // RFC 6120 §11.1: "a server MUST NOT process XML entity
+                            // references" and DTDs are forbidden.
+                            return error.ForbiddenXmlConstruct;
+                        }
+                    }
+                },
                 .comment => {
                     // Consume comment until `-->`
                     if (c == '>' and self.buf.items.len >= 2 and
@@ -299,6 +330,34 @@ pub const Scanner = struct {
                     {
                         self.buf.clearRetainingCapacity();
                         self.state = .content;
+                    } else {
+                        try self.buf.append(a, c);
+                    }
+                },
+                .entity_content => {
+                    // Reading entity name after `&` in text content.
+                    // Uses val_buf to accumulate entity name (buf holds text content).
+                    if (c == ';') {
+                        const decoded = try resolveEntity(self.val_buf.items);
+                        try self.buf.append(a, decoded);
+                        self.val_buf.clearRetainingCapacity();
+                        self.state = .content;
+                    } else if (self.val_buf.items.len > 8) {
+                        return error.InvalidEntityReference;
+                    } else {
+                        try self.val_buf.append(a, c);
+                    }
+                },
+                .entity_attr => {
+                    // Reading entity name after `&` in attribute value.
+                    // Uses buf to accumulate entity name (val_buf holds attr value).
+                    if (c == ';') {
+                        const decoded = try resolveEntity(self.buf.items);
+                        self.buf.clearRetainingCapacity();
+                        try self.val_buf.append(a, decoded);
+                        self.state = .attr_value;
+                    } else if (self.buf.items.len > 8) {
+                        return error.InvalidEntityReference;
                     } else {
                         try self.buf.append(a, c);
                     }
@@ -334,6 +393,38 @@ pub const Scanner = struct {
         };
     }
 };
+
+/// Resolve an XML entity reference name to its character value.
+///
+/// Supports the 5 predefined XML entities (required by all XML parsers)
+/// and numeric character references (&#NNN; and &#xHH;).
+///
+/// Custom/undeclared entity references return error — XMPP forbids DTDs
+/// so there is no mechanism to define custom entities (RFC 6120 §11.1).
+fn resolveEntity(name: []const u8) !u8 {
+    // Predefined XML entities
+    if (std.mem.eql(u8, name, "amp")) return '&';
+    if (std.mem.eql(u8, name, "lt")) return '<';
+    if (std.mem.eql(u8, name, "gt")) return '>';
+    if (std.mem.eql(u8, name, "apos")) return '\'';
+    if (std.mem.eql(u8, name, "quot")) return '"';
+
+    // Numeric character reference: &#NNN; (decimal)
+    if (name.len > 1 and name[0] == '#') {
+        if (name[1] == 'x' or name[1] == 'X') {
+            // Hexadecimal: &#xHH;
+            const val = std.fmt.parseInt(u8, name[2..], 16) catch return error.InvalidEntityReference;
+            return val;
+        } else {
+            // Decimal: &#NNN;
+            const val = std.fmt.parseInt(u8, name[1..], 10) catch return error.InvalidEntityReference;
+            return val;
+        }
+    }
+
+    // Unknown entity — forbidden in XMPP (no DTD to define custom entities)
+    return error.InvalidEntityReference;
+}
 
 // --- Tests ---
 
@@ -459,4 +550,106 @@ test "scan namespace-prefixed stanza" {
 
     const tok7 = (try scanner.next(input, &pos)).?;
     try std.testing.expectEqual(TokenType.element_open_end, tok7.type);
+}
+
+test "entity decoding: predefined entities in text" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<body>A &amp; B &lt; C &gt; D</body>";
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open "body"
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+
+    const tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.text, tok.type);
+    try std.testing.expectEqualStrings("A & B < C > D", tok.name);
+}
+
+test "entity decoding: numeric character reference" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<x>&#65;&#x42;</x>"; // &#65; = 'A', &#x42; = 'B'
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+
+    const tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.text, tok.type);
+    try std.testing.expectEqualStrings("AB", tok.name);
+}
+
+test "entity decoding: entities in attribute values" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<x attr='a&amp;b'/>";
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open
+    const attr_tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.attribute, attr_tok.type);
+    try std.testing.expectEqualStrings("a&b", attr_tok.value);
+}
+
+test "entity decoding: unknown entity rejected" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<body>&custom;</body>";
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+
+    const result = scanner.next(input, &pos);
+    try std.testing.expectError(error.InvalidEntityReference, result);
+}
+
+test "DOCTYPE rejected (RFC 6120 section 11.1)" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>";
+    var pos: usize = 0;
+
+    const result = scanner.next(input, &pos);
+    try std.testing.expectError(error.ForbiddenXmlConstruct, result);
+}
+
+test "CDATA rejected" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<body><![CDATA[test]]></body>";
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open "body"
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+
+    const result = scanner.next(input, &pos);
+    try std.testing.expectError(error.ForbiddenXmlConstruct, result);
+}
+
+test "XML comment allowed" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<!-- this is a comment --><presence/>";
+    var pos: usize = 0;
+
+    // Comment is consumed silently, next token should be the element
+    const tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.element_open, tok.type);
+    try std.testing.expectEqualStrings("presence", tok.name);
 }

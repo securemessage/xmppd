@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const resolver = @import("resolver.zig");
 
 /// DNS record types relevant to XMPP.
 pub const RecordType = enum(u16) {
@@ -294,4 +295,8 @@ test "parseDnsName" {
     const name = try parseDnsName(&data, alloc);
     defer alloc.free(name);
     try std.testing.expectEqualStrings("foo.bar", name);
+}
+
+test {
+    _ = resolver;
 }
