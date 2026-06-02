@@ -94,18 +94,18 @@ pub fn main() !void {
     try loop.addSignal(posix.SIG.INT);
     try loop.addSignal(posix.SIG.HUP);
 
-    // Scratch buffer for batching changes
+    // Scratch buffer for batching changes across iterations.
     var scratch: [16]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
 
     // Main event loop
     var running = true;
     while (running) {
-        const events = loop.poll(null) catch |err| {
+        const events = loop.submitAndPoll(batch.slice(), null) catch |err| {
             log.err("event loop poll failed: {}", .{err});
             break;
         };
-
-        var batch = ChangeList.init(&scratch);
+        batch.reset();
 
         for (events) |ev| {
             switch (ev) {
@@ -140,11 +140,6 @@ pub fn main() !void {
                 },
                 else => {},
             }
-        }
-
-        // Submit accumulated changes
-        if (batch.count() > 0) {
-            _ = loop.submitAndPoll(batch.slice(), 0) catch {};
         }
     }
 

@@ -415,17 +415,19 @@ pub fn main() !void {
 
     log.info("xmppd-s2s event loop started", .{});
 
-    // Scratch buffer for batching kqueue changes within a single loop iteration
+    // Scratch buffer for batching kqueue changes across iterations.
+    // Changes accumulated in iteration N are submitted at the top of iteration N+1
+    // via submitAndPoll — one syscall both commits changes AND waits for events.
     var scratch: [32]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
 
     // Main event loop
     while (daemon.running) {
-        const events = loop.poll(null) catch |err| {
+        const events = loop.submitAndPoll(batch.slice(), null) catch |err| {
             log.err("event loop poll failed: {}", .{err});
             break;
         };
-
-        var batch = ChangeList.init(&scratch);
+        batch.reset();
 
         for (events) |ev| {
             switch (ev) {
@@ -458,11 +460,6 @@ pub fn main() !void {
                 },
                 else => {},
             }
-        }
-
-        // Flush all accumulated changes + wait in next iteration
-        if (batch.count() > 0) {
-            _ = loop.submitAndPoll(batch.slice(), 0) catch {};
         }
     }
 
