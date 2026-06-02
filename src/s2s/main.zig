@@ -29,6 +29,10 @@ const std = @import("std");
 const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const protocol = @import("ipc_protocol");
+const event_loop_mod = @import("event_loop");
+const EventLoop = event_loop_mod.EventLoop;
+const ChangeList = event_loop_mod.ChangeList;
+const Event = event_loop_mod.Event;
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
@@ -396,103 +400,76 @@ pub fn main() !void {
         log.warn("no --core-socket specified, running without core IPC", .{});
     }
 
-    // Block signals for kqueue delivery
-    var mask = posix.sigemptyset();
-    posix.sigaddset(&mask, posix.SIG.TERM);
-    posix.sigaddset(&mask, posix.SIG.INT);
-    posix.sigprocmask(posix.SIG.BLOCK, &mask, null);
+    // Initialize event loop
+    var loop = try EventLoop.init(allocator, 64);
+    defer loop.deinit();
 
-    // Create kqueue
-    const kq = try posix.kqueue();
-    defer posix.close(kq);
-
-    var event_buf: [64]posix.Kevent = undefined;
-
-    // Register initial events
-    var initial_count: usize = 0;
-    var initial_changes: [4]posix.Kevent = undefined;
-
-    // Inbound listener
+    // Register inbound listener
     if (daemon.listener_fd >= 0) {
-        initial_changes[initial_count] = makeKevent(
-            @intCast(daemon.listener_fd),
-            std.c.EVFILT.READ,
-            std.c.EV.ADD | std.c.EV.ENABLE,
-            LISTENER_UDATA,
-        );
-        initial_count += 1;
+        try loop.addFd(daemon.listener_fd, .read, LISTENER_UDATA);
     }
 
-    // Signals
-    initial_changes[initial_count] = makeKevent(
-        @intCast(posix.SIG.TERM),
-        std.c.EVFILT.SIGNAL,
-        std.c.EV.ADD | std.c.EV.ENABLE,
-        0,
-    );
-    initial_count += 1;
-
-    initial_changes[initial_count] = makeKevent(
-        @intCast(posix.SIG.INT),
-        std.c.EVFILT.SIGNAL,
-        std.c.EV.ADD | std.c.EV.ENABLE,
-        0,
-    );
-    initial_count += 1;
-
-    _ = try posix.kevent(kq, initial_changes[0..initial_count], &event_buf, null);
+    // Register signals (automatically blocked from default delivery)
+    try loop.addSignal(posix.SIG.TERM);
+    try loop.addSignal(posix.SIG.INT);
 
     log.info("xmppd-s2s event loop started", .{});
 
+    // Scratch buffer for batching kqueue changes within a single loop iteration
+    var scratch: [32]posix.Kevent = undefined;
+
     // Main event loop
     while (daemon.running) {
-        const count = posix.kevent(kq, &.{}, &event_buf, null) catch |err| {
-            log.err("kevent failed: {}", .{err});
+        const events = loop.poll(null) catch |err| {
+            log.err("event loop poll failed: {}", .{err});
             break;
         };
 
-        for (event_buf[0..count]) |ev| {
-            if (ev.filter == std.c.EVFILT.SIGNAL) {
-                const signo: u8 = @intCast(ev.ident);
-                if (signo == posix.SIG.TERM or signo == posix.SIG.INT) {
-                    log.info("received signal {d}, shutting down", .{signo});
-                    daemon.stop();
-                }
-            } else if (ev.filter == std.c.EVFILT.READ) {
-                if (ev.udata == LISTENER_UDATA) {
-                    // Accept inbound S2S connection
-                    while (true) {
-                        const slot = daemon.acceptInbound() catch break;
-                        if (slot == null) break;
+        var batch = ChangeList.init(&scratch);
 
-                        const session = daemon.getInbound(slot.?) orelse continue;
-                        var add_ev = [_]posix.Kevent{
-                            makeKevent(
-                                @intCast(session.fd),
-                                std.c.EVFILT.READ,
-                                std.c.EV.ADD | std.c.EV.ENABLE,
-                                INBOUND_UDATA_BASE + slot.?,
-                            ),
-                        };
-                        _ = posix.kevent(kq, &add_ev, &.{}, null) catch {};
+        for (events) |ev| {
+            switch (ev) {
+                .signal => |s| {
+                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
+                        log.info("received signal {d}, shutting down", .{s.signo});
+                        daemon.stop();
                     }
-                } else if (ev.udata >= INBOUND_UDATA_BASE) {
-                    const slot = ev.udata - INBOUND_UDATA_BASE;
-                    handleInboundReadable(&daemon, slot, kq);
-                }
-            } else if (ev.filter == std.c.EVFILT.WRITE) {
-                if (ev.udata >= INBOUND_UDATA_BASE) {
-                    const slot = ev.udata - INBOUND_UDATA_BASE;
-                    handleInboundWritable(&daemon, slot, kq);
-                }
+                },
+                .fd_readable => |e| {
+                    if (e.udata == LISTENER_UDATA) {
+                        // Accept inbound S2S connections
+                        while (true) {
+                            const slot = daemon.acceptInbound() catch break;
+                            if (slot == null) break;
+
+                            const session = daemon.getInbound(slot.?) orelse continue;
+                            batch.addRead(session.fd, INBOUND_UDATA_BASE + slot.?) catch break;
+                        }
+                    } else if (e.udata >= INBOUND_UDATA_BASE) {
+                        const slot = e.udata - INBOUND_UDATA_BASE;
+                        handleInboundReadable(&daemon, &batch, slot);
+                    }
+                },
+                .fd_writable => |e| {
+                    if (e.udata >= INBOUND_UDATA_BASE) {
+                        const slot = e.udata - INBOUND_UDATA_BASE;
+                        handleInboundWritable(&daemon, &batch, slot);
+                    }
+                },
+                else => {},
             }
+        }
+
+        // Flush all accumulated changes + wait in next iteration
+        if (batch.count() > 0) {
+            _ = loop.submitAndPoll(batch.slice(), 0) catch {};
         }
     }
 
     log.info("xmppd-s2s shutdown complete", .{});
 }
 
-fn handleInboundReadable(daemon: *S2sDaemon, slot: usize, kq: posix.fd_t) void {
+fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
     const session = daemon.getInbound(slot) orelse return;
 
     const n = session.recv() catch {
@@ -510,21 +487,13 @@ fn handleInboundReadable(daemon: *S2sDaemon, slot: usize, kq: posix.fd_t) void {
     // complete event loop wiring (needs XML reader integration).
     log.debug("inbound S2S id={d} received {d} bytes", .{ slot, n });
 
-    // Flush any pending writes
+    // Request one-shot write notification when there's data to flush
     if (session.hasPendingWrite()) {
-        var add_ev = [_]posix.Kevent{
-            makeKevent(
-                @intCast(session.fd),
-                std.c.EVFILT.WRITE,
-                std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
-                INBOUND_UDATA_BASE + slot,
-            ),
-        };
-        _ = posix.kevent(kq, &add_ev, &.{}, null) catch {};
+        batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
     }
 }
 
-fn handleInboundWritable(daemon: *S2sDaemon, slot: usize, kq: posix.fd_t) void {
+fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
     const session = daemon.getInbound(slot) orelse return;
 
     _ = session.flushWrite() catch {
@@ -532,28 +501,10 @@ fn handleInboundWritable(daemon: *S2sDaemon, slot: usize, kq: posix.fd_t) void {
         return;
     };
 
+    // If still more to write, re-register for another one-shot write event
     if (session.hasPendingWrite()) {
-        var add_ev = [_]posix.Kevent{
-            makeKevent(
-                @intCast(session.fd),
-                std.c.EVFILT.WRITE,
-                std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
-                INBOUND_UDATA_BASE + slot,
-            ),
-        };
-        _ = posix.kevent(kq, &add_ev, &.{}, null) catch {};
+        batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
     }
-}
-
-fn makeKevent(ident: usize, filter: i16, flags: u16, udata: usize) posix.Kevent {
-    return .{
-        .ident = ident,
-        .filter = filter,
-        .flags = flags,
-        .fflags = 0,
-        .data = 0,
-        .udata = udata,
-    };
 }
 
 fn printUsage() void {

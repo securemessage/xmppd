@@ -23,6 +23,10 @@
 const std = @import("std");
 const posix = std.posix;
 const Supervisor = @import("supervisor.zig").Supervisor;
+const event_loop_mod = @import("event_loop");
+const EventLoop = event_loop_mod.EventLoop;
+const ChangeList = event_loop_mod.ChangeList;
+const Event = event_loop_mod.Event;
 
 const log = std.log.scoped(.xmppd);
 
@@ -105,19 +109,6 @@ pub fn main() !void {
     var auth_sup = Supervisor.init(auth_path, &.{});
     var core_sup = Supervisor.init(core_path, &.{});
 
-    // Block SIGTERM and SIGINT for delivery via kqueue
-    var mask = posix.sigemptyset();
-    posix.sigaddset(&mask, posix.SIG.TERM);
-    posix.sigaddset(&mask, posix.SIG.INT);
-    posix.sigaddset(&mask, posix.SIG.HUP);
-    posix.sigprocmask(posix.SIG.BLOCK, &mask, null);
-
-    // Create kqueue for supervision
-    const kq = try posix.kqueue();
-    defer posix.close(kq);
-
-    var event_buf: [8]posix.Kevent = undefined;
-
     log.info("config: auth_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
         db_path,
@@ -125,8 +116,18 @@ pub fn main() !void {
         key_path orelse "(none)",
     });
 
+    // Initialize event loop
+    var loop = try EventLoop.init(allocator, 8);
+    defer loop.deinit();
+
+    // Register signals (automatic masking)
+    try loop.addSignal(posix.SIG.TERM);
+    try loop.addSignal(posix.SIG.INT);
+    try loop.addSignal(posix.SIG.HUP);
+
     // Spawn xmppd-auth first (must be ready before core connects)
     const auth_pid = try auth_sup.spawnChild();
+    try loop.addProcess(auth_pid);
     log.info("auth daemon started, waiting for socket", .{});
 
     // Brief delay for auth daemon to bind its socket
@@ -134,120 +135,79 @@ pub fn main() !void {
 
     // Spawn xmppd-core
     const core_pid = try core_sup.spawnChild();
+    try loop.addProcess(core_pid);
 
-    // Register both children + signals
+    // Timer idents for restart backoff
     const AUTH_UDATA: usize = 1;
     const CORE_UDATA: usize = 2;
 
-    var changes: [4]posix.Kevent = .{
-        makeKevent(@intCast(auth_pid), std.c.EVFILT.PROC, std.c.EV.ADD | std.c.EV.ONESHOT, AUTH_UDATA),
-        makeKevent(@intCast(core_pid), std.c.EVFILT.PROC, std.c.EV.ADD | std.c.EV.ONESHOT, CORE_UDATA),
-        makeKevent(@intCast(posix.SIG.TERM), std.c.EVFILT.SIGNAL, std.c.EV.ADD | std.c.EV.ENABLE, 0),
-        makeKevent(@intCast(posix.SIG.INT), std.c.EVFILT.SIGNAL, std.c.EV.ADD | std.c.EV.ENABLE, 0),
-    };
-    changes[0].fflags = std.c.NOTE.EXIT;
-    changes[1].fflags = std.c.NOTE.EXIT;
-
-    _ = posix.kevent(kq, &changes, &event_buf, null) catch |err| {
-        log.err("kevent setup failed: {}", .{err});
-        return err;
-    };
-
     // Supervisor event loop
-    const AUTH_RESTART_TIMER: usize = 0xBACCA;
-    const CORE_RESTART_TIMER: usize = 0xBACCF;
-
     var running = true;
     while (running) {
-        const count = posix.kevent(kq, &.{}, &event_buf, null) catch |err| {
-            log.err("kevent wait failed: {}", .{err});
+        const events = loop.poll(null) catch |err| {
+            log.err("event loop poll failed: {}", .{err});
             break;
         };
 
-        for (event_buf[0..count]) |ev| {
-            if (ev.filter == std.c.EVFILT.PROC) {
-                const status = ev.fflags;
-
-                if (ev.udata == AUTH_UDATA) {
-                    _ = auth_sup.waitChild() catch {};
-                    const should_restart = auth_sup.handleChildExit(status);
-                    if (should_restart) {
-                        log.info("restarting auth daemon in {d}ms", .{auth_sup.backoffMs()});
-                        var timer_change = [_]posix.Kevent{
-                            makeKevent(AUTH_RESTART_TIMER, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ONESHOT, AUTH_UDATA),
-                        };
-                        timer_change[0].data = @intCast(auth_sup.backoffMs());
-                        _ = posix.kevent(kq, &timer_change, &.{}, null) catch {};
-                    } else {
-                        running = false;
+        for (events) |ev| {
+            switch (ev) {
+                .process_exit => |p| {
+                    if (auth_sup.child_pid != null and p.pid == auth_sup.child_pid.?) {
+                        _ = auth_sup.waitChild() catch {};
+                        const should_restart = auth_sup.handleChildExit(p.status);
+                        if (should_restart) {
+                            log.info("restarting auth daemon in {d}ms", .{auth_sup.backoffMs()});
+                            loop.addTimer(AUTH_UDATA, auth_sup.backoffMs(), true) catch {};
+                        } else {
+                            running = false;
+                        }
+                    } else if (core_sup.child_pid != null and p.pid == core_sup.child_pid.?) {
+                        _ = core_sup.waitChild() catch {};
+                        const should_restart = core_sup.handleChildExit(p.status);
+                        if (should_restart) {
+                            log.info("restarting core in {d}ms", .{core_sup.backoffMs()});
+                            loop.addTimer(CORE_UDATA, core_sup.backoffMs(), true) catch {};
+                        } else {
+                            running = false;
+                        }
                     }
-                } else if (ev.udata == CORE_UDATA) {
-                    _ = core_sup.waitChild() catch {};
-                    const should_restart = core_sup.handleChildExit(status);
-                    if (should_restart) {
-                        log.info("restarting core in {d}ms", .{core_sup.backoffMs()});
-                        var timer_change = [_]posix.Kevent{
-                            makeKevent(CORE_RESTART_TIMER, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ONESHOT, CORE_UDATA),
+                },
+                .timer => |t| {
+                    if (t.ident == AUTH_UDATA) {
+                        const new_pid = auth_sup.spawnChild() catch |err| {
+                            log.err("failed to respawn auth daemon: {}", .{err});
+                            running = false;
+                            continue;
                         };
-                        timer_change[0].data = @intCast(core_sup.backoffMs());
-                        _ = posix.kevent(kq, &timer_change, &.{}, null) catch {};
-                    } else {
-                        running = false;
+                        loop.addProcess(new_pid) catch {};
+                    } else if (t.ident == CORE_UDATA) {
+                        const new_pid = core_sup.spawnChild() catch |err| {
+                            log.err("failed to respawn core: {}", .{err});
+                            running = false;
+                            continue;
+                        };
+                        loop.addProcess(new_pid) catch {};
                     }
-                }
-            } else if (ev.filter == std.c.EVFILT.TIMER) {
-                if (ev.udata == AUTH_UDATA) {
-                    const new_pid = auth_sup.spawnChild() catch |err| {
-                        log.err("failed to respawn auth daemon: {}", .{err});
+                },
+                .signal => |s| {
+                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
+                        log.info("received signal {d}, shutting down", .{s.signo});
+                        core_sup.shutdown();
+                        _ = core_sup.waitChild() catch {};
+                        auth_sup.shutdown();
+                        _ = auth_sup.waitChild() catch {};
                         running = false;
-                        continue;
-                    };
-                    var proc_change = [_]posix.Kevent{
-                        makeKevent(@intCast(new_pid), std.c.EVFILT.PROC, std.c.EV.ADD | std.c.EV.ONESHOT, AUTH_UDATA),
-                    };
-                    proc_change[0].fflags = std.c.NOTE.EXIT;
-                    _ = posix.kevent(kq, &proc_change, &.{}, null) catch {};
-                } else if (ev.udata == CORE_UDATA) {
-                    const new_pid = core_sup.spawnChild() catch |err| {
-                        log.err("failed to respawn core: {}", .{err});
-                        running = false;
-                        continue;
-                    };
-                    var proc_change = [_]posix.Kevent{
-                        makeKevent(@intCast(new_pid), std.c.EVFILT.PROC, std.c.EV.ADD | std.c.EV.ONESHOT, CORE_UDATA),
-                    };
-                    proc_change[0].fflags = std.c.NOTE.EXIT;
-                    _ = posix.kevent(kq, &proc_change, &.{}, null) catch {};
-                }
-            } else if (ev.filter == std.c.EVFILT.SIGNAL) {
-                const signo: u8 = @intCast(ev.ident);
-                if (signo == posix.SIG.TERM or signo == posix.SIG.INT) {
-                    log.info("received signal {d}, shutting down", .{signo});
-                    core_sup.shutdown();
-                    _ = core_sup.waitChild() catch {};
-                    auth_sup.shutdown();
-                    _ = auth_sup.waitChild() catch {};
-                    running = false;
-                } else if (signo == posix.SIG.HUP) {
-                    log.info("received SIGHUP, forwarding to auth daemon", .{});
-                    auth_sup.forwardSignal(signo);
-                }
+                    } else if (s.signo == posix.SIG.HUP) {
+                        log.info("received SIGHUP, forwarding to auth daemon", .{});
+                        auth_sup.forwardSignal(@intCast(s.signo));
+                    }
+                },
+                else => {},
             }
         }
     }
 
     log.info("xmppd master shutdown complete", .{});
-}
-
-fn makeKevent(ident: usize, filter: i16, flags: u16, udata: usize) posix.Kevent {
-    return .{
-        .ident = ident,
-        .filter = filter,
-        .flags = flags,
-        .fflags = 0,
-        .data = 0,
-        .udata = udata,
-    };
 }
 
 fn printUsage() void {

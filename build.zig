@@ -413,6 +413,12 @@ pub fn build(b: *std.Build) void {
 
     // --- S2S main (daemon) tests ---
 
+    const s2s_event_loop_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const s2s_main_test_mod = b.createModule(.{
         .root_source_file = b.path("src/s2s/main.zig"),
         .target = target,
@@ -421,6 +427,7 @@ pub fn build(b: *std.Build) void {
     });
     s2s_main_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     s2s_main_test_mod.addImport("ipc_server", ipc_server_test_mod);
+    s2s_main_test_mod.addImport("event_loop", s2s_event_loop_mod);
 
     const s2s_main_tests = b.addTest(.{
         .name = "s2s-main-tests",
@@ -472,11 +479,18 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(core_exe);
 
     // xmppd: the master supervisor
+    const master_event_loop_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const master_mod = b.createModule(.{
         .root_source_file = b.path("src/master/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    master_mod.addImport("event_loop", master_event_loop_mod);
 
     const master_exe = b.addExecutable(.{
         .name = "xmppd",
@@ -514,6 +528,12 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("user_store", auth_user_store_mod);
 
+    const auth_event_loop_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const auth_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/main.zig"),
         .target = target,
@@ -524,6 +544,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
+    auth_mod.addImport("event_loop", auth_event_loop_mod);
 
     const auth_exe = b.addExecutable(.{
         .name = "xmppd-auth",
@@ -545,6 +566,12 @@ pub fn build(b: *std.Build) void {
     });
     s2s_ipc_server_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
 
+    const s2s_event_loop_exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const s2s_main_mod = b.createModule(.{
         .root_source_file = b.path("src/s2s/main.zig"),
         .target = target,
@@ -553,6 +580,7 @@ pub fn build(b: *std.Build) void {
     });
     s2s_main_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
     s2s_main_mod.addImport("ipc_server", s2s_ipc_server_mod);
+    s2s_main_mod.addImport("event_loop", s2s_event_loop_exe_mod);
 
     const s2s_exe = b.addExecutable(.{
         .name = "xmppd-s2s",

@@ -221,6 +221,18 @@ pub const ChangeList = struct {
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
     }
 
+    /// Add a one-shot read monitor (fires once when readable, then auto-removes).
+    pub fn addReadOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
+    }
+
+    /// Add a one-shot write monitor (fires once when writable, then auto-removes).
+    /// Idiomatic for flush-on-demand: register when data is queued, fires once
+    /// kernel send buffer has space.
+    pub fn addWriteOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
+    }
+
     /// Enable read monitoring for an fd (must be previously added).
     pub fn enableRead(self: *ChangeList, fd: posix.fd_t) !void {
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ENABLE, 0));
@@ -333,15 +345,35 @@ pub const EventLoop = struct {
     /// - `error.FileDescriptorInvalid` — fd is not open
     /// - `error.SystemResources` — kernel resource exhaustion
     pub fn addFd(self: *EventLoop, fd: posix.fd_t, filter: Filter, udata: usize) !void {
+        return self.addFdEx(fd, filter, udata, false);
+    }
+
+    /// Register a file descriptor for one-shot monitoring.
+    ///
+    /// Same as `addFd()` but the registration auto-removes after the first event
+    /// fires. Ideal for write monitoring: register when data is queued, fires once
+    /// when the kernel send buffer has space, then stops automatically.
+    ///
+    /// ## Errors
+    /// - `error.FileDescriptorInvalid` — fd is not open
+    /// - `error.SystemResources` — kernel resource exhaustion
+    pub fn addFdOneshot(self: *EventLoop, fd: posix.fd_t, filter: Filter, udata: usize) !void {
+        return self.addFdEx(fd, filter, udata, true);
+    }
+
+    fn addFdEx(self: *EventLoop, fd: posix.fd_t, filter: Filter, udata: usize, one_shot: bool) !void {
         const kfilter: i16 = switch (filter) {
             .read => std.c.EVFILT.READ,
             .write => std.c.EVFILT.WRITE,
         };
 
+        var flags: u16 = std.c.EV.ADD | std.c.EV.ENABLE;
+        if (one_shot) flags |= std.c.EV.ONESHOT;
+
         const changelist = [_]posix.Kevent{makeKevent(
             @intCast(fd),
             kfilter,
-            std.c.EV.ADD | std.c.EV.ENABLE,
+            flags,
             udata,
         )};
 
@@ -1041,6 +1073,51 @@ test "ChangeList: overflow returns error" {
     try batch.addRead(1, 0);
     try batch.addRead(2, 0);
     try std.testing.expectError(error.ChangeListFull, batch.addRead(3, 0));
+}
+
+test "EventLoop: addFdOneshot fires once then stops" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Register write end as one-shot writable
+    try loop.addFdOneshot(pipe_fds[1], .write, 0xFACE);
+
+    // Poll — should fire immediately (pipe is writable)
+    const events = try loop.poll(100);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0] == .fd_writable);
+    try std.testing.expectEqual(@as(usize, 0xFACE), events[0].fd_writable.udata);
+
+    // Poll again — one-shot should have auto-removed, no more events
+    const events2 = try loop.poll(50);
+    try std.testing.expectEqual(@as(usize, 0), events2.len);
+}
+
+test "ChangeList: addWriteOnce fires once then stops" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Use ChangeList to add one-shot write monitor
+    var scratch: [4]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    try batch.addWriteOnce(pipe_fds[1], 0xD00D);
+
+    const events = try loop.submitAndPoll(batch.slice(), 100);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0] == .fd_writable);
+    try std.testing.expectEqual(@as(usize, 0xD00D), events[0].fd_writable.udata);
+
+    // Second poll — auto-removed
+    const events2 = try loop.poll(50);
+    try std.testing.expectEqual(@as(usize, 0), events2.len);
 }
 
 test "EventLoop: modifyFd disable and enable" {
