@@ -193,6 +193,81 @@ pub fn build(b: *std.Build) void {
 
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    // --- IPC tests ---
+
+    const ipc_protocol_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const ipc_protocol_tests = b.addTest(.{
+        .name = "ipc-protocol-tests",
+        .root_module = ipc_protocol_test_mod,
+    });
+
+    const run_ipc_protocol_tests = b.addRunArtifact(ipc_protocol_tests);
+
+    const ipc_client_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ipc_client_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+
+    const ipc_client_tests = b.addTest(.{
+        .name = "ipc-client-tests",
+        .root_module = ipc_client_test_mod,
+    });
+
+    const run_ipc_client_tests = b.addRunArtifact(ipc_client_tests);
+
+    const ipc_server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ipc_server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+
+    const ipc_server_tests = b.addTest(.{
+        .name = "ipc-server-tests",
+        .root_module = ipc_server_test_mod,
+    });
+
+    const run_ipc_server_tests = b.addRunArtifact(ipc_server_tests);
+
+    // --- Auth tests ---
+
+    const user_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/user_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    user_store_test_mod.addImport("sasl", sasl_mod);
+
+    const user_store_tests = b.addTest(.{
+        .name = "user-store-tests",
+        .root_module = user_store_test_mod,
+    });
+
+    const run_user_store_tests = b.addRunArtifact(user_store_tests);
+
+    const auth_handler_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_handler_test_mod.addImport("sasl", sasl_mod);
+    auth_handler_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    auth_handler_test_mod.addImport("user_store", user_store_test_mod);
+
+    const auth_handler_tests = b.addTest(.{
+        .name = "auth-handler-tests",
+        .root_module = auth_handler_test_mod,
+    });
+
+    const run_auth_handler_tests = b.addRunArtifact(auth_handler_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -243,6 +318,91 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(master_exe);
 
+    // xmppd-auth: the authentication daemon
+    const auth_ipc_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const auth_ipc_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_ipc_server_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
+
+    const auth_user_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/user_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_user_store_mod.addImport("sasl", sasl_mod);
+
+    const auth_handler_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_handler_mod.addImport("sasl", sasl_mod);
+    auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
+    auth_handler_mod.addImport("user_store", auth_user_store_mod);
+
+    const auth_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_mod.addImport("sasl", sasl_mod);
+    auth_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
+    auth_mod.addImport("ipc_server", auth_ipc_server_mod);
+    auth_mod.addImport("user_store", auth_user_store_mod);
+    auth_mod.addImport("handler", auth_handler_mod);
+
+    const auth_exe = b.addExecutable(.{
+        .name = "xmppd-auth",
+        .root_module = auth_mod,
+    });
+    b.installArtifact(auth_exe);
+
+    // xmppctl: user management CLI
+    const ctl_user_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/user_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_user_store_mod.addImport("sasl", sasl_mod);
+
+    const ctl_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_mod.addImport("user_store", ctl_user_store_mod);
+
+    const ctl_exe = b.addExecutable(.{
+        .name = "xmppctl",
+        .root_module = ctl_mod,
+    });
+    b.installArtifact(ctl_exe);
+
+    // xmppctl tests
+    const ctl_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_test_mod.addImport("user_store", ctl_user_store_mod);
+
+    const ctl_tests = b.addTest(.{
+        .name = "xmppctl-tests",
+        .root_module = ctl_test_mod,
+    });
+
+    const run_ctl_tests = b.addRunArtifact(ctl_tests);
+
     // --- Test step ---
 
     const test_step = b.step("test", "Run all library tests");
@@ -256,5 +416,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_connection_tests.step);
     test_step.dependOn(&run_listener_tests.step);
     test_step.dependOn(&run_server_tests.step);
+    test_step.dependOn(&run_ipc_protocol_tests.step);
+    test_step.dependOn(&run_ipc_client_tests.step);
+    test_step.dependOn(&run_ipc_server_tests.step);
+    test_step.dependOn(&run_user_store_tests.step);
+    test_step.dependOn(&run_auth_handler_tests.step);
+    test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
 }

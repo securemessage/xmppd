@@ -26,3 +26,12 @@ c2s_port = 5222
 
 # Path to xmppd-core binary (default: alongside xmppd)
 # core_path = /usr/local/libexec/xmppd/xmppd-core
+
+# Path to xmppd-auth binary (default: alongside xmppd)
+# auth_path = /usr/local/libexec/xmppd/xmppd-auth
+
+# IPC socket for core↔auth communication
+auth_socket = /var/run/xmppd/auth.sock
+
+# User credential database
+user_db = /var/db/xmppd/users.db
