@@ -190,16 +190,22 @@ fn readPassword(prompt: []const u8) ![]const u8 {
         }
     }
 
+    // Read one byte at a time until newline (handles piped input correctly)
     var buf: [256]u8 = undefined;
-    const n = posix.read(stdin_fd, &buf) catch return error.ReadFailed;
-    if (n == 0) return error.ReadFailed;
+    var len: usize = 0;
+    while (len < buf.len) {
+        var byte: [1]u8 = undefined;
+        const n = posix.read(stdin_fd, &byte) catch return error.ReadFailed;
+        if (n == 0) break; // EOF
+        if (byte[0] == '\n') break;
+        if (byte[0] == '\r') continue;
+        buf[len] = byte[0];
+        len += 1;
+    }
 
-    // Strip trailing newline
-    var end = n;
-    if (end > 0 and buf[end - 1] == '\n') end -= 1;
-    if (end > 0 and buf[end - 1] == '\r') end -= 1;
+    if (len == 0) return error.ReadFailed;
 
-    return buf[0..end];
+    return buf[0..len];
 }
 
 /// Try to send SIGHUP to xmppd-auth if a PID file exists.
