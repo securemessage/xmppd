@@ -82,6 +82,10 @@ pub const Reader = struct {
     ns_binding_count: u32 = 0,
     /// Default namespace URI
     default_ns: []const u8 = "",
+    /// Namespace stack — saves default_ns on element_open, restores on element_close.
+    /// XMPP stanzas are shallow (depth rarely exceeds 5–6), so 16 entries suffice.
+    ns_stack: [16][]const u8 = undefined,
+    ns_stack_depth: u32 = 0,
     /// Whether we're inside the stream element
     stream_opened: bool = false,
     /// Arena for element/attribute data
@@ -122,6 +126,11 @@ pub const Reader = struct {
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
                     self.current_element_local = try self.arenaDupe(token.local_name);
                     self.attrs.clearRetainingCapacity();
+                    // Push current default namespace before this element's xmlns decls modify it
+                    if (self.ns_stack_depth < self.ns_stack.len) {
+                        self.ns_stack[self.ns_stack_depth] = self.default_ns;
+                        self.ns_stack_depth += 1;
+                    }
                 },
                 .namespace_decl => {
                     const uri = try self.arenaDupe(token.value);
@@ -150,6 +159,7 @@ pub const Reader = struct {
                 .element_open_end => {
                     self.depth += 1;
                     const elem = self.buildElement(false);
+                    // For non-self-closing elements, namespace is restored on element_close
 
                     // The stream:stream element is special
                     if (self.depth == 1 and std.mem.eql(u8, self.current_element_prefix, "stream")) {
@@ -169,11 +179,22 @@ pub const Reader = struct {
                     }
 
                     self.depth -= 1;
+                    // Restore the parent's default namespace — self-closing element's
+                    // xmlns scope ends immediately.
+                    if (self.ns_stack_depth > 0) {
+                        self.ns_stack_depth -= 1;
+                        self.default_ns = self.ns_stack[self.ns_stack_depth];
+                    }
                     return Event{ .element_start = elem };
                 },
                 .element_close => {
                     if (self.depth > 0) {
                         self.depth -= 1;
+                    }
+                    // Restore the parent's default namespace
+                    if (self.ns_stack_depth > 0) {
+                        self.ns_stack_depth -= 1;
+                        self.default_ns = self.ns_stack[self.ns_stack_depth];
                     }
 
                     // Stream close
@@ -237,6 +258,7 @@ pub const Reader = struct {
         self.depth = 0;
         self.stream_opened = false;
         self.default_ns = "";
+        self.ns_stack_depth = 0;
         self.ns_binding_count = 0;
         self.current_element_name = "";
         self.current_element_prefix = "";

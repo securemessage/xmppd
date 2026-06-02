@@ -91,6 +91,13 @@ const SaslCollecting = enum {
     response,
 };
 
+/// Which type of stanza is currently being accumulated for forwarding.
+const StanzaKind = enum {
+    none,
+    message,
+    presence,
+};
+
 /// Per-connection session state. Bundles a Connection with its XML parser,
 /// XMPP stream FSM, and SASL state.
 const Session = struct {
@@ -102,6 +109,9 @@ const Session = struct {
 
     /// Auth daemon IPC exchange state.
     auth_state: AuthState = .none,
+    /// Stable copy of authenticated username (IPC message data is transient).
+    auth_username_buf: [256]u8 = undefined,
+    auth_username_len: usize = 0,
     /// Which SASL element we're collecting text content for.
     sasl_collecting: SaslCollecting = .none,
     /// Buffer for accumulating SASL text content (base64 from XML).
@@ -109,6 +119,17 @@ const Session = struct {
     sasl_buf_len: usize = 0,
     /// Mechanism name from the last <auth> element.
     sasl_mechanism: []const u8 = "",
+
+    /// Stanza accumulation for message/presence forwarding.
+    /// Child XML content is serialized into stanza_buf between element_start
+    /// and element_end at stream-child depth. dispatchStanza() then routes
+    /// the reconstructed stanza with rewritten 'from' attribute.
+    stanza_kind: StanzaKind = .none,
+    stanza_buf: [16384]u8 = undefined,
+    stanza_buf_len: usize = 0,
+    stanza_to: []const u8 = "",
+    stanza_id: []const u8 = "",
+    stanza_type: []const u8 = "",
 
     /// IQ stanza accumulation — tracks child element namespace for dispatching.
     iq_active: bool = false,
@@ -139,6 +160,14 @@ const Session = struct {
         self.sasl_buf_len = 0;
         self.sasl_mechanism = "";
         self.auth_state = .none;
+    }
+
+    fn resetStanza(self: *Session) void {
+        self.stanza_kind = .none;
+        self.stanza_buf_len = 0;
+        self.stanza_to = "";
+        self.stanza_id = "";
+        self.stanza_type = "";
     }
 };
 
@@ -459,7 +488,9 @@ pub const Server = struct {
             self.processXmlEvent(session, event.?, changes);
             events_processed += 1;
 
-            if (session.conn.isClosed()) break;
+            // Session may have been closed/freed by processXmlEvent (stream
+            // error, close, etc.) — check the slot, not the stale pointer.
+            if (self.sessions[id] == null) return;
             // After STARTTLS upgrade, stop processing pre-TLS buffer
             if (session.conn.isTlsHandshaking()) break;
         }
@@ -493,8 +524,8 @@ pub const Server = struct {
             .element_start => |elem| {
                 self.handleElementStart(session, elem, changes);
             },
-            .element_end => {
-                self.handleElementEnd(session, changes);
+            .element_end => |name| {
+                self.handleElementEnd(session, name, changes);
             },
             .text => |text| {
                 self.handleText(session, text);
@@ -519,6 +550,12 @@ pub const Server = struct {
     }
 
     fn handleElementStart(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        // If accumulating a message/presence stanza, serialize child elements into buffer
+        if (session.stanza_kind != .none) {
+            self.accumulateStanzaElement(session, elem);
+            return;
+        }
+
         const ns = elem.namespace_uri;
 
         // STARTTLS namespace
@@ -574,7 +611,12 @@ pub const Server = struct {
     // ========================================================================
 
     fn handleText(self: *Server, session: *Session, text: []const u8) void {
-        _ = self;
+        // Stanza content accumulation (message/presence body text)
+        if (session.stanza_kind != .none) {
+            self.accumulateStanzaText(session, text);
+            return;
+        }
+
         if (session.sasl_collecting == .none) return;
 
         // Accumulate text into SASL buffer
@@ -586,7 +628,19 @@ pub const Server = struct {
         }
     }
 
-    fn handleElementEnd(self: *Server, session: *Session, changes: *ChangeList) void {
+    fn handleElementEnd(self: *Server, session: *Session, name: []const u8, changes: *ChangeList) void {
+        // Stanza accumulation — child close tag or stanza dispatch
+        if (session.stanza_kind != .none) {
+            if (session.reader.depth > 1) {
+                // Still inside the stanza — accumulate the child close tag
+                self.accumulateStanzaClose(session, name);
+            } else {
+                // Stanza complete (depth back to stream level) — route to targets
+                self.dispatchStanza(session, changes);
+            }
+            return;
+        }
+
         // SASL text accumulation
         switch (session.sasl_collecting) {
             .auth => {
@@ -797,7 +851,14 @@ pub const Server = struct {
                     }
                 }
 
-                const success_action = session.stream.saslSuccess(m.username, server_final_b64);
+                // Copy username into session-owned storage — the IPC recv buffer
+                // is transient and will be reused for other connections' auth.
+                const ulen = @min(m.username.len, session.auth_username_buf.len);
+                @memcpy(session.auth_username_buf[0..ulen], m.username[0..ulen]);
+                session.auth_username_len = ulen;
+                const stable_username = session.auth_username_buf[0..ulen];
+
+                const success_action = session.stream.saslSuccess(stable_username, server_final_b64);
                 self.executeAction(session, success_action);
                 session.resetSasl();
 
@@ -824,7 +885,7 @@ pub const Server = struct {
     // ========================================================================
 
     fn handleMessage(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
-        // Extract 'to' attribute for routing
+        // Extract attributes for routing (saved for dispatch on stanza close)
         var to_str: []const u8 = "";
         var id_str: []const u8 = "";
         var type_str: []const u8 = "normal";
@@ -834,21 +895,112 @@ pub const Server = struct {
             if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
         }
 
-        if (to_str.len == 0) {
-            // Messages without 'to' are handled by the server (ignored for now)
-            return;
+        if (to_str.len == 0) return;
+
+        // Start stanza accumulation — child content (body, thread, etc.) will be
+        // serialized into stanza_buf. On </message>, dispatchStanza() constructs
+        // the full stanza with rewritten 'from' and routes to target session(s).
+        session.stanza_kind = .message;
+        session.stanza_buf_len = 0;
+        session.stanza_to = to_str;
+        session.stanza_id = id_str;
+        session.stanza_type = type_str;
+
+        // Self-closing message (no children) — dispatch immediately
+        if (elem.self_closing) {
+            self.dispatchStanza(session, changes);
         }
+    }
+
+    // ========================================================================
+    // Stanza accumulation + dispatch (full stanza forwarding)
+    // ========================================================================
+
+    /// Serialize a child element opening tag into the stanza accumulation buffer.
+    fn accumulateStanzaElement(self: *Server, session: *Session, elem: xml.Element) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
+        const w = fbs.writer();
+
+        w.writeByte('<') catch return;
+        w.writeAll(elem.name) catch return;
+
+        // Reconstruct namespace declaration if element uses a non-default namespace.
+        // The reader resolves xmlns declarations into namespace_uri but doesn't
+        // include them in the attributes array — we must re-emit them.
+        if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client)) {
+            if (elem.prefix.len > 0) {
+                w.writeAll(" xmlns:") catch return;
+                w.writeAll(elem.prefix) catch return;
+                w.writeAll("='") catch return;
+                w.writeAll(elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
+            } else {
+                w.writeAll(" xmlns='") catch return;
+                w.writeAll(elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
+            }
+        }
+
+        for (elem.attributes) |attr| {
+            w.writeByte(' ') catch return;
+            w.writeAll(attr.name) catch return;
+            w.writeAll("='") catch return;
+            xmlEscapeWrite(w, attr.value) catch return;
+            w.writeByte('\'') catch return;
+        }
+
+        if (elem.self_closing) {
+            w.writeAll("/>") catch return;
+        } else {
+            w.writeByte('>') catch return;
+        }
+
+        session.stanza_buf_len += fbs.pos;
+    }
+
+    /// Serialize text content (XML-escaped) into the stanza accumulation buffer.
+    fn accumulateStanzaText(self: *Server, session: *Session, text: []const u8) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
+        xmlEscapeWrite(fbs.writer(), text) catch return;
+        session.stanza_buf_len += fbs.pos;
+    }
+
+    /// Serialize a child element close tag into the stanza accumulation buffer.
+    fn accumulateStanzaClose(self: *Server, session: *Session, name: []const u8) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
+        const w = fbs.writer();
+        w.writeAll("</") catch return;
+        w.writeAll(name) catch return;
+        w.writeByte('>') catch return;
+        session.stanza_buf_len += fbs.pos;
+    }
+
+    /// Route a fully accumulated stanza to target session(s).
+    /// Reconstructs the opening tag with the sender's full JID as 'from',
+    /// appends the accumulated child XML, and closes the stanza.
+    fn dispatchStanza(self: *Server, session: *Session, changes: *ChangeList) void {
+        defer session.resetStanza();
+
+        const to_str = session.stanza_to;
+        const id_str = session.stanza_id;
+        const type_str = session.stanza_type;
+        const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
+
+        if (to_str.len == 0) return;
 
         // Parse target JID
         const to_jid = xmpp.Jid.parse(to_str) catch {
-            log.warn("connection {d} message with invalid 'to': {s}", .{ session.conn.id, to_str });
+            log.warn("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
             return;
         };
 
         // Get the sender's bound JID
         const from_jid = session.stream.bound_jid orelse return;
 
-        // Build the from string
+        // Build the from string (full JID: local@domain/resource)
         var from_buf: [256]u8 = undefined;
         var from_fbs = std.io.fixedBufferStream(&from_buf);
         const from_w = from_fbs.writer();
@@ -862,22 +1014,16 @@ pub const Server = struct {
         const from_str = from_fbs.getWritten();
 
         // Route: find target session(s)
-        // If full JID specified, deliver to that resource; otherwise deliver to all available
         var target_ids: [16]usize = undefined;
-        const target_count = if (to_jid.resource.len > 0)
-            // Full JID — find specific resource
-            blk: {
-                if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
-                    target_ids[0] = entry.id;
-                    break :blk @as(usize, 1);
-                }
-                break :blk @as(usize, 0);
-            } else
-            // Bare JID — deliver to all available resources
-            self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
+        const target_count = if (to_jid.resource.len > 0) blk: {
+            if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
+                target_ids[0] = entry.id;
+                break :blk @as(usize, 1);
+            }
+            break :blk @as(usize, 0);
+        } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
 
         if (target_count == 0) {
-            // TODO: offline message storage. For now, bounce with error.
             log.info("connection {d} message to {s} — recipient unavailable", .{ session.conn.id, to_str });
             self.sendServiceUnavailable(session, id_str, to_str, from_str);
             if (session.conn.hasPendingWrite()) {
@@ -886,30 +1032,54 @@ pub const Server = struct {
             return;
         }
 
-        // Forward the message to target session(s) — rewrite 'from' to sender's full JID
+        const tag_name: []const u8 = switch (session.stanza_kind) {
+            .message => "message",
+            .presence => "presence",
+            .none => return,
+        };
+
+        // Forward to each target session
         for (target_ids[0..target_count]) |tid| {
             const target_session = self.sessions[tid] orelse continue;
-            var msg_buf: [4096]u8 = undefined;
+            // 20KB buffer: opening tag attrs + 16KB inner XML + closing tag
+            var msg_buf: [20480]u8 = undefined;
             var msg_fbs = std.io.fixedBufferStream(&msg_buf);
             const mw = msg_fbs.writer();
-            mw.writeAll("<message from='") catch continue;
+
+            // Opening tag with rewritten 'from'
+            mw.writeByte('<') catch continue;
+            mw.writeAll(tag_name) catch continue;
+            mw.writeAll(" from='") catch continue;
             mw.writeAll(from_str) catch continue;
             mw.writeAll("' to='") catch continue;
             mw.writeAll(to_str) catch continue;
             mw.writeByte('\'') catch continue;
-            if (!std.mem.eql(u8, type_str, "normal")) {
-                mw.writeAll(" type='") catch continue;
-                mw.writeAll(type_str) catch continue;
-                mw.writeByte('\'') catch continue;
+            // Omit type='normal' for messages (it's the default)
+            if (type_str.len > 0) {
+                if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
+                    mw.writeAll(" type='") catch continue;
+                    mw.writeAll(type_str) catch continue;
+                    mw.writeByte('\'') catch continue;
+                }
             }
             if (id_str.len > 0) {
                 mw.writeAll(" id='") catch continue;
                 mw.writeAll(id_str) catch continue;
                 mw.writeByte('\'') catch continue;
             }
-            // For now, self-close (we don't yet accumulate body).
-            // TODO: Phase 7 refinement — accumulate full stanza XML and forward verbatim
-            mw.writeAll("/>") catch continue;
+
+            if (inner_xml.len == 0) {
+                // No children — self-close
+                mw.writeAll("/>") catch continue;
+            } else {
+                // Emit children and close tag
+                mw.writeByte('>') catch continue;
+                mw.writeAll(inner_xml) catch continue;
+                mw.writeAll("</") catch continue;
+                mw.writeAll(tag_name) catch continue;
+                mw.writeByte('>') catch continue;
+            }
+
             target_session.conn.queueSend(msg_fbs.getWritten()) catch continue;
             if (target_session.conn.hasPendingWrite()) {
                 changes.addWrite(target_session.conn.fd, tid) catch {};
@@ -1822,13 +1992,34 @@ pub const Server = struct {
 // Base64 helpers for SASL XML payloads
 // ============================================================================
 
+/// Re-encode text for XML output. The XML parser decodes entities (&amp; → &),
+/// so when serializing parsed content back to XML we must re-encode them.
+fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try writer.writeAll("&amp;"),
+            '<' => try writer.writeAll("&lt;"),
+            '>' => try writer.writeAll("&gt;"),
+            '\'' => try writer.writeAll("&apos;"),
+            '"' => try writer.writeAll("&quot;"),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
 /// Decode base64 into a fixed buffer. Returns the decoded slice or null on error.
 fn b64Decode(input: []const u8, output: []u8) ?[]const u8 {
+    if (input.len == 0) return output[0..0];
     const decoder = std.base64.standard.Decoder;
     const upper_bound = decoder.calcSizeUpperBound(input.len) catch return null;
     if (upper_bound > output.len) return null;
     decoder.decode(output[0..upper_bound], input) catch return null;
-    return output[0..upper_bound];
+    // calcSizeUpperBound doesn't account for '=' padding — subtract padding
+    // chars to get the actual decoded length.
+    var decoded_len = upper_bound;
+    if (input[input.len - 1] == '=') decoded_len -= 1;
+    if (input.len >= 2 and input[input.len - 2] == '=') decoded_len -= 1;
+    return output[0..decoded_len];
 }
 
 /// Base64-encode data and write directly to a writer.

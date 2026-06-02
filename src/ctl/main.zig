@@ -66,15 +66,17 @@ pub fn main() !void {
         const jid = remaining_args.items[1];
         const username = extractLocal(jid);
 
-        // Read password from stdin
-        const password = try readPassword("Password: ");
+        // Read password from stdin (buffers in caller's frame to avoid dangling refs)
+        var pass_buf: [256]u8 = undefined;
+        const password = try readPassword("Password: ", &pass_buf);
         if (password.len < 1) {
             printErr("password cannot be empty\n");
             return error.InvalidArgs;
         }
 
         // Confirm
-        const confirm = try readPassword("Confirm password: ");
+        var confirm_buf: [256]u8 = undefined;
+        const confirm = try readPassword("Confirm password: ", &confirm_buf);
         if (!std.mem.eql(u8, password, confirm)) {
             printErr("passwords do not match\n");
             return error.InvalidArgs;
@@ -121,8 +123,10 @@ pub fn main() !void {
         const jid = remaining_args.items[1];
         const username = extractLocal(jid);
 
-        const password = try readPassword("New password: ");
-        const confirm = try readPassword("Confirm password: ");
+        var pass_buf: [256]u8 = undefined;
+        const password = try readPassword("New password: ", &pass_buf);
+        var confirm_buf: [256]u8 = undefined;
+        const confirm = try readPassword("Confirm password: ", &confirm_buf);
         if (!std.mem.eql(u8, password, confirm)) {
             printErr("passwords do not match\n");
             return error.InvalidArgs;
@@ -169,8 +173,9 @@ fn extractLocal(jid: []const u8) []const u8 {
     return jid;
 }
 
-/// Read a password from stdin (with terminal echo disabled if possible).
-fn readPassword(prompt: []const u8) ![]const u8 {
+/// Read a password from stdin into a caller-provided buffer.
+/// Returns a slice of `out` containing the password.
+fn readPassword(prompt: []const u8, out: *[256]u8) ![]const u8 {
     printErr(prompt);
 
     // Try to disable echo
@@ -191,21 +196,20 @@ fn readPassword(prompt: []const u8) ![]const u8 {
     }
 
     // Read one byte at a time until newline (handles piped input correctly)
-    var buf: [256]u8 = undefined;
     var len: usize = 0;
-    while (len < buf.len) {
+    while (len < out.len) {
         var byte: [1]u8 = undefined;
         const n = posix.read(stdin_fd, &byte) catch return error.ReadFailed;
         if (n == 0) break; // EOF
         if (byte[0] == '\n') break;
         if (byte[0] == '\r') continue;
-        buf[len] = byte[0];
+        out[len] = byte[0];
         len += 1;
     }
 
     if (len == 0) return error.ReadFailed;
 
-    return buf[0..len];
+    return out[0..len];
 }
 
 /// Try to send SIGHUP to xmppd-auth if a PID file exists.
