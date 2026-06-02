@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Server = @import("server.zig").Server;
+const RosterStore = @import("roster_store").RosterStore;
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -41,6 +42,7 @@ pub fn main() !void {
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
     var auth_socket: ?[]const u8 = null;
+    var db_path: ?[]const u8 = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -80,6 +82,11 @@ pub fn main() !void {
                 log.err("--auth-socket requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--db")) {
+            db_path = args.next() orelse {
+                log.err("--db requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -110,6 +117,22 @@ pub fn main() !void {
         };
     }
 
+    // Load roster store from same directory as user DB
+    var roster_store: ?RosterStore = null;
+    if (db_path) |db| {
+        // Derive roster path from DB path: replace extension or append .roster
+        var roster_path_buf: [1024]u8 = undefined;
+        const roster_path = std.fmt.bufPrint(&roster_path_buf, "{s}.roster", .{db}) catch {
+            log.err("db path too long", .{});
+            return error.InvalidArgs;
+        };
+        roster_store = RosterStore.init(allocator, roster_path);
+        roster_store.?.load() catch |err| {
+            log.warn("failed to load roster: {}", .{err});
+        };
+        server.configureRoster(&roster_store.?);
+    }
+
     log.info("listening on {s}:{d}", .{ address, port });
     try server.run();
     log.info("shutdown complete", .{});
@@ -126,6 +149,7 @@ fn printUsage() void {
         \\  --cert PATH      TLS certificate file (PEM)
         \\  --key PATH       TLS private key file (PEM)
         \\  --auth-socket PATH  Auth daemon IPC socket
+        \\  --db PATH        User database path (roster stored alongside)
         \\  --help, -h       Show this help
         \\
     ;
