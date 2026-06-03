@@ -363,6 +363,9 @@ pub fn writeFeatures(writer: anytype, features: FeatureSet) !void {
 
     if (features.bind) {
         try writer.writeAll("<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>");
+        // Legacy session (RFC 3921) — marked optional for backward compatibility.
+        // Some clients (Profanity/libstrophe) expect this element in bind features.
+        try writer.writeAll("<session xmlns='urn:ietf:params:xml:ns:xmpp-session'><optional/></session>");
     }
 
     try writer.writeAll("</stream:features>");

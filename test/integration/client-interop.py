@@ -120,8 +120,9 @@ async def test_disco_info(client):
         has_identity = len(identities) > 0
         if has_identity:
             ident = list(identities)[0]
+            # slixmpp identity tuple: (category, type, lang, name)
             record('disco#info — identity present', True,
-                   f"{ident[0]}/{ident[1]} '{ident[2]}'")
+                   f"{ident[0]}/{ident[1]} '{ident[3]}'")
         else:
             record('disco#info — identity present', False, 'no identity')
 

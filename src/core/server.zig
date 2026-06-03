@@ -1786,12 +1786,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
             w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
             w.writeAll("<feature var='http://jabber.org/protocol/disco#info'/>") catch return;
@@ -1810,12 +1805,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1825,12 +1815,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, child_ns, xml.ns.ping) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("/>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1842,12 +1827,7 @@ pub const Server = struct {
         {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("/>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1857,12 +1837,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1872,12 +1847,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, child_ns, xml.ns.version) and std.mem.eql(u8, iq_type, "get")) {
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("><query xmlns='jabber:iq:version'>") catch return;
             w.writeAll("<name>xmppd</name>") catch return;
             w.writeAll("<version>0.1.0</version>") catch return;
@@ -1887,17 +1857,8 @@ pub const Server = struct {
             return;
         }
 
-        // Unknown IQ — return empty result for 'get', ack for 'set'
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const w = fbs.writer();
-        w.writeAll("<iq type='result'") catch return;
-        if (iq_id.len > 0) {
-            w.writeAll(" id='") catch return;
-            w.writeAll(iq_id) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll("/>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        // Unknown IQ — return service-unavailable per RFC 6120 §8.4
+        self.sendIqError(session, iq_id, "service-unavailable");
     }
 
     /// Handle IQ roster get — return the user's roster.
@@ -1907,12 +1868,7 @@ pub const Server = struct {
             // No roster configured — return empty roster
             var fbs = std.io.fixedBufferStream(&session.write_scratch);
             const w = fbs.writer();
-            w.writeAll("<iq type='result'") catch return;
-            if (iq_id.len > 0) {
-                w.writeAll(" id='") catch return;
-                w.writeAll(iq_id) catch return;
-                w.writeByte('\'') catch return;
-            }
+            self.writeIqHeader(w, session, "result", iq_id);
             w.writeAll("><query xmlns='jabber:iq:roster'/></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -1931,12 +1887,7 @@ pub const Server = struct {
         // Build roster response
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        w.writeAll("<iq type='result'") catch return;
-        if (iq_id.len > 0) {
-            w.writeAll(" id='") catch return;
-            w.writeAll(iq_id) catch return;
-            w.writeByte('\'') catch return;
-        }
+        self.writeIqHeader(w, session, "result", iq_id);
         w.writeAll("><query xmlns='jabber:iq:roster'>") catch return;
 
         // Add each roster item
@@ -2011,26 +1962,44 @@ pub const Server = struct {
         // Ack with result
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        w.writeAll("<iq type='result'") catch return;
-        if (iq_id.len > 0) {
-            w.writeAll(" id='") catch return;
-            w.writeAll(iq_id) catch return;
-            w.writeByte('\'') catch return;
-        }
+        self.writeIqHeader(w, session, "result", iq_id);
         w.writeAll("/>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
     }
 
-    fn sendIqError(self: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
-        _ = self;
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const w = fbs.writer();
-        w.writeAll("<iq type='error'") catch return;
+    /// Write IQ opening tag with type, from (server), to (client full JID), and id.
+    /// Per RFC 6120 §8.1.2.1, server-generated IQ results MUST include from/to.
+    fn writeIqHeader(self: *Server, w: anytype, session: *Session, iq_type: []const u8, iq_id: []const u8) void {
+        w.writeAll("<iq type='") catch return;
+        w.writeAll(iq_type) catch return;
+        w.writeByte('\'') catch return;
+        // from = server host for server-directed IQs
+        w.writeAll(" from='") catch return;
+        w.writeAll(self.server_host) catch return;
+        w.writeByte('\'') catch return;
+        // to = client's full JID
+        if (session.stream.bound_jid) |bound| {
+            w.writeAll(" to='") catch return;
+            w.writeAll(bound.local) catch return;
+            w.writeByte('@') catch return;
+            w.writeAll(bound.domain) catch return;
+            if (bound.resource.len > 0) {
+                w.writeByte('/') catch return;
+                w.writeAll(bound.resource) catch return;
+            }
+            w.writeByte('\'') catch return;
+        }
         if (iq_id.len > 0) {
             w.writeAll(" id='") catch return;
             w.writeAll(iq_id) catch return;
             w.writeByte('\'') catch return;
         }
+    }
+
+    fn sendIqError(self: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        self.writeIqHeader(w, session, "error", iq_id);
         w.writeAll("><error type='cancel'><") catch return;
         w.writeAll(condition) catch return;
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
