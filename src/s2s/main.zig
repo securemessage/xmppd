@@ -980,12 +980,17 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             {
                 // Check if this is a result with type (response) or without (key submission)
                 var result_type: []const u8 = "";
+                var db_from: []const u8 = "";
+                var db_to: []const u8 = "";
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "type")) result_type = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "from")) db_from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) db_to = attr.value;
                 }
                 if (result_type.len == 0) {
-                    // Key submission — would need callback verification (not yet implemented)
-                    log.warn("inbound dialback from {s}: callback verification not implemented", .{session.getRemoteDomain()});
+                    // Key submission — start capturing the key text
+                    session.startDbResult(db_from, db_to);
+                    log.info("inbound dialback key submission from {s}", .{db_from});
                 }
             }
         },
@@ -1005,11 +1010,32 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 }
                 return;
             }
+            // db:result close — key text is fully captured, initiate callback
+            if (session.db_result_pending and
+                (std.mem.eql(u8, name, "result") or std.mem.eql(u8, name, "db:result")))
+            {
+                session.db_result_pending = false;
+                initiateDialbackCallback(daemon, batch, session);
+                return;
+            }
         },
         .text => |text_content| {
             // Stanza content accumulation
             if (session.stanza_active) {
                 session.accumulateText(text_content);
+                return;
+            }
+            // Capture db:result key text (dialback key submission)
+            if (session.db_result_pending) {
+                const remaining = session.db_result_key_buf.len - session.db_result_key_len;
+                const to_copy = @min(text_content.len, remaining);
+                if (to_copy > 0) {
+                    @memcpy(
+                        session.db_result_key_buf[session.db_result_key_len .. session.db_result_key_len + to_copy],
+                        text_content[0..to_copy],
+                    );
+                    session.db_result_key_len += to_copy;
+                }
                 return;
             }
             // Handle db:verify key text
@@ -1083,6 +1109,109 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
             }
         }
     }
+}
+
+/// Initiate a dialback verification callback: open an outbound connection to
+/// the origin domain and send db:verify with the received key.
+fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+    const origin = session.getDbResultFrom();
+    const key = session.getDbResultKey();
+    const stream_id = session.getStreamId();
+
+    if (origin.len == 0 or key.len == 0) {
+        log.warn("dialback callback: missing origin or key", .{});
+        return;
+    }
+
+    log.info("initiating dialback callback to {s} for stream {s}", .{ origin, stream_id });
+
+    // Store the dialback state on the inbound session
+    session.inbound_dialback.receiveResult(origin, stream_id, key);
+
+    // Get or create an outbound connection to the origin domain
+    const conn = daemon.pool.getOrCreate(daemon.local_domain, origin) catch {
+        log.err("dialback callback: failed to create outbound connection to {s}", .{origin});
+        return;
+    };
+
+    // Tag this connection as a dialback callback and store the key/stream_id
+    conn.db_callback_inbound_slot = session.id;
+    const kl = @min(key.len, conn.db_callback_key_buf.len);
+    @memcpy(conn.db_callback_key_buf[0..kl], key[0..kl]);
+    conn.db_callback_key_len = kl;
+    const sl = @min(stream_id.len, conn.db_callback_stream_id_buf.len);
+    @memcpy(conn.db_callback_stream_id_buf[0..sl], stream_id[0..sl]);
+    conn.db_callback_stream_id_len = sl;
+
+    if (conn.isEstablished()) {
+        // Connection already established — send db:verify immediately
+        sendDbVerifyOnCallback(daemon, conn);
+    } else if (conn.state == .connecting and conn.fd < 0) {
+        // New connection — initiate DNS + TCP connect
+        daemon.initiateOutbound(batch, conn, origin);
+    }
+    // else: connection is in progress — db:verify will be sent when established
+}
+
+/// Send a db:verify stanza on an outbound callback connection.
+fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
+    const key = conn.db_callback_key_buf[0..conn.db_callback_key_len];
+    const sid = conn.db_callback_stream_id_buf[0..conn.db_callback_stream_id_len];
+
+    if (key.len == 0 or sid.len == 0) return;
+
+    var buf: [512]u8 = undefined;
+    const verify_xml = dialback.buildDbVerify(
+        &buf,
+        daemon.local_domain,
+        conn.remote_domain,
+        sid,
+        key,
+    ) catch return;
+
+    conn.queueWrite(verify_xml) catch return;
+    _ = conn.flushWrite() catch return;
+    log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
+}
+
+/// Handle a db:verify response on an outbound callback connection.
+/// Completes the inbound dialback by sending db:result on the original inbound session.
+fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, valid: bool) void {
+    const inbound_slot = conn.db_callback_inbound_slot orelse return;
+    const session = daemon.getInbound(inbound_slot) orelse {
+        log.warn("dialback callback: inbound session {d} gone", .{inbound_slot});
+        return;
+    };
+
+    // Send db:result response on the original inbound connection
+    var resp_buf: [512]u8 = undefined;
+    const resp = dialback.buildDbResultResponse(
+        &resp_buf,
+        session.stream.local_domain,
+        session.getRemoteDomain(),
+        valid,
+    ) catch return;
+
+    session.queueWrite(resp) catch return;
+    if (session.hasPendingWrite()) {
+        batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + inbound_slot) catch {};
+    }
+
+    if (valid) {
+        session.inbound_dialback.setValid();
+        session.stream.setAuthenticated();
+        log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{
+            session.getRemoteDomain(), inbound_slot,
+        });
+    } else {
+        session.inbound_dialback.setInvalid();
+        log.warn("dialback callback: {s} invalid, inbound session {d} rejected", .{
+            session.getRemoteDomain(), inbound_slot,
+        });
+    }
+
+    // Clear the callback marker
+    conn.db_callback_inbound_slot = null;
 }
 
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
@@ -1382,6 +1511,20 @@ fn processOutboundEvent(
                     daemon.closeOutbound(slot);
                 }
             }
+            // Handle db:verify response (dialback callback path)
+            else if (std.mem.eql(u8, elem.local_name, "verify") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
+            {
+                var verify_type: []const u8 = "";
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "type")) verify_type = attr.value;
+                }
+                if (verify_type.len > 0 and conn.db_callback_inbound_slot != null) {
+                    const valid = std.mem.eql(u8, verify_type, "valid");
+                    log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
+                    handleDbVerifyResponse(daemon, batch, conn, valid);
+                }
+            }
         },
         .element_end => |name| {
             // End of <stream:features> — decide what to do
@@ -1390,6 +1533,12 @@ fn processOutboundEvent(
                 if (conn.state == .established) {
                     log.info("outbound S2S to {s} fully established", .{conn.remote_domain});
                     daemon.flushOutboundStanzas(conn);
+                    return;
+                }
+
+                // Dialback callback: after TLS+features, send db:verify instead of auth
+                if (conn.db_callback_inbound_slot != null) {
+                    sendDbVerifyOnCallback(daemon, conn);
                     return;
                 }
 

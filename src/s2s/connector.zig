@@ -88,6 +88,15 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
+    /// If set, this outbound connection is a dialback verification callback.
+    /// The value is the inbound session slot that initiated the callback.
+    /// After db:verify response, the result is sent back on that inbound session.
+    db_callback_inbound_slot: ?usize = null,
+    /// The key and stream ID for the pending db:verify request.
+    db_callback_key_buf: [128]u8 = undefined,
+    db_callback_key_len: usize = 0,
+    db_callback_stream_id_buf: [64]u8 = undefined,
+    db_callback_stream_id_len: usize = 0,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.

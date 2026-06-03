@@ -20,6 +20,7 @@ const DaneStatus = connector_mod.DaneStatus;
 const ssl = @import("ssl");
 const SslConn = ssl.SslConn;
 const SslContext = ssl.SslContext;
+const dialback_mod = @import("dialback.zig");
 
 /// TLS handshake state for non-blocking integration with kqueue.
 pub const TlsState = enum {
@@ -72,6 +73,18 @@ pub const S2sSession = struct {
     db_verify_id_buf: [64]u8 = undefined,
     db_verify_id_len: usize = 0,
     db_verify_pending: bool = false,
+
+    /// Pending inbound db:result key capture (dialback: remote sends key text).
+    db_result_pending: bool = false,
+    db_result_from_buf: [256]u8 = undefined,
+    db_result_from_len: usize = 0,
+    db_result_to_buf: [256]u8 = undefined,
+    db_result_to_len: usize = 0,
+    db_result_key_buf: [128]u8 = undefined,
+    db_result_key_len: usize = 0,
+
+    /// Inbound dialback state tracker.
+    inbound_dialback: dialback_mod.InboundDialback = .{},
 
     /// Inbound stanza accumulation — buffers child XML content for stanzas
     /// received on an established session, to be forwarded to xmppd-core via IPC.
@@ -147,6 +160,33 @@ pub const S2sSession = struct {
 
     pub fn getDbVerifyId(self: *const S2sSession) []const u8 {
         return self.db_verify_id_buf[0..self.db_verify_id_len];
+    }
+
+    /// Start tracking an inbound db:result key submission (for dialback callback).
+    pub fn startDbResult(self: *S2sSession, from: []const u8, to: []const u8) void {
+        const fl = @min(from.len, self.db_result_from_buf.len);
+        @memcpy(self.db_result_from_buf[0..fl], from[0..fl]);
+        self.db_result_from_len = fl;
+        const tl = @min(to.len, self.db_result_to_buf.len);
+        @memcpy(self.db_result_to_buf[0..tl], to[0..tl]);
+        self.db_result_to_len = tl;
+        self.db_result_key_len = 0;
+        self.db_result_pending = true;
+    }
+
+    /// Get the db:result from domain.
+    pub fn getDbResultFrom(self: *const S2sSession) []const u8 {
+        return self.db_result_from_buf[0..self.db_result_from_len];
+    }
+
+    /// Get the db:result to domain.
+    pub fn getDbResultTo(self: *const S2sSession) []const u8 {
+        return self.db_result_to_buf[0..self.db_result_to_len];
+    }
+
+    /// Get the accumulated db:result key text.
+    pub fn getDbResultKey(self: *const S2sSession) []const u8 {
+        return self.db_result_key_buf[0..self.db_result_key_len];
     }
 
     /// Set the remote domain from the stream open.
