@@ -30,6 +30,11 @@ pub const IpcClient = struct {
     /// Receive buffer for partial frame reassembly.
     recv_buf: [RECV_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
+    /// Bytes consumed by the last nextMessage() call, pending compaction.
+    /// The buffer is compacted lazily — at the start of the next
+    /// nextMessage() or recv() call — so that the returned Message's
+    /// borrowed slices remain valid until the caller processes them.
+    recv_consumed: usize = 0,
 
     /// Send buffer.
     send_buf: [SEND_BUF_SIZE]u8 = undefined,
@@ -63,6 +68,7 @@ pub const IpcClient = struct {
         self.fd = sock;
         self.connected = true;
         self.recv_len = 0;
+        self.recv_consumed = 0;
         self.send_start = 0;
         self.send_end = 0;
     }
@@ -75,6 +81,7 @@ pub const IpcClient = struct {
         }
         self.connected = false;
         self.recv_len = 0;
+        self.recv_consumed = 0;
         self.send_start = 0;
         self.send_end = 0;
     }
@@ -142,6 +149,9 @@ pub const IpcClient = struct {
         if (!self.connected) return error.NotConnected;
         if (self.fd < 0) return error.NotConnected;
 
+        // Apply deferred compaction before reading new data
+        self.compactRecvBuf();
+
         // Read into recv_buf
         const space = RECV_BUF_SIZE - self.recv_len;
         if (space == 0) return error.RecvBufferFull;
@@ -173,21 +183,35 @@ pub const IpcClient = struct {
     /// Try to extract one complete message from the receive buffer.
     /// Returns null if no complete frame is available yet.
     /// The returned Message borrows from the recv buffer — process it
-    /// before calling recv() again.
+    /// before calling nextMessage() or recv() again.
     pub fn nextMessage(self: *IpcClient) !?protocol.Message {
+        // Apply deferred compaction from the previous call
+        self.compactRecvBuf();
+
         const data = self.recv_buf[0..self.recv_len];
         const frame = protocol.readFrame(data) orelse return null;
 
         const msg = try protocol.decode(frame.payload);
 
-        // Compact: shift remaining data to front
-        const remaining = self.recv_len - frame.consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[frame.consumed..self.recv_len]);
-        }
-        self.recv_len = remaining;
+        // Defer compaction — the returned msg borrows from recv_buf.
+        // Compaction will happen at the start of the next nextMessage()
+        // or recv() call.
+        self.recv_consumed = frame.consumed;
 
         return msg;
+    }
+
+    /// Apply deferred compaction: shift unconsumed data to the front of
+    /// the receive buffer. This invalidates any previously returned
+    /// Message slices.
+    fn compactRecvBuf(self: *IpcClient) void {
+        if (self.recv_consumed == 0) return;
+        const remaining = self.recv_len - self.recv_consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[self.recv_consumed..self.recv_len]);
+        }
+        self.recv_len = remaining;
+        self.recv_consumed = 0;
     }
 
     fn compactSendBuf(self: *IpcClient) void {

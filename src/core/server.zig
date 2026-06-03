@@ -459,11 +459,10 @@ pub const Server = struct {
             // OpenSSL may have buffered application data internally during
             // the handshake (client pipelines Finished + new stream open).
             // kqueue won't fire for data already consumed from the socket.
-            // Try reading immediately to drain any buffered TLS app data.
+            // Drain in a loop — handleReadable returns on WouldBlock.
             self.handleReadable(id, changes);
 
-            // If the session is still alive and we didn't get data yet,
-            // ensure kqueue will notify us when new data arrives.
+            // If the session is still alive, ensure kqueue monitors the fd.
             if (self.sessions[id] != null and !session.conn.isClosed()) {
                 changes.addRead(session.conn.fd, id) catch {};
             }
@@ -958,6 +957,16 @@ pub const Server = struct {
 
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+
+                // OpenSSL may have buffered the client's post-auth stream open
+                // internally. kqueue won't fire for data already consumed from
+                // the socket. Drain the SSL buffer immediately — same pattern
+                // as post-TLS and the S2S post-SASL fix.
+                if (session.conn.tls_conn) |*tls| {
+                    if (tls.pending() > 0) {
+                        self.handleReadable(conn_id, changes);
+                    }
                 }
             },
             .auth_failure => |m| {

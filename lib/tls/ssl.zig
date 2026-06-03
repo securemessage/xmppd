@@ -284,6 +284,14 @@ pub const SslConn = struct {
         };
     }
 
+    /// Returns the number of bytes available for immediate read from the
+    /// SSL internal buffer (already decrypted, not yet returned to the app).
+    /// A non-zero value means `read()` can return data without a syscall.
+    pub fn pending(self: *SslConn) usize {
+        const ret = c.SSL_pending(self.ssl);
+        return if (ret > 0) @intCast(ret) else 0;
+    }
+
     /// Extract the peer's leaf certificate as DER-encoded bytes.
     ///
     /// Returns `null` if no peer certificate is available (server-side,
