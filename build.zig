@@ -258,8 +258,19 @@ pub fn build(b: *std.Build) void {
 
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    // --- Storage backend module (needed by auth + ctl tests and executables) ---
+
+    const backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const lmdb_dep = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
+
     // --- Auth tests ---
 
+    // Legacy flat-file user store tests (backward compat)
     const user_store_test_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/user_store.zig"),
         .target = target,
@@ -274,6 +285,22 @@ pub fn build(b: *std.Build) void {
 
     const run_user_store_tests = b.addRunArtifact(user_store_tests);
 
+    // Generic user store tests (uses MemoryBackend)
+    const generic_user_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/user_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generic_user_store_test_mod.addImport("sasl", sasl_mod);
+    generic_user_store_test_mod.addImport("backend", backend_test_mod);
+
+    const generic_user_store_tests = b.addTest(.{
+        .name = "generic-user-store-tests",
+        .root_module = generic_user_store_test_mod,
+    });
+
+    const run_generic_user_store_tests = b.addRunArtifact(generic_user_store_tests);
+
     const auth_handler_test_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/handler.zig"),
         .target = target,
@@ -281,7 +308,8 @@ pub fn build(b: *std.Build) void {
     });
     auth_handler_test_mod.addImport("sasl", sasl_mod);
     auth_handler_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
-    auth_handler_test_mod.addImport("user_store", user_store_test_mod);
+    auth_handler_test_mod.addImport("user_store", generic_user_store_test_mod);
+    auth_handler_test_mod.addImport("backend", backend_test_mod);
 
     const auth_handler_tests = b.addTest(.{
         .name = "auth-handler-tests",
@@ -454,12 +482,6 @@ pub fn build(b: *std.Build) void {
 
     // --- Storage backend tests ---
 
-    const backend_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/store/backend.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const backend_tests = b.addTest(.{
         .name = "storage-backend-tests",
         .root_module = backend_test_mod,
@@ -468,8 +490,6 @@ pub fn build(b: *std.Build) void {
     const run_backend_tests = b.addRunArtifact(backend_tests);
 
     // --- LMDB backend tests ---
-
-    const lmdb_dep = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
 
     const lmdb_backend_test_mod = b.createModule(.{
         .root_source_file = b.path("src/store/lmdb.zig"),
@@ -563,12 +583,28 @@ pub fn build(b: *std.Build) void {
     });
     auth_ipc_server_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
 
+    const auth_backend_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const auth_lmdb_backend_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lmdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    auth_lmdb_backend_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
+    auth_lmdb_backend_mod.addImport("backend", auth_backend_mod);
+
     const auth_user_store_mod = b.createModule(.{
-        .root_source_file = b.path("src/auth/user_store.zig"),
+        .root_source_file = b.path("src/store/user_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     auth_user_store_mod.addImport("sasl", sasl_mod);
+    auth_user_store_mod.addImport("backend", auth_backend_mod);
 
     const auth_handler_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/handler.zig"),
@@ -577,7 +613,6 @@ pub fn build(b: *std.Build) void {
     });
     auth_handler_mod.addImport("sasl", sasl_mod);
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
-    auth_handler_mod.addImport("user_store", auth_user_store_mod);
 
     const auth_event_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/core/event_loop.zig"),
@@ -589,12 +624,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/auth/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     auth_mod.addImport("sasl", sasl_mod);
     auth_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
+    auth_mod.addImport("lmdb_backend", auth_lmdb_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
 
     const auth_exe = b.addExecutable(.{
@@ -645,12 +682,28 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(s2s_exe);
 
     // xmppctl: user management CLI
+    const ctl_backend_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const ctl_lmdb_backend_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lmdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_lmdb_backend_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
+    ctl_lmdb_backend_mod.addImport("backend", ctl_backend_mod);
+
     const ctl_user_store_mod = b.createModule(.{
-        .root_source_file = b.path("src/auth/user_store.zig"),
+        .root_source_file = b.path("src/store/user_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     ctl_user_store_mod.addImport("sasl", sasl_mod);
+    ctl_user_store_mod.addImport("backend", ctl_backend_mod);
 
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
@@ -659,6 +712,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     ctl_mod.addImport("user_store", ctl_user_store_mod);
+    ctl_mod.addImport("lmdb_backend", ctl_lmdb_backend_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -674,6 +728,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     ctl_test_mod.addImport("user_store", ctl_user_store_mod);
+    ctl_test_mod.addImport("lmdb_backend", ctl_lmdb_backend_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",
@@ -713,4 +768,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_main_tests.step);
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_lmdb_backend_tests.step);
+    test_step.dependOn(&run_generic_user_store_tests.step);
 }

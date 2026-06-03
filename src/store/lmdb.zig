@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const lmdb = @import("lmdb");
-const backend = @import("backend.zig");
+const backend = @import("backend");
 
 const log = std.log.scoped(.lmdb_store);
 

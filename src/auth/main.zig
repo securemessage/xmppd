@@ -1,26 +1,29 @@
 //! # xmppd-auth — Authentication daemon
 //!
 //! Separate process that handles SASL authentication exchanges over a Unix
-//! domain socket IPC channel. Loads user credentials from a flat-file store
-//! and processes SCRAM-SHA-256 and PLAIN authentication requests.
+//! domain socket IPC channel. Reads user credentials from the storage backend
+//! (LMDB by default) and processes SCRAM-SHA-256 and PLAIN authentication.
 //!
 //! ## Usage
 //!
 //! ```
-//! xmppd-auth --db /var/db/xmppd/users.db --socket /var/run/xmppd/auth.sock
+//! xmppd-auth --db /var/db/xmppd/ --socket /var/run/xmppd/auth.sock
 //! ```
 //!
 //! ## Signals
 //!
-//! - SIGHUP: reload user store from disk
+//! - SIGHUP: logged (LMDB always sees latest committed data)
 //! - SIGTERM: graceful shutdown
 
 const std = @import("std");
 const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;
-const AuthHandler = @import("handler").AuthHandler;
-const UserStore = @import("user_store").UserStore;
+const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const user_store_mod = @import("user_store");
+const UserStore = user_store_mod.UserStore(LmdbBackend);
+const handler_mod = @import("handler");
+const AuthHandler = handler_mod.AuthHandler(UserStore);
 const protocol = @import("ipc_protocol");
 const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
@@ -44,7 +47,7 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    var db_path: []const u8 = "/var/db/xmppd/users.db";
+    var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
 
     _ = args.next(); // Skip argv[0]
@@ -70,10 +73,10 @@ pub fn main() !void {
 
     log.info("xmppd-auth starting, db={s} socket={s}", .{ db_path, socket_path });
 
-    // Load user store
-    var store = UserStore.init(allocator, db_path);
-    defer store.deinit();
-    try store.load();
+    // Open storage backend
+    var backend = try LmdbBackend.open(db_path, .{});
+    defer backend.close();
+    var store = UserStore.init(&backend);
 
     // Initialize auth handler
     var handler = AuthHandler.init(allocator, &store);
@@ -114,10 +117,7 @@ pub fn main() !void {
                         log.info("received signal {d}, shutting down", .{s.signo});
                         running = false;
                     } else if (s.signo == posix.SIG.HUP) {
-                        log.info("received SIGHUP, reloading user store", .{});
-                        store.load() catch |err| {
-                            log.err("failed to reload user store: {}", .{err});
-                        };
+                        log.info("received SIGHUP (LMDB — no reload needed)", .{});
                     }
                 },
                 .fd_readable => |e| {
@@ -208,7 +208,7 @@ fn printUsage() void {
         \\Usage: xmppd-auth [OPTIONS]
         \\
         \\Options:
-        \\  --db PATH       Path to users.db (default: /var/db/xmppd/users.db)
+        \\  --db PATH       Storage directory (default: /var/db/xmppd)
         \\  --socket PATH   IPC socket path (default: /var/run/xmppd/auth.sock)
         \\  --help, -h      Show this help
         \\

@@ -1,8 +1,8 @@
 //! # xmppctl — User management CLI
 //!
 //! Administrative tool for managing xmppd user accounts. Operates directly
-//! on the user store file (not via IPC). After modifications, send SIGHUP
-//! to xmppd-auth to reload.
+//! on the storage backend (LMDB by default). After modifications, send SIGHUP
+//! to xmppd-auth (no-op for LMDB — it sees changes immediately).
 //!
 //! ## Commands
 //!
@@ -15,7 +15,9 @@
 
 const std = @import("std");
 const posix = std.posix;
-const UserStore = @import("user_store").UserStore;
+const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const user_store_mod = @import("user_store");
+const UserStore = user_store_mod.UserStore(LmdbBackend);
 
 const log = std.log.scoped(.xmppctl);
 
@@ -27,7 +29,7 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    var db_path: []const u8 = "/var/db/xmppd/users.db";
+    var db_path: []const u8 = "/var/db/xmppd";
 
     _ = args.next(); // Skip argv[0]
 
@@ -53,10 +55,10 @@ pub fn main() !void {
 
     const command = remaining_args.items[0];
 
-    // Open user store
-    var store = UserStore.init(allocator, db_path);
-    defer store.deinit();
-    try store.load();
+    // Open storage backend
+    var backend = try LmdbBackend.open(db_path, .{});
+    defer backend.close();
+    var store = UserStore.init(&backend);
 
     if (std.mem.eql(u8, command, "adduser")) {
         if (remaining_args.items.len < 2) {
@@ -82,7 +84,7 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
 
-        store.addUser(username, password) catch |err| {
+        store.addUser(allocator, username, password) catch |err| {
             switch (err) {
                 error.UserExists => printErr("user already exists\n"),
                 else => {
@@ -104,7 +106,7 @@ pub fn main() !void {
         const jid = remaining_args.items[1];
         const username = extractLocal(jid);
 
-        store.removeUser(username) catch |err| {
+        store.removeUser(allocator, username) catch |err| {
             switch (err) {
                 error.UserNotFound => printErr("user not found\n"),
                 else => return err,
@@ -132,7 +134,7 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
 
-        store.changePassword(username, password) catch |err| {
+        store.changePassword(allocator, username, password) catch |err| {
             switch (err) {
                 error.UserNotFound => printErr("user not found\n"),
                 else => return err,
@@ -248,7 +250,7 @@ fn printUsage() void {
         \\  listusers       List all users
         \\
         \\Options:
-        \\  --db PATH       Path to users.db (default: /var/db/xmppd/users.db)
+        \\  --db PATH       Storage directory (default: /var/db/xmppd)
         \\
     );
 }

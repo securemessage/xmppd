@@ -123,7 +123,7 @@ pub fn assertBackend(comptime B: type) void {
 
 /// In-memory backend for testing. Stores data in hash maps.
 /// Also serves as the reference implementation of the trait contract.
-const MemoryBackend = struct {
+pub const MemoryBackend = struct {
     const Self = @This();
 
     namespaces: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
