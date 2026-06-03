@@ -79,6 +79,14 @@ pub const SslError = error{
 // SslContext — shared across all connections
 // ============================================================================
 
+/// Custom OpenSSL verify callback that always accepts the peer certificate.
+/// DANE verification is performed separately after the handshake completes.
+/// This allows us to request a peer cert without OpenSSL rejecting it for
+/// PKIX reasons (self-signed, unknown CA, etc).
+fn alwaysAcceptVerify(_: c_int, _: ?*c.X509_STORE_CTX) callconv(.c) c_int {
+    return 1; // Always OK
+}
+
 /// An OpenSSL `SSL_CTX` wrapper. Create once at server startup, share across
 /// all connections. Thread-safe after initialization (OpenSSL 3.x guarantee).
 pub const SslContext = struct {
@@ -110,6 +118,14 @@ pub const SslContext = struct {
         if (c.SSL_CTX_check_private_key(ctx) != 1) {
             return SslError.KeyMismatch;
         }
+
+        // Request (but don't require) a client certificate for DANE verification.
+        // SSL_VERIFY_PEER without SSL_VERIFY_FAIL_IF_NO_PEER_CERT means:
+        // - Ask the client for a cert (CertificateRequest message)
+        // - If they provide one, we can inspect it (for DANE)
+        // - If they don't provide one, the handshake still succeeds (dialback fallback)
+        // Custom callback always returns OK — we do DANE ourselves after handshake.
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, &alwaysAcceptVerify);
 
         return SslContext{ .ctx = ctx };
     }

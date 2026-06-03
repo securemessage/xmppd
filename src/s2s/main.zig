@@ -876,10 +876,19 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             const action = session.stream.handleStreamOpen(from, to, version);
             executeAction(daemon, session, action);
 
+            // After post-TLS stream open, perform DANE verification on peer cert
+            if (session.stream.state == .features_auth and session.tls_conn != null and from.len > 0) {
+                performInboundDane(daemon, session, from);
+            }
+
             // After stream open response, send features
             if (session.stream.getFeatures()) |_| {
                 const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
                 executeAction(daemon, session, features_action);
+            } else if (session.stream.isEstablished()) {
+                // Post-auth stream: send empty features
+                session.queueWrite("<stream:features/>") catch {};
+                log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
             }
         },
         .element_start => |elem| {
@@ -963,6 +972,7 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
         .send_sasl_success => {
             const success = session.buildSaslSuccess(&buf) catch return;
             session.queueWrite(success) catch {};
+            _ = session.flushWrite() catch {};
             log.info("inbound S2S authenticated: remote={s}", .{session.getRemoteDomain()});
         },
         .send_sasl_failure => |reason| {
@@ -1404,6 +1414,89 @@ fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnectio
         }
     } else {
         conn.setDaneResult(.no_records);
+    }
+}
+
+/// Perform DANE verification for an inbound S2S session.
+/// Called after post-TLS stream open reveals the remote domain.
+/// Queries TLSA for the standard S2S port of the remote domain and
+/// verifies against the presented peer certificate.
+fn performInboundDane(daemon: *S2sDaemon, session: *S2sSession, remote_domain: []const u8) void {
+    const dane_mod = @import("dane.zig");
+
+    // Resolve the remote's SRV to find their actual S2S port for TLSA query
+    const targets = dns.resolver.resolveXmpp(daemon.allocator, remote_domain, true) catch {
+        session.stream.setDaneVerified(false);
+        return;
+    };
+    defer {
+        for (targets) |t| daemon.allocator.free(t.host);
+        daemon.allocator.free(targets);
+    }
+    const tlsa_port: u16 = if (targets.len > 0) targets[0].port else 5269;
+    const tlsa_host = if (targets.len > 0) targets[0].host else remote_domain;
+
+    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, tlsa_port, tlsa_host) catch {
+        session.stream.setDaneVerified(false);
+        return;
+    };
+    defer {
+        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
+        if (tlsa_records.len > 0) daemon.allocator.free(tlsa_records);
+    }
+
+    if (tlsa_records.len == 0) {
+        log.info("inbound DANE: no TLSA records for {s}", .{remote_domain});
+        session.stream.setDaneVerified(false);
+        return;
+    }
+
+    // Get peer cert from the TLS session
+    if (session.tls_conn) |*tls| {
+        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
+            session.stream.setDaneVerified(false);
+            return;
+        };
+        if (leaf_der == null) {
+            log.info("inbound DANE: no peer certificate from {s}", .{remote_domain});
+            session.stream.setDaneVerified(false);
+            return;
+        }
+        defer daemon.allocator.free(leaf_der.?);
+
+        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
+            session.stream.setDaneVerified(false);
+            return;
+        };
+        defer {
+            for (chain_der) |cert| daemon.allocator.free(cert);
+            daemon.allocator.free(chain_der);
+        }
+
+        // Convert and verify
+        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
+            session.stream.setDaneVerified(false);
+            return;
+        };
+        defer daemon.allocator.free(dane_records);
+        for (tlsa_records, 0..) |rec, i| {
+            dane_records[i] = .{
+                .usage = rec.usage,
+                .selector = rec.selector,
+                .matching_type = rec.matching_type,
+                .association_data = rec.association_data,
+            };
+        }
+
+        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
+        const verified = (status == .verified);
+        session.stream.setDaneVerified(verified);
+        log.info("inbound DANE for {s}: {s}", .{
+            remote_domain,
+            if (verified) "verified" else "not verified (will offer dialback)",
+        });
+    } else {
+        session.stream.setDaneVerified(false);
     }
 }
 

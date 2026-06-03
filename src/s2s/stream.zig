@@ -164,17 +164,26 @@ pub const S2sStream = struct {
                 }
             },
             .awaiting_stream_open_tls => {
-                // Post-TLS stream restart
+                // Post-TLS or post-SASL stream restart
                 if (self.role == .receiving) {
-                    self.state = .features_auth;
+                    if (self.authenticated) {
+                        // Post-SASL restart — stream is now fully established
+                        self.state = .established;
+                    } else {
+                        self.state = .features_auth;
+                    }
                     return .{ .send_stream_open = .{
                         .from = self.local_domain,
                         .to = self.remote_domain,
                         .id = "s2s-placeholder-id",
                     } };
                 } else {
-                    // Outbound post-TLS — wait for features
-                    self.state = .features_auth;
+                    // Outbound — wait for features
+                    if (self.authenticated) {
+                        self.state = .established;
+                    } else {
+                        self.state = .features_auth;
+                    }
                     return .none;
                 }
             },
@@ -217,7 +226,8 @@ pub const S2sStream = struct {
 
         if (self.dane_verified) {
             self.authenticated = true;
-            self.state = .established;
+            // After SASL success, remote will restart the stream
+            self.state = .awaiting_stream_open_tls; // Reuse: expects stream restart
             return .send_sasl_success;
         } else {
             return .{ .send_sasl_failure = "not-authorized" };
@@ -302,8 +312,16 @@ test "S2sStream: receiving role — full lifecycle" {
     // SASL EXTERNAL auth
     const auth_action = s.handleSaslExternal();
     try std.testing.expectEqual(S2sStreamAction.send_sasl_success, auth_action);
-    try std.testing.expect(s.isEstablished());
     try std.testing.expect(s.authenticated);
+    try std.testing.expectEqual(S2sStreamState.awaiting_stream_open_tls, s.state);
+
+    // Post-auth stream restart
+    const open3_action = s.handleStreamOpen("b.example", "a.example", "1.0");
+    switch (open3_action) {
+        .send_stream_open => {},
+        else => return error.UnexpectedAction,
+    }
+    try std.testing.expect(s.isEstablished());
 }
 
 test "S2sStream: initiating role — DANE auth flow" {
