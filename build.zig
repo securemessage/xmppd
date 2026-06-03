@@ -452,6 +452,41 @@ pub fn build(b: *std.Build) void {
 
     const run_s2s_main_tests = b.addRunArtifact(s2s_main_tests);
 
+    // --- Storage backend tests ---
+
+    const backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const backend_tests = b.addTest(.{
+        .name = "storage-backend-tests",
+        .root_module = backend_test_mod,
+    });
+
+    const run_backend_tests = b.addRunArtifact(backend_tests);
+
+    // --- LMDB backend tests ---
+
+    const lmdb_dep = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
+
+    const lmdb_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lmdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lmdb_backend_test_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
+    lmdb_backend_test_mod.addImport("backend", backend_test_mod);
+
+    const lmdb_backend_tests = b.addTest(.{
+        .name = "lmdb-backend-tests",
+        .root_module = lmdb_backend_test_mod,
+    });
+
+    const run_lmdb_backend_tests = b.addRunArtifact(lmdb_backend_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -676,4 +711,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_dialback_tests.step);
     test_step.dependOn(&run_s2s_session_tests.step);
     test_step.dependOn(&run_s2s_main_tests.step);
+    test_step.dependOn(&run_backend_tests.step);
+    test_step.dependOn(&run_lmdb_backend_tests.step);
 }

@@ -1,0 +1,12 @@
+.{
+    .name = .xmppd,
+    .version = "0.15.2",
+    .dependencies = .{
+        .lmdb = .{
+            .url = "https://github.com/nDimensional/zig-lmdb/archive/refs/tags/v0.3.2.tar.gz",
+            .hash = "lmdb-0.3.2-6TpzoHE_AAAk2TZyIMXLiBTiGoCDd4ykSqHE91QzBE2L",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xf7ddc72a9baea654,
+}
