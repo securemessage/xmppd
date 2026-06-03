@@ -649,8 +649,10 @@ pub fn main() !void {
         }
     }
 
-    // Initialize client TLS context for outbound connections
-    daemon.tls_client_ctx = SslContext.initClient() catch |err| {
+    // Initialize client TLS context for outbound connections (with our cert for SASL EXTERNAL)
+    const client_cert: ?[*:0]const u8 = if (cert_path) |p| p.ptr else null;
+    const client_key: ?[*:0]const u8 = if (key_path) |p| p.ptr else null;
+    daemon.tls_client_ctx = SslContext.initClientWithCert(client_cert, client_key) catch |err| {
         log.err("failed to initialize client TLS context: {}", .{err});
         return err;
     };

@@ -192,51 +192,81 @@ pub const CertFingerprint = struct {
 };
 
 /// Extract SubjectPublicKeyInfo from DER-encoded X.509 (simplified ASN.1).
+///
+/// X.509 structure:
+///   SEQUENCE {                    -- Certificate
+///     SEQUENCE {                  -- tbsCertificate
+///       [0] EXPLICIT version     -- optional
+///       INTEGER serialNumber
+///       SEQUENCE signatureAlgorithm
+///       SEQUENCE issuer
+///       SEQUENCE validity
+///       SEQUENCE subject
+///       SEQUENCE subjectPublicKeyInfo  <-- this is what we want
+///       ...
+///     }
+///     ...
+///   }
 fn extractSpki(der: []const u8) ?[]const u8 {
     var pos: usize = 0;
 
-    // Outer SEQUENCE
-    _ = parseTag(der, &pos) orelse return null;
-    // tbsCertificate SEQUENCE
-    _ = parseTag(der, &pos) orelse return null;
-    // version [0] EXPLICIT (optional)
+    // Enter outer SEQUENCE (Certificate) — skip tag+length header only
+    _ = enterSequence(der, &pos) orelse return null;
+    // Enter tbsCertificate SEQUENCE — skip tag+length header only
+    _ = enterSequence(der, &pos) orelse return null;
+    // version [0] EXPLICIT (optional — context tag class 0xA0)
     if (pos < der.len and (der[pos] & 0xE0) == 0xA0) {
-        _ = parseTag(der, &pos) orelse return null;
+        skipTlv(der, &pos) orelse return null;
     }
-    // serialNumber, signature, issuer, validity, subject — skip 5
-    comptime var i = 0;
-    inline while (i < 5) : (i += 1) {
-        _ = parseTag(der, &pos) orelse return null;
-    }
-    // subjectPublicKeyInfo — return full TLV
+    // serialNumber — skip full TLV
+    skipTlv(der, &pos) orelse return null;
+    // signatureAlgorithm — skip full TLV
+    skipTlv(der, &pos) orelse return null;
+    // issuer — skip full TLV
+    skipTlv(der, &pos) orelse return null;
+    // validity — skip full TLV
+    skipTlv(der, &pos) orelse return null;
+    // subject — skip full TLV
+    skipTlv(der, &pos) orelse return null;
+    // subjectPublicKeyInfo — return the entire TLV (tag + length + value)
     const spki_start = pos;
-    _ = parseTag(der, &pos) orelse return null;
+    skipTlv(der, &pos) orelse return null;
     return der[spki_start..pos];
 }
 
-fn parseTag(der: []const u8, pos: *usize) ?usize {
+/// Skip a complete TLV (tag + length + value), advancing pos past it.
+fn skipTlv(der: []const u8, pos: *usize) ?void {
     if (pos.* >= der.len) return null;
-    var p = pos.*;
-    const tag_byte = der[p];
-    _ = tag_byte;
-    p += 1;
-    if (p >= der.len) return null;
-    const len_byte = der[p];
-    p += 1;
-    var length: usize = 0;
+    pos.* += 1; // tag byte
+    const length = readLength(der, pos) orelse return null;
+    if (pos.* + length > der.len) return null;
+    pos.* += length;
+}
+
+/// Enter a SEQUENCE: skip the tag+length header, return the content length.
+/// After this call, pos points to the first byte of the SEQUENCE content.
+fn enterSequence(der: []const u8, pos: *usize) ?usize {
+    if (pos.* >= der.len) return null;
+    pos.* += 1; // tag byte (0x30 for SEQUENCE)
+    return readLength(der, pos);
+}
+
+/// Read a DER length value, advancing pos past the length bytes.
+fn readLength(der: []const u8, pos: *usize) ?usize {
+    if (pos.* >= der.len) return null;
+    const len_byte = der[pos.*];
+    pos.* += 1;
     if ((len_byte & 0x80) == 0) {
-        length = len_byte;
-    } else {
-        const num_bytes = len_byte & 0x7F;
-        if (num_bytes > 4 or p + num_bytes > der.len) return null;
-        var j: usize = 0;
-        while (j < num_bytes) : (j += 1) {
-            length = (length << 8) | der[p];
-            p += 1;
-        }
+        return len_byte;
     }
-    if (p + length > der.len) return null;
-    pos.* = p + length;
+    const num_bytes = len_byte & 0x7F;
+    if (num_bytes > 4 or pos.* + num_bytes > der.len) return null;
+    var length: usize = 0;
+    var j: usize = 0;
+    while (j < num_bytes) : (j += 1) {
+        length = (length << 8) | der[pos.*];
+        pos.* += 1;
+    }
     return length;
 }
 

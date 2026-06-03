@@ -116,16 +116,39 @@ pub const SslContext = struct {
 
     /// Initialize a client-side TLS context for outbound connections.
     ///
-    /// No certificate or key is needed — the connecting party doesn't present
-    /// a client cert (unless mutual TLS is required, which is handled separately).
-    /// PKIX verification is disabled because we use DANE verification ourselves.
+    /// Loads our certificate for presentation to the remote server (needed for
+    /// SASL EXTERNAL authentication with DANE). PKIX verification of the remote
+    /// peer is disabled because we use DANE verification ourselves.
     pub fn initClient() SslError!SslContext {
+        return initClientWithCert(null, null);
+    }
+
+    /// Initialize a client-side TLS context with a certificate for mutual TLS.
+    ///
+    /// The cert/key are presented to the remote server so it can authenticate us
+    /// (required for XMPP S2S SASL EXTERNAL after DANE verification).
+    pub fn initClientWithCert(cert_path: ?[*:0]const u8, key_path: ?[*:0]const u8) SslError!SslContext {
         const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
         errdefer c.SSL_CTX_free(ctx);
 
         // Disable OpenSSL's built-in certificate verification — we do DANE ourselves
         c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
+
+        // Load our certificate for presentation to remote peer
+        if (cert_path) |cp| {
+            if (c.SSL_CTX_use_certificate_chain_file(ctx, cp) != 1) {
+                return SslError.CertLoadFailed;
+            }
+        }
+        if (key_path) |kp| {
+            if (c.SSL_CTX_use_PrivateKey_file(ctx, kp, c.SSL_FILETYPE_PEM) != 1) {
+                return SslError.KeyLoadFailed;
+            }
+            if (c.SSL_CTX_check_private_key(ctx) != 1) {
+                return SslError.KeyMismatch;
+            }
+        }
 
         return SslContext{ .ctx = ctx };
     }
