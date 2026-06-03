@@ -1502,15 +1502,6 @@ fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnectio
             };
         }
 
-        // Log fingerprint details for debugging
-        {
-            const fp = dane_mod.CertFingerprint.fromDer(leaf_der.?);
-            log.info("DANE leaf SPKI sha256: {s}", .{std.fmt.bytesToHex(fp.spki, .lower)});
-            log.info("DANE expected from DNS ({d} bytes): {s}", .{ dane_records[0].association_data.len, std.fmt.bytesToHex(dane_records[0].association_data[0..32].*, .lower) });
-            log.info("DANE record: usage={d} sel={d} match={d}", .{
-                dane_records[0].usage, dane_records[0].selector, dane_records[0].matching_type,
-            });
-        }
         const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
         log.info("DANE result for {s}: {s}", .{
             conn.remote_domain,
