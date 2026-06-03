@@ -152,11 +152,15 @@ pub fn resolveXmppTargets(
     direct_tls_records: []const SrvRecord,
 ) ![]ConnectionTarget {
     var targets = std.ArrayList(ConnectionTarget){};
+    errdefer {
+        for (targets.items) |t| alloc.free(t.host);
+        targets.deinit(alloc);
+    }
 
     // Direct TLS targets first (preferred per XEP-0368)
     for (direct_tls_records) |srv| {
         try targets.append(alloc, .{
-            .host = srv.target,
+            .host = try alloc.dupe(u8, srv.target),
             .port = srv.port,
             .is_direct_tls = true,
         });
@@ -165,7 +169,7 @@ pub fn resolveXmppTargets(
     // Then STARTTLS targets
     for (srv_records) |srv| {
         try targets.append(alloc, .{
-            .host = srv.target,
+            .host = try alloc.dupe(u8, srv.target),
             .port = srv.port,
             .is_direct_tls = false,
         });
@@ -175,7 +179,7 @@ pub fn resolveXmppTargets(
     if (targets.items.len == 0) {
         const default_port: u16 = if (is_server) 5269 else 5222;
         try targets.append(alloc, .{
-            .host = domain,
+            .host = try alloc.dupe(u8, domain),
             .port = default_port,
             .is_direct_tls = false,
         });
@@ -266,7 +270,10 @@ test "resolveXmppTargets with SRV records" {
     };
 
     const targets = try resolveXmppTargets(alloc, "example.com", false, &srv_records, &direct_tls);
-    defer alloc.free(targets);
+    defer {
+        for (targets) |t| alloc.free(t.host);
+        alloc.free(targets);
+    }
 
     // Direct TLS should come first
     try std.testing.expectEqual(@as(usize, 2), targets.len);
@@ -280,7 +287,10 @@ test "resolveXmppTargets fallback" {
     const alloc = std.testing.allocator;
 
     const targets = try resolveXmppTargets(alloc, "example.com", false, &.{}, &.{});
-    defer alloc.free(targets);
+    defer {
+        for (targets) |t| alloc.free(t.host);
+        alloc.free(targets);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), targets.len);
     try std.testing.expectEqualStrings("example.com", targets[0].host);

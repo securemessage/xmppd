@@ -245,7 +245,10 @@ test "resolveXmpp: fallback for non-existent domain" {
     const targets = resolveXmpp(alloc, "no-srv-records-here.invalid", false) catch {
         return; // Network error — skip
     };
-    defer alloc.free(targets);
+    defer {
+        for (targets) |t| alloc.free(t.host);
+        alloc.free(targets);
+    }
 
     // Should fall back to domain:5222
     try std.testing.expectEqual(@as(usize, 1), targets.len);

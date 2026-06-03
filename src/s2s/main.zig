@@ -281,7 +281,11 @@ pub const S2sDaemon = struct {
             conn.fail("dns-resolution-failed");
             return;
         };
-        defer self.allocator.free(targets);
+        defer {
+            // Free all target hosts except the one we kept (index 0)
+            for (targets[1..]) |t| self.allocator.free(t.host);
+            self.allocator.free(targets);
+        }
 
         if (targets.len == 0) {
             log.warn("no SRV targets for {s}", .{domain});
@@ -289,9 +293,9 @@ pub const S2sDaemon = struct {
             return;
         }
 
-        // Try the first target (TODO: iterate on failure)
+        // Try the first target — transfer ownership of host string to connection
         const target = targets[0];
-        conn.target_host = target.host;
+        conn.target_host = target.host; // ownership transferred, not freed in defer
         conn.target_port = target.port;
         conn.is_direct_tls = target.is_direct_tls;
 
@@ -358,8 +362,8 @@ pub const S2sDaemon = struct {
         reader.* = XmlReader.init(self.allocator);
         self.outbound_readers[slot] = reader;
 
-        // Register for write events (connect completion signals writable)
-        batch.addWrite(sock, OUTBOUND_UDATA_BASE + slot) catch {};
+        // Register for one-shot write event (connect completion signals writable)
+        batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {};
     }
 
     /// Flush queued stanzas on an established outbound connection.
@@ -398,6 +402,7 @@ pub const S2sDaemon = struct {
         if (self.outbound[slot]) |conn| {
             log.info("closing outbound S2S to {s}", .{conn.remote_domain});
             self.pool.remove(conn.remote_domain);
+            conn.deinit(self.allocator);
         }
         self.outbound[slot] = null;
     }
@@ -1192,7 +1197,7 @@ fn processOutboundEvent(
         },
         .element_end => |name| {
             // End of <stream:features> — decide what to do
-            if (std.mem.eql(u8, name, "features")) {
+            if (std.mem.eql(u8, name, "features") or std.mem.eql(u8, name, "stream:features")) {
                 const action = conn.handleRemoteFeatures(
                     conn.stream.dane_verified,
                     !conn.stream.dane_verified,
@@ -1359,6 +1364,15 @@ fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnectio
             };
         }
 
+        // Log fingerprint details for debugging
+        {
+            const fp = dane_mod.CertFingerprint.fromDer(leaf_der.?);
+            log.info("DANE leaf SPKI sha256: {s}", .{std.fmt.bytesToHex(fp.spki, .lower)});
+            log.info("DANE expected from DNS ({d} bytes): {s}", .{ dane_records[0].association_data.len, std.fmt.bytesToHex(dane_records[0].association_data[0..32].*, .lower) });
+            log.info("DANE record: usage={d} sel={d} match={d}", .{
+                dane_records[0].usage, dane_records[0].selector, dane_records[0].matching_type,
+            });
+        }
         const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
         log.info("DANE result for {s}: {s}", .{
             conn.remote_domain,

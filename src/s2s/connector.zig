@@ -125,6 +125,10 @@ pub const OutboundConnection = struct {
             allocator.free(stanza.xml);
         }
         self.pending_stanzas.deinit(allocator);
+        if (self.target_host.len > 0) {
+            allocator.free(self.target_host);
+            self.target_host = "";
+        }
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();
