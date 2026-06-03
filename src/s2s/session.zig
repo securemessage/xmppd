@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const xml = @import("xml");
 const stream_mod = @import("stream.zig");
 const S2sStream = stream_mod.S2sStream;
 const S2sStreamState = stream_mod.S2sStreamState;
@@ -71,6 +72,22 @@ pub const S2sSession = struct {
     db_verify_id_buf: [64]u8 = undefined,
     db_verify_id_len: usize = 0,
     db_verify_pending: bool = false,
+
+    /// Inbound stanza accumulation — buffers child XML content for stanzas
+    /// received on an established session, to be forwarded to xmppd-core via IPC.
+    stanza_active: bool = false,
+    stanza_tag_buf: [32]u8 = undefined,
+    stanza_tag_len: usize = 0,
+    stanza_from_buf: [512]u8 = undefined,
+    stanza_from_len: usize = 0,
+    stanza_to_buf: [512]u8 = undefined,
+    stanza_to_len: usize = 0,
+    stanza_type_buf: [32]u8 = undefined,
+    stanza_type_len: usize = 0,
+    stanza_id_buf: [128]u8 = undefined,
+    stanza_id_len: usize = 0,
+    stanza_inner_buf: [16384]u8 = undefined,
+    stanza_inner_len: usize = 0,
 
     pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
         var session = S2sSession{
@@ -376,7 +393,177 @@ pub const S2sSession = struct {
         try writer.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
         return fbs.getWritten();
     }
+
+    // ========================================================================
+    // Inbound stanza accumulation
+    // ========================================================================
+
+    /// Begin accumulating a new inbound stanza. Called when element_start for
+    /// message/presence/iq is seen on an established session.
+    pub fn startStanza(self: *S2sSession, elem: xml.Element) void {
+        self.stanza_active = true;
+        self.stanza_inner_len = 0;
+        // Tag name
+        const tl = @min(elem.local_name.len, self.stanza_tag_buf.len);
+        @memcpy(self.stanza_tag_buf[0..tl], elem.local_name[0..tl]);
+        self.stanza_tag_len = tl;
+        // Extract from/to/type/id attributes
+        self.stanza_from_len = 0;
+        self.stanza_to_len = 0;
+        self.stanza_type_len = 0;
+        self.stanza_id_len = 0;
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "from")) {
+                const fl = @min(attr.value.len, self.stanza_from_buf.len);
+                @memcpy(self.stanza_from_buf[0..fl], attr.value[0..fl]);
+                self.stanza_from_len = fl;
+            } else if (std.mem.eql(u8, attr.local_name, "to")) {
+                const tol = @min(attr.value.len, self.stanza_to_buf.len);
+                @memcpy(self.stanza_to_buf[0..tol], attr.value[0..tol]);
+                self.stanza_to_len = tol;
+            } else if (std.mem.eql(u8, attr.local_name, "type")) {
+                const tyl = @min(attr.value.len, self.stanza_type_buf.len);
+                @memcpy(self.stanza_type_buf[0..tyl], attr.value[0..tyl]);
+                self.stanza_type_len = tyl;
+            } else if (std.mem.eql(u8, attr.local_name, "id")) {
+                const il = @min(attr.value.len, self.stanza_id_buf.len);
+                @memcpy(self.stanza_id_buf[0..il], attr.value[0..il]);
+                self.stanza_id_len = il;
+            }
+        }
+    }
+
+    /// Accumulate a child element opening tag into the stanza inner buffer.
+    pub fn accumulateElement(self: *S2sSession, elem: xml.Element) void {
+        var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
+        const w = fbs.writer();
+        w.writeByte('<') catch return;
+        w.writeAll(elem.name) catch return;
+        for (elem.attributes) |attr| {
+            w.writeByte(' ') catch return;
+            w.writeAll(attr.name) catch return;
+            w.writeAll("='") catch return;
+            xmlEscapeWrite(w, attr.value) catch return;
+            w.writeByte('\'') catch return;
+        }
+        if (elem.self_closing) {
+            w.writeAll("/>") catch return;
+        } else {
+            w.writeByte('>') catch return;
+        }
+        self.stanza_inner_len += fbs.pos;
+    }
+
+    /// Accumulate text content (XML-escaped) into the stanza inner buffer.
+    pub fn accumulateText(self: *S2sSession, text: []const u8) void {
+        var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
+        xmlEscapeWrite(fbs.writer(), text) catch return;
+        self.stanza_inner_len += fbs.pos;
+    }
+
+    /// Accumulate a child element close tag into the stanza inner buffer.
+    pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
+        var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
+        const w = fbs.writer();
+        w.writeAll("</") catch return;
+        w.writeAll(name) catch return;
+        w.writeByte('>') catch return;
+        self.stanza_inner_len += fbs.pos;
+    }
+
+    /// Reset stanza accumulation state.
+    pub fn resetStanza(self: *S2sSession) void {
+        self.stanza_active = false;
+        self.stanza_inner_len = 0;
+        self.stanza_tag_len = 0;
+        self.stanza_from_len = 0;
+        self.stanza_to_len = 0;
+        self.stanza_type_len = 0;
+        self.stanza_id_len = 0;
+    }
+
+    /// Get the accumulated stanza tag name.
+    pub fn getStanzaTag(self: *const S2sSession) []const u8 {
+        return self.stanza_tag_buf[0..self.stanza_tag_len];
+    }
+
+    /// Get the accumulated stanza 'from' attribute.
+    pub fn getStanzaFrom(self: *const S2sSession) []const u8 {
+        return self.stanza_from_buf[0..self.stanza_from_len];
+    }
+
+    /// Get the accumulated stanza 'to' attribute.
+    pub fn getStanzaTo(self: *const S2sSession) []const u8 {
+        return self.stanza_to_buf[0..self.stanza_to_len];
+    }
+
+    /// Get the accumulated stanza 'type' attribute.
+    pub fn getStanzaType(self: *const S2sSession) []const u8 {
+        return self.stanza_type_buf[0..self.stanza_type_len];
+    }
+
+    /// Get the accumulated stanza 'id' attribute.
+    pub fn getStanzaId(self: *const S2sSession) []const u8 {
+        return self.stanza_id_buf[0..self.stanza_id_len];
+    }
+
+    /// Get the accumulated inner XML content.
+    pub fn getStanzaInner(self: *const S2sSession) []const u8 {
+        return self.stanza_inner_buf[0..self.stanza_inner_len];
+    }
+
+    /// Build the complete stanza XML from accumulated parts.
+    pub fn buildStanzaXml(self: *const S2sSession, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeByte('<');
+        try w.writeAll(self.getStanzaTag());
+        if (self.stanza_from_len > 0) {
+            try w.writeAll(" from='");
+            try w.writeAll(self.getStanzaFrom());
+            try w.writeByte('\'');
+        }
+        if (self.stanza_to_len > 0) {
+            try w.writeAll(" to='");
+            try w.writeAll(self.getStanzaTo());
+            try w.writeByte('\'');
+        }
+        if (self.stanza_type_len > 0) {
+            try w.writeAll(" type='");
+            try w.writeAll(self.getStanzaType());
+            try w.writeByte('\'');
+        }
+        if (self.stanza_id_len > 0) {
+            try w.writeAll(" id='");
+            try w.writeAll(self.getStanzaId());
+            try w.writeByte('\'');
+        }
+        if (self.stanza_inner_len == 0) {
+            try w.writeAll("/>");
+        } else {
+            try w.writeByte('>');
+            try w.writeAll(self.getStanzaInner());
+            try w.writeAll("</");
+            try w.writeAll(self.getStanzaTag());
+            try w.writeByte('>');
+        }
+        return fbs.getWritten();
+    }
 };
+
+/// Re-encode text for XML output (entities like &amp; must be re-escaped).
+fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '&' => try writer.writeAll("&amp;"),
+            '<' => try writer.writeAll("&lt;"),
+            '>' => try writer.writeAll("&gt;"),
+            '\'' => try writer.writeAll("&apos;"),
+            '"' => try writer.writeAll("&quot;"),
+            else => try writer.writeByte(c),
+        }
+    }
+}
 
 // ============================================================================
 // Tests
@@ -403,11 +590,11 @@ test "S2sSession: buildStreamOpenResponse" {
     session.closed = true;
     session.setRemoteDomain("b.example");
     var buf: [1024]u8 = undefined;
-    const xml = try session.buildStreamOpenResponse(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns='jabber:server'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "from='a.example'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "to='b.example'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "version='1.0'") != null);
+    const out = try session.buildStreamOpenResponse(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xmlns='jabber:server'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "from='a.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "to='b.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "version='1.0'") != null);
 }
 
 test "S2sSession: buildFeatures — TLS required" {
@@ -416,9 +603,9 @@ test "S2sSession: buildFeatures — TLS required" {
     // Set stream to features_tls state
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
-    const xml = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<starttls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<required/>") != null);
+    const out = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<starttls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<required/>") != null);
 }
 
 test "S2sSession: buildFeatures — auth with DANE" {
@@ -430,9 +617,9 @@ test "S2sSession: buildFeatures — auth with DANE" {
     session.stream.setDaneVerified(true);
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
-    const xml = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "EXTERNAL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "dialback") == null);
+    const out = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "EXTERNAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") == null);
 }
 
 test "S2sSession: buildFeatures — auth without DANE" {
@@ -444,42 +631,42 @@ test "S2sSession: buildFeatures — auth without DANE" {
     session.stream.setDaneVerified(false);
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
-    const xml = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "dialback") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "EXTERNAL") == null);
+    const out = try session.buildFeatures(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "EXTERNAL") == null);
 }
 
 test "S2sSession: buildSaslSuccess" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true;
     var buf: [256]u8 = undefined;
-    const xml = try session.buildSaslSuccess(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<success") != null);
+    const out = try session.buildSaslSuccess(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<success") != null);
 }
 
 test "S2sSession: buildSaslFailure" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true;
     var buf: [256]u8 = undefined;
-    const xml = try session.buildSaslFailure(&buf, "not-authorized");
-    try std.testing.expect(std.mem.indexOf(u8, xml, "not-authorized") != null);
+    const out = try session.buildSaslFailure(&buf, "not-authorized");
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
 test "S2sSession: buildTlsProceed" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true;
     var buf: [256]u8 = undefined;
-    const xml = try session.buildTlsProceed(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<proceed") != null);
+    const out = try session.buildTlsProceed(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<proceed") != null);
 }
 
 test "S2sSession: buildStreamError" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true;
     var buf: [512]u8 = undefined;
-    const xml = try session.buildStreamError(&buf, "host-unknown");
-    try std.testing.expect(std.mem.indexOf(u8, xml, "host-unknown") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "</stream:stream>") != null);
+    const out = try session.buildStreamError(&buf, "host-unknown");
+    try std.testing.expect(std.mem.indexOf(u8, out, "host-unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</stream:stream>") != null);
 }
 
 test "S2sSession: write buffer operations" {

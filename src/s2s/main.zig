@@ -806,7 +806,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         };
         if (event == null) break;
 
-        processInboundEvent(daemon, session, reader, event.?);
+        processInboundEvent(daemon, session, reader, event.?, batch);
 
         // Session may have been closed by processInboundEvent
         if (daemon.getInbound(slot) == null) return;
@@ -878,7 +878,7 @@ fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, ses
 }
 
 /// Process a single XML event for an inbound S2S session.
-fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlReader, event: XmlEvent) void {
+fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlReader, event: XmlEvent, batch: *ChangeList) void {
     switch (event) {
         .stream_open => |elem| {
             // Extract 'from' and 'to' attributes
@@ -911,6 +911,26 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             }
         },
         .element_start => |elem| {
+            // If accumulating a stanza, serialize child elements into inner buffer
+            if (session.stanza_active) {
+                session.accumulateElement(elem);
+                return;
+            }
+
+            // On established sessions, detect stanza elements and start accumulation
+            if (session.stream.isEstablished()) {
+                if (std.mem.eql(u8, elem.local_name, "message") or
+                    std.mem.eql(u8, elem.local_name, "presence") or
+                    std.mem.eql(u8, elem.local_name, "iq"))
+                {
+                    session.startStanza(elem);
+                    if (elem.self_closing) {
+                        dispatchInboundStanza(daemon, session, batch);
+                    }
+                    return;
+                }
+            }
+
             // Handle STARTTLS request
             if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls) and
                 std.mem.eql(u8, elem.local_name, "starttls"))
@@ -975,8 +995,23 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             session.queueWrite("</stream:stream>") catch {};
         },
         .xml_declaration => {},
-        .element_end => {},
+        .element_end => |name| {
+            // Stanza accumulation — child close tag or stanza dispatch
+            if (session.stanza_active) {
+                if (reader.depth > 1) {
+                    session.accumulateClose(name);
+                } else {
+                    dispatchInboundStanza(daemon, session, batch);
+                }
+                return;
+            }
+        },
         .text => |text_content| {
+            // Stanza content accumulation
+            if (session.stanza_active) {
+                session.accumulateText(text_content);
+                return;
+            }
             // Handle db:verify key text
             if (session.db_verify_pending) {
                 const from = session.getDbVerifyFrom();
@@ -1006,6 +1041,47 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 }
             }
         },
+    }
+}
+
+/// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
+fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
+    defer session.resetStanza();
+
+    const from = session.getStanzaFrom();
+    const to = session.getStanzaTo();
+
+    if (from.len == 0 or to.len == 0) {
+        log.warn("inbound stanza missing from/to, dropping", .{});
+        return;
+    }
+
+    // Build the complete stanza XML
+    var stanza_buf: [20480]u8 = undefined;
+    const stanza_xml = session.buildStanzaXml(&stanza_buf) catch {
+        log.warn("inbound stanza too large, dropping", .{});
+        return;
+    };
+
+    log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), from, to });
+
+    // Send to all connected core IPC clients
+    const msg = protocol.Message{ .s2s_inbound = .{
+        .from_jid = from,
+        .to_jid = to,
+        .stanza_xml = stanza_xml,
+    } };
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        if (daemon.ipc.getClient(i)) |client| {
+            client.queueSend(msg) catch {
+                log.err("failed to queue inbound stanza to IPC client {d}", .{i});
+                continue;
+            };
+            if (client.hasPendingSend()) {
+                batch.addWriteOnce(client.fd, IPC_CLIENT_UDATA_BASE + i) catch {};
+            }
+        }
     }
 }
 
