@@ -812,6 +812,19 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     // Mark consumed bytes
     if (pos > 0) session.consume(pos);
 
+    // After SASL success, flush <success/> and drain any OpenSSL-buffered
+    // post-auth stream data. Same pattern as post-TLS handshake (line 843):
+    // OpenSSL may have internally consumed socket bytes during SSL_write,
+    // buffering Prosody's post-auth stream open without triggering kqueue.
+    if (session.stream.state == .awaiting_stream_open_tls and session.stream.authenticated) {
+        _ = session.flushWrite() catch {};
+        handleInboundReadable(daemon, batch, slot);
+        if (daemon.getInbound(slot) != null) {
+            batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+        }
+        return;
+    }
+
     // Request one-shot write notification when there's data to flush
     if (session.hasPendingWrite()) {
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
@@ -911,8 +924,9 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 if (std.mem.eql(u8, mechanism, "EXTERNAL")) {
                     const action = session.stream.handleSaslExternal();
                     executeAction(daemon, session, action);
-                    // After successful SASL, the remote will restart the stream
-                    if (session.stream.isEstablished()) {
+                    // After successful SASL, the remote will restart the stream.
+                    // State is awaiting_stream_open_tls (reused for post-SASL restart).
+                    if (session.stream.state == .awaiting_stream_open_tls) {
                         reader.reset();
                     }
                 } else {
