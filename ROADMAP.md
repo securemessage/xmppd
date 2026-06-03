@@ -13,7 +13,7 @@ Last updated: 2026-06-03
 | 1. Protocol Library | ✅ Complete | XML parser, JID, stanzas, SASL, TLS, DNS |
 | 2. Core Daemon | ✅ Complete | kqueue event loop, C2S, master supervisor |
 | 3. S2S Federation | 🟡 ~90% | DANE + SASL EXTERNAL verified both directions |
-| 4. Client Interop | ⬜ Not started | Real XMPP client testing |
+| 4. Client Interop | 🟡 In progress | slixmpp 23/23, profanity pending |
 | 5. Storage | ⬜ Not started | Pluggable storage interface + backends |
 | 6. Auth | ⬜ Not started | Pluggable auth backends |
 | 7. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
@@ -85,16 +85,37 @@ Server-to-server federation for cross-domain messaging.
 | Outbound (no DANE) | Dialback | 🟡 Key sent, callback arrives |
 | Inbound (no DANE) | Dialback | ⬜ Needs outbound callback |
 
-## Phase 4 — Client Interop
+## Phase 4 — Client Interop 🟡
 
 Validate the server against real XMPP clients before adding features.
 
-- [ ] Aparte (terminal client, FreeBSD native)
+- [x] slixmpp library (23/23 tests — see `test/integration/client-interop.py`)
+  - [x] STARTTLS + SASL PLAIN authentication
+  - [x] STARTTLS + SASL SCRAM-SHA-256 authentication
+  - [x] Wrong password rejection
+  - [x] Resource binding
+  - [x] Service Discovery — disco#info (identity + 7 features)
+  - [x] Service Discovery — disco#items
+  - [x] XMPP Ping (XEP-0199)
+  - [x] Software Version (XEP-0092)
+  - [x] vCard-temp (XEP-0054)
+  - [x] Roster get + set
+  - [x] Initial presence
+  - [x] Two-way messaging (alice↔bob with body verification)
+- [ ] Profanity (terminal client, FreeBSD native)
 - [ ] Gajim (desktop, GTK)
 - [ ] Dino (desktop, GTK)
 - [ ] Conversations (Android)
-- [ ] Document any standards compliance gaps found
-- [ ] Fix issues surfaced by client testing
+
+### Bugs Found and Fixed
+
+- **IPC recv buffer use-after-compact** — `nextMessage()` compacted the
+  receive buffer before returning, corrupting borrowed Message slices
+  when two IPC responses arrived simultaneously (concurrent SASL auth).
+  Fix: deferred compaction to the start of the next `nextMessage()` or
+  `recv()` call.
+- **Post-SASL SSL drain** — Added `SSL_pending()` check after SASL
+  success to drain OpenSSL-buffered data that kqueue won't fire for.
 
 This phase gates further feature work. No point building on a foundation
 that doesn't interoperate with real clients.
@@ -238,7 +259,7 @@ long-term radar.
 | Language | Zig 0.15.2 |
 | Source files | 36 |
 | Lines of code | ~17,650 |
-| Unit tests | 425 (26 test suites) |
+| Unit tests | 425 (26 suites, 53 build steps) |
 | Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
