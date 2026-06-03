@@ -13,7 +13,7 @@ Last updated: 2026-06-03
 | 1. Protocol Library | ✅ Complete | XML parser, JID, stanzas, SASL, TLS, DNS |
 | 2. Core Daemon | ✅ Complete | kqueue event loop, C2S, master supervisor |
 | 3. S2S Federation | 🟡 ~90% | DANE + SASL EXTERNAL verified both directions |
-| 4. Client Interop | 🟡 In progress | slixmpp 23/23, profanity pending |
+| 4. Client Interop | 🟡 In progress | slixmpp 23/23, profanity 14/14 |
 | 5. Storage | ⬜ Not started | Pluggable storage interface + backends |
 | 6. Auth | ⬜ Not started | Pluggable auth backends |
 | 7. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
@@ -102,7 +102,7 @@ Validate the server against real XMPP clients before adding features.
   - [x] Roster get + set
   - [x] Initial presence
   - [x] Two-way messaging (alice↔bob with body verification)
-- [ ] Profanity (terminal client, FreeBSD native)
+- [x] Profanity (terminal client, FreeBSD native — 14/14 tests)
 - [ ] Gajim (desktop, GTK)
 - [ ] Dino (desktop, GTK)
 - [ ] Conversations (Android)
