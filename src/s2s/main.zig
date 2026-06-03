@@ -1187,8 +1187,13 @@ fn processOutboundEvent(
             {
                 log.info("outbound SASL success from {s}", .{conn.remote_domain});
                 conn.handleAuthSuccess();
-                // Flush queued stanzas
-                daemon.flushOutboundStanzas(conn);
+
+                // Stream restart after SASL — must open new stream
+                reader.reset();
+                var rst_buf: [2048]u8 = undefined;
+                const stream_open = conn.buildStreamOpen(&rst_buf) catch return;
+                conn.queueWrite(stream_open) catch return;
+                _ = conn.flushWrite() catch return;
             } else if (std.mem.eql(u8, elem.local_name, "failure") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
             {
@@ -1200,6 +1205,13 @@ fn processOutboundEvent(
         .element_end => |name| {
             // End of <stream:features> — decide what to do
             if (std.mem.eql(u8, name, "features") or std.mem.eql(u8, name, "stream:features")) {
+                // Post-auth features: connection is established, flush queued stanzas
+                if (conn.state == .established) {
+                    log.info("outbound S2S to {s} fully established", .{conn.remote_domain});
+                    daemon.flushOutboundStanzas(conn);
+                    return;
+                }
+
                 const action = conn.handleRemoteFeatures(
                     conn.stream.dane_verified,
                     !conn.stream.dane_verified,
