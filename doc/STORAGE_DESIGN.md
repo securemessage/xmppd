@@ -110,6 +110,9 @@ pub fn StorageBackend(comptime Impl: type) type {
         pub fn delete(self: *@This(), ns: []const u8, key: []const u8) !void { ... }
 
         // Range iteration (prefix scan — essential for both roster enum and MAM paging)
+        // INVARIANT: Iterator is prefix-bounded. next() returns null when the
+        // cursor key no longer starts with `prefix`. Each backend enforces this
+        // internally so callers never leak data from adjacent namespaces.
         pub fn iterator(self: *@This(), ns: []const u8, prefix: []const u8) !Iterator { ... }
 
         // Batch writes (RocksDB WriteBatch, LMDB write txn)
@@ -140,7 +143,7 @@ pub fn RosterStore(comptime Backend: type) type {
 | `users` | `username` | binary: `salt(32) \| stored_key(32) \| server_key(32) \| iter_count(4)` |
 | `rosters` | `owner\x00contact` | binary: `subscription(1) \| ask(1) \| name_len(2) \| name` |
 | `roster_rev` | `contact\x00owner` | `""` (reverse index for presence fan-out) |
-| `offline` | `recipient\x00timestamp_be(8)\x00msg_id` | stanza XML |
+| `offline` | `recipient\x00timestamp_be(8)\x00msg_id` | `""` (delivery flag — payload lives in archive) |
 | `vcards` | `bare_jid` | vCard XML blob |
 | `meta` | `schema_version` | version u32 |
 
@@ -155,6 +158,21 @@ pub fn RosterStore(comptime Backend: type) type {
 - Timestamps: big-endian u64 for lexicographic = chronological ordering
 - Compression: RocksDB's built-in LZ4 at block level (transparent)
 - Retention: RocksDB CompactionFilter deletes expired entries during compaction
+
+### Offline Message Strategy
+
+Offline stanza payloads are stored in the **archive** DB, not the operational DB.
+The operational `offline` namespace holds only lightweight delivery pointers
+(empty values keyed by `recipient\x00timestamp\x00msg_id`). On reconnect:
+
+1. Scan `offline` prefix for the recipient → collect message keys
+2. Fetch each stanza from the archive by `recipient\x00timestamp\x00stanza_id`
+3. Deliver to client, then delete the offline pointer
+
+This keeps LMDB strictly bounded and lean — no unbounded stanza XML accumulating
+in the operational B+ tree. LMDB's B+ tree does not reclaim disk space on deletion
+(freed pages are reused internally), so keeping large payloads out prevents the
+operational DB file from growing permanently due to offline message churn.
 
 ## 8. XEP-0313 (MAM) — The "Slack Scrollback"
 
@@ -193,7 +211,7 @@ Flat-file backend remains available as `-Dop-storage=flatfile` for backward comp
 | **10d** | `src/store/flatfile.zig` — Wrap existing flat-file stores | 200 |
 | **10e** | Migrate `UserStore` → `UserStore(Backend)` | 150 |
 | **10f** | Migrate `RosterStore` → `RosterStore(Backend)` | 200 |
-| **10g** | Migrate `OfflineStore` → `OfflineStore(Backend)` | 150 |
+| **10g** | Migrate `OfflineStore` → `OfflineStore(Backend)` — pointer in op DB, payload in archive | 200 |
 | **10h** | New: `VCardStore(Backend)` | 100 |
 | **10i** | New: `ArchiveStore(Backend)` — MAM write + paginated read + retention | 500 |
 | **10j** | MAM query handler in core (XEP-0313 IQ handling + RSM pagination) | 400 |
@@ -206,10 +224,11 @@ Flat-file backend remains available as `-Dop-storage=flatfile` for backward comp
 
 ### Suggested execution order
 1. Trait interface (10a) → LMDB backend (10b) → migrate UserStore (10e) — proves the pattern
-2. RosterStore + OfflineStore (10f, 10g) → VCardStore (10h) — complete operational migration
+2. RosterStore (10f) → VCardStore (10h) — operational stores (no archive dependency)
 3. RocksDB backend (10c) → ArchiveStore (10i) → MAM handler (10j) — archive layer
-4. SQLite (10k) → flat-file compat (10d) → migration tooling (10m)
-5. build.zig integration (10l) → comprehensive tests (10n)
+4. OfflineStore (10g) — depends on ArchiveStore (pointers in op DB, payloads in archive)
+5. SQLite (10k) → flat-file compat (10d) → migration tooling (10m)
+6. build.zig integration (10l) → comprehensive tests (10n)
 
 ## 11. Build Integration
 
