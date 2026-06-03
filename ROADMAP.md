@@ -12,7 +12,7 @@ Last updated: 2026-06-03
 |-------|--------|---------|
 | 1. Protocol Library | ✅ Complete | XML parser, JID, stanzas, SASL, TLS, DNS |
 | 2. Core Daemon | ✅ Complete | kqueue event loop, C2S, master supervisor |
-| 3. S2S Federation | 🟡 ~90% | DANE + SASL EXTERNAL verified both directions |
+| 3. S2S Federation | ✅ Complete | DANE + EXTERNAL + dialback + E2E tested |
 | 4. Client Interop | ✅ Complete | slixmpp 23/23, profanity 14/14, gajim ✓, dino ✓ |
 | 5. Storage | ⬜ Not started | Pluggable storage interface + backends |
 | 6. Auth | ⬜ Not started | Pluggable auth backends |
@@ -55,7 +55,7 @@ Multi-process XMPP server that handles C2S connections.
 
 **Binaries:** `xmppd`, `xmppd-core`, `xmppd-auth`, `xmppctl`
 
-## Phase 3 — S2S Federation 🟡
+## Phase 3 — S2S Federation ✅
 
 Server-to-server federation for cross-domain messaging.
 
@@ -69,10 +69,11 @@ Server-to-server federation for cross-domain messaging.
 - [x] `xmppd-s2s` daemon with full event loop
 - [x] XEP-0220 dialback: outbound key generation + sending
 - [x] XEP-0220 dialback: inbound db:verify callback verification
-- [ ] XEP-0220 dialback: inbound db:result verification (outbound callback)
+- [x] XEP-0220 dialback: inbound db:result verification (outbound callback)
+- [x] Inbound stanza forwarding (S2S→core IPC pipeline)
+- [x] Offline delivery across federation
+- [x] E2E integration test (`test/integration/s2s-federation.py` — 9/9)
 - [x] Interop tested against Prosody 13.0.6 (DANE + EXTERNAL path)
-- [ ] E2E integration test (Python: message delivery both directions)
-- [ ] Offline delivery across federation
 
 **Binaries:** `xmppd-s2s`
 
@@ -82,8 +83,8 @@ Server-to-server federation for cross-domain messaging.
 |------|------|--------|
 | Outbound (xmppd → Prosody) | SASL EXTERNAL / DANE-EE | ✅ Verified |
 | Inbound (Prosody → xmppd) | SASL EXTERNAL / DANE-EE | ✅ Verified |
-| Outbound (no DANE) | Dialback | 🟡 Key sent, callback arrives |
-| Inbound (no DANE) | Dialback | ⬜ Needs outbound callback |
+| Outbound (no DANE) | Dialback | ✅ Key sent + verified |
+| Inbound (no DANE) | Dialback | ✅ Callback verification |
 
 ## Phase 4 — Client Interop ✅
 
@@ -248,7 +249,7 @@ long-term radar.
 - **OMEMO key distribution** — PEP for end-to-end encryption
 - **Admin Web UI** — monitoring dashboard
 - **Prometheus metrics** — observability
-- **Bidirectional S2S dialback** — full XEP-0220 with outbound callbacks
+- **S2S dialback error recovery** — retry/backoff on callback connection failure
 
 ---
 
@@ -258,8 +259,9 @@ long-term radar.
 |--------|-------|
 | Language | Zig 0.15.2 |
 | Source files | 36 |
-| Lines of code | ~17,650 |
-| Unit tests | 425 (26 suites, 53 build steps) |
+| Lines of code | ~18,250 |
+| Unit tests | 53 build steps (all pass) |
+| Integration tests | 9/9 S2S federation + 23 C2S interop |
 | Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
