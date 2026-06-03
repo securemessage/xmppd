@@ -48,6 +48,7 @@ const S2sSession = session_mod.S2sSession;
 const stream_mod = @import("stream.zig");
 const S2sStreamAction = stream_mod.S2sStreamAction;
 const StreamError = stream_mod.StreamError;
+const dialback = @import("dialback.zig");
 
 const log = std.log.scoped(.@"xmppd-s2s");
 
@@ -79,6 +80,9 @@ pub const S2sDaemon = struct {
     /// TLS context for inbound connections (server-side).
     tls_ctx: ?SslContext = null,
 
+    /// Dialback secret (XEP-0220) — generated at startup, never disclosed.
+    dialback_secret: [dialback.SECRET_LEN]u8 = undefined,
+
     /// Outbound connection pool (maps domain → OutboundConnection).
     pool: ConnectionPool,
 
@@ -104,11 +108,13 @@ pub const S2sDaemon = struct {
     listener_port: u16 = 5269,
 
     pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) S2sDaemon {
-        return .{
+        var d = S2sDaemon{
             .allocator = allocator,
             .local_domain = local_domain,
             .pool = ConnectionPool.init(allocator),
         };
+        d.dialback_secret = dialback.generateSecret();
+        return d;
     }
 
     pub fn deinit(self: *S2sDaemon) void {
@@ -934,6 +940,34 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                     sendStreamError(session, .not_authorized);
                 }
             }
+            // Handle dialback verify callback: <db:verify from='...' to='...' id='...'>KEY</db:verify>
+            else if (std.mem.eql(u8, elem.local_name, "verify") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
+            {
+                var from: []const u8 = "";
+                var to: []const u8 = "";
+                var verify_id: []const u8 = "";
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "from")) from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) to = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "id")) verify_id = attr.value;
+                }
+                session.startDbVerify(from, to, verify_id);
+            }
+            // Handle inbound dialback result (remote initiates dialback to us)
+            else if (std.mem.eql(u8, elem.local_name, "result") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
+            {
+                // Check if this is a result with type (response) or without (key submission)
+                var result_type: []const u8 = "";
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "type")) result_type = attr.value;
+                }
+                if (result_type.len == 0) {
+                    // Key submission — would need callback verification (not yet implemented)
+                    log.warn("inbound dialback from {s}: callback verification not implemented", .{session.getRemoteDomain()});
+                }
+            }
         },
         .stream_close => {
             _ = session.stream.handleClose();
@@ -942,7 +976,36 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
         },
         .xml_declaration => {},
         .element_end => {},
-        .text => {},
+        .text => |text_content| {
+            // Handle db:verify key text
+            if (session.db_verify_pending) {
+                const from = session.getDbVerifyFrom();
+                const to = session.getDbVerifyTo();
+                const verify_id = session.getDbVerifyId();
+                const valid = dialback.verifyKey(
+                    &daemon.dialback_secret,
+                    from,
+                    to,
+                    verify_id,
+                    text_content,
+                );
+                var resp_buf: [512]u8 = undefined;
+                const resp = dialback.buildDbVerifyResponse(
+                    &resp_buf,
+                    session.stream.local_domain,
+                    from,
+                    verify_id,
+                    valid,
+                ) catch return;
+                session.queueWrite(resp) catch {};
+                session.db_verify_pending = false;
+                if (valid) {
+                    log.info("dialback verify: valid key from {s} for stream {s}", .{ from, verify_id });
+                } else {
+                    log.warn("dialback verify: invalid key from {s} for stream {s}", .{ from, verify_id });
+                }
+            }
+        },
     }
 }
 
@@ -1225,6 +1288,24 @@ fn processOutboundEvent(
                 conn.handleAuthFailure();
                 daemon.closeOutbound(slot);
             }
+            // Handle dialback result response: <db:result type='valid'/>
+            else if (std.mem.eql(u8, elem.local_name, "result") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
+            {
+                var result_type: []const u8 = "";
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "type")) result_type = attr.value;
+                }
+                if (std.mem.eql(u8, result_type, "valid")) {
+                    log.info("outbound dialback verified by {s}", .{conn.remote_domain});
+                    conn.handleAuthSuccess();
+                    daemon.flushOutboundStanzas(conn);
+                } else if (result_type.len > 0) {
+                    log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
+                    conn.handleAuthFailure();
+                    daemon.closeOutbound(slot);
+                }
+            }
         },
         .element_end => |name| {
             // End of <stream:features> — decide what to do
@@ -1254,8 +1335,27 @@ fn processOutboundEvent(
                         _ = conn.flushWrite() catch return;
                     },
                     .begin_dialback => {
-                        log.info("outbound dialback needed for {s} (not yet implemented)", .{conn.remote_domain});
-                        // TODO: wire dialback here
+                        const stream_id = conn.getRemoteStreamId();
+                        if (stream_id.len == 0) {
+                            log.err("outbound dialback for {s}: no remote stream ID", .{conn.remote_domain});
+                            return;
+                        }
+                        const key_hex = dialback.computeKeyHex(
+                            &daemon.dialback_secret,
+                            conn.remote_domain,
+                            conn.local_domain,
+                            stream_id,
+                        );
+                        var db_buf: [512]u8 = undefined;
+                        const db_result = dialback.buildDbResult(
+                            &db_buf,
+                            conn.local_domain,
+                            conn.remote_domain,
+                            &key_hex,
+                        ) catch return;
+                        conn.queueWrite(db_result) catch return;
+                        _ = conn.flushWrite() catch return;
+                        log.info("outbound dialback key sent to {s}", .{conn.remote_domain});
                     },
                     .none => {},
                 }

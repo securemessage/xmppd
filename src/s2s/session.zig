@@ -63,6 +63,14 @@ pub const S2sSession = struct {
     /// Stream ID we assign to this session.
     stream_id_buf: [32]u8 = undefined,
     stream_id_len: usize = 0,
+    /// Pending db:verify tracking for dialback callback verification.
+    db_verify_from_buf: [256]u8 = undefined,
+    db_verify_from_len: usize = 0,
+    db_verify_to_buf: [256]u8 = undefined,
+    db_verify_to_len: usize = 0,
+    db_verify_id_buf: [64]u8 = undefined,
+    db_verify_id_len: usize = 0,
+    db_verify_pending: bool = false,
 
     pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
         var session = S2sSession{
@@ -96,6 +104,32 @@ pub const S2sSession = struct {
     /// Get the remote domain (set after stream open).
     pub fn getRemoteDomain(self: *const S2sSession) []const u8 {
         return self.remote_domain_buf[0..self.remote_domain_len];
+    }
+
+    /// Start tracking a pending db:verify callback.
+    pub fn startDbVerify(self: *S2sSession, from: []const u8, to: []const u8, id: []const u8) void {
+        const f_len = @min(from.len, self.db_verify_from_buf.len);
+        @memcpy(self.db_verify_from_buf[0..f_len], from[0..f_len]);
+        self.db_verify_from_len = f_len;
+        const t_len = @min(to.len, self.db_verify_to_buf.len);
+        @memcpy(self.db_verify_to_buf[0..t_len], to[0..t_len]);
+        self.db_verify_to_len = t_len;
+        const i_len = @min(id.len, self.db_verify_id_buf.len);
+        @memcpy(self.db_verify_id_buf[0..i_len], id[0..i_len]);
+        self.db_verify_id_len = i_len;
+        self.db_verify_pending = true;
+    }
+
+    pub fn getDbVerifyFrom(self: *const S2sSession) []const u8 {
+        return self.db_verify_from_buf[0..self.db_verify_from_len];
+    }
+
+    pub fn getDbVerifyTo(self: *const S2sSession) []const u8 {
+        return self.db_verify_to_buf[0..self.db_verify_to_len];
+    }
+
+    pub fn getDbVerifyId(self: *const S2sSession) []const u8 {
+        return self.db_verify_id_buf[0..self.db_verify_id_len];
     }
 
     /// Set the remote domain from the stream open.
