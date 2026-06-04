@@ -555,6 +555,39 @@ pub fn build(b: *std.Build) void {
 
     const run_archive_store_tests = b.addRunArtifact(archive_store_tests);
 
+    // --- MAM handler tests ---
+
+    const mam_handler_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/mam_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mam_handler_test_mod.addImport("backend", backend_test_mod);
+    mam_handler_test_mod.addImport("archive_store", archive_store_test_mod);
+
+    const mam_handler_tests = b.addTest(.{
+        .name = "mam-handler-tests",
+        .root_module = mam_handler_test_mod,
+    });
+
+    const run_mam_handler_tests = b.addRunArtifact(mam_handler_tests);
+
+    // --- Generic offline store tests ---
+
+    const generic_offline_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/offline_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generic_offline_store_test_mod.addImport("backend", backend_test_mod);
+
+    const generic_offline_store_tests = b.addTest(.{
+        .name = "generic-offline-store-tests",
+        .root_module = generic_offline_store_test_mod,
+    });
+
+    const run_generic_offline_store_tests = b.addRunArtifact(generic_offline_store_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -841,4 +874,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_generic_roster_store_tests.step);
     test_step.dependOn(&run_vcard_store_tests.step);
     test_step.dependOn(&run_archive_store_tests.step);
+    test_step.dependOn(&run_mam_handler_tests.step);
+    test_step.dependOn(&run_generic_offline_store_tests.step);
 }
