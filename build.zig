@@ -539,6 +539,22 @@ pub fn build(b: *std.Build) void {
 
     const run_lmdb_backend_tests = b.addRunArtifact(lmdb_backend_tests);
 
+    // --- Archive store tests ---
+
+    const archive_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/archive_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    archive_store_test_mod.addImport("backend", backend_test_mod);
+
+    const archive_store_tests = b.addTest(.{
+        .name = "archive-store-tests",
+        .root_module = archive_store_test_mod,
+    });
+
+    const run_archive_store_tests = b.addRunArtifact(archive_store_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -824,4 +840,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_generic_user_store_tests.step);
     test_step.dependOn(&run_generic_roster_store_tests.step);
     test_step.dependOn(&run_vcard_store_tests.step);
+    test_step.dependOn(&run_archive_store_tests.step);
 }
