@@ -18,6 +18,8 @@ const CfCacheEntry = struct {
     handle: *c.rocksdb_column_family_handle_t,
 };
 
+pub const Backend = RocksDbBackend;
+
 pub const RocksDbBackend = struct {
     db: *c.rocksdb_t,
     options: *c.rocksdb_options_t,

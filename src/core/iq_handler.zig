@@ -98,6 +98,25 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
             session.mam_collecting = .rsm_before;
             session.mam_text_len = 0;
         }
+    } else if (std.mem.eql(u8, elem.local_name, "vCard") and std.mem.eql(u8, ns, xml.ns.vcard_temp)) {
+        session.iq_child_ns = ns;
+        session.iq_child_name = elem.local_name;
+        // For vcard-temp SET, start accumulating the <vCard> XML into vcard_buf
+        if (std.mem.eql(u8, session.iq_type, "set")) {
+            session.vcard_collecting = true;
+            session.vcard_buf_len = 0;
+            // Write the opening <vCard xmlns='vcard-temp'> tag
+            var fbs = std.io.fixedBufferStream(&session.vcard_buf);
+            const w = fbs.writer();
+            w.writeAll("<vCard xmlns='vcard-temp'") catch return;
+            if (elem.self_closing) {
+                w.writeAll("/>") catch return;
+                session.vcard_collecting = false;
+            } else {
+                w.writeByte('>') catch return;
+            }
+            session.vcard_buf_len = fbs.pos;
+        }
     } else if (session.iq_child_ns.len == 0) {
         // First child element determines the IQ payload namespace
         session.iq_child_ns = ns;
@@ -161,6 +180,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.mam_field_var = "";
         session.mam_collecting = .none;
         session.mam_text_len = 0;
+        // Reset vCard accumulation
+        session.vcard_collecting = false;
+        session.vcard_buf_len = 0;
     }
 
     const iq_type = session.iq_type;
@@ -230,14 +252,15 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         return;
     }
 
-    // vCard-temp (XEP-0054) — return empty vCard
-    if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
-        return;
+    // vCard-temp (XEP-0054)
+    if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp)) {
+        if (std.mem.eql(u8, iq_type, "get")) {
+            handleVcardGet(server, session, iq_id);
+            return;
+        } else if (std.mem.eql(u8, iq_type, "set")) {
+            handleVcardSet(server, session, iq_id);
+            return;
+        }
     }
 
     // Software Version (XEP-0092)
@@ -421,8 +444,8 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
         .max = max,
     };
 
-    const LmdbBackend = @import("lmdb_backend").LmdbBackend;
-    var response = mam_handler.handleMamQuery(LmdbBackend, archive, query, server.allocator) catch {
+    const OpBackendType = server_mod.OpBackendType;
+    var response = mam_handler.handleMamQuery(OpBackendType, archive, query, server.allocator) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -503,6 +526,70 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
         w.writeAll(iq_id) catch return;
         w.writeByte('\'') catch return;
     }
+}
+
+/// Handle vCard-temp GET — return stored vCard or empty fallback.
+fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
+    const bound = session.stream.bound_jid orelse return;
+
+    // Build bare JID
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+
+    if (server.vcard) |vcard| {
+        const xml_data = vcard.get(server.allocator, bare_jid) catch null;
+        if (xml_data) |data| {
+            defer server.allocator.free(data);
+            w.writeByte('>') catch return;
+            w.writeAll(data) catch return;
+            w.writeAll("</iq>") catch return;
+        } else {
+            w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
+        }
+    } else {
+        w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
+    }
+
+    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
+fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
+    const bound = session.stream.bound_jid orelse return;
+
+    // Build bare JID
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    const vcard_xml = session.vcard_buf[0..session.vcard_buf_len];
+
+    if (server.vcard) |vcard| {
+        vcard.set(bare_jid, vcard_xml) catch {
+            sendIqError(server, session, iq_id, "internal-server-error");
+            return;
+        };
+    } else {
+        // No store configured — silently accept (RFC allows no-op)
+    }
+
+    // Ack with empty result
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("/>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {

@@ -45,15 +45,18 @@ const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
 const backend_mod = @import("backend");
-const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const OpBackendMod = @import("op_backend");
+pub const OpBackendType = OpBackendMod.Backend;
 const generic_roster = @import("roster_store");
-const GenericRosterStore = generic_roster.RosterStore(LmdbBackend);
+const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const Subscription = generic_roster.Subscription;
 const SessionRegistry = @import("session_registry").SessionRegistry;
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const OfflinePointer = generic_offline.OfflinePointer;
 const archive_store_mod = @import("archive_store");
+const vcard_store_mod = @import("vcard_store");
+const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
 
 const log = std.log.scoped(.xmppd);
@@ -190,6 +193,11 @@ pub const Session = struct {
     /// Current <field var='...'> name being parsed inside <x> data form.
     mam_field_var: []const u8 = "",
 
+    /// vCard XML accumulation (for IQ set vcard-temp).
+    vcard_collecting: bool = false,
+    vcard_buf: [4096]u8 = undefined,
+    vcard_buf_len: usize = 0,
+
     fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
             .conn = Connection.init(fd, id),
@@ -247,10 +255,13 @@ pub const Server = struct {
     roster: ?*GenericRosterStore = null,
 
     /// Generic offline store — delivery pointers for unavailable recipients.
-    offline: ?*GenericOfflineStore(LmdbBackend) = null,
+    offline: ?*GenericOfflineStore(OpBackendType) = null,
 
     /// Archive store — MAM message archive (stanza payloads).
-    archive: ?*archive_store_mod.ArchiveStore(LmdbBackend) = null,
+    archive: ?*archive_store_mod.ArchiveStore(OpBackendType) = null,
+
+    /// VCard store — per-user vCard XML blobs (XEP-0054).
+    vcard: ?*GenericVCardStore = null,
 
     /// Initialize the server.
     ///
@@ -308,10 +319,16 @@ pub const Server = struct {
     }
 
     /// Configure the offline + archive stores.
-    pub fn configureOffline(self: *Server, offline_store: *GenericOfflineStore(LmdbBackend), arch_store: *archive_store_mod.ArchiveStore(LmdbBackend)) void {
+    pub fn configureOffline(self: *Server, offline_store: *GenericOfflineStore(OpBackendType), arch_store: *archive_store_mod.ArchiveStore(OpBackendType)) void {
         self.offline = offline_store;
         self.archive = arch_store;
         log.info("offline + archive stores configured", .{});
+    }
+
+    /// Configure the vCard store (XEP-0054).
+    pub fn configureVcard(self: *Server, vcard_store: *GenericVCardStore) void {
+        self.vcard = vcard_store;
+        log.info("vcard store configured", .{});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -692,6 +709,10 @@ pub const Server = struct {
         if (session.stream.isActive()) {
             // If we're inside an IQ stanza, handle child elements
             if (session.iq_active) {
+                if (session.vcard_collecting) {
+                    self.accumulateVcardElement(session, elem);
+                    return;
+                }
                 self.handleIqChild(session, elem);
                 return;
             }
@@ -725,6 +746,12 @@ pub const Server = struct {
                 @memcpy(session.bind_resource_buf[session.bind_resource_len .. session.bind_resource_len + to_copy], text[0..to_copy]);
                 session.bind_resource_len += to_copy;
             }
+            return;
+        }
+
+        // vCard XML text accumulation (for vcard-temp SET)
+        if (session.vcard_collecting) {
+            self.accumulateVcardText(session, text);
             return;
         }
 
@@ -794,6 +821,17 @@ pub const Server = struct {
                 return;
             },
             .none => {},
+        }
+
+        // vCard XML close tag accumulation
+        if (session.iq_active and session.vcard_collecting) {
+            if (session.reader.depth > 2) {
+                self.accumulateVcardClose(session, name);
+            } else {
+                // </vCard> reached — write closing tag and stop collecting
+                self.accumulateVcardClose(session, name);
+                session.vcard_collecting = false;
+            }
         }
 
         // MAM text accumulation — commit collected text on element close
@@ -1331,6 +1369,68 @@ pub const Server = struct {
         w.writeAll(name) catch return;
         w.writeByte('>') catch return;
         session.stanza_buf_len += fbs.pos;
+    }
+
+    // ========================================================================
+    // vCard XML accumulation (for IQ set vcard-temp)
+    // ========================================================================
+
+    fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Element) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
+        const w = fbs.writer();
+
+        w.writeByte('<') catch return;
+        w.writeAll(elem.name) catch return;
+
+        if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client) and
+            !std.mem.eql(u8, elem.namespace_uri, "vcard-temp"))
+        {
+            if (elem.prefix.len > 0) {
+                w.writeAll(" xmlns:") catch return;
+                w.writeAll(elem.prefix) catch return;
+                w.writeAll("='") catch return;
+                w.writeAll(elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
+            } else {
+                w.writeAll(" xmlns='") catch return;
+                w.writeAll(elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
+            }
+        }
+
+        for (elem.attributes) |attr| {
+            w.writeByte(' ') catch return;
+            w.writeAll(attr.name) catch return;
+            w.writeAll("='") catch return;
+            xmlEscapeWrite(w, attr.value) catch return;
+            w.writeByte('\'') catch return;
+        }
+
+        if (elem.self_closing) {
+            w.writeAll("/>") catch return;
+        } else {
+            w.writeByte('>') catch return;
+        }
+
+        session.vcard_buf_len += fbs.pos;
+    }
+
+    fn accumulateVcardText(self: *Server, session: *Session, text: []const u8) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
+        xmlEscapeWrite(fbs.writer(), text) catch return;
+        session.vcard_buf_len += fbs.pos;
+    }
+
+    fn accumulateVcardClose(self: *Server, session: *Session, name: []const u8) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
+        const w = fbs.writer();
+        w.writeAll("</") catch return;
+        w.writeAll(name) catch return;
+        w.writeByte('>') catch return;
+        session.vcard_buf_len += fbs.pos;
     }
 
     /// Route a fully accumulated stanza to target session(s).

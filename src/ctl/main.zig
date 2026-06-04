@@ -15,9 +15,9 @@
 
 const std = @import("std");
 const posix = std.posix;
-const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const OpBackendType = @import("op_backend").Backend;
 const user_store_mod = @import("user_store");
-const UserStore = user_store_mod.UserStore(LmdbBackend);
+const UserStore = user_store_mod.UserStore(OpBackendType);
 
 const log = std.log.scoped(.xmppctl);
 
@@ -56,7 +56,7 @@ pub fn main() !void {
     const command = remaining_args.items[0];
 
     // Open storage backend
-    var backend = try LmdbBackend.open(db_path, .{});
+    var backend = try OpBackendType.open(db_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
 

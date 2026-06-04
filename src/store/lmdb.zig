@@ -19,6 +19,8 @@ const DbiCacheEntry = struct {
     dbi: lmdb.Database.DBI,
 };
 
+pub const Backend = LmdbBackend;
+
 pub const LmdbBackend = struct {
     env: lmdb.Environment,
     dbi_cache: [MAX_DBS]DbiCacheEntry,

@@ -24,11 +24,14 @@
 const std = @import("std");
 const Server = @import("server.zig").Server;
 const generic_roster = @import("roster_store");
-const GenericRosterStore = generic_roster.RosterStore(LmdbBackend);
+const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const archive_store_mod = @import("archive_store");
-const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const vcard_store_mod = @import("vcard_store");
+const OpBackendMod = @import("op_backend");
+const OpBackendType = OpBackendMod.Backend;
+const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -136,25 +139,28 @@ pub fn main() !void {
     }
 
     // Open LMDB-backed operational stores (roster, offline, archive)
-    var op_backend: ?LmdbBackend = null;
+    var op_backend: ?OpBackendType = null;
     var roster_store: ?GenericRosterStore = null;
-    var offline_store: ?GenericOfflineStore(LmdbBackend) = null;
-    var archive_store: ?archive_store_mod.ArchiveStore(LmdbBackend) = null;
+    var offline_store: ?GenericOfflineStore(OpBackendType) = null;
+    var archive_store: ?archive_store_mod.ArchiveStore(OpBackendType) = null;
+    var vcard_store: ?GenericVCardStore = null;
     if (db_path) |db| {
         var op_path_buf: [1024]u8 = undefined;
         const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
             log.err("db path too long", .{});
             return error.InvalidArgs;
         };
-        op_backend = LmdbBackend.open(op_path, .{}) catch |err| {
+        op_backend = OpBackendType.open(op_path, .{}) catch |err| {
             log.err("failed to open operational DB at {s}: {}", .{ op_path, err });
             return error.StorageOpenFailed;
         };
         roster_store = GenericRosterStore.init(&op_backend.?);
         server.configureRoster(&roster_store.?);
-        offline_store = GenericOfflineStore(LmdbBackend).init(&op_backend.?, allocator);
-        archive_store = archive_store_mod.ArchiveStore(LmdbBackend).init(&op_backend.?, allocator);
+        offline_store = GenericOfflineStore(OpBackendType).init(&op_backend.?, allocator);
+        archive_store = archive_store_mod.ArchiveStore(OpBackendType).init(&op_backend.?, allocator);
         server.configureOffline(&offline_store.?, &archive_store.?);
+        vcard_store = GenericVCardStore.init(&op_backend.?);
+        server.configureVcard(&vcard_store.?);
     }
     defer if (op_backend) |*b| b.close();
 

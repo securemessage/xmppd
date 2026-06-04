@@ -19,9 +19,9 @@ const std = @import("std");
 const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;
-const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const OpBackendType = @import("op_backend").Backend;
 const user_store_mod = @import("user_store");
-const UserStore = user_store_mod.UserStore(LmdbBackend);
+const UserStore = user_store_mod.UserStore(OpBackendType);
 const handler_mod = @import("handler");
 const AuthHandler = handler_mod.AuthHandler(UserStore);
 const protocol = @import("ipc_protocol");
@@ -74,7 +74,7 @@ pub fn main() !void {
     log.info("xmppd-auth starting, db={s} socket={s}", .{ db_path, socket_path });
 
     // Open storage backend
-    var backend = try LmdbBackend.open(db_path, .{});
+    var backend = try OpBackendType.open(db_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
 

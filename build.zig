@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const op_storage = b.option([]const u8, "op-storage", "Operational storage backend: lmdb (default), rocksdb, sqlite") orelse "lmdb";
+
     // --- Protocol Library Modules ---
 
     const xml_mod = b.createModule(.{
@@ -244,20 +246,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const server_lmdb_mod = b.createModule(.{
-        .root_source_file = b.path("src/store/lmdb.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    server_lmdb_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
-    server_lmdb_mod.addImport("backend", server_backend_mod);
+    const server_op_backend_mod = createOpBackendMod(b, op_storage, target, optimize, server_backend_mod, lmdb_dep);
     const server_archive_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/archive_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     server_archive_store_mod.addImport("backend", server_backend_mod);
+    const server_vcard_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/vcard_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_vcard_store_mod.addImport("backend", server_backend_mod);
     const server_generic_offline_mod = b.createModule(.{
         .root_source_file = b.path("src/store/offline_store.zig"),
         .target = target,
@@ -282,8 +283,9 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
     server_test_mod.addImport("archive_store", server_archive_store_mod);
     server_test_mod.addImport("backend", server_backend_mod);
-    server_test_mod.addImport("lmdb_backend", server_lmdb_mod);
+    server_test_mod.addImport("op_backend", server_op_backend_mod);
     server_test_mod.addImport("mam_handler", server_mam_handler_mod);
+    server_test_mod.addImport("vcard_store", server_vcard_store_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -642,6 +644,24 @@ pub fn build(b: *std.Build) void {
 
     const run_rocksdb_backend_tests = b.addRunArtifact(rocksdb_backend_tests);
 
+    // --- SQLite backend tests ---
+
+    const sqlite_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_backend_test_mod.addImport("backend", backend_test_mod);
+    sqlite_backend_test_mod.linkSystemLibrary("sqlite3", .{});
+
+    const sqlite_backend_tests = b.addTest(.{
+        .name = "sqlite-backend-tests",
+        .root_module = sqlite_backend_test_mod,
+    });
+
+    const run_sqlite_backend_tests = b.addRunArtifact(sqlite_backend_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -677,8 +697,9 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
     core_mod.addImport("archive_store", server_archive_store_mod);
     core_mod.addImport("backend", server_backend_mod);
-    core_mod.addImport("lmdb_backend", server_lmdb_mod);
+    core_mod.addImport("op_backend", server_op_backend_mod);
     core_mod.addImport("mam_handler", server_mam_handler_mod);
+    core_mod.addImport("vcard_store", server_vcard_store_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -728,14 +749,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const auth_lmdb_backend_mod = b.createModule(.{
-        .root_source_file = b.path("src/store/lmdb.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    auth_lmdb_backend_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
-    auth_lmdb_backend_mod.addImport("backend", auth_backend_mod);
+    const auth_op_backend_mod = createOpBackendMod(b, op_storage, target, optimize, auth_backend_mod, lmdb_dep);
 
     const auth_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -770,7 +784,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
-    auth_mod.addImport("lmdb_backend", auth_lmdb_backend_mod);
+    auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
 
     const auth_exe = b.addExecutable(.{
@@ -827,14 +841,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ctl_lmdb_backend_mod = b.createModule(.{
-        .root_source_file = b.path("src/store/lmdb.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    ctl_lmdb_backend_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
-    ctl_lmdb_backend_mod.addImport("backend", ctl_backend_mod);
+    const ctl_op_backend_mod = createOpBackendMod(b, op_storage, target, optimize, ctl_backend_mod, lmdb_dep);
 
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -851,7 +858,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     ctl_mod.addImport("user_store", ctl_user_store_mod);
-    ctl_mod.addImport("lmdb_backend", ctl_lmdb_backend_mod);
+    ctl_mod.addImport("op_backend", ctl_op_backend_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -867,7 +874,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     ctl_test_mod.addImport("user_store", ctl_user_store_mod);
-    ctl_test_mod.addImport("lmdb_backend", ctl_lmdb_backend_mod);
+    ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",
@@ -908,10 +915,59 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_lmdb_backend_tests.step);
     test_step.dependOn(&run_rocksdb_backend_tests.step);
+    test_step.dependOn(&run_sqlite_backend_tests.step);
     test_step.dependOn(&run_generic_user_store_tests.step);
     test_step.dependOn(&run_generic_roster_store_tests.step);
     test_step.dependOn(&run_vcard_store_tests.step);
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+}
+
+/// Create an operational storage backend module based on the -Dop-storage flag.
+/// Returns a module that exports the selected backend type via its public API.
+fn createOpBackendMod(
+    b: *std.Build,
+    op_storage: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    backend_mod: *std.Build.Module,
+    lmdb_dep: *std.Build.Dependency,
+) *std.Build.Module {
+    if (std.mem.eql(u8, op_storage, "lmdb")) {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/store/lmdb.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("lmdb", lmdb_dep.module("lmdb"));
+        mod.addImport("backend", backend_mod);
+        return mod;
+    } else if (std.mem.eql(u8, op_storage, "rocksdb")) {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/store/rocksdb.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("backend", backend_mod);
+        mod.linkSystemLibrary("rocksdb", .{});
+        mod.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+        mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+        return mod;
+    } else if (std.mem.eql(u8, op_storage, "sqlite")) {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/store/sqlite.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addImport("backend", backend_mod);
+        mod.linkSystemLibrary("sqlite3", .{});
+        return mod;
+    } else {
+        std.debug.print("error: unknown -Dop-storage value: '{s}' (valid: lmdb, rocksdb, sqlite)\n", .{op_storage});
+        @panic("invalid -Dop-storage value");
+    }
 }
