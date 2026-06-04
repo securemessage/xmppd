@@ -263,6 +263,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_generic_offline_mod.addImport("backend", server_backend_mod);
+    const server_mam_handler_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/mam_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mam_handler_mod.addImport("backend", server_backend_mod);
+    server_mam_handler_mod.addImport("archive_store", server_archive_store_mod);
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -275,6 +282,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("archive_store", server_archive_store_mod);
     server_test_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("lmdb_backend", server_lmdb_mod);
+    server_test_mod.addImport("mam_handler", server_mam_handler_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -669,6 +677,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("archive_store", server_archive_store_mod);
     core_mod.addImport("backend", server_backend_mod);
     core_mod.addImport("lmdb_backend", server_lmdb_mod);
+    core_mod.addImport("mam_handler", server_mam_handler_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 

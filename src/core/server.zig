@@ -108,6 +108,19 @@ const StanzaKind = enum {
     presence,
 };
 
+/// Which MAM query text field we're currently collecting.
+pub const MamCollecting = enum {
+    none,
+    /// Collecting text inside <value> element of a <field> in the data form.
+    field_value,
+    /// Collecting text inside <max> element (RSM page size).
+    rsm_max,
+    /// Collecting text inside <after> element (RSM after cursor).
+    rsm_after,
+    /// Collecting text inside <before> element (RSM before cursor).
+    rsm_before,
+};
+
 /// Per-connection session state. Bundles a Connection with its XML parser,
 /// XMPP stream FSM, and SASL state.
 pub const Session = struct {
@@ -158,6 +171,22 @@ pub const Session = struct {
     iq_roster_item_jid: []const u8 = "",
     iq_roster_item_name: []const u8 = "",
     iq_roster_item_sub: []const u8 = "",
+
+    /// MAM query accumulation (XEP-0313) — populated by handleIqChild.
+    mam_query_id: []const u8 = "",
+    mam_with: []const u8 = "",
+    mam_start: []const u8 = "",
+    mam_end: []const u8 = "",
+    mam_after: []const u8 = "",
+    mam_before: []const u8 = "",
+    mam_max: []const u8 = "",
+    /// Which MAM text field we're currently collecting (from nested value/max elements).
+    mam_collecting: MamCollecting = .none,
+    /// Buffer for MAM text content accumulation.
+    mam_text_buf: [256]u8 = undefined,
+    mam_text_len: usize = 0,
+    /// Current <field var='...'> name being parsed inside <x> data form.
+    mam_field_var: []const u8 = "",
 
     fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -698,6 +727,17 @@ pub const Server = struct {
             return;
         }
 
+        // MAM query text accumulation (field values, RSM elements)
+        if (session.mam_collecting != .none) {
+            const remaining = session.mam_text_buf.len - session.mam_text_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.mam_text_buf[session.mam_text_len .. session.mam_text_len + to_copy], text[0..to_copy]);
+                session.mam_text_len += to_copy;
+            }
+            return;
+        }
+
         if (session.sasl_collecting == .none) return;
 
         // Accumulate text into SASL buffer
@@ -753,6 +793,11 @@ pub const Server = struct {
                 return;
             },
             .none => {},
+        }
+
+        // MAM text accumulation — commit collected text on element close
+        if (session.iq_active and session.mam_collecting != .none) {
+            iq_handler.commitMamText(session);
         }
 
         // IQ stanza dispatch — when the IQ closes (depth back to stream child level)

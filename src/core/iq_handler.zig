@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const xml = @import("xml");
+const mam_handler = @import("mam_handler");
 
 const log = std.log.scoped(.xmppd);
 
@@ -24,7 +25,13 @@ const log = std.log.scoped(.xmppd);
 const server_mod = @import("server.zig");
 const Session = server_mod.Session;
 const Server = server_mod.Server;
+const MamCollecting = server_mod.MamCollecting;
 const ChangeList = @import("event_loop.zig").ChangeList;
+
+/// RSM namespace URI.
+const ns_rsm = "http://jabber.org/protocol/rsm";
+/// jabber:x:data namespace URI.
+const ns_xdata = "jabber:x:data";
 
 /// Start IQ accumulation — called from handleElementStart when an <iq> is seen.
 pub fn handleIq(session: *Session, elem: xml.Element) void {
@@ -48,6 +55,15 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     if (std.mem.eql(u8, elem.local_name, "query")) {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
+        // MAM query — extract queryid attribute
+        if (std.mem.eql(u8, ns, xml.ns.mam)) {
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "queryid")) {
+                    session.mam_query_id = attr.value;
+                    break;
+                }
+            }
+        }
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.roster)) {
         // Roster item inside <query xmlns='jabber:iq:roster'>
         for (elem.attributes) |attr| {
@@ -58,11 +74,69 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     } else if (std.mem.eql(u8, elem.local_name, "ping") and std.mem.eql(u8, ns, xml.ns.ping)) {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
+    } else if (std.mem.eql(u8, elem.local_name, "field") and std.mem.eql(u8, ns, ns_xdata)) {
+        // <field var='with|start|end'> inside <x xmlns='jabber:x:data'>
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "var")) {
+                session.mam_field_var = attr.value;
+                break;
+            }
+        }
+    } else if (std.mem.eql(u8, elem.local_name, "value") and session.mam_field_var.len > 0) {
+        // <value> inside a <field> — start collecting text
+        session.mam_collecting = .field_value;
+        session.mam_text_len = 0;
+    } else if (std.mem.eql(u8, ns, ns_rsm)) {
+        // RSM elements: <max>, <after>, <before>
+        if (std.mem.eql(u8, elem.local_name, "max")) {
+            session.mam_collecting = .rsm_max;
+            session.mam_text_len = 0;
+        } else if (std.mem.eql(u8, elem.local_name, "after")) {
+            session.mam_collecting = .rsm_after;
+            session.mam_text_len = 0;
+        } else if (std.mem.eql(u8, elem.local_name, "before")) {
+            session.mam_collecting = .rsm_before;
+            session.mam_text_len = 0;
+        }
     } else if (session.iq_child_ns.len == 0) {
         // First child element determines the IQ payload namespace
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
     }
+}
+
+/// Commit collected MAM text to the appropriate session field.
+/// Called from handleElementEnd when a text-collecting element closes.
+pub fn commitMamText(session: *Session) void {
+    const text = session.mam_text_buf[0..session.mam_text_len];
+
+    switch (session.mam_collecting) {
+        .field_value => {
+            // Route based on current field var
+            const field_var = session.mam_field_var;
+            if (std.mem.eql(u8, field_var, "with")) {
+                session.mam_with = text;
+            } else if (std.mem.eql(u8, field_var, "start")) {
+                session.mam_start = text;
+            } else if (std.mem.eql(u8, field_var, "end")) {
+                session.mam_end = text;
+            }
+            // Reset field_var after consuming value
+            session.mam_field_var = "";
+        },
+        .rsm_max => {
+            session.mam_max = text;
+        },
+        .rsm_after => {
+            session.mam_after = text;
+        },
+        .rsm_before => {
+            session.mam_before = text;
+        },
+        .none => {},
+    }
+
+    session.mam_collecting = .none;
 }
 
 /// Dispatch a complete IQ stanza based on accumulated state.
@@ -76,6 +150,17 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_roster_item_jid = "";
         session.iq_roster_item_name = "";
         session.iq_roster_item_sub = "";
+        // Reset MAM accumulation
+        session.mam_query_id = "";
+        session.mam_with = "";
+        session.mam_start = "";
+        session.mam_end = "";
+        session.mam_after = "";
+        session.mam_before = "";
+        session.mam_max = "";
+        session.mam_field_var = "";
+        session.mam_collecting = .none;
+        session.mam_text_len = 0;
     }
 
     const iq_type = session.iq_type;
@@ -286,22 +371,99 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
 }
 
 /// Handle MAM query (XEP-0313). Queries the archive store and sends results.
-/// NOTE: Full MAM query parsing (with/start/end/RSM from <x>/<field>/<value>
-/// child elements) requires extending handleIqChild. For now, returns an
-/// empty result set with <fin complete='true'/>.
 fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
     _ = changes;
-    _ = server.archive orelse {
+    const archive = server.archive orelse {
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
 
-    // Send empty fin result (placeholder until query parsing is wired)
-    var fbs = std.io.fixedBufferStream(&session.write_scratch);
-    const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    const bound = session.stream.bound_jid orelse return;
+
+    // Build bare JID for archive lookup
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    // Parse max from text (default 50)
+    const max: u32 = if (session.mam_max.len > 0)
+        std.fmt.parseInt(u32, session.mam_max, 10) catch 50
+    else
+        50;
+
+    // Parse timestamps from ISO 8601 if provided
+    const start_ts = if (session.mam_start.len > 0) parseTimestamp(session.mam_start) else null;
+    const end_ts = if (session.mam_end.len > 0) parseTimestamp(session.mam_end) else null;
+
+    // Build MamQuery from accumulated session state
+    const query = mam_handler.MamQuery{
+        .iq_id = iq_id,
+        .owner = bare_jid,
+        .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
+        .with = if (session.mam_with.len > 0) session.mam_with else null,
+        .start = start_ts,
+        .end = end_ts,
+        .after_id = if (session.mam_after.len > 0) session.mam_after else null,
+        .before_id = if (session.mam_before.len > 0) session.mam_before else null,
+        .max = max,
+    };
+
+    const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+    var response = mam_handler.handleMamQuery(LmdbBackend, archive, query, server.allocator) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+    defer response.deinit();
+
+    // Send each result message
+    for (response.messages) |msg| {
+        session.conn.queueSend(msg.xml) catch continue;
+    }
+
+    // Send the fin IQ
+    session.conn.queueSend(response.fin_iq) catch return;
+}
+
+/// Parse a subset of ISO 8601 timestamps (YYYY-MM-DDThh:mm:ssZ) to unix epoch.
+/// Returns null if parsing fails.
+fn parseTimestamp(text: []const u8) ?u64 {
+    // Minimal parser: "2023-11-14T22:13:20Z" (20 chars)
+    if (text.len < 19) return null;
+    const year = std.fmt.parseInt(u16, text[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, text[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, text[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, text[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, text[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(u8, text[17..19], 10) catch return null;
+
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > 31) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+
+    // Days per month (non-leap)
+    const days_per_month = [_]u16{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    // Calculate days from epoch (1970-01-01)
+    var days: u64 = 0;
+    var y: u16 = 1970;
+    while (y < year) : (y += 1) {
+        days += if (isLeapYear(y)) 366 else 365;
+    }
+    var m: u8 = 1;
+    while (m < month) : (m += 1) {
+        days += days_per_month[m - 1];
+        if (m == 2 and isLeapYear(year)) days += 1;
+    }
+    days += @as(u64, day) - 1;
+
+    return days * 86400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + @as(u64, second);
+}
+
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
 /// Write IQ opening tag with type, from (server), to (client full JID), and id.
