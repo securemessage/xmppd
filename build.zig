@@ -228,18 +228,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const roster_store_mod_for_server = b.createModule(.{
-        .root_source_file = b.path("src/core/roster_store.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const session_registry_mod_for_server = b.createModule(.{
-        .root_source_file = b.path("src/core/session_registry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const server_backend_mod = b.createModule(.{
         .root_source_file = b.path("src/store/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const roster_store_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/store/roster_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    roster_store_mod_for_server.addImport("backend", server_backend_mod);
+    const session_registry_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/core/session_registry.zig"),
         .target = target,
         .optimize = optimize,
     });

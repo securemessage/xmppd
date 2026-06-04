@@ -44,14 +44,16 @@ const Event = @import("event_loop.zig").Event;
 const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
-const RosterStore = @import("roster_store").RosterStore;
+const backend_mod = @import("backend");
+const LmdbBackend = @import("lmdb_backend").LmdbBackend;
+const generic_roster = @import("roster_store");
+const GenericRosterStore = generic_roster.RosterStore(LmdbBackend);
+const Subscription = generic_roster.Subscription;
 const SessionRegistry = @import("session_registry").SessionRegistry;
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const OfflinePointer = generic_offline.OfflinePointer;
 const archive_store_mod = @import("archive_store");
-const backend_mod = @import("backend");
-const LmdbBackend = @import("lmdb_backend").LmdbBackend;
 const iq_handler = @import("iq_handler.zig");
 
 const log = std.log.scoped(.xmppd);
@@ -242,7 +244,7 @@ pub const Server = struct {
     registry: SessionRegistry = .{},
 
     /// Roster store — per-user contact lists with subscription states.
-    roster: ?*RosterStore = null,
+    roster: ?*GenericRosterStore = null,
 
     /// Generic offline store — delivery pointers for unavailable recipients.
     offline: ?*GenericOfflineStore(LmdbBackend) = null,
@@ -289,11 +291,10 @@ pub const Server = struct {
         log.info("connected to auth daemon at {s}", .{socket_path});
     }
 
-    /// Configure the roster store. The roster file lives in the same
-    /// directory as the user database.
-    pub fn configureRoster(self: *Server, roster_store: *RosterStore) void {
+    /// Configure the roster store (generic backend-backed).
+    pub fn configureRoster(self: *Server, roster_store: *GenericRosterStore) void {
         self.roster = roster_store;
-        log.info("roster store configured ({d} items)", .{roster_store.items.items.len});
+        log.info("roster store configured", .{});
     }
 
     /// Connect to the S2S federation daemon IPC socket.
@@ -1557,7 +1558,6 @@ pub const Server = struct {
     fn handleSubscribe(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         const roster = self.roster orelse return;
         const bound = session.stream.bound_jid orelse return;
-        const Subscription = @import("roster_store").Subscription;
 
         var to_str: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1574,12 +1574,12 @@ pub const Server = struct {
         const owner_bare = bare_fbs.getWritten();
 
         // Update owner's roster: set ask='subscribe'
-        if (roster.getItemMut(owner_bare, to_str)) |item| {
-            item.ask = "subscribe";
+        if (roster.getItem(self.allocator, owner_bare, to_str) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            roster.setItem(owner_bare, to_str, "", existing.subscription, true) catch return;
         } else {
-            roster.setItem(owner_bare, to_str, "", Subscription.none, "subscribe") catch return;
+            roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
         }
-        roster.save() catch {};
 
         // Forward subscribe to the target (if online)
         const to_jid = xmpp.Jid.parse(to_str) catch return;
@@ -1614,7 +1614,6 @@ pub const Server = struct {
     fn handleSubscribed(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         const roster = self.roster orelse return;
         const bound = session.stream.bound_jid orelse return;
-        const Subscription = @import("roster_store").Subscription;
 
         var to_str: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1631,29 +1630,30 @@ pub const Server = struct {
         const owner_bare = bare_fbs.getWritten();
 
         // Update our roster: contact's subscription gains "from" direction
-        if (roster.getItemMut(owner_bare, to_str)) |item| {
-            item.subscription = switch (item.subscription) {
-                .none => Subscription.from,
-                .to => Subscription.both,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, owner_bare, to_str) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .none => .from,
+                .to => .both,
+                else => existing.subscription,
             };
-            item.ask = "";
+            roster.setItem(owner_bare, to_str, "", new_sub, false) catch return;
         } else {
-            roster.setItem(owner_bare, to_str, "", Subscription.from, "") catch return;
+            roster.setItem(owner_bare, to_str, "", .from, false) catch return;
         }
 
         // Update contact's roster: their subscription gains "to" direction
-        if (roster.getItemMut(to_str, owner_bare)) |item| {
-            item.subscription = switch (item.subscription) {
-                .none => Subscription.to,
-                .from => Subscription.both,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, to_str, owner_bare) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .none => .to,
+                .from => .both,
+                else => existing.subscription,
             };
-            item.ask = "";
+            roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
         } else {
-            roster.setItem(to_str, owner_bare, "", Subscription.to, "") catch {};
+            roster.setItem(to_str, owner_bare, "", .to, false) catch {};
         }
-        roster.save() catch {};
 
         // Forward subscribed to the target (if online)
         const to_jid = xmpp.Jid.parse(to_str) catch return;
@@ -1690,7 +1690,6 @@ pub const Server = struct {
     fn handleUnsubscribe(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         const roster = self.roster orelse return;
         const bound = session.stream.bound_jid orelse return;
-        const Subscription = @import("roster_store").Subscription;
 
         var to_str: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1706,23 +1705,26 @@ pub const Server = struct {
         const owner_bare = bare_fbs.getWritten();
 
         // Update our roster: remove "to" direction
-        if (roster.getItemMut(owner_bare, to_str)) |item| {
-            item.subscription = switch (item.subscription) {
-                .to => Subscription.none,
-                .both => Subscription.from,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, owner_bare, to_str) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .to => .none,
+                .both => .from,
+                else => existing.subscription,
             };
+            roster.setItem(owner_bare, to_str, "", new_sub, false) catch {};
         }
 
         // Update contact's roster: remove "from" direction
-        if (roster.getItemMut(to_str, owner_bare)) |item| {
-            item.subscription = switch (item.subscription) {
-                .from => Subscription.none,
-                .both => Subscription.to,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, to_str, owner_bare) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .from => .none,
+                .both => .to,
+                else => existing.subscription,
             };
+            roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
         }
-        roster.save() catch {};
 
         // Forward unsubscribe
         const to_jid = xmpp.Jid.parse(to_str) catch return;
@@ -1751,7 +1753,6 @@ pub const Server = struct {
     fn handleUnsubscribed(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         const roster = self.roster orelse return;
         const bound = session.stream.bound_jid orelse return;
-        const Subscription = @import("roster_store").Subscription;
 
         var to_str: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1767,24 +1768,26 @@ pub const Server = struct {
         const owner_bare = bare_fbs.getWritten();
 
         // Update our roster: remove "from" direction
-        if (roster.getItemMut(owner_bare, to_str)) |item| {
-            item.subscription = switch (item.subscription) {
-                .from => Subscription.none,
-                .both => Subscription.to,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, owner_bare, to_str) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .from => .none,
+                .both => .to,
+                else => existing.subscription,
             };
+            roster.setItem(owner_bare, to_str, "", new_sub, existing.ask) catch {};
         }
 
         // Update contact's roster: remove "to" direction
-        if (roster.getItemMut(to_str, owner_bare)) |item| {
-            item.subscription = switch (item.subscription) {
-                .to => Subscription.none,
-                .both => Subscription.from,
-                else => item.subscription,
+        if (roster.getItem(self.allocator, to_str, owner_bare) catch null) |existing| {
+            defer if (existing.name.len > 0) self.allocator.free(existing.name);
+            const new_sub: Subscription = switch (existing.subscription) {
+                .to => .none,
+                .both => .from,
+                else => existing.subscription,
             };
-            item.ask = "";
+            roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
         }
-        roster.save() catch {};
 
         // Forward unsubscribed
         const to_jid = xmpp.Jid.parse(to_str) catch return;
@@ -1850,9 +1853,11 @@ pub const Server = struct {
         const bare_jid = bare_fbs.getWritten();
 
         // Find subscribers (contacts with "from" or "both" in our roster)
-        var subscriber_jids: [128][]const u8 = undefined;
-        const sub_count = roster.getPresenceSubscribers(bare_jid, &subscriber_jids);
-
+        const subscriber_jids = roster.getPresenceSubscribers(self.allocator, bare_jid) catch return;
+        defer {
+            for (subscriber_jids) |s| self.allocator.free(s);
+            self.allocator.free(subscriber_jids);
+        }
         // Build presence stanza
         var pres_buf: [512]u8 = undefined;
         var pres_fbs = std.io.fixedBufferStream(&pres_buf);
@@ -1863,7 +1868,7 @@ pub const Server = struct {
         const presence_xml = pres_fbs.getWritten();
 
         // Deliver to each subscriber that has an active session
-        for (subscriber_jids[0..sub_count]) |sub_bare_jid| {
+        for (subscriber_jids) |sub_bare_jid| {
             // Parse the subscriber bare JID to get local/domain
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
@@ -1902,8 +1907,11 @@ pub const Server = struct {
         bare_fbs.writer().writeAll(domain) catch return;
         const bare_jid = bare_fbs.getWritten();
 
-        var subscriber_jids: [128][]const u8 = undefined;
-        const sub_count = roster.getPresenceSubscribers(bare_jid, &subscriber_jids);
+        const subscriber_jids = roster.getPresenceSubscribers(self.allocator, bare_jid) catch return;
+        defer {
+            for (subscriber_jids) |s| self.allocator.free(s);
+            self.allocator.free(subscriber_jids);
+        }
 
         var pres_buf: [512]u8 = undefined;
         var pres_fbs = std.io.fixedBufferStream(&pres_buf);
@@ -1913,7 +1921,7 @@ pub const Server = struct {
         pw.writeAll("' type='unavailable'/>") catch return;
         const presence_xml = pres_fbs.getWritten();
 
-        for (subscriber_jids[0..sub_count]) |sub_bare_jid| {
+        for (subscriber_jids) |sub_bare_jid| {
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
@@ -1945,11 +1953,14 @@ pub const Server = struct {
         const bare_jid = bare_fbs.getWritten();
 
         // Get contacts whose presence we should receive (to/both)
-        var contact_jids: [128][]const u8 = undefined;
-        const count = roster.getPresenceSubscriptions(bare_jid, &contact_jids);
+        const contact_jids = roster.getPresenceSubscriptions(self.allocator, bare_jid) catch return;
+        defer {
+            for (contact_jids) |s| self.allocator.free(s);
+            self.allocator.free(contact_jids);
+        }
 
         // For each subscribed contact, check if they're online and send their presence
-        for (contact_jids[0..count]) |contact_bare| {
+        for (contact_jids) |contact_bare| {
             const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
             const contact_local = contact_bare[0..at_pos];
             const contact_domain = contact_bare[at_pos + 1 ..];

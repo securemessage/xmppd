@@ -197,7 +197,7 @@ fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: 
     return buf[0 .. 4 + name.len];
 }
 
-fn deserializeEntry(allocator: std.mem.Allocator, data: []const u8) !RosterEntry {
+pub fn deserializeEntry(allocator: std.mem.Allocator, data: []const u8) !RosterEntry {
     if (data.len < 4) return error.InvalidFormat;
     const sub_byte = data[0];
     const ask_byte = data[1];

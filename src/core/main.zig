@@ -23,7 +23,8 @@
 
 const std = @import("std");
 const Server = @import("server.zig").Server;
-const RosterStore = @import("roster_store").RosterStore;
+const generic_roster = @import("roster_store");
+const GenericRosterStore = generic_roster.RosterStore(LmdbBackend);
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const archive_store_mod = @import("archive_store");
@@ -134,24 +135,9 @@ pub fn main() !void {
         };
     }
 
-    // Load roster store from same directory as user DB
-    var roster_store: ?RosterStore = null;
-    if (db_path) |db| {
-        // Derive roster path from DB path: replace extension or append .roster
-        var roster_path_buf: [1024]u8 = undefined;
-        const roster_path = std.fmt.bufPrint(&roster_path_buf, "{s}.roster", .{db}) catch {
-            log.err("db path too long", .{});
-            return error.InvalidArgs;
-        };
-        roster_store = RosterStore.init(allocator, roster_path);
-        roster_store.?.load() catch |err| {
-            log.warn("failed to load roster: {}", .{err});
-        };
-        server.configureRoster(&roster_store.?);
-    }
-
-    // Open LMDB-backed offline + archive stores
+    // Open LMDB-backed operational stores (roster, offline, archive)
     var op_backend: ?LmdbBackend = null;
+    var roster_store: ?GenericRosterStore = null;
     var offline_store: ?GenericOfflineStore(LmdbBackend) = null;
     var archive_store: ?archive_store_mod.ArchiveStore(LmdbBackend) = null;
     if (db_path) |db| {
@@ -164,6 +150,8 @@ pub fn main() !void {
             log.err("failed to open operational DB at {s}: {}", .{ op_path, err });
             return error.StorageOpenFailed;
         };
+        roster_store = GenericRosterStore.init(&op_backend.?);
+        server.configureRoster(&roster_store.?);
         offline_store = GenericOfflineStore(LmdbBackend).init(&op_backend.?, allocator);
         archive_store = archive_store_mod.ArchiveStore(LmdbBackend).init(&op_backend.?, allocator);
         server.configureOffline(&offline_store.?, &archive_store.?);

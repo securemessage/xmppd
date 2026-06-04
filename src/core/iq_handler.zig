@@ -287,30 +287,42 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
     bare_fbs.writer().writeAll(bound.domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    // Build roster response
+    // Build roster response using prefix iteration
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("><query xmlns='jabber:iq:roster'>") catch return;
 
-    // Add each roster item
-    for (roster.items.items) |item| {
-        if (!std.mem.eql(u8, item.owner, bare_jid)) continue;
+    // Iterate all roster items for this owner via backend prefix scan
+    var prefix_buf: [256]u8 = undefined;
+    @memcpy(prefix_buf[0..bare_jid.len], bare_jid);
+    prefix_buf[bare_jid.len] = 0;
+    const prefix = prefix_buf[0 .. bare_jid.len + 1];
+
+    var iter = roster.backend.iterator("rosters", prefix) catch return;
+    defer iter.deinit();
+
+    const generic_roster_mod = @import("roster_store");
+    while (iter.next()) |entry| {
+        // Key is "owner\x00contact" — extract contact after separator
+        const contact_jid = entry.key[bare_jid.len + 1 ..];
+        // Deserialize value to get subscription + name
+        const parsed = generic_roster_mod.deserializeEntry(server.allocator, entry.value) catch continue;
+        defer if (parsed.name.len > 0) server.allocator.free(parsed.name);
+
         w.writeAll("<item jid='") catch return;
-        w.writeAll(item.jid) catch return;
+        w.writeAll(contact_jid) catch return;
         w.writeByte('\'') catch return;
-        if (item.name.len > 0) {
+        if (parsed.name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(item.name) catch return;
+            w.writeAll(parsed.name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll(" subscription='") catch return;
-        w.writeAll(item.subscription.toString()) catch return;
+        w.writeAll(parsed.subscription.toString()) catch return;
         w.writeByte('\'') catch return;
-        if (item.ask.len > 0) {
-            w.writeAll(" ask='") catch return;
-            w.writeAll(item.ask) catch return;
-            w.writeByte('\'') catch return;
+        if (parsed.ask) {
+            w.writeAll(" ask='subscribe'") catch return;
         }
         w.writeAll("/>") catch return;
     }
@@ -347,19 +359,17 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
 
     if (std.mem.eql(u8, item_sub, "remove")) {
         // Remove roster item
-        _ = roster.removeItem(bare_jid, item_jid);
-        roster.save() catch {};
+        roster.removeItem(bare_jid, item_jid) catch {};
     } else {
-        // Add or update
-        const sub = if (roster.getItem(bare_jid, item_jid)) |existing|
-            existing.subscription
-        else
-            Subscription.none;
-        roster.setItem(bare_jid, item_jid, session.iq_roster_item_name, sub, "") catch {
+        // Add or update — preserve existing subscription if item exists
+        const sub = if (roster.getItem(server.allocator, bare_jid, item_jid) catch null) |existing| blk: {
+            defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            break :blk existing.subscription;
+        } else Subscription.none;
+        roster.setItem(bare_jid, item_jid, session.iq_roster_item_name, sub, false) catch {
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
-        roster.save() catch {};
     }
 
     // Ack with result
