@@ -288,9 +288,17 @@ archive_dsn = postgresql://xmppd:pass@db/xmppd_archive
 
 ## 13. Open Questions
 
-1. **zig-lmdb** v0.3.2 targets Zig 0.15.1 — verify clean build on 0.15.2
+1. ~~**zig-lmdb** v0.3.2 targets Zig 0.15.1~~ — **RESOLVED:** builds clean on 0.15.2
 2. **rocksdb-zig** (Syndica) targets Zig 0.15 — verify FreeBSD cross-compile of C++ sources via Zig build
-3. **LMDB map size** — auto-resize on `MDB_MAP_FULL` (Postfix pattern)
-4. **Value serialization** — compact binary with `xmppctl dump` for human inspection
+3. ~~**LMDB map size**~~ — **RESOLVED:** auto-resize on `MDB_MAP_FULL` implemented (3 retries, double map size)
+4. ~~**Value serialization**~~ — **RESOLVED:** compact binary: users=100B packed, roster=4+name_len, vcard=raw XML
 5. **Archive stanza format** — store verbatim XML (spec-compliant) with RocksDB block compression
 6. **Config file format** — INI (shown above) vs. TOML vs. custom. Postfix uses `main.cf` (key=value). INI is simplest.
+
+## 14. Implementation Notes
+
+- **Trait pattern diverges from §6:** Implementation uses `assertBackend()` comptime validation + duck typing rather than the `StorageBackend(Impl)` wrapper. Simpler, same zero-cost result.
+- **`get()` takes allocator:** Returns allocator-owned `!?[]u8`. Caller frees. Needed because LMDB mmap pointers are only valid during the read transaction.
+- **Named module imports:** Use `@import("backend")` not `@import("backend.zig")` — Zig disallows a file belonging to two modules when referenced via both paths.
+- **AuthHandler generic over Store type** (not Backend) — handler doesn't know or care about the storage engine, only the store interface.
+- **`roster_rev` deferred:** Forward prefix scan on `owner\x00` in the `rosters` namespace handles all current presence queries. Reverse index for inbound presence probes can be added later.
