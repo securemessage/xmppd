@@ -216,6 +216,10 @@ pub fn build(b: *std.Build) void {
 
     const run_ipc_server_tests = b.addRunArtifact(ipc_server_tests);
 
+    // --- Storage dependency (needed early for server module) ---
+
+    const lmdb_dep = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
+
     // --- Server tests (depends on IPC modules) ---
 
     const server_test_mod = b.createModule(.{
@@ -234,11 +238,31 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const offline_store_mod_for_server = b.createModule(.{
-        .root_source_file = b.path("src/core/offline_store.zig"),
+    const server_backend_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/backend.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const server_lmdb_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lmdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    server_lmdb_mod.addImport("lmdb", lmdb_dep.module("lmdb"));
+    server_lmdb_mod.addImport("backend", server_backend_mod);
+    const server_archive_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/archive_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_archive_store_mod.addImport("backend", server_backend_mod);
+    const server_generic_offline_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/offline_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_generic_offline_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -247,7 +271,10 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
     server_test_mod.addImport("session_registry", session_registry_mod_for_server);
-    server_test_mod.addImport("offline_store", offline_store_mod_for_server);
+    server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
+    server_test_mod.addImport("archive_store", server_archive_store_mod);
+    server_test_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("lmdb_backend", server_lmdb_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -265,8 +292,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
-    const lmdb_dep = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
 
     // --- Auth tests ---
 
@@ -640,7 +665,10 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
     core_mod.addImport("session_registry", session_registry_mod_for_server);
-    core_mod.addImport("offline_store", offline_store_mod_for_server);
+    core_mod.addImport("generic_offline_store", server_generic_offline_mod);
+    core_mod.addImport("archive_store", server_archive_store_mod);
+    core_mod.addImport("backend", server_backend_mod);
+    core_mod.addImport("lmdb_backend", server_lmdb_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 

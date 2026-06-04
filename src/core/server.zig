@@ -46,9 +46,12 @@ const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
 const RosterStore = @import("roster_store").RosterStore;
 const SessionRegistry = @import("session_registry").SessionRegistry;
-const offline_store_mod = @import("offline_store");
-const OfflineStore = offline_store_mod.OfflineStore;
-const OfflineMessage = offline_store_mod.OfflineMessage;
+const generic_offline = @import("generic_offline_store");
+const GenericOfflineStore = generic_offline.GenericOfflineStore;
+const OfflinePointer = generic_offline.OfflinePointer;
+const archive_store_mod = @import("archive_store");
+const backend_mod = @import("backend");
+const LmdbBackend = @import("lmdb_backend").LmdbBackend;
 
 const log = std.log.scoped(.xmppd);
 
@@ -211,8 +214,11 @@ pub const Server = struct {
     /// Roster store — per-user contact lists with subscription states.
     roster: ?*RosterStore = null,
 
-    /// Offline message store — messages for unavailable recipients.
-    offline: ?*OfflineStore = null,
+    /// Generic offline store — delivery pointers for unavailable recipients.
+    offline: ?*GenericOfflineStore(LmdbBackend) = null,
+
+    /// Archive store — MAM message archive (stanza payloads).
+    archive: ?*archive_store_mod.ArchiveStore(LmdbBackend) = null,
 
     /// Initialize the server.
     ///
@@ -270,10 +276,11 @@ pub const Server = struct {
         log.info("connected to S2S daemon at {s}", .{socket_path});
     }
 
-    /// Configure the offline message store.
-    pub fn configureOffline(self: *Server, offline_store: *OfflineStore) void {
+    /// Configure the offline + archive stores.
+    pub fn configureOffline(self: *Server, offline_store: *GenericOfflineStore(LmdbBackend), arch_store: *archive_store_mod.ArchiveStore(LmdbBackend)) void {
         self.offline = offline_store;
-        log.info("offline store configured ({d} pending messages)", .{offline_store.messages.items.len});
+        self.archive = arch_store;
+        log.info("offline + archive stores configured", .{});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -1110,20 +1117,25 @@ pub const Server = struct {
                 if (target_count == 0) {
                     // Try offline storage for messages — only if this is a <message> stanza
                     if (self.offline) |store| {
-                        // Extract inner XML, type, and id from the complete stanza
-                        // to avoid double-wrapping when deliverOfflineMessages reconstructs it.
-                        const parts = extractStanzaParts(m.stanza_xml);
-                        if (parts.is_message) {
-                            var recip_buf: [256]u8 = undefined;
-                            var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                            recip_fbs.writer().writeAll(to_jid.local) catch {};
-                            recip_fbs.writer().writeByte('@') catch {};
-                            recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                            const recipient_bare = recip_fbs.getWritten();
+                        if (self.archive) |archive| {
+                            const parts = extractStanzaParts(m.stanza_xml);
+                            if (parts.is_message) {
+                                var recip_buf: [256]u8 = undefined;
+                                var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                                recip_fbs.writer().writeAll(to_jid.local) catch {};
+                                recip_fbs.writer().writeByte('@') catch {};
+                                recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                                const recipient_bare = recip_fbs.getWritten();
 
-                            if (store.storeMessage(recipient_bare, m.from_jid, parts.msg_type, parts.msg_id, parts.inner_xml)) {
-                                log.info("S2S inbound to {s} stored offline", .{m.to_jid});
-                                return;
+                                const timestamp: u64 = @intCast(std.time.timestamp());
+                                const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
+
+                                // Store full stanza in archive, pointer in offline
+                                archive.store(recipient_bare, m.from_jid, stanza_id, timestamp, m.stanza_xml) catch {};
+                                if (store.storePointer(recipient_bare, m.from_jid, stanza_id, timestamp) catch false) {
+                                    log.info("S2S inbound to {s} stored offline", .{m.to_jid});
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1329,17 +1341,53 @@ pub const Server = struct {
             // Only messages get offline storage (not presence stanzas)
             if (session.stanza_kind == .message) {
                 if (self.offline) |store| {
-                    // Build recipient bare JID
-                    var recip_buf: [256]u8 = undefined;
-                    var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                    recip_fbs.writer().writeAll(to_jid.local) catch {};
-                    recip_fbs.writer().writeByte('@') catch {};
-                    recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                    const recipient_bare = recip_fbs.getWritten();
+                    if (self.archive) |archive| {
+                        // Build recipient bare JID
+                        var recip_buf: [256]u8 = undefined;
+                        var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                        recip_fbs.writer().writeAll(to_jid.local) catch {};
+                        recip_fbs.writer().writeByte('@') catch {};
+                        recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                        const recipient_bare = recip_fbs.getWritten();
 
-                    if (store.storeMessage(recipient_bare, from_str, type_str, id_str, inner_xml)) {
-                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                        return;
+                        // Build full stanza XML for archive
+                        var stanza_buf: [20480]u8 = undefined;
+                        var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
+                        const sw = stanza_fbs.writer();
+                        sw.writeAll("<message from='") catch {};
+                        sw.writeAll(from_str) catch {};
+                        sw.writeAll("' to='") catch {};
+                        sw.writeAll(to_str) catch {};
+                        sw.writeByte('\'') catch {};
+                        if (type_str.len > 0) {
+                            sw.writeAll(" type='") catch {};
+                            sw.writeAll(type_str) catch {};
+                            sw.writeByte('\'') catch {};
+                        }
+                        if (id_str.len > 0) {
+                            sw.writeAll(" id='") catch {};
+                            sw.writeAll(id_str) catch {};
+                            sw.writeByte('\'') catch {};
+                        }
+                        if (inner_xml.len == 0) {
+                            sw.writeAll("/>") catch {};
+                        } else {
+                            sw.writeByte('>') catch {};
+                            sw.writeAll(inner_xml) catch {};
+                            sw.writeAll("</message>") catch {};
+                        }
+                        const full_stanza = stanza_fbs.getWritten();
+
+                        // Generate stanza ID
+                        const timestamp: u64 = @intCast(std.time.timestamp());
+                        const stanza_id = if (id_str.len > 0) id_str else "offline";
+
+                        // Store payload in archive, pointer in offline
+                        archive.store(recipient_bare, from_str, stanza_id, timestamp, full_stanza) catch {};
+                        if (store.storePointer(recipient_bare, from_str, stanza_id, timestamp) catch false) {
+                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
+                            return;
+                        }
                     }
                 }
             }
@@ -1799,6 +1847,7 @@ pub const Server = struct {
             w.writeAll("<feature var='vcard-temp'/>") catch return;
             w.writeAll("<feature var='jabber:iq:version'/>") catch return;
             w.writeAll("<feature var='msgoffline'/>") catch return;
+            w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
             w.writeAll("</query></iq>") catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             return;
@@ -2173,8 +2222,10 @@ pub const Server = struct {
     }
 
     /// Deliver queued offline messages to a user who just became available.
+    /// Uses the generic offline store (pointers) + archive store (payloads).
     fn deliverOfflineMessages(self: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
         const store = self.offline orelse return;
+        const archive = self.archive orelse return;
 
         // Build bare JID for lookup
         var bare_buf: [256]u8 = undefined;
@@ -2184,59 +2235,31 @@ pub const Server = struct {
         bare_fbs.writer().writeAll(domain) catch return;
         const bare_jid = bare_fbs.getWritten();
 
-        const count = store.countMessages(bare_jid);
+        const count = store.countMessages(bare_jid) catch return;
         if (count == 0) return;
 
-        // Retrieve and deliver messages (max 100 per user)
-        var msg_buf: [100]OfflineMessage = undefined;
-        const msg_count = store.getMessages(bare_jid, &msg_buf);
+        // Retrieve pointers and deliver messages from archive
+        const pointers = store.getPointers(bare_jid) catch return;
+        defer store.freePointers(pointers);
 
-        for (msg_buf[0..msg_count]) |msg| {
-            // Build the full <message> stanza for delivery
-            var out_buf: [20480]u8 = undefined;
-            var out_fbs = std.io.fixedBufferStream(&out_buf);
-            const w = out_fbs.writer();
-
-            w.writeAll("<message from='") catch continue;
-            w.writeAll(msg.from) catch continue;
-            w.writeAll("' to='") catch continue;
-            w.writeAll(bare_jid) catch continue;
-            w.writeByte('\'') catch continue;
-            if (msg.msg_type.len > 0 and !std.mem.eql(u8, msg.msg_type, "normal")) {
-                w.writeAll(" type='") catch continue;
-                w.writeAll(msg.msg_type) catch continue;
-                w.writeByte('\'') catch continue;
+        var delivered: usize = 0;
+        for (pointers) |ptr| {
+            // Fetch stanza XML from archive
+            const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch continue;
+            if (stanza_xml) |xml_data| {
+                defer self.allocator.free(xml_data);
+                session.conn.queueSend(xml_data) catch continue;
+                delivered += 1;
             }
-            if (msg.msg_id.len > 0) {
-                w.writeAll(" id='") catch continue;
-                w.writeAll(msg.msg_id) catch continue;
-                w.writeByte('\'') catch continue;
-            }
-
-            if (msg.inner_xml.len == 0) {
-                w.writeAll("/>") catch continue;
-            } else {
-                w.writeByte('>') catch continue;
-                w.writeAll(msg.inner_xml) catch continue;
-                // Add delay stamp (XEP-0203) to indicate this is a delayed message
-                w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-                w.writeAll(self.server_host) catch continue;
-                w.writeAll("' stamp='") catch continue;
-                self.writeTimestamp(w, msg.timestamp) catch continue;
-                w.writeAll("'/>") catch continue;
-                w.writeAll("</message>") catch continue;
-            }
-
-            session.conn.queueSend(out_fbs.getWritten()) catch continue;
         }
 
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
 
-        // Clear delivered messages
-        store.clearMessages(bare_jid);
-        log.info("delivered {d} offline messages to {s}", .{ msg_count, bare_jid });
+        // Clear all delivered pointers
+        store.clearAll(bare_jid) catch {};
+        log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
     }
 
     /// Write an ISO 8601 timestamp from a unix timestamp.

@@ -24,7 +24,10 @@
 const std = @import("std");
 const Server = @import("server.zig").Server;
 const RosterStore = @import("roster_store").RosterStore;
-const OfflineStore = @import("offline_store").OfflineStore;
+const generic_offline = @import("generic_offline_store");
+const GenericOfflineStore = generic_offline.GenericOfflineStore;
+const archive_store_mod = @import("archive_store");
+const LmdbBackend = @import("lmdb_backend").LmdbBackend;
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -147,20 +150,25 @@ pub fn main() !void {
         server.configureRoster(&roster_store.?);
     }
 
-    // Load offline message store from same directory as user DB
-    var offline_store: ?OfflineStore = null;
+    // Open LMDB-backed offline + archive stores
+    var op_backend: ?LmdbBackend = null;
+    var offline_store: ?GenericOfflineStore(LmdbBackend) = null;
+    var archive_store: ?archive_store_mod.ArchiveStore(LmdbBackend) = null;
     if (db_path) |db| {
-        var offline_path_buf: [1024]u8 = undefined;
-        const offline_path = std.fmt.bufPrint(&offline_path_buf, "{s}.offline", .{db}) catch {
+        var op_path_buf: [1024]u8 = undefined;
+        const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
             log.err("db path too long", .{});
             return error.InvalidArgs;
         };
-        offline_store = OfflineStore.init(allocator, offline_path);
-        offline_store.?.load() catch |err| {
-            log.warn("failed to load offline store: {}", .{err});
+        op_backend = LmdbBackend.open(op_path, .{}) catch |err| {
+            log.err("failed to open operational DB at {s}: {}", .{ op_path, err });
+            return error.StorageOpenFailed;
         };
-        server.configureOffline(&offline_store.?);
+        offline_store = GenericOfflineStore(LmdbBackend).init(&op_backend.?, allocator);
+        archive_store = archive_store_mod.ArchiveStore(LmdbBackend).init(&op_backend.?, allocator);
+        server.configureOffline(&offline_store.?, &archive_store.?);
     }
+    defer if (op_backend) |*b| b.close();
 
     log.info("listening on {s}:{d}", .{ address, port });
     try server.run();
