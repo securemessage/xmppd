@@ -26,6 +26,8 @@ const server_mod = @import("server.zig");
 const Session = server_mod.Session;
 const Server = server_mod.Server;
 const MamCollecting = server_mod.MamCollecting;
+const generic_roster = @import("roster_store");
+const GenericRosterStore = generic_roster.RosterStore(server_mod.OpBackendType);
 const ChangeList = @import("event_loop.zig").ChangeList;
 
 /// RSM namespace URI.
@@ -316,35 +318,23 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("><query xmlns='jabber:iq:roster'>") catch return;
 
-    // Iterate all roster items for this owner via backend prefix scan
-    var prefix_buf: [256]u8 = undefined;
-    @memcpy(prefix_buf[0..bare_jid.len], bare_jid);
-    prefix_buf[bare_jid.len] = 0;
-    const prefix = prefix_buf[0 .. bare_jid.len + 1];
+    // Get all roster items via the store's domain API
+    const items = roster.getAllItems(server.allocator, bare_jid) catch return;
+    defer GenericRosterStore.freeAllItems(server.allocator, items);
 
-    var iter = roster.backend.iterator("rosters", prefix) catch return;
-    defer iter.deinit();
-
-    const generic_roster_mod = @import("roster_store");
-    while (iter.next()) |entry| {
-        // Key is "owner\x00contact" — extract contact after separator
-        const contact_jid = entry.key[bare_jid.len + 1 ..];
-        // Deserialize value to get subscription + name
-        const parsed = generic_roster_mod.deserializeEntry(server.allocator, entry.value) catch continue;
-        defer if (parsed.name.len > 0) server.allocator.free(parsed.name);
-
+    for (items) |item| {
         w.writeAll("<item jid='") catch return;
-        w.writeAll(contact_jid) catch return;
+        w.writeAll(item.contact_jid) catch return;
         w.writeByte('\'') catch return;
-        if (parsed.name.len > 0) {
+        if (item.entry.name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(parsed.name) catch return;
+            w.writeAll(item.entry.name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll(" subscription='") catch return;
-        w.writeAll(parsed.subscription.toString()) catch return;
+        w.writeAll(item.entry.subscription.toString()) catch return;
         w.writeByte('\'') catch return;
-        if (parsed.ask) {
+        if (item.entry.ask) {
             w.writeAll(" ask='subscribe'") catch return;
         }
         w.writeAll("/>") catch return;
@@ -444,8 +434,8 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
         .max = max,
     };
 
-    const OpBackendType = server_mod.OpBackendType;
-    var response = mam_handler.handleMamQuery(OpBackendType, archive, query, server.allocator) catch {
+    const ArchBackend = @import("archive_backend").Backend;
+    var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };

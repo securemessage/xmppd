@@ -71,10 +71,17 @@ pub fn main() !void {
         }
     }
 
-    log.info("xmppd-auth starting, db={s} socket={s}", .{ db_path, socket_path });
+    // Build auth-specific sub-path: {db_path}/auth
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch {
+        log.err("db path too long", .{});
+        return error.InvalidArgs;
+    };
+
+    log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
 
     // Open storage backend
-    var backend = try OpBackendType.open(db_path, .{});
+    var backend = try OpBackendType.open(auth_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
 

@@ -55,8 +55,15 @@ pub fn main() !void {
 
     const command = remaining_args.items[0];
 
+    // Build auth-specific sub-path: {db_path}/auth
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch {
+        printErr("db path too long\n");
+        return error.InvalidArgs;
+    };
+
     // Open storage backend
-    var backend = try OpBackendType.open(db_path, .{});
+    var backend = try OpBackendType.open(auth_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
 

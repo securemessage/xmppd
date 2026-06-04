@@ -84,10 +84,13 @@ zig build -Dop-storage=lmdb -Darchive-storage=sqlite       # mix
                               └─────────────────────────┘
 
 /var/db/xmppd/
-├── op/              # LMDB environment (operational)
+├── auth/            # User credentials (xmppd-auth + xmppctl only)
 │   ├── data.mdb
 │   └── data.mdb-lock
-└── archive/         # RocksDB directory (message archive)
+├── op/              # Operational data (xmppd-core only)
+│   ├── data.mdb
+│   └── data.mdb-lock
+└── archive/         # Message archive (xmppd-core only)
     ├── 000003.sst
     ├── MANIFEST-000001
     └── ...

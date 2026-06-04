@@ -31,6 +31,8 @@ const archive_store_mod = @import("archive_store");
 const vcard_store_mod = @import("vcard_store");
 const OpBackendMod = @import("op_backend");
 const OpBackendType = OpBackendMod.Backend;
+const ArchiveBackendMod = @import("archive_backend");
+const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 
 const log = std.log.scoped(.@"xmppd-core");
@@ -138,11 +140,10 @@ pub fn main() !void {
         };
     }
 
-    // Open LMDB-backed operational stores (roster, offline, archive)
+    // Open operational stores at {db_path}/op
     var op_backend: ?OpBackendType = null;
     var roster_store: ?GenericRosterStore = null;
     var offline_store: ?GenericOfflineStore(OpBackendType) = null;
-    var archive_store: ?archive_store_mod.ArchiveStore(OpBackendType) = null;
     var vcard_store: ?GenericVCardStore = null;
     if (db_path) |db| {
         var op_path_buf: [1024]u8 = undefined;
@@ -157,12 +158,30 @@ pub fn main() !void {
         roster_store = GenericRosterStore.init(&op_backend.?);
         server.configureRoster(&roster_store.?);
         offline_store = GenericOfflineStore(OpBackendType).init(&op_backend.?, allocator);
-        archive_store = archive_store_mod.ArchiveStore(OpBackendType).init(&op_backend.?, allocator);
-        server.configureOffline(&offline_store.?, &archive_store.?);
         vcard_store = GenericVCardStore.init(&op_backend.?);
         server.configureVcard(&vcard_store.?);
     }
     defer if (op_backend) |*b| b.close();
+
+    // Open archive store at {db_path}/archive (separate backend)
+    var archive_backend: ?ArchiveBackendType = null;
+    var archive_store: ?archive_store_mod.ArchiveStore(ArchiveBackendType) = null;
+    if (db_path) |db| {
+        var archive_path_buf: [1024]u8 = undefined;
+        const archive_path = std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db}) catch {
+            log.err("db path too long", .{});
+            return error.InvalidArgs;
+        };
+        archive_backend = ArchiveBackendType.open(archive_path, .{}) catch |err| {
+            log.err("failed to open archive DB at {s}: {}", .{ archive_path, err });
+            return error.StorageOpenFailed;
+        };
+        archive_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&archive_backend.?, allocator);
+        if (offline_store != null) {
+            server.configureOffline(&offline_store.?, &archive_store.?);
+        }
+    }
+    defer if (archive_backend) |*b| b.close();
 
     log.info("listening on {s}:{d}", .{ address, port });
     try server.run();

@@ -55,6 +55,8 @@ const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const OfflinePointer = generic_offline.OfflinePointer;
 const archive_store_mod = @import("archive_store");
+const ArchiveBackendMod = @import("archive_backend");
+const ArchiveBackendType = ArchiveBackendMod.Backend;
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
@@ -258,7 +260,7 @@ pub const Server = struct {
     offline: ?*GenericOfflineStore(OpBackendType) = null,
 
     /// Archive store — MAM message archive (stanza payloads).
-    archive: ?*archive_store_mod.ArchiveStore(OpBackendType) = null,
+    archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType) = null,
 
     /// VCard store — per-user vCard XML blobs (XEP-0054).
     vcard: ?*GenericVCardStore = null,
@@ -319,7 +321,7 @@ pub const Server = struct {
     }
 
     /// Configure the offline + archive stores.
-    pub fn configureOffline(self: *Server, offline_store: *GenericOfflineStore(OpBackendType), arch_store: *archive_store_mod.ArchiveStore(OpBackendType)) void {
+    pub fn configureOffline(self: *Server, offline_store: *GenericOfflineStore(OpBackendType), arch_store: *archive_store_mod.ArchiveStore(ArchiveBackendType)) void {
         self.offline = offline_store;
         self.archive = arch_store;
         log.info("offline + archive stores configured", .{});

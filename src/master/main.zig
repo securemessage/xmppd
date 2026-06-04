@@ -105,6 +105,23 @@ pub fn main() !void {
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
 
+    // Ensure storage sub-directories exist
+    const sub_dirs = [_][]const u8{ "auth", "op", "archive" };
+    for (sub_dirs) |sub| {
+        var path_buf: [1024]u8 = undefined;
+        const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ db_path, sub }) catch {
+            log.err("db path too long", .{});
+            return error.InvalidArgs;
+        };
+        std.fs.cwd().makePath(sub_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                log.err("failed to create {s}: {}", .{ sub_path, err });
+                return error.StorageSetupFailed;
+            },
+        };
+    }
+
     // Initialize supervisors for both children
     var auth_sup = Supervisor.init(auth_path, &.{});
     var core_sup = Supervisor.init(core_path, &.{});

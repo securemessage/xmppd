@@ -117,6 +117,59 @@ pub fn RosterStore(comptime Backend: type) type {
             return self.scanBySubscription(allocator, owner, .{ .to = true, .both = true });
         }
 
+        /// A roster item with its contact JID for enumeration.
+        pub const RosterItem = struct {
+            contact_jid: []const u8,
+            entry: RosterEntry,
+        };
+
+        /// Get all roster items for an owner.
+        /// Caller owns the returned slice and must free each item's contact_jid
+        /// and name (if non-empty), then free the slice itself.
+        pub fn getAllItems(self: *Self, allocator: std.mem.Allocator, owner: []const u8) ![]RosterItem {
+            var prefix_buf: [256]u8 = undefined;
+            const prefix = ownerPrefix(&prefix_buf, owner);
+
+            var iter = try self.backend.iterator(NAMESPACE, prefix);
+            defer iter.deinit();
+
+            var list: std.ArrayListUnmanaged(RosterItem) = .{};
+            errdefer {
+                for (list.items) |item| {
+                    allocator.free(item.contact_jid);
+                    if (item.entry.name.len > 0) allocator.free(item.entry.name);
+                }
+                list.deinit(allocator);
+            }
+
+            while (iter.next()) |kv| {
+                const contact = kv.key[owner.len + 1 ..];
+                const entry = deserializeEntry(allocator, kv.value) catch continue;
+
+                list.append(allocator, .{
+                    .contact_jid = allocator.dupe(u8, contact) catch {
+                        if (entry.name.len > 0) allocator.free(entry.name);
+                        continue;
+                    },
+                    .entry = entry,
+                }) catch {
+                    if (entry.name.len > 0) allocator.free(entry.name);
+                    continue;
+                };
+            }
+
+            return list.toOwnedSlice(allocator);
+        }
+
+        /// Free a slice returned by getAllItems.
+        pub fn freeAllItems(allocator: std.mem.Allocator, items: []const RosterItem) void {
+            for (items) |item| {
+                allocator.free(item.contact_jid);
+                if (item.entry.name.len > 0) allocator.free(item.entry.name);
+            }
+            allocator.free(items);
+        }
+
         /// Count roster items for an owner.
         pub fn countForOwner(self: *Self, owner: []const u8) !usize {
             var prefix_buf: [256]u8 = undefined;
