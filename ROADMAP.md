@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-03
+Last updated: 2026-06-04
 
 ## Current Status
 
@@ -14,10 +14,13 @@ Last updated: 2026-06-03
 | 2. Core Daemon | ✅ Complete | kqueue event loop, C2S, master supervisor |
 | 3. S2S Federation | ✅ Complete | DANE + EXTERNAL + dialback + E2E tested |
 | 4. Client Interop | ✅ Complete | slixmpp 23/23, profanity 14/14, gajim ✓, dino ✓ |
-| 5. Storage | ⬜ Not started | Pluggable storage interface + backends |
-| 6. Auth | ⬜ Not started | Pluggable auth backends |
-| 7. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
-| 8. Polish & Deploy | ⬜ Not started | Config, RC script, port, XEPs, docs |
+| 5. Storage | ✅ Complete | Comptime generic stores, LMDB/RocksDB/SQLite backends |
+| 6. Auth Daemon + IPC | ✅ Complete | xmppd-auth, SCRAM-SHA-256, PLAIN, binary IPC |
+| 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
+| 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
+| 9. Auth Hardening | 🔵 Design | Rate limiting, registration, token auth, ext backends |
+| 10. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
+| 11. Polish & Deploy | ⬜ Not started | Config, RC script, port, XEPs, docs |
 
 ---
 
@@ -121,70 +124,118 @@ Validate the server against real XMPP clients before adding features.
 This phase gates further feature work. No point building on a foundation
 that doesn't interoperate with real clients.
 
-## Phase 5 — Storage
+## Phase 5 — Storage ✅
 
-Replace flat-file stores with a proper storage subsystem. This phase
-requires a dedicated design session before implementation begins.
+Pluggable storage subsystem with comptime generic stores and multiple
+backends. Build flag `-Dop-storage` selects the operational backend.
 
-### Design Goals
+- [x] Comptime `StorageBackend` trait (`src/store/backend.zig`) with `assertBackend()`
+- [x] `MemoryBackend` — reference implementation and test double
+- [x] `LmdbBackend` — LMDB via zig-lmdb v0.3.2, auto-resize on MDB_MAP_FULL
+- [x] `RocksDbBackend` — RocksDB via system librocksdb C API
+- [x] `SqliteBackend` — SQLite3 via system libsqlite3
+- [x] `UserStore(Backend)` — SCRAM credential storage (binary format)
+- [x] `RosterStore(Backend)` — composite key, subscription state machine
+- [x] `VCardStore(Backend)` — raw XML blob storage
+- [x] `OfflineStore(Backend)` — offline message queue with per-user cap
+- [x] `ArchiveStore(Backend)` — MAM archive with paginated query + retention
+- [x] `MamHandler` — XEP-0313 IQ handler wired into core
+- [x] Auth daemon migrated to `UserStore(LmdbBackend)`
+- [x] Core daemon wired with generic RosterStore, VCardStore, OfflineStore, ArchiveStore
+- [x] `-Dop-storage` build flag (lmdb, rocksdb, sqlite)
 
-- Pluggable storage interface (comptime traits, zero runtime dispatch)
-- Separate `xmppd-store` daemon process (privilege separation)
-- IPC protocol for store operations (same pattern as auth IPC)
-- Default backend that works with zero external dependencies
+**Key files:** `src/store/` (10 files, ~3,663 LOC)
 
-### Planned Backends
+## Phase 6 — Auth Daemon + IPC ✅
 
-| Backend | Use Case | Dependencies |
-|---------|----------|--------------|
-| RocksDB | Default, zero-ops | librocksdb (static) |
-| PostgreSQL | Large deployments, clustering | libpq |
-| MariaDB/MySQL | Existing infrastructure | libmariadb |
-| SQLite | Single-server, lightweight | libsqlite3 (base) |
+Separate auth daemon with binary IPC protocol and kqueue event loop.
 
-### What Moves to Storage
+- [x] IPC framework (`src/ipc/`) — length-prefixed binary framing
+- [x] 5 auth message types: AuthRequest, AuthChallenge, AuthSuccess, AuthFailure, SaslResponse
+- [x] `xmppd-auth` daemon with kqueue event loop, SIGHUP, graceful shutdown
+- [x] `AuthHandler(Store)` — generic over store type, SCRAM + PLAIN dispatch
+- [x] SCRAM-SHA-256 multi-step exchange (256 concurrent sessions)
+- [x] PLAIN single-step authentication
+- [x] `xmppctl` admin CLI (adduser, deluser, passwd, listusers)
+- [x] Core daemon wired to auth via async IPC calls
 
-- User accounts and credentials (currently flat-file in auth)
-- Rosters and subscription state (currently flat-file in core)
-- Offline messages (currently flat-file in core)
-- vCards (currently stubbed)
-- Message Archive Management / XEP-0313 (new)
-- MUC room configuration and history (Phase 7 dependency)
+**Binaries:** `xmppd-auth`, `xmppctl`
 
-## Phase 6 — Auth
+## Phase 7 — Messaging + IM ✅
 
-Replace the single-backend auth daemon with pluggable authentication.
-This phase also requires a design session.
+Core XMPP instant messaging functionality.
 
-### Design Goals
+- [x] Session registry for JID-based routing
+- [x] Message routing between local users
+- [x] Presence engine (available/unavailable broadcast, fan-out)
+- [x] Roster management with subscription state machine
+- [x] Offline message storage and delivery (XEP-0160)
+- [x] Message Archive Management / MAM (XEP-0313)
+- [x] IQ dispatch framework (`src/core/iq_handler.zig`)
+- [x] Service Discovery — disco#info/items (XEP-0030)
+- [x] vCard-temp (XEP-0054)
+- [x] Software Version (XEP-0092)
+- [x] XMPP Ping (XEP-0199)
 
-- Pluggable auth backend interface
-- Multiple backends configurable per domain
-- Standard protocols for enterprise integration
+## Phase 8 — S2S Hardening ✅
 
-### Planned Backends
+Server-to-server federation hardening and interop.
 
-| Backend | Use Case |
-|---------|----------|
-| Internal | Stored credentials (via storage layer) |
-| LDAP | Active Directory / OpenLDAP |
-| OIDC | Modern identity providers |
-| PAM | System accounts |
-| RADIUS | Legacy enterprise |
+- [x] DANE-EE verification (outbound + inbound)
+- [x] SASL EXTERNAL authentication (both directions)
+- [x] XEP-0220 dialback (outbound key generation, inbound callback verification)
+- [x] Post-SASL stream restart (RFC 6120 compliance)
+- [x] Inbound stanza forwarding (S2S→core IPC pipeline)
+- [x] Offline delivery across federation
+- [x] E2E integration test (`test/integration/s2s-federation.py`)
+- [x] Interop tested against Prosody 13.0.6
+
+### S2S Interop Status
+
+| Path | Auth | Status |
+|------|------|--------|
+| Outbound (xmppd → Prosody) | SASL EXTERNAL / DANE-EE | ✅ Verified |
+| Inbound (Prosody → xmppd) | SASL EXTERNAL / DANE-EE | ✅ Verified |
+| Outbound (no DANE) | Dialback | ✅ Key sent + verified |
+| Inbound (no DANE) | Dialback | ✅ Callback verification |
+
+## Phase 9 — Auth Hardening
+
+Harden authentication: rate limiting, account registration, token-based
+auth for mobile clients, external auth backend support, and channel
+binding. This phase requires a design session before implementation.
+
+### Design Topics
+
+1. **Rate limiting / brute force protection** — per-IP and per-account
+   attempt limits, lockout policy, exponential backoff
+2. **In-band registration (XEP-0077)** — allow clients to create accounts
+   via XMPP stream; captcha, invitation codes, or admin approval
+3. **Account management** — password change via IQ (XEP-0077 §3.3),
+   account deletion
+4. **Token-based auth** — SASL mechanism for mobile clients (OAUTHBEARER,
+   HT-SHA-256, or custom)
+5. **External auth backends** — LDAP bind, HTTP callback, PAM,
+   Rauthy/OIDC; trait-based backend selection
+6. **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
+7. **Channel binding** — tls-server-end-point / tls-exporter for SCRAM
+   (XEP-0440)
+8. **Account privacy** — JID enumeration protection, presence leak
+   prevention
 
 ### Dependencies
 
-- Phase 5 (Storage) must be complete — internal auth backend reads
-  credentials from the storage layer, not a flat file.
+- Phase 5 (Storage) — credential storage for new mechanisms
+- Phase 6 (Auth Daemon) — IPC protocol may need new message types
 
-## Phase 7 — Multi-User Chat (MUC)
+## Phase 10 — Multi-User Chat (MUC)
 
 XEP-0045 implementation for group messaging.
 
 ### Dependencies
 
 - Phase 5 (Storage) — room persistence, message history
-- Phase 6 (Auth) — room access control, member management
+- Phase 9 (Auth Hardening) — room access control
 
 ### Planned Features
 
@@ -196,7 +247,7 @@ XEP-0045 implementation for group messaging.
 - [ ] Basic moderation (kick, ban, voice)
 - [ ] Room discovery (disco#items)
 
-## Phase 8 — Polish & Deploy
+## Phase 11 — Polish & Deploy
 
 Production readiness.
 
@@ -216,7 +267,6 @@ Production readiness.
 
 - [ ] XEP-0198: Stream Management (mobile reconnection)
 - [ ] XEP-0280: Message Carbons (multi-device)
-- [ ] XEP-0313: Message Archive Management (history)
 - [ ] XEP-0363: HTTP File Upload (media sharing)
 
 ### Documentation
@@ -253,14 +303,28 @@ long-term radar.
 
 ---
 
+## XEPs Supported
+
+| XEP | Name | Phase |
+|-----|------|-------|
+| RFC 6120 | XMPP Core | 1–2 |
+| RFC 6121 | XMPP IM | 7 |
+| XEP-0030 | Service Discovery | 7 |
+| XEP-0054 | vcard-temp | 7 |
+| XEP-0092 | Software Version | 7 |
+| XEP-0160 | Offline Message Storage | 7 |
+| XEP-0199 | XMPP Ping | 7 |
+| XEP-0220 | Server Dialback | 8 |
+| XEP-0313 | Message Archive Management | 5+7 |
+
 ## Metrics
 
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 36 |
-| Lines of code | ~18,250 |
-| Unit tests | 53 build steps (all pass) |
+| Source files | 47 |
+| Lines of code | ~22,400 |
+| Unit tests | 73 build steps, 575 tests (all pass) |
 | Integration tests | 9/9 S2S federation + 23 C2S interop |
 | Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
