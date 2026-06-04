@@ -289,7 +289,7 @@ archive_dsn = postgresql://xmppd:pass@db/xmppd_archive
 ## 13. Open Questions
 
 1. ~~**zig-lmdb** v0.3.2 targets Zig 0.15.1~~ — **RESOLVED:** builds clean on 0.15.2
-2. **rocksdb-zig** (Syndica) targets Zig 0.15 — verify FreeBSD cross-compile of C++ sources via Zig build
+2. ~~**rocksdb-zig** (Syndica)~~ — **RESOLVED:** Syndica/rocksdb-zig moved to Zig 0.16. Using RocksDB C API directly via `@cImport` + system `librocksdb` (databases/rocksdb in ports). Cleaner for FreeBSD port — no bundled C++ sources.
 3. ~~**LMDB map size**~~ — **RESOLVED:** auto-resize on `MDB_MAP_FULL` implemented (3 retries, double map size)
 4. ~~**Value serialization**~~ — **RESOLVED:** compact binary: users=100B packed, roster=4+name_len, vcard=raw XML
 5. **Archive stanza format** — store verbatim XML (spec-compliant) with RocksDB block compression

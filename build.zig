@@ -539,6 +539,26 @@ pub fn build(b: *std.Build) void {
 
     const run_lmdb_backend_tests = b.addRunArtifact(lmdb_backend_tests);
 
+    // --- RocksDB backend tests ---
+
+    const rocksdb_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/rocksdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    rocksdb_backend_test_mod.addImport("backend", backend_test_mod);
+    rocksdb_backend_test_mod.linkSystemLibrary("rocksdb", .{});
+    rocksdb_backend_test_mod.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+    rocksdb_backend_test_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+
+    const rocksdb_backend_tests = b.addTest(.{
+        .name = "rocksdb-backend-tests",
+        .root_module = rocksdb_backend_test_mod,
+    });
+
+    const run_rocksdb_backend_tests = b.addRunArtifact(rocksdb_backend_tests);
+
     // --- Supervisor tests ---
 
     const supervisor_test_mod = b.createModule(.{
@@ -800,6 +820,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_main_tests.step);
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_lmdb_backend_tests.step);
+    test_step.dependOn(&run_rocksdb_backend_tests.step);
     test_step.dependOn(&run_generic_user_store_tests.step);
     test_step.dependOn(&run_generic_roster_store_tests.step);
     test_step.dependOn(&run_vcard_store_tests.step);
