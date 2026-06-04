@@ -318,7 +318,39 @@ pub fn build(b: *std.Build) void {
 
     const run_auth_handler_tests = b.addRunArtifact(auth_handler_tests);
 
-    // --- Roster store tests ---
+    // --- Generic roster store tests ---
+
+    const generic_roster_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/roster_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generic_roster_store_test_mod.addImport("backend", backend_test_mod);
+
+    const generic_roster_store_tests = b.addTest(.{
+        .name = "generic-roster-store-tests",
+        .root_module = generic_roster_store_test_mod,
+    });
+
+    const run_generic_roster_store_tests = b.addRunArtifact(generic_roster_store_tests);
+
+    // --- VCard store tests ---
+
+    const vcard_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/vcard_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vcard_store_test_mod.addImport("backend", backend_test_mod);
+
+    const vcard_store_tests = b.addTest(.{
+        .name = "vcard-store-tests",
+        .root_module = vcard_store_test_mod,
+    });
+
+    const run_vcard_store_tests = b.addRunArtifact(vcard_store_tests);
+
+    // --- Legacy roster store tests ---
 
     const roster_store_test_mod = b.createModule(.{
         .root_source_file = b.path("src/core/roster_store.zig"),
@@ -769,4 +801,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_lmdb_backend_tests.step);
     test_step.dependOn(&run_generic_user_store_tests.step);
+    test_step.dependOn(&run_generic_roster_store_tests.step);
+    test_step.dependOn(&run_vcard_store_tests.step);
 }
