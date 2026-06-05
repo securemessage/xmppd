@@ -18,7 +18,7 @@ Last updated: 2026-06-05
 | 6. Auth Daemon + IPC | ✅ Complete | xmppd-auth, SCRAM-SHA-256, PLAIN, binary IPC |
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
-| 9. Auth Hardening | � In Progress | Rate limiting, lockout, registration, passwd, delete — 9f remains |
+| 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
 | 10. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
 | 11. External Auth | ⬜ Not started | OIDC/OAuth, LDAP/AD, SQL backends |
 | 12. Polish & Deploy | ⬜ Not started | Config, RC script, port, privilege separation, docs |
@@ -216,7 +216,7 @@ Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 | 9c | In-band registration (XEP-0077) — invitation codes, InviteStore | ✅ |
 | 9d | Password change (XEP-0077 §3.3) — IPC tags 0x08/0x09 | ✅ |
 | 9e | Account deletion (XEP-0077 §3.2) — cascade cleanup | ✅ |
-| 9f | Channel binding (XEP-0440) — tls-server-end-point + tls-exporter | ⬜ |
+| 9f | Channel binding (XEP-0440) — tls-server-end-point + tls-exporter | ✅ |
 
 ### Key Design Decisions
 
@@ -373,7 +373,7 @@ long-term radar.
 | XEP-0220 | Server Dialback | 8 |
 | XEP-0313 | Message Archive Management | 5+7 |
 | XEP-0077 | In-Band Registration | 9 |
-| XEP-0440 | SASL Channel-Binding Type Capability | 9 (planned) |
+| XEP-0440 | SASL Channel-Binding Type Capability | 9 |
 
 ## Metrics
 
