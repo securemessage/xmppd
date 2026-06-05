@@ -94,6 +94,9 @@ pub const Connection = struct {
     peer_addr_buf: [64]u8 = undefined,
     peer_addr_len: usize = 0,
 
+    /// Stable buffer for channel binding data (outlives the getChannelBinding call).
+    cb_data_buf: [32]u8 = undefined,
+
     /// Initialize a new connection from an accepted socket.
     ///
     /// - `fd` — the accepted client socket (must already be non-blocking)
@@ -108,6 +111,21 @@ pub const Connection = struct {
     /// Returns the peer address as a string slice, or empty if unknown.
     pub fn peerAddr(self: *const Connection) []const u8 {
         return self.peer_addr_buf[0..self.peer_addr_len];
+    }
+
+    /// Extract channel binding data from the TLS session.
+    /// Returns cb_type (0=none, 1=tls-server-end-point, 2=tls-exporter) and
+    /// a pointer to 32 bytes of binding data. Returns (0, empty) if no TLS or
+    /// binding data unavailable.
+    pub fn getChannelBinding(self: *Connection) struct { cb_type: u8, data: []const u8 } {
+        if (self.tls_conn) |*tls| {
+            if (tls.getChannelBinding()) |cb| {
+                // Store in a stable buffer so the slice outlives this call
+                self.cb_data_buf = cb.data;
+                return .{ .cb_type = @intFromEnum(cb.cb_type), .data = &self.cb_data_buf };
+            }
+        }
+        return .{ .cb_type = 0, .data = "" };
     }
 
     /// Read data from the socket into the read buffer.

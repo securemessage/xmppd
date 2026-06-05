@@ -69,6 +69,12 @@ pub const ScramServer = struct {
     client_first_bare: []const u8 = "",
     /// server-first-message (needed for AuthMessage computation)
     server_first_msg: []const u8 = "",
+    /// Channel binding type: 0=none, 1=tls-server-end-point, 2=tls-exporter
+    cb_type: u8 = 0,
+    /// Channel binding data (32 bytes, empty if cb_type=0)
+    cb_data: []const u8 = "",
+    /// GS2 channel binding flag from client-first ('n', 'y', or 'p')
+    gs2_cb_flag: u8 = 'n',
     /// Arena for string allocations
     arena: std.heap.ArenaAllocator,
 
@@ -101,6 +107,11 @@ pub const ScramServer = struct {
         // gs2-header is "n,," (no channel binding, no authzid) for basic SCRAM
         // or "y,," or "p=..." for channel binding variants
 
+        // Capture the gs2 channel binding flag
+        if (message.len > 0) {
+            self.gs2_cb_flag = message[0];
+        }
+
         // Skip gs2-header (everything up to and including the second comma after the flag)
         const bare_start = findClientFirstBare(message) orelse return error.InvalidMessage;
         const bare = message[bare_start..];
@@ -128,6 +139,13 @@ pub const ScramServer = struct {
     /// Set the stored credentials for the user (looked up by the caller).
     pub fn setCredentials(self: *ScramServer, creds: StoredCredentials) void {
         self.credentials = creds;
+    }
+
+    /// Set channel binding data from the TLS session.
+    /// Must be called before handleClientFinal() for SCRAM-PLUS validation.
+    pub fn setChannelBinding(self: *ScramServer, cb_type: u8, cb_data: []const u8) void {
+        self.cb_type = cb_type;
+        self.cb_data = cb_data;
     }
 
     /// Generate the server-first-message to send to the client.
@@ -164,11 +182,15 @@ pub const ScramServer = struct {
 
         const alloc = self.arena.allocator();
 
-        // Format: c=base64(gs2-header),r=combined_nonce,p=base64(ClientProof)
+        // Format: c=base64(gs2-header[+cb-data]),r=combined_nonce,p=base64(ClientProof)
         // Parse channel binding
         if (!std.mem.startsWith(u8, message, "c=")) return error.InvalidMessage;
         const after_c = message[2..];
         const comma1 = std.mem.indexOfScalar(u8, after_c, ',') orelse return error.InvalidMessage;
+
+        // Validate channel binding data
+        const cb_b64 = after_c[0..comma1];
+        try self.validateChannelBinding(cb_b64);
 
         // Parse r=nonce
         const after_cb = after_c[comma1 + 1 ..];
@@ -233,6 +255,58 @@ pub const ScramServer = struct {
 
         // server-final-message: v=base64(ServerSignature)
         return try std.fmt.allocPrint(alloc, "v={s}", .{server_sig_b64});
+    }
+
+    /// Validate the channel binding data from the client-final c= field.
+    /// Per RFC 5802: c= is base64(gs2-header [+ channel-binding-data])
+    fn validateChannelBinding(self: *ScramServer, cb_b64: []const u8) !void {
+        // Decode the c= field
+        var decoded_buf: [256]u8 = undefined;
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeUpperBound(cb_b64.len) catch return error.InvalidMessage;
+        if (decoded_len > decoded_buf.len) return error.InvalidMessage;
+        const actual_len = decoder.calcSizeForSlice(cb_b64) catch return error.InvalidMessage;
+        decoder.decode(decoded_buf[0..actual_len], cb_b64) catch return error.InvalidMessage;
+        const decoded = decoded_buf[0..actual_len];
+
+        if (self.gs2_cb_flag == 'n') {
+            // Client said no channel binding: c= must be base64("n,,")
+            // "n,," = { 0x6e, 0x2c, 0x2c } → base64 "biws"
+            if (!std.mem.eql(u8, cb_b64, "biws")) {
+                return error.ChannelBindingMismatch;
+            }
+        } else if (self.gs2_cb_flag == 'y') {
+            // Client supports CB but server doesn't advertise it (or SCRAM without -PLUS)
+            // c= must be base64("y,,")
+            const expected = "y,,";
+            if (!std.mem.eql(u8, decoded[0..@min(decoded.len, expected.len)], expected)) {
+                return error.ChannelBindingMismatch;
+            }
+        } else if (self.gs2_cb_flag == 'p') {
+            // Client wants channel binding: c= is base64(gs2-header + cb-data)
+            // gs2-header is "p=<cb-name>,," — we need to verify the cb-data portion
+            if (self.cb_type == 0 or self.cb_data.len == 0) {
+                // Server has no binding data but client demands it
+                return error.ChannelBindingMismatch;
+            }
+            // Find the end of gs2-header in decoded: after "p=cb-name,,"
+            var hdr_end: usize = 0;
+            var commas: u8 = 0;
+            while (hdr_end < decoded.len) : (hdr_end += 1) {
+                if (decoded[hdr_end] == ',') {
+                    commas += 1;
+                    if (commas == 2) {
+                        hdr_end += 1;
+                        break;
+                    }
+                }
+            }
+            // The rest is the channel binding data
+            const client_cb = decoded[hdr_end..];
+            if (!std.mem.eql(u8, client_cb, self.cb_data)) {
+                return error.ChannelBindingMismatch;
+            }
+        }
     }
 
     pub fn isComplete(self: *const ScramServer) bool {

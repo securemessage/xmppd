@@ -209,6 +209,9 @@ pub fn AuthHandler(comptime Store: type) type {
             session.conn_id = req.conn_id;
             session.active = true;
 
+            // Set channel binding data from TLS session
+            session.server.setChannelBinding(req.cb_type, req.cb_data);
+
             // Process client-first-message
             const username = session.server.handleClientFirst(req.payload) catch {
                 session.deinit();

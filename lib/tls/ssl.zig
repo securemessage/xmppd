@@ -370,6 +370,71 @@ pub const SslConn = struct {
         return result;
     }
 
+    /// Channel binding type identifiers (matches IPC cb_type field).
+    pub const CbType = enum(u8) {
+        none = 0,
+        tls_server_end_point = 1,
+        tls_exporter = 2,
+    };
+
+    /// Channel binding result — type + 32-byte binding data.
+    pub const ChannelBinding = struct {
+        cb_type: CbType,
+        data: [32]u8,
+    };
+
+    /// Extract channel binding data from the TLS session.
+    ///
+    /// - TLS 1.3: uses `tls-exporter` (RFC 9266) via `SSL_export_keying_material`
+    /// - TLS 1.2: uses `tls-server-end-point` (RFC 5929) — SHA-256 of server cert DER
+    ///
+    /// Returns null if the handshake hasn't completed or binding data
+    /// cannot be extracted.
+    pub fn getChannelBinding(self: *SslConn) ?ChannelBinding {
+        // Check TLS version to determine binding type
+        const version = c.SSL_version(self.ssl);
+        if (version >= c.TLS1_3_VERSION) {
+            // tls-exporter (RFC 9266): export keying material
+            var data: [32]u8 = undefined;
+            const label = "EXPORTER-Channel-Binding";
+            const ret = c.SSL_export_keying_material(
+                self.ssl,
+                &data,
+                32,
+                label.ptr,
+                label.len,
+                "",
+                0,
+                0, // no context
+            );
+            if (ret == 1) {
+                return .{ .cb_type = .tls_exporter, .data = data };
+            }
+            return null;
+        } else if (version >= c.TLS1_2_VERSION) {
+            // tls-server-end-point (RFC 5929): SHA-256 hash of server certificate
+            const x509 = c.SSL_get_certificate(self.ssl) orelse return null;
+            const der_len = c.i2d_X509(x509, null);
+            if (der_len <= 0 or der_len > 65535) return null;
+
+            // Stack-allocate a buffer for the DER (typical cert is 1-4KB)
+            var der_buf: [8192]u8 = undefined;
+            if (@as(usize, @intCast(der_len)) > der_buf.len) return null;
+
+            var ptr: [*c]u8 = &der_buf;
+            const written = c.i2d_X509(x509, &ptr);
+            if (written != der_len) return null;
+
+            // SHA-256 hash of the DER-encoded certificate
+            var data: [32]u8 = undefined;
+            const Sha256 = std.crypto.hash.sha2.Sha256;
+            Sha256.hash(der_buf[0..@intCast(der_len)], &data, .{});
+
+            return .{ .cb_type = .tls_server_end_point, .data = data };
+        }
+        return null;
+    }
+
     /// Initiate a clean TLS shutdown (sends close_notify alert).
     /// Non-blocking — may need to be called again after kqueue signals readiness.
     pub fn shutdown(self: *SslConn) void {

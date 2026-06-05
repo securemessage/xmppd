@@ -963,14 +963,17 @@ pub const Server = struct {
             return;
         };
 
+        // Extract channel binding data from TLS session
+        const cb = session.conn.getChannelBinding();
+
         // Send AuthRequest to auth daemon
         self.ipc.send(.{
             .auth_request = .{
                 .conn_id = @intCast(session.conn.id),
                 .mechanism = mech_id,
                 .client_ip = session.conn.peerAddr(),
-                .cb_type = 0, // Phase 9f will wire channel binding
-                .cb_data = "",
+                .cb_type = cb.cb_type,
+                .cb_data = cb.data,
                 .username = "", // auth daemon extracts from payload
                 .payload = decoded,
             },
