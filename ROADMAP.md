@@ -19,7 +19,7 @@ Last updated: 2026-06-05
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
 | 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
-| 10. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
+| 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
 | 11. External Auth | ⬜ Not started | OIDC/OAuth, LDAP/AD, SQL backends |
 | 12. Polish & Deploy | ⬜ Not started | Config, RC script, port, privilege separation, docs |
 
@@ -244,24 +244,59 @@ Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 - Phase 5 (Storage) — LockStore, InviteStore use storage backend
 - Phase 6 (Auth Daemon) — IPC protocol gains 6 new message types
 
-## Phase 10 — Multi-User Chat (MUC)
+## Phase 10 — Multi-User Chat (MUC) ✅
 
-XEP-0045 implementation for group messaging.
+XEP-0045 implementation for group messaging. MUC lives inline in
+xmppd-core (not a separate process) since it's fundamentally routing/fan-out,
+tightly coupled to the C2S session lifecycle.
 
-### Dependencies
+Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 
-- Phase 5 (Storage) — room persistence, message history
-- Phase 9 (Auth Hardening) — room access control
+### Sub-steps
 
-### Planned Features
+| Step | Feature | Status |
+|------|---------|--------|
+| 10a | XML namespace constants (muc_user, muc_admin, muc_owner) | ✅ |
+| 10b | RoomStore(Backend) — room config + affiliation persistence | ✅ |
+| 10c | RoomRegistry — in-memory room + occupant tracking (heap-alloc) | ✅ |
+| 10d | MUC handler — join, part, groupchat fan-out, disco, kick | ✅ |
+| 10e | server.zig — MUC subdomain routing, closeSession cleanup | ✅ |
+| 10f | iq_handler.zig — MUC IQ dispatch (disco, admin) | ✅ |
+| 10g | main.zig — --muc-host CLI flag, RoomRegistry init | ✅ |
+| 10h | build.zig — room_store + room_registry modules | ✅ |
+| 10i | Unit tests (28 tests for RoomStore + RoomRegistry) | ✅ |
+| 10j | Integration test (slixmpp, 12 assertions) | ✅ |
 
-- [ ] Room creation, configuration, destruction
-- [ ] Join / part / presence in rooms
-- [ ] Room message delivery (fan-out to occupants)
-- [ ] Message history (scrollback via storage)
-- [ ] Room persistence across server restarts
-- [ ] Basic moderation (kick, ban, voice)
-- [ ] Room discovery (disco#items)
+### Implemented Features
+
+- [x] Room creation (instant, transient by default)
+- [x] Join with nick conflict / capacity / members-only checks
+- [x] Part (explicit + auto-part on disconnect)
+- [x] Groupchat message fan-out (all occupants including echo)
+- [x] Moderated room voice check (visitors blocked)
+- [x] Admin kick (role=none, status 307)
+- [x] Grant/revoke voice
+- [x] Transient room auto-destroy on last occupant leave
+- [x] Room discovery (disco#info/items for MUC service + rooms)
+- [x] Server disco#items advertises MUC service
+- [x] Session disconnect auto-parts all rooms
+
+### Deferred (Post-MVP)
+
+- [ ] Room history on join (wire ArchiveStore query)
+- [ ] Persistent affiliation lookup on join (RoomStore.getAffiliation)
+- [ ] Load persistent rooms from RoomStore on startup
+- [ ] Room configuration form (XEP-0045 §10.1 dataforms)
+- [ ] Ban (outcast affiliation + persist)
+- [ ] Password-protected rooms
+- [ ] S2S room federation
+
+### Key Files
+
+- `src/store/room_store.zig` — ~620 LOC
+- `src/core/room_registry.zig` — ~500 LOC
+- `src/core/muc_handler.zig` — ~900 LOC
+- `test/integration/muc-test.py` — slixmpp integration test
 
 ## Phase 11 — External Auth Backends
 
@@ -375,16 +410,17 @@ long-term radar.
 | XEP-0313 | Message Archive Management | 5+7 |
 | XEP-0077 | In-Band Registration | 9 |
 | XEP-0440 | SASL Channel-Binding Type Capability | 9 |
+| XEP-0045 | Multi-User Chat | 10 |
 
 ## Metrics
 
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 49 |
-| Lines of code | ~23,600 |
-| Unit tests | 78 build steps, 591 tests (all pass) |
-| Integration tests | 9/9 S2S federation + 23 C2S interop |
+| Source files | 52 |
+| Lines of code | ~25,200 |
+| Unit tests | 83 build steps, 619 tests (all pass) |
+| Integration tests | 9 S2S federation + 23 C2S interop + 12 MUC |
 | Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
