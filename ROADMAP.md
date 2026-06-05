@@ -346,6 +346,7 @@ Production readiness.
 These items are out of scope for the initial release but are on the
 long-term radar.
 
+- **Multi-threaded / multi-process core** — break out of single-thread event loop; options: worker threads per room (fan-out), multi-process room sharding (Postfix model at room level), or io_uring/kqueue batched sendmsg. Required for MUC at scale.
 - **Clustering** — multi-node via shared storage + message bus
 - **epoll backend** — Linux support (secondary platform)
 - **WebSocket** (RFC 7395) — web client connectivity

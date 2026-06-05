@@ -289,6 +289,20 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("archive_backend", server_archive_backend_mod);
     server_test_mod.addImport("mam_handler", server_mam_handler_mod);
     server_test_mod.addImport("vcard_store", server_vcard_store_mod);
+    const server_room_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/room_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_room_store_mod.addImport("backend", server_backend_mod);
+    const server_room_registry_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/room_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_room_registry_mod.addImport("room_store", server_room_store_mod);
+    server_test_mod.addImport("room_store", server_room_store_mod);
+    server_test_mod.addImport("room_registry", server_room_registry_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -671,6 +685,38 @@ pub fn build(b: *std.Build) void {
 
     const run_generic_offline_store_tests = b.addRunArtifact(generic_offline_store_tests);
 
+    // --- Room store tests ---
+
+    const room_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/room_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    room_store_test_mod.addImport("backend", backend_test_mod);
+
+    const room_store_tests = b.addTest(.{
+        .name = "room-store-tests",
+        .root_module = room_store_test_mod,
+    });
+
+    const run_room_store_tests = b.addRunArtifact(room_store_tests);
+
+    // --- Room registry tests ---
+
+    const room_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/room_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    room_registry_test_mod.addImport("room_store", room_store_test_mod);
+
+    const room_registry_tests = b.addTest(.{
+        .name = "room-registry-tests",
+        .root_module = room_registry_test_mod,
+    });
+
+    const run_room_registry_tests = b.addRunArtifact(room_registry_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -748,6 +794,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("archive_backend", server_archive_backend_mod);
     core_mod.addImport("mam_handler", server_mam_handler_mod);
     core_mod.addImport("vcard_store", server_vcard_store_mod);
+    core_mod.addImport("room_store", server_room_store_mod);
+    core_mod.addImport("room_registry", server_room_registry_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -1017,6 +1065,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);
     test_step.dependOn(&run_invite_store_tests.step);
+    test_step.dependOn(&run_room_store_tests.step);
+    test_step.dependOn(&run_room_registry_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

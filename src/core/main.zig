@@ -34,6 +34,8 @@ const OpBackendType = OpBackendMod.Backend;
 const ArchiveBackendMod = @import("archive_backend");
 const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
+const room_registry_mod = @import("room_registry");
+const RoomRegistry = room_registry_mod.RoomRegistry;
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -54,6 +56,7 @@ pub fn main() !void {
     var auth_socket: ?[]const u8 = null;
     var s2s_socket: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
+    var muc_host_arg: ?[]const u8 = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -101,6 +104,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--db")) {
             db_path = args.next() orelse {
                 log.err("--db requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--muc-host")) {
+            muc_host_arg = args.next() orelse {
+                log.err("--muc-host requires a value", .{});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -183,6 +191,22 @@ pub fn main() !void {
     }
     defer if (archive_backend) |*b| b.close();
 
+    // Configure MUC (Multi-User Chat)
+    var muc_host_buf: [256]u8 = undefined;
+    var room_registry: ?RoomRegistry = null;
+    const effective_muc_host: ?[]const u8 = if (muc_host_arg) |h| h else blk: {
+        // Default: conference.{host}
+        const muc_default = std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch null;
+        break :blk muc_default;
+    };
+    if (effective_muc_host) |muc_host| {
+        room_registry = RoomRegistry.init(allocator);
+        server.room_registry = &room_registry.?;
+        server.muc_host = muc_host;
+        log.info("MUC service enabled: {s}", .{muc_host});
+    }
+    defer if (room_registry) |*reg| reg.deinit();
+
     log.info("listening on {s}:{d}", .{ address, port });
     try server.run();
     log.info("shutdown complete", .{});
@@ -201,6 +225,7 @@ fn printUsage() void {
         \\  --auth-socket PATH  Auth daemon IPC socket
         \\  --s2s-socket PATH   S2S federation daemon IPC socket
         \\  --db PATH        User database path (roster stored alongside)
+        \\  --muc-host HOST  MUC service hostname (default: conference.{host})
         \\  --help, -h       Show this help
         \\
     ;

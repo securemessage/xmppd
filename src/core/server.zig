@@ -60,6 +60,9 @@ const ArchiveBackendType = ArchiveBackendMod.Backend;
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
+const muc_handler = @import("muc_handler.zig");
+const room_registry_mod = @import("room_registry");
+const RoomRegistry = room_registry_mod.RoomRegistry;
 
 const log = std.log.scoped(.xmppd);
 
@@ -172,6 +175,7 @@ pub const Session = struct {
     iq_active: bool = false,
     iq_type: []const u8 = "",
     iq_id: []const u8 = "",
+    iq_to: []const u8 = "",
     iq_child_ns: []const u8 = "",
     iq_child_name: []const u8 = "",
     /// Roster item attributes from <item> inside roster query.
@@ -276,6 +280,12 @@ pub const Server = struct {
 
     /// VCard store — per-user vCard XML blobs (XEP-0054).
     vcard: ?*GenericVCardStore = null,
+
+    /// MUC room registry — in-memory rooms and occupants.
+    room_registry: ?*RoomRegistry = null,
+
+    /// MUC service hostname (e.g., "conference.example.com").
+    muc_host: ?[]const u8 = null,
 
     /// Initialize the server.
     ///
@@ -1667,6 +1677,17 @@ pub const Server = struct {
         }
         const from_str = from_fbs.getWritten();
 
+        // MUC domain? Route to MUC handler for groupchat fan-out.
+        if (self.muc_host) |muc_host| {
+            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+                if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "groupchat")) {
+                    muc_handler.handleMucGroupchat(self, session, to_jid.local, inner_xml, id_str, changes);
+                }
+                // Presence to MUC is handled separately in handlePresence dispatch
+                return;
+            }
+        }
+
         // Remote domain? Forward via S2S IPC instead of local delivery.
         if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
             self.forwardToS2s(session, from_str, to_str, type_str, id_str, inner_xml, changes);
@@ -1803,10 +1824,20 @@ pub const Server = struct {
 
     fn handlePresence(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         var type_str: []const u8 = "";
+        var to_str: []const u8 = "";
         for (elem.attributes) |attr| {
-            if (std.mem.eql(u8, attr.local_name, "type")) {
-                type_str = attr.value;
-                break;
+            if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
+        }
+
+        // Directed presence to MUC domain → MUC join/part
+        if (to_str.len > 0) {
+            if (self.muc_host) |muc_host| {
+                const to_jid = xmpp.Jid.parse(to_str) catch return;
+                if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+                    muc_handler.handleMucPresence(self, session, to_jid.local, to_jid.resource, type_str, changes);
+                    return;
+                }
             }
         }
 
@@ -2508,6 +2539,9 @@ pub const Server = struct {
 
     fn closeSession(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+
+        // Remove from all MUC rooms (broadcasts unavailable to room occupants)
+        muc_handler.handleSessionClose(self, id, changes);
 
         // Unregister from session registry and broadcast unavailable presence
         if (self.registry.unbind(id)) |bound| {

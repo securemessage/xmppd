@@ -18,6 +18,7 @@
 const std = @import("std");
 const xml = @import("xml");
 const mam_handler = @import("mam_handler");
+const muc_handler = @import("muc_handler.zig");
 
 const log = std.log.scoped(.xmppd);
 
@@ -40,6 +41,7 @@ pub fn handleIq(session: *Session, elem: xml.Element) void {
     session.iq_active = true;
     session.iq_child_ns = "";
     session.iq_child_name = "";
+    session.iq_to = "";
     session.iq_roster_item_jid = "";
     session.iq_roster_item_name = "";
     session.iq_roster_item_sub = "";
@@ -47,6 +49,7 @@ pub fn handleIq(session: *Session, elem: xml.Element) void {
     for (elem.attributes) |attr| {
         if (std.mem.eql(u8, attr.local_name, "type")) session.iq_type = attr.value;
         if (std.mem.eql(u8, attr.local_name, "id")) session.iq_id = attr.value;
+        if (std.mem.eql(u8, attr.local_name, "to")) session.iq_to = attr.value;
     }
 }
 
@@ -72,6 +75,12 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
             if (std.mem.eql(u8, attr.local_name, "jid")) session.iq_roster_item_jid = attr.value;
             if (std.mem.eql(u8, attr.local_name, "name")) session.iq_roster_item_name = attr.value;
             if (std.mem.eql(u8, attr.local_name, "subscription")) session.iq_roster_item_sub = attr.value;
+        }
+    } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.muc_admin)) {
+        // MUC admin item: reuse roster item fields (nick→jid, role→sub)
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "nick")) session.iq_roster_item_jid = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "role")) session.iq_roster_item_sub = attr.value;
         }
     } else if (std.mem.eql(u8, elem.local_name, "ping") and std.mem.eql(u8, ns, xml.ns.ping)) {
         session.iq_child_ns = ns;
@@ -183,6 +192,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_active = false;
         session.iq_type = "";
         session.iq_id = "";
+        session.iq_to = "";
         session.iq_child_ns = "";
         session.iq_child_name = "";
         session.iq_roster_item_jid = "";
@@ -212,7 +222,47 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
 
     const iq_type = session.iq_type;
     const iq_id = session.iq_id;
+    const iq_to = session.iq_to;
     const child_ns = session.iq_child_ns;
+
+    // IQ addressed to MUC service domain — handle MUC disco and admin commands
+    if (server.muc_host) |muc_host| {
+        if (iq_to.len > 0) {
+            // Check if 'to' matches the MUC service domain (bare or with localpart)
+            const xmpp = @import("xmpp");
+            const to_jid = xmpp.Jid.parse(iq_to) catch {
+                sendIqError(server, session, iq_id, "jid-malformed");
+                return;
+            };
+            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+                if (to_jid.local.len == 0) {
+                    // Bare MUC service JID: disco#info or disco#items for the service
+                    if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
+                        muc_handler.handleMucDiscoInfo(server, session, iq_id, changes);
+                        return;
+                    }
+                    if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
+                        muc_handler.handleMucDiscoItems(server, session, iq_id, changes);
+                        return;
+                    }
+                } else {
+                    // IQ to a specific room: admin commands (kick/ban)
+                    if (std.mem.eql(u8, child_ns, xml.ns.muc_admin) and std.mem.eql(u8, iq_type, "set")) {
+                        muc_handler.handleMucAdminIq(server, session, to_jid.local, iq_id, changes);
+                        return;
+                    }
+                    // disco#info for a specific room
+                    if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
+                        muc_handler.handleRoomDiscoInfo(server, session, to_jid.local, iq_id, changes);
+                        return;
+                    }
+                }
+                // Unknown IQ to MUC domain
+                sendIqError(server, session, iq_id, "service-unavailable");
+                return;
+            }
+        }
+    }
 
     // Roster query
     if (std.mem.eql(u8, child_ns, xml.ns.roster)) {
@@ -250,7 +300,14 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
+        w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'>") catch return;
+        // Advertise MUC service if configured
+        if (server.muc_host) |muc_host| {
+            w.writeAll("<item jid='") catch return;
+            w.writeAll(muc_host) catch return;
+            w.writeAll("' name='Chat Rooms'/>") catch return;
+        }
+        w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
     }
