@@ -28,6 +28,7 @@ pub const ns = struct {
     pub const delay = "urn:xmpp:delay";
     pub const dialback = "jabber:server:dialback";
     pub const db = "urn:xmpp:features:dialback";
+    pub const register = "jabber:iq:register";
 };
 
 /// An XML element with its attributes and namespace context.

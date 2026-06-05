@@ -13,8 +13,38 @@
 const std = @import("std");
 const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
+const RateLimiter = @import("rate_limiter").RateLimiter;
+const lock_store_mod = @import("lock_store");
 
 const log = std.log.scoped(.auth_handler);
+
+/// Interface for permanent lock checking. The auth daemon sets this to
+/// a closure over the LockStore. Decouples handler from Backend type.
+pub const LockChecker = struct {
+    ctx: *anyopaque,
+    checkFn: *const fn (ctx: *anyopaque, username: []const u8) bool,
+
+    pub fn isLocked(self: LockChecker, username: []const u8) bool {
+        return self.checkFn(self.ctx, username);
+    }
+};
+
+/// Interface for invite code validation. The auth daemon sets this to
+/// a closure over the InviteStore.
+pub const InviteValidator = struct {
+    ctx: *anyopaque,
+    validateFn: *const fn (ctx: *anyopaque, code: []const u8) bool,
+
+    pub fn validate(self: InviteValidator, code: []const u8) bool {
+        return self.validateFn(self.ctx, code);
+    }
+};
+
+/// Registration configuration.
+pub const RegistrationConfig = struct {
+    enabled: bool = false,
+    require_invite: bool = true,
+};
 
 /// Maximum concurrent SCRAM exchanges (one per XMPP connection doing auth).
 const MAX_SCRAM_SESSIONS = 256;
@@ -37,6 +67,14 @@ pub fn AuthHandler(comptime Store: type) type {
         allocator: std.mem.Allocator,
         /// Active SCRAM sessions indexed by slot.
         scram_sessions: [MAX_SCRAM_SESSIONS]ScramSession = undefined,
+        /// Rate limiter (optional — null disables rate limiting).
+        rate_limiter: ?*RateLimiter = null,
+        /// Permanent lock checker (optional — null disables lock checking).
+        lock_checker: ?LockChecker = null,
+        /// Registration configuration.
+        reg_config: RegistrationConfig = .{},
+        /// Invite code validator (optional — required when reg_config.require_invite is true).
+        invite_validator: ?InviteValidator = null,
 
         const Self = @This();
 
@@ -52,6 +90,16 @@ pub fn AuthHandler(comptime Store: type) type {
             return handler;
         }
 
+        /// Set the rate limiter (call after init).
+        pub fn setRateLimiter(self: *Self, limiter: *RateLimiter) void {
+            self.rate_limiter = limiter;
+        }
+
+        /// Set the lock checker (call after init).
+        pub fn setLockChecker(self: *Self, checker: LockChecker) void {
+            self.lock_checker = checker;
+        }
+
         pub fn deinit(self: *Self) void {
             for (&self.scram_sessions) |*s| {
                 if (s.active) s.deinit();
@@ -63,11 +111,30 @@ pub fn AuthHandler(comptime Store: type) type {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req),
                 .sasl_response => |resp| self.handleSaslResponse(resp),
+                .password_change_request => |req| self.handlePasswordChange(req),
+                .account_delete_request => |req| self.handleAccountDelete(req),
+                .register_request => |req| self.handleRegisterRequest(req),
                 else => null,
             };
         }
 
         fn handleAuthRequest(self: *Self, req: protocol.AuthRequest) protocol.Message {
+            // Permanent lock check (if enabled)
+            if (self.lock_checker) |checker| {
+                if (req.username.len > 0 and checker.isLocked(req.username)) {
+                    log.info("auth rejected: account '{s}' is permanently locked", .{req.username});
+                    return authFailure(req.conn_id, "account-disabled");
+                }
+            }
+
+            // Rate limiting check (if enabled)
+            if (self.rate_limiter) |rl| {
+                if (rl.checkAllowed(req.username, req.client_ip)) |reason| {
+                    return authFailure(req.conn_id, reason);
+                }
+                rl.recordAttempt(req.username, req.client_ip);
+            }
+
             return switch (req.mechanism) {
                 .plain => self.handlePlainAuth(req),
                 .scram_sha_256 => self.handleScramInit(req),
@@ -110,6 +177,7 @@ pub fn AuthHandler(comptime Store: type) type {
             };
             const creds = maybe_creds orelse {
                 log.info("PLAIN auth failed: user '{s}' not found", .{username});
+                if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
                 return authFailure(req.conn_id, "not-authorized");
             };
 
@@ -117,10 +185,12 @@ pub fn AuthHandler(comptime Store: type) type {
             const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count);
             if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
                 log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
+                if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
                 return authFailure(req.conn_id, "not-authorized");
             }
 
             log.info("PLAIN auth success: '{s}'", .{username});
+            if (self.rate_limiter) |rl| rl.recordSuccess(username);
             return protocol.Message{ .auth_success = .{
                 .conn_id = req.conn_id,
                 .username = username,
@@ -184,13 +254,14 @@ pub fn AuthHandler(comptime Store: type) type {
             const server_final = session.server.handleClientFinal(resp.payload) catch {
                 log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
                 const username = session.server.username;
-                _ = username;
+                if (self.rate_limiter) |rl| rl.recordFailure(username, "");
                 session.deinit();
                 return authFailure(resp.conn_id, "not-authorized");
             };
 
             const username = session.server.username;
             log.info("SCRAM auth success: '{s}' conn={d}", .{ username, resp.conn_id });
+            if (self.rate_limiter) |rl| rl.recordSuccess(username);
 
             // Keep session alive briefly for the username reference, then clean up
             const result = protocol.Message{ .auth_success = .{
@@ -203,6 +274,156 @@ pub fn AuthHandler(comptime Store: type) type {
             // They'll be valid until the next message for this slot.
 
             return result;
+        }
+
+        fn handlePasswordChange(self: *Self, req: protocol.PasswordChangeRequest) protocol.Message {
+            if (req.username.len == 0 or req.new_password.len == 0) {
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "bad-request",
+                } };
+            }
+
+            self.store.changePassword(self.allocator, req.username, req.new_password) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    error.UserNotFound => "item-not-found",
+                    else => "internal-server-error",
+                };
+                log.info("password change failed for '{s}': {s}", .{ req.username, reason });
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = reason,
+                } };
+            };
+
+            log.info("password changed for '{s}'", .{req.username});
+            return protocol.Message{ .password_change_result = .{
+                .conn_id = req.conn_id,
+                .success = true,
+                .reason = "",
+            } };
+        }
+
+        fn handleAccountDelete(self: *Self, req: protocol.AccountDeleteRequest) protocol.Message {
+            if (req.username.len == 0) {
+                return protocol.Message{ .account_delete_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "bad-request",
+                } };
+            }
+
+            // Remove from UserStore (ignore UserNotFound — may be external auth)
+            self.store.removeUser(self.allocator, req.username) catch |err| {
+                switch (err) {
+                    error.UserNotFound => {},
+                    else => {
+                        log.err("account delete failed for '{s}': store error", .{req.username});
+                        return protocol.Message{ .account_delete_result = .{
+                            .conn_id = req.conn_id,
+                            .success = false,
+                            .reason = "internal-server-error",
+                        } };
+                    },
+                }
+            };
+
+            // Remove from LockStore (if lock_checker is configured, the LockStore exists)
+            // The lock checker holds a reference to LockStore — we use a dedicated
+            // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
+            // or naturally don't apply once the account is gone.
+
+            log.info("account deleted (auth): '{s}'", .{req.username});
+            return protocol.Message{ .account_delete_result = .{
+                .conn_id = req.conn_id,
+                .success = true,
+                .reason = "",
+            } };
+        }
+
+        fn handleRegisterRequest(self: *Self, req: protocol.RegisterRequest) protocol.Message {
+            const regResult = protocol.RegisterResult;
+
+            // Check if registration is enabled
+            if (!self.reg_config.enabled) {
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-allowed",
+                } };
+            }
+
+            // Rate limit registration attempts
+            if (self.rate_limiter) |rl| {
+                if (rl.checkAllowed("", req.client_ip)) |reason| {
+                    return protocol.Message{ .register_result = regResult{
+                        .conn_id = req.conn_id,
+                        .success = false,
+                        .reason = reason,
+                    } };
+                }
+                rl.recordAttempt("", req.client_ip);
+            }
+
+            // Validate input
+            if (req.username.len == 0 or req.password.len == 0) {
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "bad-request",
+                } };
+            }
+
+            // Validate invitation code if required
+            if (self.reg_config.require_invite) {
+                if (req.invite_code.len == 0) {
+                    return protocol.Message{ .register_result = regResult{
+                        .conn_id = req.conn_id,
+                        .success = false,
+                        .reason = "not-allowed",
+                    } };
+                }
+                if (self.invite_validator) |validator| {
+                    if (!validator.validate(req.invite_code)) {
+                        log.info("registration rejected: invalid invite code for '{s}'", .{req.username});
+                        return protocol.Message{ .register_result = regResult{
+                            .conn_id = req.conn_id,
+                            .success = false,
+                            .reason = "not-allowed",
+                        } };
+                    }
+                } else {
+                    // No validator configured but invites required — reject
+                    return protocol.Message{ .register_result = regResult{
+                        .conn_id = req.conn_id,
+                        .success = false,
+                        .reason = "not-allowed",
+                    } };
+                }
+            }
+
+            // Create the user
+            self.store.addUser(self.allocator, req.username, req.password) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    error.UserExists => "conflict",
+                    else => "internal-server-error",
+                };
+                log.info("registration failed for '{s}': {s}", .{ req.username, reason });
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = reason,
+                } };
+            };
+
+            log.info("user registered: '{s}'", .{req.username});
+            return protocol.Message{ .register_result = regResult{
+                .conn_id = req.conn_id,
+                .success = true,
+                .reason = "",
+            } };
         }
 
         /// Clean up a SCRAM session after the response has been sent.
@@ -273,6 +494,9 @@ test "AuthHandler: PLAIN auth success" {
     const result = handler.handleMessage(.{ .auth_request = .{
         .conn_id = 1,
         .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "alice",
         .payload = plain_payload[0 .. 2 + user.len + pass.len],
     } }) orelse return error.NoResponse;
@@ -301,6 +525,9 @@ test "AuthHandler: PLAIN auth wrong password" {
     const result = handler.handleMessage(.{ .auth_request = .{
         .conn_id = 2,
         .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "bob",
         .payload = plain_payload[0..10],
     } }) orelse return error.NoResponse;
@@ -328,6 +555,9 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     const challenge_msg = handler.handleMessage(.{ .auth_request = .{
         .conn_id = 5,
         .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "testuser",
         .payload = client_first,
     } }) orelse return error.NoResponse;
@@ -373,6 +603,9 @@ test "AuthHandler: SCRAM unknown user" {
     const result = handler.handleMessage(.{ .auth_request = .{
         .conn_id = 10,
         .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.2",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "ghost",
         .payload = client_first,
     } }) orelse return error.NoResponse;

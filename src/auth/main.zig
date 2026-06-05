@@ -29,6 +29,15 @@ const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
 const Event = event_loop_mod.Event;
+const RateLimiter = @import("rate_limiter").RateLimiter;
+const RatePolicy = @import("rate_limiter").RatePolicy;
+const lock_store_mod = @import("lock_store");
+const LockStore = lock_store_mod.LockStore(OpBackendType);
+const LockChecker = handler_mod.LockChecker;
+const invite_store_mod = @import("invite_store");
+const InviteStore = invite_store_mod.InviteStore(OpBackendType);
+const InviteValidator = handler_mod.InviteValidator;
+const RegistrationConfig = handler_mod.RegistrationConfig;
 
 const log = std.log.scoped(.xmppd_auth);
 
@@ -49,6 +58,8 @@ pub fn main() !void {
 
     var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
+    var rate_policy = RatePolicy{};
+    var reg_config = RegistrationConfig{};
 
     _ = args.next(); // Skip argv[0]
 
@@ -63,6 +74,35 @@ pub fn main() !void {
                 log.err("--socket requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--max-auth-per-account")) {
+            rate_policy.max_per_account = parseU32Arg(args.next()) orelse {
+                log.err("--max-auth-per-account requires a numeric value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--max-auth-per-ip")) {
+            rate_policy.max_per_ip = parseU32Arg(args.next()) orelse {
+                log.err("--max-auth-per-ip requires a numeric value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--auth-window")) {
+            rate_policy.window_seconds = parseU32Arg(args.next()) orelse {
+                log.err("--auth-window requires a numeric value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--lockout-duration")) {
+            rate_policy.lockout_duration = parseU32Arg(args.next()) orelse {
+                log.err("--lockout-duration requires a numeric value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--lockout-threshold")) {
+            rate_policy.lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+                log.err("--lockout-threshold requires a numeric value", .{});
+                return error.InvalidArgs;
+            });
+        } else if (std.mem.eql(u8, arg, "--enable-registration")) {
+            reg_config.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
+            reg_config.require_invite = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -79,15 +119,37 @@ pub fn main() !void {
     };
 
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
+    log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
+        rate_policy.max_per_account,
+        rate_policy.max_per_ip,
+        rate_policy.window_seconds,
+        rate_policy.lockout_duration,
+        rate_policy.lockout_threshold,
+    });
 
     // Open storage backend
     var backend = try OpBackendType.open(auth_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
+    var lock_store = LockStore.init(&backend);
+    var invite_store = InviteStore.init(&backend);
+
+    // Initialize rate limiter
+    var rate_limiter = RateLimiter.init(rate_policy);
 
     // Initialize auth handler
     var handler = AuthHandler.init(allocator, &store);
+    handler.setRateLimiter(&rate_limiter);
+    handler.setLockChecker(makeLockChecker(&lock_store, allocator));
+    handler.reg_config = reg_config;
+    if (reg_config.enabled and reg_config.require_invite) {
+        handler.invite_validator = makeInviteValidator(&invite_store, allocator);
+    }
     defer handler.deinit();
+
+    if (reg_config.enabled) {
+        log.info("registration enabled (require_invite={s})", .{if (reg_config.require_invite) "true" else "false"});
+    }
 
     // Start IPC server
     var ipc = IpcServer{};
@@ -210,14 +272,73 @@ fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize) void {
     }
 }
 
+/// Context for the invite validator callback.
+const InviteValidatorCtx = struct {
+    invite_store: *InviteStore,
+    allocator: std.mem.Allocator,
+};
+
+/// Create an InviteValidator interface backed by an InviteStore.
+fn makeInviteValidator(is: *InviteStore, alloc: std.mem.Allocator) InviteValidator {
+    const S = struct {
+        var ctx: InviteValidatorCtx = undefined;
+
+        fn check(raw_ctx: *anyopaque, code: []const u8) bool {
+            _ = raw_ctx;
+            return ctx.invite_store.validate(ctx.allocator, code) catch false;
+        }
+    };
+    S.ctx = .{ .invite_store = is, .allocator = alloc };
+    return .{
+        .ctx = @ptrCast(&S.ctx),
+        .validateFn = &S.check,
+    };
+}
+
+/// Context for the lock checker callback — holds references to LockStore + allocator.
+const LockCheckerCtx = struct {
+    lock_store: *LockStore,
+    allocator: std.mem.Allocator,
+};
+
+/// Create a LockChecker interface backed by a LockStore.
+fn makeLockChecker(ls: *LockStore, alloc: std.mem.Allocator) LockChecker {
+    const S = struct {
+        var ctx: LockCheckerCtx = undefined;
+
+        fn check(raw_ctx: *anyopaque, username: []const u8) bool {
+            _ = raw_ctx;
+            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return false;
+            return result != null;
+        }
+    };
+    S.ctx = .{ .lock_store = ls, .allocator = alloc };
+    return .{
+        .ctx = @ptrCast(&S.ctx),
+        .checkFn = &S.check,
+    };
+}
+
+fn parseU32Arg(arg: ?[]const u8) ?u32 {
+    const s = arg orelse return null;
+    return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
 fn printUsage() void {
     const usage =
         \\Usage: xmppd-auth [OPTIONS]
         \\
         \\Options:
-        \\  --db PATH       Storage directory (default: /var/db/xmppd)
-        \\  --socket PATH   IPC socket path (default: /var/run/xmppd/auth.sock)
-        \\  --help, -h      Show this help
+        \\  --db PATH                  Storage directory (default: /var/db/xmppd)
+        \\  --socket PATH              IPC socket path (default: /var/run/xmppd/auth.sock)
+        \\  --max-auth-per-account N   Max attempts per account per window (default: 5)
+        \\  --max-auth-per-ip N        Max attempts per IP per window (default: 20)
+        \\  --auth-window N            Rate window in seconds (default: 120)
+        \\  --lockout-duration N       Temp lockout duration in seconds (default: 300)
+        \\  --lockout-threshold N      Consecutive failures before lockout (default: 10)
+        \\  --enable-registration      Enable in-band registration (XEP-0077)
+        \\  --no-require-invite        Allow registration without invitation code
+        \\  --help, -h                 Show this help
         \\
     ;
     var buf: [0]u8 = .{};

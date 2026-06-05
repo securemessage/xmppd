@@ -87,7 +87,8 @@ pub const Listener = struct {
     /// Accept a pending connection.
     ///
     /// Returns a new `Connection` wrapping the accepted client socket.
-    /// The socket is set to non-blocking mode.
+    /// The socket is set to non-blocking mode. The peer IP address is
+    /// captured and stored on the Connection.
     ///
     /// - `conn_id` — unique ID to assign to this connection (used as kqueue udata)
     ///
@@ -98,7 +99,10 @@ pub const Listener = struct {
     /// - `error.WouldBlock` — no more pending connections
     /// - `error.SystemResources` — fd exhaustion
     pub fn accept(self: *const Listener, conn_id: usize) !Connection {
-        const client_fd = posix.accept(self.fd, null, null, posix.SOCK.NONBLOCK) catch |err| {
+        var addr: std.c.sockaddr.in = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+
+        const client_fd = posix.accept(self.fd, @ptrCast(&addr), &addr_len, posix.SOCK.NONBLOCK) catch |err| {
             return switch (err) {
                 error.WouldBlock => error.WouldBlock,
                 error.ProcessFdQuotaExceeded => error.SystemResources,
@@ -108,7 +112,14 @@ pub const Listener = struct {
             };
         };
 
-        return Connection.init(client_fd, conn_id);
+        // Format peer IP into the connection
+        var conn = Connection.init(client_fd, conn_id);
+        const ip_bytes = @as(*const [4]u8, @ptrCast(&addr.addr));
+        const written = std.fmt.bufPrint(&conn.peer_addr_buf, "{d}.{d}.{d}.{d}", .{
+            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+        }) catch "";
+        conn.peer_addr_len = written.len;
+        return conn;
     }
 
     /// Close the listening socket.

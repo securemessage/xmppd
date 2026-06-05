@@ -250,6 +250,9 @@ test "IpcClient: send and receive over socketpair" {
     try client.send(.{ .auth_request = .{
         .conn_id = 5,
         .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "test",
         .payload = "initial-data",
     } });

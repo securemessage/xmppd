@@ -70,7 +70,7 @@ const MAX_SESSIONS = 1024;
 const LISTENER_UDATA = std.math.maxInt(usize);
 
 /// Sentinel value for auth IPC fd in kqueue udata.
-const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
+pub const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
 
 /// Sentinel value for S2S IPC fd in kqueue udata.
 const IPC_S2S_UDATA = LISTENER_UDATA - 2;
@@ -199,6 +199,18 @@ pub const Session = struct {
     vcard_collecting: bool = false,
     vcard_buf: [4096]u8 = undefined,
     vcard_buf_len: usize = 0,
+
+    /// Registration (XEP-0077) text accumulation.
+    reg_collecting_password: bool = false,
+    reg_password_buf: [256]u8 = undefined,
+    reg_password_len: usize = 0,
+    reg_collecting_username: bool = false,
+    reg_username_buf: [256]u8 = undefined,
+    reg_username_len: usize = 0,
+    /// Whether a <remove/> element was seen inside jabber:iq:register (account deletion).
+    reg_has_remove: bool = false,
+    /// IQ id for a pending password change/deletion response (awaiting auth daemon reply).
+    reg_pending_iq_id: []const u8 = "",
 
     fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -681,6 +693,24 @@ pub const Server = struct {
             return;
         }
 
+        // Pre-auth IQ for registration (XEP-0077) — in features_sasl state
+        if (session.stream.state == .features_sasl or session.stream.state == .sasl_negotiating) {
+            if (std.mem.eql(u8, elem.local_name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
+                // Start IQ accumulation for registration
+                iq_handler.handleIq(session, elem);
+                return;
+            }
+            // IQ child elements during pre-auth registration
+            if (session.iq_active) {
+                if (session.vcard_collecting) {
+                    self.accumulateVcardElement(session, elem);
+                    return;
+                }
+                self.handleIqChild(session, elem);
+                return;
+            }
+        }
+
         // Bind namespace — defer to </iq> so <resource> text is parsed
         if (std.mem.eql(u8, ns, xml.ns.bind)) {
             if (std.mem.eql(u8, elem.local_name, "bind")) {
@@ -754,6 +784,26 @@ pub const Server = struct {
         // vCard XML text accumulation (for vcard-temp SET)
         if (session.vcard_collecting) {
             self.accumulateVcardText(session, text);
+            return;
+        }
+
+        // Registration text accumulation (XEP-0077)
+        if (session.reg_collecting_username) {
+            const remaining = session.reg_username_buf.len - session.reg_username_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.reg_username_buf[session.reg_username_len .. session.reg_username_len + to_copy], text[0..to_copy]);
+                session.reg_username_len += to_copy;
+            }
+            return;
+        }
+        if (session.reg_collecting_password) {
+            const remaining = session.reg_password_buf.len - session.reg_password_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.reg_password_buf[session.reg_password_len .. session.reg_password_len + to_copy], text[0..to_copy]);
+                session.reg_password_len += to_copy;
+            }
             return;
         }
 
@@ -836,6 +886,14 @@ pub const Server = struct {
             }
         }
 
+        // Registration text — stop collecting on </username> or </password>
+        if (session.iq_active and session.reg_collecting_username) {
+            session.reg_collecting_username = false;
+        }
+        if (session.iq_active and session.reg_collecting_password) {
+            session.reg_collecting_password = false;
+        }
+
         // MAM text accumulation — commit collected text on element close
         if (session.iq_active and session.mam_collecting != .none) {
             iq_handler.commitMamText(session);
@@ -910,6 +968,9 @@ pub const Server = struct {
             .auth_request = .{
                 .conn_id = @intCast(session.conn.id),
                 .mechanism = mech_id,
+                .client_ip = session.conn.peerAddr(),
+                .cb_type = 0, // Phase 9f will wire channel binding
+                .cb_data = "",
                 .username = "", // auth daemon extracts from payload
                 .payload = decoded,
             },
@@ -1003,6 +1064,9 @@ pub const Server = struct {
             .auth_challenge => |m| m.conn_id,
             .auth_success => |m| m.conn_id,
             .auth_failure => |m| m.conn_id,
+            .register_result => |m| m.conn_id,
+            .password_change_result => |m| m.conn_id,
+            .account_delete_result => |m| m.conn_id,
             else => return,
         };
 
@@ -1073,8 +1137,138 @@ pub const Server = struct {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
                 }
             },
+            .register_result => |m| {
+                const iq_id = session.reg_pending_iq_id;
+                session.reg_pending_iq_id = "";
+
+                var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                const w = fbs.writer();
+                if (m.success) {
+                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
+                    w.writeAll("/>") catch return;
+                } else {
+                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
+                    w.writeAll("><error type='cancel'><") catch return;
+                    w.writeAll(m.reason) catch return;
+                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+                }
+                session.conn.queueSend(fbs.getWritten()) catch return;
+
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+            },
+            .password_change_result => |m| {
+                const iq_id = session.reg_pending_iq_id;
+                session.reg_pending_iq_id = "";
+
+                var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                const w = fbs.writer();
+                if (m.success) {
+                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
+                    w.writeAll("/>") catch return;
+                } else {
+                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
+                    w.writeAll("><error type='modify'><") catch return;
+                    w.writeAll(m.reason) catch return;
+                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+                }
+                session.conn.queueSend(fbs.getWritten()) catch return;
+
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                }
+            },
+            .account_delete_result => |m| {
+                const iq_id = session.reg_pending_iq_id;
+                session.reg_pending_iq_id = "";
+                session.reg_has_remove = false;
+
+                if (m.success) {
+                    // Cascade cleanup in core stores
+                    const username = session.auth_username_buf[0..session.auth_username_len];
+                    if (username.len > 0) {
+                        self.cascadeAccountDelete(username);
+                    }
+
+                    // Send IQ result then close the stream
+                    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                    const w = fbs.writer();
+                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
+                    w.writeAll("/>") catch return;
+                    session.conn.queueSend(fbs.getWritten()) catch return;
+
+                    // Close the stream per XEP-0077 §3.2
+                    session.conn.queueSend("</stream:stream>") catch {};
+
+                    if (session.conn.hasPendingWrite()) {
+                        changes.addWrite(session.conn.fd, conn_id) catch {};
+                    }
+                } else {
+                    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                    const w = fbs.writer();
+                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
+                    w.writeAll("><error type='cancel'><") catch return;
+                    w.writeAll(m.reason) catch return;
+                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+                    session.conn.queueSend(fbs.getWritten()) catch return;
+
+                    if (session.conn.hasPendingWrite()) {
+                        changes.addWrite(session.conn.fd, conn_id) catch {};
+                    }
+                }
+            },
             else => {},
         }
+    }
+
+    /// Cascade cleanup for a deleted account — remove from all core stores.
+    /// Called after auth daemon confirms credential deletion.
+    fn cascadeAccountDelete(self: *Server, username: []const u8) void {
+        // Build bare JID for store lookups: username@server_host
+        var bare_buf: [320]u8 = undefined;
+        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+        bare_fbs.writer().writeAll(username) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(self.server_host) catch return;
+        const bare_jid = bare_fbs.getWritten();
+
+        // Remove roster entries (iterate + delete each)
+        if (self.roster) |roster| {
+            const items = roster.getAllItems(self.allocator, bare_jid) catch |err| {
+                log.warn("cascade: roster getAllItems failed for {s}: {}", .{ bare_jid, err });
+                return;
+            };
+            for (items) |item| {
+                roster.removeItem(bare_jid, item.contact_jid) catch {};
+                self.allocator.free(item.contact_jid);
+                if (item.entry.name.len > 0) self.allocator.free(item.entry.name);
+            }
+            self.allocator.free(items);
+        }
+
+        // Remove vCard
+        if (self.vcard) |vcard| {
+            vcard.delete(bare_jid) catch |err| {
+                log.warn("cascade: vcard cleanup failed for {s}: {}", .{ bare_jid, err });
+            };
+        }
+
+        // Offline + MAM archive cleanup is best-effort.
+        // The stores use prefix keys (recipient\x00timestamp), so individual
+        // deletion requires iteration. For now we log — a full prefix-delete
+        // can be added to the backend trait in a future phase.
+        if (self.offline != null) {
+            log.info("cascade: offline messages for {s} will expire naturally", .{bare_jid});
+        }
+        if (self.archive != null) {
+            log.info("cascade: MAM archive for {s} will be pruned by retention", .{bare_jid});
+        }
+
+        // Session registry unbind happens automatically when the connection closes
+        // after we send </stream:stream>.
+
+        log.info("cascade cleanup complete for {s}", .{bare_jid});
     }
 
     // ========================================================================

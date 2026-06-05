@@ -90,6 +90,10 @@ pub const Connection = struct {
     /// Whether the connection is in a closed/error state.
     closed: bool = false,
 
+    /// Peer address string (e.g., "192.168.1.100"). Stored from accept().
+    peer_addr_buf: [64]u8 = undefined,
+    peer_addr_len: usize = 0,
+
     /// Initialize a new connection from an accepted socket.
     ///
     /// - `fd` — the accepted client socket (must already be non-blocking)
@@ -99,6 +103,11 @@ pub const Connection = struct {
             .fd = fd,
             .id = id,
         };
+    }
+
+    /// Returns the peer address as a string slice, or empty if unknown.
+    pub fn peerAddr(self: *const Connection) []const u8 {
+        return self.peer_addr_buf[0..self.peer_addr_len];
     }
 
     /// Read data from the socket into the read buffer.

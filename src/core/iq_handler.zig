@@ -119,6 +119,23 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
             }
             session.vcard_buf_len = fbs.pos;
         }
+    } else if (std.mem.eql(u8, elem.local_name, "username") and
+        std.mem.eql(u8, session.iq_child_ns, xml.ns.register))
+    {
+        // <username> inside <query xmlns='jabber:iq:register'> — collect text
+        session.reg_collecting_username = true;
+        session.reg_username_len = 0;
+    } else if (std.mem.eql(u8, elem.local_name, "password") and
+        std.mem.eql(u8, session.iq_child_ns, xml.ns.register))
+    {
+        // <password> inside <query xmlns='jabber:iq:register'> — collect text
+        session.reg_collecting_password = true;
+        session.reg_password_len = 0;
+    } else if (std.mem.eql(u8, elem.local_name, "remove") and
+        std.mem.eql(u8, session.iq_child_ns, xml.ns.register))
+    {
+        // <remove/> inside <query xmlns='jabber:iq:register'> — account deletion
+        session.reg_has_remove = true;
     } else if (session.iq_child_ns.len == 0) {
         // First child element determines the IQ payload namespace
         session.iq_child_ns = ns;
@@ -185,6 +202,12 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // Reset vCard accumulation
         session.vcard_collecting = false;
         session.vcard_buf_len = 0;
+        // Reset registration accumulation
+        session.reg_collecting_username = false;
+        session.reg_username_len = 0;
+        session.reg_collecting_password = false;
+        session.reg_password_len = 0;
+        session.reg_has_remove = false;
     }
 
     const iq_type = session.iq_type;
@@ -283,6 +306,27 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     if (std.mem.eql(u8, child_ns, xml.ns.mam) and std.mem.eql(u8, iq_type, "set")) {
         handleMamQuery(server, session, iq_id, changes);
         return;
+    }
+
+    // XEP-0077 — jabber:iq:register
+    if (std.mem.eql(u8, child_ns, xml.ns.register)) {
+        if (std.mem.eql(u8, iq_type, "get")) {
+            // Registration form query (pre-auth or post-auth)
+            handleRegisterGet(server, session, iq_id);
+            return;
+        } else if (std.mem.eql(u8, iq_type, "set")) {
+            if (session.reg_has_remove) {
+                // Account deletion (post-auth only)
+                handleAccountDelete(server, session, iq_id, changes);
+            } else if (session.stream.bound_jid != null) {
+                // Authenticated — password change
+                handlePasswordChange(server, session, iq_id, changes);
+            } else {
+                // Pre-auth — in-band registration
+                handleRegisterSubmit(server, session, iq_id, changes);
+            }
+            return;
+        }
     }
 
     // Unknown IQ — return service-unavailable per RFC 6120 §8.4
@@ -391,6 +435,136 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle password change (XEP-0077 §3.3). Sends PasswordChangeRequest to auth daemon.
+/// Only allowed for authenticated sessions with a bound JID.
+fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+
+    // Must be authenticated
+    const bound = session.stream.bound_jid orelse {
+        sendIqError(server, session, iq_id, "not-authorized");
+        return;
+    };
+
+    // Get the new password from accumulated text
+    const new_password = session.reg_password_buf[0..session.reg_password_len];
+    if (new_password.len == 0) {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    }
+
+    // Send PasswordChangeRequest via IPC to auth daemon
+    if (!server.ipc.connected) {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    }
+
+    server.ipc.send(.{
+        .password_change_request = .{
+            .conn_id = @intCast(session.conn.id),
+            .username = bound.local,
+            .new_password = new_password,
+        },
+    }) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+
+    // Store the IQ id so we can respond when the result arrives
+    session.reg_pending_iq_id = iq_id;
+
+    // Ensure IPC write is registered
+    if (server.ipc.hasPendingSend()) {
+        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
+    }
+}
+
+/// Handle registration form query (XEP-0077 §3.1).
+/// Returns the registration form with required fields.
+fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void {
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("><query xmlns='jabber:iq:register'>") catch return;
+    w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
+    w.writeAll("<username/>") catch return;
+    w.writeAll("<password/>") catch return;
+    w.writeAll("</query></iq>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle registration submission (XEP-0077 §3.1, pre-auth).
+/// Sends RegisterRequest to auth daemon via IPC.
+fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+    const reg_username = session.reg_username_buf[0..session.reg_username_len];
+    const reg_password = session.reg_password_buf[0..session.reg_password_len];
+
+    if (reg_username.len == 0 or reg_password.len == 0) {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    }
+
+    if (!server.ipc.connected) {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    }
+
+    // TODO: extract invite code from <x xmlns='jabber:x:data'> form field
+    // For now, invite code is empty (works when --no-require-invite is set)
+
+    server.ipc.send(.{
+        .register_request = .{
+            .conn_id = @intCast(session.conn.id),
+            .username = reg_username,
+            .password = reg_password,
+            .invite_code = "",
+            .client_ip = session.conn.peerAddr(),
+        },
+    }) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+
+    session.reg_pending_iq_id = iq_id;
+
+    if (server.ipc.hasPendingSend()) {
+        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
+    }
+}
+
+/// Handle account deletion (XEP-0077 §3.2). Sends AccountDeleteRequest to auth daemon.
+/// On success, core performs cascade cleanup (roster, vcard, offline, MAM).
+fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+    // Must be authenticated
+    const bound = session.stream.bound_jid orelse {
+        sendIqError(server, session, iq_id, "not-authorized");
+        return;
+    };
+
+    // Send AccountDeleteRequest via IPC to auth daemon
+    if (!server.ipc.connected) {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    }
+
+    server.ipc.send(.{
+        .account_delete_request = .{
+            .conn_id = @intCast(session.conn.id),
+            .username = bound.local,
+        },
+    }) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+
+    // Store the IQ id so we can respond when the result arrives
+    session.reg_pending_iq_id = iq_id;
+
+    // Ensure IPC write is registered
+    if (server.ipc.hasPendingSend()) {
+        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
+    }
 }
 
 /// Handle MAM query (XEP-0313). Queries the archive store and sends results.

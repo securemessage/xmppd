@@ -340,6 +340,47 @@ pub fn build(b: *std.Build) void {
 
     const run_generic_user_store_tests = b.addRunArtifact(generic_user_store_tests);
 
+    const rate_limiter_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/rate_limiter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const rate_limiter_tests = b.addTest(.{
+        .name = "rate-limiter-tests",
+        .root_module = rate_limiter_test_mod,
+    });
+
+    const run_rate_limiter_tests = b.addRunArtifact(rate_limiter_tests);
+
+    const lock_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lock_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lock_store_test_mod.addImport("backend", backend_test_mod);
+
+    const lock_store_tests = b.addTest(.{
+        .name = "lock-store-tests",
+        .root_module = lock_store_test_mod,
+    });
+
+    const run_lock_store_tests = b.addRunArtifact(lock_store_tests);
+
+    const invite_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/invite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    invite_store_test_mod.addImport("backend", backend_test_mod);
+
+    const invite_store_tests = b.addTest(.{
+        .name = "invite-store-tests",
+        .root_module = invite_store_test_mod,
+    });
+
+    const run_invite_store_tests = b.addRunArtifact(invite_store_tests);
+
     const auth_handler_test_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/handler.zig"),
         .target = target,
@@ -347,6 +388,9 @@ pub fn build(b: *std.Build) void {
     });
     auth_handler_test_mod.addImport("sasl", sasl_mod);
     auth_handler_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    auth_handler_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
+    auth_handler_test_mod.addImport("lock_store", lock_store_test_mod);
+    auth_handler_test_mod.addImport("invite_store", invite_store_test_mod);
     auth_handler_test_mod.addImport("user_store", generic_user_store_test_mod);
     auth_handler_test_mod.addImport("backend", backend_test_mod);
 
@@ -763,13 +807,36 @@ pub fn build(b: *std.Build) void {
     auth_user_store_mod.addImport("sasl", sasl_mod);
     auth_user_store_mod.addImport("backend", auth_backend_mod);
 
+    const auth_rate_limiter_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/rate_limiter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const auth_handler_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/handler.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const auth_lock_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lock_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_lock_store_mod.addImport("backend", auth_backend_mod);
+
     auth_handler_mod.addImport("sasl", sasl_mod);
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
+    auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
+    auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
+
+    const auth_invite_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/invite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_invite_store_mod.addImport("backend", auth_backend_mod);
+    auth_handler_mod.addImport("invite_store", auth_invite_store_mod);
 
     const auth_event_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/core/event_loop.zig"),
@@ -788,6 +855,9 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
+    auth_mod.addImport("rate_limiter", auth_rate_limiter_mod);
+    auth_mod.addImport("lock_store", auth_lock_store_mod);
+    auth_mod.addImport("invite_store", auth_invite_store_mod);
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
 
@@ -861,7 +931,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const ctl_lock_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lock_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_lock_store_mod.addImport("backend", ctl_backend_mod);
+
     ctl_mod.addImport("user_store", ctl_user_store_mod);
+    const ctl_invite_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/invite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_invite_store_mod.addImport("backend", ctl_backend_mod);
+
+    ctl_mod.addImport("lock_store", ctl_lock_store_mod);
+    ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
 
     const ctl_exe = b.addExecutable(.{
@@ -878,6 +964,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     ctl_test_mod.addImport("user_store", ctl_user_store_mod);
+    ctl_test_mod.addImport("lock_store", ctl_lock_store_mod);
+    ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
 
     const ctl_tests = b.addTest(.{
@@ -926,6 +1014,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+    test_step.dependOn(&run_rate_limiter_tests.step);
+    test_step.dependOn(&run_lock_store_tests.step);
+    test_step.dependOn(&run_invite_store_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-04
+Last updated: 2026-06-05
 
 ## Current Status
 
@@ -18,9 +18,10 @@ Last updated: 2026-06-04
 | 6. Auth Daemon + IPC | ✅ Complete | xmppd-auth, SCRAM-SHA-256, PLAIN, binary IPC |
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
-| 9. Auth Hardening | 🔵 Design | Rate limiting, registration, token auth, ext backends |
+| 9. Auth Hardening | � In Progress | Rate limiting, lockout, registration, passwd, delete — 9f remains |
 | 10. MUC | ⬜ Not started | Multi-User Chat (XEP-0045) |
-| 11. Polish & Deploy | ⬜ Not started | Config, RC script, port, XEPs, docs |
+| 11. External Auth | ⬜ Not started | OIDC/OAuth, LDAP/AD, SQL backends |
+| 12. Polish & Deploy | ⬜ Not started | Config, RC script, port, privilege separation, docs |
 
 ---
 
@@ -201,32 +202,47 @@ Server-to-server federation hardening and interop.
 
 ## Phase 9 — Auth Hardening
 
-Harden authentication: rate limiting, account registration, token-based
-auth for mobile clients, external auth backend support, and channel
-binding. This phase requires a design session before implementation.
+Harden the authentication subsystem within `xmppd-auth`. All new auth
+logic lives in the auth daemon — core remains a pure XML/IPC relay.
 
-### Design Topics
+Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 
-1. **Rate limiting / brute force protection** — per-IP and per-account
-   attempt limits, lockout policy, exponential backoff
-2. **In-band registration (XEP-0077)** — allow clients to create accounts
-   via XMPP stream; captcha, invitation codes, or admin approval
-3. **Account management** — password change via IQ (XEP-0077 §3.3),
-   account deletion
-4. **Token-based auth** — SASL mechanism for mobile clients (OAUTHBEARER,
-   HT-SHA-256, or custom)
-5. **External auth backends** — LDAP bind, HTTP callback, PAM,
-   Rauthy/OIDC; trait-based backend selection
-6. **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
-7. **Channel binding** — tls-server-end-point / tls-exporter for SCRAM
-   (XEP-0440)
-8. **Account privacy** — JID enumeration protection, presence leak
-   prevention
+### Sub-steps
+
+| Step | Feature | Status |
+|------|---------|--------|
+| 9a | Rate limiting — per-IP + per-account, fixed-size hash tables | ✅ |
+| 9b | Account lockout — temp (rate-based) + permanent (LockStore) | ✅ |
+| 9c | In-band registration (XEP-0077) — invitation codes, InviteStore | ✅ |
+| 9d | Password change (XEP-0077 §3.3) — IPC tags 0x08/0x09 | ✅ |
+| 9e | Account deletion (XEP-0077 §3.2) — cascade cleanup | ✅ |
+| 9f | Channel binding (XEP-0440) — tls-server-end-point + tls-exporter | ⬜ |
+
+### Key Design Decisions
+
+- **LockStore** — permanent locks stored in separate `locks` namespace
+  (not embedded in credential format). Works for both local and future
+  external auth users. No breaking schema change.
+- **Single IPC breaking change** — `client_ip`, `cb_type`, `cb_data`
+  added to AuthRequest (0x01) in step 9a.
+- **Forward-compatible** — all designs work with future Phase 11
+  external auth backends.
+
+### Deferred to Phase 11
+
+- Token-based auth (OAUTHBEARER, HT-SHA-256)
+- External auth backends (OIDC, LDAP, SQL, PAM)
+- SASL EXTERNAL for C2S (mTLS)
+
+### Deferred to Phase 12
+
+- JID enumeration protection
+- Presence leak prevention
 
 ### Dependencies
 
-- Phase 5 (Storage) — credential storage for new mechanisms
-- Phase 6 (Auth Daemon) — IPC protocol may need new message types
+- Phase 5 (Storage) — LockStore, InviteStore use storage backend
+- Phase 6 (Auth Daemon) — IPC protocol gains 6 new message types
 
 ## Phase 10 — Multi-User Chat (MUC)
 
@@ -247,7 +263,37 @@ XEP-0045 implementation for group messaging.
 - [ ] Basic moderation (kick, ban, voice)
 - [ ] Room discovery (disco#items)
 
-## Phase 11 — Polish & Deploy
+## Phase 11 — External Auth Backends
+
+Pluggable authentication backends for enterprise and federated identity.
+The `AuthHandler(Store)` generic pattern from Phase 6 means adding
+backends is purely additive — no refactoring needed.
+
+### Priority Order
+
+1. **OIDC/OAuth** — OAUTHBEARER SASL mechanism, token validation against IdP
+2. **LDAP/AD** — bind authentication, group-based authorization
+3. **SQL** — external database credential lookup (PostgreSQL/MariaDB)
+4. **Token auth** — HT-SHA-256 for mobile clients (needs token issuer)
+5. **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
+6. **PAM** — system-level auth integration (pending SASL vs PAM discussion)
+
+### Configuration
+
+```ini
+# xmppd.conf
+auth_backend = internal          # or: oidc, ldap, sql, pam
+# auth_oidc_issuer = https://idp.example.com
+# auth_ldap_url = ldap://ldap.example.com
+# auth_sql_dsn = postgresql://...
+```
+
+### Dependencies
+
+- Phase 9 (Auth Hardening) — LockStore and rate limiting apply to all backends
+- External infrastructure — IdP, LDAP server, or database must exist
+
+## Phase 12 — Polish & Deploy
 
 Production readiness.
 
@@ -256,6 +302,11 @@ Production readiness.
 - [ ] Configuration file system (single `xmppd.conf`)
 - [ ] Sensible defaults (Postfix model: works out of the box)
 - [ ] Runtime config validation
+
+### Privilege Separation
+
+- [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
+- [ ] Per-daemon UID (xmppd-core, xmppd-auth, xmppd-s2s as separate users)
 
 ### Deployment
 
@@ -282,6 +333,11 @@ Production readiness.
 - [ ] XMPP Compliance Suite verification
 - [ ] Performance benchmarks (connections/sec, message throughput)
 - [ ] Fuzz testing on XML parser
+
+### Account Privacy
+
+- [ ] JID enumeration protection
+- [ ] Presence leak prevention
 
 ---
 
@@ -316,15 +372,17 @@ long-term radar.
 | XEP-0199 | XMPP Ping | 7 |
 | XEP-0220 | Server Dialback | 8 |
 | XEP-0313 | Message Archive Management | 5+7 |
+| XEP-0077 | In-Band Registration | 9 |
+| XEP-0440 | SASL Channel-Binding Type Capability | 9 (planned) |
 
 ## Metrics
 
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 47 |
-| Lines of code | ~22,400 |
-| Unit tests | 73 build steps, 575 tests (all pass) |
+| Source files | 49 |
+| Lines of code | ~23,600 |
+| Unit tests | 78 build steps, 591 tests (all pass) |
 | Integration tests | 9/9 S2S federation + 23 C2S interop |
 | Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |

@@ -269,6 +269,9 @@ test "IpcServer: listen, accept, send/receive" {
     const frame_len = try protocol.encode(.{ .auth_request = .{
         .conn_id = 1,
         .mechanism = .plain,
+        .client_ip = "192.168.1.50",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "bob",
         .payload = "secret",
     } }, &frame_buf);

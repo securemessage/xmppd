@@ -40,6 +40,14 @@ pub const Tag = enum(u8) {
     auth_failure = 0x04,
     sasl_response = 0x05,
 
+    // Auth management IPC (0x06–0x0B)
+    register_request = 0x06,
+    register_result = 0x07,
+    password_change_request = 0x08,
+    password_change_result = 0x09,
+    account_delete_request = 0x0A,
+    account_delete_result = 0x0B,
+
     // S2S IPC (0x10–0x12)
     s2s_deliver = 0x10,
     s2s_inbound = 0x11,
@@ -78,6 +86,19 @@ pub const Message = union(enum) {
     /// Core→Auth: SASL response (SCRAM client-final-message).
     sasl_response: SaslResponse,
 
+    /// Core→Auth: in-band registration request (pre-auth).
+    register_request: RegisterRequest,
+    /// Auth→Core: registration result.
+    register_result: RegisterResult,
+    /// Core→Auth: request password change for authenticated user.
+    password_change_request: PasswordChangeRequest,
+    /// Auth→Core: password change result.
+    password_change_result: PasswordChangeResult,
+    /// Core→Auth: request account deletion.
+    account_delete_request: AccountDeleteRequest,
+    /// Auth→Core: account deletion result.
+    account_delete_result: AccountDeleteResult,
+
     /// Core→S2S: deliver a stanza to a remote domain.
     s2s_deliver: S2sDeliver,
     /// S2S→Core: inbound stanza from a remote domain for a local user.
@@ -91,6 +112,12 @@ pub const AuthRequest = struct {
     conn_id: u32,
     /// SASL mechanism.
     mechanism: MechanismId,
+    /// Client IP address string (from accept()).
+    client_ip: []const u8,
+    /// Channel binding type: 0=none, 1=tls-server-end-point, 2=tls-exporter.
+    cb_type: u8,
+    /// Channel binding data (empty when cb_type=0).
+    cb_data: []const u8,
     /// Username (from SASL initial response).
     username: []const u8,
     /// SASL payload (base64-decoded initial response).
@@ -116,6 +143,66 @@ pub const AuthFailure = struct {
 pub const SaslResponse = struct {
     conn_id: u32,
     payload: []const u8,
+};
+
+// ============================================================================
+// Auth management IPC message types
+// ============================================================================
+
+pub const PasswordChangeRequest = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Username whose password is being changed.
+    username: []const u8,
+    /// New password (plaintext — will be hashed by auth daemon).
+    new_password: []const u8,
+};
+
+pub const PasswordChangeResult = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Whether the operation succeeded.
+    success: bool,
+    /// Reason string (empty on success, error description on failure).
+    reason: []const u8,
+};
+
+pub const AccountDeleteRequest = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Username of the account to delete.
+    username: []const u8,
+};
+
+pub const AccountDeleteResult = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Whether the operation succeeded.
+    success: bool,
+    /// Reason string (empty on success, error description on failure).
+    reason: []const u8,
+};
+
+pub const RegisterRequest = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Requested username.
+    username: []const u8,
+    /// Password (plaintext — will be hashed by auth daemon).
+    password: []const u8,
+    /// Invitation code (empty if not required).
+    invite_code: []const u8,
+    /// Client IP address (for rate limiting).
+    client_ip: []const u8,
+};
+
+pub const RegisterResult = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Whether the registration succeeded.
+    success: bool,
+    /// Reason string (empty on success, error description on failure).
+    reason: []const u8,
 };
 
 // ============================================================================
@@ -171,6 +258,13 @@ pub fn encode(msg: Message, buf: []u8) !usize {
             // mechanism (1B)
             buf[pos] = @intFromEnum(req.mechanism);
             pos += 1;
+            // client_ip (len16 + bytes)
+            pos = try writeField(buf, pos, req.client_ip);
+            // cb_type (1B)
+            buf[pos] = req.cb_type;
+            pos += 1;
+            // cb_data (len16 + bytes)
+            pos = try writeField(buf, pos, req.cb_data);
             // username_len (2B LE) + username
             pos = try writeField(buf, pos, req.username);
             // payload_len (2B LE) + payload
@@ -204,6 +298,58 @@ pub fn encode(msg: Message, buf: []u8) !usize {
             std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
             pos += 4;
             pos = try writeField(buf, pos, r.payload);
+        },
+        .register_request => |r| {
+            buf[pos] = @intFromEnum(Tag.register_request);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            pos = try writeField(buf, pos, r.username);
+            pos = try writeField(buf, pos, r.password);
+            pos = try writeField(buf, pos, r.invite_code);
+            pos = try writeField(buf, pos, r.client_ip);
+        },
+        .register_result => |r| {
+            buf[pos] = @intFromEnum(Tag.register_result);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            buf[pos] = if (r.success) 1 else 0;
+            pos += 1;
+            pos = try writeField(buf, pos, r.reason);
+        },
+        .password_change_request => |r| {
+            buf[pos] = @intFromEnum(Tag.password_change_request);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            pos = try writeField(buf, pos, r.username);
+            pos = try writeField(buf, pos, r.new_password);
+        },
+        .password_change_result => |r| {
+            buf[pos] = @intFromEnum(Tag.password_change_result);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            buf[pos] = if (r.success) 1 else 0;
+            pos += 1;
+            pos = try writeField(buf, pos, r.reason);
+        },
+        .account_delete_request => |r| {
+            buf[pos] = @intFromEnum(Tag.account_delete_request);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            pos = try writeField(buf, pos, r.username);
+        },
+        .account_delete_result => |r| {
+            buf[pos] = @intFromEnum(Tag.account_delete_result);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
+            pos += 4;
+            buf[pos] = if (r.success) 1 else 0;
+            pos += 1;
+            pos = try writeField(buf, pos, r.reason);
         },
         .s2s_deliver => |d| {
             buf[pos] = @intFromEnum(Tag.s2s_deliver);
@@ -245,16 +391,24 @@ pub fn decode(payload: []const u8) !Message {
 
     return switch (tag_byte) {
         @intFromEnum(Tag.auth_request) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort; // conn_id(4) + mechanism(1) + username_len(2) min
+            if (data.len < 6) break :blk error.MessageTooShort; // conn_id(4) + mechanism(1) + client_ip_len(2) min
             const conn_id = std.mem.readInt(u32, data[0..4], .little);
             const mech_byte = data[4];
             const mechanism = std.meta.intToEnum(MechanismId, mech_byte) catch return error.InvalidMechanism;
             var pos: usize = 5;
+            const client_ip = try readField(data, &pos);
+            if (pos >= data.len) break :blk error.MessageTooShort;
+            const cb_type = data[pos];
+            pos += 1;
+            const cb_data = try readField(data, &pos);
             const username = try readField(data, &pos);
             const req_payload = try readField(data, &pos);
             break :blk Message{ .auth_request = .{
                 .conn_id = conn_id,
                 .mechanism = mechanism,
+                .client_ip = client_ip,
+                .cb_type = cb_type,
+                .cb_data = cb_data,
                 .username = username,
                 .payload = req_payload,
             } };
@@ -299,6 +453,83 @@ pub fn decode(payload: []const u8) !Message {
             break :blk Message{ .sasl_response = .{
                 .conn_id = conn_id,
                 .payload = resp_payload,
+            } };
+        },
+        @intFromEnum(Tag.register_request) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            var pos: usize = 4;
+            const username = try readField(data, &pos);
+            const password = try readField(data, &pos);
+            const invite_code = try readField(data, &pos);
+            const client_ip = try readField(data, &pos);
+            break :blk Message{ .register_request = .{
+                .conn_id = conn_id,
+                .username = username,
+                .password = password,
+                .invite_code = invite_code,
+                .client_ip = client_ip,
+            } };
+        },
+        @intFromEnum(Tag.register_result) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            if (data.len < 5) break :blk error.MessageTooShort;
+            const success = data[4] != 0;
+            var pos: usize = 5;
+            const reason = try readField(data, &pos);
+            break :blk Message{ .register_result = .{
+                .conn_id = conn_id,
+                .success = success,
+                .reason = reason,
+            } };
+        },
+        @intFromEnum(Tag.password_change_request) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            var pos: usize = 4;
+            const username = try readField(data, &pos);
+            const new_password = try readField(data, &pos);
+            break :blk Message{ .password_change_request = .{
+                .conn_id = conn_id,
+                .username = username,
+                .new_password = new_password,
+            } };
+        },
+        @intFromEnum(Tag.password_change_result) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            if (data.len < 5) break :blk error.MessageTooShort;
+            const success = data[4] != 0;
+            var pos: usize = 5;
+            const reason = try readField(data, &pos);
+            break :blk Message{ .password_change_result = .{
+                .conn_id = conn_id,
+                .success = success,
+                .reason = reason,
+            } };
+        },
+        @intFromEnum(Tag.account_delete_request) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            var pos: usize = 4;
+            const username = try readField(data, &pos);
+            break :blk Message{ .account_delete_request = .{
+                .conn_id = conn_id,
+                .username = username,
+            } };
+        },
+        @intFromEnum(Tag.account_delete_result) => blk: {
+            if (data.len < 6) break :blk error.MessageTooShort;
+            const conn_id = std.mem.readInt(u32, data[0..4], .little);
+            if (data.len < 5) break :blk error.MessageTooShort;
+            const success = data[4] != 0;
+            var pos: usize = 5;
+            const reason = try readField(data, &pos);
+            break :blk Message{ .account_delete_result = .{
+                .conn_id = conn_id,
+                .success = success,
+                .reason = reason,
             } };
         },
         @intFromEnum(Tag.s2s_deliver) => blk: {
@@ -394,6 +625,9 @@ test "AuthRequest encode/decode roundtrip" {
     const msg = Message{ .auth_request = .{
         .conn_id = 42,
         .mechanism = .scram_sha_256,
+        .client_ip = "192.168.1.100",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "alice",
         .payload = "n,,n=alice,r=rOprNGfwEbeRWgbNEkqO",
     } };
@@ -405,6 +639,9 @@ test "AuthRequest encode/decode roundtrip" {
     const req = decoded.auth_request;
     try std.testing.expectEqual(@as(u32, 42), req.conn_id);
     try std.testing.expectEqual(MechanismId.scram_sha_256, req.mechanism);
+    try std.testing.expectEqualStrings("192.168.1.100", req.client_ip);
+    try std.testing.expectEqual(@as(u8, 0), req.cb_type);
+    try std.testing.expectEqualStrings("", req.cb_data);
     try std.testing.expectEqualStrings("alice", req.username);
     try std.testing.expectEqualStrings("n,,n=alice,r=rOprNGfwEbeRWgbNEkqO", req.payload);
 }
@@ -520,6 +757,9 @@ test "encode with empty fields" {
     const msg = Message{ .auth_request = .{
         .conn_id = 0,
         .mechanism = .plain,
+        .client_ip = "",
+        .cb_type = 0,
+        .cb_data = "",
         .username = "",
         .payload = "",
     } };
@@ -530,6 +770,9 @@ test "encode with empty fields" {
     const req = decoded.auth_request;
     try std.testing.expectEqual(@as(u32, 0), req.conn_id);
     try std.testing.expectEqual(MechanismId.plain, req.mechanism);
+    try std.testing.expectEqualStrings("", req.client_ip);
+    try std.testing.expectEqual(@as(u8, 0), req.cb_type);
+    try std.testing.expectEqualStrings("", req.cb_data);
     try std.testing.expectEqualStrings("", req.username);
     try std.testing.expectEqualStrings("", req.payload);
 }

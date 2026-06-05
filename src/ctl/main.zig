@@ -18,6 +18,10 @@ const posix = std.posix;
 const OpBackendType = @import("op_backend").Backend;
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
+const lock_store_mod = @import("lock_store");
+const LockStore = lock_store_mod.LockStore(OpBackendType);
+const invite_store_mod = @import("invite_store");
+const InviteStore = invite_store_mod.InviteStore(OpBackendType);
 
 const log = std.log.scoped(.xmppctl);
 
@@ -66,6 +70,8 @@ pub fn main() !void {
     var backend = try OpBackendType.open(auth_path, .{});
     defer backend.close();
     var store = UserStore.init(&backend);
+    var lock_store = LockStore.init(&backend);
+    var invite_store = InviteStore.init(&backend);
 
     if (std.mem.eql(u8, command, "adduser")) {
         if (remaining_args.items.len < 2) {
@@ -164,6 +170,110 @@ pub fn main() !void {
                 printOut("\n");
             }
         }
+    } else if (std.mem.eql(u8, command, "lock")) {
+        if (remaining_args.items.len < 2) {
+            printErr("lock requires a JID argument\n");
+            return error.InvalidArgs;
+        }
+        const jid = remaining_args.items[1];
+        const username = extractLocal(jid);
+
+        lock_store.lock(username, .permanent) catch |err| {
+            printErr("failed to lock account\n");
+            return err;
+        };
+        printOut("Account ");
+        printOut(jid);
+        printOut(" locked.\n");
+        signalAuthDaemon();
+    } else if (std.mem.eql(u8, command, "unlock")) {
+        if (remaining_args.items.len < 2) {
+            printErr("unlock requires a JID argument\n");
+            return error.InvalidArgs;
+        }
+        const jid = remaining_args.items[1];
+        const username = extractLocal(jid);
+
+        lock_store.unlock(allocator, username) catch |err| {
+            printErr("failed to unlock account\n");
+            return err;
+        };
+        printOut("Account ");
+        printOut(jid);
+        printOut(" unlocked.\n");
+        signalAuthDaemon();
+    } else if (std.mem.eql(u8, command, "invite")) {
+        if (remaining_args.items.len < 2) {
+            printErr("invite requires a subcommand: create, list, revoke\n");
+            return error.InvalidArgs;
+        }
+        const subcmd = remaining_args.items[1];
+
+        if (std.mem.eql(u8, subcmd, "create")) {
+            // Parse --max-uses and --expires from remaining args
+            var max_uses: u16 = 1;
+            var expires: u32 = 0;
+            var i: usize = 2;
+            while (i < remaining_args.items.len) : (i += 1) {
+                const a = remaining_args.items[i];
+                if (std.mem.eql(u8, a, "--max-uses") and i + 1 < remaining_args.items.len) {
+                    i += 1;
+                    max_uses = std.fmt.parseInt(u16, remaining_args.items[i], 10) catch {
+                        printErr("--max-uses requires a number\n");
+                        return error.InvalidArgs;
+                    };
+                } else if (std.mem.eql(u8, a, "--expires") and i + 1 < remaining_args.items.len) {
+                    i += 1;
+                    const hours = std.fmt.parseInt(u32, remaining_args.items[i], 10) catch {
+                        printErr("--expires requires hours as a number\n");
+                        return error.InvalidArgs;
+                    };
+                    const now: u32 = @intCast(@as(u64, @bitCast(std.time.timestamp())) & 0xFFFFFFFF);
+                    expires = now + hours * 3600;
+                }
+            }
+
+            var code_buf: [16]u8 = undefined;
+            const code = invite_store_mod.generateCode(&code_buf);
+
+            invite_store.create(code, max_uses, expires) catch |err| {
+                printErr("failed to create invite\n");
+                return err;
+            };
+            printOut(code);
+            printOut("\n");
+        } else if (std.mem.eql(u8, subcmd, "list")) {
+            const entries = invite_store.list(allocator) catch |err| {
+                printErr("failed to list invites\n");
+                return err;
+            };
+            defer InviteStore.freeEntries(allocator, entries);
+
+            if (entries.len == 0) {
+                printOut("No invites.\n");
+            } else {
+                for (entries) |entry| {
+                    printOut(entry.code);
+                    printOut("\n");
+                }
+            }
+        } else if (std.mem.eql(u8, subcmd, "revoke")) {
+            if (remaining_args.items.len < 3) {
+                printErr("invite revoke requires a code argument\n");
+                return error.InvalidArgs;
+            }
+            const code = remaining_args.items[2];
+            invite_store.revoke(allocator, code) catch |err| {
+                printErr("failed to revoke invite\n");
+                return err;
+            };
+            printOut("Invite revoked.\n");
+        } else {
+            printErr("unknown invite subcommand: ");
+            printErr(subcmd);
+            printErr("\n");
+            return error.InvalidArgs;
+        }
     } else {
         printErr("unknown command: ");
         printErr(command);
@@ -255,6 +365,11 @@ fn printUsage() void {
         \\  deluser JID     Remove a user account
         \\  passwd  JID     Change a user's password
         \\  listusers       List all users
+        \\  lock JID        Permanently lock an account
+        \\  unlock JID      Unlock a locked account
+        \\  invite create   Create invitation code [--max-uses N] [--expires HOURS]
+        \\  invite list     List all invitation codes
+        \\  invite revoke   Revoke an invitation code
         \\
         \\Options:
         \\  --db PATH       Storage directory (default: /var/db/xmppd)
