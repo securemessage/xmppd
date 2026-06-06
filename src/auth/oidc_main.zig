@@ -99,6 +99,7 @@ pub fn main() !void {
         return error.InvalidArgs;
     };
     const ca_file = cfg.get("oidc", "ca_file");
+    const introspection_endpoint = cfg.get("oidc", "introspection_endpoint");
 
     // Override socket path from config if present
     if (cfg.get("oidc", "socket")) |s| {
@@ -119,6 +120,7 @@ pub fn main() !void {
         .client_secret = client_secret,
         .token_endpoint = token_endpoint,
         .jwks_uri = jwks_uri,
+        .introspection_endpoint = introspection_endpoint,
         .ca_file = ca_file,
     });
     defer oidc_store.deinit();

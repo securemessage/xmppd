@@ -33,18 +33,26 @@ pub const OidcConfig = struct {
     token_endpoint: []const u8,
     /// JWKS endpoint URL (for key fetching).
     jwks_uri: []const u8,
+    /// Introspection endpoint URL (for opaque token validation, optional).
+    introspection_endpoint: ?[]const u8 = null,
     /// CA file for TLS verification (null = system default).
     ca_file: ?[]const u8 = null,
     /// Claim to extract username from (default: preferred_username, fallback: email).
     username_claim: []const u8 = "preferred_username",
 };
 
-/// Cached JWK (RSA public key components).
+/// Cached JWK key (supports RSA and EdDSA/OKP).
 const JwkKey = struct {
     kid: []const u8,
-    n: []const u8,
-    e: []const u8,
+    kty: KeyType,
+    // RSA fields
+    n: []const u8 = "",
+    e: []const u8 = "",
+    // EdDSA (OKP) field
+    x: []const u8 = "",
 };
+
+const KeyType = enum { rsa, okp };
 
 /// Maximum number of cached JWKS keys.
 const MAX_JWKS_KEYS = 16;
@@ -83,13 +91,13 @@ pub const OidcStore = struct {
 
     /// Validate an OAUTHBEARER token. Returns the extracted username on success.
     /// The returned slice borrows from internal state — valid until next validateToken call.
+    /// Tries JWT validation first; falls back to token introspection for opaque tokens.
     pub fn validateToken(self: *OidcStore, allocator: Allocator, token: []const u8) !?[]const u8 {
-        _ = allocator;
-
         // Parse the JWT
         const parsed = jwt.parse(token) catch |err| {
-            log.info("OAUTHBEARER: JWT parse failed: {}", .{err});
-            return null;
+            // JWT parsing failed — token may be opaque. Try introspection.
+            log.info("OAUTHBEARER: JWT parse failed ({}) — trying introspection", .{err});
+            return self.introspectToken(allocator, token);
         };
 
         // Validate expiry
@@ -116,7 +124,11 @@ pub const OidcStore = struct {
             return null;
         };
 
-        if (!jwt.verifyRs256(&parsed, signing_key.n, signing_key.e)) {
+        const sig_valid = switch (signing_key.kty) {
+            .rsa => jwt.verifyRs256(&parsed, signing_key.n, signing_key.e),
+            .okp => jwt.verifyEdDSA(&parsed, signing_key.x),
+        };
+        if (!sig_valid) {
             log.info("OAUTHBEARER: signature verification failed for sub='{s}'", .{parsed.claims.sub});
             return null;
         }
@@ -173,6 +185,62 @@ pub const OidcStore = struct {
 
         // Success — the IdP authenticated the user. Return the username as-is.
         log.info("ROPC: password validated for '{s}'", .{username});
+        return username;
+    }
+
+    /// Validate a token via the introspection endpoint (RFC 7662).
+    /// Used as fallback when JWT parsing fails (opaque tokens).
+    fn introspectToken(self: *OidcStore, allocator: Allocator, token: []const u8) ?[]const u8 {
+        const endpoint = self.config.introspection_endpoint orelse {
+            log.info("OAUTHBEARER: no introspection endpoint configured", .{});
+            return null;
+        };
+
+        // Build introspection request body
+        var body_buf: [4096]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&body_buf);
+        const w = fbs.writer();
+
+        w.writeAll("token=") catch return null;
+        percentEncode(w, token) catch return null;
+        w.writeAll("&client_id=") catch return null;
+        percentEncode(w, self.config.client_id) catch return null;
+        w.writeAll("&client_secret=") catch return null;
+        percentEncode(w, self.config.client_secret) catch return null;
+
+        const body = fbs.getWritten();
+
+        var response = http.post(allocator, endpoint, body, self.config.ca_file) catch |err| {
+            log.err("introspection: HTTP request failed: {}", .{err});
+            return null;
+        };
+        defer response.deinit();
+
+        if (response.status != 200) {
+            log.info("introspection: endpoint returned {d}", .{response.status});
+            return null;
+        }
+
+        // Parse introspection response — check "active":true and extract username
+        const resp_body = response.body;
+
+        // Check active flag
+        if (std.mem.indexOf(u8, resp_body, "\"active\":true") == null and
+            std.mem.indexOf(u8, resp_body, "\"active\": true") == null)
+        {
+            log.info("introspection: token is not active", .{});
+            return null;
+        }
+
+        // Extract username from response (try username, then sub)
+        const username_claim = extractNamedField(resp_body, "\"username\"") orelse
+            extractNamedField(resp_body, "\"sub\"") orelse {
+            log.info("introspection: no username in response", .{});
+            return null;
+        };
+
+        const username = extractLocalpart(username_claim);
+        log.info("OAUTHBEARER: introspection validated for '{s}'", .{username});
         return username;
     }
 
@@ -248,8 +316,7 @@ pub const OidcStore = struct {
         self.parseJwksKeys();
     }
 
-    /// Parse JWKS JSON and extract RSA key components.
-    /// Minimal JSON parsing — looks for "kid", "n", "e" fields within "keys" array.
+    /// Parse JWKS JSON and extract key components (RSA and EdDSA/OKP).
     fn parseJwksKeys(self: *OidcStore) void {
         const body = self.jwks_body orelse return;
 
@@ -260,35 +327,54 @@ pub const OidcStore = struct {
             const kid_start = std.mem.indexOf(u8, body[pos..], "\"kid\"") orelse break;
             const abs_kid_start = pos + kid_start;
 
-            // Find the enclosing object boundaries (approximate: find previous { and next })
-            // We extract kid, n, e from nearby context
             const kid_value = extractFieldValue(body[abs_kid_start..]) orelse {
                 pos = abs_kid_start + 5;
                 continue;
             };
 
-            // Look for "n" and "e" near this key
-            // Search within a reasonable window after kid
-            const search_start = abs_kid_start;
+            // Determine key type from surrounding context
+            const search_start = if (abs_kid_start > 200) abs_kid_start - 200 else 0;
             const search_end = @min(body.len, abs_kid_start + 4096);
             const key_region = body[search_start..search_end];
 
-            const n_value = extractNamedField(key_region, "\"n\"") orelse {
+            const kty_value = extractNamedField(key_region, "\"kty\"") orelse {
                 pos = abs_kid_start + 5;
                 continue;
             };
 
-            const e_value = extractNamedField(key_region, "\"e\"") orelse {
-                pos = abs_kid_start + 5;
-                continue;
-            };
+            if (std.mem.eql(u8, kty_value, "RSA")) {
+                // RSA key — need n and e
+                const n_value = extractNamedField(key_region, "\"n\"") orelse {
+                    pos = abs_kid_start + 5;
+                    continue;
+                };
+                const e_value = extractNamedField(key_region, "\"e\"") orelse {
+                    pos = abs_kid_start + 5;
+                    continue;
+                };
 
-            self.keys[self.key_count] = JwkKey{
-                .kid = kid_value,
-                .n = n_value,
-                .e = e_value,
-            };
-            self.key_count += 1;
+                self.keys[self.key_count] = JwkKey{
+                    .kid = kid_value,
+                    .kty = .rsa,
+                    .n = n_value,
+                    .e = e_value,
+                };
+                self.key_count += 1;
+            } else if (std.mem.eql(u8, kty_value, "OKP")) {
+                // EdDSA (Ed25519) key — need x
+                const x_value = extractNamedField(key_region, "\"x\"") orelse {
+                    pos = abs_kid_start + 5;
+                    continue;
+                };
+
+                self.keys[self.key_count] = JwkKey{
+                    .kid = kid_value,
+                    .kty = .okp,
+                    .x = x_value,
+                };
+                self.key_count += 1;
+            }
+            // Skip unknown key types
 
             pos = abs_kid_start + 5;
         }

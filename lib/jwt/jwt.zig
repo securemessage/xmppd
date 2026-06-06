@@ -163,6 +163,47 @@ pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
     return verify_result == 1;
 }
 
+/// Verify an EdDSA (Ed25519) JWT signature against a raw public key (x in base64url).
+/// Returns true if signature is valid, false otherwise.
+pub fn verifyEdDSA(jwt_token: *const Jwt, x_b64: []const u8) bool {
+    // Decode signature from base64url (Ed25519 signatures are 64 bytes)
+    var sig_buf: [128]u8 = undefined;
+    const sig_len = b64urlDecode(jwt_token.signature_b64, &sig_buf) orelse return false;
+    if (sig_len != 64) return false; // Ed25519 signatures are always 64 bytes
+    const signature = sig_buf[0..sig_len];
+
+    // Decode the raw Ed25519 public key (32 bytes)
+    var key_buf: [64]u8 = undefined;
+    const key_len = b64urlDecode(x_b64, &key_buf) orelse return false;
+    if (key_len != 32) return false; // Ed25519 public keys are always 32 bytes
+
+    // Create EVP_PKEY from raw Ed25519 public key
+    const pkey = c.EVP_PKEY_new_raw_public_key(
+        c.EVP_PKEY_ED25519,
+        null,
+        &key_buf,
+        32,
+    ) orelse return false;
+    defer c.EVP_PKEY_free(pkey);
+
+    // Ed25519 uses EVP_DigestVerify with NULL digest (pure signature scheme)
+    const md_ctx = c.EVP_MD_CTX_new() orelse return false;
+    defer c.EVP_MD_CTX_free(md_ctx);
+
+    // Init with NULL md — Ed25519 doesn't use a separate hash
+    if (c.EVP_DigestVerifyInit(md_ctx, null, null, null, pkey) != 1) return false;
+
+    // Ed25519 uses the one-shot EVP_DigestVerify (not Update+Final)
+    const verify_result = c.EVP_DigestVerify(
+        md_ctx,
+        signature.ptr,
+        signature.len,
+        jwt_token.signed_portion.ptr,
+        jwt_token.signed_portion.len,
+    );
+    return verify_result == 1;
+}
+
 /// Validate token expiration. Returns error if expired.
 pub fn validateExpiry(claims: *const JwtClaims) JwtError!void {
     const now = std.time.timestamp();
