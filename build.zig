@@ -818,6 +818,33 @@ pub fn build(b: *std.Build) void {
 
     const run_http_tests = b.addRunArtifact(http_tests);
 
+    // --- JWT module (for OIDC backend) ---
+
+    const jwt_mod = b.createModule(.{
+        .root_source_file = b.path("lib/jwt/jwt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    jwt_mod.linkSystemLibrary("ssl", .{});
+    jwt_mod.linkSystemLibrary("crypto", .{});
+
+    const jwt_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/jwt/jwt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    jwt_test_mod.linkSystemLibrary("ssl", .{});
+    jwt_test_mod.linkSystemLibrary("crypto", .{});
+
+    const jwt_tests = b.addTest(.{
+        .name = "jwt-tests",
+        .root_module = jwt_test_mod,
+    });
+
+    const run_jwt_tests = b.addRunArtifact(jwt_tests);
+
     // --- Executables ---
 
     // xmppd-core: the connection handler worker
@@ -1119,6 +1146,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
+    test_step.dependOn(&run_jwt_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.
