@@ -992,6 +992,76 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(auth_exe);
 
+    // xmppd-auth-oidc: the OIDC authentication daemon
+    const oidc_ipc_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const oidc_ipc_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oidc_ipc_server_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
+
+    const oidc_rate_limiter_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/rate_limiter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const oidc_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/oidc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    oidc_store_mod.addImport("http", http_mod);
+    oidc_store_mod.addImport("jwt", jwt_mod);
+    oidc_store_mod.linkSystemLibrary("ssl", .{});
+    oidc_store_mod.linkSystemLibrary("crypto", .{});
+
+    const oidc_handler_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oidc_handler_mod.addImport("sasl", sasl_mod);
+    oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
+    oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
+    oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_handler_mod.addImport("invite_store", auth_invite_store_mod);
+
+    const oidc_event_loop_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/event_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const oidc_main_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/oidc_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    oidc_main_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
+    oidc_main_mod.addImport("ipc_server", oidc_ipc_server_mod);
+    oidc_main_mod.addImport("handler", oidc_handler_mod);
+    oidc_main_mod.addImport("oidc", oidc_store_mod);
+    oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
+    oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
+    oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.linkSystemLibrary("ssl", .{});
+    oidc_main_mod.linkSystemLibrary("crypto", .{});
+
+    const oidc_exe = b.addExecutable(.{
+        .name = "xmppd-auth-oidc",
+        .root_module = oidc_main_mod,
+    });
+    b.installArtifact(oidc_exe);
+
     // xmppd-s2s: the S2S federation daemon
     const s2s_ipc_protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),

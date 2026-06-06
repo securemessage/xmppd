@@ -17,6 +17,8 @@ const c = @cImport({
     @cInclude("openssl/rsa.h");
     @cInclude("openssl/bn.h");
     @cInclude("openssl/err.h");
+    @cInclude("openssl/param_build.h");
+    @cInclude("openssl/core_names.h");
 });
 
 pub const JwtError = error{

@@ -251,7 +251,7 @@ fn tcpConnect(host: []const u8, port: u16) ?posix.fd_t {
     defer c.freeaddrinfo(result.?);
 
     const ai = result.?;
-    const fd = std.c.socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol);
+    const fd = std.c.socket(@intCast(ai.ai_family), @intCast(ai.ai_socktype), @intCast(ai.ai_protocol));
     if (fd < 0) return null;
 
     if (std.c.connect(fd, @ptrCast(ai.ai_addr), ai.ai_addrlen) != 0) {

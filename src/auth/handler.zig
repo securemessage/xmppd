@@ -137,8 +137,14 @@ pub fn AuthHandler(comptime Store: type) type {
 
             return switch (req.mechanism) {
                 .plain => self.handlePlainAuth(req),
-                .scram_sha_256 => self.handleScramInit(req),
-                .oauthbearer => authFailure(req.conn_id, "mechanism-not-supported"),
+                .scram_sha_256 => if (comptime @hasDecl(Store, "lookup"))
+                    self.handleScramInit(req)
+                else
+                    authFailure(req.conn_id, "mechanism-not-supported"),
+                .oauthbearer => if (comptime @hasDecl(Store, "validateToken"))
+                    self.handleOAuthBearerAuth(req)
+                else
+                    authFailure(req.conn_id, "mechanism-not-supported"),
             };
         }
 
@@ -172,78 +178,137 @@ pub fn AuthHandler(comptime Store: type) type {
             const username = payload[authcid_start..authcid_end];
             const password = payload[passwd_start..];
 
-            // Look up user
-            const maybe_creds = self.store.lookup(self.allocator, username) catch {
-                return authFailure(req.conn_id, "temporary-auth-failure");
-            };
-            const creds = maybe_creds orelse {
-                log.info("PLAIN auth failed: user '{s}' not found", .{username});
-                if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
-                return authFailure(req.conn_id, "not-authorized");
-            };
-
-            // Verify by deriving with the same salt and comparing
-            const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count);
-            if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
-                log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
-                return authFailure(req.conn_id, "not-authorized");
+            // If the store supports validatePassword (OIDC/IdP delegation), use that
+            if (comptime @hasDecl(Store, "validatePassword")) {
+                const result = self.store.validatePassword(self.allocator, username, password) catch {
+                    return authFailure(req.conn_id, "temporary-auth-failure");
+                };
+                if (result) |validated_user| {
+                    log.info("PLAIN auth success (IdP): '{s}'", .{validated_user});
+                    if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                    return protocol.Message{ .auth_success = .{
+                        .conn_id = req.conn_id,
+                        .username = validated_user,
+                        .server_final = "",
+                    } };
+                } else {
+                    log.info("PLAIN auth failed (IdP): '{s}'", .{username});
+                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    return authFailure(req.conn_id, "not-authorized");
+                }
             }
 
-            log.info("PLAIN auth success: '{s}'", .{username});
-            if (self.rate_limiter) |rl| rl.recordSuccess(username);
-            return protocol.Message{ .auth_success = .{
-                .conn_id = req.conn_id,
-                .username = username,
-                .server_final = "",
-            } };
+            // Traditional credential lookup + SCRAM derive
+            if (comptime @hasDecl(Store, "lookup")) {
+                const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                    return authFailure(req.conn_id, "temporary-auth-failure");
+                };
+                const creds = maybe_creds orelse {
+                    log.info("PLAIN auth failed: user '{s}' not found", .{username});
+                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    return authFailure(req.conn_id, "not-authorized");
+                };
+
+                // Verify by deriving with the same salt and comparing
+                const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count);
+                if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
+                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    return authFailure(req.conn_id, "not-authorized");
+                }
+
+                log.info("PLAIN auth success: '{s}'", .{username});
+                if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                return protocol.Message{ .auth_success = .{
+                    .conn_id = req.conn_id,
+                    .username = username,
+                    .server_final = "",
+                } };
+            }
+
+            return authFailure(req.conn_id, "mechanism-not-supported");
+        }
+
+        /// Handle OAUTHBEARER mechanism — delegates to Store.validateToken.
+        fn handleOAuthBearerAuth(self: *Self, req: protocol.AuthRequest) protocol.Message {
+            if (comptime !@hasDecl(Store, "validateToken")) {
+                return authFailure(req.conn_id, "mechanism-not-supported");
+            }
+
+            // OAUTHBEARER payload: the bearer token directly
+            const token = req.payload;
+            if (token.len == 0) {
+                return authFailure(req.conn_id, "invalid-encoding");
+            }
+
+            const result = self.store.validateToken(self.allocator, token) catch {
+                return authFailure(req.conn_id, "temporary-auth-failure");
+            };
+
+            if (result) |validated_user| {
+                log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
+                if (self.rate_limiter) |rl| rl.recordSuccess(validated_user);
+                return protocol.Message{ .auth_success = .{
+                    .conn_id = req.conn_id,
+                    .username = validated_user,
+                    .server_final = "",
+                } };
+            } else {
+                log.info("OAUTHBEARER auth failed", .{});
+                if (self.rate_limiter) |rl| rl.recordFailure(req.username, req.client_ip);
+                return authFailure(req.conn_id, "not-authorized");
+            }
         }
 
         fn handleScramInit(self: *Self, req: protocol.AuthRequest) protocol.Message {
-            // Find or create a SCRAM session for this conn_id
-            const slot = self.findOrCreateScramSlot(req.conn_id) orelse {
-                return authFailure(req.conn_id, "temporary-auth-failure");
-            };
+            if (comptime !@hasDecl(Store, "lookup")) {
+                return authFailure(req.conn_id, "mechanism-not-supported");
+            } else {
+                // Find or create a SCRAM session for this conn_id
+                const slot = self.findOrCreateScramSlot(req.conn_id) orelse {
+                    return authFailure(req.conn_id, "temporary-auth-failure");
+                };
 
-            var session = &self.scram_sessions[slot];
-            session.server = sasl.ScramServer.init(self.allocator);
-            session.conn_id = req.conn_id;
-            session.active = true;
+                var session = &self.scram_sessions[slot];
+                session.server = sasl.ScramServer.init(self.allocator);
+                session.conn_id = req.conn_id;
+                session.active = true;
 
-            // Set channel binding data from TLS session
-            session.server.setChannelBinding(req.cb_type, req.cb_data);
+                // Set channel binding data from TLS session
+                session.server.setChannelBinding(req.cb_type, req.cb_data);
 
-            // Process client-first-message
-            const username = session.server.handleClientFirst(req.payload) catch {
-                session.deinit();
-                return authFailure(req.conn_id, "invalid-encoding");
-            };
+                // Process client-first-message
+                const username = session.server.handleClientFirst(req.payload) catch {
+                    session.deinit();
+                    return authFailure(req.conn_id, "invalid-encoding");
+                };
 
-            // Look up credentials
-            const maybe_creds = self.store.lookup(self.allocator, username) catch {
-                session.deinit();
-                return authFailure(req.conn_id, "temporary-auth-failure");
-            };
-            const creds = maybe_creds orelse {
-                log.info("SCRAM auth failed: user '{s}' not found", .{username});
-                session.deinit();
-                return authFailure(req.conn_id, "not-authorized");
-            };
+                // Look up credentials
+                const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                    session.deinit();
+                    return authFailure(req.conn_id, "temporary-auth-failure");
+                };
+                const creds = maybe_creds orelse {
+                    log.info("SCRAM auth failed: user '{s}' not found", .{username});
+                    session.deinit();
+                    return authFailure(req.conn_id, "not-authorized");
+                };
 
-            session.server.setCredentials(creds);
+                session.server.setCredentials(creds);
 
-            // Generate server-first-message
-            const server_first = session.server.serverFirst() catch {
-                session.deinit();
-                return authFailure(req.conn_id, "temporary-auth-failure");
-            };
+                // Generate server-first-message
+                const server_first = session.server.serverFirst() catch {
+                    session.deinit();
+                    return authFailure(req.conn_id, "temporary-auth-failure");
+                };
 
-            log.info("SCRAM challenge sent for '{s}' conn={d}", .{ username, req.conn_id });
+                log.info("SCRAM challenge sent for '{s}' conn={d}", .{ username, req.conn_id });
 
-            return protocol.Message{ .auth_challenge = .{
-                .conn_id = req.conn_id,
-                .challenge = server_first,
-            } };
+                return protocol.Message{ .auth_challenge = .{
+                    .conn_id = req.conn_id,
+                    .challenge = server_first,
+                } };
+            }
         }
 
         fn handleSaslResponse(self: *Self, resp: protocol.SaslResponse) protocol.Message {
@@ -289,6 +354,14 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            if (comptime !@hasDecl(Store, "changePassword")) {
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-allowed",
+                } };
+            }
+
             self.store.changePassword(self.allocator, req.username, req.new_password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserNotFound => "item-not-found",
@@ -316,6 +389,14 @@ pub fn AuthHandler(comptime Store: type) type {
                     .conn_id = req.conn_id,
                     .success = false,
                     .reason = "bad-request",
+                } };
+            }
+
+            if (comptime !@hasDecl(Store, "removeUser")) {
+                return protocol.Message{ .account_delete_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-allowed",
                 } };
             }
 
@@ -349,6 +430,15 @@ pub fn AuthHandler(comptime Store: type) type {
 
         fn handleRegisterRequest(self: *Self, req: protocol.RegisterRequest) protocol.Message {
             const regResult = protocol.RegisterResult;
+
+            // OIDC backends don't support registration
+            if (comptime !@hasDecl(Store, "addUser")) {
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-allowed",
+                } };
+            }
 
             // Check if registration is enabled
             if (!self.reg_config.enabled) {
