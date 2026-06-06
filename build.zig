@@ -770,6 +770,27 @@ pub fn build(b: *std.Build) void {
 
     const run_supervisor_tests = b.addRunArtifact(supervisor_tests);
 
+    // --- Config module (shared by all daemons) ---
+
+    const config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const config_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const config_tests = b.addTest(.{
+        .name = "config-tests",
+        .root_module = config_test_mod,
+    });
+
+    const run_config_tests = b.addRunArtifact(config_tests);
+
     // --- Executables ---
 
     // xmppd-core: the connection handler worker
@@ -818,6 +839,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     master_mod.addImport("event_loop", master_event_loop_mod);
+    master_mod.addImport("config", config_mod);
 
     const master_exe = b.addExecutable(.{
         .name = "xmppd",
@@ -908,6 +930,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("invite_store", auth_invite_store_mod);
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
+    auth_mod.addImport("config", config_mod);
 
     const auth_exe = b.addExecutable(.{
         .name = "xmppd-auth",
@@ -1067,6 +1090,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_invite_store_tests.step);
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
+    test_step.dependOn(&run_config_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

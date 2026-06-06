@@ -138,6 +138,7 @@ pub fn AuthHandler(comptime Store: type) type {
             return switch (req.mechanism) {
                 .plain => self.handlePlainAuth(req),
                 .scram_sha_256 => self.handleScramInit(req),
+                .oauthbearer => authFailure(req.conn_id, "mechanism-not-supported"),
             };
         }
 

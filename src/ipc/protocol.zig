@@ -48,6 +48,9 @@ pub const Tag = enum(u8) {
     account_delete_request = 0x0A,
     account_delete_result = 0x0B,
 
+    // Mechanism handshake (0x0C)
+    mechanism_list = 0x0C,
+
     // S2S IPC (0x10–0x12)
     s2s_deliver = 0x10,
     s2s_inbound = 0x11,
@@ -58,10 +61,12 @@ pub const Tag = enum(u8) {
 pub const MechanismId = enum(u8) {
     plain = 0x01,
     scram_sha_256 = 0x02,
+    oauthbearer = 0x03,
 
     pub fn fromName(name: []const u8) ?MechanismId {
         if (std.mem.eql(u8, name, "PLAIN")) return .plain;
         if (std.mem.eql(u8, name, "SCRAM-SHA-256")) return .scram_sha_256;
+        if (std.mem.eql(u8, name, "OAUTHBEARER")) return .oauthbearer;
         return null;
     }
 
@@ -69,6 +74,7 @@ pub const MechanismId = enum(u8) {
         return switch (self) {
             .plain => "PLAIN",
             .scram_sha_256 => "SCRAM-SHA-256",
+            .oauthbearer => "OAUTHBEARER",
         };
     }
 };
@@ -98,6 +104,9 @@ pub const Message = union(enum) {
     account_delete_request: AccountDeleteRequest,
     /// Auth→Core: account deletion result.
     account_delete_result: AccountDeleteResult,
+
+    /// Auth→Core: supported SASL mechanisms (sent once on IPC connect).
+    mechanism_list: MechanismList,
 
     /// Core→S2S: deliver a stanza to a remote domain.
     s2s_deliver: S2sDeliver,
@@ -203,6 +212,32 @@ pub const RegisterResult = struct {
     success: bool,
     /// Reason string (empty on success, error description on failure).
     reason: []const u8,
+};
+
+// ============================================================================
+// Mechanism handshake IPC message type
+// ============================================================================
+
+pub const MechanismList = struct {
+    /// Number of mechanisms.
+    count: u8,
+    /// Mechanism IDs (up to 8).
+    mechanisms: [8]MechanismId,
+
+    pub fn init(mechs: []const MechanismId) MechanismList {
+        var ml = MechanismList{
+            .count = @intCast(@min(mechs.len, 8)),
+            .mechanisms = undefined,
+        };
+        for (mechs[0..ml.count], 0..ml.count) |m, i| {
+            ml.mechanisms[i] = m;
+        }
+        return ml;
+    }
+
+    pub fn slice(self: *const MechanismList) []const MechanismId {
+        return self.mechanisms[0..self.count];
+    }
 };
 
 // ============================================================================
@@ -350,6 +385,16 @@ pub fn encode(msg: Message, buf: []u8) !usize {
             buf[pos] = if (r.success) 1 else 0;
             pos += 1;
             pos = try writeField(buf, pos, r.reason);
+        },
+        .mechanism_list => |ml| {
+            buf[pos] = @intFromEnum(Tag.mechanism_list);
+            pos += 1;
+            buf[pos] = ml.count;
+            pos += 1;
+            for (ml.mechanisms[0..ml.count]) |m| {
+                buf[pos] = @intFromEnum(m);
+                pos += 1;
+            }
         },
         .s2s_deliver => |d| {
             buf[pos] = @intFromEnum(Tag.s2s_deliver);
@@ -531,6 +576,20 @@ pub fn decode(payload: []const u8) !Message {
                 .success = success,
                 .reason = reason,
             } };
+        },
+        @intFromEnum(Tag.mechanism_list) => blk: {
+            if (data.len < 1) break :blk error.MessageTooShort;
+            const count = data[0];
+            if (count > 8) break :blk error.InvalidMechanism;
+            if (data.len < 1 + count) break :blk error.MessageTooShort;
+            var ml = MechanismList{
+                .count = count,
+                .mechanisms = undefined,
+            };
+            for (0..count) |i| {
+                ml.mechanisms[i] = std.meta.intToEnum(MechanismId, data[1 + i]) catch break :blk error.InvalidMechanism;
+            }
+            break :blk Message{ .mechanism_list = ml };
         },
         @intFromEnum(Tag.s2s_deliver) => blk: {
             var pos: usize = 0;
@@ -803,9 +862,11 @@ test "multiple frames in sequence" {
 test "MechanismId fromName/toName roundtrip" {
     try std.testing.expectEqual(MechanismId.plain, MechanismId.fromName("PLAIN").?);
     try std.testing.expectEqual(MechanismId.scram_sha_256, MechanismId.fromName("SCRAM-SHA-256").?);
+    try std.testing.expectEqual(MechanismId.oauthbearer, MechanismId.fromName("OAUTHBEARER").?);
     try std.testing.expect(MechanismId.fromName("BOGUS") == null);
     try std.testing.expectEqualStrings("PLAIN", MechanismId.plain.toName());
     try std.testing.expectEqualStrings("SCRAM-SHA-256", MechanismId.scram_sha_256.toName());
+    try std.testing.expectEqualStrings("OAUTHBEARER", MechanismId.oauthbearer.toName());
 }
 
 test "S2sDeliver encode/decode roundtrip" {
@@ -862,4 +923,30 @@ test "S2sDeliveryFailed encode/decode roundtrip" {
     try std.testing.expectEqualStrings("alice@a.example/res", d.from_jid);
     try std.testing.expectEqualStrings("bob@b.example", d.to_jid);
     try std.testing.expectEqualStrings("remote-server-not-found", d.error_type);
+}
+
+test "MechanismList encode/decode roundtrip" {
+    var buf: [1024]u8 = undefined;
+
+    const mechs = [_]MechanismId{ .oauthbearer, .plain };
+    const ml = MechanismList.init(&mechs);
+    const msg = Message{ .mechanism_list = ml };
+
+    const written = try encode(msg, &buf);
+    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const decoded = try decode(frame.payload);
+    const decoded_ml = decoded.mechanism_list;
+    try std.testing.expectEqual(@as(u8, 2), decoded_ml.count);
+    try std.testing.expectEqual(MechanismId.oauthbearer, decoded_ml.mechanisms[0]);
+    try std.testing.expectEqual(MechanismId.plain, decoded_ml.mechanisms[1]);
+}
+
+test "MechanismList init and slice" {
+    const mechs = [_]MechanismId{ .plain, .scram_sha_256 };
+    const ml = MechanismList.init(&mechs);
+    try std.testing.expectEqual(@as(u8, 2), ml.count);
+    const s = ml.slice();
+    try std.testing.expectEqual(@as(usize, 2), s.len);
+    try std.testing.expectEqual(MechanismId.plain, s[0]);
+    try std.testing.expectEqual(MechanismId.scram_sha_256, s[1]);
 }
