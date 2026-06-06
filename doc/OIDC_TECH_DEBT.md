@@ -5,14 +5,14 @@ Each item MUST be addressed before production deployment.
 
 ## Critical (security/correctness)
 
-### 1. ROPC body not URL-encoded
+### ~~1. ROPC body not URL-encoded~~ ✅ FIXED (6082e15)
 **File:** `src/auth/oidc.zig` — `validatePassword()`
 **Impact:** Passwords containing `&`, `=`, `+`, `%`, `@`, spaces, or non-ASCII
 will corrupt the form body, causing auth failures or injection.
 **Fix:** Implement percent-encoding for username and password fields before
 inserting into the form body. Standard RFC 3986 unreserved set.
 
-### 2. No JWKS TTL / periodic refresh
+### ~~2. No JWKS TTL / periodic refresh~~ ✅ FIXED (6082e15)
 **File:** `src/auth/oidc.zig` — `refreshJwks()`
 **Impact:** Key rotation with same kid is invisible. Compromised keys stay
 cached indefinitely. Only a kid-miss triggers refresh.
@@ -29,7 +29,7 @@ base64url-encoded). OpenSSL 3.0 supports this natively.
 
 ## Important (functionality)
 
-### 4. Username extraction — no JID mapping
+### ~~4. Username extraction — no JID mapping~~ ✅ FIXED (6082e15)
 **File:** `src/auth/oidc.zig` — `validateToken()`
 **Impact:** Returns raw `email` claim (`alice@morante.dev`) as username.
 XMPP expects bare localpart (`alice`). Different IdPs use different claims.
@@ -46,7 +46,7 @@ access tokens that require introspection.
 (`POST /introspect` with `token=X&client_id=Y&client_secret=Z`).
 Only if introspection returns `"active": true`, accept the token.
 
-### 6. Response body ownership in refreshJwks
+### ~~6. Response body ownership in refreshJwks~~ ✅ FIXED (6082e15)
 **File:** `src/auth/oidc.zig` — `refreshJwks()`
 **Impact:** Takes ownership of Response.body by not calling deinit(). Relies
 on the assumption that Response only heap-allocates body. Fragile if
