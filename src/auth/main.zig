@@ -205,6 +205,17 @@ pub fn main() !void {
                         if (ipc.accept() catch null) |slot| {
                             const conn = ipc.getClient(slot) orelse continue;
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch break;
+
+                            // Send MechanismList immediately on connect
+                            const mechs = [_]protocol.MechanismId{ .plain, .scram_sha_256 };
+                            const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&mechs) };
+                            conn.queueSend(ml_msg) catch {
+                                ipc.closeClient(slot);
+                                continue;
+                            };
+                            if (conn.hasPendingSend()) {
+                                batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+                            }
                         }
                     } else if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;

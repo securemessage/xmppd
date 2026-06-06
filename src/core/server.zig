@@ -287,6 +287,13 @@ pub const Server = struct {
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
 
+    /// SASL mechanism names received from auth daemon (dynamic advertisement).
+    /// Stored as slices into auth_mechanism_name_buf.
+    auth_mechanisms: [8][]const u8 = .{""} ** 8,
+    auth_mechanism_count: u8 = 0,
+    /// Backing storage for mechanism name strings.
+    auth_mechanism_name_buf: [256]u8 = undefined,
+
     /// Initialize the server.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
@@ -1072,7 +1079,36 @@ pub const Server = struct {
         }
     }
 
+    /// Override sasl_mechanisms in a FeatureSet with the dynamic list from auth daemon.
+    /// If auth hasn't reported yet (count=0), returns features unchanged (falls back to FSM default).
+    fn applyDynamicMechanisms(self: *Server, features: xmpp.stream.FeatureSet) xmpp.stream.FeatureSet {
+        if (self.auth_mechanism_count == 0) return features;
+        if (features.sasl_mechanisms.len == 0) return features;
+        var f = features;
+        f.sasl_mechanisms = self.auth_mechanisms[0..self.auth_mechanism_count];
+        return f;
+    }
+
     fn dispatchAuthResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+        // Handle MechanismList separately (not per-connection)
+        switch (msg) {
+            .mechanism_list => |ml| {
+                self.auth_mechanism_count = 0;
+                var buf_pos: usize = 0;
+                for (ml.slice()) |mech_id| {
+                    const name = mech_id.toName();
+                    if (buf_pos + name.len > self.auth_mechanism_name_buf.len) break;
+                    @memcpy(self.auth_mechanism_name_buf[buf_pos .. buf_pos + name.len], name);
+                    self.auth_mechanisms[self.auth_mechanism_count] = self.auth_mechanism_name_buf[buf_pos .. buf_pos + name.len];
+                    self.auth_mechanism_count += 1;
+                    buf_pos += name.len;
+                }
+                log.info("auth daemon advertises {d} mechanisms", .{self.auth_mechanism_count});
+                return;
+            },
+            else => {},
+        }
+
         const conn_id: usize = switch (msg) {
             .auth_challenge => |m| m.conn_id,
             .auth_success => |m| m.conn_id,
@@ -2424,12 +2460,12 @@ pub const Server = struct {
                 // Immediately send features after stream open
                 if (session.stream.getFeatures()) |features| {
                     var fbs2 = std.io.fixedBufferStream(session.write_scratch[fbs.pos..]);
-                    xmpp.stream.writeFeatures(fbs2.writer(), features) catch return;
+                    xmpp.stream.writeFeatures(fbs2.writer(), self.applyDynamicMechanisms(features)) catch return;
                     session.conn.queueSend(fbs2.getWritten()) catch return;
                 }
             },
             .send_features => |features| {
-                xmpp.stream.writeFeatures(writer, features) catch return;
+                xmpp.stream.writeFeatures(writer, self.applyDynamicMechanisms(features)) catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
             },
             .send_tls_proceed, .start_tls => {
