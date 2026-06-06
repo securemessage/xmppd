@@ -791,6 +791,33 @@ pub fn build(b: *std.Build) void {
 
     const run_config_tests = b.addRunArtifact(config_tests);
 
+    // --- HTTP client module (for OIDC backend) ---
+
+    const http_mod = b.createModule(.{
+        .root_source_file = b.path("lib/http/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http_mod.linkSystemLibrary("ssl", .{});
+    http_mod.linkSystemLibrary("crypto", .{});
+
+    const http_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/http/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http_test_mod.linkSystemLibrary("ssl", .{});
+    http_test_mod.linkSystemLibrary("crypto", .{});
+
+    const http_tests = b.addTest(.{
+        .name = "http-client-tests",
+        .root_module = http_test_mod,
+    });
+
+    const run_http_tests = b.addRunArtifact(http_tests);
+
     // --- Executables ---
 
     // xmppd-core: the connection handler worker
@@ -1091,6 +1118,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_config_tests.step);
+    test_step.dependOn(&run_http_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.
