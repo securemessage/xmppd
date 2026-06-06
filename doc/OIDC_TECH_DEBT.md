@@ -19,7 +19,7 @@ cached indefinitely. Only a kid-miss triggers refresh.
 **Fix:** Track `last_refresh_time`. Refresh if >1h elapsed on any validation.
 Also refresh on signature verification failure (key may have been rotated).
 
-### 3. JWT only supports RS256 — no EdDSA
+### ~~3. JWT only supports RS256 — no EdDSA~~ ✅ FIXED (90d2ed5)
 **File:** `lib/jwt/jwt.zig` — `verifyRs256()`
 **Impact:** Cannot validate Ed25519-signed tokens (Rauthy default, industry
 trend). Had to force Rauthy to RS256 as workaround.
@@ -38,7 +38,7 @@ XMPP expects bare localpart (`alice`). Different IdPs use different claims.
 - `claim_name`: choose which claim to extract from (sub, email, preferred_username)
 - `jid_domain_check`: reject tokens where email domain ≠ XMPP domain
 
-### 5. No token introspection fallback
+### ~~5. No token introspection fallback~~ ✅ FIXED (90d2ed5)
 **File:** `src/auth/oidc.zig` — `validateToken()`
 **Impact:** Opaque (non-JWT) tokens are rejected. Some IdPs issue opaque
 access tokens that require introspection.
