@@ -49,6 +49,9 @@ const JwkKey = struct {
 /// Maximum number of cached JWKS keys.
 const MAX_JWKS_KEYS = 16;
 
+/// JWKS cache max age in seconds (1 hour).
+const JWKS_MAX_AGE_SECONDS: i64 = 3600;
+
 pub const OidcStore = struct {
     config: OidcConfig,
     allocator: Allocator,
@@ -59,6 +62,9 @@ pub const OidcStore = struct {
 
     /// Raw JWKS response body (owns key slice memory).
     jwks_body: ?[]const u8 = null,
+
+    /// Timestamp of last JWKS refresh (Unix seconds).
+    jwks_last_refresh: i64 = 0,
 
     pub fn init(allocator: Allocator, config: OidcConfig) OidcStore {
         return OidcStore{
@@ -115,16 +121,20 @@ pub const OidcStore = struct {
             return null;
         }
 
-        // Extract username from the configured claim
-        const username = if (parsed.claims.preferred_username.len > 0)
+        // Extract username: preferred_username/email (jwt parser tries both) → sub
+        const raw_username = if (parsed.claims.preferred_username.len > 0)
             parsed.claims.preferred_username
         else
             parsed.claims.sub;
 
-        if (username.len == 0) {
+        if (raw_username.len == 0) {
             log.info("OAUTHBEARER: no username in token claims", .{});
             return null;
         }
+
+        // Strip domain from email-style usernames to get JID localpart
+        // e.g., "alice@morante.dev" → "alice"
+        const username = extractLocalpart(raw_username);
 
         log.info("OAUTHBEARER: validated token for '{s}'", .{username});
         return username;
@@ -133,18 +143,22 @@ pub const OidcStore = struct {
     /// Validate a password via ROPC (Resource Owner Password Credentials) grant.
     /// Sends credentials to the IdP token endpoint; returns username on success.
     pub fn validatePassword(self: *OidcStore, allocator: Allocator, username: []const u8, password: []const u8) !?[]const u8 {
-        // Build form-urlencoded body:
-        // grant_type=password&client_id=X&client_secret=Y&username=U&password=P&scope=openid
-        var body_buf: [2048]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, "grant_type=password&client_id={s}&client_secret={s}&username={s}&password={s}&scope=openid", .{
-            self.config.client_id,
-            self.config.client_secret,
-            username,
-            password,
-        }) catch {
-            log.err("ROPC: request body too large", .{});
-            return null;
-        };
+        // Build form-urlencoded body with proper percent-encoding
+        var body_buf: [4096]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&body_buf);
+        const w = fbs.writer();
+
+        w.writeAll("grant_type=password&client_id=") catch return null;
+        percentEncode(w, self.config.client_id) catch return null;
+        w.writeAll("&client_secret=") catch return null;
+        percentEncode(w, self.config.client_secret) catch return null;
+        w.writeAll("&username=") catch return null;
+        percentEncode(w, username) catch return null;
+        w.writeAll("&password=") catch return null;
+        percentEncode(w, password) catch return null;
+        w.writeAll("&scope=openid%20email%20profile") catch return null;
+
+        const body = fbs.getWritten();
 
         var response = http.post(allocator, self.config.token_endpoint, body, self.config.ca_file) catch |err| {
             log.err("ROPC: HTTP request failed: {}", .{err});
@@ -158,7 +172,6 @@ pub const OidcStore = struct {
         }
 
         // Success — the IdP authenticated the user. Return the username as-is.
-        // We trust the IdP's response; no need to parse the access_token for PLAIN auth.
         log.info("ROPC: password validated for '{s}'", .{username});
         return username;
     }
@@ -170,16 +183,28 @@ pub const OidcStore = struct {
     // JWKS key management
     // ========================================================================
 
-    /// Get signing key by kid, refreshing JWKS if necessary.
+    /// Get signing key by kid, refreshing JWKS if cache is stale or kid not found.
     fn getSigningKey(self: *OidcStore, kid: []const u8) ?*const JwkKey {
-        // Try cached keys first
+        const now = std.time.timestamp();
+        const cache_stale = (now - self.jwks_last_refresh) > JWKS_MAX_AGE_SECONDS;
+
+        // If cache is stale, refresh before lookup
+        if (cache_stale) {
+            self.refreshJwks() catch {
+                log.err("JWKS stale refresh failed", .{});
+            };
+        }
+
+        // Try cached keys
         if (self.findKeyDirect(kid)) |k| return k;
 
-        // Refresh and try again
-        self.refreshJwks() catch {
-            log.err("JWKS refresh failed", .{});
-            return null;
-        };
+        // Kid not found — refresh and retry (may be newly rotated key)
+        if (!cache_stale) {
+            self.refreshJwks() catch {
+                log.err("JWKS kid-miss refresh failed", .{});
+                return null;
+            };
+        }
 
         return self.findKeyDirect(kid);
     }
@@ -196,27 +221,27 @@ pub const OidcStore = struct {
     fn refreshJwks(self: *OidcStore) !void {
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
-        const response = http.get(self.allocator, self.config.jwks_uri, self.config.ca_file) catch |err| {
+        var response = http.get(self.allocator, self.config.jwks_uri, self.config.ca_file) catch |err| {
             log.err("JWKS fetch failed: {}", .{err});
             return error.OutOfMemory;
         };
+        defer response.deinit();
 
         if (response.status != 200) {
             log.err("JWKS endpoint returned {d}", .{response.status});
-            self.allocator.free(response.body);
             return error.OutOfMemory;
         }
 
-        // Replace old JWKS body — take ownership of response body
+        // Copy response body into our own allocation (response.deinit frees its copy)
+        const body_copy = self.allocator.alloc(u8, response.body.len) catch return error.OutOfMemory;
+        @memcpy(body_copy, response.body);
+
+        // Replace old JWKS body
         if (self.jwks_body) |old| {
             self.allocator.free(old);
         }
-        // Take ownership: copy the slice descriptor, then free via our own deinit
-        self.jwks_body = response.body;
-        // Leak the body out of Response by zeroing its reference before deinit would free it.
-        // Response.body is a const slice — we need to avoid double-free.
-        // Since we took the pointer, just don't call response.deinit().
-        // The response struct itself is stack-allocated, no heap to free beyond body.
+        self.jwks_body = body_copy;
+        self.jwks_last_refresh = std.time.timestamp();
 
         // Parse keys from JWKS JSON
         self.key_count = 0;
@@ -317,6 +342,47 @@ fn extractNamedField(data: []const u8, key: []const u8) ?[]const u8 {
 }
 
 // ============================================================================
+// URL Encoding
+// ============================================================================
+
+/// RFC 3986 percent-encoding for form-urlencoded values.
+/// Writes encoded bytes to the writer. Unreserved chars pass through.
+fn percentEncode(writer: anytype, input: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (input) |ch| {
+        if (isUnreserved(ch)) {
+            try writer.writeByte(ch);
+        } else {
+            try writer.writeByte('%');
+            try writer.writeByte(hex[ch >> 4]);
+            try writer.writeByte(hex[ch & 0x0F]);
+        }
+    }
+}
+
+/// RFC 3986 unreserved characters (pass through without encoding).
+fn isUnreserved(ch: u8) bool {
+    return switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => true,
+        else => false,
+    };
+}
+
+// ============================================================================
+// Username / JID Extraction
+// ============================================================================
+
+/// Extract the localpart from an email-style identifier.
+/// "alice@morante.dev" → "alice"
+/// "alice" → "alice" (no @, returned as-is)
+fn extractLocalpart(input: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, input, '@')) |at_pos| {
+        return input[0..at_pos];
+    }
+    return input;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -362,4 +428,37 @@ test "extractNamedField: basic" {
 test "extractNamedField: missing field" {
     const data = "{\"kid\":\"k1\",\"n\":\"modulus\"}";
     try std.testing.expect(extractNamedField(data, "\"e\"") == null);
+}
+
+test "percentEncode: unreserved chars pass through" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try percentEncode(fbs.writer(), "alice");
+    try std.testing.expectEqualStrings("alice", fbs.getWritten());
+}
+
+test "percentEncode: special chars encoded" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try percentEncode(fbs.writer(), "p@ss w0rd!");
+    try std.testing.expectEqualStrings("p%40ss%20w0rd%21", fbs.getWritten());
+}
+
+test "percentEncode: all reserved form chars" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try percentEncode(fbs.writer(), "&=+%");
+    try std.testing.expectEqualStrings("%26%3D%2B%25", fbs.getWritten());
+}
+
+test "extractLocalpart: email" {
+    try std.testing.expectEqualStrings("alice", extractLocalpart("alice@morante.dev"));
+}
+
+test "extractLocalpart: bare username" {
+    try std.testing.expectEqualStrings("alice", extractLocalpart("alice"));
+}
+
+test "extractLocalpart: empty" {
+    try std.testing.expectEqualStrings("", extractLocalpart(""));
 }
