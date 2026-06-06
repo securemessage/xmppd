@@ -50,6 +50,7 @@ pub fn main() !void {
     var auth_path: []const u8 = "xmppd-auth";
     var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
     var db_path: []const u8 = "/var/db/xmppd/users.db";
+    var config_path: ?[]const u8 = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -95,6 +96,11 @@ pub fn main() !void {
                 log.err("--db requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            config_path = args.next() orelse {
+                log.err("--config requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -122,9 +128,40 @@ pub fn main() !void {
         };
     }
 
+    // Build child argv: pass --config, --db, --socket to auth and core children
+    var auth_args_buf: [6][]const u8 = undefined;
+    var auth_argc: usize = 0;
+    if (config_path) |cp| {
+        auth_args_buf[auth_argc] = "--config";
+        auth_argc += 1;
+        auth_args_buf[auth_argc] = cp;
+        auth_argc += 1;
+    }
+    auth_args_buf[auth_argc] = "--db";
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = db_path;
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = "--socket";
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = auth_socket;
+    auth_argc += 1;
+
+    var core_args_buf: [6][]const u8 = undefined;
+    var core_argc: usize = 0;
+    if (config_path) |cp| {
+        core_args_buf[core_argc] = "--config";
+        core_argc += 1;
+        core_args_buf[core_argc] = cp;
+        core_argc += 1;
+    }
+    core_args_buf[core_argc] = "--auth-socket";
+    core_argc += 1;
+    core_args_buf[core_argc] = auth_socket;
+    core_argc += 1;
+
     // Initialize supervisors for both children
-    var auth_sup = Supervisor.init(auth_path, &.{});
-    var core_sup = Supervisor.init(core_path, &.{});
+    var auth_sup = Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
+    var core_sup = Supervisor.init(core_path, core_args_buf[0..core_argc]);
 
     log.info("config: auth_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
@@ -240,6 +277,7 @@ fn printUsage() void {
         \\  --auth-path PATH   Path to xmppd-auth binary (default: xmppd-auth)
         \\  --auth-socket PATH IPC socket path (default: /var/run/xmppd/auth.sock)
         \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
+        \\  --config PATH, -c  Config file path (passed to children)
         \\  --help, -h         Show this help
         \\
     ;

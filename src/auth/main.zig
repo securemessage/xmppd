@@ -61,10 +61,17 @@ pub fn main() !void {
     var rate_policy = RatePolicy{};
     var reg_config = RegistrationConfig{};
 
+    var config_path: ?[]const u8 = null;
+
     _ = args.next(); // Skip argv[0]
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--db")) {
+        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            config_path = args.next() orelse {
+                log.err("--config requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--db")) {
             db_path = args.next() orelse {
                 log.err("--db requires a value", .{});
                 return error.InvalidArgs;
@@ -118,6 +125,9 @@ pub fn main() !void {
         return error.InvalidArgs;
     };
 
+    if (config_path) |cp| {
+        log.info("config file: {s}", .{cp});
+    }
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
     log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
         rate_policy.max_per_account,

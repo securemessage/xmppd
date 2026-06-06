@@ -71,6 +71,8 @@ pub const Supervisor = struct {
     /// Returns the child PID on success. The `exe_path` must be a
     /// null-terminated string ([:0]const u8) or will be copied to
     /// a stack buffer with null termination.
+    ///
+    /// The child receives argv[0] = exe_path, followed by self.args.
     pub fn spawnChild(self: *Supervisor) !posix.pid_t {
         const pid = try posix.fork();
 
@@ -82,11 +84,26 @@ pub const Supervisor = struct {
             @memcpy(path_buf[0..self.exe_path.len], self.exe_path);
             path_buf[self.exe_path.len] = 0;
 
-            const argv = [_:null]?[*:0]const u8{null};
+            // Build argv: [exe_path, args..., null]
+            // Max 16 args (more than enough for xmppd daemons)
+            var argv_buf: [18:null]?[*:0]const u8 = .{null} ** 18;
+            argv_buf[0] = @ptrCast(&path_buf);
+
+            var arg_bufs: [16][1024]u8 = undefined;
+            const max_args = @min(self.args.len, 16);
+            for (0..max_args) |i| {
+                const arg = self.args[i];
+                if (arg.len >= arg_bufs[i].len) std.c._exit(126);
+                @memcpy(arg_bufs[i][0..arg.len], arg);
+                arg_bufs[i][arg.len] = 0;
+                argv_buf[1 + i] = @ptrCast(&arg_bufs[i]);
+            }
+            argv_buf[1 + max_args] = null;
+
             const envp = [_:null]?[*:0]const u8{null};
             _ = std.c.execve(
                 @ptrCast(&path_buf),
-                &argv,
+                &argv_buf,
                 &envp,
             );
             // execve only returns on failure
