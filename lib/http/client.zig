@@ -113,6 +113,7 @@ fn request(
 
     w.print("{s} {s} HTTP/1.1\r\n", .{ method, parsed.path }) catch return HttpError.OutOfMemory;
     w.print("Host: {s}\r\n", .{parsed.host_header}) catch return HttpError.OutOfMemory;
+    w.writeAll("User-Agent: xmppd/0.1\r\n") catch return HttpError.OutOfMemory;
     w.writeAll("Connection: close\r\n") catch return HttpError.OutOfMemory;
 
     if (body) |b| {

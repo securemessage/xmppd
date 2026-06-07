@@ -39,6 +39,8 @@ pub const OidcConfig = struct {
     ca_file: ?[]const u8 = null,
     /// Claim to extract username from (default: preferred_username, fallback: email).
     username_claim: []const u8 = "preferred_username",
+    /// Domain to append to bare usernames for ROPC (e.g., "morante.dev" → alice@morante.dev).
+    user_domain: ?[]const u8 = null,
 };
 
 /// Cached JWK key (supports RSA and EdDSA/OKP).
@@ -165,7 +167,14 @@ pub const OidcStore = struct {
         w.writeAll("&client_secret=") catch return null;
         percentEncode(w, self.config.client_secret) catch return null;
         w.writeAll("&username=") catch return null;
-        percentEncode(w, username) catch return null;
+        // Append @domain if configured and username is bare (no @)
+        if (self.config.user_domain != null and std.mem.indexOfScalar(u8, username, '@') == null) {
+            percentEncode(w, username) catch return null;
+            w.writeAll("%40") catch return null;
+            percentEncode(w, self.config.user_domain.?) catch return null;
+        } else {
+            percentEncode(w, username) catch return null;
+        }
         w.writeAll("&password=") catch return null;
         percentEncode(w, password) catch return null;
         w.writeAll("&scope=openid%20email%20profile") catch return null;

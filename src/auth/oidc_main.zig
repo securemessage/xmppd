@@ -100,6 +100,7 @@ pub fn main() !void {
     };
     const ca_file = cfg.get("oidc", "ca_file");
     const introspection_endpoint = cfg.get("oidc", "introspection_endpoint");
+    const user_domain = cfg.get("oidc", "user_domain");
 
     // Override socket path from config if present
     if (cfg.get("oidc", "socket")) |s| {
@@ -111,6 +112,7 @@ pub fn main() !void {
     log.info("  client_id: {s}", .{client_id});
     log.info("  token_endpoint: {s}", .{token_endpoint});
     log.info("  jwks_uri: {s}", .{jwks_uri});
+    if (user_domain) |d| log.info("  user_domain: {s}", .{d});
     log.info("  socket: {s}", .{socket_path});
 
     // Initialize OIDC store
@@ -122,6 +124,7 @@ pub fn main() !void {
         .jwks_uri = jwks_uri,
         .introspection_endpoint = introspection_endpoint,
         .ca_file = ca_file,
+        .user_domain = user_domain,
     });
     defer oidc_store.deinit();
 
