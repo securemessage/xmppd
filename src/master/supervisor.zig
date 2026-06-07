@@ -113,6 +113,10 @@ pub const Supervisor = struct {
             }
             argv_buf[1 + max_args] = null;
 
+            // Reset signal mask — children must not inherit parent's blocked signals
+            var empty_mask = posix.sigemptyset();
+            posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
+
             // Drop privileges before exec if configured
             if (self.gid != 0) {
                 const ret_g = std.c.setgid(self.gid);
