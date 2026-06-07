@@ -570,10 +570,13 @@ fn handleJoin(
         return;
     }
 
-    // Nickname conflict check
-    if (r.findByNick(nick) != null) {
-        sendPresenceError(server, session, room_local, muc_host, "conflict", changes);
-        return;
+    // Nickname conflict check — allow same bare JID to share nick (XEP-0045 §7.2.14 multi-session)
+    if (r.findByNick(nick)) |existing_idx| {
+        const existing = r.occupants[existing_idx].?;
+        if (!std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
+            sendPresenceError(server, session, room_local, muc_host, "conflict", changes);
+            return;
+        }
     }
 
     // Determine affiliation and role
