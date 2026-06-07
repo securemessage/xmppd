@@ -27,6 +27,9 @@ user = jabber
 # automatically by the master supervisor.
 db_path = /var/db/xmppd
 
+# Log file path (used when running with --background)
+# log_file = /var/log/xmppd/xmppd.log
+
 # PID file
 # pidfile = /var/run/xmppd/xmppd.pid
 

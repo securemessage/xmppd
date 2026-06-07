@@ -34,10 +34,12 @@ pub fn main() !void {
     defer args.deinit();
 
     var db_path: []const u8 = "/var/db/xmppd";
+    var cli_password: ?[]const u8 = null;
+    var password_file: ?[]const u8 = null;
 
     _ = args.next(); // Skip argv[0]
 
-    // Check for --db option first
+    // Check for global options first
     var remaining_args: std.ArrayListUnmanaged([]const u8) = .{};
     defer remaining_args.deinit(allocator);
 
@@ -45,6 +47,16 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--db")) {
             db_path = args.next() orelse {
                 printErr("--db requires a value\n");
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--password")) {
+            cli_password = args.next() orelse {
+                printErr("--password requires a value\n");
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--password-file")) {
+            password_file = args.next() orelse {
+                printErr("--password-file requires a value\n");
                 return error.InvalidArgs;
             };
         } else {
@@ -81,21 +93,44 @@ pub fn main() !void {
         const jid = remaining_args.items[1];
         const username = extractLocal(jid);
 
-        // Read password from stdin (buffers in caller's frame to avoid dangling refs)
+        // Resolve password: --password > --password-file > interactive prompt
         var pass_buf: [256]u8 = undefined;
-        const password = try readPassword("Password: ", &pass_buf);
-        if (password.len < 1) {
-            printErr("password cannot be empty\n");
-            return error.InvalidArgs;
-        }
-
-        // Confirm
-        var confirm_buf: [256]u8 = undefined;
-        const confirm = try readPassword("Confirm password: ", &confirm_buf);
-        if (!std.mem.eql(u8, password, confirm)) {
-            printErr("passwords do not match\n");
-            return error.InvalidArgs;
-        }
+        var file_buf: [256]u8 = undefined;
+        const password = blk: {
+            if (cli_password) |p| {
+                break :blk p;
+            } else if (password_file) |pf| {
+                const f = std.fs.cwd().openFile(pf, .{}) catch {
+                    printErr("cannot open password file\n");
+                    return error.InvalidArgs;
+                };
+                defer f.close();
+                const n = f.read(&file_buf) catch {
+                    printErr("cannot read password file\n");
+                    return error.InvalidArgs;
+                };
+                const content = std.mem.trimRight(u8, file_buf[0..n], "\r\n");
+                if (content.len == 0) {
+                    printErr("password file is empty\n");
+                    return error.InvalidArgs;
+                }
+                break :blk content;
+            } else {
+                const p = readPassword("Password: ", &pass_buf) catch return error.InvalidArgs;
+                if (p.len < 1) {
+                    printErr("password cannot be empty\n");
+                    return error.InvalidArgs;
+                }
+                // Confirm
+                var confirm_buf: [256]u8 = undefined;
+                const confirm = readPassword("Confirm password: ", &confirm_buf) catch return error.InvalidArgs;
+                if (!std.mem.eql(u8, p, confirm)) {
+                    printErr("passwords do not match\n");
+                    return error.InvalidArgs;
+                }
+                break :blk p;
+            }
+        };
 
         store.addUser(allocator, username, password) catch |err| {
             switch (err) {
@@ -160,7 +195,10 @@ pub fn main() !void {
         signalAuthDaemon();
     } else if (std.mem.eql(u8, command, "listusers")) {
         const users = try store.listUsers(allocator);
-        defer allocator.free(users);
+        defer {
+            for (users) |u| allocator.free(u);
+            allocator.free(users);
+        }
 
         if (users.len == 0) {
             printOut("No users.\n");
@@ -372,7 +410,9 @@ fn printUsage() void {
         \\  invite revoke   Revoke an invitation code
         \\
         \\Options:
-        \\  --db PATH       Storage directory (default: /var/db/xmppd)
+        \\  --db PATH           Storage directory (default: /var/db/xmppd)
+        \\  --password PASS     Provide password on command line (non-interactive)
+        \\  --password-file F   Read password from file (first line, trailing newline stripped)
         \\
     );
 }

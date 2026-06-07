@@ -149,7 +149,11 @@ pub const LmdbBackend = struct {
         pub fn next(self: *Iterator) ?backend.Entry {
             const key = if (!self.started) blk: {
                 self.started = true;
-                break :blk self.cursor.seek(self.prefix[0..self.prefix_len]) catch return null;
+                if (self.prefix_len == 0) {
+                    break :blk self.cursor.goToFirst() catch return null;
+                } else {
+                    break :blk self.cursor.seek(self.prefix[0..self.prefix_len]) catch return null;
+                }
             } else blk: {
                 break :blk self.cursor.goToNext() catch return null;
             };

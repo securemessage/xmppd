@@ -53,6 +53,7 @@ pub fn main() !void {
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
+    var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
     var daemonize: bool = false;
 
     // Skip argv[0]
@@ -104,6 +105,11 @@ pub fn main() !void {
                 log.err("--config requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--log-file")) {
+            log_file = args.next() orelse {
+                log.err("--log-file requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--background") or std.mem.eql(u8, arg, "-b")) {
             daemonize = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -135,6 +141,9 @@ pub fn main() !void {
         }
         if (run_user == null) {
             if (c.get("server", "user")) |v| run_user = v;
+        }
+        if (std.mem.eql(u8, log_file, "/var/log/xmppd/xmppd.log")) {
+            if (c.get("server", "log_file")) |v| log_file = v;
         }
 
         // [tls] section
@@ -190,13 +199,28 @@ pub fn main() !void {
         }
         // Child: become session leader, detach from terminal
         _ = std.c.setsid();
-        // Close stdin/stdout/stderr → /dev/null
+
+        // Open log file for stderr (append mode) — all children inherit this fd
+        const log_fd = blk: {
+            break :blk std.fs.cwd().openFile(log_file, .{ .mode = .write_only }) catch {
+                // Try to create it
+                break :blk std.fs.cwd().createFile(log_file, .{ .truncate = false }) catch {
+                    // Last resort: /dev/null
+                    break :blk std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write }) catch
+                        return error.DaemonizeFailed;
+                };
+            };
+        };
+        // Seek to end for append behavior
+        log_fd.seekFromEnd(0) catch {};
+
         const devnull = std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write }) catch
             return error.DaemonizeFailed;
         posix.dup2(devnull.handle, 0) catch {};
         posix.dup2(devnull.handle, 1) catch {};
-        posix.dup2(devnull.handle, 2) catch {};
+        posix.dup2(log_fd.handle, 2) catch {};
         if (devnull.handle > 2) devnull.close();
+        if (log_fd.handle > 2) log_fd.close();
     }
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
@@ -467,6 +491,7 @@ fn printUsage() void {
         \\  --auth-socket PATH IPC socket path (default: /var/run/xmppd/auth.sock)
         \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
         \\  --config PATH, -c  Config file path (passed to children)
+        \\  --log-file PATH    Log file path (default: /var/log/xmppd/xmppd.log)
         \\  --background, -b   Daemonize (fork, detach from terminal)
         \\  --help, -h         Show this help
         \\
