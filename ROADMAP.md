@@ -465,7 +465,8 @@ avatar via standard XEPs; the server handles sourcing transparently.
 2. **External auth (OIDC)** — on first login, fetch `picture` claim from IdP
    userinfo. Cache locally. Only used if no client-set avatar exists.
 3. **Gravatar** — hash user's email (MD5 per Gravatar spec), fetch from
-   `gravatar.com/avatar/{hash}`. Zero-config default when nothing else exists.
+   `gravatar.com/avatar/{hash}`. Enabled by default, toggle via
+   `[avatar] gravatar = true|false` in xmppd.conf.
 
 **XEPs:**
 
