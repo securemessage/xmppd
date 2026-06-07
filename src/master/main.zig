@@ -295,7 +295,7 @@ pub fn main() !void {
     auth_args_buf[auth_argc] = auth_socket;
     auth_argc += 1;
 
-    var core_args_buf: [6][]const u8 = undefined;
+    var core_args_buf: [10][]const u8 = undefined;
     var core_argc: usize = 0;
     if (config_path) |cp| {
         core_args_buf[core_argc] = "--config";
@@ -307,6 +307,18 @@ pub fn main() !void {
     core_argc += 1;
     core_args_buf[core_argc] = auth_socket;
     core_argc += 1;
+    if (cert_path) |cp| {
+        core_args_buf[core_argc] = "--cert";
+        core_argc += 1;
+        core_args_buf[core_argc] = cp;
+        core_argc += 1;
+    }
+    if (key_path) |kp| {
+        core_args_buf[core_argc] = "--key";
+        core_argc += 1;
+        core_args_buf[core_argc] = kp;
+        core_argc += 1;
+    }
 
     // Initialize supervisors for both children
     var auth_sup = if (child_uid != 0)
