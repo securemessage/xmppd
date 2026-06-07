@@ -149,6 +149,8 @@ pub const Stream = struct {
     bound_jid: ?Jid = null,
     /// Stream ID (generated per stream)
     stream_id: [16]u8 = undefined,
+    /// Hex-encoded stream ID (persisted for pointer stability)
+    stream_id_hex: [32]u8 = undefined,
 
     pub fn init(server_host: []const u8, direct_tls: bool) Stream {
         var s = Stream{
@@ -156,6 +158,7 @@ pub const Stream = struct {
             .tls_active = direct_tls,
         };
         std.crypto.random.bytes(&s.stream_id);
+        s.stream_id_hex = std.fmt.bytesToHex(s.stream_id, .lower);
         // If already on TLS, skip the TLS negotiation phase
         if (direct_tls) {
             s.state = .awaiting_stream_open;
@@ -173,8 +176,6 @@ pub const Stream = struct {
             return .{ .send_error = .host_unknown };
         }
 
-        const stream_id_hex = std.fmt.bytesToHex(self.stream_id, .lower);
-
         switch (self.state) {
             .awaiting_stream_open => {
                 if (self.tls_active) {
@@ -186,7 +187,7 @@ pub const Stream = struct {
                 return .{ .send_stream_open = .{
                     .from = self.server_host,
                     .to = to,
-                    .id = &stream_id_hex,
+                    .id = &self.stream_id_hex,
                 } };
             },
             .awaiting_stream_open_tls => {
@@ -194,7 +195,7 @@ pub const Stream = struct {
                 return .{ .send_stream_open = .{
                     .from = self.server_host,
                     .to = to,
-                    .id = &stream_id_hex,
+                    .id = &self.stream_id_hex,
                 } };
             },
             .awaiting_stream_open_authenticated => {
@@ -202,7 +203,7 @@ pub const Stream = struct {
                 return .{ .send_stream_open = .{
                     .from = self.server_host,
                     .to = to,
-                    .id = &stream_id_hex,
+                    .id = &self.stream_id_hex,
                 } };
             },
             else => {
