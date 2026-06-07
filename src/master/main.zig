@@ -53,6 +53,7 @@ pub fn main() !void {
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
+    var daemonize: bool = false;
 
     // Skip argv[0]
     _ = args.next();
@@ -103,6 +104,8 @@ pub fn main() !void {
                 log.err("--config requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--background") or std.mem.eql(u8, arg, "-b")) {
+            daemonize = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -176,6 +179,24 @@ pub fn main() !void {
         } else {
             log.err("user name too long: {s}", .{username});
         }
+    }
+
+    // --- Daemonize if requested ---
+    if (daemonize) {
+        const fork_pid = try posix.fork();
+        if (fork_pid != 0) {
+            // Parent exits immediately — child continues as daemon
+            std.c._exit(0);
+        }
+        // Child: become session leader, detach from terminal
+        _ = std.c.setsid();
+        // Close stdin/stdout/stderr → /dev/null
+        const devnull = std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write }) catch
+            return error.DaemonizeFailed;
+        posix.dup2(devnull.handle, 0) catch {};
+        posix.dup2(devnull.handle, 1) catch {};
+        posix.dup2(devnull.handle, 2) catch {};
+        if (devnull.handle > 2) devnull.close();
     }
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
@@ -446,6 +467,7 @@ fn printUsage() void {
         \\  --auth-socket PATH IPC socket path (default: /var/run/xmppd/auth.sock)
         \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
         \\  --config PATH, -c  Config file path (passed to children)
+        \\  --background, -b   Daemonize (fork, detach from terminal)
         \\  --help, -h         Show this help
         \\
     ;
