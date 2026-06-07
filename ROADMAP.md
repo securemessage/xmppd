@@ -353,10 +353,12 @@ Design document: `~/.windsurf/plans/xmppd-phase11-external-auth-4f6f38.md`
 - **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
 - **PAM** — system-level auth integration
 
-## Phase 12 — Polish & Deploy (In Progress)
+## Phase 12 — Polish & Deploy (MVP Complete)
 
 Production readiness. The "Giant Thread" problem (event loop starvation
-during MUC fan-out) was solved as part of this phase.
+during MUC fan-out) was solved as part of this phase. FreeBSD port
+created, jail tested, privilege separation implemented, process lifecycle
+hardened. Tagged `v0.1.0`.
 
 ### Fan-out Scalability (Done)
 
@@ -372,24 +374,40 @@ during MUC fan-out) was solved as part of this phase.
 - [x] Sensible defaults (works out of the box without config for dev mode)
 - [x] `config/xmppd.conf.sample` with all sections documented
 
-### Deployment (Partial)
+### Deployment (Done)
 
-- [x] FreeBSD RC script (`etc/rc.d/xmppd`)
-- [ ] FreeBSD port (Makefile, pkg-plist, pkg-descr) — lives in deluxe ports tree
-- [ ] Jail installation and end-to-end testing
+- [x] FreeBSD RC script (`etc/rc.d/xmppd`) — no daemon(8), master self-daemonizes
+- [x] FreeBSD port (`net-im/xmppd` in deluxe ports tree) — builds all 6 binaries
+- [x] Jail installation and end-to-end testing (xmppd jail on freebsd-dev1)
+- [x] `v0.1.0` tagged and pushed to all 3 remotes
 
-### Privilege Separation
+### Privilege Separation (Done)
 
+- [x] `user` config option in `[server]` section — children drop to unprivileged user
+- [x] Master resolves user via `getpwnam()`, passes uid/gid to Supervisor
+- [x] `Supervisor.initWithUser()` — `setgid()`/`setuid()` in child fork before `execve()`
+- [x] Signal mask reset in child fork — children don't inherit parent's blocked signals
+
+### Process Lifecycle (Done)
+
+- [x] Self-daemonizing master (`--background`/`-b`) — `fork()` + `setsid()` + stdio → `/dev/null`
+- [x] Single-instance via PID file `flock(LOCK_EX|LOCK_NB)` — refuses to start if locked
+- [x] Child PID files (`auth.pid`, `core.pid`) written after spawn
+- [x] Orphan cleanup on startup — SIGTERM → 2s grace → SIGKILL for stale children
+- [x] Clean PID file removal on graceful shutdown
+
+### Remaining (Deferred to V1)
+
+- [ ] S2S supervisor wiring — xmppd-s2s not yet spawned by master (needs `[s2s]` config plumbing, ~50 LOC)
 - [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
-- [ ] Per-daemon UID (xmppd-core, xmppd-auth, xmppd-s2s as separate users)
 
-### Standards
+### Standards (Post-MVP)
 
 - [ ] XEP-0198: Stream Management (mobile reconnection)
 - [ ] XEP-0280: Message Carbons (multi-device)
 - [ ] XEP-0363: HTTP File Upload (media sharing)
 
-### Documentation
+### Documentation (Post-MVP)
 
 - [ ] `doc/ARCHITECTURE.md` — multi-process design, IPC protocol
 - [ ] `doc/CONFIGURATION.md` — all config options
@@ -397,13 +415,13 @@ during MUC fan-out) was solved as part of this phase.
 - [ ] `doc/FEDERATION.md` — S2S setup, DANE, dialback
 - [ ] Man pages for all binaries
 
-### Testing
+### Testing (Post-MVP)
 
 - [ ] XMPP Compliance Suite verification
 - [ ] Performance benchmarks (connections/sec, message throughput)
 - [ ] Fuzz testing on XML parser
 
-### Account Privacy
+### Account Privacy (Post-MVP)
 
 - [ ] JID enumeration protection
 - [ ] Presence leak prevention
@@ -414,6 +432,17 @@ during MUC fan-out) was solved as part of this phase.
 
 Multi-threaded xmppd-core for horizontal scaling across CPU cores.
 Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
+
+### Pre-requisites (from Phase 12 deferred)
+
+- [ ] S2S supervisor wiring — master spawns xmppd-s2s as third child process
+  - xmppd-s2s reads `--config` (add config file support like auth/core)
+  - Master reads `[s2s]` section: socket, port, cert, key
+  - Master passes args to S2S child, writes `s2s.pid`, handles restart/cleanup
+  - ~50 LOC in master + config plumbing in xmppd-s2s
+- [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
+
+### Thread-Per-Core
 
 - [ ] SO_REUSEPORT thread-per-core event loops (kernel-level connection distribution)
 - [ ] Lock-free cross-thread delivery (MPSC queues + EVFILT_USER + coalesced signaling)
