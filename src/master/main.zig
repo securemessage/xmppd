@@ -180,6 +180,41 @@ pub fn main() !void {
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
 
+    // --- Single-instance enforcement via PID file lock ---
+    const pidfile_path = "/var/run/xmppd/xmppd.pid";
+    const pidfile = std.fs.cwd().openFile(pidfile_path, .{ .mode = .read_write }) catch blk: {
+        break :blk std.fs.cwd().createFile(pidfile_path, .{ .read = true }) catch |err| {
+            log.err("cannot open/create PID file {s}: {}", .{ pidfile_path, err });
+            return error.PidFileFailed;
+        };
+    };
+    defer pidfile.close();
+
+    // Non-blocking exclusive lock — fails immediately if another master holds it
+    {
+        const LOCK_EX = 0x02;
+        const LOCK_NB = 0x04;
+        const ret = std.c.flock(pidfile.handle, LOCK_EX | LOCK_NB);
+        if (ret != 0) {
+            log.err("another xmppd master is already running (PID file locked)", .{});
+            return error.AlreadyRunning;
+        }
+    }
+
+    // Write our PID
+    {
+        var pid_buf: [20]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&pid_buf, "{d}\n", .{std.c.getpid()}) catch unreachable;
+        pidfile.seekTo(0) catch {};
+        pidfile.writeAll(pid_str) catch {};
+        pidfile.setEndPos(pid_str.len) catch {};
+    }
+
+    // --- Orphan child cleanup ---
+    // Kill any stale children from a previous master that died ungracefully
+    cleanupOrphan("/var/run/xmppd/auth.pid");
+    cleanupOrphan("/var/run/xmppd/core.pid");
+
     // Ensure storage sub-directories exist
     const sub_dirs = [_][]const u8{ "auth", "op", "archive" };
     for (sub_dirs) |sub| {
@@ -257,6 +292,7 @@ pub fn main() !void {
     // Spawn xmppd-auth first (must be ready before core connects)
     const auth_pid = try auth_sup.spawnChild();
     try loop.addProcess(auth_pid);
+    writeChildPid("/var/run/xmppd/auth.pid", auth_pid);
     log.info("auth daemon started, waiting for socket", .{});
 
     // Brief delay for auth daemon to bind its socket
@@ -265,6 +301,7 @@ pub fn main() !void {
     // Spawn xmppd-core
     const core_pid = try core_sup.spawnChild();
     try loop.addProcess(core_pid);
+    writeChildPid("/var/run/xmppd/core.pid", core_pid);
 
     // Timer idents for restart backoff
     const AUTH_UDATA: usize = 1;
@@ -336,7 +373,63 @@ pub fn main() !void {
         }
     }
 
+    // Clean up child PID files on graceful shutdown
+    removeChildPid("/var/run/xmppd/auth.pid");
+    removeChildPid("/var/run/xmppd/core.pid");
+
     log.info("xmppd master shutdown complete", .{});
+}
+
+/// Write a child PID to a file for orphan detection on restart.
+fn writeChildPid(path: []const u8, pid: posix.pid_t) void {
+    const file = std.fs.cwd().createFile(path, .{}) catch return;
+    defer file.close();
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}\n", .{pid}) catch return;
+    file.writeAll(s) catch {};
+}
+
+/// Remove a child PID file (called during clean shutdown).
+fn removeChildPid(path: []const u8) void {
+    std.fs.cwd().deleteFile(path) catch {};
+}
+
+/// Check for an orphaned child process from a previous master instance.
+/// If the PID file exists and the process is still alive, terminate it.
+fn cleanupOrphan(path: []const u8) void {
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+
+    var buf: [20]u8 = undefined;
+    const n = posix.read(file.handle, &buf) catch return;
+    if (n == 0) return;
+
+    const trimmed = std.mem.trimRight(u8, buf[0..n], "\n \t\r");
+    const pid = std.fmt.parseInt(posix.pid_t, trimmed, 10) catch return;
+    if (pid <= 1) return;
+
+    // Check if process exists
+    const ret = std.c.kill(pid, 0);
+    if (ret != 0) {
+        // Process doesn't exist — clean up stale PID file
+        std.fs.cwd().deleteFile(path) catch {};
+        return;
+    }
+
+    // Process exists — send SIGTERM, wait briefly, then SIGKILL
+    log.warn("killing orphaned child pid={d} from {s}", .{ pid, path });
+    _ = std.c.kill(pid, posix.SIG.TERM);
+    std.Thread.sleep(2 * std.time.ns_per_s);
+
+    // Check again
+    const ret2 = std.c.kill(pid, 0);
+    if (ret2 == 0) {
+        log.warn("orphan pid={d} did not exit, sending SIGKILL", .{pid});
+        _ = std.c.kill(pid, posix.SIG.KILL);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    std.fs.cwd().deleteFile(path) catch {};
 }
 
 fn printUsage() void {
