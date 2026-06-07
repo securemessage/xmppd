@@ -964,7 +964,9 @@ fn sendMessageError(
 fn buildRoomJid(buf: *[320]u8, local: []const u8, host: []const u8) ?[]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
-    w.writeAll(local) catch return null;
+    for (local) |c| {
+        w.writeByte(std.ascii.toLower(c)) catch return null;
+    }
     w.writeByte('@') catch return null;
     w.writeAll(host) catch return null;
     return fbs.getWritten();

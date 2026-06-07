@@ -110,10 +110,15 @@ Validate the server against real XMPP clients before adding features.
 - [x] Profanity (terminal client, FreeBSD native — 14/14 tests)
 - [x] Gajim (desktop, GTK — connected via Windows, full session)
 - [x] Dino (desktop, GTK — connected via FreeBSD, full session)
-- [ ] Conversations (Android — deferred, needs Android dev environment)
+- [x] Conversations (Android — SCRAM-SHA-256, multi-resource, MUC join, reconnection)
 
 ### Bugs Found and Fixed
 
+- **MUC room name case-sensitivity** — Conversations lowercases room
+  names per RFC 7622, but xmppd stored/matched them case-sensitively.
+  `FirstRoom` (Thunderbird) vs `firstroom` (Conversations) created two
+  separate rooms instead of joining the same one. Fix: case-fold the
+  localpart in `buildRoomJid()` before lookup/creation.
 - **IPC recv buffer use-after-compact** — `nextMessage()` compacted the
   receive buffer before returning, corrupting borrowed Message slices
   when two IPC responses arrived simultaneously (concurrent SASL auth).
@@ -286,6 +291,7 @@ Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 - [ ] Room history on join (wire ArchiveStore query)
 - [ ] Persistent affiliation lookup on join (RoomStore.getAffiliation)
 - [ ] Load persistent rooms from RoomStore on startup
+- [x] Room name case-folding (RFC 7622 — JID localpart is case-insensitive)
 - [ ] Room configuration form (XEP-0045 §10.1 dataforms)
 - [ ] Ban (outcast affiliation + persist)
 - [ ] Password-protected rooms
