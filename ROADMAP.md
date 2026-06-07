@@ -441,6 +441,11 @@ Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
   - Master passes args to S2S child, writes `s2s.pid`, handles restart/cleanup
   - ~50 LOC in master + config plumbing in xmppd-s2s
 - [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
+- [ ] xmppctl IPC-based management — talk to running xmppd-auth via IPC socket
+  instead of opening the database directly. Required for non-LMDB backends
+  (RocksDB takes exclusive lock). IPC protocol already has management tags
+  (0x06–0x0B: Register, PasswordChange, AccountDelete). Fallback to direct
+  DB access when daemon is not running (LMDB/SQLite only).
 
 ### Thread-Per-Core
 
