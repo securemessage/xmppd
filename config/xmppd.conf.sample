@@ -18,6 +18,11 @@ hostname = example.com
 # STARTTLS port (default: 5222)
 # c2s_port = 5222
 
+# Unprivileged user for child processes.
+# The master supervisor runs as root and spawns children (xmppd-core,
+# xmppd-auth) which drop privileges to this user after initialization.
+user = jabber
+
 # Storage base directory — subdirectories auth/, op/, archive/ are created
 # automatically by the master supervisor.
 db_path = /var/db/xmppd

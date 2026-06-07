@@ -1,0 +1,45 @@
+#!/bin/sh
+
+# PROVIDE: xmppd
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add these lines to /etc/rc.conf.local or /etc/rc.conf
+# to enable this service:
+#
+# xmppd_enable (bool):      Enable xmppd XMPP server. (default=NO)
+# xmppd_config (str):       Configuration file.
+#                            (default=%%ETCDIR%%/xmppd.conf)
+# xmppd_flags (str):        Additional flags for xmppd.
+#                            (default="")
+
+. /etc/rc.subr
+
+name=xmppd
+rcvar=xmppd_enable
+
+load_rc_config $name
+
+: ${xmppd_enable:="NO"}
+: ${xmppd_config:="%%ETCDIR%%/xmppd.conf"}
+
+pidfile="/var/run/${name}/${name}.pid"
+logfile="/var/log/${name}/${name}.log"
+
+command=/usr/sbin/daemon
+procname=%%PREFIX%%/libexec/${name}/${name}
+command_args="-o ${logfile} -p ${pidfile} -H -T ${name} ${procname} --config ${xmppd_config} ${xmppd_flags}"
+
+start_precmd="xmppd_precmd"
+
+xmppd_precmd()
+{
+	install -d -o jabber -g jabber /var/run/${name}
+	install -d -o jabber -g jabber /var/log/${name}
+	install -d -o jabber -g jabber /var/db/${name}
+	install -d -o jabber -g jabber /var/db/${name}/auth
+	install -d -o jabber -g jabber /var/db/${name}/op
+	install -d -o jabber -g jabber /var/db/${name}/archive
+}
+
+run_rc_command "$1"

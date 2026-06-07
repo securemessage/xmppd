@@ -44,6 +44,9 @@ pub const Supervisor = struct {
     exe_path: []const u8,
     /// Arguments to pass to the child.
     args: []const []const u8,
+    /// Unprivileged user/group IDs for the child process (0 = no drop).
+    uid: std.posix.uid_t = 0,
+    gid: std.posix.gid_t = 0,
     /// Current child PID, or null if not running.
     child_pid: ?posix.pid_t = null,
     /// Child state.
@@ -63,6 +66,16 @@ pub const Supervisor = struct {
         return .{
             .exe_path = exe_path,
             .args = args,
+        };
+    }
+
+    /// Initialize with privilege drop.
+    pub fn initWithUser(exe_path: []const u8, args: []const []const u8, uid: std.posix.uid_t, gid: std.posix.gid_t) Supervisor {
+        return .{
+            .exe_path = exe_path,
+            .args = args,
+            .uid = uid,
+            .gid = gid,
         };
     }
 
@@ -99,6 +112,16 @@ pub const Supervisor = struct {
                 argv_buf[1 + i] = @ptrCast(&arg_bufs[i]);
             }
             argv_buf[1 + max_args] = null;
+
+            // Drop privileges before exec if configured
+            if (self.gid != 0) {
+                const ret_g = std.c.setgid(self.gid);
+                if (ret_g != 0) std.c._exit(125);
+            }
+            if (self.uid != 0) {
+                const ret_u = std.c.setuid(self.uid);
+                if (ret_u != 0) std.c._exit(125);
+            }
 
             const envp = [_:null]?[*:0]const u8{null};
             _ = std.c.execve(

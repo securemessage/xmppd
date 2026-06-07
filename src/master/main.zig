@@ -52,6 +52,7 @@ pub fn main() !void {
     var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
+    var run_user: ?[]const u8 = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -129,6 +130,9 @@ pub fn main() !void {
         if (std.mem.eql(u8, db_path, "/var/db/xmppd/users.db")) {
             if (c.get("server", "db_path")) |v| db_path = v;
         }
+        if (run_user == null) {
+            if (c.get("server", "user")) |v| run_user = v;
+        }
 
         // [tls] section
         if (cert_path == null) {
@@ -152,6 +156,27 @@ pub fn main() !void {
         }
     }
     defer if (cfg) |*c| c.deinit();
+
+    // Resolve unprivileged user for child processes
+    var child_uid: posix.uid_t = 0;
+    var child_gid: posix.gid_t = 0;
+    if (run_user) |username| {
+        var user_buf: [256]u8 = undefined;
+        if (username.len < user_buf.len) {
+            @memcpy(user_buf[0..username.len], username);
+            user_buf[username.len] = 0;
+            const pw = std.c.getpwnam(@ptrCast(&user_buf));
+            if (pw) |entry| {
+                child_uid = entry.uid;
+                child_gid = entry.gid;
+                log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
+            } else {
+                log.err("user '{s}' not found — children will run as root", .{username});
+            }
+        } else {
+            log.err("user name too long: {s}", .{username});
+        }
+    }
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
 
@@ -204,8 +229,14 @@ pub fn main() !void {
     core_argc += 1;
 
     // Initialize supervisors for both children
-    var auth_sup = Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
-    var core_sup = Supervisor.init(core_path, core_args_buf[0..core_argc]);
+    var auth_sup = if (child_uid != 0)
+        Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid)
+    else
+        Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
+    var core_sup = if (child_uid != 0)
+        Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
+    else
+        Supervisor.init(core_path, core_args_buf[0..core_argc]);
 
     log.info("config: auth_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
