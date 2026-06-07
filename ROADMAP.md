@@ -453,6 +453,41 @@ Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
   (0x06–0x0B: Register, PasswordChange, AccountDelete). Fallback to direct
   DB access when daemon is not running (LMDB/SQLite only).
 
+### Avatar System (V1)
+
+Unified avatar resolution with fallback chain. Clients see a single canonical
+avatar via standard XEPs; the server handles sourcing transparently.
+
+**Resolution order (highest priority wins):**
+
+1. **Client-set** — user uploads via XEP-0084 (User Avatar / PEP) or XEP-0153
+   (vCard-Based Avatars). Overrides everything. Updates external auth if supported.
+2. **External auth (OIDC)** — on first login, fetch `picture` claim from IdP
+   userinfo. Cache locally. Only used if no client-set avatar exists.
+3. **Gravatar** — hash user's email (MD5 per Gravatar spec), fetch from
+   `gravatar.com/avatar/{hash}`. Zero-config default when nothing else exists.
+
+**XEPs:**
+
+- [ ] XEP-0084: User Avatar (PEP publish/subscribe for avatar data + metadata)
+- [ ] XEP-0153: vCard-Based Avatars (presence `<photo>` hash, legacy clients)
+- [ ] XEP-0054: vcard-temp PHOTO element (already stubbed, needs real storage)
+
+**Behavior:**
+
+- [ ] Gravatar fetch on session bind if no stored avatar (async, cache result)
+- [ ] OIDC avatar fetch on first auth success (from `picture` claim URL)
+- [ ] Client avatar upload persists to VCardStore (PHOTO element) + PEP node
+- [ ] If external auth supports avatar update (Rauthy API), push client-set avatar upstream
+- [ ] Presence broadcasts include `<photo>` hash per XEP-0153 for legacy clients
+
+**Notes:**
+
+- Client-local overrides are purely client-side behavior (not server-enforced).
+  The server always serves the canonical avatar; clients may display a local
+  override per their own UX preference.
+- Post-V1: admin policies for avatar size limits, allowed formats, corporate branding
+
 ### Thread-Per-Core
 
 - [ ] SO_REUSEPORT thread-per-core event loops (kernel-level connection distribution)
