@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-05
+Last updated: 2026-06-06
 
 ## Current Status
 
@@ -20,7 +20,7 @@ Last updated: 2026-06-05
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
 | 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
 | 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
-| 11. External Auth | ⬜ Not started | OIDC/OAuth, LDAP/AD, SQL backends |
+| 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
 | 12. Polish & Deploy | ⬜ Not started | Config, RC script, port, privilege separation, docs |
 
 ---
@@ -298,35 +298,60 @@ Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 - `src/core/muc_handler.zig` — ~900 LOC
 - `test/integration/muc-test.py` — slixmpp integration test
 
-## Phase 11 — External Auth Backends
+## Phase 11 — External Auth (OIDC) ✅
 
-Pluggable authentication backends for enterprise and federated identity.
-The `AuthHandler(Store)` generic pattern from Phase 6 means adding
-backends is purely additive — no refactoring needed.
+Pluggable authentication via external Identity Providers. Multi-binary
+architecture: each auth backend is a separate executable selected by
+the master supervisor via `--auth-path`.
 
-### Priority Order
+Design document: `~/.windsurf/plans/xmppd-phase11-external-auth-4f6f38.md`
 
-1. **OIDC/OAuth** — OAUTHBEARER SASL mechanism, token validation against IdP
-2. **LDAP/AD** — bind authentication, group-based authorization
-3. **SQL** — external database credential lookup (PostgreSQL/MariaDB)
-4. **Token auth** — HT-SHA-256 for mobile clients (needs token issuer)
-5. **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
-6. **PAM** — system-level auth integration (pending SASL vs PAM discussion)
+### Sub-steps
 
-### Configuration
+| Step | Feature | Status |
+|------|---------|--------|
+| 11a | `src/config/parser.zig` — INI config parser (sections, key=value, #comments) | ✅ |
+| 11b | Master passes `--config` to children via execve argv | ✅ |
+| 11c | `MechanismId.oauthbearer` (0x03) + IPC tag 0x0C (MechanismList) | ✅ |
+| 11d | Auth sends MechanismList on IPC connect → core uses for stream features | ✅ |
+| 11e | `lib/http/client.zig` — blocking HTTPS GET/POST over OpenSSL | ✅ |
+| 11f | `lib/jwt/jwt.zig` — JWT parse + RS256/EdDSA signature verification | ✅ |
+| 11g | `src/auth/oidc.zig` — OidcStore (JWKS cache, JWT validation, ROPC, introspection) | ✅ |
+| 11h | AuthHandler refactor — comptime `@hasDecl` for validatePassword/validateToken | ✅ |
+| 11i | `src/auth/oidc_main.zig` — xmppd-auth-oidc entry point | ✅ |
+| 11j | Build system — `xmppd-auth-oidc` executable in build.zig | ✅ |
+| 11k | Integration test — OAUTHBEARER + ROPC against Rauthy | ✅ |
 
-```ini
-# xmppd.conf
-auth_backend = internal          # or: oidc, ldap, sql, pam
-# auth_oidc_issuer = https://idp.example.com
-# auth_ldap_url = ldap://ldap.example.com
-# auth_sql_dsn = postgresql://...
-```
+### Implemented Features
 
-### Dependencies
+- [x] OAUTHBEARER SASL mechanism (RFC 7628) — JWT validation
+- [x] PLAIN-to-IdP delegation via ROPC (Resource Owner Password Credentials)
+- [x] Token introspection fallback (RFC 7662) for opaque tokens
+- [x] JWKS key cache with 1-hour TTL + kid-miss refresh
+- [x] EdDSA (Ed25519) + RS256 JWT signature verification
+- [x] JID localpart extraction from email claims
+- [x] RFC 3986 percent-encoding for ROPC form bodies
+- [x] Dynamic mechanism advertisement via IPC MechanismList
+- [x] Shared INI config parser for all daemons
+- [x] Rate limiting applies to OIDC backend (reuses Phase 9 infrastructure)
 
-- Phase 9 (Auth Hardening) — LockStore and rate limiting apply to all backends
-- External infrastructure — IdP, LDAP server, or database must exist
+### Key Files
+
+- `src/auth/oidc.zig` — ~460 LOC (OidcStore, JWKS, introspection)
+- `src/auth/oidc_main.zig` — ~240 LOC (entry point, event loop)
+- `lib/http/client.zig` — ~360 LOC (HTTPS client)
+- `lib/jwt/jwt.zig` — ~410 LOC (JWT parse + RS256 + EdDSA verify)
+- `src/config/parser.zig` — ~190 LOC (shared INI parser)
+
+**Binaries:** `xmppd-auth-oidc` (4.3MB)
+
+### Future Backends (Not This Phase)
+
+- **LDAP/AD** — bind authentication, group-based authorization
+- **SQL** — external database credential lookup (PostgreSQL/MariaDB)
+- **Token auth** — HT-SHA-256 for mobile clients
+- **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
+- **PAM** — system-level auth integration
 
 ## Phase 12 — Polish & Deploy
 
@@ -417,10 +442,10 @@ long-term radar.
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 52 |
-| Lines of code | ~25,200 |
-| Unit tests | 83 build steps, 619 tests (all pass) |
-| Integration tests | 9 S2S federation + 23 C2S interop + 12 MUC |
-| Binaries | 5 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-s2s`, `xmppctl`) |
+| Source files | 57 |
+| Lines of code | ~27,000 |
+| Unit tests | 85+ build steps, 637+ tests (all pass) |
+| Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC |
+| Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
