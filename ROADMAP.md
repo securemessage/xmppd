@@ -21,7 +21,7 @@ Last updated: 2026-06-06
 | 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
 | 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
-| 12. Polish & Deploy | ⬜ Not started | Config, RC script, port, privilege separation, docs |
+| 12. Polish & Deploy | 🔄 In progress | Fan-out fix, config, RC script done; port + testing remain |
 
 ---
 
@@ -353,26 +353,35 @@ Design document: `~/.windsurf/plans/xmppd-phase11-external-auth-4f6f38.md`
 - **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
 - **PAM** — system-level auth integration
 
-## Phase 12 — Polish & Deploy
+## Phase 12 — Polish & Deploy (In Progress)
 
-Production readiness.
+Production readiness. The "Giant Thread" problem (event loop starvation
+during MUC fan-out) was solved as part of this phase.
 
-### Configuration
+### Fan-out Scalability (Done)
 
-- [ ] Configuration file system (single `xmppd.conf`)
-- [ ] Sensible defaults (Postfix model: works out of the box)
-- [ ] Runtime config validation
+- [x] Bounded continuation — yield after N occupants per event loop tick (`src/core/fanout.zig`)
+- [x] Pre-built common stanza — prefix/JID/suffix assembly eliminates per-occupant serialization
+- [x] Configurable `max_sessions` — heap-allocated, default 4096 (was hard-coded 1024)
+
+### Configuration (Done)
+
+- [x] Configuration file system (single `xmppd.conf` with INI sections)
+- [x] All daemons read `--config` (xmppd, xmppd-core, xmppd-auth, xmppd-auth-oidc)
+- [x] CLI flags override config file values (Postfix convention)
+- [x] Sensible defaults (works out of the box without config for dev mode)
+- [x] `config/xmppd.conf.sample` with all sections documented
+
+### Deployment (Partial)
+
+- [x] FreeBSD RC script (`etc/rc.d/xmppd`)
+- [ ] FreeBSD port (Makefile, pkg-plist, pkg-descr) — lives in deluxe ports tree
+- [ ] Jail installation and end-to-end testing
 
 ### Privilege Separation
 
 - [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
 - [ ] Per-daemon UID (xmppd-core, xmppd-auth, xmppd-s2s as separate users)
-
-### Deployment
-
-- [ ] FreeBSD RC script (`etc/rc.d/xmppd`)
-- [ ] FreeBSD port (Makefile, pkg-plist, pkg-descr)
-- [ ] Systemd unit file (Linux)
 
 ### Standards
 
@@ -401,12 +410,25 @@ Production readiness.
 
 ---
 
-## Post-MVP
+## V1 — Thread-Per-Core (Next after MVP)
 
-These items are out of scope for the initial release but are on the
-long-term radar.
+Multi-threaded xmppd-core for horizontal scaling across CPU cores.
+Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
 
-- **Multi-threaded / multi-process core** — break out of single-thread event loop; options: worker threads per room (fan-out), multi-process room sharding (Postfix model at room level), or io_uring/kqueue batched sendmsg. Required for MUC at scale.
+- [ ] SO_REUSEPORT thread-per-core event loops (kernel-level connection distribution)
+- [ ] Lock-free cross-thread delivery (MPSC queues + EVFILT_USER + coalesced signaling)
+- [ ] Shared session registry (cache-line-aligned slots, generational IDs for ABA protection)
+- [ ] MUC fan-out cross-thread batching
+- [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
+- [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
+- [ ] Testing + benchmarks
+
+---
+
+## Post-V1
+
+These items are out of scope for V1 but are on the long-term radar.
+
 - **Clustering** — multi-node via shared storage + message bus
 - **epoll backend** — Linux support (secondary platform)
 - **WebSocket** (RFC 7395) — web client connectivity
@@ -442,9 +464,9 @@ long-term radar.
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 57 |
-| Lines of code | ~27,000 |
-| Unit tests | 85+ build steps, 637+ tests (all pass) |
+| Source files | 58 |
+| Lines of code | ~27,500 |
+| Unit tests | 86+ build steps, 640+ tests (all pass) |
 | Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |

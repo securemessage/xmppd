@@ -27,6 +27,7 @@ const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
 const Event = event_loop_mod.Event;
+const config_mod = @import("config");
 
 const log = std.log.scoped(.xmppd);
 
@@ -108,6 +109,49 @@ pub fn main() !void {
             log.warn("unknown argument: {s}", .{arg});
         }
     }
+
+    // Apply config file defaults (CLI flags take precedence)
+    var cfg: ?config_mod.Config = null;
+    if (config_path) |cp| {
+        cfg = config_mod.parse(allocator, cp) catch |err| {
+            log.err("failed to read config file '{s}': {}", .{ cp, err });
+            return error.InvalidArgs;
+        };
+        const c = &cfg.?;
+
+        // [server] section
+        if (std.mem.eql(u8, host, "localhost")) {
+            if (c.get("server", "hostname")) |v| host = v;
+        }
+        if (std.mem.eql(u8, port, "5222")) {
+            if (c.get("server", "c2s_port")) |v| port = v;
+        }
+        if (std.mem.eql(u8, db_path, "/var/db/xmppd/users.db")) {
+            if (c.get("server", "db_path")) |v| db_path = v;
+        }
+
+        // [tls] section
+        if (cert_path == null) {
+            if (c.get("tls", "cert")) |v| cert_path = v;
+        }
+        if (key_path == null) {
+            if (c.get("tls", "key")) |v| key_path = v;
+        }
+
+        // [auth] section
+        if (std.mem.eql(u8, auth_socket, "/var/run/xmppd/auth.sock")) {
+            if (c.get("auth", "socket")) |v| auth_socket = v;
+        }
+
+        // [master] section
+        if (std.mem.eql(u8, core_path, "xmppd-core")) {
+            if (c.get("master", "core_path")) |v| core_path = v;
+        }
+        if (std.mem.eql(u8, auth_path, "xmppd-auth")) {
+            if (c.get("master", "auth_path")) |v| auth_path = v;
+        }
+    }
+    defer if (cfg) |*c| c.deinit();
 
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
 

@@ -717,6 +717,23 @@ pub fn build(b: *std.Build) void {
 
     const run_room_registry_tests = b.addRunArtifact(room_registry_tests);
 
+    // --- Fan-out tests ---
+
+    const fanout_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/fanout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fanout_test_mod.addImport("room_registry", room_registry_test_mod);
+    fanout_test_mod.addImport("room_store", room_store_test_mod);
+
+    const fanout_tests = b.addTest(.{
+        .name = "fanout-tests",
+        .root_module = fanout_test_mod,
+    });
+
+    const run_fanout_tests = b.addRunArtifact(fanout_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -871,6 +888,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("vcard_store", server_vcard_store_mod);
     core_mod.addImport("room_store", server_room_store_mod);
     core_mod.addImport("room_registry", server_room_registry_mod);
+    core_mod.addImport("config", config_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -985,6 +1003,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
     auth_mod.addImport("config", config_mod);
+    auth_mod.addImport("backend", auth_backend_mod);
 
     const auth_exe = b.addExecutable(.{
         .name = "xmppd-auth",
@@ -1214,6 +1233,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_invite_store_tests.step);
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
+    test_step.dependOn(&run_fanout_tests.step);
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);

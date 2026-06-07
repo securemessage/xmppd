@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Server = @import("server.zig").Server;
+const config_mod = @import("config");
 const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const generic_offline = @import("generic_offline_store");
@@ -57,6 +58,9 @@ pub fn main() !void {
     var s2s_socket: ?[]const u8 = null;
     var db_path: ?[]const u8 = null;
     var muc_host_arg: ?[]const u8 = null;
+    var config_path: ?[]const u8 = null;
+    var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
+    var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
 
     // Skip argv[0]
     _ = args.next();
@@ -111,6 +115,11 @@ pub fn main() !void {
                 log.err("--muc-host requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            config_path = args.next() orelse {
+                log.err("--config requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -119,9 +128,64 @@ pub fn main() !void {
         }
     }
 
-    log.info("starting xmppd-core host={s} address={s} port={d}", .{ host, address, port });
+    // Apply config file defaults (CLI flags above take precedence)
+    var cfg: ?config_mod.Config = null;
+    if (config_path) |cp| {
+        cfg = config_mod.parse(allocator, cp) catch |err| {
+            log.err("failed to read config file '{s}': {}", .{ cp, err });
+            return error.InvalidArgs;
+        };
+        const c = &cfg.?;
 
-    var server = try Server.init(host, address, port, allocator);
+        // [server] section
+        if (host.len == 0 or std.mem.eql(u8, host, "localhost")) {
+            if (c.get("server", "hostname")) |v| host = v;
+        }
+        if (std.mem.eql(u8, address, "127.0.0.1")) {
+            if (c.get("server", "bind_address")) |v| address = v;
+        }
+        if (port == 15222) {
+            if (c.get("server", "c2s_port")) |v| {
+                port = std.fmt.parseInt(u16, v, 10) catch 15222;
+            }
+        }
+        if (db_path == null) {
+            if (c.get("server", "db_path")) |v| db_path = v;
+        }
+
+        // [tls] section — cert/key are sentinel-terminated (C API requirement),
+        // config values are not null-terminated. TLS is typically set via CLI or
+        // passed by the master supervisor. Skip config for TLS paths.
+
+        // [auth] section
+        if (auth_socket == null) {
+            if (c.get("auth", "socket")) |v| auth_socket = v;
+        }
+
+        // [s2s] section
+        if (s2s_socket == null) {
+            if (c.get("s2s", "socket")) |v| s2s_socket = v;
+        }
+
+        // [muc] section
+        if (muc_host_arg == null) {
+            if (c.get("muc", "host")) |v| muc_host_arg = v;
+        }
+
+        // [core] section
+        if (c.get("core", "max_sessions")) |v| {
+            max_sessions = std.fmt.parseInt(usize, v, 10) catch @import("server.zig").DEFAULT_MAX_SESSIONS;
+        }
+        if (c.get("core", "fan_out_batch_size")) |v| {
+            fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("fanout.zig").DEFAULT_BATCH_SIZE;
+        }
+    }
+    defer if (cfg) |*c| c.deinit();
+
+    log.info("starting xmppd-core host={s} address={s} port={d} max_sessions={d}", .{ host, address, port, max_sessions });
+
+    var server = try Server.initWithMaxSessions(host, address, port, allocator, max_sessions);
+    server.fanout_queue.batch_size = fan_out_batch_size;
     defer server.deinit();
 
     // Configure TLS if cert and key are provided

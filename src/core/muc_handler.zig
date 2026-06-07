@@ -29,6 +29,9 @@ const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const ChangeList = @import("event_loop.zig").ChangeList;
+const fanout = @import("fanout.zig");
+const FanoutQueue = fanout.FanoutQueue;
+const PendingFanout = fanout.PendingFanout;
 
 const log = std.log.scoped(.muc);
 
@@ -62,7 +65,9 @@ pub fn handleMucPresence(
 }
 
 /// Handle a groupchat message addressed to a room bare JID.
-/// Fan-out to all occupants.
+/// Uses pre-built stanza + bounded continuation to prevent event loop starvation.
+/// Delivers to the first batch_size occupants immediately, then queues the
+/// remainder for delivery in subsequent event loop ticks.
 pub fn handleMucGroupchat(
     server: *Server,
     session: *Session,
@@ -105,35 +110,139 @@ pub fn handleMucGroupchat(
     fw.writeAll(sender.getNick()) catch return;
     const from_str = from_fbs.getWritten();
 
-    // Fan-out to ALL occupants (including sender for echo)
-    for (&room.occupants) |*slot| {
+    // Build pre-built stanza: prefix (before recipient JID) + suffix (after)
+    var prefix_buf: [512]u8 = undefined;
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
+    var suffix_buf: [16500]u8 = undefined;
+    const suffix_len = fanout.buildSuffix(&suffix_buf, id_str, inner_xml) orelse return;
+    const prefix = prefix_buf[0..prefix_len];
+    const suffix = suffix_buf[0..suffix_len];
+
+    // Deliver first batch directly (bounded continuation — yield after batch_size)
+    const batch_size = server.fanout_queue.batch_size;
+    var delivered: u8 = 0;
+    var resume_slot: u8 = 0;
+    var all_done = true;
+
+    for (&room.occupants, 0..) |*slot, idx| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue; // S2S deferred
+        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
         const target_session = server.sessions[occ.session_id] orelse continue;
 
-        var msg_buf: [20480]u8 = undefined;
-        var msg_fbs = std.io.fixedBufferStream(&msg_buf);
-        const mw = msg_fbs.writer();
-
-        mw.writeAll("<message from='") catch continue;
-        mw.writeAll(from_str) catch continue;
-        mw.writeAll("' to='") catch continue;
-        writeOccupantRealJid(mw, &occ) catch continue;
-        mw.writeAll("' type='groupchat'") catch continue;
-        if (id_str.len > 0) {
-            mw.writeAll(" id='") catch continue;
-            mw.writeAll(id_str) catch continue;
-            mw.writeByte('\'') catch continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
         }
-        if (inner_xml.len == 0) {
-            mw.writeAll("/>") catch continue;
+
+        delivered += 1;
+        if (delivered >= batch_size) {
+            // Check if there are more occupants after this index
+            resume_slot = @intCast(idx + 1);
+            if (resume_slot < room_registry.MAX_OCCUPANTS) {
+                // Check if any remaining slots have occupants
+                for (room.occupants[resume_slot..]) |remaining| {
+                    if (remaining != null) {
+                        all_done = false;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // If more occupants remain, queue a continuation
+    if (!all_done) {
+        if (server.fanout_queue.alloc()) |pf| {
+            // Store room JID for safe re-lookup
+            @memcpy(pf.room_jid_buf[0..room_jid.len], room_jid);
+            pf.room_jid_len = @intCast(room_jid.len);
+            // Store pre-built stanza parts
+            @memcpy(pf.prefix_buf[0..prefix_len], prefix);
+            pf.prefix_len = prefix_len;
+            @memcpy(pf.suffix_buf[0..suffix_len], suffix);
+            pf.suffix_len = suffix_len;
+            // Resume from next slot
+            pf.next_slot = resume_slot;
+            log.debug("queued fan-out continuation for {s} from slot {d}", .{ room_jid, resume_slot });
         } else {
-            mw.writeByte('>') catch continue;
-            mw.writeAll(inner_xml) catch continue;
-            mw.writeAll("</message>") catch continue;
+            // Queue full — deliver remaining synchronously (fallback)
+            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+        }
+    }
+}
+
+/// Drain one batch of a pending fan-out. Called from the server main loop.
+/// Returns true if the fan-out completed (slot freed), false if more work remains.
+pub fn drainPendingFanout(
+    server: *Server,
+    pf: *PendingFanout,
+    changes: *ChangeList,
+) bool {
+    const reg = server.room_registry orelse {
+        pf.complete();
+        return true;
+    };
+
+    // Re-find the room by JID (it may have been destroyed between ticks)
+    const room = reg.findByJid(pf.getRoomJid()) orelse {
+        log.debug("fan-out target room gone: {s}", .{pf.getRoomJid()});
+        pf.complete();
+        return true;
+    };
+
+    const batch_size = server.fanout_queue.batch_size;
+    const prefix = pf.getPrefix();
+    const suffix = pf.getSuffix();
+    var delivered: u8 = 0;
+
+    var i: usize = pf.next_slot;
+    while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
+        const occ = room.occupants[i] orelse continue;
+        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        const target_session = server.sessions[occ.session_id] orelse continue;
+
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
         }
 
-        target_session.conn.queueSend(msg_fbs.getWritten()) catch continue;
+        delivered += 1;
+        if (delivered >= batch_size) {
+            pf.next_slot = @intCast(i + 1);
+            // Check if any more occupants remain
+            if (pf.next_slot < room_registry.MAX_OCCUPANTS) {
+                for (room.occupants[pf.next_slot..]) |remaining| {
+                    if (remaining != null) return false; // more work
+                }
+            }
+            // All done
+            pf.complete();
+            return true;
+        }
+    }
+
+    // Reached end of occupant array
+    pf.complete();
+    return true;
+}
+
+/// Synchronous fallback: deliver to remaining occupants when the fan-out queue is full.
+fn deliverRemainingSync(
+    server: *Server,
+    room: *const Room,
+    start_slot: u8,
+    prefix: []const u8,
+    suffix: []const u8,
+    changes: *ChangeList,
+) void {
+    var i: usize = start_slot;
+    while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
+        const occ = room.occupants[i] orelse continue;
+        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        const target_session = server.sessions[occ.session_id] orelse continue;
+
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
         }

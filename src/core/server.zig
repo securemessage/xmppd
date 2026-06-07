@@ -63,11 +63,13 @@ const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
+const fanout_mod = @import("fanout.zig");
+const FanoutQueue = fanout_mod.FanoutQueue;
 
 const log = std.log.scoped(.xmppd);
 
-/// Maximum simultaneous connections.
-const MAX_SESSIONS = 1024;
+/// Default maximum simultaneous connections (configurable via init).
+pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 
 /// Sentinel value for listener fd in kqueue udata.
 const LISTENER_UDATA = std.math.maxInt(usize);
@@ -253,8 +255,9 @@ pub const Server = struct {
     server_host: []const u8,
     running: bool = true,
 
-    /// Session table — indexed by session ID.
-    sessions: [MAX_SESSIONS]?*Session = [_]?*Session{null} ** MAX_SESSIONS,
+    /// Session table — indexed by session ID. Heap-allocated, size configurable.
+    sessions: []?*Session = &.{},
+    max_sessions: usize = DEFAULT_MAX_SESSIONS,
     next_id: usize = 1, // 0 reserved
 
     /// TLS context — shared across all connections. Null if TLS is not configured.
@@ -287,6 +290,9 @@ pub const Server = struct {
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
 
+    /// Pending fan-out queue — bounded continuation for MUC groupchat delivery.
+    fanout_queue: FanoutQueue = .{},
+
     /// SASL mechanism names received from auth daemon (dynamic advertisement).
     /// Stored as slices into auth_mechanism_name_buf.
     auth_mechanisms: [8][]const u8 = .{""} ** 8,
@@ -306,6 +312,19 @@ pub const Server = struct {
         port: u16,
         allocator: std.mem.Allocator,
     ) !Server {
+        return initWithMaxSessions(host, address, port, allocator, DEFAULT_MAX_SESSIONS);
+    }
+
+    pub fn initWithMaxSessions(
+        host: []const u8,
+        address: []const u8,
+        port: u16,
+        allocator: std.mem.Allocator,
+        max_sessions: usize,
+    ) !Server {
+        const sessions = try allocator.alloc(?*Session, max_sessions);
+        @memset(sessions, null);
+
         const loop = try EventLoop.init(allocator, 256);
         errdefer {
             var l = loop;
@@ -317,6 +336,8 @@ pub const Server = struct {
         return Server{
             .loop = loop,
             .listener = listener,
+            .sessions = sessions,
+            .max_sessions = max_sessions,
             .allocator = allocator,
             .server_host = host,
         };
@@ -373,13 +394,13 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         // Close all sessions
-        for (&self.sessions) |*slot| {
-            if (slot.*) |session| {
+        for (self.sessions) |session_opt| {
+            if (session_opt) |session| {
                 session.deinit();
                 self.allocator.destroy(session);
-                slot.* = null;
             }
         }
+        self.allocator.free(self.sessions);
         self.listener.deinit();
         self.loop.deinit();
         if (self.ssl_ctx) |*ctx| ctx.deinit();
@@ -444,6 +465,15 @@ pub const Server = struct {
                     else => {},
                 }
             }
+
+            // Drain pending fan-outs (bounded continuation — one batch per slot per tick)
+            if (self.fanout_queue.hasPending()) {
+                for (&self.fanout_queue.slots) |*slot| {
+                    if (slot.active) {
+                        _ = muc_handler.drainPendingFanout(self, slot, &changes);
+                    }
+                }
+            }
         }
     }
 
@@ -460,7 +490,7 @@ pub const Server = struct {
         // Drain all pending connections
         while (true) {
             const id = self.allocateId() orelse {
-                log.warn("connection limit reached ({d})", .{MAX_SESSIONS});
+                log.warn("connection limit reached ({d})", .{self.max_sessions});
                 break;
             };
 
@@ -2598,11 +2628,11 @@ pub const Server = struct {
     fn allocateId(self: *Server) ?usize {
         // Linear scan for a free slot
         var i: usize = 0;
-        while (i < MAX_SESSIONS) : (i += 1) {
-            const id = (self.next_id + i) % MAX_SESSIONS;
+        while (i < self.max_sessions) : (i += 1) {
+            const id = (self.next_id + i) % self.max_sessions;
             if (id == 0) continue; // Skip slot 0
             if (self.sessions[id] == null) {
-                self.next_id = (id + 1) % MAX_SESSIONS;
+                self.next_id = (id + 1) % self.max_sessions;
                 return id;
             }
         }

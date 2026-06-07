@@ -1,37 +1,121 @@
 # xmppd configuration
 #
-# Copy to xmppd.conf and edit for your deployment.
+# Copy to /usr/local/etc/xmppd/xmppd.conf and edit for your deployment.
+# All daemons read this file via --config (or -c).
+# CLI flags override config file values.
 
-# XMPP virtual host domain
+# ==========================================================================
+# Server — global settings shared across all daemons
+# ==========================================================================
+
+[server]
+# XMPP virtual host domain (required)
 hostname = example.com
-
-# TLS certificate and key (PEM format)
-tls_cert = /usr/local/etc/xmppd/server.pem
-tls_key = /usr/local/etc/xmppd/server.key
-
-# STARTTLS port (default: 5222)
-c2s_port = 5222
-
-# Direct TLS port (default: 5223)
-# c2s_tls_port = 5223
 
 # Bind address (default: 0.0.0.0)
 # bind_address = 0.0.0.0
 
-# User to run as after binding ports (requires root to start)
-# user = xmppd
+# STARTTLS port (default: 5222)
+# c2s_port = 5222
+
+# Storage base directory — subdirectories auth/, op/, archive/ are created
+# automatically by the master supervisor.
+db_path = /var/db/xmppd
 
 # PID file
 # pidfile = /var/run/xmppd/xmppd.pid
 
+# ==========================================================================
+# TLS — certificate and key for STARTTLS
+# ==========================================================================
+
+[tls]
+cert = /usr/local/etc/xmppd/server.pem
+key = /usr/local/etc/xmppd/server.key
+
+# ==========================================================================
+# Core — xmppd-core connection handler settings
+# ==========================================================================
+
+[core]
+# Maximum simultaneous client connections (default: 4096)
+# Memory cost: ~60KB per session. 4096 sessions ≈ 240MB, 16384 ≈ 960MB.
+# max_sessions = 4096
+
+# Fan-out batch size — number of MUC occupants delivered per event loop
+# tick before yielding to other connections (default: 32).
+# Lower = fairer latency, higher = faster total fan-out.
+# fan_out_batch_size = 32
+
+# ==========================================================================
+# Auth — xmppd-auth authentication daemon settings
+# ==========================================================================
+
+[auth]
+# IPC socket path for core↔auth communication
+socket = /var/run/xmppd/auth.sock
+
+# Rate limiting: max authentication attempts per account per window
+# max_per_account = 5
+
+# Rate limiting: max authentication attempts per IP per window
+# max_per_ip = 20
+
+# Rate window in seconds (default: 120)
+# window_seconds = 120
+
+# Temporary lockout duration after threshold failures (default: 300)
+# lockout_duration = 300
+
+# Consecutive failures before temporary lockout (default: 10)
+# lockout_threshold = 10
+
+# Enable in-band registration (XEP-0077). Default: false.
+# registration = false
+
+# Require invitation code for registration. Default: true.
+# require_invite = true
+
+# ==========================================================================
+# S2S — xmppd-s2s federation daemon settings
+# ==========================================================================
+
+[s2s]
+# IPC socket path for core↔s2s communication
+# socket = /var/run/xmppd/s2s.sock
+
+# S2S listening port (default: 5269)
+# port = 5269
+
+# ==========================================================================
+# MUC — Multi-User Chat (XEP-0045)
+# ==========================================================================
+
+[muc]
+# MUC service hostname. Default: conference.{hostname}
+# host = conference.example.com
+
+# ==========================================================================
+# Master — xmppd supervisor settings
+# ==========================================================================
+
+[master]
 # Path to xmppd-core binary (default: alongside xmppd)
 # core_path = /usr/local/libexec/xmppd/xmppd-core
 
 # Path to xmppd-auth binary (default: alongside xmppd)
 # auth_path = /usr/local/libexec/xmppd/xmppd-auth
 
-# IPC socket for core↔auth communication
-auth_socket = /var/run/xmppd/auth.sock
+# ==========================================================================
+# OIDC — External authentication via OpenID Connect (optional)
+# Use xmppd-auth-oidc instead of xmppd-auth when this section is configured.
+# ==========================================================================
 
-# User credential database
-user_db = /var/db/xmppd/users.db
+# [oidc]
+# issuer = https://auth.example.com/auth/v1
+# client_id = xmppd
+# client_secret = your-client-secret
+# token_endpoint = https://auth.example.com/auth/v1/oidc/token
+# jwks_uri = https://auth.example.com/auth/v1/oidc/certs
+# introspection_endpoint = https://auth.example.com/auth/v1/oidc/tokenInfo
+# ca_file = /usr/local/etc/xmppd/ca.pem

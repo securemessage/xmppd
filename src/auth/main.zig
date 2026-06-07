@@ -20,6 +20,7 @@ const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;
 const OpBackendType = @import("op_backend").Backend;
+const config_mod = @import("config");
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
 const handler_mod = @import("handler");
@@ -118,16 +119,66 @@ pub fn main() !void {
         }
     }
 
+    // Apply config file defaults (CLI flags take precedence)
+    var cfg: ?config_mod.Config = null;
+    if (config_path) |cp| {
+        cfg = config_mod.parse(allocator, cp) catch |err| {
+            log.err("failed to read config file '{s}': {}", .{ cp, err });
+            return error.InvalidArgs;
+        };
+        const c = &cfg.?;
+
+        // [server] section
+        if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
+            if (c.get("server", "db_path")) |v| db_path = v;
+        }
+
+        // [auth] section
+        if (std.mem.eql(u8, socket_path, "/var/run/xmppd/auth.sock")) {
+            if (c.get("auth", "socket")) |v| socket_path = v;
+        }
+        if (rate_policy.max_per_account == 5) {
+            if (c.get("auth", "max_per_account")) |v| {
+                rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch 5;
+            }
+        }
+        if (rate_policy.max_per_ip == 20) {
+            if (c.get("auth", "max_per_ip")) |v| {
+                rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch 20;
+            }
+        }
+        if (rate_policy.window_seconds == 120) {
+            if (c.get("auth", "window_seconds")) |v| {
+                rate_policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch 120;
+            }
+        }
+        if (rate_policy.lockout_duration == 300) {
+            if (c.get("auth", "lockout_duration")) |v| {
+                rate_policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch 300;
+            }
+        }
+        if (rate_policy.lockout_threshold == 10) {
+            if (c.get("auth", "lockout_threshold")) |v| {
+                rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch 10);
+            }
+        }
+        if (c.get("auth", "registration")) |v| {
+            if (std.mem.eql(u8, v, "true")) reg_config.enabled = true;
+        }
+        if (c.get("auth", "require_invite")) |v| {
+            if (std.mem.eql(u8, v, "false")) reg_config.require_invite = false;
+        }
+
+        log.info("config file: {s}", .{cp});
+    }
+    defer if (cfg) |*c| c.deinit();
+
     // Build auth-specific sub-path: {db_path}/auth
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch {
         log.err("db path too long", .{});
         return error.InvalidArgs;
     };
-
-    if (config_path) |cp| {
-        log.info("config file: {s}", .{cp});
-    }
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
     log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
         rate_policy.max_per_account,
