@@ -335,7 +335,7 @@ pub fn main() !void {
             };
             c2s_fd_count += 1;
         }
-        log.info("bound {d} C2S listener sockets on port {s} (SO_REUSEPORT)", .{ c2s_fd_count, port });
+        log.info("bound {d} C2S listener sockets on port {s} (SO_REUSEPORT_LB)", .{ c2s_fd_count, port });
     }
     if (s2s_enabled) {
         const s2s_port_num = std.fmt.parseInt(u16, s2s_port, 10) catch 5269;
@@ -700,10 +700,13 @@ fn printUsage() void {
 }
 
 /// Bind a non-blocking, SO_REUSEADDR TCP socket on the given address and port.
-/// When `reuseport` is true, also sets SO_REUSEPORT to allow multiple sockets
-/// bound to the same port — the kernel distributes incoming connections across them.
-/// Returns the listening fd. Used by the master to bind privileged ports
-/// before dropping privileges and passing fds to children.
+/// When `reuseport` is true, also sets SO_REUSEPORT_LB (FreeBSD 12+) to enable
+/// kernel-level load balancing of incoming TCP connections across sockets via
+/// 4-tuple Toeplitz hash. Falls back to SO_REUSEPORT on non-FreeBSD platforms.
+///
+/// Note: FreeBSD's SO_REUSEPORT (without _LB) does NOT distribute TCP connections —
+/// it preserves historic POSIX behavior and delivers all to one socket.
+/// SO_REUSEPORT_LB was introduced in FreeBSD 12.0 specifically for this purpose.
 fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
     const fd = try posix.socket(
         posix.AF.INET,
@@ -715,7 +718,13 @@ fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !pos
     const one: c_int = 1;
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
     if (reuseport) {
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
+        // FreeBSD: SO_REUSEPORT_LB for actual TCP load balancing (4-tuple hash).
+        // Linux/others: SO_REUSEPORT already does load balancing.
+        if (comptime @hasDecl(posix.SO, "REUSEPORT_LB")) {
+            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, std.mem.asBytes(&one));
+        } else {
+            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
+        }
     }
 
     var addr = std.c.sockaddr.in{

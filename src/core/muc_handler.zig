@@ -94,8 +94,9 @@ pub fn handleMucGroupchat(
         return;
     };
 
-    // Find sender's occupant entry
-    const sender_idx = room.findBySessionId(session.conn.id) orelse {
+    // Find sender's occupant entry (occupant stores global session ID)
+    const sender_global: usize = server.session_id_base + session.conn.id;
+    const sender_idx = room.findBySessionId(sender_global) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "not-acceptable", changes);
         return;
     };
@@ -148,10 +149,12 @@ pub fn handleMucGroupchat(
                 }
             }
         } else {
-            const target_session = server.sessions[occ.session_id] orelse continue;
+            // Same worker: convert global session ID to local for sessions[] access
+            const local_sid = occ.session_id - server.session_id_base;
+            const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+                changes.addWrite(target_session.conn.fd, local_sid) catch {};
             }
         }
 
@@ -238,10 +241,11 @@ pub fn drainPendingFanout(
                 }
             }
         } else {
-            const target_session = server.sessions[occ.session_id] orelse continue;
+            const local_sid = occ.session_id - server.session_id_base;
+            const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+                changes.addWrite(target_session.conn.fd, local_sid) catch {};
             }
         }
 
@@ -292,10 +296,11 @@ fn deliverRemainingSync(
                 }
             }
         } else {
-            const target_session = server.sessions[occ.session_id] orelse continue;
+            const local_sid = occ.session_id - server.session_id_base;
+            const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+                changes.addWrite(target_session.conn.fd, local_sid) catch {};
             }
         }
     }
@@ -487,7 +492,8 @@ pub fn handleMucAdminIq(
     };
 
     // Verify requester is moderator+ (for kick) or admin+ (for ban)
-    const requester_idx = room.findBySessionId(session.conn.id) orelse {
+    const requester_global: usize = server.session_id_base + session.conn.id;
+    const requester_idx = room.findBySessionId(requester_global) orelse {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
         return;
     };
@@ -626,7 +632,8 @@ fn handleJoin(
     const r = room.?;
 
     // Check if already in room (rejoin = no-op with self-presence)
-    if (r.findBySessionId(session.conn.id)) |_| {
+    const global_check: usize = server.session_id_base + session.conn.id;
+    if (r.findBySessionId(global_check)) |_| {
         sendSelfPresence(server, session, r, nick, muc_host, changes);
         return;
     }
@@ -665,8 +672,10 @@ fn handleJoin(
         return;
     }
 
-    // Add occupant
-    _ = r.addOccupant(nick, real_jid, bare_jid, session.conn.id, server.worker_id, role, affiliation) catch {
+    // Add occupant — store GLOBAL session ID for cross-thread shared registry lookups.
+    // Local sessions[] access converts back: local = global - session_id_base.
+    const global_sid: usize = server.session_id_base + session.conn.id;
+    _ = r.addOccupant(nick, real_jid, bare_jid, global_sid, server.worker_id, role, affiliation) catch {
         sendPresenceError(server, session, room_local, muc_host, "service-unavailable", changes);
         return;
     };
@@ -676,7 +685,7 @@ fn handleJoin(
     // 1. Send existing occupants' presence to the new joiner
     for (&r.occupants) |*slot| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == session.conn.id) continue; // skip self
+        if (occ.session_id == global_sid) continue; // skip self
         sendOccupantPresence(server, session, r, &occ, muc_host, null, changes);
     }
 
@@ -699,7 +708,8 @@ fn handlePart(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const room = reg.findByJid(room_jid) orelse return;
-    const removed = room.removeBySessionId(session.conn.id) orelse return;
+    const global_sid: usize = server.session_id_base + session.conn.id;
+    const removed = room.removeBySessionId(global_sid) orelse return;
 
     log.info("{s} left {s}", .{ removed.getRealJid(), room_jid });
 
@@ -720,11 +730,14 @@ pub fn handleSessionClose(server: *Server, session_id: usize, changes: *ChangeLi
     if (server.delivery_system != null) reg.lock.lock();
     defer if (server.delivery_system != null) reg.lock.unlock();
 
+    // Occupants store global session IDs; convert from local
+    const global_sid: usize = server.session_id_base + session_id;
+
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;
         if (!room.active) continue;
 
-        const removed = room.removeBySessionId(session_id) orelse continue;
+        const removed = room.removeBySessionId(global_sid) orelse continue;
 
         broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 

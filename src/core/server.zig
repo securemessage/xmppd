@@ -286,6 +286,11 @@ pub const Server = struct {
     /// This worker's thread ID (0..N-1). Used for cross-thread routing decisions.
     worker_id: u16 = 0,
 
+    /// Base offset for mapping local session IDs to global shared registry slots.
+    /// Worker N's global ID = session_id_base + local_id.
+    /// Set by configureServer() to worker_id * max_sessions.
+    session_id_base: u32 = 0,
+
     /// Cross-thread delivery system (MPSC queues + wake pipes).
     /// Null in single-thread mode.
     delivery_system: ?*DeliverySystem = null,
@@ -2025,7 +2030,7 @@ pub const Server = struct {
             .available => {
                 // Initial presence — mark session as available, broadcast to subscribers
                 self.registry.setPresenceAvailable(session.conn.id, true);
-                if (self.shared_registry) |sr| sr.setPresenceAvailable(@intCast(session.conn.id), true);
+                if (self.shared_registry) |sr| sr.setPresenceAvailable(self.globalSessionId(session.conn.id), true);
                 self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
 
                 // Send presence probes to contacts we're subscribed to
@@ -2040,7 +2045,7 @@ pub const Server = struct {
             },
             .unavailable => {
                 self.registry.setPresenceAvailable(session.conn.id, false);
-                if (self.shared_registry) |sr| sr.setPresenceAvailable(@intCast(session.conn.id), false);
+                if (self.shared_registry) |sr| sr.setPresenceAvailable(self.globalSessionId(session.conn.id), false);
                 self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
             },
             .subscribe => {
@@ -2624,7 +2629,7 @@ pub const Server = struct {
                 };
                 // Register in shared registry (cross-thread — when workers > 1)
                 if (self.shared_registry) |sr| {
-                    sr.bind(@intCast(session.conn.id), self.worker_id, bound.local, bound.domain, bound.resource) catch |err| {
+                    sr.bind(self.globalSessionId(session.conn.id), self.worker_id, bound.local, bound.domain, bound.resource) catch |err| {
                         log.err("connection {d} shared registry bind failed (rolling back local): {}", .{ session.conn.id, err });
                         _ = self.registry.unbind(session.conn.id);
                         return;
@@ -2846,8 +2851,9 @@ pub const Server = struct {
             server: *Server,
             changes: *ChangeList,
             registry: *SharedSessionRegistry,
+            base: u32,
         };
-        const ctx = Ctx{ .server = self, .changes = changes, .registry = sr };
+        const ctx = Ctx{ .server = self, .changes = changes, .registry = sr, .base = self.session_id_base };
 
         _ = queue.drain(ctx, struct {
             fn handle(c: Ctx, session_id: u32, generation: u32, payload: []const u8) void {
@@ -2855,11 +2861,13 @@ pub const Server = struct {
                 const current_gen = c.registry.getGeneration(session_id) orelse return;
                 if (current_gen != generation) return;
 
-                // Deliver the stanza to the local session
-                const target_session = c.server.sessions[session_id] orelse return;
+                // Convert global session ID back to local index for sessions[] lookup.
+                // global = session_id_base + local → local = global - base
+                const local_id = session_id - c.base;
+                const target_session = c.server.sessions[local_id] orelse return;
                 target_session.conn.queueSend(payload) catch return;
                 if (target_session.conn.hasPendingWrite()) {
-                    c.changes.addWrite(target_session.conn.fd, session_id) catch {};
+                    c.changes.addWrite(target_session.conn.fd, local_id) catch {};
                 }
             }
         }.handle);
@@ -2873,7 +2881,7 @@ pub const Server = struct {
 
         // Unregister from shared registry (cross-thread — increments generation for ABA)
         if (self.shared_registry) |sr| {
-            _ = sr.unbind(@intCast(id));
+            _ = sr.unbind(self.globalSessionId(id));
         }
 
         // Unregister from local session registry and broadcast unavailable presence
@@ -2890,6 +2898,12 @@ pub const Server = struct {
         session.deinit();
         self.allocator.destroy(session);
         self.sessions[id] = null;
+    }
+
+    /// Convert a local session ID to a global shared registry slot.
+    /// Each worker's sessions are offset: global = session_id_base + local_id.
+    fn globalSessionId(self: *const Server, local_id: usize) u32 {
+        return self.session_id_base + @as(u32, @intCast(local_id));
     }
 
     fn allocateId(self: *Server) ?usize {
@@ -3219,33 +3233,38 @@ test "extractAttrValue: finds attribute" {
 test "cross-thread delivery: enqueue and drain" {
     const allocator = std.testing.allocator;
 
-    // Set up shared infrastructure
-    var shared_reg = try SharedSessionRegistry.init(allocator, 64);
+    // Set up shared infrastructure (128 total slots for 2 workers × 64 each)
+    var shared_reg = try SharedSessionRegistry.init(allocator, 128);
     defer shared_reg.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
     // Create a server that acts as worker 1 (the one draining)
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    // Worker 1 owns global slots 64..127 (base = 1 * 64 = 64)
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
+    server.session_id_base = 64; // worker 1 × 64 per_worker_sessions
     server.shared_registry = &shared_reg;
     server.delivery_system = &delivery_sys;
 
     // Create a target session on worker 1 using a socketpair
+    // Local session ID = 5, global = 64 + 5 = 69
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     session.* = Session.init(fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = session;
 
-    // Bind the session in the shared registry as worker 1
-    try shared_reg.bind(5, 1, "bob", "localhost", "desktop");
+    // Bind in shared registry using GLOBAL session ID
+    const global_id = server.globalSessionId(5);
+    try std.testing.expectEqual(@as(u32, 69), global_id);
+    try shared_reg.bind(global_id, 1, "bob", "localhost", "desktop");
 
-    // Simulate a cross-thread enqueue FROM worker 0 TO session 5 on worker 1
+    // Simulate a cross-thread enqueue FROM worker 0 TO session 69 on worker 1
     const route = shared_reg.findByFullJid("bob", "localhost", "desktop").?;
     try std.testing.expectEqual(@as(u16, 1), route.worker_id);
-    try std.testing.expectEqual(@as(u32, 5), route.session_id);
+    try std.testing.expectEqual(@as(u32, 69), route.session_id);
 
     // Build a stanza and enqueue it (as if worker 0 is sending)
     try delivery_sys.deliver(route.worker_id, route.session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");

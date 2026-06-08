@@ -414,6 +414,7 @@ const WorkerArgs = struct {
 /// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and shared registry.
 fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     server.worker_id = worker_id;
+    server.session_id_base = @as(u32, worker_id) * @as(u32, @intCast(ctx.per_worker_sessions));
     if (ctx.shared_registry) |sr| {
         server.shared_registry = sr;
     }
