@@ -1570,14 +1570,17 @@ pub const Server = struct {
                 }
 
                 for (s2s_entries[0..target_count]) |entry| {
-                    if (entry.worker_id != self.worker_id) continue; // S2S inbound only delivers locally
-                    const target_session = self.sessions[entry.local_session_id] orelse continue;
-                    target_session.conn.queueSend(m.stanza_xml) catch continue;
-                    if (target_session.conn.hasPendingWrite()) {
-                        changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
+                    if (entry.worker_id == self.worker_id) {
+                        const target_session = self.sessions[entry.local_session_id] orelse continue;
+                        target_session.conn.queueSend(m.stanza_xml) catch continue;
+                        if (target_session.conn.hasPendingWrite()) {
+                            changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
+                        }
+                    } else if (self.delivery_system) |ds| {
+                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml) catch {};
                     }
                 }
-                log.info("S2S inbound from {s} delivered to {d} local session(s)", .{ m.from_jid, target_count });
+                log.info("S2S inbound from {s} delivered to {d} session(s)", .{ m.from_jid, target_count });
             },
             .s2s_delivery_failed => |m| {
                 // Delivery to remote failed — bounce error to original sender
@@ -1593,22 +1596,28 @@ pub const Server = struct {
                     break :blk @as(usize, 0);
                 } else fail_sm.findAvailableByBareJid(from_jid.local, from_jid.domain, &sender_entries);
 
+                // Build error stanza once for all targets
+                var err_buf: [1024]u8 = undefined;
+                var err_fbs = std.io.fixedBufferStream(&err_buf);
+                const ew = err_fbs.writer();
+                ew.writeAll("<message type='error' from='") catch return;
+                ew.writeAll(m.to_jid) catch return;
+                ew.writeAll("' to='") catch return;
+                ew.writeAll(m.from_jid) catch return;
+                ew.writeAll("'><error type='cancel'><") catch return;
+                ew.writeAll(m.error_type) catch return;
+                ew.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+                const err_xml = err_fbs.getWritten();
+
                 for (sender_entries[0..sender_count]) |sentry| {
-                    if (sentry.worker_id != self.worker_id) continue;
-                    const sender_session = self.sessions[sentry.local_session_id] orelse continue;
-                    var err_buf: [1024]u8 = undefined;
-                    var err_fbs = std.io.fixedBufferStream(&err_buf);
-                    const ew = err_fbs.writer();
-                    ew.writeAll("<message type='error' from='") catch continue;
-                    ew.writeAll(m.to_jid) catch continue;
-                    ew.writeAll("' to='") catch continue;
-                    ew.writeAll(m.from_jid) catch continue;
-                    ew.writeAll("'><error type='cancel'><") catch continue;
-                    ew.writeAll(m.error_type) catch continue;
-                    ew.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch continue;
-                    sender_session.conn.queueSend(err_fbs.getWritten()) catch continue;
-                    if (sender_session.conn.hasPendingWrite()) {
-                        changes.addWrite(sender_session.conn.fd, sentry.local_session_id) catch {};
+                    if (sentry.worker_id == self.worker_id) {
+                        const sender_session = self.sessions[sentry.local_session_id] orelse continue;
+                        sender_session.conn.queueSend(err_xml) catch continue;
+                        if (sender_session.conn.hasPendingWrite()) {
+                            changes.addWrite(sender_session.conn.fd, sentry.local_session_id) catch {};
+                        }
+                    } else if (self.delivery_system) |ds| {
+                        ds.deliver(sentry.worker_id, sentry.local_session_id, sentry.generation, err_xml) catch {};
                     }
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
@@ -2085,20 +2094,26 @@ pub const Server = struct {
         from_fbs.writer().writeAll(owner_bare) catch return;
         const from_str = from_fbs.getWritten();
 
+        // Build presence stanza once for all targets
+        var sub_pres_buf: [512]u8 = undefined;
+        var sub_pres_fbs = std.io.fixedBufferStream(&sub_pres_buf);
+        const spw = sub_pres_fbs.writer();
+        spw.writeAll("<presence from='") catch return;
+        spw.writeAll(from_str) catch return;
+        spw.writeAll("' to='") catch return;
+        spw.writeAll(to_str) catch return;
+        spw.writeAll("' type='subscribe'/>") catch return;
+        const sub_pres_xml = sub_pres_fbs.getWritten();
+
         for (sub_entries[0..target_count]) |ent| {
-            if (ent.worker_id != self.worker_id) continue;
-            const target_session = self.sessions[ent.local_session_id] orelse continue;
-            var pres_buf: [512]u8 = undefined;
-            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const ppw = pres_fbs.writer();
-            ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(from_str) catch continue;
-            ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
-            ppw.writeAll("' type='subscribe'/>") catch continue;
-            target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+            if (ent.worker_id == self.worker_id) {
+                const target_session = self.sessions[ent.local_session_id] orelse continue;
+                target_session.conn.queueSend(sub_pres_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                }
+            } else if (self.delivery_system) |ds| {
+                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sub_pres_xml) catch {};
             }
         }
 
@@ -2156,20 +2171,26 @@ pub const Server = struct {
         var sd_entries: [16]SessionEntry = undefined;
         const target_count = sd_sm.findByBareJid(to_jid.local, to_jid.domain, &sd_entries);
 
+        // Build presence stanza once for all targets
+        var sd_pres_buf: [512]u8 = undefined;
+        var sd_pres_fbs = std.io.fixedBufferStream(&sd_pres_buf);
+        const sdpw = sd_pres_fbs.writer();
+        sdpw.writeAll("<presence from='") catch return;
+        sdpw.writeAll(owner_bare) catch return;
+        sdpw.writeAll("' to='") catch return;
+        sdpw.writeAll(to_str) catch return;
+        sdpw.writeAll("' type='subscribed'/>") catch return;
+        const sd_pres_xml = sd_pres_fbs.getWritten();
+
         for (sd_entries[0..target_count]) |ent| {
-            if (ent.worker_id != self.worker_id) continue;
-            const target_session = self.sessions[ent.local_session_id] orelse continue;
-            var pres_buf: [512]u8 = undefined;
-            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const ppw = pres_fbs.writer();
-            ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(owner_bare) catch continue;
-            ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
-            ppw.writeAll("' type='subscribed'/>") catch continue;
-            target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+            if (ent.worker_id == self.worker_id) {
+                const target_session = self.sessions[ent.local_session_id] orelse continue;
+                target_session.conn.queueSend(sd_pres_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                }
+            } else if (self.delivery_system) |ds| {
+                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sd_pres_xml) catch {};
             }
         }
 
@@ -2228,20 +2249,26 @@ pub const Server = struct {
         const unsub_sm = self.session_map orelse return;
         var unsub_entries: [16]SessionEntry = undefined;
         const target_count = unsub_sm.findByBareJid(to_jid.local, to_jid.domain, &unsub_entries);
+        // Build presence stanza once for all targets
+        var unsub_pres_buf: [512]u8 = undefined;
+        var unsub_pres_fbs = std.io.fixedBufferStream(&unsub_pres_buf);
+        const usbw = unsub_pres_fbs.writer();
+        usbw.writeAll("<presence from='") catch return;
+        usbw.writeAll(owner_bare) catch return;
+        usbw.writeAll("' to='") catch return;
+        usbw.writeAll(to_str) catch return;
+        usbw.writeAll("' type='unsubscribe'/>") catch return;
+        const unsub_pres_xml = unsub_pres_fbs.getWritten();
+
         for (unsub_entries[0..target_count]) |ent| {
-            if (ent.worker_id != self.worker_id) continue;
-            const target_session = self.sessions[ent.local_session_id] orelse continue;
-            var pres_buf: [512]u8 = undefined;
-            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const ppw = pres_fbs.writer();
-            ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(owner_bare) catch continue;
-            ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
-            ppw.writeAll("' type='unsubscribe'/>") catch continue;
-            target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+            if (ent.worker_id == self.worker_id) {
+                const target_session = self.sessions[ent.local_session_id] orelse continue;
+                target_session.conn.queueSend(unsub_pres_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                }
+            } else if (self.delivery_system) |ds| {
+                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsub_pres_xml) catch {};
             }
         }
 
@@ -2293,20 +2320,26 @@ pub const Server = struct {
         const unsd_sm = self.session_map orelse return;
         var unsd_entries: [16]SessionEntry = undefined;
         const target_count = unsd_sm.findByBareJid(to_jid.local, to_jid.domain, &unsd_entries);
+        // Build presence stanza once for all targets
+        var unsd_pres_buf: [512]u8 = undefined;
+        var unsd_pres_fbs = std.io.fixedBufferStream(&unsd_pres_buf);
+        const usdw = unsd_pres_fbs.writer();
+        usdw.writeAll("<presence from='") catch return;
+        usdw.writeAll(owner_bare) catch return;
+        usdw.writeAll("' to='") catch return;
+        usdw.writeAll(to_str) catch return;
+        usdw.writeAll("' type='unsubscribed'/>") catch return;
+        const unsd_pres_xml = unsd_pres_fbs.getWritten();
+
         for (unsd_entries[0..target_count]) |ent| {
-            if (ent.worker_id != self.worker_id) continue;
-            const target_session = self.sessions[ent.local_session_id] orelse continue;
-            var pres_buf: [512]u8 = undefined;
-            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const ppw = pres_fbs.writer();
-            ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(owner_bare) catch continue;
-            ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
-            ppw.writeAll("' type='unsubscribed'/>") catch continue;
-            target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+            if (ent.worker_id == self.worker_id) {
+                const target_session = self.sessions[ent.local_session_id] orelse continue;
+                target_session.conn.queueSend(unsd_pres_xml) catch continue;
+                if (target_session.conn.hasPendingWrite()) {
+                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                }
+            } else if (self.delivery_system) |ds| {
+                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsd_pres_xml) catch {};
             }
         }
 
