@@ -59,7 +59,7 @@ pub fn main() !void {
     var db_path: ?[]const u8 = null;
     var muc_host_arg: ?[]const u8 = null;
     var config_path: ?[]const u8 = null;
-    var listen_fd: ?std.posix.fd_t = null;
+    var listen_fd_str: ?[]const u8 = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
 
@@ -107,12 +107,8 @@ pub fn main() !void {
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--listen-fd")) {
-            const val = args.next() orelse {
+            listen_fd_str = args.next() orelse {
                 log.err("--listen-fd requires a value", .{});
-                return error.InvalidArgs;
-            };
-            listen_fd = std.fmt.parseInt(std.posix.fd_t, val, 10) catch {
-                log.err("invalid fd number: {s}", .{val});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--db")) {
@@ -192,40 +188,32 @@ pub fn main() !void {
     }
     defer if (cfg) |*c| c.deinit();
 
-    log.info("starting xmppd-core host={s} address={s} port={d} max_sessions={d}", .{ host, address, port, max_sessions });
+    // Parse listen fd list (comma-separated)
+    const MAX_LISTEN_FDS = 64;
+    var listen_fds: [MAX_LISTEN_FDS]std.posix.fd_t = undefined;
+    var listen_fd_count: usize = 0;
 
-    var server = if (listen_fd) |fd|
-        try Server.initFromFd(host, fd, allocator, max_sessions)
-    else
-        try Server.initWithMaxSessions(host, address, port, allocator, max_sessions);
-    server.fanout_queue.batch_size = fan_out_batch_size;
-    defer server.deinit();
-
-    // Configure TLS if cert and key are provided
-    if (cert_path) |cert| {
-        const key = key_path orelse {
-            log.err("--cert requires --key", .{});
-            return error.InvalidArgs;
-        };
-        try server.configureTls(cert, key);
-        log.info("TLS configured: cert={s} key={s}", .{ cert, key });
+    if (listen_fd_str) |fd_str| {
+        var iter = std.mem.splitScalar(u8, fd_str, ',');
+        while (iter.next()) |part| {
+            if (listen_fd_count >= MAX_LISTEN_FDS) break;
+            listen_fds[listen_fd_count] = std.fmt.parseInt(std.posix.fd_t, part, 10) catch {
+                log.err("invalid fd number in list: {s}", .{part});
+                return error.InvalidArgs;
+            };
+            listen_fd_count += 1;
+        }
     }
 
-    // Connect to auth daemon if socket path is provided
-    if (auth_socket) |socket_path| {
-        server.configureAuth(socket_path) catch {
-            log.warn("auth daemon not available, SASL auth will fail", .{});
-        };
-    }
+    // Per-worker session quota
+    const worker_count: usize = if (listen_fd_count > 0) listen_fd_count else 1;
+    const per_worker_sessions = max_sessions / worker_count;
 
-    // Connect to S2S daemon if socket path is provided
-    if (s2s_socket) |socket_path| {
-        server.configureS2s(socket_path) catch {
-            log.warn("S2S daemon not available, remote delivery will bounce", .{});
-        };
-    }
+    log.info("starting xmppd-core host={s} address={s} port={d} workers={d} sessions_per_worker={d}", .{
+        host, address, port, worker_count, per_worker_sessions,
+    });
 
-    // Open operational stores at {db_path}/op
+    // Open storage backends (shared across workers — backends are thread-safe)
     var op_backend: ?OpBackendType = null;
     var roster_store: ?GenericRosterStore = null;
     var offline_store: ?GenericOfflineStore(OpBackendType) = null;
@@ -241,14 +229,11 @@ pub fn main() !void {
             return error.StorageOpenFailed;
         };
         roster_store = GenericRosterStore.init(&op_backend.?);
-        server.configureRoster(&roster_store.?);
         offline_store = GenericOfflineStore(OpBackendType).init(&op_backend.?, allocator);
         vcard_store = GenericVCardStore.init(&op_backend.?);
-        server.configureVcard(&vcard_store.?);
     }
     defer if (op_backend) |*b| b.close();
 
-    // Open archive store at {db_path}/archive (separate backend)
     var archive_backend: ?ArchiveBackendType = null;
     var archive_store: ?archive_store_mod.ArchiveStore(ArchiveBackendType) = null;
     if (db_path) |db| {
@@ -262,31 +247,90 @@ pub fn main() !void {
             return error.StorageOpenFailed;
         };
         archive_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&archive_backend.?, allocator);
-        if (offline_store != null) {
-            server.configureOffline(&offline_store.?, &archive_store.?);
-        }
     }
     defer if (archive_backend) |*b| b.close();
 
-    // Configure MUC (Multi-User Chat)
+    // MUC host resolution
     var muc_host_buf: [256]u8 = undefined;
     var room_registry: ?RoomRegistry = null;
     const effective_muc_host: ?[]const u8 = if (muc_host_arg) |h| h else blk: {
-        // Default: conference.{host}
         const muc_default = std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch null;
         break :blk muc_default;
     };
-    if (effective_muc_host) |muc_host| {
+    if (effective_muc_host) |_| {
         room_registry = RoomRegistry.init(allocator);
-        server.room_registry = &room_registry.?;
-        server.muc_host = muc_host;
-        log.info("MUC service enabled: {s}", .{muc_host});
     }
     defer if (room_registry) |*reg| reg.deinit();
 
-    log.info("listening on {s}:{d}", .{ address, port });
-    try server.run();
-    log.info("shutdown complete", .{});
+    // Worker context shared across threads
+    var ctx = WorkerCtx{
+        .host = host,
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .auth_socket = auth_socket,
+        .s2s_socket = s2s_socket,
+        .per_worker_sessions = per_worker_sessions,
+        .fan_out_batch_size = fan_out_batch_size,
+        .roster = if (roster_store != null) &roster_store.? else null,
+        .offline = if (offline_store != null) &offline_store.? else null,
+        .archive = if (archive_store != null) &archive_store.? else null,
+        .vcard = if (vcard_store != null) &vcard_store.? else null,
+        .room_registry = if (room_registry != null) &room_registry.? else null,
+        .muc_host = effective_muc_host,
+        .allocator = allocator,
+    };
+
+    // Single-fd (legacy / dev mode): run directly on main thread
+    if (listen_fd_count <= 1) {
+        var server = if (listen_fd_count == 1)
+            try Server.initFromFd(host, listen_fds[0], allocator, per_worker_sessions)
+        else
+            try Server.initWithMaxSessions(host, address, port, allocator, per_worker_sessions);
+        server.fanout_queue.batch_size = fan_out_batch_size;
+        defer server.deinit();
+
+        configureServer(&server, &ctx);
+
+        log.info("listening on {s}:{d} (single worker)", .{ address, port });
+        try server.run();
+        log.info("shutdown complete", .{});
+        return;
+    }
+
+    // Multi-fd: spawn N-1 threads, main thread takes the last fd
+    var threads: [MAX_LISTEN_FDS]std.Thread = undefined;
+    var worker_args: [MAX_LISTEN_FDS]WorkerArgs = undefined;
+
+    var spawned: usize = 0;
+    var i: usize = 0;
+    while (i < listen_fd_count - 1) : (i += 1) {
+        worker_args[i] = .{ .fd = listen_fds[i], .worker_id = i, .ctx = &ctx };
+        threads[i] = std.Thread.spawn(.{}, workerThread, .{&worker_args[i]}) catch |err| {
+            log.err("failed to spawn worker thread {d}: {}", .{ i, err });
+            break;
+        };
+        spawned += 1;
+    }
+
+    // Main thread runs the last worker
+    log.info("main thread running worker {d}", .{listen_fd_count - 1});
+    {
+        var server = try Server.initFromFd(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions);
+        server.fanout_queue.batch_size = fan_out_batch_size;
+        defer server.deinit();
+        configureServer(&server, &ctx);
+        server.run() catch |err| {
+            log.err("main worker error: {}", .{err});
+        };
+    }
+
+    // Join all spawned threads
+    i = 0;
+    while (i < spawned) : (i += 1) {
+        threads[i].join();
+    }
+
+    log.info("shutdown complete ({d} workers)", .{worker_count});
 }
 
 fn printUsage() void {
@@ -301,7 +345,7 @@ fn printUsage() void {
         \\  --key PATH       TLS private key file (PEM)
         \\  --auth-socket PATH  Auth daemon IPC socket
         \\  --s2s-socket PATH   S2S federation daemon IPC socket
-        \\  --listen-fd N    Pre-bound listener fd (from master)
+        \\  --listen-fd N[,N...]  Pre-bound listener fd(s) from master (comma-separated for multi-worker)
         \\  --db PATH        User database path (roster stored alongside)
         \\  --muc-host HOST  MUC service hostname (default: conference.{host})
         \\  --help, -h       Show this help
@@ -310,4 +354,92 @@ fn printUsage() void {
     var buf: [0]u8 = .{};
     var stdout = std.fs.File.stdout().writer(&buf);
     stdout.interface.writeAll(usage) catch {};
+}
+
+/// Worker context struct (defined at file scope for thread function signature).
+const WorkerCtx = struct {
+    host: []const u8,
+    cert_path: ?[:0]const u8,
+    key_path: ?[:0]const u8,
+    auth_socket: ?[]const u8,
+    s2s_socket: ?[]const u8,
+    per_worker_sessions: usize,
+    fan_out_batch_size: u8,
+    roster: ?*GenericRosterStore,
+    offline: ?*GenericOfflineStore(OpBackendType),
+    archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
+    vcard: ?*GenericVCardStore,
+    room_registry: ?*RoomRegistry,
+    muc_host: ?[]const u8,
+    allocator: std.mem.Allocator,
+};
+
+/// Worker thread arguments.
+const WorkerArgs = struct {
+    fd: std.posix.fd_t,
+    worker_id: usize,
+    ctx: *WorkerCtx,
+};
+
+/// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, and MUC.
+fn configureServer(server: *Server, ctx: *WorkerCtx) void {
+    if (ctx.cert_path) |cert| {
+        const key = ctx.key_path orelse {
+            log.err("--cert requires --key", .{});
+            return;
+        };
+        server.configureTls(cert, key) catch {
+            log.err("TLS configuration failed", .{});
+            return;
+        };
+    }
+
+    if (ctx.auth_socket) |socket_path| {
+        server.configureAuth(socket_path) catch {
+            log.warn("auth daemon not available, SASL auth will fail", .{});
+        };
+    }
+
+    if (ctx.s2s_socket) |socket_path| {
+        server.configureS2s(socket_path) catch {
+            log.warn("S2S daemon not available, remote delivery will bounce", .{});
+        };
+    }
+
+    if (ctx.roster) |r| server.configureRoster(r);
+    if (ctx.vcard) |v| server.configureVcard(v);
+    if (ctx.offline != null and ctx.archive != null) {
+        server.configureOffline(ctx.offline.?, ctx.archive.?);
+    }
+
+    if (ctx.room_registry) |reg| {
+        server.room_registry = reg;
+        server.muc_host = ctx.muc_host;
+    }
+}
+
+/// Thread entry point for worker threads. Each thread owns its own Server
+/// with its own kqueue and listener fd.
+fn workerThread(args: *WorkerArgs) void {
+    log.info("worker {d} starting (fd={d})", .{ args.worker_id, args.fd });
+
+    var server = Server.initFromFd(
+        args.ctx.host,
+        args.fd,
+        args.ctx.allocator,
+        args.ctx.per_worker_sessions,
+    ) catch |err| {
+        log.err("worker {d} init failed: {}", .{ args.worker_id, err });
+        return;
+    };
+    server.fanout_queue.batch_size = args.ctx.fan_out_batch_size;
+    defer server.deinit();
+
+    configureServer(&server, args.ctx);
+
+    server.run() catch |err| {
+        log.err("worker {d} error: {}", .{ args.worker_id, err });
+    };
+
+    log.info("worker {d} stopped", .{args.worker_id});
 }

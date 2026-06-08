@@ -46,8 +46,13 @@ key = /usr/local/etc/xmppd/server.key
 # ==========================================================================
 
 [core]
-# Maximum simultaneous client connections (default: 4096)
-# Memory cost: ~60KB per session. 4096 sessions ≈ 240MB, 16384 ≈ 960MB.
+# Number of worker threads (default: auto = CPU core count).
+# Each worker has its own kqueue event loop and SO_REUSEPORT listener.
+# The kernel distributes incoming connections across workers.
+# workers = auto
+
+# Maximum simultaneous client connections total (default: 4096)
+# Divided equally among workers. Memory cost: ~60KB per session.
 # max_sessions = 4096
 
 # Fan-out batch size — number of MUC occupants delivered per event loop

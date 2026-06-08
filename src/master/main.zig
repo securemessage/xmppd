@@ -60,6 +60,7 @@ pub fn main() !void {
     var run_user: ?[]const u8 = null;
     var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
     var daemonize: bool = false;
+    var workers: u16 = 0; // 0 = auto-detect CPU count
 
     // Skip argv[0]
     _ = args.next();
@@ -177,6 +178,13 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, s2s_port, "5269")) {
             if (c.get("s2s", "port")) |v| s2s_port = v;
+        }
+
+        // [core] section — workers
+        if (workers == 0) {
+            if (c.get("core", "workers")) |v| {
+                workers = std.fmt.parseInt(u16, v, 10) catch 0;
+            }
         }
 
         // [master] section
@@ -301,32 +309,65 @@ pub fn main() !void {
         };
     }
 
+    // --- Resolve worker count ---
+    // 0 = auto-detect from hw.ncpu sysctl (FreeBSD) or fallback to 1
+    if (workers == 0) {
+        workers = detectCpuCount();
+    }
+    if (workers < 1) workers = 1;
+    if (workers > 64) workers = 64;
+    log.info("worker threads: {d}", .{workers});
+
     // --- Bind privileged ports while still root ---
-    // Fds survive fork+exec (no CLOEXEC) — children use --listen-fd N.
-    var c2s_listen_fd: posix.fd_t = -1;
+    // Create N C2S sockets with SO_REUSEPORT (one per worker thread).
+    // Fds survive fork+exec (no CLOEXEC) — children use --listen-fd 5,6,7,...
+    const MAX_WORKERS = 64;
+    var c2s_listen_fds: [MAX_WORKERS]posix.fd_t = .{-1} ** MAX_WORKERS;
+    var c2s_fd_count: u16 = 0;
     var s2s_listen_fd: posix.fd_t = -1;
     {
         const c2s_port_num = std.fmt.parseInt(u16, port, 10) catch 5222;
-        c2s_listen_fd = bindListenerSocket("0.0.0.0", c2s_port_num) catch |err| {
-            log.err("failed to bind C2S port {s}: {}", .{ port, err });
-            return error.BindFailed;
-        };
-        log.info("bound C2S listener fd={d} port={s}", .{ c2s_listen_fd, port });
+        var i: u16 = 0;
+        while (i < workers) : (i += 1) {
+            c2s_listen_fds[i] = bindListenerSocket("0.0.0.0", c2s_port_num, true) catch |err| {
+                log.err("failed to bind C2S port {s} (socket {d}): {}", .{ port, i, err });
+                return error.BindFailed;
+            };
+            c2s_fd_count += 1;
+        }
+        log.info("bound {d} C2S listener sockets on port {s} (SO_REUSEPORT)", .{ c2s_fd_count, port });
     }
     if (s2s_enabled) {
         const s2s_port_num = std.fmt.parseInt(u16, s2s_port, 10) catch 5269;
-        s2s_listen_fd = bindListenerSocket("0.0.0.0", s2s_port_num) catch |err| {
+        s2s_listen_fd = bindListenerSocket("0.0.0.0", s2s_port_num, false) catch |err| {
             log.err("failed to bind S2S port {s}: {}", .{ s2s_port, err });
             return error.BindFailed;
         };
         log.info("bound S2S listener fd={d} port={s}", .{ s2s_listen_fd, s2s_port });
     }
-    defer if (c2s_listen_fd >= 0) posix.close(c2s_listen_fd);
+    defer {
+        var i: u16 = 0;
+        while (i < c2s_fd_count) : (i += 1) {
+            if (c2s_listen_fds[i] >= 0) posix.close(c2s_listen_fds[i]);
+        }
+    }
     defer if (s2s_listen_fd >= 0) posix.close(s2s_listen_fd);
 
-    // Format fd numbers as strings for child argv
-    var c2s_fd_str_buf: [12]u8 = undefined;
-    const c2s_fd_str = std.fmt.bufPrint(&c2s_fd_str_buf, "{d}", .{c2s_listen_fd}) catch "3";
+    // Format fd numbers as comma-separated string for --listen-fd arg
+    var c2s_fd_str_buf: [256]u8 = undefined;
+    var c2s_fd_str_len: usize = 0;
+    {
+        var i: u16 = 0;
+        while (i < c2s_fd_count) : (i += 1) {
+            if (i > 0) {
+                c2s_fd_str_buf[c2s_fd_str_len] = ',';
+                c2s_fd_str_len += 1;
+            }
+            const written = std.fmt.bufPrint(c2s_fd_str_buf[c2s_fd_str_len..], "{d}", .{c2s_listen_fds[i]}) catch break;
+            c2s_fd_str_len += written.len;
+        }
+    }
+    const c2s_fd_str = c2s_fd_str_buf[0..c2s_fd_str_len];
     var s2s_fd_str_buf: [12]u8 = undefined;
     const s2s_fd_str = std.fmt.bufPrint(&s2s_fd_str_buf, "{d}", .{s2s_listen_fd}) catch "4";
 
@@ -659,9 +700,11 @@ fn printUsage() void {
 }
 
 /// Bind a non-blocking, SO_REUSEADDR TCP socket on the given address and port.
+/// When `reuseport` is true, also sets SO_REUSEPORT to allow multiple sockets
+/// bound to the same port — the kernel distributes incoming connections across them.
 /// Returns the listening fd. Used by the master to bind privileged ports
 /// before dropping privileges and passing fds to children.
-fn bindListenerSocket(address: []const u8, bind_port: u16) !posix.fd_t {
+fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
     const fd = try posix.socket(
         posix.AF.INET,
         posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
@@ -671,6 +714,9 @@ fn bindListenerSocket(address: []const u8, bind_port: u16) !posix.fd_t {
 
     const one: c_int = 1;
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+    if (reuseport) {
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
+    }
 
     var addr = std.c.sockaddr.in{
         .port = std.mem.nativeToBig(u16, bind_port),
@@ -688,4 +734,24 @@ fn bindListenerSocket(address: []const u8, bind_port: u16) !posix.fd_t {
 
     posix.listen(fd, 128) catch return error.SystemResources;
     return fd;
+}
+
+/// Detect the number of CPU cores available.
+/// Uses hw.ncpu sysctl on FreeBSD, falls back to 1.
+fn detectCpuCount() u16 {
+    // sysctlbyname("hw.ncpu")
+    var ncpu: c_int = 1;
+    var len: usize = @sizeOf(c_int);
+    const name = "hw.ncpu";
+    const ret = std.c.sysctlbyname(
+        @ptrCast(name.ptr),
+        @ptrCast(&ncpu),
+        &len,
+        null,
+        0,
+    );
+    if (ret == 0 and ncpu > 0) {
+        return @intCast(@min(ncpu, 64));
+    }
+    return 1;
 }
