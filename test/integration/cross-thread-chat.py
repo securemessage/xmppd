@@ -14,7 +14,7 @@ Usage:
     python3 cross-thread-chat.py [--host HOST] [--port PORT] [--count N]
 """
 
-import socket, ssl, time, base64, sys, argparse
+import socket, ssl, time, base64, sys, argparse, threading
 
 HOST = '127.0.0.1'
 PORT = 5222
@@ -28,11 +28,12 @@ def make_sasl_plain(user, password):
 
 
 class XmppClient:
-    def __init__(self, user, resource='test'):
+    def __init__(self, user, domain='localhost', resource='test'):
         self.user = user
+        self.domain = domain
         self.resource = resource
-        self.jid = f'{user}@localhost/{resource}'
-        self.bare = f'{user}@localhost'
+        self.jid = f'{user}@{domain}/{resource}'
+        self.bare = f'{user}@{domain}'
         self.sock = None
         self.tls = None
 
@@ -151,13 +152,53 @@ def test_cross_thread(host, port, domain, users, use_tls):
     clients = {}
 
     try:
-        # Phase 1: Connect all clients
-        print(f"\n[Phase 1] Connecting {count} clients...")
+        # Phase 1: Connect all clients concurrently
+        # Concurrent TCP connects force SO_REUSEPORT to distribute across workers.
+        # Sequential connects tend to land on the same worker (kernel affinity).
+        print(f"\n[Phase 1] Connecting {count} clients concurrently...")
+        errors = {}
+        barrier = threading.Barrier(count)
+
+        def connect_user(user):
+            try:
+                c = XmppClient(user, domain, 'cross-thread')
+                c.connect(host, port)
+                # Wait for all threads to have TCP sockets open before proceeding.
+                # This ensures SO_REUSEPORT distributes them across workers.
+                barrier.wait(timeout=5)
+                # Small stagger to avoid overwhelming auth daemon with simultaneous SASL
+                import random
+                time.sleep(random.uniform(0.05, 0.3))
+                # Now do TLS + SASL + bind + presence
+                resp = c.stream_open(domain)
+                if '<starttls' in resp and use_tls:
+                    c.starttls()
+                    c.stream_open(domain)
+                c.auth_plain()
+                c.stream_open(domain)
+                c.bind()
+                c.send_presence()
+                time.sleep(0.2)
+                c.recv(timeout=0.5)  # drain presence
+                clients[user] = c
+            except Exception as e:
+                errors[user] = e
+
+        threads = []
         for user in users:
-            c = XmppClient(user, 'cross-thread')
-            full_connect(c, host, port, domain, use_tls)
-            clients[user] = c
-            print(f"    ✓ {c.jid} connected")
+            t = threading.Thread(target=connect_user, args=(user,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=10)
+
+        for user, err in errors.items():
+            print(f"    ✗ {user} failed: {err}")
+        if errors:
+            raise RuntimeError(f"{len(errors)} clients failed to connect")
+
+        for user in users:
+            print(f"    ✓ {clients[user].jid} connected")
 
         time.sleep(0.5)  # Let presence settle
 
@@ -183,7 +224,7 @@ def test_cross_thread(host, port, domain, users, use_tls):
             resp = receiver.recv_until('</message>', timeout=3)
 
             if '<message' in resp and expected_body in resp:
-                from_jid = f"{sender_name}@localhost/cross-thread"
+                from_jid = f"{sender_name}@{domain}/cross-thread"
                 if f"from='{from_jid}'" in resp:
                     print(f"    ✓ {receiver_name} received from {sender_name}")
                     passed += 1
