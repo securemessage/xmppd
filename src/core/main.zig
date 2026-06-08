@@ -37,6 +37,10 @@ const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
+const shared_registry_mod = @import("shared_registry");
+const SharedSessionRegistry = shared_registry_mod.SharedSessionRegistry;
+const delivery_queue_mod = @import("delivery_queue");
+const DeliverySystem = delivery_queue_mod.DeliverySystem;
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -262,6 +266,28 @@ pub fn main() !void {
     }
     defer if (room_registry) |*reg| reg.deinit();
 
+    // Shared session registry — allocated only when workers > 1
+    var shared_reg: ?SharedSessionRegistry = null;
+    if (worker_count > 1) {
+        shared_reg = SharedSessionRegistry.init(allocator, @intCast(max_sessions)) catch |err| {
+            log.err("failed to allocate shared session registry: {}", .{err});
+            return error.RegistryInitFailed;
+        };
+        log.info("shared session registry allocated: {d} slots", .{max_sessions});
+    }
+    defer if (shared_reg) |*sr| sr.deinit();
+
+    // Delivery system (MPSC queues + wake pipes) — allocated only when workers > 1
+    var delivery_sys: ?DeliverySystem = null;
+    if (worker_count > 1) {
+        delivery_sys = DeliverySystem.init(allocator, @intCast(worker_count)) catch |err| {
+            log.err("failed to allocate delivery system: {}", .{err});
+            return error.DeliverySystemInitFailed;
+        };
+        log.info("delivery system allocated: {d} worker queues", .{worker_count});
+    }
+    defer if (delivery_sys) |*ds| ds.deinit();
+
     // Worker context shared across threads
     var ctx = WorkerCtx{
         .host = host,
@@ -277,6 +303,8 @@ pub fn main() !void {
         .vcard = if (vcard_store != null) &vcard_store.? else null,
         .room_registry = if (room_registry != null) &room_registry.? else null,
         .muc_host = effective_muc_host,
+        .shared_registry = if (shared_reg) |*sr| sr else null,
+        .delivery_system = if (delivery_sys) |*ds| ds else null,
         .allocator = allocator,
     };
 
@@ -289,7 +317,7 @@ pub fn main() !void {
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
 
-        configureServer(&server, &ctx);
+        configureServer(&server, &ctx, 0);
 
         log.info("listening on {s}:{d} (single worker)", .{ address, port });
         try server.run();
@@ -318,7 +346,7 @@ pub fn main() !void {
         var server = try Server.initFromFd(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions);
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
-        configureServer(&server, &ctx);
+        configureServer(&server, &ctx, @intCast(listen_fd_count - 1));
         server.run() catch |err| {
             log.err("main worker error: {}", .{err});
         };
@@ -371,6 +399,8 @@ const WorkerCtx = struct {
     vcard: ?*GenericVCardStore,
     room_registry: ?*RoomRegistry,
     muc_host: ?[]const u8,
+    shared_registry: ?*SharedSessionRegistry,
+    delivery_system: ?*DeliverySystem,
     allocator: std.mem.Allocator,
 };
 
@@ -381,8 +411,15 @@ const WorkerArgs = struct {
     ctx: *WorkerCtx,
 };
 
-/// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, and MUC.
-fn configureServer(server: *Server, ctx: *WorkerCtx) void {
+/// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and shared registry.
+fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
+    server.worker_id = worker_id;
+    if (ctx.shared_registry) |sr| {
+        server.shared_registry = sr;
+    }
+    if (ctx.delivery_system) |ds| {
+        server.delivery_system = ds;
+    }
     if (ctx.cert_path) |cert| {
         const key = ctx.key_path orelse {
             log.err("--cert requires --key", .{});
@@ -435,7 +472,7 @@ fn workerThread(args: *WorkerArgs) void {
     server.fanout_queue.batch_size = args.ctx.fan_out_batch_size;
     defer server.deinit();
 
-    configureServer(&server, args.ctx);
+    configureServer(&server, args.ctx, @intCast(args.worker_id));
 
     server.run() catch |err| {
         log.err("worker {d} error: {}", .{ args.worker_id, err });

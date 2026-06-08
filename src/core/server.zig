@@ -51,6 +51,10 @@ const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const Subscription = generic_roster.Subscription;
 const SessionRegistry = @import("session_registry").SessionRegistry;
+const shared_registry_mod = @import("shared_registry");
+const SharedSessionRegistry = shared_registry_mod.SharedSessionRegistry;
+const delivery_queue_mod = @import("delivery_queue");
+const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const OfflinePointer = generic_offline.OfflinePointer;
@@ -79,6 +83,9 @@ pub const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
 
 /// Sentinel value for S2S IPC fd in kqueue udata.
 const IPC_S2S_UDATA = LISTENER_UDATA - 2;
+
+/// Sentinel value for delivery system wake pipe fd in kqueue udata.
+const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
 
 /// Maximum changelist entries per event loop iteration.
 const CHANGE_BUF_SIZE = 256;
@@ -269,8 +276,19 @@ pub const Server = struct {
     /// IPC client for S2S daemon communication (federation).
     s2s_ipc: IpcClient = .{},
 
-    /// Session registry — maps bound JIDs to session IDs.
+    /// Session registry — maps bound JIDs to session IDs (used when workers == 1).
     registry: SessionRegistry = .{},
+
+    /// Shared session registry — cross-thread routing table (used when workers > 1).
+    /// Null in single-thread mode (zero overhead path).
+    shared_registry: ?*SharedSessionRegistry = null,
+
+    /// This worker's thread ID (0..N-1). Used for cross-thread routing decisions.
+    worker_id: u16 = 0,
+
+    /// Cross-thread delivery system (MPSC queues + wake pipes).
+    /// Null in single-thread mode.
+    delivery_system: ?*DeliverySystem = null,
 
     /// Roster store — per-user contact lists with subscription states.
     roster: ?*GenericRosterStore = null,
@@ -454,7 +472,17 @@ pub const Server = struct {
             try changes.addRead(self.s2s_ipc.fd, IPC_S2S_UDATA);
         }
 
+        // Register delivery system wake pipe for reads (cross-thread wakeup)
+        if (self.delivery_system) |ds| {
+            try changes.addRead(ds.getPipeReadFd(self.worker_id), WAKE_PIPE_UDATA);
+        }
+
         while (self.running) {
+            // Mark active before processing events (coalesced signaling)
+            if (self.delivery_system) |ds| {
+                ds.getState(self.worker_id).setActive();
+            }
+
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
 
@@ -467,6 +495,8 @@ pub const Server = struct {
                             self.handleIpcReadable(&changes);
                         } else if (e.udata == IPC_S2S_UDATA) {
                             self.handleS2sIpcReadable(&changes);
+                        } else if (e.udata == WAKE_PIPE_UDATA) {
+                            self.handleDeliveryWake(&changes);
                         } else {
                             self.handleReadableOrHandshake(e.udata, &changes);
                         }
@@ -486,7 +516,7 @@ pub const Server = struct {
                         }
                     },
                     .fd_error => |e| {
-                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA and e.udata != IPC_S2S_UDATA) {
+                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA and e.udata != IPC_S2S_UDATA and e.udata != WAKE_PIPE_UDATA) {
                             self.closeSession(e.udata, &changes);
                         }
                     },
@@ -500,6 +530,16 @@ pub const Server = struct {
                     if (slot.active) {
                         _ = muc_handler.drainPendingFanout(self, slot, &changes);
                     }
+                }
+            }
+
+            // Double-check pattern: mark idle, then re-check for pending deliveries.
+            // Prevents lost wakeup when a producer enqueues between our last drain
+            // and entering kevent() wait.
+            if (self.delivery_system) |ds| {
+                ds.getState(self.worker_id).setIdle();
+                if (ds.getQueue(self.worker_id).hasPending()) {
+                    self.drainDeliveryQueue(&changes);
                 }
             }
         }
@@ -1788,17 +1828,60 @@ pub const Server = struct {
             return;
         }
 
-        // Route: find target session(s)
-        var target_ids: [16]usize = undefined;
-        const target_count = if (to_jid.resource.len > 0) blk: {
-            if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
-                target_ids[0] = entry.id;
-                break :blk @as(usize, 1);
-            }
-            break :blk @as(usize, 0);
-        } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
+        // Route: find target session(s).
+        // Multi-worker path uses shared registry (cross-thread aware routing).
+        // Single-worker path uses local registry (zero overhead).
+        const RoutingInfo = shared_registry_mod.RoutingResult;
+        var routing_buf: [16]RoutingInfo = undefined;
+        var local_ids: [16]usize = undefined;
+        var target_count: usize = 0;
 
-        if (target_count == 0) {
+        var remote_delivered: bool = false;
+
+        if (self.shared_registry) |sr| {
+            // Multi-worker: lookup via shared registry, returns (session_id, worker_id, generation)
+            const route_count = if (to_jid.resource.len > 0) blk: {
+                if (sr.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |r| {
+                    routing_buf[0] = r;
+                    break :blk @as(usize, 1);
+                }
+                break :blk @as(usize, 0);
+            } else sr.findAvailableByBareJid(to_jid.local, to_jid.domain, &routing_buf);
+
+            // Split into local (same worker) and remote (cross-thread MPSC)
+            for (routing_buf[0..route_count]) |route| {
+                if (route.worker_id == self.worker_id) {
+                    // Local delivery — add to local_ids for normal forwarding below
+                    if (target_count < local_ids.len) {
+                        local_ids[target_count] = route.session_id;
+                        target_count += 1;
+                    }
+                } else {
+                    // Cross-thread delivery: serialize stanza and enqueue via MPSC
+                    self.enqueueCrossThreadStanza(
+                        route,
+                        from_str,
+                        to_str,
+                        type_str,
+                        id_str,
+                        inner_xml,
+                        session.stanza_kind,
+                    );
+                    remote_delivered = true;
+                }
+            }
+        } else {
+            // Single-worker: use local registry (no shared infrastructure overhead)
+            target_count = if (to_jid.resource.len > 0) blk: {
+                if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
+                    local_ids[0] = entry.id;
+                    break :blk @as(usize, 1);
+                }
+                break :blk @as(usize, 0);
+            } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &local_ids);
+        }
+
+        if (target_count == 0 and !remote_delivered) {
             // Only messages get offline storage (not presence stanzas)
             if (session.stanza_kind == .message) {
                 if (self.offline) |store| {
@@ -1867,8 +1950,8 @@ pub const Server = struct {
             .none => return,
         };
 
-        // Forward to each target session
-        for (target_ids[0..target_count]) |tid| {
+        // Forward to each local target session
+        for (local_ids[0..target_count]) |tid| {
             const target_session = self.sessions[tid] orelse continue;
             // 20KB buffer: opening tag attrs + 16KB inner XML + closing tag
             var msg_buf: [20480]u8 = undefined;
@@ -1942,6 +2025,7 @@ pub const Server = struct {
             .available => {
                 // Initial presence — mark session as available, broadcast to subscribers
                 self.registry.setPresenceAvailable(session.conn.id, true);
+                if (self.shared_registry) |sr| sr.setPresenceAvailable(@intCast(session.conn.id), true);
                 self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
 
                 // Send presence probes to contacts we're subscribed to
@@ -1956,6 +2040,7 @@ pub const Server = struct {
             },
             .unavailable => {
                 self.registry.setPresenceAvailable(session.conn.id, false);
+                if (self.shared_registry) |sr| sr.setPresenceAvailable(@intCast(session.conn.id), false);
                 self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
             },
             .subscribe => {
@@ -2298,13 +2383,34 @@ pub const Server = struct {
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
 
-            var target_ids: [16]usize = undefined;
-            const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
-            for (target_ids[0..target_count]) |tid| {
-                const target_session = self.sessions[tid] orelse continue;
-                target_session.conn.queueSend(presence_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, tid) catch {};
+            if (self.shared_registry) |sr| {
+                // Multi-worker: use shared registry for cross-thread routing
+                var routing_buf: [16]shared_registry_mod.RoutingResult = undefined;
+                const route_count = sr.findAvailableByBareJid(sub_local, sub_domain, &routing_buf);
+                for (routing_buf[0..route_count]) |route| {
+                    if (route.worker_id == self.worker_id) {
+                        const target_session = self.sessions[route.session_id] orelse continue;
+                        target_session.conn.queueSend(presence_xml) catch continue;
+                        if (target_session.conn.hasPendingWrite()) {
+                            changes.addWrite(target_session.conn.fd, route.session_id) catch {};
+                        }
+                    } else {
+                        // Cross-thread: enqueue pre-built presence XML
+                        if (self.delivery_system) |ds| {
+                            ds.deliver(route.worker_id, route.session_id, route.generation, presence_xml) catch {};
+                        }
+                    }
+                }
+            } else {
+                // Single-worker: local registry only
+                var target_ids: [16]usize = undefined;
+                const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
+                for (target_ids[0..target_count]) |tid| {
+                    const target_session = self.sessions[tid] orelse continue;
+                    target_session.conn.queueSend(presence_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                    }
                 }
             }
         }
@@ -2350,13 +2456,34 @@ pub const Server = struct {
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
 
-            var target_ids: [16]usize = undefined;
-            const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
-            for (target_ids[0..target_count]) |tid| {
-                const target_session = self.sessions[tid] orelse continue;
-                target_session.conn.queueSend(presence_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, tid) catch {};
+            if (self.shared_registry) |sr| {
+                // Multi-worker: use shared registry for cross-thread routing
+                var routing_buf: [16]shared_registry_mod.RoutingResult = undefined;
+                const route_count = sr.findAvailableByBareJid(sub_local, sub_domain, &routing_buf);
+                for (routing_buf[0..route_count]) |route| {
+                    if (route.worker_id == self.worker_id) {
+                        const target_session = self.sessions[route.session_id] orelse continue;
+                        target_session.conn.queueSend(presence_xml) catch continue;
+                        if (target_session.conn.hasPendingWrite()) {
+                            changes.addWrite(target_session.conn.fd, route.session_id) catch {};
+                        }
+                    } else {
+                        // Cross-thread: enqueue pre-built presence XML
+                        if (self.delivery_system) |ds| {
+                            ds.deliver(route.worker_id, route.session_id, route.generation, presence_xml) catch {};
+                        }
+                    }
+                }
+            } else {
+                // Single-worker: local registry only
+                var target_ids: [16]usize = undefined;
+                const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
+                for (target_ids[0..target_count]) |tid| {
+                    const target_session = self.sessions[tid] orelse continue;
+                    target_session.conn.queueSend(presence_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                    }
                 }
             }
         }
@@ -2490,11 +2617,19 @@ pub const Server = struct {
 
         if (session.stream.isActive()) {
             if (session.stream.bound_jid) |bound| {
-                // Register in session registry
+                // Register in session registry (local — always)
                 self.registry.bind(session.conn.id, bound.local, bound.domain, bound.resource) catch |err| {
                     log.err("connection {d} registry bind failed: {}", .{ session.conn.id, err });
                     return;
                 };
+                // Register in shared registry (cross-thread — when workers > 1)
+                if (self.shared_registry) |sr| {
+                    sr.bind(@intCast(session.conn.id), self.worker_id, bound.local, bound.domain, bound.resource) catch |err| {
+                        log.err("connection {d} shared registry bind failed (rolling back local): {}", .{ session.conn.id, err });
+                        _ = self.registry.unbind(session.conn.id);
+                        return;
+                    };
+                }
                 log.info("connection {d} session established: {s}@{s}/{s}", .{
                     session.conn.id, bound.local, bound.domain, bound.resource,
                 });
@@ -2631,13 +2766,117 @@ pub const Server = struct {
         session.conn.queueSend(data) catch return;
     }
 
+    // ========================================================================
+    // Cross-thread delivery (MPSC queue consumer)
+    // ========================================================================
+
+    /// Handle EVFILT_READ on the wake pipe — drain pipe bytes, then drain the MPSC queue.
+    fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
+        const ds = self.delivery_system orelse return;
+        ds.drainPipe(self.worker_id);
+        self.drainDeliveryQueue(changes);
+    }
+
+    /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
+    fn enqueueCrossThreadStanza(
+        self: *Server,
+        route: shared_registry_mod.RoutingResult,
+        from_str: []const u8,
+        to_str: []const u8,
+        type_str: []const u8,
+        id_str: []const u8,
+        inner_xml: []const u8,
+        kind: StanzaKind,
+    ) void {
+        const ds = self.delivery_system orelse return;
+
+        const tag_name: []const u8 = switch (kind) {
+            .message => "message",
+            .presence => "presence",
+            .none => return,
+        };
+
+        // Serialize the full stanza into a buffer (must fit in MAX_PAYLOAD_SIZE)
+        var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+
+        w.writeByte('<') catch return;
+        w.writeAll(tag_name) catch return;
+        w.writeAll(" from='") catch return;
+        w.writeAll(from_str) catch return;
+        w.writeAll("' to='") catch return;
+        w.writeAll(to_str) catch return;
+        w.writeByte('\'') catch return;
+        if (type_str.len > 0) {
+            if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
+                w.writeAll(" type='") catch return;
+                w.writeAll(type_str) catch return;
+                w.writeByte('\'') catch return;
+            }
+        }
+        if (id_str.len > 0) {
+            w.writeAll(" id='") catch return;
+            w.writeAll(id_str) catch return;
+            w.writeByte('\'') catch return;
+        }
+        if (inner_xml.len == 0) {
+            w.writeAll("/>") catch return;
+        } else {
+            w.writeByte('>') catch return;
+            w.writeAll(inner_xml) catch return;
+            w.writeAll("</") catch return;
+            w.writeAll(tag_name) catch return;
+            w.writeByte('>') catch return;
+        }
+
+        ds.deliver(route.worker_id, route.session_id, route.generation, fbs.getWritten()) catch |err| {
+            log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.session_id, err });
+        };
+    }
+
+    /// Drain all pending deliveries from this worker's MPSC queue.
+    /// Validates generation (ABA protection) before delivering to local sessions.
+    fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
+        const ds = self.delivery_system orelse return;
+        const sr = self.shared_registry orelse return;
+        const queue = ds.getQueue(self.worker_id);
+
+        const Ctx = struct {
+            server: *Server,
+            changes: *ChangeList,
+            registry: *SharedSessionRegistry,
+        };
+        const ctx = Ctx{ .server = self, .changes = changes, .registry = sr };
+
+        _ = queue.drain(ctx, struct {
+            fn handle(c: Ctx, session_id: u32, generation: u32, payload: []const u8) void {
+                // ABA check: verify session is still bound with same generation
+                const current_gen = c.registry.getGeneration(session_id) orelse return;
+                if (current_gen != generation) return;
+
+                // Deliver the stanza to the local session
+                const target_session = c.server.sessions[session_id] orelse return;
+                target_session.conn.queueSend(payload) catch return;
+                if (target_session.conn.hasPendingWrite()) {
+                    c.changes.addWrite(target_session.conn.fd, session_id) catch {};
+                }
+            }
+        }.handle);
+    }
+
     fn closeSession(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
 
         // Remove from all MUC rooms (broadcasts unavailable to room occupants)
         muc_handler.handleSessionClose(self, id, changes);
 
-        // Unregister from session registry and broadcast unavailable presence
+        // Unregister from shared registry (cross-thread — increments generation for ABA)
+        if (self.shared_registry) |sr| {
+            _ = sr.unbind(@intCast(id));
+        }
+
+        // Unregister from local session registry and broadcast unavailable presence
         if (self.registry.unbind(id)) |bound| {
             if (bound.presence_available) {
                 self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);

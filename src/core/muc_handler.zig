@@ -51,6 +51,9 @@ pub fn handleMucPresence(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
+    if (server.delivery_system != null) reg.lock.lock();
+    defer if (server.delivery_system != null) reg.lock.unlock();
+
     if (to_resource.len == 0) {
         // Presence to bare room JID (no nick) — error
         sendPresenceError(server, session, to_local, muc_host, "jid-malformed", changes);
@@ -78,6 +81,9 @@ pub fn handleMucGroupchat(
 ) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
+
+    if (server.delivery_system != null) reg.lock.lockShared();
+    defer if (server.delivery_system != null) reg.lock.unlockShared();
 
     // Build room JID
     var room_jid_buf: [320]u8 = undefined;
@@ -127,11 +133,26 @@ pub fn handleMucGroupchat(
     for (&room.occupants, 0..) |*slot, idx| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
-        const target_session = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+        if (occ.worker_id != server.worker_id) {
+            // Cross-thread: serialize and enqueue via MPSC delivery system
+            if (server.delivery_system) |ds| {
+                if (server.shared_registry) |sr| {
+                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
+                        var xthread_buf: [4080]u8 = undefined;
+                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                        if (xthread_len) |len| {
+                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
+                        }
+                    }
+                }
+            }
+        } else {
+            const target_session = server.sessions[occ.session_id] orelse continue;
+            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+            if (target_session.conn.hasPendingWrite()) {
+                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+            }
         }
 
         delivered += 1;
@@ -184,6 +205,9 @@ pub fn drainPendingFanout(
         return true;
     };
 
+    if (server.delivery_system != null) reg.lock.lockShared();
+    defer if (server.delivery_system != null) reg.lock.unlockShared();
+
     // Re-find the room by JID (it may have been destroyed between ticks)
     const room = reg.findByJid(pf.getRoomJid()) orelse {
         log.debug("fan-out target room gone: {s}", .{pf.getRoomJid()});
@@ -200,11 +224,25 @@ pub fn drainPendingFanout(
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
-        const target_session = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+        if (occ.worker_id != server.worker_id) {
+            if (server.delivery_system) |ds| {
+                if (server.shared_registry) |sr| {
+                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
+                        var xthread_buf: [4080]u8 = undefined;
+                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                        if (xthread_len) |len| {
+                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
+                        }
+                    }
+                }
+            }
+        } else {
+            const target_session = server.sessions[occ.session_id] orelse continue;
+            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+            if (target_session.conn.hasPendingWrite()) {
+                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+            }
         }
 
         delivered += 1;
@@ -240,11 +278,25 @@ fn deliverRemainingSync(
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
-        const target_session = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+        if (occ.worker_id != server.worker_id) {
+            if (server.delivery_system) |ds| {
+                if (server.shared_registry) |sr| {
+                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
+                        var xthread_buf: [4080]u8 = undefined;
+                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                        if (xthread_len) |len| {
+                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
+                        }
+                    }
+                }
+            }
+        } else {
+            const target_session = server.sessions[occ.session_id] orelse continue;
+            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+            if (target_session.conn.hasPendingWrite()) {
+                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+            }
         }
     }
 }
@@ -287,6 +339,9 @@ pub fn handleMucDiscoItems(
 ) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
+
+    if (server.delivery_system != null) reg.lock.lockShared();
+    defer if (server.delivery_system != null) reg.lock.unlockShared();
 
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -340,6 +395,9 @@ pub fn handleRoomDiscoInfo(
 ) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
+
+    if (server.delivery_system != null) reg.lock.lockShared();
+    defer if (server.delivery_system != null) reg.lock.unlockShared();
 
     var room_jid_buf: [320]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
@@ -416,6 +474,9 @@ pub fn handleMucAdminIq(
 ) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
+
+    if (server.delivery_system != null) reg.lock.lock();
+    defer if (server.delivery_system != null) reg.lock.unlock();
 
     var room_jid_buf: [320]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
@@ -605,7 +666,7 @@ fn handleJoin(
     }
 
     // Add occupant
-    _ = r.addOccupant(nick, real_jid, bare_jid, session.conn.id, role, affiliation) catch {
+    _ = r.addOccupant(nick, real_jid, bare_jid, session.conn.id, server.worker_id, role, affiliation) catch {
         sendPresenceError(server, session, room_local, muc_host, "service-unavailable", changes);
         return;
     };
@@ -655,6 +716,9 @@ fn handlePart(
 pub fn handleSessionClose(server: *Server, session_id: usize, changes: *ChangeList) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
+
+    if (server.delivery_system != null) reg.lock.lock();
+    defer if (server.delivery_system != null) reg.lock.unlock();
 
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;

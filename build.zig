@@ -247,6 +247,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const shared_registry_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/shared_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const delivery_queue_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const server_op_backend_mod = createBackendMod(b, op_storage, target, optimize, server_backend_mod, lmdb_dep);
     const server_archive_backend_mod = createBackendMod(b, archive_storage, target, optimize, server_backend_mod, lmdb_dep);
     const server_archive_store_mod = b.createModule(.{
@@ -282,6 +293,8 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
     server_test_mod.addImport("session_registry", session_registry_mod_for_server);
+    server_test_mod.addImport("shared_registry", shared_registry_mod);
+    server_test_mod.addImport("delivery_queue", delivery_queue_mod);
     server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
     server_test_mod.addImport("archive_store", server_archive_store_mod);
     server_test_mod.addImport("backend", server_backend_mod);
@@ -476,6 +489,37 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_session_registry_tests = b.addRunArtifact(session_registry_tests);
+
+    // --- Shared session registry tests ---
+
+    const shared_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/shared_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const shared_registry_tests = b.addTest(.{
+        .name = "shared-registry-tests",
+        .root_module = shared_registry_test_mod,
+    });
+
+    const run_shared_registry_tests = b.addRunArtifact(shared_registry_tests);
+
+    // --- Delivery queue tests ---
+
+    const delivery_queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const delivery_queue_tests = b.addTest(.{
+        .name = "delivery-queue-tests",
+        .root_module = delivery_queue_test_mod,
+    });
+
+    const run_delivery_queue_tests = b.addRunArtifact(delivery_queue_tests);
 
     // --- Offline store tests ---
 
@@ -879,6 +923,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
     core_mod.addImport("session_registry", session_registry_mod_for_server);
+    core_mod.addImport("shared_registry", shared_registry_mod);
+    core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
     core_mod.addImport("archive_store", server_archive_store_mod);
     core_mod.addImport("backend", server_backend_mod);
@@ -1213,6 +1259,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_registry_tests.step);
+    test_step.dependOn(&run_shared_registry_tests.step);
+    test_step.dependOn(&run_delivery_queue_tests.step);
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);

@@ -164,6 +164,24 @@ pub fn deliverPrebuilt(
     try conn.queueSend(msg_buf[0..total]);
 }
 
+/// Build a complete stanza from pre-built prefix + recipient JID + suffix into a buffer.
+/// Returns the total length, or null if the buffer would overflow.
+/// Used for cross-thread MPSC delivery where we need the full stanza as contiguous bytes.
+pub fn buildComplete(
+    buf: []u8,
+    prefix: []const u8,
+    recipient_jid: []const u8,
+    suffix: []const u8,
+) ?usize {
+    const total = prefix.len + recipient_jid.len + suffix.len;
+    if (total > buf.len) return null;
+
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len .. prefix.len + recipient_jid.len], recipient_jid);
+    @memcpy(buf[prefix.len + recipient_jid.len .. total], suffix);
+    return total;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
