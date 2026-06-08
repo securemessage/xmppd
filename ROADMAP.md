@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-06
+Last updated: 2026-06-07
 
 ## Current Status
 
@@ -13,7 +13,7 @@ Last updated: 2026-06-06
 | 1. Protocol Library | ✅ Complete | XML parser, JID, stanzas, SASL, TLS, DNS |
 | 2. Core Daemon | ✅ Complete | kqueue event loop, C2S, master supervisor |
 | 3. S2S Federation | ✅ Complete | DANE + EXTERNAL + dialback + E2E tested |
-| 4. Client Interop | ✅ Complete | slixmpp 23/23, profanity 14/14, gajim ✓, dino ✓ |
+| 4. Client Interop | ✅ Complete | slixmpp 23/23, profanity 14/14, gajim ✓, dino ✓, Conversations ✓ |
 | 5. Storage | ✅ Complete | Comptime generic stores, LMDB/RocksDB/SQLite backends |
 | 6. Auth Daemon + IPC | ✅ Complete | xmppd-auth, SCRAM-SHA-256, PLAIN, binary IPC |
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
@@ -21,7 +21,7 @@ Last updated: 2026-06-06
 | 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
 | 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
-| 12. Polish & Deploy | 🔄 In progress | Fan-out fix, config, RC script done; port + testing remain |
+| 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
 
 ---
 
