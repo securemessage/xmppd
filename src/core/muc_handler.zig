@@ -95,8 +95,8 @@ pub fn handleMucGroupchat(
     };
 
     // Find sender's occupant entry (occupant stores global session ID)
-    const sender_global: usize = server.session_id_base + session.conn.id;
-    const sender_idx = room.findBySessionId(sender_global) orelse {
+    const sender_local: usize = session.conn.id;
+    const sender_idx = room.findBySessionId(sender_local) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "not-acceptable", changes);
         return;
     };
@@ -138,19 +138,15 @@ pub fn handleMucGroupchat(
         if (occ.worker_id != server.worker_id) {
             // Cross-thread: serialize and enqueue via MPSC delivery system
             if (server.delivery_system) |ds| {
-                if (server.shared_registry) |sr| {
-                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
-                        var xthread_buf: [4080]u8 = undefined;
-                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                        if (xthread_len) |len| {
-                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
-                        }
-                    }
+                var xthread_buf: [4080]u8 = undefined;
+                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                if (xthread_len) |len| {
+                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
                 }
             }
         } else {
-            // Same worker: convert global session ID to local for sessions[] access
-            const local_sid = occ.session_id - server.session_id_base;
+            // Same worker: session_id is already the local sessions[] index
+            const local_sid = occ.session_id;
             const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
@@ -230,18 +226,14 @@ pub fn drainPendingFanout(
 
         if (occ.worker_id != server.worker_id) {
             if (server.delivery_system) |ds| {
-                if (server.shared_registry) |sr| {
-                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
-                        var xthread_buf: [4080]u8 = undefined;
-                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                        if (xthread_len) |len| {
-                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
-                        }
-                    }
+                var xthread_buf: [4080]u8 = undefined;
+                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                if (xthread_len) |len| {
+                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
                 }
             }
         } else {
-            const local_sid = occ.session_id - server.session_id_base;
+            const local_sid = occ.session_id;
             const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
@@ -285,18 +277,14 @@ fn deliverRemainingSync(
 
         if (occ.worker_id != server.worker_id) {
             if (server.delivery_system) |ds| {
-                if (server.shared_registry) |sr| {
-                    if (sr.getGeneration(@intCast(occ.session_id))) |gen| {
-                        var xthread_buf: [4080]u8 = undefined;
-                        const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                        if (xthread_len) |len| {
-                            ds.deliver(occ.worker_id, @intCast(occ.session_id), gen, xthread_buf[0..len]) catch {};
-                        }
-                    }
+                var xthread_buf: [4080]u8 = undefined;
+                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
+                if (xthread_len) |len| {
+                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
                 }
             }
         } else {
-            const local_sid = occ.session_id - server.session_id_base;
+            const local_sid = occ.session_id;
             const target_session = server.sessions[local_sid] orelse continue;
             fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
             if (target_session.conn.hasPendingWrite()) {
@@ -492,8 +480,8 @@ pub fn handleMucAdminIq(
     };
 
     // Verify requester is moderator+ (for kick) or admin+ (for ban)
-    const requester_global: usize = server.session_id_base + session.conn.id;
-    const requester_idx = room.findBySessionId(requester_global) orelse {
+    const requester_local: usize = session.conn.id;
+    const requester_idx = room.findBySessionId(requester_local) orelse {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
         return;
     };
@@ -632,8 +620,8 @@ fn handleJoin(
     const r = room.?;
 
     // Check if already in room (rejoin = no-op with self-presence)
-    const global_check: usize = server.session_id_base + session.conn.id;
-    if (r.findBySessionId(global_check)) |_| {
+    const local_check: usize = session.conn.id;
+    if (r.findBySessionId(local_check)) |_| {
         sendSelfPresence(server, session, r, nick, muc_host, changes);
         return;
     }
@@ -672,10 +660,12 @@ fn handleJoin(
         return;
     }
 
-    // Add occupant — store GLOBAL session ID for cross-thread shared registry lookups.
-    // Local sessions[] access converts back: local = global - session_id_base.
-    const global_sid: usize = server.session_id_base + session.conn.id;
-    _ = r.addOccupant(nick, real_jid, bare_jid, global_sid, server.worker_id, role, affiliation) catch {
+    // Add occupant — store local session ID directly (no global mapping).
+    const local_sid: usize = session.conn.id;
+    // Look up generation from session map for ABA-safe cross-thread delivery.
+    const join_bound = session.stream.bound_jid orelse return;
+    const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(join_bound.local, join_bound.domain, join_bound.resource) orelse 0 else 0;
+    _ = r.addOccupant(nick, real_jid, bare_jid, local_sid, server.worker_id, join_gen, role, affiliation) catch {
         sendPresenceError(server, session, room_local, muc_host, "service-unavailable", changes);
         return;
     };
@@ -685,7 +675,7 @@ fn handleJoin(
     // 1. Send existing occupants' presence to the new joiner
     for (&r.occupants) |*slot| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == global_sid) continue; // skip self
+        if (occ.session_id == local_sid) continue; // skip self
         sendOccupantPresence(server, session, r, &occ, muc_host, null, changes);
     }
 
@@ -708,8 +698,8 @@ fn handlePart(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const room = reg.findByJid(room_jid) orelse return;
-    const global_sid: usize = server.session_id_base + session.conn.id;
-    const removed = room.removeBySessionId(global_sid) orelse return;
+    const local_sid: usize = session.conn.id;
+    const removed = room.removeBySessionId(local_sid) orelse return;
 
     log.info("{s} left {s}", .{ removed.getRealJid(), room_jid });
 
@@ -730,14 +720,12 @@ pub fn handleSessionClose(server: *Server, session_id: usize, changes: *ChangeLi
     if (server.delivery_system != null) reg.lock.lock();
     defer if (server.delivery_system != null) reg.lock.unlock();
 
-    // Occupants store global session IDs; convert from local
-    const global_sid: usize = server.session_id_base + session_id;
-
+    // Occupants store local session IDs directly (no global mapping)
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;
         if (!room.active) continue;
 
-        const removed = room.removeBySessionId(global_sid) orelse continue;
+        const removed = room.removeBySessionId(session_id) orelse continue;
 
         broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 

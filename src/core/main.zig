@@ -37,8 +37,8 @@ const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
-const shared_registry_mod = @import("shared_registry");
-const SharedSessionRegistry = shared_registry_mod.SharedSessionRegistry;
+const session_map_mod = @import("session_map");
+const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 
@@ -266,16 +266,10 @@ pub fn main() !void {
     }
     defer if (room_registry) |*reg| reg.deinit();
 
-    // Shared session registry — allocated only when workers > 1
-    var shared_reg: ?SharedSessionRegistry = null;
-    if (worker_count > 1) {
-        shared_reg = SharedSessionRegistry.init(allocator, @intCast(max_sessions)) catch |err| {
-            log.err("failed to allocate shared session registry: {}", .{err});
-            return error.RegistryInitFailed;
-        };
-        log.info("shared session registry allocated: {d} slots", .{max_sessions});
-    }
-    defer if (shared_reg) |*sr| sr.deinit();
+    // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
+    var session_map = SessionMap.init(allocator, worker_count > 1);
+    defer session_map.deinit();
+    log.info("session map allocated (multi_worker={s})", .{if (worker_count > 1) "true" else "false"});
 
     // Delivery system (MPSC queues + wake pipes) — allocated only when workers > 1
     var delivery_sys: ?DeliverySystem = null;
@@ -303,7 +297,7 @@ pub fn main() !void {
         .vcard = if (vcard_store != null) &vcard_store.? else null,
         .room_registry = if (room_registry != null) &room_registry.? else null,
         .muc_host = effective_muc_host,
-        .shared_registry = if (shared_reg) |*sr| sr else null,
+        .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
         .allocator = allocator,
     };
@@ -399,7 +393,7 @@ const WorkerCtx = struct {
     vcard: ?*GenericVCardStore,
     room_registry: ?*RoomRegistry,
     muc_host: ?[]const u8,
-    shared_registry: ?*SharedSessionRegistry,
+    session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
     allocator: std.mem.Allocator,
 };
@@ -411,13 +405,10 @@ const WorkerArgs = struct {
     ctx: *WorkerCtx,
 };
 
-/// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and shared registry.
+/// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and session map.
 fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     server.worker_id = worker_id;
-    server.session_id_base = @as(u32, worker_id) * @as(u32, @intCast(ctx.per_worker_sessions));
-    if (ctx.shared_registry) |sr| {
-        server.shared_registry = sr;
-    }
+    server.session_map = ctx.session_map;
     if (ctx.delivery_system) |ds| {
         server.delivery_system = ds;
     }

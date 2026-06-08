@@ -35,10 +35,12 @@ pub const Occupant = struct {
     /// Bare JID of the real user (user@domain).
     bare_jid_buf: [256]u8 = [_]u8{0} ** 256,
     bare_jid_len: u16 = 0,
-    /// Session ID (index into Server.sessions). REMOTE_OCCUPANT for federated.
+    /// Session ID (local index into Server.sessions). REMOTE_OCCUPANT for federated.
     session_id: usize = 0,
     /// Worker thread that owns this session (for cross-thread fan-out routing).
     worker_id: u16 = 0,
+    /// Session generation (from SessionMap bind) for ABA-safe cross-thread delivery.
+    generation: u32 = 0,
     /// Current role (runtime, not persisted).
     role: Role = .participant,
     /// Current affiliation (may differ from stored if changed at runtime).
@@ -129,7 +131,7 @@ pub const Room = struct {
     }
 
     /// Add an occupant to the room. Returns slot index or error.
-    pub fn addOccupant(self: *Room, nick: []const u8, real_jid: []const u8, bare_jid: []const u8, session_id: usize, worker_id: u16, role: Role, affiliation: Affiliation) !usize {
+    pub fn addOccupant(self: *Room, nick: []const u8, real_jid: []const u8, bare_jid: []const u8, session_id: usize, worker_id: u16, generation: u32, role: Role, affiliation: Affiliation) !usize {
         // Check capacity
         if (self.config.max_occupants > 0 and self.occupant_count >= self.config.max_occupants) {
             return error.RoomFull;
@@ -144,6 +146,7 @@ pub const Room = struct {
                 occ.setBareJid(bare_jid);
                 occ.session_id = session_id;
                 occ.worker_id = worker_id;
+                occ.generation = generation;
                 occ.role = role;
                 occ.affiliation = affiliation;
                 slot.* = occ;
@@ -328,7 +331,7 @@ test "Room: add and find occupant" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, .participant, .none);
+    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 
@@ -346,8 +349,8 @@ test "Room: remove occupant" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 
     const removed = room.removeBySessionId(5).?;
@@ -364,7 +367,7 @@ test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {
     config.persistent = false; // transient
 
     const room = try reg.createRoom("temp@conference.localhost", config);
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, .participant, .owner);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
     try std.testing.expectEqual(@as(usize, 1), reg.count);
 
     const removed_count = reg.removeOccupantBySessionId(3);
@@ -380,7 +383,7 @@ test "RoomRegistry: persistent room survives empty" {
     config.persistent = true;
 
     const room = try reg.createRoom("persist@conference.localhost", config);
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, .participant, .owner);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
 
     _ = reg.removeOccupantBySessionId(3);
     // Persistent room stays
@@ -393,7 +396,7 @@ test "Room: nickname conflict" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 0, 0, .participant, .none);
     // Same nick from different user — caller should check findByNick first
     try std.testing.expect(room.findByNick("alice") != null);
 }
@@ -404,10 +407,10 @@ test "Room: max occupants enforcement" {
     room.setJid("test@conference.localhost");
     room.config.max_occupants = 2;
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, 0, .participant, .none);
     // Third occupant should be rejected
-    try std.testing.expectError(error.RoomFull, room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, .participant, .none));
+    try std.testing.expectError(error.RoomFull, room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none));
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 }
 
@@ -416,8 +419,8 @@ test "Room: findByBareJid" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, .moderator, .admin);
+    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, 0, .moderator, .admin);
 
     try std.testing.expectEqual(@as(?usize, 0), room.findByBareJid("alice@localhost"));
     try std.testing.expectEqual(@as(?usize, 1), room.findByBareJid("bob@localhost"));
@@ -429,8 +432,8 @@ test "Room: occupant role and affiliation" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("owner", "alice@localhost/m", "alice@localhost", 1, 0, .moderator, .owner);
-    _ = try room.addOccupant("guest", "bob@localhost/m", "bob@localhost", 2, 0, .visitor, .none);
+    _ = try room.addOccupant("owner", "alice@localhost/m", "alice@localhost", 1, 0, 0, .moderator, .owner);
+    _ = try room.addOccupant("guest", "bob@localhost/m", "bob@localhost", 2, 0, 0, .visitor, .none);
 
     const owner = room.occupants[0].?;
     try std.testing.expectEqual(Role.moderator, owner.role);
@@ -447,8 +450,8 @@ test "Room: remove and re-add occupant reuses slot" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    const idx0 = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, .participant, .none);
+    const idx0 = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx0);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 
@@ -457,7 +460,7 @@ test "Room: remove and re-add occupant reuses slot" {
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 
     // New occupant should reuse slot 0
-    const idx_carol = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, .participant, .none);
+    const idx_carol = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx_carol);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 }
@@ -492,9 +495,9 @@ test "RoomRegistry: removeOccupantBySessionId from multiple rooms" {
     const room2 = try reg.createRoom("room2@conference.localhost", .{ .persistent = false });
 
     // Same user in both rooms
-    _ = try room1.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, .participant, .none);
-    _ = try room1.addOccupant("bob", "bob@localhost/m", "bob@localhost", 4, 0, .participant, .none);
-    _ = try room2.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, .participant, .none);
+    _ = try room1.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .none);
+    _ = try room1.addOccupant("bob", "bob@localhost/m", "bob@localhost", 4, 0, 0, .participant, .none);
+    _ = try room2.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .none);
 
     // Disconnect alice — removed from both rooms
     const removed_count = reg.removeOccupantBySessionId(3);

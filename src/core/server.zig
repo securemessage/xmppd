@@ -50,9 +50,9 @@ pub const OpBackendType = OpBackendMod.Backend;
 const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const Subscription = generic_roster.Subscription;
-const SessionRegistry = @import("session_registry").SessionRegistry;
-const shared_registry_mod = @import("shared_registry");
-const SharedSessionRegistry = shared_registry_mod.SharedSessionRegistry;
+const session_map_mod = @import("session_map");
+const SessionMap = session_map_mod.SessionMap;
+const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const generic_offline = @import("generic_offline_store");
@@ -276,20 +276,12 @@ pub const Server = struct {
     /// IPC client for S2S daemon communication (federation).
     s2s_ipc: IpcClient = .{},
 
-    /// Session registry — maps bound JIDs to session IDs (used when workers == 1).
-    registry: SessionRegistry = .{},
-
-    /// Shared session registry — cross-thread routing table (used when workers > 1).
-    /// Null in single-thread mode (zero overhead path).
-    shared_registry: ?*SharedSessionRegistry = null,
+    /// Session map — unified JID-keyed routing table (thread-safe, replaces both
+    /// SessionRegistry and SharedSessionRegistry). Null before configureServer().
+    session_map: ?*SessionMap = null,
 
     /// This worker's thread ID (0..N-1). Used for cross-thread routing decisions.
     worker_id: u16 = 0,
-
-    /// Base offset for mapping local session IDs to global shared registry slots.
-    /// Worker N's global ID = session_id_base + local_id.
-    /// Set by configureServer() to worker_id * max_sessions.
-    session_id_base: u32 = 0,
 
     /// Cross-thread delivery system (MPSC queues + wake pipes).
     /// Null in single-thread mode.
@@ -1417,7 +1409,7 @@ pub const Server = struct {
             log.info("cascade: MAM archive for {s} will be pruned by retention", .{bare_jid});
         }
 
-        // Session registry unbind happens automatically when the connection closes
+        // Session map unbind happens in closeSession() when the connection closes
         // after we send </stream:stream>.
 
         log.info("cascade cleanup complete for {s}", .{bare_jid});
@@ -1538,14 +1530,15 @@ pub const Server = struct {
                     return;
                 };
 
-                var target_ids: [16]usize = undefined;
+                const s2s_sm = self.session_map orelse return;
+                var s2s_entries: [16]SessionEntry = undefined;
                 const target_count = if (to_jid.resource.len > 0) blk: {
-                    if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
-                        target_ids[0] = entry.id;
+                    if (s2s_sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
+                        s2s_entries[0] = e;
                         break :blk @as(usize, 1);
                     }
                     break :blk @as(usize, 0);
-                } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_ids);
+                } else s2s_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &s2s_entries);
 
                 if (target_count == 0) {
                     // Try offline storage for messages — only if this is a <message> stanza
@@ -1576,11 +1569,12 @@ pub const Server = struct {
                     return;
                 }
 
-                for (target_ids[0..target_count]) |tid| {
-                    const target_session = self.sessions[tid] orelse continue;
+                for (s2s_entries[0..target_count]) |entry| {
+                    if (entry.worker_id != self.worker_id) continue; // S2S inbound only delivers locally
+                    const target_session = self.sessions[entry.local_session_id] orelse continue;
                     target_session.conn.queueSend(m.stanza_xml) catch continue;
                     if (target_session.conn.hasPendingWrite()) {
-                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                        changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
                     }
                 }
                 log.info("S2S inbound from {s} delivered to {d} local session(s)", .{ m.from_jid, target_count });
@@ -1589,17 +1583,19 @@ pub const Server = struct {
                 // Delivery to remote failed — bounce error to original sender
                 const from_jid = xmpp.Jid.parse(m.from_jid) catch return;
 
-                var sender_ids: [16]usize = undefined;
+                const fail_sm = self.session_map orelse return;
+                var sender_entries: [16]SessionEntry = undefined;
                 const sender_count = if (from_jid.resource.len > 0) blk: {
-                    if (self.registry.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |entry| {
-                        sender_ids[0] = entry.id;
+                    if (fail_sm.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |e| {
+                        sender_entries[0] = e;
                         break :blk @as(usize, 1);
                     }
                     break :blk @as(usize, 0);
-                } else self.registry.findAvailableByBareJid(from_jid.local, from_jid.domain, &sender_ids);
+                } else fail_sm.findAvailableByBareJid(from_jid.local, from_jid.domain, &sender_entries);
 
-                for (sender_ids[0..sender_count]) |sid| {
-                    const sender_session = self.sessions[sid] orelse continue;
+                for (sender_entries[0..sender_count]) |sentry| {
+                    if (sentry.worker_id != self.worker_id) continue;
+                    const sender_session = self.sessions[sentry.local_session_id] orelse continue;
                     var err_buf: [1024]u8 = undefined;
                     var err_fbs = std.io.fixedBufferStream(&err_buf);
                     const ew = err_fbs.writer();
@@ -1612,7 +1608,7 @@ pub const Server = struct {
                     ew.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch continue;
                     sender_session.conn.queueSend(err_fbs.getWritten()) catch continue;
                     if (sender_session.conn.hasPendingWrite()) {
-                        changes.addWrite(sender_session.conn.fd, sid) catch {};
+                        changes.addWrite(sender_session.conn.fd, sentry.local_session_id) catch {};
                     }
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
@@ -1833,57 +1829,42 @@ pub const Server = struct {
             return;
         }
 
-        // Route: find target session(s).
-        // Multi-worker path uses shared registry (cross-thread aware routing).
-        // Single-worker path uses local registry (zero overhead).
-        const RoutingInfo = shared_registry_mod.RoutingResult;
-        var routing_buf: [16]RoutingInfo = undefined;
+        // Route: find target session(s) via unified session map.
+        const sm = self.session_map orelse return;
+        var entries_buf: [16]SessionEntry = undefined;
         var local_ids: [16]usize = undefined;
         var target_count: usize = 0;
 
         var remote_delivered: bool = false;
 
-        if (self.shared_registry) |sr| {
-            // Multi-worker: lookup via shared registry, returns (session_id, worker_id, generation)
-            const route_count = if (to_jid.resource.len > 0) blk: {
-                if (sr.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |r| {
-                    routing_buf[0] = r;
-                    break :blk @as(usize, 1);
-                }
-                break :blk @as(usize, 0);
-            } else sr.findAvailableByBareJid(to_jid.local, to_jid.domain, &routing_buf);
-
-            // Split into local (same worker) and remote (cross-thread MPSC)
-            for (routing_buf[0..route_count]) |route| {
-                if (route.worker_id == self.worker_id) {
-                    // Local delivery — add to local_ids for normal forwarding below
-                    if (target_count < local_ids.len) {
-                        local_ids[target_count] = route.session_id;
-                        target_count += 1;
-                    }
-                } else {
-                    // Cross-thread delivery: serialize stanza and enqueue via MPSC
-                    self.enqueueCrossThreadStanza(
-                        route,
-                        from_str,
-                        to_str,
-                        type_str,
-                        id_str,
-                        inner_xml,
-                        session.stanza_kind,
-                    );
-                    remote_delivered = true;
-                }
+        const route_count = if (to_jid.resource.len > 0) blk: {
+            if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
+                entries_buf[0] = e;
+                break :blk @as(usize, 1);
             }
-        } else {
-            // Single-worker: use local registry (no shared infrastructure overhead)
-            target_count = if (to_jid.resource.len > 0) blk: {
-                if (self.registry.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |entry| {
-                    local_ids[0] = entry.id;
-                    break :blk @as(usize, 1);
+            break :blk @as(usize, 0);
+        } else sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+
+        for (entries_buf[0..route_count]) |entry| {
+            if (entry.worker_id == self.worker_id) {
+                // Local delivery
+                if (target_count < local_ids.len) {
+                    local_ids[target_count] = entry.local_session_id;
+                    target_count += 1;
                 }
-                break :blk @as(usize, 0);
-            } else self.registry.findAvailableByBareJid(to_jid.local, to_jid.domain, &local_ids);
+            } else {
+                // Cross-thread delivery via MPSC
+                self.enqueueCrossThreadStanza(
+                    entry,
+                    from_str,
+                    to_str,
+                    type_str,
+                    id_str,
+                    inner_xml,
+                    session.stanza_kind,
+                );
+                remote_delivered = true;
+            }
         }
 
         if (target_count == 0 and !remote_delivered) {
@@ -2029,8 +2010,7 @@ pub const Server = struct {
         switch (ptype) {
             .available => {
                 // Initial presence — mark session as available, broadcast to subscribers
-                self.registry.setPresenceAvailable(session.conn.id, true);
-                if (self.shared_registry) |sr| sr.setPresenceAvailable(self.globalSessionId(session.conn.id), true);
+                if (self.session_map) |sm| sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
                 self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
 
                 // Send presence probes to contacts we're subscribed to
@@ -2044,8 +2024,7 @@ pub const Server = struct {
                 });
             },
             .unavailable => {
-                self.registry.setPresenceAvailable(session.conn.id, false);
-                if (self.shared_registry) |sr| sr.setPresenceAvailable(self.globalSessionId(session.conn.id), false);
+                if (self.session_map) |sm| sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
                 self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
             },
             .subscribe => {
@@ -2097,27 +2076,29 @@ pub const Server = struct {
 
         // Forward subscribe to the target (if online)
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        var target_ids: [16]usize = undefined;
-        const target_count = self.registry.findByBareJid(to_jid.local, to_jid.domain, &target_ids);
+        const sub_sm = self.session_map orelse return;
+        var sub_entries: [16]SessionEntry = undefined;
+        const target_count = sub_sm.findByBareJid(to_jid.local, to_jid.domain, &sub_entries);
 
         var from_buf: [256]u8 = undefined;
         var from_fbs = std.io.fixedBufferStream(&from_buf);
         from_fbs.writer().writeAll(owner_bare) catch return;
         const from_str = from_fbs.getWritten();
 
-        for (target_ids[0..target_count]) |tid| {
-            const target_session = self.sessions[tid] orelse continue;
+        for (sub_entries[0..target_count]) |ent| {
+            if (ent.worker_id != self.worker_id) continue;
+            const target_session = self.sessions[ent.local_session_id] orelse continue;
             var pres_buf: [512]u8 = undefined;
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const pw = pres_fbs.writer();
-            pw.writeAll("<presence from='") catch continue;
-            pw.writeAll(from_str) catch continue;
-            pw.writeAll("' to='") catch continue;
-            pw.writeAll(to_str) catch continue;
-            pw.writeAll("' type='subscribe'/>") catch continue;
+            const ppw = pres_fbs.writer();
+            ppw.writeAll("<presence from='") catch continue;
+            ppw.writeAll(from_str) catch continue;
+            ppw.writeAll("' to='") catch continue;
+            ppw.writeAll(to_str) catch continue;
+            ppw.writeAll("' type='subscribe'/>") catch continue;
             target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, tid) catch {};
+                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
             }
         }
 
@@ -2171,28 +2152,30 @@ pub const Server = struct {
 
         // Forward subscribed to the target (if online)
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        var target_ids: [16]usize = undefined;
-        const target_count = self.registry.findByBareJid(to_jid.local, to_jid.domain, &target_ids);
+        const sd_sm = self.session_map orelse return;
+        var sd_entries: [16]SessionEntry = undefined;
+        const target_count = sd_sm.findByBareJid(to_jid.local, to_jid.domain, &sd_entries);
 
-        for (target_ids[0..target_count]) |tid| {
-            const target_session = self.sessions[tid] orelse continue;
+        for (sd_entries[0..target_count]) |ent| {
+            if (ent.worker_id != self.worker_id) continue;
+            const target_session = self.sessions[ent.local_session_id] orelse continue;
             var pres_buf: [512]u8 = undefined;
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const pw = pres_fbs.writer();
-            pw.writeAll("<presence from='") catch continue;
-            pw.writeAll(owner_bare) catch continue;
-            pw.writeAll("' to='") catch continue;
-            pw.writeAll(to_str) catch continue;
-            pw.writeAll("' type='subscribed'/>") catch continue;
+            const ppw = pres_fbs.writer();
+            ppw.writeAll("<presence from='") catch continue;
+            ppw.writeAll(owner_bare) catch continue;
+            ppw.writeAll("' to='") catch continue;
+            ppw.writeAll(to_str) catch continue;
+            ppw.writeAll("' type='subscribed'/>") catch continue;
             target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, tid) catch {};
+                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
             }
         }
 
         // Also send our current presence to the newly subscribed contact
-        if (self.registry.get(session.conn.id)) |entry| {
-            if (entry.presence_available) {
+        if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
+            if (ent.presence_available) {
                 self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
             }
         }
@@ -2242,21 +2225,23 @@ pub const Server = struct {
 
         // Forward unsubscribe
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        var target_ids: [16]usize = undefined;
-        const target_count = self.registry.findByBareJid(to_jid.local, to_jid.domain, &target_ids);
-        for (target_ids[0..target_count]) |tid| {
-            const target_session = self.sessions[tid] orelse continue;
+        const unsub_sm = self.session_map orelse return;
+        var unsub_entries: [16]SessionEntry = undefined;
+        const target_count = unsub_sm.findByBareJid(to_jid.local, to_jid.domain, &unsub_entries);
+        for (unsub_entries[0..target_count]) |ent| {
+            if (ent.worker_id != self.worker_id) continue;
+            const target_session = self.sessions[ent.local_session_id] orelse continue;
             var pres_buf: [512]u8 = undefined;
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const pw = pres_fbs.writer();
-            pw.writeAll("<presence from='") catch continue;
-            pw.writeAll(owner_bare) catch continue;
-            pw.writeAll("' to='") catch continue;
-            pw.writeAll(to_str) catch continue;
-            pw.writeAll("' type='unsubscribe'/>") catch continue;
+            const ppw = pres_fbs.writer();
+            ppw.writeAll("<presence from='") catch continue;
+            ppw.writeAll(owner_bare) catch continue;
+            ppw.writeAll("' to='") catch continue;
+            ppw.writeAll(to_str) catch continue;
+            ppw.writeAll("' type='unsubscribe'/>") catch continue;
             target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, tid) catch {};
+                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
             }
         }
 
@@ -2305,21 +2290,23 @@ pub const Server = struct {
 
         // Forward unsubscribed
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        var target_ids: [16]usize = undefined;
-        const target_count = self.registry.findByBareJid(to_jid.local, to_jid.domain, &target_ids);
-        for (target_ids[0..target_count]) |tid| {
-            const target_session = self.sessions[tid] orelse continue;
+        const unsd_sm = self.session_map orelse return;
+        var unsd_entries: [16]SessionEntry = undefined;
+        const target_count = unsd_sm.findByBareJid(to_jid.local, to_jid.domain, &unsd_entries);
+        for (unsd_entries[0..target_count]) |ent| {
+            if (ent.worker_id != self.worker_id) continue;
+            const target_session = self.sessions[ent.local_session_id] orelse continue;
             var pres_buf: [512]u8 = undefined;
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const pw = pres_fbs.writer();
-            pw.writeAll("<presence from='") catch continue;
-            pw.writeAll(owner_bare) catch continue;
-            pw.writeAll("' to='") catch continue;
-            pw.writeAll(to_str) catch continue;
-            pw.writeAll("' type='unsubscribed'/>") catch continue;
+            const ppw = pres_fbs.writer();
+            ppw.writeAll("<presence from='") catch continue;
+            ppw.writeAll(owner_bare) catch continue;
+            ppw.writeAll("' to='") catch continue;
+            ppw.writeAll(to_str) catch continue;
+            ppw.writeAll("' type='unsubscribed'/>") catch continue;
             target_session.conn.queueSend(pres_fbs.getWritten()) catch continue;
             if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, tid) catch {};
+                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
             }
         }
 
@@ -2382,39 +2369,25 @@ pub const Server = struct {
         const presence_xml = pres_fbs.getWritten();
 
         // Deliver to each subscriber that has an active session
+        const sm = self.session_map orelse return;
         for (subscriber_jids) |sub_bare_jid| {
             // Parse the subscriber bare JID to get local/domain
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
 
-            if (self.shared_registry) |sr| {
-                // Multi-worker: use shared registry for cross-thread routing
-                var routing_buf: [16]shared_registry_mod.RoutingResult = undefined;
-                const route_count = sr.findAvailableByBareJid(sub_local, sub_domain, &routing_buf);
-                for (routing_buf[0..route_count]) |route| {
-                    if (route.worker_id == self.worker_id) {
-                        const target_session = self.sessions[route.session_id] orelse continue;
-                        target_session.conn.queueSend(presence_xml) catch continue;
-                        if (target_session.conn.hasPendingWrite()) {
-                            changes.addWrite(target_session.conn.fd, route.session_id) catch {};
-                        }
-                    } else {
-                        // Cross-thread: enqueue pre-built presence XML
-                        if (self.delivery_system) |ds| {
-                            ds.deliver(route.worker_id, route.session_id, route.generation, presence_xml) catch {};
-                        }
-                    }
-                }
-            } else {
-                // Single-worker: local registry only
-                var target_ids: [16]usize = undefined;
-                const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
-                for (target_ids[0..target_count]) |tid| {
-                    const target_session = self.sessions[tid] orelse continue;
+            var entries_buf: [16]SessionEntry = undefined;
+            const route_count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries_buf);
+            for (entries_buf[0..route_count]) |entry| {
+                if (entry.worker_id == self.worker_id) {
+                    const target_session = self.sessions[entry.local_session_id] orelse continue;
                     target_session.conn.queueSend(presence_xml) catch continue;
                     if (target_session.conn.hasPendingWrite()) {
-                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                        changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
+                    }
+                } else {
+                    if (self.delivery_system) |ds| {
+                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
                     }
                 }
             }
@@ -2456,38 +2429,24 @@ pub const Server = struct {
         pw.writeAll("' type='unavailable'/>") catch return;
         const presence_xml = pres_fbs.getWritten();
 
+        const sm = self.session_map orelse return;
         for (subscriber_jids) |sub_bare_jid| {
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
 
-            if (self.shared_registry) |sr| {
-                // Multi-worker: use shared registry for cross-thread routing
-                var routing_buf: [16]shared_registry_mod.RoutingResult = undefined;
-                const route_count = sr.findAvailableByBareJid(sub_local, sub_domain, &routing_buf);
-                for (routing_buf[0..route_count]) |route| {
-                    if (route.worker_id == self.worker_id) {
-                        const target_session = self.sessions[route.session_id] orelse continue;
-                        target_session.conn.queueSend(presence_xml) catch continue;
-                        if (target_session.conn.hasPendingWrite()) {
-                            changes.addWrite(target_session.conn.fd, route.session_id) catch {};
-                        }
-                    } else {
-                        // Cross-thread: enqueue pre-built presence XML
-                        if (self.delivery_system) |ds| {
-                            ds.deliver(route.worker_id, route.session_id, route.generation, presence_xml) catch {};
-                        }
-                    }
-                }
-            } else {
-                // Single-worker: local registry only
-                var target_ids: [16]usize = undefined;
-                const target_count = self.registry.findAvailableByBareJid(sub_local, sub_domain, &target_ids);
-                for (target_ids[0..target_count]) |tid| {
-                    const target_session = self.sessions[tid] orelse continue;
+            var entries_buf: [16]SessionEntry = undefined;
+            const route_count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries_buf);
+            for (entries_buf[0..route_count]) |entry| {
+                if (entry.worker_id == self.worker_id) {
+                    const target_session = self.sessions[entry.local_session_id] orelse continue;
                     target_session.conn.queueSend(presence_xml) catch continue;
                     if (target_session.conn.hasPendingWrite()) {
-                        changes.addWrite(target_session.conn.fd, tid) catch {};
+                        changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
+                    }
+                } else {
+                    if (self.delivery_system) |ds| {
+                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
                     }
                 }
             }
@@ -2522,8 +2481,9 @@ pub const Server = struct {
             const contact_domain = contact_bare[at_pos + 1 ..];
 
             // If the contact has available sessions, send their presence to us
-            var target_ids: [16]usize = undefined;
-            const target_count = self.registry.findAvailableByBareJid(contact_local, contact_domain, &target_ids);
+            const probe_sm = self.session_map orelse return;
+            var probe_entries: [16]SessionEntry = undefined;
+            const target_count = probe_sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
             if (target_count > 0) {
                 // Send presence from contact to our session
                 var pres_buf: [512]u8 = undefined;
@@ -2622,19 +2582,15 @@ pub const Server = struct {
 
         if (session.stream.isActive()) {
             if (session.stream.bound_jid) |bound| {
-                // Register in session registry (local — always)
-                self.registry.bind(session.conn.id, bound.local, bound.domain, bound.resource) catch |err| {
-                    log.err("connection {d} registry bind failed: {}", .{ session.conn.id, err });
+                // Register in unified session map
+                const sm = self.session_map orelse {
+                    log.err("connection {d} bind failed: session_map not configured", .{session.conn.id});
                     return;
                 };
-                // Register in shared registry (cross-thread — when workers > 1)
-                if (self.shared_registry) |sr| {
-                    sr.bind(self.globalSessionId(session.conn.id), self.worker_id, bound.local, bound.domain, bound.resource) catch |err| {
-                        log.err("connection {d} shared registry bind failed (rolling back local): {}", .{ session.conn.id, err });
-                        _ = self.registry.unbind(session.conn.id);
-                        return;
-                    };
-                }
+                _ = sm.bind(self.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err| {
+                    log.err("connection {d} session_map bind failed: {}", .{ session.conn.id, err });
+                    return;
+                };
                 log.info("connection {d} session established: {s}@{s}/{s}", .{
                     session.conn.id, bound.local, bound.domain, bound.resource,
                 });
@@ -2785,7 +2741,7 @@ pub const Server = struct {
     /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
     fn enqueueCrossThreadStanza(
         self: *Server,
-        route: shared_registry_mod.RoutingResult,
+        route: SessionEntry,
         from_str: []const u8,
         to_str: []const u8,
         type_str: []const u8,
@@ -2835,8 +2791,8 @@ pub const Server = struct {
             w.writeByte('>') catch return;
         }
 
-        ds.deliver(route.worker_id, route.session_id, route.generation, fbs.getWritten()) catch |err| {
-            log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.session_id, err });
+        ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
+            log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         };
     }
 
@@ -2844,30 +2800,26 @@ pub const Server = struct {
     /// Validates generation (ABA protection) before delivering to local sessions.
     fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
         const ds = self.delivery_system orelse return;
-        const sr = self.shared_registry orelse return;
+        const sm = self.session_map orelse return;
         const queue = ds.getQueue(self.worker_id);
 
         const Ctx = struct {
             server: *Server,
             changes: *ChangeList,
-            registry: *SharedSessionRegistry,
-            base: u32,
+            session_map: *SessionMap,
         };
-        const ctx = Ctx{ .server = self, .changes = changes, .registry = sr, .base = self.session_id_base };
+        const ctx = Ctx{ .server = self, .changes = changes, .session_map = sm };
 
         _ = queue.drain(ctx, struct {
-            fn handle(c: Ctx, session_id: u32, generation: u32, payload: []const u8) void {
+            fn handle(c: Ctx, local_session_id: u32, generation: u32, payload: []const u8) void {
                 // ABA check: verify session is still bound with same generation
-                const current_gen = c.registry.getGeneration(session_id) orelse return;
-                if (current_gen != generation) return;
+                if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
-                // Convert global session ID back to local index for sessions[] lookup.
-                // global = session_id_base + local → local = global - base
-                const local_id = session_id - c.base;
-                const target_session = c.server.sessions[local_id] orelse return;
+                // local_session_id indexes directly into sessions[] (no global→local conversion)
+                const target_session = c.server.sessions[local_session_id] orelse return;
                 target_session.conn.queueSend(payload) catch return;
                 if (target_session.conn.hasPendingWrite()) {
-                    c.changes.addWrite(target_session.conn.fd, local_id) catch {};
+                    c.changes.addWrite(target_session.conn.fd, local_session_id) catch {};
                 }
             }
         }.handle);
@@ -2879,15 +2831,15 @@ pub const Server = struct {
         // Remove from all MUC rooms (broadcasts unavailable to room occupants)
         muc_handler.handleSessionClose(self, id, changes);
 
-        // Unregister from shared registry (cross-thread — increments generation for ABA)
-        if (self.shared_registry) |sr| {
-            _ = sr.unbind(self.globalSessionId(id));
-        }
-
-        // Unregister from local session registry and broadcast unavailable presence
-        if (self.registry.unbind(id)) |bound| {
-            if (bound.presence_available) {
-                self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
+        // Unregister from session map and broadcast unavailable presence
+        if (session.stream.bound_jid) |bound| {
+            if (self.session_map) |sm| {
+                const removed = sm.unbind(bound.local, bound.domain, bound.resource);
+                if (removed) |entry| {
+                    if (entry.presence_available) {
+                        self.broadcastUnavailable(bound.local, bound.domain, bound.resource, changes);
+                    }
+                }
             }
         }
 
@@ -2898,12 +2850,6 @@ pub const Server = struct {
         session.deinit();
         self.allocator.destroy(session);
         self.sessions[id] = null;
-    }
-
-    /// Convert a local session ID to a global shared registry slot.
-    /// Each worker's sessions are offset: global = session_id_base + local_id.
-    fn globalSessionId(self: *const Server, local_id: usize) u32 {
-        return self.session_id_base + @as(u32, @intCast(local_id));
     }
 
     fn allocateId(self: *Server) ?usize {
@@ -3233,41 +3179,38 @@ test "extractAttrValue: finds attribute" {
 test "cross-thread delivery: enqueue and drain" {
     const allocator = std.testing.allocator;
 
-    // Set up shared infrastructure (128 total slots for 2 workers × 64 each)
-    var shared_reg = try SharedSessionRegistry.init(allocator, 128);
-    defer shared_reg.deinit();
+    // Set up shared infrastructure
+    var sm = SessionMap.init(allocator, true);
+    defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
     // Create a server that acts as worker 1 (the one draining)
-    // Worker 1 owns global slots 64..127 (base = 1 * 64 = 64)
     var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_id_base = 64; // worker 1 × 64 per_worker_sessions
-    server.shared_registry = &shared_reg;
+    server.session_map = &sm;
     server.delivery_system = &delivery_sys;
 
     // Create a target session on worker 1 using a socketpair
-    // Local session ID = 5, global = 64 + 5 = 69
+    // Local session ID = 5
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     session.* = Session.init(fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = session;
 
-    // Bind in shared registry using GLOBAL session ID
-    const global_id = server.globalSessionId(5);
-    try std.testing.expectEqual(@as(u32, 69), global_id);
-    try shared_reg.bind(global_id, 1, "bob", "localhost", "desktop");
+    // Bind in session map (local_session_id = 5, worker = 1)
+    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
 
-    // Simulate a cross-thread enqueue FROM worker 0 TO session 69 on worker 1
-    const route = shared_reg.findByFullJid("bob", "localhost", "desktop").?;
+    // Simulate a cross-thread enqueue FROM worker 0 TO session 5 on worker 1
+    const route = sm.findByFullJid("bob", "localhost", "desktop").?;
     try std.testing.expectEqual(@as(u16, 1), route.worker_id);
-    try std.testing.expectEqual(@as(u32, 69), route.session_id);
+    try std.testing.expectEqual(@as(u32, 5), route.local_session_id);
+    try std.testing.expectEqual(gen, route.generation);
 
     // Build a stanza and enqueue it (as if worker 0 is sending)
-    try delivery_sys.deliver(route.worker_id, route.session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
+    try delivery_sys.deliver(route.worker_id, route.local_session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
 
     // Worker 1 drains its queue
     var change_buf: [16]posix.Kevent = undefined;
@@ -3292,24 +3235,23 @@ test "cross-thread delivery: enqueue and drain" {
 test "cross-thread delivery: generation mismatch drops stanza" {
     const allocator = std.testing.allocator;
 
-    var shared_reg = try SharedSessionRegistry.init(allocator, 64);
-    defer shared_reg.deinit();
+    var sm = SessionMap.init(allocator, true);
+    defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
     var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.worker_id = 0;
-    server.shared_registry = &shared_reg;
+    server.session_map = &sm;
     server.delivery_system = &delivery_sys;
 
     // Bind a session, get its generation, then unbind (simulating disconnect)
-    try shared_reg.bind(3, 0, "alice", "localhost", "mobile");
-    const old_gen = shared_reg.findByFullJid("alice", "localhost", "mobile").?.generation;
-    _ = shared_reg.unbind(3);
+    const gen = try sm.bind(0, 3, "alice", "localhost", "mobile");
+    _ = sm.unbind("alice", "localhost", "mobile");
 
     // Enqueue with the OLD generation (stale delivery)
-    try delivery_sys.deliver(0, 3, old_gen, "<message>stale</message>");
+    try delivery_sys.deliver(0, 3, gen, "<message>stale</message>");
 
     // Drain — should silently drop (generation mismatch)
     var change_buf: [16]posix.Kevent = undefined;

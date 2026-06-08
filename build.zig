@@ -242,13 +242,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     roster_store_mod_for_server.addImport("backend", server_backend_mod);
-    const session_registry_mod_for_server = b.createModule(.{
-        .root_source_file = b.path("src/core/session_registry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const shared_registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/shared_registry.zig"),
+    const session_map_mod_for_server = b.createModule(.{
+        .root_source_file = b.path("src/core/session_map.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -292,8 +287,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
-    server_test_mod.addImport("session_registry", session_registry_mod_for_server);
-    server_test_mod.addImport("shared_registry", shared_registry_mod);
+    server_test_mod.addImport("session_map", session_map_mod_for_server);
     server_test_mod.addImport("delivery_queue", delivery_queue_mod);
     server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
     server_test_mod.addImport("archive_store", server_archive_store_mod);
@@ -474,36 +468,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_roster_store_tests = b.addRunArtifact(roster_store_tests);
-
-    // --- Session registry tests ---
-
-    const session_registry_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/session_registry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const session_registry_tests = b.addTest(.{
-        .name = "session-registry-tests",
-        .root_module = session_registry_test_mod,
-    });
-
-    const run_session_registry_tests = b.addRunArtifact(session_registry_tests);
-
-    // --- Shared session registry tests ---
-
-    const shared_registry_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/shared_registry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const shared_registry_tests = b.addTest(.{
-        .name = "shared-registry-tests",
-        .root_module = shared_registry_test_mod,
-    });
-
-    const run_shared_registry_tests = b.addRunArtifact(shared_registry_tests);
 
     // --- Session map tests ---
 
@@ -937,8 +901,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
-    core_mod.addImport("session_registry", session_registry_mod_for_server);
-    core_mod.addImport("shared_registry", shared_registry_mod);
+    core_mod.addImport("session_map", session_map_mod_for_server);
     core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
     core_mod.addImport("archive_store", server_archive_store_mod);
@@ -1273,8 +1236,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
-    test_step.dependOn(&run_session_registry_tests.step);
-    test_step.dependOn(&run_shared_registry_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
     test_step.dependOn(&run_offline_store_tests.step);
