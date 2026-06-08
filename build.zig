@@ -505,6 +505,21 @@ pub fn build(b: *std.Build) void {
 
     const run_shared_registry_tests = b.addRunArtifact(shared_registry_tests);
 
+    // --- Session map tests ---
+
+    const session_map_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/session_map.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const session_map_tests = b.addTest(.{
+        .name = "session-map-tests",
+        .root_module = session_map_test_mod,
+    });
+
+    const run_session_map_tests = b.addRunArtifact(session_map_tests);
+
     // --- Delivery queue tests ---
 
     const delivery_queue_test_mod = b.createModule(.{
@@ -1260,6 +1275,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_registry_tests.step);
     test_step.dependOn(&run_shared_registry_tests.step);
+    test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
