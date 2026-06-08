@@ -12,6 +12,7 @@
 //! ```
 //! xmppd (master, root → xmppd user)
 //!   ├── xmppd-auth (authentication daemon)
+//!   ├── xmppd-s2s  (federation daemon)
 //!   └── xmppd-core (worker, handles connections)
 //! ```
 //!
@@ -49,7 +50,11 @@ pub fn main() !void {
     var key_path: ?[]const u8 = null;
     var core_path: []const u8 = "xmppd-core";
     var auth_path: []const u8 = "xmppd-auth";
+    var s2s_path: []const u8 = "xmppd-s2s";
     var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
+    var s2s_socket: []const u8 = "/var/run/xmppd/s2s.sock";
+    var s2s_port: []const u8 = "5269";
+    var s2s_enabled: bool = true;
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
@@ -90,6 +95,13 @@ pub fn main() !void {
                 log.err("--auth-path requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--s2s-path")) {
+            s2s_path = args.next() orelse {
+                log.err("--s2s-path requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--no-s2s")) {
+            s2s_enabled = false;
         } else if (std.mem.eql(u8, arg, "--auth-socket")) {
             auth_socket = args.next() orelse {
                 log.err("--auth-socket requires a value", .{});
@@ -159,12 +171,23 @@ pub fn main() !void {
             if (c.get("auth", "socket")) |v| auth_socket = v;
         }
 
+        // [s2s] section
+        if (std.mem.eql(u8, s2s_socket, "/var/run/xmppd/s2s.sock")) {
+            if (c.get("s2s", "socket")) |v| s2s_socket = v;
+        }
+        if (std.mem.eql(u8, s2s_port, "5269")) {
+            if (c.get("s2s", "port")) |v| s2s_port = v;
+        }
+
         // [master] section
         if (std.mem.eql(u8, core_path, "xmppd-core")) {
             if (c.get("master", "core_path")) |v| core_path = v;
         }
         if (std.mem.eql(u8, auth_path, "xmppd-auth")) {
             if (c.get("master", "auth_path")) |v| auth_path = v;
+        }
+        if (std.mem.eql(u8, s2s_path, "xmppd-s2s")) {
+            if (c.get("master", "s2s_path")) |v| s2s_path = v;
         }
     }
     defer if (cfg) |*c| c.deinit();
@@ -258,6 +281,7 @@ pub fn main() !void {
     // --- Orphan child cleanup ---
     // Kill any stale children from a previous master that died ungracefully
     cleanupOrphan("/var/run/xmppd/auth.pid");
+    cleanupOrphan("/var/run/xmppd/s2s.pid");
     cleanupOrphan("/var/run/xmppd/core.pid");
 
     // Ensure storage sub-directories exist
@@ -277,7 +301,36 @@ pub fn main() !void {
         };
     }
 
-    // Build child argv: pass --config, --db, --socket to auth and core children
+    // --- Bind privileged ports while still root ---
+    // Fds survive fork+exec (no CLOEXEC) — children use --listen-fd N.
+    var c2s_listen_fd: posix.fd_t = -1;
+    var s2s_listen_fd: posix.fd_t = -1;
+    {
+        const c2s_port_num = std.fmt.parseInt(u16, port, 10) catch 5222;
+        c2s_listen_fd = bindListenerSocket("0.0.0.0", c2s_port_num) catch |err| {
+            log.err("failed to bind C2S port {s}: {}", .{ port, err });
+            return error.BindFailed;
+        };
+        log.info("bound C2S listener fd={d} port={s}", .{ c2s_listen_fd, port });
+    }
+    if (s2s_enabled) {
+        const s2s_port_num = std.fmt.parseInt(u16, s2s_port, 10) catch 5269;
+        s2s_listen_fd = bindListenerSocket("0.0.0.0", s2s_port_num) catch |err| {
+            log.err("failed to bind S2S port {s}: {}", .{ s2s_port, err });
+            return error.BindFailed;
+        };
+        log.info("bound S2S listener fd={d} port={s}", .{ s2s_listen_fd, s2s_port });
+    }
+    defer if (c2s_listen_fd >= 0) posix.close(c2s_listen_fd);
+    defer if (s2s_listen_fd >= 0) posix.close(s2s_listen_fd);
+
+    // Format fd numbers as strings for child argv
+    var c2s_fd_str_buf: [12]u8 = undefined;
+    const c2s_fd_str = std.fmt.bufPrint(&c2s_fd_str_buf, "{d}", .{c2s_listen_fd}) catch "3";
+    var s2s_fd_str_buf: [12]u8 = undefined;
+    const s2s_fd_str = std.fmt.bufPrint(&s2s_fd_str_buf, "{d}", .{s2s_listen_fd}) catch "4";
+
+    // Build child argv: pass --config, --db, --socket to auth, s2s, and core children
     var auth_args_buf: [6][]const u8 = undefined;
     var auth_argc: usize = 0;
     if (config_path) |cp| {
@@ -286,16 +339,59 @@ pub fn main() !void {
         auth_args_buf[auth_argc] = cp;
         auth_argc += 1;
     }
-    auth_args_buf[auth_argc] = "--db";
-    auth_argc += 1;
-    auth_args_buf[auth_argc] = db_path;
-    auth_argc += 1;
+    // Only pass --db to auth backends that need it (not OIDC)
+    const is_oidc_auth = std.mem.indexOf(u8, auth_path, "oidc") != null;
+    if (!is_oidc_auth) {
+        auth_args_buf[auth_argc] = "--db";
+        auth_argc += 1;
+        auth_args_buf[auth_argc] = db_path;
+        auth_argc += 1;
+    }
     auth_args_buf[auth_argc] = "--socket";
     auth_argc += 1;
     auth_args_buf[auth_argc] = auth_socket;
     auth_argc += 1;
 
-    var core_args_buf: [10][]const u8 = undefined;
+    var s2s_args_buf: [14][]const u8 = undefined;
+    var s2s_argc: usize = 0;
+    if (config_path) |cp| {
+        s2s_args_buf[s2s_argc] = "--config";
+        s2s_argc += 1;
+        s2s_args_buf[s2s_argc] = cp;
+        s2s_argc += 1;
+    }
+    s2s_args_buf[s2s_argc] = "--host";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = host;
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = "--port";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = s2s_port;
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = "--core-socket";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = s2s_socket;
+    s2s_argc += 1;
+    if (cert_path) |cp| {
+        s2s_args_buf[s2s_argc] = "--cert";
+        s2s_argc += 1;
+        s2s_args_buf[s2s_argc] = cp;
+        s2s_argc += 1;
+    }
+    if (key_path) |kp| {
+        s2s_args_buf[s2s_argc] = "--key";
+        s2s_argc += 1;
+        s2s_args_buf[s2s_argc] = kp;
+        s2s_argc += 1;
+    }
+    if (s2s_listen_fd >= 0) {
+        s2s_args_buf[s2s_argc] = "--listen-fd";
+        s2s_argc += 1;
+        s2s_args_buf[s2s_argc] = s2s_fd_str;
+        s2s_argc += 1;
+    }
+
+    var core_args_buf: [14][]const u8 = undefined;
     var core_argc: usize = 0;
     if (config_path) |cp| {
         core_args_buf[core_argc] = "--config";
@@ -306,6 +402,16 @@ pub fn main() !void {
     core_args_buf[core_argc] = "--auth-socket";
     core_argc += 1;
     core_args_buf[core_argc] = auth_socket;
+    core_argc += 1;
+    if (s2s_enabled) {
+        core_args_buf[core_argc] = "--s2s-socket";
+        core_argc += 1;
+        core_args_buf[core_argc] = s2s_socket;
+        core_argc += 1;
+    }
+    core_args_buf[core_argc] = "--listen-fd";
+    core_argc += 1;
+    core_args_buf[core_argc] = c2s_fd_str;
     core_argc += 1;
     if (cert_path) |cp| {
         core_args_buf[core_argc] = "--cert";
@@ -320,18 +426,24 @@ pub fn main() !void {
         core_argc += 1;
     }
 
-    // Initialize supervisors for both children
+    // Initialize supervisors for all children
     var auth_sup = if (child_uid != 0)
         Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid)
     else
         Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
+    var s2s_sup = if (child_uid != 0)
+        Supervisor.initWithUser(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid)
+    else
+        Supervisor.init(s2s_path, s2s_args_buf[0..s2s_argc]);
     var core_sup = if (child_uid != 0)
         Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
     else
         Supervisor.init(core_path, core_args_buf[0..core_argc]);
 
-    log.info("config: auth_socket={s} db={s} cert={s} key={s}", .{
+    log.info("config: auth_socket={s} s2s={any} s2s_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
+        s2s_enabled,
+        s2s_socket,
         db_path,
         cert_path orelse "(none)",
         key_path orelse "(none)",
@@ -355,6 +467,15 @@ pub fn main() !void {
     // Brief delay for auth daemon to bind its socket
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
+    // Spawn xmppd-s2s (must be ready before core connects to it)
+    if (s2s_enabled) {
+        const s2s_pid = try s2s_sup.spawnChild();
+        try loop.addProcess(s2s_pid);
+        writeChildPid("/var/run/xmppd/s2s.pid", s2s_pid);
+        log.info("s2s daemon started, waiting for socket", .{});
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
     // Spawn xmppd-core
     const core_pid = try core_sup.spawnChild();
     try loop.addProcess(core_pid);
@@ -363,6 +484,7 @@ pub fn main() !void {
     // Timer idents for restart backoff
     const AUTH_UDATA: usize = 1;
     const CORE_UDATA: usize = 2;
+    const S2S_UDATA: usize = 3;
 
     // Supervisor event loop
     var running = true;
@@ -393,6 +515,15 @@ pub fn main() !void {
                         } else {
                             running = false;
                         }
+                    } else if (s2s_enabled and s2s_sup.child_pid != null and p.pid == s2s_sup.child_pid.?) {
+                        _ = s2s_sup.waitChild() catch {};
+                        const should_restart = s2s_sup.handleChildExit(p.status);
+                        if (should_restart) {
+                            log.info("restarting s2s in {d}ms", .{s2s_sup.backoffMs()});
+                            loop.addTimer(S2S_UDATA, s2s_sup.backoffMs(), true) catch {};
+                        } else {
+                            running = false;
+                        }
                     }
                 },
                 .timer => |t| {
@@ -410,6 +541,13 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                    } else if (t.ident == S2S_UDATA) {
+                        const new_pid = s2s_sup.spawnChild() catch |err| {
+                            log.err("failed to respawn s2s: {}", .{err});
+                            running = false;
+                            continue;
+                        };
+                        loop.addProcess(new_pid) catch {};
                     }
                 },
                 .signal => |s| {
@@ -417,6 +555,10 @@ pub fn main() !void {
                         log.info("received signal {d}, shutting down", .{s.signo});
                         core_sup.shutdown();
                         _ = core_sup.waitChild() catch {};
+                        if (s2s_enabled) {
+                            s2s_sup.shutdown();
+                            _ = s2s_sup.waitChild() catch {};
+                        }
                         auth_sup.shutdown();
                         _ = auth_sup.waitChild() catch {};
                         running = false;
@@ -432,6 +574,7 @@ pub fn main() !void {
 
     // Clean up child PID files on graceful shutdown
     removeChildPid("/var/run/xmppd/auth.pid");
+    removeChildPid("/var/run/xmppd/s2s.pid");
     removeChildPid("/var/run/xmppd/core.pid");
 
     log.info("xmppd master shutdown complete", .{});
@@ -500,6 +643,8 @@ fn printUsage() void {
         \\  --key PATH         TLS private key file (PEM)
         \\  --core-path PATH   Path to xmppd-core binary (default: xmppd-core)
         \\  --auth-path PATH   Path to xmppd-auth binary (default: xmppd-auth)
+        \\  --s2s-path PATH    Path to xmppd-s2s binary (default: xmppd-s2s)
+        \\  --no-s2s           Disable S2S federation
         \\  --auth-socket PATH IPC socket path (default: /var/run/xmppd/auth.sock)
         \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
         \\  --config PATH, -c  Config file path (passed to children)
@@ -511,4 +656,36 @@ fn printUsage() void {
     var buf: [0]u8 = .{};
     var stdout = std.fs.File.stdout().writer(&buf);
     stdout.interface.writeAll(usage) catch {};
+}
+
+/// Bind a non-blocking, SO_REUSEADDR TCP socket on the given address and port.
+/// Returns the listening fd. Used by the master to bind privileged ports
+/// before dropping privileges and passing fds to children.
+fn bindListenerSocket(address: []const u8, bind_port: u16) !posix.fd_t {
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
+        0,
+    );
+    errdefer posix.close(fd);
+
+    const one: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, bind_port),
+        .addr = 0, // INADDR_ANY
+    };
+    _ = address;
+
+    posix.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
+        return switch (err) {
+            error.AddressInUse => error.AddressInUse,
+            error.AccessDenied => error.PermissionDenied,
+            else => error.SystemResources,
+        };
+    };
+
+    posix.listen(fd, 128) catch return error.SystemResources;
+    return fd;
 }

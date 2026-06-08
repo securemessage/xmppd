@@ -590,6 +590,7 @@ pub fn main() !void {
     var core_socket: ?[]const u8 = null;
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
+    var listen_fd: ?posix.fd_t = null;
 
     _ = args.next(); // Skip argv[0]
 
@@ -628,6 +629,15 @@ pub fn main() !void {
                 log.err("--key requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--listen-fd")) {
+            const val = args.next() orelse {
+                log.err("--listen-fd requires a value", .{});
+                return error.InvalidArgs;
+            };
+            listen_fd = std.fmt.parseInt(posix.fd_t, val, 10) catch {
+                log.err("invalid fd number: {s}", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -663,11 +673,17 @@ pub fn main() !void {
         return err;
     };
 
-    // Start inbound listener
-    daemon.listen(address, port) catch |err| {
-        log.err("failed to bind S2S listener: {}", .{err});
-        return err;
-    };
+    // Start inbound listener (from pre-bound fd or bind ourselves)
+    if (listen_fd) |fd| {
+        daemon.listener_fd = fd;
+        daemon.listener_port = port;
+        log.info("S2S using inherited listener fd={d} port={d}", .{ fd, port });
+    } else {
+        daemon.listen(address, port) catch |err| {
+            log.err("failed to bind S2S listener: {}", .{err});
+            return err;
+        };
+    }
 
     // Start IPC server for core communication
     if (core_socket) |socket_path| {

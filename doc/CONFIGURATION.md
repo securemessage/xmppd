@@ -49,6 +49,7 @@ in development mode.
 |-----|---------|-------------|
 | `core_path` | `/usr/local/libexec/xmppd/xmppd-core` | Core binary path |
 | `auth_path` | `/usr/local/libexec/xmppd/xmppd-auth` | Auth binary path (or `xmppd-auth-oidc`) |
+| `s2s_path` | `/usr/local/libexec/xmppd/xmppd-s2s` | S2S federation binary path |
 
 ### [oidc] (when using xmppd-auth-oidc)
 
@@ -113,5 +114,6 @@ The master additionally accepts:
 
 `xmppctl` accepts:
 - `--db PATH` — database directory
+- `--auth-socket PATH` — auth daemon IPC socket (tries IPC first, falls back to direct DB)
 - `--password VALUE` — non-interactive password
 - `--password-file PATH` — read password from file

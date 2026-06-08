@@ -1163,6 +1163,7 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -1181,6 +1182,7 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",

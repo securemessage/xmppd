@@ -59,6 +59,7 @@ pub fn main() !void {
     var db_path: ?[]const u8 = null;
     var muc_host_arg: ?[]const u8 = null;
     var config_path: ?[]const u8 = null;
+    var listen_fd: ?std.posix.fd_t = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
 
@@ -103,6 +104,15 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--s2s-socket")) {
             s2s_socket = args.next() orelse {
                 log.err("--s2s-socket requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--listen-fd")) {
+            const val = args.next() orelse {
+                log.err("--listen-fd requires a value", .{});
+                return error.InvalidArgs;
+            };
+            listen_fd = std.fmt.parseInt(std.posix.fd_t, val, 10) catch {
+                log.err("invalid fd number: {s}", .{val});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--db")) {
@@ -184,7 +194,10 @@ pub fn main() !void {
 
     log.info("starting xmppd-core host={s} address={s} port={d} max_sessions={d}", .{ host, address, port, max_sessions });
 
-    var server = try Server.initWithMaxSessions(host, address, port, allocator, max_sessions);
+    var server = if (listen_fd) |fd|
+        try Server.initFromFd(host, fd, allocator, max_sessions)
+    else
+        try Server.initWithMaxSessions(host, address, port, allocator, max_sessions);
     server.fanout_queue.batch_size = fan_out_batch_size;
     defer server.deinit();
 
@@ -288,6 +301,7 @@ fn printUsage() void {
         \\  --key PATH       TLS private key file (PEM)
         \\  --auth-socket PATH  Auth daemon IPC socket
         \\  --s2s-socket PATH   S2S federation daemon IPC socket
+        \\  --listen-fd N    Pre-bound listener fd (from master)
         \\  --db PATH        User database path (roster stored alongside)
         \\  --muc-host HOST  MUC service hostname (default: conference.{host})
         \\  --help, -h       Show this help

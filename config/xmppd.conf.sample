@@ -114,6 +114,9 @@ socket = /var/run/xmppd/auth.sock
 # Path to xmppd-auth binary (default: alongside xmppd)
 # auth_path = /usr/local/libexec/xmppd/xmppd-auth
 
+# Path to xmppd-s2s binary (default: alongside xmppd)
+# s2s_path = /usr/local/libexec/xmppd/xmppd-s2s
+
 # ==========================================================================
 # OIDC — External authentication via OpenID Connect (optional)
 # Use xmppd-auth-oidc instead of xmppd-auth when this section is configured.

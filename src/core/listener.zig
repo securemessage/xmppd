@@ -84,6 +84,15 @@ pub const Listener = struct {
         };
     }
 
+    /// Wrap a pre-bound, pre-listening fd (received from the master via fd inheritance).
+    /// The fd must already be bound, listening, and non-blocking.
+    pub fn initFromFd(fd: posix.fd_t, direct_tls: bool) Listener {
+        return Listener{
+            .fd = fd,
+            .direct_tls = direct_tls,
+        };
+    }
+
     /// Accept a pending connection.
     ///
     /// Returns a new `Connection` wrapping the accepted client socket.

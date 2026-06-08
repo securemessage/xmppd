@@ -343,6 +343,34 @@ pub const Server = struct {
         };
     }
 
+    /// Initialize with a pre-bound listener fd (received from master via fd inheritance).
+    pub fn initFromFd(
+        host: []const u8,
+        fd: std.posix.fd_t,
+        allocator: std.mem.Allocator,
+        max_sessions: usize,
+    ) !Server {
+        const sessions = try allocator.alloc(?*Session, max_sessions);
+        @memset(sessions, null);
+
+        const loop = try EventLoop.init(allocator, 256);
+        errdefer {
+            var l = loop;
+            l.deinit();
+        }
+
+        const listener = Listener.initFromFd(fd, false);
+
+        return Server{
+            .loop = loop,
+            .listener = listener,
+            .sessions = sessions,
+            .max_sessions = max_sessions,
+            .allocator = allocator,
+            .server_host = host,
+        };
+    }
+
     /// Connect to the auth daemon IPC socket.
     /// Must be called before `run()`. Without this, SASL auth requests
     /// will receive temporary-auth-failure.

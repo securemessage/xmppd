@@ -22,6 +22,7 @@ const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const invite_store_mod = @import("invite_store");
 const InviteStore = invite_store_mod.InviteStore(OpBackendType);
+const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.xmppctl);
 
@@ -34,6 +35,7 @@ pub fn main() !void {
     defer args.deinit();
 
     var db_path: []const u8 = "/var/db/xmppd";
+    var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
     var cli_password: ?[]const u8 = null;
     var password_file: ?[]const u8 = null;
 
@@ -47,6 +49,11 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--db")) {
             db_path = args.next() orelse {
                 printErr("--db requires a value\n");
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--auth-socket")) {
+            auth_socket = args.next() orelse {
+                printErr("--auth-socket requires a value\n");
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--password")) {
@@ -70,6 +77,15 @@ pub fn main() !void {
     }
 
     const command = remaining_args.items[0];
+
+    // Try IPC to running auth daemon first for adduser/deluser/passwd.
+    // This is required for RocksDB (exclusive lock) and preferred for all backends.
+    if (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd")) {
+        if (tryIpcCommand(command, remaining_args.items, auth_socket, cli_password, password_file)) {
+            return; // IPC succeeded
+        }
+        // Fall through to direct DB access
+    }
 
     // Build auth-specific sub-path: {db_path}/auth
     var auth_path_buf: [1024]u8 = undefined;
@@ -394,9 +410,167 @@ fn printErr(msg: []const u8) void {
     stderr.interface.writeAll(msg) catch {};
 }
 
+/// Try to execute a management command via IPC to the running auth daemon.
+/// Returns true if IPC succeeded, false if daemon is unreachable (fall back to direct DB).
+fn tryIpcCommand(
+    command: []const u8,
+    cmd_args: []const []const u8,
+    socket_path: []const u8,
+    cli_password: ?[]const u8,
+    password_file: ?[]const u8,
+) bool {
+    // Connect to auth daemon (blocking)
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
+    defer posix.close(sock);
+
+    var addr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+    addr.family = posix.AF.UNIX;
+    if (socket_path.len >= addr.path.len) return false;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) catch return false;
+
+    if (cmd_args.len < 2) {
+        printErr(command);
+        printErr(" requires a JID argument\n");
+        return true; // Consumed — don't fall through
+    }
+    const jid = cmd_args[1];
+    const username = extractLocal(jid);
+
+    // Build IPC message
+    var frame_buf: [4096]u8 = undefined;
+    const conn_id: u32 = 0; // xmppctl uses conn_id 0
+
+    if (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "passwd")) {
+        // Resolve password
+        var pass_buf: [256]u8 = undefined;
+        var file_buf: [256]u8 = undefined;
+        const password = blk: {
+            if (cli_password) |p| break :blk p;
+            if (password_file) |pf| {
+                const f = std.fs.cwd().openFile(pf, .{}) catch {
+                    printErr("cannot open password file\n");
+                    return true;
+                };
+                defer f.close();
+                const n = f.read(&file_buf) catch {
+                    printErr("cannot read password file\n");
+                    return true;
+                };
+                const content = std.mem.trimRight(u8, file_buf[0..n], "\r\n");
+                if (content.len == 0) {
+                    printErr("password file is empty\n");
+                    return true;
+                }
+                break :blk content;
+            }
+            const p = readPassword("Password: ", &pass_buf) catch return true;
+            if (p.len < 1) {
+                printErr("password cannot be empty\n");
+                return true;
+            }
+            var confirm_buf: [256]u8 = undefined;
+            const confirm = readPassword("Confirm password: ", &confirm_buf) catch return true;
+            if (!std.mem.eql(u8, p, confirm)) {
+                printErr("passwords do not match\n");
+                return true;
+            }
+            break :blk p;
+        };
+
+        const msg: ipc_protocol.Message = if (std.mem.eql(u8, command, "adduser"))
+            .{ .register_request = .{ .conn_id = conn_id, .username = username, .password = password, .invite_code = "", .client_ip = "ctl" } }
+        else
+            .{ .password_change_request = .{ .conn_id = conn_id, .username = username, .new_password = password } };
+
+        const frame_len = ipc_protocol.encode(msg, &frame_buf) catch return false;
+        _ = writeAll(sock, frame_buf[0..frame_len]) catch return false;
+    } else if (std.mem.eql(u8, command, "deluser")) {
+        const msg = ipc_protocol.Message{ .account_delete_request = .{ .conn_id = conn_id, .username = username } };
+        const frame_len = ipc_protocol.encode(msg, &frame_buf) catch return false;
+        _ = writeAll(sock, frame_buf[0..frame_len]) catch return false;
+    } else {
+        return false;
+    }
+
+    // Read response (blocking)
+    var recv_buf: [4096]u8 = undefined;
+    var recv_len: usize = 0;
+    while (recv_len < recv_buf.len) {
+        const n = posix.read(sock, recv_buf[recv_len..]) catch break;
+        if (n == 0) break;
+        recv_len += n;
+
+        // Try to parse a frame
+        const frame = ipc_protocol.readFrame(recv_buf[0..recv_len]) orelse continue;
+        const resp = ipc_protocol.decode(frame.payload) catch {
+            printErr("invalid response from auth daemon\n");
+            return true;
+        };
+
+        switch (resp) {
+            .register_result => |r| {
+                if (r.success) {
+                    printOut("User ");
+                    printOut(jid);
+                    printOut(" created.\n");
+                } else {
+                    printErr("registration failed: ");
+                    printErr(r.reason);
+                    printErr("\n");
+                }
+            },
+            .password_change_result => |r| {
+                if (r.success) {
+                    printOut("Password changed for ");
+                    printOut(jid);
+                    printOut(".\n");
+                } else {
+                    printErr("password change failed: ");
+                    printErr(r.reason);
+                    printErr("\n");
+                }
+            },
+            .account_delete_result => |r| {
+                if (r.success) {
+                    printOut("User ");
+                    printOut(jid);
+                    printOut(" removed.\n");
+                } else {
+                    printErr("deletion failed: ");
+                    printErr(r.reason);
+                    printErr("\n");
+                }
+            },
+            else => {
+                printErr("unexpected response from auth daemon\n");
+            },
+        }
+        return true;
+    }
+
+    printErr("no response from auth daemon\n");
+    return true;
+}
+
+/// Blocking write-all helper.
+fn writeAll(fd: posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = posix.write(fd, data[written..]) catch |err| {
+            return switch (err) {
+                error.WouldBlock => continue,
+                else => error.WriteFailed,
+            };
+        };
+        written += n;
+    }
+}
+
 fn printUsage() void {
     printErr(
-        \\Usage: xmppctl [--db PATH] COMMAND [ARGS]
+        \\Usage: xmppctl [--db PATH] [--auth-socket PATH] COMMAND [ARGS]
         \\
         \\Commands:
         \\  adduser JID     Create a user account
@@ -411,6 +585,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --db PATH           Storage directory (default: /var/db/xmppd)
+        \\  --auth-socket PATH  Auth daemon IPC socket (default: /var/run/xmppd/auth.sock)
         \\  --password PASS     Provide password on command line (non-interactive)
         \\  --password-file F   Read password from file (first line, trailing newline stripped)
         \\
