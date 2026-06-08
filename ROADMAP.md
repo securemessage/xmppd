@@ -505,7 +505,13 @@ invalidation) and routing (direct pointer lookup, no serialization).
 **Trade-off:** A crash takes down all threads (no fault isolation). Acceptable
 at V1 scale. Multi-process + multi-thread is the Post-V1 evolution.
 
-- [ ] SO_REUSEPORT — master creates N sockets, passes N fds via `--listen-fd 5,6,7,8`
+**Stage 1 — PoC (fd inheritance, isolate threading from fd-passing):**
+
+Use existing `--listen-fd` mechanism. Master creates N SO_REUSEPORT sockets,
+passes all N fds to one xmppd-core child. xmppd-core spawns N threads,
+each taking one fd. Proves threading works before changing fd-passing mechanism.
+
+- [ ] SO_REUSEPORT — master creates N sockets, passes via `--listen-fd 5,6,7,8`
 - [ ] Per-thread kqueue event loop — each thread owns one listener fd + its sessions
 - [ ] MPSC channels — lock-free cross-thread stanza delivery (pipe/EVFILT_USER wakeup)
 - [ ] Shared session registry — cache-line-aligned slots, generational IDs for ABA
@@ -513,6 +519,15 @@ at V1 scale. Multi-process + multi-thread is the Post-V1 evolution.
 - [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
 - [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
 - [ ] Testing + benchmarks
+
+**Stage 2 — SCM_RIGHTS migration (after Stage 1 is stable):**
+
+Replace fd inheritance with explicit fd passing over Unix socketpair.
+Enables hot restart, zero-downtime upgrades, and Post-V1 multi-process.
+
+- [ ] `sendfd()`/`recvfd()` helpers (`sendmsg`/`recvmsg` + `CMSG_DATA(SCM_RIGHTS)`)
+- [ ] Master creates socketpair per child, sends bound fds after fork+exec
+- [ ] Child receives fds via `recvfd()` on startup (replaces fd inheritance)
 
 ---
 
