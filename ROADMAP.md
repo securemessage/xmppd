@@ -402,10 +402,12 @@ hardened. Tagged `v0.1.0`.
 - [x] Orphan cleanup on startup — SIGTERM → 2s grace → SIGKILL for stale children
 - [x] Clean PID file removal on graceful shutdown
 
-### Remaining (Deferred to V1)
+### V1 Pre-requisites (Done)
 
-- [ ] S2S supervisor wiring — xmppd-s2s not yet spawned by master (needs `[s2s]` config plumbing, ~50 LOC)
-- [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
+- [x] S2S supervisor wiring — master spawns xmppd-s2s as third child (auth → s2s → core)
+- [x] Privileged port binding — master binds 5222/5269 while root, passes fds via `--listen-fd`
+- [x] xmppctl IPC-based management — tries auth daemon IPC first, falls back to direct DB
+- [x] Auth-OIDC cosmetic fix — master skips `--db` for OIDC backend
 
 ### Standards (Post-MVP)
 
@@ -439,19 +441,14 @@ hardened. Tagged `v0.1.0`.
 Multi-threaded xmppd-core for horizontal scaling across CPU cores.
 Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
 
-### Pre-requisites (from Phase 12 deferred)
+### Pre-requisites ✅
 
-- [ ] S2S supervisor wiring — master spawns xmppd-s2s as third child process
-  - xmppd-s2s reads `--config` (add config file support like auth/core)
-  - Master reads `[s2s]` section: socket, port, cert, key
-  - Master passes args to S2S child, writes `s2s.pid`, handles restart/cleanup
-  - ~50 LOC in master + config plumbing in xmppd-s2s
-- [ ] SCM_RIGHTS fd passing (master binds privileged ports → passes to children)
-- [ ] xmppctl IPC-based management — talk to running xmppd-auth via IPC socket
-  instead of opening the database directly. Required for non-LMDB backends
-  (RocksDB takes exclusive lock). IPC protocol already has management tags
-  (0x06–0x0B: Register, PasswordChange, AccountDelete). Fallback to direct
-  DB access when daemon is not running (LMDB/SQLite only).
+All completed in commit a24fa94:
+
+- [x] S2S supervisor wiring — master spawns xmppd-s2s as third child
+- [x] Privileged port binding + fd passing (`--listen-fd`)
+- [x] xmppctl IPC-based management (IPC first, DB fallback)
+- [x] Auth-OIDC `--db` cosmetic fix
 
 ### Avatar System (V1)
 
@@ -489,11 +486,29 @@ avatar via standard XEPs; the server handles sourcing transparently.
   override per their own UX preference.
 - Post-V1: admin policies for avatar size limits, allowed formats, corporate branding
 
-### Thread-Per-Core
+### Thread-Per-Core (single process, multiple threads)
 
-- [ ] SO_REUSEPORT thread-per-core event loops (kernel-level connection distribution)
-- [ ] Lock-free cross-thread delivery (MPSC queues + EVFILT_USER + coalesced signaling)
-- [ ] Shared session registry (cache-line-aligned slots, generational IDs for ABA protection)
+V1 targets single-process multi-thread. All threads share one address space,
+one storage handle, one session registry. This dramatically simplifies storage
+(no cross-process coordination, no IPC for store access, no distributed cache
+invalidation) and routing (direct pointer lookup, no serialization).
+
+**Why single-process for V1:**
+- Storage — LMDB/RocksDB handle shared across threads. No exclusive lock
+  conflicts. One thread writes, all threads see it immediately.
+- Session routing — shared in-memory registry with mutex/lock-free access.
+  Cross-thread message delivery is MPSC push + kqueue wakeup, not IPC.
+- MUC fan-out — occupants on different threads reached via MPSC, not
+  Unix socket marshaling.
+- Simpler to implement — delete more IPC code than you add thread sync code.
+
+**Trade-off:** A crash takes down all threads (no fault isolation). Acceptable
+at V1 scale. Multi-process + multi-thread is the Post-V1 evolution.
+
+- [ ] SO_REUSEPORT — master creates N sockets, passes N fds via `--listen-fd 5,6,7,8`
+- [ ] Per-thread kqueue event loop — each thread owns one listener fd + its sessions
+- [ ] MPSC channels — lock-free cross-thread stanza delivery (pipe/EVFILT_USER wakeup)
+- [ ] Shared session registry — cache-line-aligned slots, generational IDs for ABA
 - [ ] MUC fan-out cross-thread batching
 - [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
 - [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
@@ -504,6 +519,53 @@ avatar via standard XEPs; the server handles sourcing transparently.
 ## Post-V1
 
 These items are out of scope for V1 but are on the long-term radar.
+
+### Multi-Process + Multi-Thread
+
+Combine process-level fault isolation with thread-level shared memory.
+Natural evolution of V1's single-process thread-per-core once scale
+demands fault isolation between worker groups.
+
+```
+xmppd (master, root)
+  ├── xmppd-auth
+  ├── xmppd-s2s
+  ├── xmppd-core worker 0  (N threads, fds 5..8)
+  └── xmppd-core worker 1  (N threads, fds 9..12)
+```
+
+**Process boundary** gives fault isolation (worker 0 crashes, worker 1
+keeps serving) and security separation (different UIDs possible).
+
+**Thread boundary** gives shared memory for the session registry within
+a worker (no IPC for same-worker routing), shared storage handle, and
+zero-copy stanza delivery.
+
+**Cross-worker routing** requires IPC (Unix socket or shared memory
+ring buffer). Intra-worker routing is a pointer dereference through
+the shared registry — no serialization.
+
+**Topology tuning:** On a 32-core box, run 4 workers × 8 threads.
+More processes = better fault isolation. More threads per process =
+fewer IPC hops for routing. The sweet spot depends on workload.
+
+**fd passing works for both topologies:** Master creates N SO_REUSEPORT
+sockets, distributes them. Whether a given fd goes to a different
+process or a different thread is transparent — the `--listen-fd`
+infrastructure from V1 pre-requisites is reused unchanged.
+
+**Storage complexity (the reason V1 is single-process first):**
+- LMDB supports concurrent readers across processes (OK).
+- RocksDB needs shared-nothing (separate DB dir per worker) or a
+  dedicated storage service process.
+- Single-process avoids this entirely — one handle, all threads see
+  writes immediately via shared memory.
+
+**Prior art:** Nginx (multi-process, per-worker threads for async I/O),
+HAProxy (added threads within workers), Envoy (thread-per-core within
+one process). The hybrid model is where large servers converge.
+
+### Other Post-V1
 
 - **Clustering** — multi-node via shared storage + message bus
 - **epoll backend** — Linux support (secondary platform)
