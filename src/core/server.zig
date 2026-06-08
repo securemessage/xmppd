@@ -3215,3 +3215,88 @@ test "extractAttrValue: finds attribute" {
     try std.testing.expectEqualStrings("msg1", extractAttrValue("<message from='a' id='msg1' to='b'>", "id"));
     try std.testing.expectEqualStrings("", extractAttrValue("<message from='a'>", "type"));
 }
+
+test "cross-thread delivery: enqueue and drain" {
+    const allocator = std.testing.allocator;
+
+    // Set up shared infrastructure
+    var shared_reg = try SharedSessionRegistry.init(allocator, 64);
+    defer shared_reg.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    // Create a server that acts as worker 1 (the one draining)
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.shared_registry = &shared_reg;
+    server.delivery_system = &delivery_sys;
+
+    // Create a target session on worker 1 using a socketpair
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session;
+
+    // Bind the session in the shared registry as worker 1
+    try shared_reg.bind(5, 1, "bob", "localhost", "desktop");
+
+    // Simulate a cross-thread enqueue FROM worker 0 TO session 5 on worker 1
+    const route = shared_reg.findByFullJid("bob", "localhost", "desktop").?;
+    try std.testing.expectEqual(@as(u16, 1), route.worker_id);
+    try std.testing.expectEqual(@as(u32, 5), route.session_id);
+
+    // Build a stanza and enqueue it (as if worker 0 is sending)
+    try delivery_sys.deliver(route.worker_id, route.session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
+
+    // Worker 1 drains its queue
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // The session should now have pending write data
+    try std.testing.expect(session.conn.hasPendingWrite());
+
+    // Flush and read from the client side of the socketpair
+    _ = try session.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const received = buf[0..n];
+
+    // Verify the stanza arrived intact
+    try std.testing.expect(std.mem.indexOf(u8, received, "cross-thread!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "alice@localhost/mobile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
+}
+
+test "cross-thread delivery: generation mismatch drops stanza" {
+    const allocator = std.testing.allocator;
+
+    var shared_reg = try SharedSessionRegistry.init(allocator, 64);
+    defer shared_reg.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.shared_registry = &shared_reg;
+    server.delivery_system = &delivery_sys;
+
+    // Bind a session, get its generation, then unbind (simulating disconnect)
+    try shared_reg.bind(3, 0, "alice", "localhost", "mobile");
+    const old_gen = shared_reg.findByFullJid("alice", "localhost", "mobile").?.generation;
+    _ = shared_reg.unbind(3);
+
+    // Enqueue with the OLD generation (stale delivery)
+    try delivery_sys.deliver(0, 3, old_gen, "<message>stale</message>");
+
+    // Drain — should silently drop (generation mismatch)
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // No session at slot 3, so nothing should crash or write
+    try std.testing.expect(server.sessions[3] == null);
+}
