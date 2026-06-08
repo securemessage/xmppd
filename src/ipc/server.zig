@@ -32,6 +32,8 @@ pub const IpcConn = struct {
     fd: posix.fd_t = -1,
     recv_buf: [CLIENT_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
+    /// Bytes consumed by the last nextMessage() — compacted on the next call.
+    recv_consumed: usize = 0,
     send_buf: [CLIENT_SEND_BUF_SIZE]u8 = undefined,
     send_start: usize = 0,
     send_end: usize = 0,
@@ -39,6 +41,7 @@ pub const IpcConn = struct {
 
     /// Read data from the socket. Returns 0 on EOF.
     pub fn recv(self: *IpcConn) !usize {
+        self.compactRecvBuf();
         const space = CLIENT_BUF_SIZE - self.recv_len;
         if (space == 0) return error.BufferFull;
 
@@ -55,20 +58,32 @@ pub const IpcConn = struct {
 
     /// Extract the next complete message from the recv buffer.
     /// Returns null if no complete frame is available.
+    /// The returned Message borrows from the recv buffer — process it
+    /// before calling nextMessage() or recv() again.
     pub fn nextMessage(self: *IpcConn) !?protocol.Message {
+        // Apply deferred compaction from the previous call
+        self.compactRecvBuf();
+
         const data = self.recv_buf[0..self.recv_len];
         const frame = protocol.readFrame(data) orelse return null;
 
         const msg = try protocol.decode(frame.payload);
 
-        // Compact
-        const remaining = self.recv_len - frame.consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[frame.consumed..self.recv_len]);
-        }
-        self.recv_len = remaining;
+        // Defer compaction — the returned msg borrows from recv_buf.
+        self.recv_consumed = frame.consumed;
 
         return msg;
+    }
+
+    /// Apply deferred compaction: shift unconsumed data to the front.
+    fn compactRecvBuf(self: *IpcConn) void {
+        if (self.recv_consumed == 0) return;
+        const remaining = self.recv_len - self.recv_consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[self.recv_consumed..self.recv_len]);
+        }
+        self.recv_len = remaining;
+        self.recv_consumed = 0;
     }
 
     /// Queue a response message for sending.
