@@ -1511,6 +1511,30 @@ pub const Server = struct {
         log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
     }
 
+    /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
+    /// Used by subscription handlers where the stanza XML is already built.
+    fn forwardPresenceXmlToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
+        if (!self.s2s_ipc.connected) {
+            log.info("connection {d} subscription to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
+            return;
+        }
+
+        self.s2s_ipc.send(.{ .s2s_deliver = .{
+            .from_jid = from_str,
+            .to_jid = to_str,
+            .stanza_xml = stanza_xml,
+        } }) catch {
+            log.err("connection {d} failed to forward subscription to S2S", .{session.conn.id});
+            return;
+        };
+
+        if (self.s2s_ipc.hasPendingSend()) {
+            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        }
+
+        log.info("connection {d} subscription to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
+    }
+
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.recv() catch {
             log.err("S2S daemon IPC recv error", .{});
@@ -2101,37 +2125,39 @@ pub const Server = struct {
             roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
         }
 
-        // Forward subscribe to the target (if online)
+        // Forward subscribe to the target
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        const sub_sm = self.session_map orelse return;
-        var sub_entries: [16]SessionEntry = undefined;
-        const target_count = sub_sm.findByBareJid(to_jid.local, to_jid.domain, &sub_entries);
 
-        var from_buf: [256]u8 = undefined;
-        var from_fbs = std.io.fixedBufferStream(&from_buf);
-        from_fbs.writer().writeAll(owner_bare) catch return;
-        const from_str = from_fbs.getWritten();
-
-        // Build presence stanza once for all targets
+        // Build presence stanza
         var sub_pres_buf: [512]u8 = undefined;
         var sub_pres_fbs = std.io.fixedBufferStream(&sub_pres_buf);
         const spw = sub_pres_fbs.writer();
         spw.writeAll("<presence from='") catch return;
-        spw.writeAll(from_str) catch return;
+        spw.writeAll(owner_bare) catch return;
         spw.writeAll("' to='") catch return;
         spw.writeAll(to_str) catch return;
         spw.writeAll("' type='subscribe'/>") catch return;
         const sub_pres_xml = sub_pres_fbs.getWritten();
 
-        for (sub_entries[0..target_count]) |ent| {
-            if (ent.worker_id == self.worker_id) {
-                const target_session = self.sessions[ent.local_session_id] orelse continue;
-                target_session.conn.queueSend(sub_pres_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+        // Remote domain? Forward via S2S.
+        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
+            self.forwardPresenceXmlToS2s(session, owner_bare, to_str, sub_pres_xml, changes);
+        } else {
+            // Local delivery
+            const sub_sm = self.session_map orelse return;
+            var sub_entries: [16]SessionEntry = undefined;
+            const target_count = sub_sm.findByBareJid(to_jid.local, to_jid.domain, &sub_entries);
+
+            for (sub_entries[0..target_count]) |ent| {
+                if (ent.worker_id == self.worker_id) {
+                    const target_session = self.sessions[ent.local_session_id] orelse continue;
+                    target_session.conn.queueSend(sub_pres_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                    }
+                } else if (self.delivery_system) |ds| {
+                    ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sub_pres_xml) catch {};
                 }
-            } else if (self.delivery_system) |ds| {
-                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sub_pres_xml) catch {};
             }
         }
 
@@ -2183,13 +2209,10 @@ pub const Server = struct {
             roster.setItem(to_str, owner_bare, "", .to, false) catch {};
         }
 
-        // Forward subscribed to the target (if online)
+        // Forward subscribed to the target
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        const sd_sm = self.session_map orelse return;
-        var sd_entries: [16]SessionEntry = undefined;
-        const target_count = sd_sm.findByBareJid(to_jid.local, to_jid.domain, &sd_entries);
 
-        // Build presence stanza once for all targets
+        // Build presence stanza
         var sd_pres_buf: [512]u8 = undefined;
         var sd_pres_fbs = std.io.fixedBufferStream(&sd_pres_buf);
         const sdpw = sd_pres_fbs.writer();
@@ -2200,19 +2223,30 @@ pub const Server = struct {
         sdpw.writeAll("' type='subscribed'/>") catch return;
         const sd_pres_xml = sd_pres_fbs.getWritten();
 
-        for (sd_entries[0..target_count]) |ent| {
-            if (ent.worker_id == self.worker_id) {
-                const target_session = self.sessions[ent.local_session_id] orelse continue;
-                target_session.conn.queueSend(sd_pres_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+        // Remote domain? Forward via S2S.
+        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
+            self.forwardPresenceXmlToS2s(session, owner_bare, to_str, sd_pres_xml, changes);
+        } else {
+            // Local delivery
+            const sd_sm = self.session_map orelse return;
+            var sd_entries: [16]SessionEntry = undefined;
+            const target_count = sd_sm.findByBareJid(to_jid.local, to_jid.domain, &sd_entries);
+
+            for (sd_entries[0..target_count]) |ent| {
+                if (ent.worker_id == self.worker_id) {
+                    const target_session = self.sessions[ent.local_session_id] orelse continue;
+                    target_session.conn.queueSend(sd_pres_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                    }
+                } else if (self.delivery_system) |ds| {
+                    ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sd_pres_xml) catch {};
                 }
-            } else if (self.delivery_system) |ds| {
-                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, sd_pres_xml) catch {};
             }
         }
 
         // Also send our current presence to the newly subscribed contact
+        const sd_sm = self.session_map orelse return;
         if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
             if (ent.presence_available) {
                 self.broadcastPresence(bound.local, bound.domain, bound.resource, changes);
@@ -2264,10 +2298,8 @@ pub const Server = struct {
 
         // Forward unsubscribe
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        const unsub_sm = self.session_map orelse return;
-        var unsub_entries: [16]SessionEntry = undefined;
-        const target_count = unsub_sm.findByBareJid(to_jid.local, to_jid.domain, &unsub_entries);
-        // Build presence stanza once for all targets
+
+        // Build presence stanza
         var unsub_pres_buf: [512]u8 = undefined;
         var unsub_pres_fbs = std.io.fixedBufferStream(&unsub_pres_buf);
         const usbw = unsub_pres_fbs.writer();
@@ -2278,15 +2310,24 @@ pub const Server = struct {
         usbw.writeAll("' type='unsubscribe'/>") catch return;
         const unsub_pres_xml = unsub_pres_fbs.getWritten();
 
-        for (unsub_entries[0..target_count]) |ent| {
-            if (ent.worker_id == self.worker_id) {
-                const target_session = self.sessions[ent.local_session_id] orelse continue;
-                target_session.conn.queueSend(unsub_pres_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+        // Remote domain? Forward via S2S.
+        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
+            self.forwardPresenceXmlToS2s(session, owner_bare, to_str, unsub_pres_xml, changes);
+        } else {
+            const unsub_sm = self.session_map orelse return;
+            var unsub_entries: [16]SessionEntry = undefined;
+            const target_count = unsub_sm.findByBareJid(to_jid.local, to_jid.domain, &unsub_entries);
+
+            for (unsub_entries[0..target_count]) |ent| {
+                if (ent.worker_id == self.worker_id) {
+                    const target_session = self.sessions[ent.local_session_id] orelse continue;
+                    target_session.conn.queueSend(unsub_pres_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                    }
+                } else if (self.delivery_system) |ds| {
+                    ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsub_pres_xml) catch {};
                 }
-            } else if (self.delivery_system) |ds| {
-                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsub_pres_xml) catch {};
             }
         }
 
@@ -2335,10 +2376,8 @@ pub const Server = struct {
 
         // Forward unsubscribed
         const to_jid = xmpp.Jid.parse(to_str) catch return;
-        const unsd_sm = self.session_map orelse return;
-        var unsd_entries: [16]SessionEntry = undefined;
-        const target_count = unsd_sm.findByBareJid(to_jid.local, to_jid.domain, &unsd_entries);
-        // Build presence stanza once for all targets
+
+        // Build presence stanza
         var unsd_pres_buf: [512]u8 = undefined;
         var unsd_pres_fbs = std.io.fixedBufferStream(&unsd_pres_buf);
         const usdw = unsd_pres_fbs.writer();
@@ -2349,15 +2388,24 @@ pub const Server = struct {
         usdw.writeAll("' type='unsubscribed'/>") catch return;
         const unsd_pres_xml = unsd_pres_fbs.getWritten();
 
-        for (unsd_entries[0..target_count]) |ent| {
-            if (ent.worker_id == self.worker_id) {
-                const target_session = self.sessions[ent.local_session_id] orelse continue;
-                target_session.conn.queueSend(unsd_pres_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+        // Remote domain? Forward via S2S.
+        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
+            self.forwardPresenceXmlToS2s(session, owner_bare, to_str, unsd_pres_xml, changes);
+        } else {
+            const unsd_sm = self.session_map orelse return;
+            var unsd_entries: [16]SessionEntry = undefined;
+            const target_count = unsd_sm.findByBareJid(to_jid.local, to_jid.domain, &unsd_entries);
+
+            for (unsd_entries[0..target_count]) |ent| {
+                if (ent.worker_id == self.worker_id) {
+                    const target_session = self.sessions[ent.local_session_id] orelse continue;
+                    target_session.conn.queueSend(unsd_pres_xml) catch continue;
+                    if (target_session.conn.hasPendingWrite()) {
+                        changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
+                    }
+                } else if (self.delivery_system) |ds| {
+                    ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsd_pres_xml) catch {};
                 }
-            } else if (self.delivery_system) |ds| {
-                ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, unsd_pres_xml) catch {};
             }
         }
 

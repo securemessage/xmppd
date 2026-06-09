@@ -408,7 +408,6 @@ pub const S2sDaemon = struct {
         if (self.outbound[slot]) |conn| {
             log.info("closing outbound S2S to {s}", .{conn.remote_domain});
             self.pool.remove(conn.remote_domain);
-            conn.deinit(self.allocator);
         }
         self.outbound[slot] = null;
     }
