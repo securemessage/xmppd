@@ -44,6 +44,18 @@ pub const RocksDbBackend = struct {
         c.rocksdb_options_set_create_missing_column_families(options, 1);
         c.rocksdb_options_set_compression(options, c.rocksdb_lz4_compression);
 
+        // Write performance tuning: reduce compaction stall impact on the event loop.
+        // - 4 write buffers (default 2): more runway before L0 flush is forced
+        // - 128MB write buffer (default 64MB): less frequent flushes
+        // - L0 slowdown at 20 files (default 20): keep default, avoids premature throttle
+        // - L0 stop at 36 files (default 36): keep default
+        // - Max background jobs 4 (default 1): parallel compaction + flush
+        // - Bytes-per-sync 1MB: spread fsync over time, avoid write stalls from OS page cache flush
+        c.rocksdb_options_set_max_write_buffer_number(options, 4);
+        c.rocksdb_options_set_write_buffer_size(options, 128 * 1024 * 1024);
+        c.rocksdb_options_set_max_background_jobs(options, 4);
+        c.rocksdb_options_set_bytes_per_sync(options, 1024 * 1024);
+
         var path_z: [4096]u8 = undefined;
         @memcpy(path_z[0..path.len], path);
         path_z[path.len] = 0;
