@@ -2507,9 +2507,11 @@ pub const Server = struct {
     }
 
     /// Send presence probes to contacts we're subscribed to (to get their current status).
+    /// For each available contact resource, sends a per-resource full-JID presence.
+    /// Cross-thread contacts receive delivery via MPSC queue.
     fn sendPresenceProbes(self: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
-        _ = changes;
         const roster = self.roster orelse return;
+        const sm = self.session_map orelse return;
 
         var bare_buf: [256]u8 = undefined;
         var bare_fbs = std.io.fixedBufferStream(&bare_buf);
@@ -2525,25 +2527,50 @@ pub const Server = struct {
             self.allocator.free(contact_jids);
         }
 
-        // For each subscribed contact, check if they're online and send their presence
+        // Build our full JID as the 'to' attribute for cross-thread deliveries
+        const bound = session.stream.bound_jid orelse return;
+        var to_buf: [256]u8 = undefined;
+        var to_fbs = std.io.fixedBufferStream(&to_buf);
+        to_fbs.writer().writeAll(bound.local) catch return;
+        to_fbs.writer().writeByte('@') catch return;
+        to_fbs.writer().writeAll(bound.domain) catch return;
+        to_fbs.writer().writeByte('/') catch return;
+        to_fbs.writer().writeAll(bound.resource) catch return;
+        const to_str = to_fbs.getWritten();
+
+        // For each subscribed contact, iterate their available sessions
         for (contact_jids) |contact_bare| {
             const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
             const contact_local = contact_bare[0..at_pos];
             const contact_domain = contact_bare[at_pos + 1 ..];
 
-            // If the contact has available sessions, send their presence to us
-            const probe_sm = self.session_map orelse return;
             var probe_entries: [16]SessionEntry = undefined;
-            const target_count = probe_sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
-            if (target_count > 0) {
-                // Send presence from contact to our session
+            const target_count = sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
+
+            for (probe_entries[0..target_count]) |entry| {
+                // Build presence from the contact's full JID (per-resource)
                 var pres_buf: [512]u8 = undefined;
                 var pres_fbs = std.io.fixedBufferStream(&pres_buf);
                 const pw = pres_fbs.writer();
                 pw.writeAll("<presence from='") catch continue;
-                pw.writeAll(contact_bare) catch continue;
+                pw.writeAll(contact_local) catch continue;
+                pw.writeByte('@') catch continue;
+                pw.writeAll(contact_domain) catch continue;
+                pw.writeByte('/') catch continue;
+                pw.writeAll(entry.resource()) catch continue;
+                pw.writeAll("' to='") catch continue;
+                pw.writeAll(to_str) catch continue;
                 pw.writeAll("'/>") catch continue;
-                session.conn.queueSend(pres_fbs.getWritten()) catch continue;
+                const presence_xml = pres_fbs.getWritten();
+
+                // The presence stanza is directed TO us (the session that just
+                // became available). Deliver locally regardless of which worker
+                // the contact is on — we already have their resource from the
+                // session map; no need to ask the remote worker.
+                session.conn.queueSend(presence_xml) catch continue;
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                }
             }
         }
     }

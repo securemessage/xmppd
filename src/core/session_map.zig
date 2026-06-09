@@ -27,12 +27,23 @@ const log = std.log.scoped(.session_map);
 /// 16 covers any reasonable scenario (phone, tablet, desktop, web × multiple clients).
 const MAX_RESOURCES: usize = 16;
 
+/// Maximum resource length stored inline in SessionEntry.
+/// Covers all practical resources (RFC allows 1023, but clients use ≤32).
+const MAX_RESOURCE_LEN: usize = 64;
+
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {
     worker_id: u16,
     local_session_id: u32,
     generation: u32,
     presence_available: bool = false,
+    resource_buf: [MAX_RESOURCE_LEN]u8 = undefined,
+    resource_len: u8 = 0,
+
+    /// Get the resource string for this entry.
+    pub fn resource(self: *const SessionEntry) []const u8 {
+        return self.resource_buf[0..self.resource_len];
+    }
 };
 
 /// Bounded list of session entries for a bare JID (multi-resource).
@@ -118,11 +129,15 @@ pub const SessionMap = struct {
         const gen = self.next_generation;
         self.next_generation +%= 1;
 
-        const entry = SessionEntry{
+        if (resource.len > MAX_RESOURCE_LEN) return error.ResourceTooLong;
+
+        var entry = SessionEntry{
             .worker_id = worker_id,
             .local_session_id = local_session_id,
             .generation = gen,
+            .resource_len = @intCast(resource.len),
         };
+        @memcpy(entry.resource_buf[0..resource.len], resource);
 
         // Check for duplicate using stack buffer (no allocation)
         var check_buf: [384]u8 = undefined;
@@ -556,4 +571,29 @@ test "SessionMap: getGenerationById for ABA check" {
 
     _ = map.unbind("alice", "host", "mobile");
     try std.testing.expect(!map.getGenerationById(0, 5, gen)); // unbound
+}
+
+test "SessionMap: resource stored in entry" {
+    var map = SessionMap.init(std.testing.allocator, false);
+    defer map.deinit();
+
+    _ = try map.bind(0, 1, "alice", "host", "mobile");
+    _ = try map.bind(1, 2, "alice", "host", "desktop");
+    map.setPresenceAvailable("alice", "host", "mobile", true);
+    map.setPresenceAvailable("alice", "host", "desktop", true);
+
+    var buf: [8]SessionEntry = undefined;
+    const count = map.findAvailableByBareJid("alice", "host", &buf);
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // Verify resources are stored and accessible
+    var found_mobile = false;
+    var found_desktop = false;
+    for (buf[0..count]) |*entry| {
+        const res = entry.resource();
+        if (std.mem.eql(u8, res, "mobile")) found_mobile = true;
+        if (std.mem.eql(u8, res, "desktop")) found_desktop = true;
+    }
+    try std.testing.expect(found_mobile);
+    try std.testing.expect(found_desktop);
 }
