@@ -256,10 +256,10 @@ pub const DeliverySystem = struct {
 
         try self.queues[target_worker].enqueue(target_session_id, target_generation, payload);
 
-        // Coalesced signaling: only wake if target is idle
-        if (!self.states[target_worker].isActive()) {
-            self.pipes[target_worker].wake();
-        }
+        // Always wake the target worker — coalesced signaling is unsafe because
+        // the target may finish processing and enter kevent() between our isActive
+        // check and the pipe write. The pipe drainPipe() handles duplicate wakes.
+        self.pipes[target_worker].wake();
     }
 
     /// Get the pipe read fd for a specific worker (for kqueue registration).

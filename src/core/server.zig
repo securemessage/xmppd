@@ -483,6 +483,19 @@ pub const Server = struct {
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
 
+            // Process MPSC wake pipe first (if in event batch) to deliver cross-thread
+            // messages before any session-closing events in the same batch.
+            for (events) |ev| {
+                switch (ev) {
+                    .fd_readable => |e| {
+                        if (e.udata == WAKE_PIPE_UDATA) {
+                            self.handleDeliveryWake(&changes);
+                        }
+                    },
+                    else => {},
+                }
+            }
+
             for (events) |ev| {
                 switch (ev) {
                     .fd_readable => |e| {
@@ -493,7 +506,7 @@ pub const Server = struct {
                         } else if (e.udata == IPC_S2S_UDATA) {
                             self.handleS2sIpcReadable(&changes);
                         } else if (e.udata == WAKE_PIPE_UDATA) {
-                            self.handleDeliveryWake(&changes);
+                            // Already handled in first pass
                         } else {
                             self.handleReadableOrHandshake(e.udata, &changes);
                         }
@@ -537,6 +550,11 @@ pub const Server = struct {
                 ds.getState(self.worker_id).setIdle();
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     self.drainDeliveryQueue(&changes);
+                    // If still pending after drain (producer reserved slot via CAS but
+                    // hasn't stored ready=true yet), self-wake to retry on next iteration.
+                    if (ds.getQueue(self.worker_id).hasPending()) {
+                        ds.pipes[self.worker_id].wake();
+                    }
                 }
             }
         }
