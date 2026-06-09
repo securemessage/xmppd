@@ -521,7 +521,7 @@ each taking one fd. Proves threading works before changing fd-passing mechanism.
 - [x] S2S subscription forwarding — subscribe/subscribed/unsubscribe/unsubscribed via S2S
 - [x] S2S inbound round-robin — single-worker delivery (was N-duplicate broadcast)
 - [x] Integration tested — 8 clients, 4 workers, 64/64 messages delivered
-- [ ] MUC per-room worker-level multicast (T62 — Option A worker_mask)
+- [x] MUC per-room worker-level multicast (T62 — Option A worker_mask)
 - [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
 - [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
 - [ ] Testing + benchmarks
@@ -627,7 +627,7 @@ one process). The hybrid model is where large servers converge.
 | Language | Zig 0.15.2 |
 | Source files | 58 |
 | Lines of code | ~28,000 |
-| Unit tests | 93 build steps, 680+ tests (all pass) |
+| Unit tests | 93 build steps, 675 tests (all pass) |
 | Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC + 8-user cross-thread |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
