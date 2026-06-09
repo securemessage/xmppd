@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-07
+Last updated: 2026-06-09
 
 ## Current Status
 
@@ -511,11 +511,17 @@ Use existing `--listen-fd` mechanism. Master creates N SO_REUSEPORT sockets,
 passes all N fds to one xmppd-core child. xmppd-core spawns N threads,
 each taking one fd. Proves threading works before changing fd-passing mechanism.
 
-- [ ] SO_REUSEPORT — master creates N sockets, passes via `--listen-fd 5,6,7,8`
-- [ ] Per-thread kqueue event loop — each thread owns one listener fd + its sessions
-- [ ] MPSC channels — lock-free cross-thread stanza delivery (pipe/EVFILT_USER wakeup)
-- [ ] Shared session registry — cache-line-aligned slots, generational IDs for ABA
-- [ ] MUC fan-out cross-thread batching
+- [x] SO_REUSEPORT_LB — master creates N sockets, passes via `--listen-fd 5,6,7,8`
+- [x] Per-thread kqueue event loop — each thread owns one listener fd + its sessions
+- [x] MPSC channels — lock-free cross-thread stanza delivery (pipe wakeup, always-wake)
+- [x] Shared SessionMap — JID-keyed hash table with RwLock, resource inline in entry
+- [x] Two-pass event processing — drain MPSC before socket events (prevents ABA races)
+- [x] Cross-thread presence, subscription, MUC fan-out via MPSC
+- [x] S2S presence broadcast — available/unavailable/probes forwarded to remote domains
+- [x] S2S subscription forwarding — subscribe/subscribed/unsubscribe/unsubscribed via S2S
+- [x] S2S inbound round-robin — single-worker delivery (was N-duplicate broadcast)
+- [x] Integration tested — 8 clients, 4 workers, 64/64 messages delivered
+- [ ] MUC per-room worker-level multicast (T62 — Option A worker_mask)
 - [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
 - [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
 - [ ] Testing + benchmarks
@@ -592,6 +598,8 @@ one process). The hybrid model is where large servers converge.
 - **Admin Web UI** — monitoring dashboard
 - **Prometheus metrics** — observability
 - **S2S dialback error recovery** — retry/backoff on callback connection failure
+- **S2S async DNS + probe throttling** — blocking DNS stalls event loop; batch probes (T65)
+- **Sharded SessionMap** — reduce RwLock contention at 64+ cores (T56)
 
 ---
 
@@ -618,9 +626,9 @@ one process). The hybrid model is where large servers converge.
 |--------|-------|
 | Language | Zig 0.15.2 |
 | Source files | 58 |
-| Lines of code | ~27,500 |
-| Unit tests | 86+ build steps, 640+ tests (all pass) |
-| Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC |
+| Lines of code | ~28,000 |
+| Unit tests | 93 build steps, 680+ tests (all pass) |
+| Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC + 8-user cross-thread |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
