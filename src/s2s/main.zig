@@ -638,6 +638,9 @@ pub fn main() !void {
                 log.err("invalid fd number: {s}", .{val});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            // Consume and ignore — passed by master but not used by S2S
+            _ = args.next();
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -646,7 +649,7 @@ pub fn main() !void {
         }
     }
 
-    log.info("xmppd-s2s starting host={s} port={d}", .{ host, port });
+    log.info("xmppd-s2s starting host={s} port={d} listen_fd={any}", .{ host, port, listen_fd });
 
     var daemon = S2sDaemon.init(allocator, host);
     defer daemon.deinit();

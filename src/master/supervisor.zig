@@ -87,6 +87,10 @@ pub const Supervisor = struct {
     ///
     /// The child receives argv[0] = exe_path, followed by self.args.
     pub fn spawnChild(self: *Supervisor) !posix.pid_t {
+        if (self.exe_path.len == 0 or self.exe_path[0] != '/') {
+            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary", .{self.exe_path});
+        }
+
         const pid = try posix.fork();
 
         if (pid == 0) {
@@ -159,8 +163,6 @@ pub const Supervisor = struct {
         } else {
             log.info("child pid={?d} exited with code {d}", .{ self.child_pid, exit_code });
         }
-
-        self.child_pid = null;
 
         if (self.state == .shutting_down) {
             return false;

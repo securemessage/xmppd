@@ -703,7 +703,7 @@ pub const EventLoop = struct {
             } },
             std.c.EVFILT.PROC => .{ .process_exit = .{
                 .pid = @intCast(kev.ident),
-                .status = kev.fflags,
+                .status = @intCast(kev.data),
             } },
             else => .{ .fd_error = .{
                 .fd = @intCast(kev.ident),
