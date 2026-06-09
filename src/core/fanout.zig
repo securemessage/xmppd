@@ -183,6 +183,83 @@ pub fn buildComplete(
 }
 
 // ============================================================================
+// Multicast payload encoding/decoding
+// ============================================================================
+
+/// Encode a multicast payload: [2B room_jid_len][room_jid][2B prefix_len][prefix][suffix]
+/// Returns the total encoded length, or null if the buffer would overflow.
+pub fn encodeMulticastPayload(
+    buf: []u8,
+    room_jid: []const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+) ?usize {
+    const header_size = 2 + room_jid.len + 2 + prefix.len + suffix.len;
+    if (header_size > buf.len) return null;
+
+    var pos: usize = 0;
+
+    // Room JID length (big-endian u16)
+    const jid_len: u16 = @intCast(room_jid.len);
+    buf[pos] = @intCast(jid_len >> 8);
+    buf[pos + 1] = @intCast(jid_len & 0xFF);
+    pos += 2;
+
+    // Room JID
+    @memcpy(buf[pos .. pos + room_jid.len], room_jid);
+    pos += room_jid.len;
+
+    // Prefix length (big-endian u16)
+    const pfx_len: u16 = @intCast(prefix.len);
+    buf[pos] = @intCast(pfx_len >> 8);
+    buf[pos + 1] = @intCast(pfx_len & 0xFF);
+    pos += 2;
+
+    // Prefix
+    @memcpy(buf[pos .. pos + prefix.len], prefix);
+    pos += prefix.len;
+
+    // Suffix (remaining bytes)
+    @memcpy(buf[pos .. pos + suffix.len], suffix);
+    pos += suffix.len;
+
+    return pos;
+}
+
+/// Decoded multicast payload fields (slices into the original payload buffer).
+pub const MulticastPayload = struct {
+    room_jid: []const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+};
+
+/// Decode a multicast payload. Returns null if the payload is too short or malformed.
+pub fn decodeMulticastPayload(payload: []const u8) ?MulticastPayload {
+    if (payload.len < 4) return null; // minimum: 2B jid_len + 2B prefix_len
+
+    var pos: usize = 0;
+
+    // Room JID length
+    const jid_len: usize = (@as(usize, payload[pos]) << 8) | @as(usize, payload[pos + 1]);
+    pos += 2;
+    if (pos + jid_len + 2 > payload.len) return null;
+    const room_jid = payload[pos .. pos + jid_len];
+    pos += jid_len;
+
+    // Prefix length
+    const pfx_len: usize = (@as(usize, payload[pos]) << 8) | @as(usize, payload[pos + 1]);
+    pos += 2;
+    if (pos + pfx_len > payload.len) return null;
+    const prefix = payload[pos .. pos + pfx_len];
+    pos += pfx_len;
+
+    // Suffix = remainder
+    const suffix = payload[pos..];
+
+    return .{ .room_jid = room_jid, .prefix = prefix, .suffix = suffix };
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -241,4 +318,28 @@ test "PendingFanout stores room JID" {
     @memcpy(pf.room_jid_buf[0..jid.len], jid);
     pf.room_jid_len = @intCast(jid.len);
     try std.testing.expectEqualStrings(jid, pf.getRoomJid());
+}
+
+test "encodeMulticastPayload round-trip" {
+    const room_jid = "dev@conference.example.com";
+    const prefix = "<message from='dev@conference.example.com/alice' to='";
+    const suffix = "' type='groupchat' id='m1'><body>hello</body></message>";
+
+    var buf: [4080]u8 = undefined;
+    const len = encodeMulticastPayload(&buf, room_jid, prefix, suffix).?;
+    const decoded = decodeMulticastPayload(buf[0..len]).?;
+
+    try std.testing.expectEqualStrings(room_jid, decoded.room_jid);
+    try std.testing.expectEqualStrings(prefix, decoded.prefix);
+    try std.testing.expectEqualStrings(suffix, decoded.suffix);
+}
+
+test "decodeMulticastPayload rejects short payload" {
+    const short = [_]u8{ 0, 0, 0 }; // only 3 bytes, need at least 4
+    try std.testing.expect(decodeMulticastPayload(&short) == null);
+}
+
+test "encodeMulticastPayload rejects overflow" {
+    var tiny: [8]u8 = undefined;
+    try std.testing.expect(encodeMulticastPayload(&tiny, "room@conf", "prefix", "suffix") == null);
 }

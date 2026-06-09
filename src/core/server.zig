@@ -2980,10 +2980,15 @@ pub const Server = struct {
 
         _ = queue.drain(ctx, struct {
             fn handle(c: Ctx, local_session_id: u32, generation: u32, payload: []const u8) void {
-                // ABA check: verify session is still bound with same generation
+                // Multicast delivery: fan-out to all local occupants in a room
+                if (local_session_id == delivery_queue_mod.MULTICAST_SENTINEL) {
+                    c.server.handleMulticastDelivery(payload, c.changes);
+                    return;
+                }
+
+                // Unicast: ABA check then deliver to single session
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
-                // local_session_id indexes directly into sessions[] (no global→local conversion)
                 const target_session = c.server.sessions[local_session_id] orelse return;
                 target_session.conn.queueSend(payload) catch return;
                 if (target_session.conn.hasPendingWrite()) {
@@ -2991,6 +2996,58 @@ pub const Server = struct {
                 }
             }
         }.handle);
+    }
+
+    /// Handle a multicast delivery from the MPSC queue.
+    /// Decodes the payload (room_jid + prefix + suffix), finds the room,
+    /// and delivers the pre-built stanza to all local occupants.
+    fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeList) void {
+        const decoded = fanout_mod.decodeMulticastPayload(payload) orelse {
+            log.warn("malformed multicast payload ({d} bytes)", .{payload.len});
+            return;
+        };
+
+        const reg = self.room_registry orelse return;
+
+        reg.lock.lockShared();
+        defer reg.lock.unlockShared();
+
+        const room = reg.findByJid(decoded.room_jid) orelse return;
+
+        for (&room.occupants) |*slot| {
+            const occ = slot.* orelse continue;
+            if (occ.worker_id != self.worker_id) continue;
+            if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
+
+            const target_session = self.sessions[occ.session_id] orelse continue;
+            fanout_mod.deliverPrebuilt(decoded.prefix, occ.getRealJid(), decoded.suffix, &target_session.conn) catch continue;
+            if (target_session.conn.hasPendingWrite()) {
+                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
+            }
+        }
+    }
+
+    /// Encode and enqueue a multicast delivery to each remote worker that has
+    /// occupants in the given room. Iterates set bits in worker_mask, excluding self.
+    pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.Room, prefix: []const u8, suffix: []const u8) void {
+        const ds = self.delivery_system orelse return;
+
+        var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
+        const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), prefix, suffix) orelse {
+            log.warn("multicast payload too large for room {s}", .{room.getJid()});
+            return;
+        };
+        const mcast_payload = mcast_buf[0..mcast_len];
+
+        // Iterate set bits in worker_mask, excluding self
+        var mask = room.worker_mask & ~(@as(u16, 1) << @intCast(self.worker_id));
+        while (mask != 0) {
+            const bit: u4 = @intCast(@ctz(mask));
+            ds.deliver(bit, delivery_queue_mod.MULTICAST_SENTINEL, 0, mcast_payload) catch |err| {
+                log.warn("multicast delivery failed to worker {d}: {}", .{ bit, err });
+            };
+            mask &= mask - 1; // clear lowest set bit
+        }
     }
 
     fn closeSession(self: *Server, id: usize, changes: *ChangeList) void {

@@ -27,6 +27,11 @@ const log = std.log.scoped(.delivery_queue);
 /// Maximum stanza payload size per delivery slot.
 pub const MAX_PAYLOAD_SIZE = 4080;
 
+/// Sentinel value for target_session_id indicating a multicast delivery.
+/// When the consumer sees this, it interprets the payload as a MUC multicast
+/// (room_jid + prefix + suffix) rather than a unicast stanza.
+pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
+
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
 

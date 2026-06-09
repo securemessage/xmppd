@@ -89,6 +89,9 @@ pub const Room = struct {
     occupant_count: usize = 0,
     /// Whether this room is active (slot in use).
     active: bool = false,
+    /// Bitmask of workers that have ≥1 occupant. Bit N set = worker N has occupants.
+    /// Used for O(workers) multicast instead of O(occupants) cross-thread delivery.
+    worker_mask: u16 = 0,
 
     pub fn getJid(self: *const Room) []const u8 {
         return self.jid_buf[0..self.jid_len];
@@ -98,6 +101,16 @@ pub const Room = struct {
         const len: u16 = @intCast(@min(jid.len, self.jid_buf.len));
         @memcpy(self.jid_buf[0..len], jid[0..len]);
         self.jid_len = len;
+    }
+
+    /// Check if any occupant belongs to the given worker.
+    pub fn hasOccupantOnWorker(self: *const Room, wid: u16) bool {
+        for (&self.occupants) |*slot| {
+            if (slot.*) |*occ| {
+                if (occ.worker_id == wid) return true;
+            }
+        }
+        return false;
     }
 
     /// Find an occupant by nickname.
@@ -151,6 +164,7 @@ pub const Room = struct {
                 occ.affiliation = affiliation;
                 slot.* = occ;
                 self.occupant_count += 1;
+                self.worker_mask |= @as(u16, 1) << @intCast(worker_id);
                 return i;
             }
         }
@@ -164,6 +178,9 @@ pub const Room = struct {
         const occ = self.occupants[index] orelse return null;
         self.occupants[index] = null;
         self.occupant_count -= 1;
+        if (!self.hasOccupantOnWorker(occ.worker_id)) {
+            self.worker_mask &= ~(@as(u16, 1) << @intCast(occ.worker_id));
+        }
         return occ;
     }
 
@@ -508,4 +525,55 @@ test "RoomRegistry: removeOccupantBySessionId from multiple rooms" {
     try std.testing.expectEqual(@as(usize, 1), reg.count);
     const remaining = reg.findByJid("room1@conference.localhost").?;
     try std.testing.expectEqual(@as(usize, 1), remaining.occupant_count);
+}
+
+test "Room: worker_mask set on add" {
+    var room = Room{};
+    room.active = true;
+    room.setJid("test@conference.localhost");
+    try std.testing.expectEqual(@as(u16, 0), room.worker_mask);
+
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b0001), room.worker_mask);
+
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 1, 0, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
+
+    // Same worker — bit already set
+    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
+}
+
+test "Room: worker_mask cleared on remove when no occupants remain on worker" {
+    var room = Room{};
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 1, 0, .participant, .none);
+    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
+
+    // Remove alice (worker 0) — carol still on worker 0
+    _ = room.removeBySessionId(1);
+    try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
+
+    // Remove carol (worker 0) — no one left on worker 0
+    _ = room.removeBySessionId(3);
+    try std.testing.expectEqual(@as(u16, 0b0010), room.worker_mask);
+
+    // Remove bob (worker 1) — empty
+    _ = room.removeBySessionId(2);
+    try std.testing.expectEqual(@as(u16, 0b0000), room.worker_mask);
+}
+
+test "Room: hasOccupantOnWorker" {
+    var room = Room{};
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    try std.testing.expect(!room.hasOccupantOnWorker(0));
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 2, 0, .participant, .none);
+    try std.testing.expect(!room.hasOccupantOnWorker(0));
+    try std.testing.expect(room.hasOccupantOnWorker(2));
 }

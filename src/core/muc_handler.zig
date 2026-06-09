@@ -125,7 +125,10 @@ pub fn handleMucGroupchat(
     const prefix = prefix_buf[0..prefix_len];
     const suffix = suffix_buf[0..suffix_len];
 
-    // Deliver first batch directly (bounded continuation — yield after batch_size)
+    // Cross-thread multicast: one MPSC enqueue per remote worker (not per occupant)
+    server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // Local fan-out: deliver to occupants on this worker (bounded continuation)
     const batch_size = server.fanout_queue.batch_size;
     var delivered: u8 = 0;
     var resume_slot: u8 = 0;
@@ -134,36 +137,25 @@ pub fn handleMucGroupchat(
     for (&room.occupants, 0..) |*slot, idx| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
 
-        if (occ.worker_id != server.worker_id) {
-            // Cross-thread: serialize and enqueue via MPSC delivery system
-            if (server.delivery_system) |ds| {
-                var xthread_buf: [4080]u8 = undefined;
-                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                if (xthread_len) |len| {
-                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
-                }
-            }
-        } else {
-            // Same worker: session_id is already the local sessions[] index
-            const local_sid = occ.session_id;
-            const target_session = server.sessions[local_sid] orelse continue;
-            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, local_sid) catch {};
-            }
+        const local_sid = occ.session_id;
+        const target_session = server.sessions[local_sid] orelse continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, local_sid) catch {};
         }
 
         delivered += 1;
         if (delivered >= batch_size) {
-            // Check if there are more occupants after this index
             resume_slot = @intCast(idx + 1);
             if (resume_slot < room_registry.MAX_OCCUPANTS) {
-                // Check if any remaining slots have occupants
                 for (room.occupants[resume_slot..]) |remaining| {
-                    if (remaining != null) {
-                        all_done = false;
-                        break;
+                    if (remaining) |r| {
+                        if (r.worker_id == server.worker_id) {
+                            all_done = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -171,22 +163,18 @@ pub fn handleMucGroupchat(
         }
     }
 
-    // If more occupants remain, queue a continuation
+    // If more local occupants remain, queue a continuation
     if (!all_done) {
         if (server.fanout_queue.alloc()) |pf| {
-            // Store room JID for safe re-lookup
             @memcpy(pf.room_jid_buf[0..room_jid.len], room_jid);
             pf.room_jid_len = @intCast(room_jid.len);
-            // Store pre-built stanza parts
             @memcpy(pf.prefix_buf[0..prefix_len], prefix);
             pf.prefix_len = prefix_len;
             @memcpy(pf.suffix_buf[0..suffix_len], suffix);
             pf.suffix_len = suffix_len;
-            // Resume from next slot
             pf.next_slot = resume_slot;
             log.debug("queued fan-out continuation for {s} from slot {d}", .{ room_jid, resume_slot });
         } else {
-            // Queue full — deliver remaining synchronously (fallback)
             deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
         }
     }
@@ -219,38 +207,30 @@ pub fn drainPendingFanout(
     const suffix = pf.getSuffix();
     var delivered: u8 = 0;
 
+    // Continuation only handles local occupants — multicast was sent in initial call
     var i: usize = pf.next_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
 
-        if (occ.worker_id != server.worker_id) {
-            if (server.delivery_system) |ds| {
-                var xthread_buf: [4080]u8 = undefined;
-                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                if (xthread_len) |len| {
-                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
-                }
-            }
-        } else {
-            const local_sid = occ.session_id;
-            const target_session = server.sessions[local_sid] orelse continue;
-            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, local_sid) catch {};
-            }
+        const local_sid = occ.session_id;
+        const target_session = server.sessions[local_sid] orelse continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, local_sid) catch {};
         }
 
         delivered += 1;
         if (delivered >= batch_size) {
             pf.next_slot = @intCast(i + 1);
-            // Check if any more occupants remain
             if (pf.next_slot < room_registry.MAX_OCCUPANTS) {
                 for (room.occupants[pf.next_slot..]) |remaining| {
-                    if (remaining != null) return false; // more work
+                    if (remaining) |r| {
+                        if (r.worker_id == server.worker_id) return false;
+                    }
                 }
             }
-            // All done
             pf.complete();
             return true;
         }
@@ -270,26 +250,18 @@ fn deliverRemainingSync(
     suffix: []const u8,
     changes: *ChangeList,
 ) void {
+    // Only local occupants — multicast was already sent in initial call
     var i: usize = start_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
 
-        if (occ.worker_id != server.worker_id) {
-            if (server.delivery_system) |ds| {
-                var xthread_buf: [4080]u8 = undefined;
-                const xthread_len = fanout.buildComplete(&xthread_buf, prefix, occ.getRealJid(), suffix);
-                if (xthread_len) |len| {
-                    ds.deliver(occ.worker_id, @intCast(occ.session_id), occ.generation, xthread_buf[0..len]) catch {};
-                }
-            }
-        } else {
-            const local_sid = occ.session_id;
-            const target_session = server.sessions[local_sid] orelse continue;
-            fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, local_sid) catch {};
-            }
+        const local_sid = occ.session_id;
+        const target_session = server.sessions[local_sid] orelse continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, local_sid) catch {};
         }
     }
 }
@@ -824,33 +796,50 @@ fn broadcastOccupantJoin(
 ) void {
     _ = real_jid;
     _ = muc_host;
+
+    // Build prefix/suffix for multicast (no status 110 — self is always local)
+    var prefix_buf: [512]u8 = undefined;
+    var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
+    const pw = prefix_fbs.writer();
+    pw.writeAll("<presence from='") catch return;
+    pw.writeAll(room.getJid()) catch return;
+    pw.writeByte('/') catch return;
+    pw.writeAll(nick) catch return;
+    pw.writeAll("' to='") catch return;
+    const prefix = prefix_fbs.getWritten();
+
+    var suffix_buf: [512]u8 = undefined;
+    var suffix_fbs = std.io.fixedBufferStream(&suffix_buf);
+    const sw = suffix_fbs.writer();
+    sw.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    sw.writeAll(affiliation.toName()) catch return;
+    sw.writeAll("' role='") catch return;
+    sw.writeAll(role.toName()) catch return;
+    sw.writeAll("'/></x></presence>") catch return;
+    const suffix = suffix_fbs.getWritten();
+
+    // Multicast to remote workers
+    server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // Local fan-out (includes status 110 for the joining user)
+    var suffix_110_buf: [512]u8 = undefined;
+    var suffix_110_fbs = std.io.fixedBufferStream(&suffix_110_buf);
+    const s110w = suffix_110_fbs.writer();
+    s110w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    s110w.writeAll(affiliation.toName()) catch return;
+    s110w.writeAll("' role='") catch return;
+    s110w.writeAll(role.toName()) catch return;
+    s110w.writeAll("'/><status code='110'/></x></presence>") catch return;
+    const suffix_110 = suffix_110_fbs.getWritten();
+
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        var buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
-
-        w.writeAll("<presence from='") catch continue;
-        w.writeAll(room.getJid()) catch continue;
-        w.writeByte('/') catch continue;
-        w.writeAll(nick) catch continue;
-        w.writeAll("' to='") catch continue;
-        writeSessionJid(w, target) catch continue;
-        w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch continue;
-        w.writeAll(affiliation.toName()) catch continue;
-        w.writeAll("' role='") catch continue;
-        w.writeAll(role.toName()) catch continue;
-        w.writeAll("'/>") catch continue;
-        // Status code 110 = self
-        if (occ.session_id == new_session_id) {
-            w.writeAll("<status code='110'/>") catch continue;
-        }
-        w.writeAll("</x></presence>") catch continue;
-
-        target.conn.queueSend(fbs.getWritten()) catch continue;
+        const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), use_suffix, &target.conn) catch continue;
         if (target.conn.hasPendingWrite()) {
             changes.addWrite(target.conn.fd, occ.session_id) catch {};
         }
@@ -866,61 +855,68 @@ fn broadcastOccupantLeave(
     changes: *ChangeList,
 ) void {
     _ = muc_host;
+
+    // Build prefix/suffix for multicast (no status 110)
+    var prefix_buf: [512]u8 = undefined;
+    var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
+    const pw = prefix_fbs.writer();
+    pw.writeAll("<presence from='") catch return;
+    pw.writeAll(room.getJid()) catch return;
+    pw.writeByte('/') catch return;
+    pw.writeAll(removed.getNick()) catch return;
+    pw.writeAll("' to='") catch return;
+    const prefix = prefix_fbs.getWritten();
+
+    var suffix_buf: [512]u8 = undefined;
+    var suffix_fbs = std.io.fixedBufferStream(&suffix_buf);
+    const sw = suffix_fbs.writer();
+    sw.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    sw.writeAll(removed.affiliation.toName()) catch return;
+    sw.writeAll("' role='none'/>") catch return;
+    if (status_code) |code| {
+        sw.writeAll("<status code='") catch return;
+        sw.writeAll(code) catch return;
+        sw.writeAll("'/>") catch return;
+    }
+    sw.writeAll("</x></presence>") catch return;
+    const suffix = suffix_fbs.getWritten();
+
+    // Multicast to remote workers
+    server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // Local fan-out to remaining occupants on this worker
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        var buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
-
-        w.writeAll("<presence from='") catch continue;
-        w.writeAll(room.getJid()) catch continue;
-        w.writeByte('/') catch continue;
-        w.writeAll(removed.getNick()) catch continue;
-        w.writeAll("' to='") catch continue;
-        writeSessionJid(w, target) catch continue;
-        w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch continue;
-        w.writeAll(removed.affiliation.toName()) catch continue;
-        w.writeAll("' role='none'/>") catch continue;
-        if (status_code) |code| {
-            w.writeAll("<status code='") catch continue;
-            w.writeAll(code) catch continue;
-            w.writeAll("'/>") catch continue;
-        }
-        w.writeAll("</x></presence>") catch continue;
-
-        target.conn.queueSend(fbs.getWritten()) catch continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target.conn) catch continue;
         if (target.conn.hasPendingWrite()) {
             changes.addWrite(target.conn.fd, occ.session_id) catch {};
         }
     }
 
-    // Also send unavailable presence to the removed occupant themselves
-    if (removed.session_id != room_registry.REMOTE_OCCUPANT) {
+    // Send unavailable presence to the removed occupant themselves (with status 110)
+    // The removed occupant is always on the current worker (they initiated part/were kicked locally)
+    if (removed.session_id != room_registry.REMOTE_OCCUPANT and removed.worker_id == server.worker_id) {
         const self_target = server.sessions[removed.session_id] orelse return;
-        var buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
 
-        w.writeAll("<presence from='") catch return;
-        w.writeAll(room.getJid()) catch return;
-        w.writeByte('/') catch return;
-        w.writeAll(removed.getNick()) catch return;
-        w.writeAll("' to='") catch return;
-        writeSessionJid(w, self_target) catch return;
-        w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
-        w.writeAll(removed.affiliation.toName()) catch return;
-        w.writeAll("' role='none'/><status code='110'/>") catch return;
+        // Build suffix with status 110
+        var suffix_110_buf: [512]u8 = undefined;
+        var suffix_110_fbs = std.io.fixedBufferStream(&suffix_110_buf);
+        const s110w = suffix_110_fbs.writer();
+        s110w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+        s110w.writeAll(removed.affiliation.toName()) catch return;
+        s110w.writeAll("' role='none'/><status code='110'/>") catch return;
         if (status_code) |code| {
-            w.writeAll("<status code='") catch return;
-            w.writeAll(code) catch return;
-            w.writeAll("'/>") catch return;
+            s110w.writeAll("<status code='") catch return;
+            s110w.writeAll(code) catch return;
+            s110w.writeAll("'/>") catch return;
         }
-        w.writeAll("</x></presence>") catch return;
+        s110w.writeAll("</x></presence>") catch return;
 
-        self_target.conn.queueSend(fbs.getWritten()) catch return;
+        fanout.deliverPrebuilt(prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), &self_target.conn) catch return;
         if (self_target.conn.hasPendingWrite()) {
             changes.addWrite(self_target.conn.fd, removed.session_id) catch {};
         }
