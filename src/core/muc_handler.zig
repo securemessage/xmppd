@@ -1040,7 +1040,7 @@ fn formatDelayStamp(buf: []u8, timestamp: u64) ?[]const u8 {
     const w = fbs.writer();
     std.fmt.format(w, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         yd.year,
-        @as(u32, @intFromEnum(md.month)) + 1,
+        @as(u32, @intFromEnum(md.month)),
         @as(u32, md.day_index) + 1,
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
