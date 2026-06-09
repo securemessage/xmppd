@@ -337,6 +337,10 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         max_sessions: usize,
     ) !Server {
+        if (max_sessions >= delivery_queue_mod.MULTICAST_SENTINEL) {
+            log.err("max_sessions ({d}) must be < MULTICAST_SENTINEL (0xFFFFFFFF)", .{max_sessions});
+            return error.MaxSessionsTooLarge;
+        }
         const sessions = try allocator.alloc(?*Session, max_sessions);
         @memset(sessions, null);
 
@@ -365,6 +369,10 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         max_sessions: usize,
     ) !Server {
+        if (max_sessions >= delivery_queue_mod.MULTICAST_SENTINEL) {
+            log.err("max_sessions ({d}) must be < MULTICAST_SENTINEL (0xFFFFFFFF)", .{max_sessions});
+            return error.MaxSessionsTooLarge;
+        }
         const sessions = try allocator.alloc(?*Session, max_sessions);
         @memset(sessions, null);
 

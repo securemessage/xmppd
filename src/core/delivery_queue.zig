@@ -30,6 +30,9 @@ pub const MAX_PAYLOAD_SIZE = 4080;
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
+///
+/// Safety: session IDs are array indices (0..max_sessions-1), not monotonic
+/// counters. max_sessions is validated at Server.init to be < MULTICAST_SENTINEL.
 pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
 
 /// Number of slots per worker queue.
