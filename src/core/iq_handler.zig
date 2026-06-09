@@ -290,6 +290,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='jabber:iq:version'/>") catch return;
         w.writeAll("<feature var='msgoffline'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
+        w.writeAll("<feature var='http://jabber.org/protocol/chatstates'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;

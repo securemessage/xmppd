@@ -178,6 +178,28 @@ pub fn handleMucGroupchat(
             deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
         }
     }
+
+    // Store in archive for room history replay (T44)
+    if (server.archive) |archive| {
+        const timestamp: u64 = @intCast(std.time.timestamp());
+        const stanza_id = if (id_str.len > 0) id_str else "muc";
+        // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
+        var arch_buf: [17200]u8 = undefined;
+        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        const aw = arch_fbs.writer();
+        aw.writeAll("<message from='") catch return;
+        aw.writeAll(from_str) catch return;
+        aw.writeAll("' type='groupchat'") catch return;
+        if (id_str.len > 0) {
+            aw.writeAll(" id='") catch return;
+            aw.writeAll(id_str) catch return;
+            aw.writeByte('\'') catch return;
+        }
+        aw.writeByte('>') catch return;
+        aw.writeAll(inner_xml) catch return;
+        aw.writeAll("</message>") catch return;
+        archive.store(room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+    }
 }
 
 /// Drain one batch of a pending fan-out. Called from the server main loop.
@@ -614,8 +636,10 @@ fn handleJoin(
         affiliation = .owner;
         role = .moderator;
     } else {
-        // TODO: check RoomStore for persistent affiliation
-        // For now: outcast check
+        // Look up persistent affiliation from RoomStore
+        if (server.room_store) |store| {
+            affiliation = store.getAffiliation(room_jid, bare_jid) catch .none;
+        }
         if (affiliation == .outcast) {
             sendPresenceError(server, session, room_local, muc_host, "forbidden", changes);
             return;
@@ -635,8 +659,7 @@ fn handleJoin(
     // Add occupant — store local session ID directly (no global mapping).
     const local_sid: usize = session.conn.id;
     // Look up generation from session map for ABA-safe cross-thread delivery.
-    const join_bound = session.stream.bound_jid orelse return;
-    const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(join_bound.local, join_bound.domain, join_bound.resource) orelse 0 else 0;
+    const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
     _ = r.addOccupant(nick, real_jid, bare_jid, local_sid, server.worker_id, join_gen, role, affiliation) catch {
         sendPresenceError(server, session, room_local, muc_host, "service-unavailable", changes);
         return;
@@ -654,7 +677,10 @@ fn handleJoin(
     // 2. Broadcast the new occupant's presence to ALL (including self with status 110)
     broadcastOccupantJoin(server, r, nick, real_jid, role, affiliation, muc_host, session.conn.id, changes);
 
-    // 3. Send room subject
+    // 3. Replay room history (XEP-0045 §7.2.14, before subject)
+    sendRoomHistory(server, session, r, muc_host, changes);
+
+    // 4. Send room subject
     sendRoomSubject(server, session, r, muc_host, changes);
 }
 
@@ -921,6 +947,106 @@ fn broadcastOccupantLeave(
             changes.addWrite(self_target.conn.fd, removed.session_id) catch {};
         }
     }
+}
+
+/// Replay recent room history to a joining occupant (XEP-0045 §7.2.14).
+/// Queries the archive store for the last history_length messages and delivers
+/// each with a XEP-0203 delay stamp.
+fn sendRoomHistory(
+    server: *Server,
+    session: *Session,
+    room: *const Room,
+    muc_host: []const u8,
+    changes: *ChangeList,
+) void {
+    _ = muc_host;
+    const archive = server.archive orelse return;
+    const history_max = room.config.history_length;
+    if (history_max == 0) return;
+
+    const room_jid = room.getJid();
+
+    // Query archive for most recent messages (backward = newest first, then we reverse)
+    const result = archive.query(room_jid, .{
+        .max = @as(u32, history_max),
+        .backward = true,
+    }) catch return;
+    defer {
+        for (result.messages) |msg| {
+            server.allocator.free(msg.stanza_id);
+            if (msg.stanza_xml.len > 0) server.allocator.free(@constCast(msg.stanza_xml));
+        }
+        server.allocator.free(result.messages);
+    }
+
+    if (result.messages.len == 0) return;
+
+    // Deliver in chronological order (reverse of backward query)
+    var i: usize = result.messages.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = result.messages[i];
+        if (msg.stanza_xml.len == 0) continue;
+
+        // Format XEP-0203 delay stamp from unix timestamp
+        var delay_buf: [64]u8 = undefined;
+        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse continue;
+
+        // The stored stanza is: <message from='room/nick' type='groupchat' ...>body</message>
+        // We need to inject to='recipient' and a <delay/> element.
+        // Find the first '>' to inject 'to' attribute and append delay before </message>
+        const stanza = msg.stanza_xml;
+        const close_tag = "</message>";
+        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
+        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+
+        var buf: [20480]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+
+        // Write up to first '>', injecting to='jid'
+        w.writeAll(stanza[0..first_gt]) catch continue;
+        w.writeAll(" to='") catch continue;
+        writeSessionJid(w, session) catch continue;
+        w.writeByte('\'') catch continue;
+        // Write rest of tag opening + body
+        w.writeAll(stanza[first_gt..close_pos]) catch continue;
+        // Append delay stamp
+        w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
+        w.writeAll(room_jid) catch continue;
+        w.writeAll("' stamp='") catch continue;
+        w.writeAll(delay_str) catch continue;
+        w.writeAll("'/>") catch continue;
+        w.writeAll(close_tag) catch continue;
+
+        session.conn.queueSend(fbs.getWritten()) catch continue;
+    }
+
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+    }
+}
+
+/// Format a unix timestamp as ISO 8601 (XEP-0203): YYYY-MM-DDThh:mm:ssZ
+fn formatDelayStamp(buf: []u8, timestamp: u64) ?[]const u8 {
+    const ts: i64 = @intCast(timestamp);
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    std.fmt.format(w, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year,
+        @as(u32, @intFromEnum(md.month)) + 1,
+        @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch return null;
+    return fbs.getWritten();
 }
 
 fn sendRoomSubject(

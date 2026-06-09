@@ -37,6 +37,9 @@ const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
+const room_store_mod = @import("room_store");
+const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
+const RoomConfig = room_store_mod.RoomConfig;
 const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
@@ -222,6 +225,7 @@ pub fn main() !void {
     var roster_store: ?GenericRosterStore = null;
     var offline_store: ?GenericOfflineStore(OpBackendType) = null;
     var vcard_store: ?GenericVCardStore = null;
+    var rs: ?GenericRoomStore = null;
     if (db_path) |db| {
         var op_path_buf: [1024]u8 = undefined;
         const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
@@ -235,6 +239,7 @@ pub fn main() !void {
         roster_store = GenericRosterStore.init(&op_backend.?);
         offline_store = GenericOfflineStore(OpBackendType).init(&op_backend.?, allocator);
         vcard_store = GenericVCardStore.init(&op_backend.?);
+        rs = GenericRoomStore.init(&op_backend.?, allocator);
     }
     defer if (op_backend) |*b| b.close();
 
@@ -263,6 +268,20 @@ pub fn main() !void {
     };
     if (effective_muc_host) |_| {
         room_registry = RoomRegistry.init(allocator);
+
+        // Load persistent rooms from RoomStore (T45)
+        if (rs) |*room_store| {
+            var room_jids: [256][]const u8 = undefined;
+            const count = room_store.listRooms(&room_jids) catch 0;
+            for (room_jids[0..count]) |room_jid| {
+                defer allocator.free(room_jid);
+                if (room_store.loadRoom(room_jid) catch null) |config| {
+                    _ = room_registry.?.createRoom(room_jid, config) catch continue;
+                    log.info("loaded persistent room: {s}", .{room_jid});
+                }
+            }
+            if (count > 0) log.info("loaded {d} persistent rooms from store", .{count});
+        }
     }
     defer if (room_registry) |*reg| reg.deinit();
 
@@ -296,6 +315,7 @@ pub fn main() !void {
         .archive = if (archive_store != null) &archive_store.? else null,
         .vcard = if (vcard_store != null) &vcard_store.? else null,
         .room_registry = if (room_registry != null) &room_registry.? else null,
+        .room_store = if (rs != null) &rs.? else null,
         .muc_host = effective_muc_host,
         .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
@@ -392,6 +412,7 @@ const WorkerCtx = struct {
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
     vcard: ?*GenericVCardStore,
     room_registry: ?*RoomRegistry,
+    room_store: ?*GenericRoomStore,
     muc_host: ?[]const u8,
     session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
@@ -443,6 +464,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
 
     if (ctx.room_registry) |reg| {
         server.room_registry = reg;
+        server.room_store = ctx.room_store;
         server.muc_host = ctx.muc_host;
     }
 }

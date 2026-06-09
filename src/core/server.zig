@@ -67,6 +67,8 @@ const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
+const room_store_mod = @import("room_store");
+const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 
@@ -301,6 +303,9 @@ pub const Server = struct {
 
     /// MUC room registry — in-memory rooms and occupants.
     room_registry: ?*RoomRegistry = null,
+
+    /// MUC room store — persistent room configs and affiliations.
+    room_store: ?*GenericRoomStore = null,
 
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
