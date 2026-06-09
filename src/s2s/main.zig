@@ -92,6 +92,9 @@ pub const S2sDaemon = struct {
     outbound_readers: [MAX_OUTBOUND_CONNS]?*XmlReader = [_]?*XmlReader{null} ** MAX_OUTBOUND_CONNS,
     next_outbound_id: usize = 0,
 
+    /// Round-robin index for IPC inbound stanza delivery.
+    next_ipc_rr: usize = 0,
+
     /// TLS context for outbound connections (client-side).
     tls_client_ctx: ?SslContext = null,
 
@@ -1109,22 +1112,29 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
 
     log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), from, to });
 
-    // Send to all connected core IPC clients
+    // Send to ONE core IPC client (round-robin). The receiving worker uses
+    // the shared SessionMap to route — if the target is on a different worker,
+    // it delivers via MPSC. Sending to all workers would cause N duplicates.
     const msg = protocol.Message{ .s2s_inbound = .{
         .from_jid = from,
         .to_jid = to,
         .stanza_xml = stanza_xml,
     } };
-    var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        if (daemon.ipc.getClient(i)) |client| {
+
+    // Find next connected client via round-robin
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        const idx = daemon.next_ipc_rr % 16;
+        daemon.next_ipc_rr = (daemon.next_ipc_rr + 1) % 16;
+        if (daemon.ipc.getClient(idx)) |client| {
             client.queueSend(msg) catch {
-                log.err("failed to queue inbound stanza to IPC client {d}", .{i});
+                log.err("failed to queue inbound stanza to IPC client {d}", .{idx});
                 continue;
             };
             if (client.hasPendingSend()) {
-                batch.addWriteOnce(client.fd, IPC_CLIENT_UDATA_BASE + i) catch {};
+                batch.addWriteOnce(client.fd, IPC_CLIENT_UDATA_BASE + idx) catch {};
             }
+            break;
         }
     }
 }
