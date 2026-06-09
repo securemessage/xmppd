@@ -436,10 +436,12 @@ pub fn handleRoomDiscoInfo(
         } else {
             w.writeAll("<feature var='muc_unsecured'/>") catch return;
         }
+        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
     } else {
         // Room doesn't exist — still return valid response per XEP-0045
         w.writeAll("<identity category='conference' type='text'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
     }
 
     w.writeAll("</query></iq>") catch return;

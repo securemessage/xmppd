@@ -313,6 +313,10 @@ pub const Server = struct {
     /// Pending fan-out queue — bounded continuation for MUC groupchat delivery.
     fanout_queue: FanoutQueue = .{},
 
+    /// Monotonic counter for generating unique stanza IDs (XEP-0359).
+    /// Combined with worker_id to ensure uniqueness across threads.
+    stanza_id_counter: u32 = 0,
+
     /// SASL mechanism names received from auth daemon (dynamic advertisement).
     /// Stored as slices into auth_mechanism_name_buf.
     auth_mechanisms: [8][]const u8 = .{""} ** 8,
@@ -1638,6 +1642,26 @@ pub const Server = struct {
                     return;
                 }
 
+                // Archive S2S inbound messages delivered to online recipients (T81)
+                if (self.archive) |archive| {
+                    const parts = extractStanzaParts(m.stanza_xml);
+                    if (parts.is_message and std.mem.indexOf(u8, parts.inner_xml, "<body") != null) {
+                        var recip_buf: [256]u8 = undefined;
+                        var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                        recip_fbs.writer().writeAll(to_jid.local) catch {};
+                        recip_fbs.writer().writeByte('@') catch {};
+                        recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                        const recipient_bare = recip_fbs.getWritten();
+
+                        var s2s_sid_buf: [32]u8 = undefined;
+                        const s2s_stanza_id = self.generateStanzaId(&s2s_sid_buf);
+                        const timestamp: u64 = @intCast(std.time.timestamp());
+
+                        // Archive under recipient bare JID
+                        archive.store(recipient_bare, m.from_jid, s2s_stanza_id, timestamp, m.stanza_xml) catch {};
+                    }
+                }
+
                 for (s2s_entries[0..target_count]) |entry| {
                     if (entry.worker_id == self.worker_id) {
                         const target_session = self.sessions[entry.local_session_id] orelse continue;
@@ -1945,54 +1969,129 @@ pub const Server = struct {
             }
         }
 
+        // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
+        // Archive chat messages that contain a <body> element (skip transient chat states).
+        const is_archivable = session.stanza_kind == .message and
+            inner_xml.len > 0 and
+            (std.mem.eql(u8, type_str, "chat") or type_str.len == 0) and
+            std.mem.indexOf(u8, inner_xml, "<body") != null;
+
+        var sid_buf: [32]u8 = undefined;
+        const archive_stanza_id: []const u8 = if (is_archivable) self.generateStanzaId(&sid_buf) else "";
+
+        // Build sender bare JID for archive
+        var sender_bare_buf: [256]u8 = undefined;
+        var sender_bare_fbs = std.io.fixedBufferStream(&sender_bare_buf);
+        sender_bare_fbs.writer().writeAll(from_jid.local) catch {};
+        sender_bare_fbs.writer().writeByte('@') catch {};
+        sender_bare_fbs.writer().writeAll(from_jid.domain) catch {};
+        const sender_bare = sender_bare_fbs.getWritten();
+
+        // Archive under both sender and recipient bare JIDs (T81 + T82)
+        if (is_archivable) {
+            if (self.archive) |archive| {
+                // Build recipient bare JID
+                var recip_buf: [256]u8 = undefined;
+                var recip_fbs = std.io.fixedBufferStream(&recip_buf);
+                recip_fbs.writer().writeAll(to_jid.local) catch {};
+                recip_fbs.writer().writeByte('@') catch {};
+                recip_fbs.writer().writeAll(to_jid.domain) catch {};
+                const recipient_bare = recip_fbs.getWritten();
+
+                // Build full stanza XML for archive (includes stanza-id element)
+                var stanza_buf: [20480]u8 = undefined;
+                var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
+                const sw = stanza_fbs.writer();
+                sw.writeAll("<message from='") catch {};
+                sw.writeAll(from_str) catch {};
+                sw.writeAll("' to='") catch {};
+                sw.writeAll(to_str) catch {};
+                sw.writeByte('\'') catch {};
+                if (type_str.len > 0) {
+                    sw.writeAll(" type='") catch {};
+                    sw.writeAll(type_str) catch {};
+                    sw.writeByte('\'') catch {};
+                }
+                if (id_str.len > 0) {
+                    sw.writeAll(" id='") catch {};
+                    sw.writeAll(id_str) catch {};
+                    sw.writeByte('\'') catch {};
+                }
+                sw.writeByte('>') catch {};
+                sw.writeAll(inner_xml) catch {};
+                sw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch {};
+                sw.writeAll(archive_stanza_id) catch {};
+                sw.writeAll("' by='") catch {};
+                sw.writeAll(self.server_host) catch {};
+                sw.writeAll("'/>") catch {};
+                sw.writeAll("</message>") catch {};
+                const full_stanza = stanza_fbs.getWritten();
+
+                const timestamp: u64 = @intCast(std.time.timestamp());
+
+                // Store under recipient's archive
+                archive.store(recipient_bare, sender_bare, archive_stanza_id, timestamp, full_stanza) catch {};
+                // Store under sender's archive (sender copy)
+                archive.store(sender_bare, recipient_bare, archive_stanza_id, timestamp, full_stanza) catch {};
+            }
+        }
+
         if (target_count == 0 and !remote_delivered) {
-            // Only messages get offline storage (not presence stanzas)
+            // Offline storage for messages (pointer to archive, which is already stored above)
             if (session.stanza_kind == .message) {
                 if (self.offline) |store| {
-                    if (self.archive) |archive| {
-                        // Build recipient bare JID
-                        var recip_buf: [256]u8 = undefined;
-                        var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                        recip_fbs.writer().writeAll(to_jid.local) catch {};
-                        recip_fbs.writer().writeByte('@') catch {};
-                        recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                        const recipient_bare = recip_fbs.getWritten();
+                    if (is_archivable and archive_stanza_id.len > 0) {
+                        // Archive already stored above — just add offline pointer
+                        var recip_buf2: [256]u8 = undefined;
+                        var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
+                        recip_fbs2.writer().writeAll(to_jid.local) catch {};
+                        recip_fbs2.writer().writeByte('@') catch {};
+                        recip_fbs2.writer().writeAll(to_jid.domain) catch {};
+                        const recipient_bare2 = recip_fbs2.getWritten();
+                        const timestamp: u64 = @intCast(std.time.timestamp());
+                        if (store.storePointer(recipient_bare2, sender_bare, archive_stanza_id, timestamp) catch false) {
+                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
+                            return;
+                        }
+                    } else if (self.archive) |archive| {
+                        // Non-archivable message (no body) going to offline — store full stanza
+                        var recip_buf2: [256]u8 = undefined;
+                        var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
+                        recip_fbs2.writer().writeAll(to_jid.local) catch {};
+                        recip_fbs2.writer().writeByte('@') catch {};
+                        recip_fbs2.writer().writeAll(to_jid.domain) catch {};
+                        const recipient_bare2 = recip_fbs2.getWritten();
 
-                        // Build full stanza XML for archive
-                        var stanza_buf: [20480]u8 = undefined;
-                        var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
-                        const sw = stanza_fbs.writer();
-                        sw.writeAll("<message from='") catch {};
-                        sw.writeAll(from_str) catch {};
-                        sw.writeAll("' to='") catch {};
-                        sw.writeAll(to_str) catch {};
-                        sw.writeByte('\'') catch {};
+                        var stanza_buf2: [20480]u8 = undefined;
+                        var stanza_fbs2 = std.io.fixedBufferStream(&stanza_buf2);
+                        const sw2 = stanza_fbs2.writer();
+                        sw2.writeAll("<message from='") catch {};
+                        sw2.writeAll(from_str) catch {};
+                        sw2.writeAll("' to='") catch {};
+                        sw2.writeAll(to_str) catch {};
+                        sw2.writeByte('\'') catch {};
                         if (type_str.len > 0) {
-                            sw.writeAll(" type='") catch {};
-                            sw.writeAll(type_str) catch {};
-                            sw.writeByte('\'') catch {};
+                            sw2.writeAll(" type='") catch {};
+                            sw2.writeAll(type_str) catch {};
+                            sw2.writeByte('\'') catch {};
                         }
                         if (id_str.len > 0) {
-                            sw.writeAll(" id='") catch {};
-                            sw.writeAll(id_str) catch {};
-                            sw.writeByte('\'') catch {};
+                            sw2.writeAll(" id='") catch {};
+                            sw2.writeAll(id_str) catch {};
+                            sw2.writeByte('\'') catch {};
                         }
                         if (inner_xml.len == 0) {
-                            sw.writeAll("/>") catch {};
+                            sw2.writeAll("/>") catch {};
                         } else {
-                            sw.writeByte('>') catch {};
-                            sw.writeAll(inner_xml) catch {};
-                            sw.writeAll("</message>") catch {};
+                            sw2.writeByte('>') catch {};
+                            sw2.writeAll(inner_xml) catch {};
+                            sw2.writeAll("</message>") catch {};
                         }
-                        const full_stanza = stanza_fbs.getWritten();
-
-                        // Generate stanza ID
+                        const full_stanza2 = stanza_fbs2.getWritten();
                         const timestamp: u64 = @intCast(std.time.timestamp());
-                        const stanza_id = if (id_str.len > 0) id_str else "offline";
-
-                        // Store payload in archive, pointer in offline
-                        archive.store(recipient_bare, from_str, stanza_id, timestamp, full_stanza) catch {};
-                        if (store.storePointer(recipient_bare, from_str, stanza_id, timestamp) catch false) {
+                        const offline_id = if (id_str.len > 0) id_str else "offline";
+                        archive.store(recipient_bare2, sender_bare, offline_id, timestamp, full_stanza2) catch {};
+                        if (store.storePointer(recipient_bare2, sender_bare, offline_id, timestamp) catch false) {
                             log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
                             return;
                         }
@@ -2051,6 +2150,14 @@ pub const Server = struct {
                 // Emit children and close tag
                 mw.writeByte('>') catch continue;
                 mw.writeAll(inner_xml) catch continue;
+                // Inject stanza-id for archivable messages (XEP-0359)
+                if (archive_stanza_id.len > 0) {
+                    mw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch continue;
+                    mw.writeAll(archive_stanza_id) catch continue;
+                    mw.writeAll("' by='") catch continue;
+                    mw.writeAll(self.server_host) catch continue;
+                    mw.writeAll("'/>") catch continue;
+                }
                 mw.writeAll("</") catch continue;
                 mw.writeAll(tag_name) catch continue;
                 mw.writeByte('>') catch continue;
@@ -2061,6 +2168,20 @@ pub const Server = struct {
                 changes.addWrite(target_session.conn.fd, tid) catch {};
             }
         }
+    }
+
+    /// Generate a unique stanza ID for XEP-0359. Format: hex(timestamp)-hex(worker_id)-hex(counter).
+    /// The ID is unique per server instance (worker_id disambiguates threads, counter disambiguates
+    /// within the same second). Written into the provided buffer, returns the slice.
+    fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
+        const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
+        const counter = self.stanza_id_counter;
+        self.stanza_id_counter +%= 1;
+
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        std.fmt.format(w, "{x}-{x}-{x}", .{ timestamp, self.worker_id, counter }) catch {};
+        return fbs.getWritten();
     }
 
     fn handlePresence(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {

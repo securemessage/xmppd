@@ -256,6 +256,11 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                         muc_handler.handleRoomDiscoInfo(server, session, to_jid.local, iq_id, changes);
                         return;
                     }
+                    // MAM query for a room (XEP-0313 + XEP-0045 §T83)
+                    if (std.mem.eql(u8, child_ns, xml.ns.mam) and std.mem.eql(u8, iq_type, "set")) {
+                        handleMucMamQuery(server, session, to_jid.local, muc_host, iq_id, changes);
+                        return;
+                    }
                 }
                 // Unknown IQ to MUC domain
                 sendIqError(server, session, iq_id, "service-unavailable");
@@ -290,6 +295,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='jabber:iq:version'/>") catch return;
         w.writeAll("<feature var='msgoffline'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:sid:0'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/chatstates'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
@@ -659,6 +665,61 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
     const query = mam_handler.MamQuery{
         .iq_id = iq_id,
         .owner = bare_jid,
+        .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
+        .with = if (session.mam_with.len > 0) session.mam_with else null,
+        .start = start_ts,
+        .end = end_ts,
+        .after_id = if (session.mam_after.len > 0) session.mam_after else null,
+        .before_id = if (session.mam_before.len > 0) session.mam_before else null,
+        .max = max,
+    };
+
+    const ArchBackend = @import("archive_backend").Backend;
+    var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+    defer response.deinit();
+
+    // Send each result message
+    for (response.messages) |msg| {
+        session.conn.queueSend(msg.xml) catch continue;
+    }
+
+    // Send the fin IQ
+    session.conn.queueSend(response.fin_iq) catch return;
+}
+
+/// Handle MAM query for a MUC room (XEP-0313 + XEP-0045).
+/// The archive owner is the room JID (room@conference.host).
+fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8, muc_host: []const u8, iq_id: []const u8, changes: *ChangeList) void {
+    _ = changes;
+    const archive = server.archive orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+
+    // Build the room bare JID as archive owner
+    var room_buf: [320]u8 = undefined;
+    var room_fbs = std.io.fixedBufferStream(&room_buf);
+    room_fbs.writer().writeAll(room_local) catch return;
+    room_fbs.writer().writeByte('@') catch return;
+    room_fbs.writer().writeAll(muc_host) catch return;
+    const room_jid = room_fbs.getWritten();
+
+    // Parse max from text (default 50)
+    const max: u32 = if (session.mam_max.len > 0)
+        std.fmt.parseInt(u32, session.mam_max, 10) catch 50
+    else
+        50;
+
+    // Parse timestamps from ISO 8601 if provided
+    const start_ts = if (session.mam_start.len > 0) parseTimestamp(session.mam_start) else null;
+    const end_ts = if (session.mam_end.len > 0) parseTimestamp(session.mam_end) else null;
+
+    const query = mam_handler.MamQuery{
+        .iq_id = iq_id,
+        .owner = room_jid,
         .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
         .with = if (session.mam_with.len > 0) session.mam_with else null,
         .start = start_ts,
