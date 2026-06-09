@@ -1512,10 +1512,10 @@ pub const Server = struct {
     }
 
     /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
-    /// Used by subscription handlers where the stanza XML is already built.
+    /// Used by subscription/presence handlers where the stanza XML is already built.
     fn forwardPresenceXmlToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
         if (!self.s2s_ipc.connected) {
-            log.info("connection {d} subscription to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
+            log.info("connection {d} presence to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
             return;
         }
 
@@ -1524,15 +1524,29 @@ pub const Server = struct {
             .to_jid = to_str,
             .stanza_xml = stanza_xml,
         } }) catch {
-            log.err("connection {d} failed to forward subscription to S2S", .{session.conn.id});
+            log.err("connection {d} failed to forward presence to S2S", .{session.conn.id});
             return;
         };
 
         if (self.s2s_ipc.hasPendingSend()) {
             changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
         }
+    }
 
-        log.info("connection {d} subscription to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
+    /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
+    /// Variant without a session reference — used by broadcast presence.
+    fn sendPresenceViaS2s(self: *Server, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
+        if (!self.s2s_ipc.connected) return;
+
+        self.s2s_ipc.send(.{ .s2s_deliver = .{
+            .from_jid = from_str,
+            .to_jid = to_str,
+            .stanza_xml = stanza_xml,
+        } }) catch return;
+
+        if (self.s2s_ipc.hasPendingSend()) {
+            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        }
     }
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
@@ -2467,13 +2481,19 @@ pub const Server = struct {
         pw.writeAll("'/>") catch return;
         const presence_xml = pres_fbs.getWritten();
 
-        // Deliver to each subscriber that has an active session
+        // Deliver to each subscriber
         const sm = self.session_map orelse return;
         for (subscriber_jids) |sub_bare_jid| {
             // Parse the subscriber bare JID to get local/domain
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
+
+            // Remote domain? Forward via S2S.
+            if (!std.mem.eql(u8, sub_domain, self.server_host)) {
+                self.sendPresenceViaS2s(bare_jid, sub_bare_jid, presence_xml, changes);
+                continue;
+            }
 
             var entries_buf: [16]SessionEntry = undefined;
             const route_count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries_buf);
@@ -2534,6 +2554,12 @@ pub const Server = struct {
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];
 
+            // Remote domain? Forward via S2S.
+            if (!std.mem.eql(u8, sub_domain, self.server_host)) {
+                self.sendPresenceViaS2s(bare_jid, sub_bare_jid, presence_xml, changes);
+                continue;
+            }
+
             var entries_buf: [16]SessionEntry = undefined;
             const route_count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries_buf);
             for (entries_buf[0..route_count]) |entry| {
@@ -2586,12 +2612,28 @@ pub const Server = struct {
         to_fbs.writer().writeAll(bound.resource) catch return;
         const to_str = to_fbs.getWritten();
 
-        // For each subscribed contact, iterate their available sessions
+        // For each subscribed contact, check if local or remote
         for (contact_jids) |contact_bare| {
             const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
             const contact_local = contact_bare[0..at_pos];
             const contact_domain = contact_bare[at_pos + 1 ..];
 
+            // Remote domain? Send a presence probe via S2S.
+            // The remote server will respond with the contact's current presence.
+            if (!std.mem.eql(u8, contact_domain, self.server_host)) {
+                var probe_buf: [512]u8 = undefined;
+                var probe_fbs = std.io.fixedBufferStream(&probe_buf);
+                const pbw = probe_fbs.writer();
+                pbw.writeAll("<presence from='") catch continue;
+                pbw.writeAll(bare_jid) catch continue;
+                pbw.writeAll("' to='") catch continue;
+                pbw.writeAll(contact_bare) catch continue;
+                pbw.writeAll("' type='probe'/>") catch continue;
+                self.sendPresenceViaS2s(bare_jid, contact_bare, probe_fbs.getWritten(), changes);
+                continue;
+            }
+
+            // Local contact — iterate their available sessions
             var probe_entries: [16]SessionEntry = undefined;
             const target_count = sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
 
