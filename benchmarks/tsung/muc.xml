@@ -33,7 +33,7 @@
   <sessions>
     <session probability="100" name="muc-load" type="ts_jabber">
 
-      <!-- Connect and authenticate -->
+      <!-- Connect and authenticate (no-tls mode) -->
       <request><jabber type="connect" ack="local"/></request>
       <thinktime value="1" random="false"/>
       <request><jabber type="auth_sasl" ack="local"/></request>

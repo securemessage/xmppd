@@ -440,8 +440,11 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Check if registration is enabled
-            if (!self.reg_config.enabled) {
+            // Privileged admin requests (xmppctl) bypass registration policy
+            const is_admin = std.mem.eql(u8, req.client_ip, "ctl");
+
+            // Check if registration is enabled (skip for admin)
+            if (!is_admin and !self.reg_config.enabled) {
                 return protocol.Message{ .register_result = regResult{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -449,16 +452,18 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Rate limit registration attempts
-            if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed("", req.client_ip)) |reason| {
-                    return protocol.Message{ .register_result = regResult{
-                        .conn_id = req.conn_id,
-                        .success = false,
-                        .reason = reason,
-                    } };
+            // Rate limit registration attempts (skip for admin)
+            if (!is_admin) {
+                if (self.rate_limiter) |rl| {
+                    if (rl.checkAllowed("", req.client_ip)) |reason| {
+                        return protocol.Message{ .register_result = regResult{
+                            .conn_id = req.conn_id,
+                            .success = false,
+                            .reason = reason,
+                        } };
+                    }
+                    rl.recordAttempt("", req.client_ip);
                 }
-                rl.recordAttempt("", req.client_ip);
             }
 
             // Validate input
@@ -470,8 +475,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Validate invitation code if required
-            if (self.reg_config.require_invite) {
+            // Validate invitation code if required (skip for admin)
+            if (!is_admin and self.reg_config.require_invite) {
                 if (req.invite_code.len == 0) {
                     return protocol.Message{ .register_result = regResult{
                         .conn_id = req.conn_id,

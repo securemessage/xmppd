@@ -33,7 +33,7 @@
   <sessions>
     <session probability="100" name="chat-1to1" type="ts_jabber">
 
-      <!-- Connect and authenticate -->
+      <!-- Connect and authenticate (no-tls mode: SASL offered without STARTTLS) -->
       <request><jabber type="connect" ack="local"/></request>
       <thinktime value="1" random="false"/>
       <request><jabber type="auth_sasl" ack="local"/></request>

@@ -137,6 +137,10 @@ pub fn main() !void {
                 log.err("--config requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--no-tls")) {
+            // Skip TLS requirement — offer SASL without STARTTLS (benchmarks/trusted networks)
+            cert_path = null;
+            key_path = null;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -318,6 +322,7 @@ pub fn main() !void {
         .s2s_socket = s2s_socket,
         .per_worker_sessions = per_worker_sessions,
         .fan_out_batch_size = fan_out_batch_size,
+        .skip_tls = (cert_path == null),
         .roster = if (roster_store != null) &roster_store.? else null,
         .offline = if (offline_store != null) &offline_store.? else null,
         .archive = if (archive_store != null) &archive_store.? else null,
@@ -335,7 +340,7 @@ pub fn main() !void {
     // Single-fd (legacy / dev mode): run directly on main thread
     if (listen_fd_count <= 1) {
         var server = if (listen_fd_count == 1)
-            try Server.initFromFd(host, listen_fds[0], allocator, per_worker_sessions)
+            try Server.initFromFdOpts(host, listen_fds[0], allocator, per_worker_sessions, ctx.skip_tls)
         else
             try Server.initWithMaxSessions(host, address, port, allocator, per_worker_sessions);
         server.fanout_queue.batch_size = fan_out_batch_size;
@@ -367,7 +372,7 @@ pub fn main() !void {
     // Main thread runs the last worker
     log.info("main thread running worker {d}", .{listen_fd_count - 1});
     {
-        var server = try Server.initFromFd(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions);
+        var server = try Server.initFromFdOpts(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions, ctx.skip_tls);
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
         configureServer(&server, &ctx, @intCast(listen_fd_count - 1));
@@ -417,6 +422,7 @@ const WorkerCtx = struct {
     s2s_socket: ?[]const u8,
     per_worker_sessions: usize,
     fan_out_batch_size: u8,
+    skip_tls: bool,
     roster: ?*GenericRosterStore,
     offline: ?*GenericOfflineStore(OpBackendType),
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
@@ -489,11 +495,12 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
 fn workerThread(args: *WorkerArgs) void {
     log.info("worker {d} starting (fd={d})", .{ args.worker_id, args.fd });
 
-    var server = Server.initFromFd(
+    var server = Server.initFromFdOpts(
         args.ctx.host,
         args.fd,
         args.ctx.allocator,
         args.ctx.per_worker_sessions,
+        args.ctx.skip_tls,
     ) catch |err| {
         log.err("worker {d} init failed: {}", .{ args.worker_id, err });
         return;

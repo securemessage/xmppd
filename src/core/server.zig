@@ -396,11 +396,22 @@ pub const Server = struct {
     }
 
     /// Initialize with a pre-bound listener fd (received from master via fd inheritance).
+    /// If `skip_tls` is true, SASL is offered without requiring STARTTLS (for benchmarks/trusted networks).
     pub fn initFromFd(
         host: []const u8,
         fd: std.posix.fd_t,
         allocator: std.mem.Allocator,
         max_sessions: usize,
+    ) !Server {
+        return initFromFdOpts(host, fd, allocator, max_sessions, false);
+    }
+
+    pub fn initFromFdOpts(
+        host: []const u8,
+        fd: std.posix.fd_t,
+        allocator: std.mem.Allocator,
+        max_sessions: usize,
+        skip_tls: bool,
     ) !Server {
         if (max_sessions >= delivery_queue_mod.MULTICAST_SENTINEL) {
             log.err("max_sessions ({d}) must be < MULTICAST_SENTINEL (0xFFFFFFFF)", .{max_sessions});
@@ -415,7 +426,7 @@ pub const Server = struct {
             l.deinit();
         }
 
-        const listener = Listener.initFromFd(fd, false);
+        const listener = Listener.initFromFd(fd, skip_tls);
 
         return Server{
             .loop = loop,
@@ -3153,8 +3164,11 @@ pub const Server = struct {
                 writer.writeAll(server_final) catch return;
                 writer.writeAll("</success>") catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
-                // Reset XML reader for post-SASL stream restart
+                // Reset XML reader and clear read buffer for post-SASL stream restart
+                // (same treatment as post-STARTTLS at line ~706)
                 session.reader.reset();
+                session.conn.read_start = 0;
+                session.conn.read_end = 0;
             },
             .send_sasl_failure => |reason| {
                 writer.writeAll("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><") catch return;

@@ -494,60 +494,69 @@ fn tryIpcCommand(
         return false;
     }
 
-    // Read response (blocking)
+    // Read response (blocking). Auth daemon sends MechanismList on connect
+    // before our command response, so we must skip non-result frames.
     var recv_buf: [4096]u8 = undefined;
     var recv_len: usize = 0;
     while (recv_len < recv_buf.len) {
+        // Try to parse from existing buffer before reading more
+        while (ipc_protocol.readFrame(recv_buf[0..recv_len])) |frame| {
+            const resp = ipc_protocol.decode(frame.payload) catch {
+                printErr("invalid response from auth daemon\n");
+                return true;
+            };
+
+            switch (resp) {
+                .register_result => |r| {
+                    if (r.success) {
+                        printOut("User ");
+                        printOut(jid);
+                        printOut(" created.\n");
+                    } else {
+                        printErr("registration failed: ");
+                        printErr(r.reason);
+                        printErr("\n");
+                    }
+                    return true;
+                },
+                .password_change_result => |r| {
+                    if (r.success) {
+                        printOut("Password changed for ");
+                        printOut(jid);
+                        printOut(".\n");
+                    } else {
+                        printErr("password change failed: ");
+                        printErr(r.reason);
+                        printErr("\n");
+                    }
+                    return true;
+                },
+                .account_delete_result => |r| {
+                    if (r.success) {
+                        printOut("User ");
+                        printOut(jid);
+                        printOut(" removed.\n");
+                    } else {
+                        printErr("deletion failed: ");
+                        printErr(r.reason);
+                        printErr("\n");
+                    }
+                    return true;
+                },
+                else => {
+                    // Skip non-result messages (e.g. mechanism_list) and try next frame
+                    if (frame.consumed < recv_len) {
+                        std.mem.copyForwards(u8, recv_buf[0 .. recv_len - frame.consumed], recv_buf[frame.consumed..recv_len]);
+                    }
+                    recv_len -= frame.consumed;
+                },
+            }
+        }
+
+        // Need more data
         const n = posix.read(sock, recv_buf[recv_len..]) catch break;
         if (n == 0) break;
         recv_len += n;
-
-        // Try to parse a frame
-        const frame = ipc_protocol.readFrame(recv_buf[0..recv_len]) orelse continue;
-        const resp = ipc_protocol.decode(frame.payload) catch {
-            printErr("invalid response from auth daemon\n");
-            return true;
-        };
-
-        switch (resp) {
-            .register_result => |r| {
-                if (r.success) {
-                    printOut("User ");
-                    printOut(jid);
-                    printOut(" created.\n");
-                } else {
-                    printErr("registration failed: ");
-                    printErr(r.reason);
-                    printErr("\n");
-                }
-            },
-            .password_change_result => |r| {
-                if (r.success) {
-                    printOut("Password changed for ");
-                    printOut(jid);
-                    printOut(".\n");
-                } else {
-                    printErr("password change failed: ");
-                    printErr(r.reason);
-                    printErr("\n");
-                }
-            },
-            .account_delete_result => |r| {
-                if (r.success) {
-                    printOut("User ");
-                    printOut(jid);
-                    printOut(" removed.\n");
-                } else {
-                    printErr("deletion failed: ");
-                    printErr(r.reason);
-                    printErr("\n");
-                }
-            },
-            else => {
-                printErr("unexpected response from auth daemon\n");
-            },
-        }
-        return true;
     }
 
     printErr("no response from auth daemon\n");

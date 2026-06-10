@@ -6,3 +6,4 @@ zig-cache/
 *.so
 *.dylib
 *.core
+erl_crash.dump
