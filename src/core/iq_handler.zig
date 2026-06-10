@@ -1068,7 +1068,8 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         server.allocator.free(items);
     }
 
-    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    // PEP payloads can be large (OMEMO bundles ~4KB) — use stanza_buf (16KB) instead of write_scratch (4KB)
+    var fbs = std.io.fixedBufferStream(&session.stanza_buf);
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
