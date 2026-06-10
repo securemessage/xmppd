@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<!DOCTYPE tsung SYSTEM "/usr/local/share/tsung/tsung-1.0.dtd">
+<!--
+  xmppd throughput test: saturate the server to find max msg/s.
+  100 users connect over 10s, each sends 100 messages with 0.05s delay.
+  Theoretical peak: ~2000 msg/s. Actual throughput visible in stats.
+-->
+<tsung loglevel="notice" version="1.0">
+
+  <clients>
+    <client host="localhost" use_controller_vm="true" maxusers="500"/>
+  </clients>
+
+  <servers>
+    <server host="127.0.0.1" port="5222" type="tcp"/>
+  </servers>
+
+  <load>
+    <!-- Ramp up 100 users over 10 seconds -->
+    <arrivalphase phase="1" duration="10" unit="second">
+      <users interarrival="0.1" unit="second"/>
+    </arrivalphase>
+  </load>
+
+  <options>
+    <option type="ts_jabber" name="domain" value="morante.dev"/>
+    <option type="ts_jabber" name="username" value="user"/>
+    <option type="ts_jabber" name="passwd" value="test1234"/>
+    <option type="ts_jabber" name="userid_max" value="100"/>
+    <option type="ts_jabber" name="global_number" value="100"/>
+  </options>
+
+  <sessions>
+    <session probability="100" name="throughput" type="ts_jabber">
+
+      <!-- Connect and authenticate (no-tls mode) -->
+      <request><jabber type="connect" ack="local"/></request>
+      <thinktime value="0.5" random="false"/>
+      <request><jabber type="auth_sasl" ack="local"/></request>
+      <request><jabber type="connect" ack="local"/></request>
+      <request><jabber type="auth_sasl_bind" ack="local"/></request>
+      <request><jabber type="auth_sasl_session" ack="local"/></request>
+
+      <!-- Send initial presence -->
+      <request><jabber type="presence:initial" ack="no_ack"/></request>
+      <thinktime value="0.5" random="false"/>
+
+      <!-- Send 100 messages with minimal delay -->
+      <for from="1" to="100" var="i">
+        <thinktime value="0.05" random="false"/>
+        <transaction name="send_msg">
+          <request>
+            <jabber type="chat" ack="no_ack" size="64" destination="random"/>
+          </request>
+        </transaction>
+      </for>
+
+      <thinktime value="1" random="false"/>
+      <request><jabber type="close" ack="no_ack"/></request>
+    </session>
+  </sessions>
+
+</tsung>
