@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<!DOCTYPE tsung SYSTEM "/usr/local/share/tsung/tsung-1.0.dtd">
+<!--
+  xmppd load test: MUC (Multi-User Chat)
+  50 users join a room and each sends 5 groupchat messages.
+  Tests fan-out under load with multiple occupants.
+-->
+<tsung loglevel="notice" version="1.0">
+
+  <clients>
+    <client host="localhost" use_controller_vm="true" maxusers="200"/>
+  </clients>
+
+  <servers>
+    <server host="127.0.0.1" port="5222" type="tcp"/>
+  </servers>
+
+  <load>
+    <arrivalphase phase="1" duration="30" unit="second">
+      <users interarrival="0.6" unit="second"/>
+    </arrivalphase>
+  </load>
+
+  <options>
+    <option type="ts_jabber" name="domain" value="morante.dev"/>
+    <option type="ts_jabber" name="username" value="user"/>
+    <option type="ts_jabber" name="passwd" value="test1234"/>
+    <option type="ts_jabber" name="userid_max" value="100"/>
+    <option type="ts_jabber" name="global_number" value="100"/>
+    <option type="ts_jabber" name="muc_service" value="conference.morante.dev"/>
+  </options>
+
+  <sessions>
+    <session probability="100" name="muc-load" type="ts_jabber">
+
+      <!-- Connect and authenticate -->
+      <request><jabber type="connect" ack="local"/></request>
+      <thinktime value="1" random="false"/>
+      <request><jabber type="auth_sasl" ack="local"/></request>
+      <request><jabber type="connect" ack="local"/></request>
+      <request><jabber type="auth_sasl_bind" ack="local"/></request>
+      <request><jabber type="auth_sasl_session" ack="local"/></request>
+
+      <!-- Send initial presence -->
+      <request><jabber type="presence:initial" ack="no_ack"/></request>
+      <thinktime value="2" random="false"/>
+
+      <!-- Join MUC room -->
+      <request>
+        <jabber type="muc:join" ack="no_ack" room="loadtest" nick="random"/>
+      </request>
+      <thinktime value="3" random="false"/>
+
+      <!-- Send 5 groupchat messages -->
+      <for from="1" to="5" var="i">
+        <thinktime value="1" random="true"/>
+        <transaction name="muc_msg">
+          <request>
+            <jabber type="muc:chat" ack="no_ack" room="loadtest" size="64"/>
+          </request>
+        </transaction>
+      </for>
+
+      <thinktime value="3" random="false"/>
+      <request><jabber type="close" ack="no_ack"/></request>
+    </session>
+  </sessions>
+
+</tsung>
