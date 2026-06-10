@@ -71,6 +71,8 @@ const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
+const block_store_mod = @import("block_store");
+const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd);
 
@@ -310,6 +312,9 @@ pub const Server = struct {
     /// MUC room store — persistent room configs and affiliations.
     room_store: ?*GenericRoomStore = null,
 
+    /// Block store — per-user block lists (XEP-0191).
+    block_store: ?*GenericBlockStore = null,
+
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
 
@@ -444,6 +449,12 @@ pub const Server = struct {
     pub fn configureVcard(self: *Server, vcard_store: *GenericVCardStore) void {
         self.vcard = vcard_store;
         log.info("vcard store configured", .{});
+    }
+
+    /// Configure the block store (XEP-0191: Blocking Command).
+    pub fn configureBlockStore(self: *Server, bs: *GenericBlockStore) void {
+        self.block_store = bs;
+        log.info("block store configured", .{});
     }
 
     /// Configure TLS with a certificate and key file.
@@ -1917,6 +1928,31 @@ pub const Server = struct {
         }
         const from_str = from_fbs.getWritten();
 
+        // XEP-0191: Block check — silently drop stanzas from blocked contacts.
+        // Check if the recipient has blocked the sender (target blocks from).
+        if (self.block_store) |bs| {
+            // Build recipient bare JID
+            var rblk_buf: [256]u8 = undefined;
+            var rblk_fbs = std.io.fixedBufferStream(&rblk_buf);
+            rblk_fbs.writer().writeAll(to_jid.local) catch {};
+            rblk_fbs.writer().writeByte('@') catch {};
+            rblk_fbs.writer().writeAll(to_jid.domain) catch {};
+            const recip_bare = rblk_fbs.getWritten();
+
+            // Build sender bare JID
+            var sblk_buf: [256]u8 = undefined;
+            var sblk_fbs = std.io.fixedBufferStream(&sblk_buf);
+            sblk_fbs.writer().writeAll(from_jid.local) catch {};
+            sblk_fbs.writer().writeByte('@') catch {};
+            sblk_fbs.writer().writeAll(from_jid.domain) catch {};
+            const sender_bare = sblk_fbs.getWritten();
+
+            if (bs.isBlocked(self.allocator, recip_bare, sender_bare) catch false) {
+                // Silently drop — XEP-0191 §3.2: stanzas from blocked JIDs are not delivered
+                return;
+            }
+        }
+
         // MUC domain? Route to MUC handler for groupchat fan-out.
         if (self.muc_host) |muc_host| {
             if (std.mem.eql(u8, to_jid.domain, muc_host)) {
@@ -2730,6 +2766,11 @@ pub const Server = struct {
         // Deliver to each subscriber
         const sm = self.session_map orelse return;
         for (subscriber_jids) |sub_bare_jid| {
+            // XEP-0191: Skip subscribers who have blocked us
+            if (self.block_store) |bs| {
+                if (bs.isBlocked(self.allocator, sub_bare_jid, bare_jid) catch false) continue;
+            }
+
             // Parse the subscriber bare JID to get local/domain
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
@@ -2796,6 +2837,11 @@ pub const Server = struct {
 
         const sm = self.session_map orelse return;
         for (subscriber_jids) |sub_bare_jid| {
+            // XEP-0191: Skip subscribers who have blocked us
+            if (self.block_store) |bs| {
+                if (bs.isBlocked(self.allocator, sub_bare_jid, bare_jid) catch false) continue;
+            }
+
             const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
             const sub_local = sub_bare_jid[0..at_pos];
             const sub_domain = sub_bare_jid[at_pos + 1 ..];

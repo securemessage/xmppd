@@ -30,6 +30,8 @@ const MamCollecting = server_mod.MamCollecting;
 const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(server_mod.OpBackendType);
 const ChangeList = @import("event_loop.zig").ChangeList;
+const session_map_mod = @import("session_map");
+const SessionEntry = session_map_mod.SessionEntry;
 
 /// RSM namespace URI.
 const ns_rsm = "http://jabber.org/protocol/rsm";
@@ -59,7 +61,10 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
 
     if (std.mem.eql(u8, elem.local_name, "query") or
         std.mem.eql(u8, elem.local_name, "enable") or
-        std.mem.eql(u8, elem.local_name, "disable"))
+        std.mem.eql(u8, elem.local_name, "disable") or
+        std.mem.eql(u8, elem.local_name, "blocklist") or
+        std.mem.eql(u8, elem.local_name, "block") or
+        std.mem.eql(u8, elem.local_name, "unblock"))
     {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
@@ -70,6 +75,14 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
                     session.mam_query_id = attr.value;
                     break;
                 }
+            }
+        }
+    } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.blocking)) {
+        // Block/unblock item: <item jid='...'> inside <block>/<unblock>
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "jid")) {
+                session.iq_roster_item_jid = attr.value;
+                break;
             }
         }
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.roster)) {
@@ -303,6 +316,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='http://jabber.org/protocol/chatstates'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:blocking'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
@@ -395,6 +409,20 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     if (std.mem.eql(u8, child_ns, xml.ns.mam) and std.mem.eql(u8, iq_type, "set")) {
         handleMamQuery(server, session, iq_id, changes);
         return;
+    }
+
+    // XEP-0191: Blocking Command
+    if (std.mem.eql(u8, child_ns, xml.ns.blocking)) {
+        if (std.mem.eql(u8, iq_type, "get") and std.mem.eql(u8, session.iq_child_name, "blocklist")) {
+            handleBlocklistGet(server, session, iq_id, changes);
+            return;
+        } else if (std.mem.eql(u8, iq_type, "set") and std.mem.eql(u8, session.iq_child_name, "block")) {
+            handleBlock(server, session, iq_id, changes);
+            return;
+        } else if (std.mem.eql(u8, iq_type, "set") and std.mem.eql(u8, session.iq_child_name, "unblock")) {
+            handleUnblock(server, session, iq_id, changes);
+            return;
+        }
     }
 
     // XEP-0077 — jabber:iq:register
@@ -898,6 +926,175 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle XEP-0191 <blocklist/> get — return the user's block list.
+fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+    _ = changes;
+    const bs = server.block_store orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+    const bound = session.stream.bound_jid orelse return;
+
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    const items = bs.getBlockList(server.allocator, bare_jid) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+    defer {
+        for (items) |item| server.allocator.free(item);
+        server.allocator.free(items);
+    }
+
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("><blocklist xmlns='urn:xmpp:blocking'>") catch return;
+    for (items) |jid| {
+        w.writeAll("<item jid='") catch return;
+        w.writeAll(jid) catch return;
+        w.writeAll("'/>") catch return;
+    }
+    w.writeAll("</blocklist></iq>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle XEP-0191 <block/> set — add JIDs to user's block list.
+fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+    const bs = server.block_store orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+    const bound = session.stream.bound_jid orelse return;
+
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    const item_jid = session.iq_roster_item_jid;
+    if (item_jid.len == 0) {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    }
+
+    bs.block(bare_jid, item_jid) catch {
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
+
+    log.info("connection {d} blocked {s}", .{ session.conn.id, item_jid });
+
+    // Ack with empty result
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("/>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+
+    // Push block list update to all resources of the blocking user (XEP-0191 §3.3)
+    pushBlockPush(server, session, bound.local, bound.domain, "block", item_jid, changes);
+}
+
+/// Handle XEP-0191 <unblock/> set — remove JIDs from user's block list.
+fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+    const bs = server.block_store orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+    const bound = session.stream.bound_jid orelse return;
+
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(bound.local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    const item_jid = session.iq_roster_item_jid;
+    if (item_jid.len == 0) {
+        // Empty <unblock/> means unblock all
+        bs.removeAll(server.allocator, bare_jid) catch {};
+        log.info("connection {d} unblocked all", .{session.conn.id});
+    } else {
+        bs.unblock(bare_jid, item_jid) catch {
+            sendIqError(server, session, iq_id, "internal-server-error");
+            return;
+        };
+        log.info("connection {d} unblocked {s}", .{ session.conn.id, item_jid });
+    }
+
+    // Ack with empty result
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("/>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+
+    // Push unblock update to all resources
+    pushBlockPush(server, session, bound.local, bound.domain, "unblock", item_jid, changes);
+}
+
+/// Push a block/unblock notification to all of the user's connected resources.
+/// Per XEP-0191 §3.3, when a block list changes, the server pushes an IQ set
+/// to all resources of the user who made the change.
+fn pushBlockPush(
+    server: *Server,
+    sender_session: *const Session,
+    user_local: []const u8,
+    user_domain: []const u8,
+    action: []const u8,
+    item_jid: []const u8,
+    changes: *ChangeList,
+) void {
+    const sm = server.session_map orelse return;
+    var entries: [16]SessionEntry = undefined;
+    const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+    if (count == 0) return;
+
+    for (entries[0..count]) |entry| {
+        if (entry.worker_id == server.worker_id) {
+            const target = server.sessions[entry.local_session_id] orelse continue;
+            // Skip the originating session (it already got the IQ result)
+            if (&target.conn == &sender_session.conn) continue;
+
+            var push_buf: [1024]u8 = undefined;
+            var pfbs = std.io.fixedBufferStream(&push_buf);
+            const pw = pfbs.writer();
+            pw.writeAll("<iq type='set' to='") catch continue;
+            pw.writeAll(user_local) catch continue;
+            pw.writeByte('@') catch continue;
+            pw.writeAll(user_domain) catch continue;
+            pw.writeByte('/') catch continue;
+            pw.writeAll(entry.resource()) catch continue;
+            pw.writeAll("'><") catch continue;
+            pw.writeAll(action) catch continue;
+            pw.writeAll(" xmlns='urn:xmpp:blocking'>") catch continue;
+            if (item_jid.len > 0) {
+                pw.writeAll("<item jid='") catch continue;
+                pw.writeAll(item_jid) catch continue;
+                pw.writeAll("'/>") catch continue;
+            }
+            pw.writeAll("</") catch continue;
+            pw.writeAll(action) catch continue;
+            pw.writeAll("></iq>") catch continue;
+
+            target.conn.queueSend(pfbs.getWritten()) catch continue;
+            if (target.conn.hasPendingWrite()) {
+                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+            }
+        }
+        // Cross-thread push: deferred to post-V1 (T89 pattern)
+    }
 }
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {

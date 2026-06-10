@@ -40,6 +40,8 @@ const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const RoomConfig = room_store_mod.RoomConfig;
+const block_store_mod = @import("block_store");
+const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
@@ -226,6 +228,7 @@ pub fn main() !void {
     var offline_store: ?GenericOfflineStore(OpBackendType) = null;
     var vcard_store: ?GenericVCardStore = null;
     var rs: ?GenericRoomStore = null;
+    var block_store_val: ?GenericBlockStore = null;
     if (db_path) |db| {
         var op_path_buf: [1024]u8 = undefined;
         const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
@@ -240,6 +243,7 @@ pub fn main() !void {
         offline_store = GenericOfflineStore(OpBackendType).init(&op_backend.?, allocator);
         vcard_store = GenericVCardStore.init(&op_backend.?);
         rs = GenericRoomStore.init(&op_backend.?, allocator);
+        block_store_val = GenericBlockStore.init(&op_backend.?);
     }
     defer if (op_backend) |*b| b.close();
 
@@ -316,6 +320,7 @@ pub fn main() !void {
         .vcard = if (vcard_store != null) &vcard_store.? else null,
         .room_registry = if (room_registry != null) &room_registry.? else null,
         .room_store = if (rs != null) &rs.? else null,
+        .block_store = if (block_store_val != null) &block_store_val.? else null,
         .muc_host = effective_muc_host,
         .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
@@ -413,6 +418,7 @@ const WorkerCtx = struct {
     vcard: ?*GenericVCardStore,
     room_registry: ?*RoomRegistry,
     room_store: ?*GenericRoomStore,
+    block_store: ?*GenericBlockStore,
     muc_host: ?[]const u8,
     session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
@@ -461,6 +467,8 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     if (ctx.offline != null and ctx.archive != null) {
         server.configureOffline(ctx.offline.?, ctx.archive.?);
     }
+
+    if (ctx.block_store) |bs| server.configureBlockStore(bs);
 
     if (ctx.room_registry) |reg| {
         server.room_registry = reg;
