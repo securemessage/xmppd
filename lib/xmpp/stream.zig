@@ -132,6 +132,7 @@ pub const FeatureSet = struct {
     starttls_required: bool = false,
     sasl_mechanisms: []const []const u8 = &.{},
     bind: bool = false,
+    sm: bool = false,
 };
 
 /// Server-side XMPP stream state machine.
@@ -224,6 +225,7 @@ pub const Stream = struct {
             },
             .features_bind => FeatureSet{
                 .bind = true,
+                .sm = true,
             },
             else => null,
         };
@@ -367,6 +369,10 @@ pub fn writeFeatures(writer: anytype, features: FeatureSet) !void {
         // Legacy session (RFC 3921) — marked optional for backward compatibility.
         // Some clients (Profanity/libstrophe) expect this element in bind features.
         try writer.writeAll("<session xmlns='urn:ietf:params:xml:ns:xmpp-session'><optional/></session>");
+    }
+
+    if (features.sm) {
+        try writer.writeAll("<sm xmlns='urn:xmpp:sm:3'/>");
     }
 
     try writer.writeAll("</stream:features>");

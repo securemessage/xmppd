@@ -232,6 +232,13 @@ pub const Session = struct {
     /// IQ id for a pending password change/deletion response (awaiting auth daemon reply).
     reg_pending_iq_id: []const u8 = "",
 
+    /// XEP-0198: Stream Management state.
+    sm_enabled: bool = false,
+    /// Inbound stanza counter (stanzas received from client).
+    sm_in_h: u32 = 0,
+    /// Outbound stanza counter (stanzas sent to client).
+    sm_out_h: u32 = 0,
+
     fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
             .conn = Connection.init(fd, id),
@@ -898,6 +905,25 @@ pub const Server = struct {
             return;
         }
 
+        // XEP-0198: Stream Management namespace — handle in active or just-bound state
+        if (std.mem.eql(u8, ns, xml.ns.sm)) {
+            if (std.mem.eql(u8, elem.local_name, "enable") and session.stream.isActive()) {
+                self.handleSmEnable(session, changes);
+            } else if (std.mem.eql(u8, elem.local_name, "r") and session.sm_enabled) {
+                self.handleSmRequest(session, changes);
+            } else if (std.mem.eql(u8, elem.local_name, "a") and session.sm_enabled) {
+                // Client acknowledges our stanzas
+                for (elem.attributes) |attr| {
+                    if (std.mem.eql(u8, attr.local_name, "h")) {
+                        const client_h = std.fmt.parseInt(u32, attr.value, 10) catch 0;
+                        session.sm_out_h = client_h;
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         // Active state — stanzas (message, presence, iq)
         if (session.stream.isActive()) {
             // If we're inside an IQ stanza, handle child elements
@@ -911,10 +937,13 @@ pub const Server = struct {
             }
 
             if (std.mem.eql(u8, elem.local_name, "message")) {
+                if (session.sm_enabled) session.sm_in_h +%= 1;
                 self.handleMessage(session, elem, changes);
             } else if (std.mem.eql(u8, elem.local_name, "presence")) {
+                if (session.sm_enabled) session.sm_in_h +%= 1;
                 self.handlePresence(session, elem, changes);
             } else if (std.mem.eql(u8, elem.local_name, "iq")) {
+                if (session.sm_enabled) session.sm_in_h +%= 1;
                 self.handleIq(session, elem, changes);
             }
         }
@@ -3339,6 +3368,41 @@ pub const Server = struct {
                 log.warn("multicast delivery failed to worker {d}: {}", .{ bit, err });
             };
             mask &= mask - 1; // clear lowest set bit
+        }
+    }
+
+    // ========================================================================
+    // XEP-0198: Stream Management
+    // ========================================================================
+
+    /// Handle <enable xmlns='urn:xmpp:sm:3'/> — activate SM for this session.
+    fn handleSmEnable(self: *Server, session: *Session, changes: *ChangeList) void {
+        _ = self;
+        session.sm_enabled = true;
+        session.sm_in_h = 0;
+        session.sm_out_h = 0;
+
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+        log.info("connection {d} stream management enabled", .{session.conn.id});
+    }
+
+    /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.
+    fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<a xmlns='urn:xmpp:sm:3' h='") catch return;
+        std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
+        w.writeAll("'/>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     }
 

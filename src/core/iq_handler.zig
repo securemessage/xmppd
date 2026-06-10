@@ -317,6 +317,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:blocking'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:sm:3'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
