@@ -105,9 +105,10 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
                 break;
             }
         }
-        // Start collecting the item payload XML
-        session.vcard_collecting = true; // reuse vcard buf for PEP payload
+        // Start collecting the item payload XML (reuse vcard buf)
+        session.vcard_collecting = true;
         session.vcard_buf_len = 0;
+        session.vcard_collect_depth = 4; // <iq><pubsub><publish><item>
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.blocking)) {
         // Block/unblock item: <item jid='...'> inside <block>/<unblock>
         for (elem.attributes) |attr| {
@@ -163,6 +164,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         if (std.mem.eql(u8, session.iq_type, "set")) {
             session.vcard_collecting = true;
             session.vcard_buf_len = 0;
+            session.vcard_collect_depth = 2; // <iq><vCard>
             // Write the opening <vCard xmlns='vcard-temp'> tag
             var fbs = std.io.fixedBufferStream(&session.vcard_buf);
             const w = fbs.writer();

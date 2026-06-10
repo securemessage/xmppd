@@ -214,10 +214,12 @@ pub const Session = struct {
     /// Current <field var='...'> name being parsed inside <x> data form.
     mam_field_var: []const u8 = "",
 
-    /// vCard XML accumulation (for IQ set vcard-temp).
+    /// vCard XML accumulation (for IQ set vcard-temp, also reused for PEP item payload).
     vcard_collecting: bool = false,
     vcard_buf: [4096]u8 = undefined,
     vcard_buf_len: usize = 0,
+    /// Depth at which vcard_collecting was started (to detect the matching close tag).
+    vcard_collect_depth: u8 = 0,
 
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
@@ -1076,13 +1078,17 @@ pub const Server = struct {
             .none => {},
         }
 
-        // vCard XML close tag accumulation
+        // vCard/PEP XML close tag accumulation
         if (session.iq_active and session.vcard_collecting) {
-            if (session.reader.depth > 2) {
+            if (session.reader.depth > session.vcard_collect_depth) {
                 self.accumulateVcardClose(session, name);
             } else {
-                // </vCard> reached — write closing tag and stop collecting
-                self.accumulateVcardClose(session, name);
+                // Reached the depth where collecting started — stop.
+                // For vCard (depth=2), include the closing tag (stores full <vCard>...</vCard>).
+                // For PEP items (depth>2), skip the closing </item> tag (stores inner payload only).
+                if (session.vcard_collect_depth <= 2) {
+                    self.accumulateVcardClose(session, name);
+                }
                 session.vcard_collecting = false;
             }
         }
