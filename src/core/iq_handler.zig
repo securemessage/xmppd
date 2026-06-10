@@ -57,7 +57,10 @@ pub fn handleIq(session: *Session, elem: xml.Element) void {
 pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     const ns = elem.namespace_uri;
 
-    if (std.mem.eql(u8, elem.local_name, "query")) {
+    if (std.mem.eql(u8, elem.local_name, "query") or
+        std.mem.eql(u8, elem.local_name, "enable") or
+        std.mem.eql(u8, elem.local_name, "disable"))
+    {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
         // MAM query — extract queryid attribute
@@ -296,6 +299,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='msgoffline'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:sid:0'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:carbons:2'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/chatstates'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
@@ -364,6 +368,25 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<version>0.1.0</version>") catch return;
         w.writeAll("<os>FreeBSD</os>") catch return;
         w.writeAll("</query></iq>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        return;
+    }
+
+    // XEP-0280: Message Carbons (enable/disable)
+    if (std.mem.eql(u8, child_ns, xml.ns.carbons) and std.mem.eql(u8, iq_type, "set")) {
+        const child_name = session.iq_child_name;
+        if (std.mem.eql(u8, child_name, "enable")) {
+            session.carbons_enabled = true;
+            log.info("connection {d} carbons enabled", .{session.conn.id});
+        } else if (std.mem.eql(u8, child_name, "disable")) {
+            session.carbons_enabled = false;
+            log.info("connection {d} carbons disabled", .{session.conn.id});
+        }
+        // Send empty result
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        writeIqHeader(server, w, session, "result", iq_id);
+        w.writeAll("/>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
     }

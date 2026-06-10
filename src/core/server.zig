@@ -215,6 +215,9 @@ pub const Session = struct {
     vcard_buf: [4096]u8 = undefined,
     vcard_buf_len: usize = 0,
 
+    /// XEP-0280: Message Carbons enabled for this session.
+    carbons_enabled: bool = false,
+
     /// Registration (XEP-0077) text accumulation.
     reg_collecting_password: bool = false,
     reg_password_buf: [256]u8 = undefined,
@@ -2174,6 +2177,16 @@ pub const Server = struct {
                 changes.addWrite(target_session.conn.fd, tid) catch {};
             }
         }
+
+        // XEP-0280: Message Carbons — send copies to sender's and recipient's other resources
+        if (session.stanza_kind == .message and
+            (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
+        {
+            // Sent carbon: sender's other resources see what they sent
+            self.sendCarbons("sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
+            // Received carbon: recipient's other resources see what was received
+            self.sendCarbons("received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
+        }
     }
 
     /// Generate a unique stanza ID for XEP-0359. Format: hex(timestamp)-hex(worker_id)-hex(counter).
@@ -2188,6 +2201,99 @@ pub const Server = struct {
         const w = fbs.writer();
         std.fmt.format(w, "{x}-{x}-{x}", .{ timestamp, self.worker_id, counter }) catch {};
         return fbs.getWritten();
+    }
+
+    /// XEP-0280: Send a carbon copy of a message to other resources of a user.
+    /// `carbon_type` is "sent" (for sender's other resources) or "received" (for recipient's other).
+    /// `from_str` is the full JID of the original sender, `to_str` is the original recipient.
+    /// `stanza_xml` is the full message XML including inner elements.
+    fn sendCarbons(
+        self: *Server,
+        carbon_type: []const u8,
+        sender_session: *const Session,
+        user_local: []const u8,
+        user_domain: []const u8,
+        from_str: []const u8,
+        to_str: []const u8,
+        type_str: []const u8,
+        id_str: []const u8,
+        delivery_inner_xml: []const u8,
+        changes: *ChangeList,
+    ) void {
+        const sm = self.session_map orelse return;
+        var entries: [16]SessionEntry = undefined;
+        const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+        if (count == 0) return;
+
+        for (entries[0..count]) |entry| {
+            // Skip the original session (sender or primary recipient)
+            if (entry.worker_id == self.worker_id) {
+                const target = self.sessions[entry.local_session_id] orelse continue;
+                // Skip if this is the sender session itself
+                if (&target.conn == &sender_session.conn) continue;
+                // Skip if carbons not enabled on this resource
+                if (!target.carbons_enabled) continue;
+
+                // Build carbon wrapper: <message to='full_jid'><{sent|received} xmlns='carbons:2'>
+                //   <forwarded xmlns='urn:xmpp:forward:0'><message ...>...</message></forwarded>
+                // </{sent|received}></message>
+                var cbuf: [20480]u8 = undefined;
+                var cfbs = std.io.fixedBufferStream(&cbuf);
+                const cw = cfbs.writer();
+
+                // Outer <message> to the carbon recipient's full JID
+                cw.writeAll("<message from='") catch continue;
+                cw.writeAll(user_local) catch continue;
+                cw.writeByte('@') catch continue;
+                cw.writeAll(user_domain) catch continue;
+                cw.writeAll("' to='") catch continue;
+                cw.writeAll(user_local) catch continue;
+                cw.writeByte('@') catch continue;
+                cw.writeAll(user_domain) catch continue;
+                cw.writeByte('/') catch continue;
+                cw.writeAll(entry.resource()) catch continue;
+                cw.writeAll("' type='chat'>") catch continue;
+
+                // Carbon wrapper
+                cw.writeByte('<') catch continue;
+                cw.writeAll(carbon_type) catch continue;
+                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
+
+                // Original message (reconstructed)
+                cw.writeAll("<message from='") catch continue;
+                cw.writeAll(from_str) catch continue;
+                cw.writeAll("' to='") catch continue;
+                cw.writeAll(to_str) catch continue;
+                cw.writeByte('\'') catch continue;
+                if (type_str.len > 0) {
+                    cw.writeAll(" type='") catch continue;
+                    cw.writeAll(type_str) catch continue;
+                    cw.writeByte('\'') catch continue;
+                }
+                if (id_str.len > 0) {
+                    cw.writeAll(" id='") catch continue;
+                    cw.writeAll(id_str) catch continue;
+                    cw.writeByte('\'') catch continue;
+                }
+                if (delivery_inner_xml.len == 0) {
+                    cw.writeAll("/>") catch continue;
+                } else {
+                    cw.writeByte('>') catch continue;
+                    cw.writeAll(delivery_inner_xml) catch continue;
+                    cw.writeAll("</message>") catch continue;
+                }
+
+                cw.writeAll("</forwarded></") catch continue;
+                cw.writeAll(carbon_type) catch continue;
+                cw.writeAll("></message>") catch continue;
+
+                target.conn.queueSend(cfbs.getWritten()) catch continue;
+                if (target.conn.hasPendingWrite()) {
+                    changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+                }
+            }
+            // Cross-thread carbon delivery would go via MPSC here (future enhancement)
+        }
     }
 
     fn handlePresence(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
