@@ -1947,28 +1947,6 @@ pub const Server = struct {
             break :blk @as(usize, 0);
         } else sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
 
-        for (entries_buf[0..route_count]) |entry| {
-            if (entry.worker_id == self.worker_id) {
-                // Local delivery
-                if (target_count < local_ids.len) {
-                    local_ids[target_count] = entry.local_session_id;
-                    target_count += 1;
-                }
-            } else {
-                // Cross-thread delivery via MPSC
-                self.enqueueCrossThreadStanza(
-                    entry,
-                    from_str,
-                    to_str,
-                    type_str,
-                    id_str,
-                    inner_xml,
-                    session.stanza_kind,
-                );
-                remote_delivered = true;
-            }
-        }
-
         // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
         // Archive chat messages that contain a <body> element (skip transient chat states).
         const is_archivable = session.stanza_kind == .message and
@@ -1978,6 +1956,42 @@ pub const Server = struct {
 
         var sid_buf: [32]u8 = undefined;
         const archive_stanza_id: []const u8 = if (is_archivable) self.generateStanzaId(&sid_buf) else "";
+
+        // Build augmented inner_xml with stanza-id appended (for delivery to recipients)
+        var aug_buf: [16512]u8 = undefined; // 16KB inner + stanza-id element
+        var aug_fbs = std.io.fixedBufferStream(&aug_buf);
+        const delivery_inner_xml: []const u8 = if (archive_stanza_id.len > 0) blk: {
+            const aw = aug_fbs.writer();
+            aw.writeAll(inner_xml) catch break :blk inner_xml;
+            aw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch break :blk inner_xml;
+            aw.writeAll(archive_stanza_id) catch break :blk inner_xml;
+            aw.writeAll("' by='") catch break :blk inner_xml;
+            aw.writeAll(self.server_host) catch break :blk inner_xml;
+            aw.writeAll("'/>") catch break :blk inner_xml;
+            break :blk aug_fbs.getWritten();
+        } else inner_xml;
+
+        for (entries_buf[0..route_count]) |entry| {
+            if (entry.worker_id == self.worker_id) {
+                // Local delivery
+                if (target_count < local_ids.len) {
+                    local_ids[target_count] = entry.local_session_id;
+                    target_count += 1;
+                }
+            } else {
+                // Cross-thread delivery via MPSC (includes stanza-id)
+                self.enqueueCrossThreadStanza(
+                    entry,
+                    from_str,
+                    to_str,
+                    type_str,
+                    id_str,
+                    delivery_inner_xml,
+                    session.stanza_kind,
+                );
+                remote_delivered = true;
+            }
+        }
 
         // Build sender bare JID for archive
         var sender_bare_buf: [256]u8 = undefined;
@@ -2143,21 +2157,13 @@ pub const Server = struct {
                 mw.writeByte('\'') catch continue;
             }
 
-            if (inner_xml.len == 0) {
+            if (delivery_inner_xml.len == 0) {
                 // No children — self-close
                 mw.writeAll("/>") catch continue;
             } else {
-                // Emit children and close tag
+                // Emit children (with stanza-id already appended) and close tag
                 mw.writeByte('>') catch continue;
-                mw.writeAll(inner_xml) catch continue;
-                // Inject stanza-id for archivable messages (XEP-0359)
-                if (archive_stanza_id.len > 0) {
-                    mw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch continue;
-                    mw.writeAll(archive_stanza_id) catch continue;
-                    mw.writeAll("' by='") catch continue;
-                    mw.writeAll(self.server_host) catch continue;
-                    mw.writeAll("'/>") catch continue;
-                }
+                mw.writeAll(delivery_inner_xml) catch continue;
                 mw.writeAll("</") catch continue;
                 mw.writeAll(tag_name) catch continue;
                 mw.writeByte('>') catch continue;
