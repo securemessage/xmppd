@@ -15,12 +15,27 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 scenario="${1:-all}"
 
+wait_for_port() {
+    local retries=0
+    while [ $retries -lt 30 ]; do
+        if nc -z 127.0.0.1 5222 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        retries=$((retries + 1))
+    done
+    echo "ERROR: port 5222 not ready after 30s"
+    return 1
+}
+
 restart_xmppd() {
     local workers="$1"
     echo ">>> Configuring workers = ${workers}"
     doas sed -i '' "s/^workers = .*/workers = ${workers}/" "$CONF"
-    doas jexec xmppd service xmppd restart 2>&1 | head -2
-    sleep 3
+    doas jexec xmppd service xmppd stop 2>&1 | head -2
+    sleep 2
+    doas jexec xmppd service xmppd start 2>&1 | head -2
+    wait_for_port
     echo ">>> xmppd restarted with workers=${workers}"
 }
 

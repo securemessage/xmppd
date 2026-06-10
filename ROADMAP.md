@@ -610,25 +610,32 @@ one process). The hybrid model is where large servers converge.
 | RFC 6120 | XMPP Core | 1–2 |
 | RFC 6121 | XMPP IM | 7 |
 | XEP-0030 | Service Discovery | 7 |
+| XEP-0045 | Multi-User Chat | 10 |
 | XEP-0054 | vcard-temp | 7 |
+| XEP-0077 | In-Band Registration | 9 |
+| XEP-0084 | User Avatar (PEP) | V1 |
+| XEP-0085 | Chat State Notifications | V1 |
 | XEP-0092 | Software Version | 7 |
 | XEP-0160 | Offline Message Storage | 7 |
+| XEP-0163 | Personal Eventing Protocol | V1 |
+| XEP-0191 | Blocking Command | V1 |
+| XEP-0198 | Stream Management | V1 |
 | XEP-0199 | XMPP Ping | 7 |
 | XEP-0220 | Server Dialback | 8 |
+| XEP-0280 | Message Carbons | V1 |
 | XEP-0313 | Message Archive Management | 5+7 |
-| XEP-0077 | In-Band Registration | 9 |
+| XEP-0359 | Unique Message and Stanza IDs | V1 |
 | XEP-0440 | SASL Channel-Binding Type Capability | 9 |
-| XEP-0045 | Multi-User Chat | 10 |
 
 ## Metrics
 
 | Metric | Value |
 |--------|-------|
 | Language | Zig 0.15.2 |
-| Source files | 58 |
-| Lines of code | ~28,000 |
-| Unit tests | 93 build steps, 675 tests (all pass) |
-| Integration tests | 9 S2S + 23 C2S + 12 MUC + 4 OIDC + 8-user cross-thread |
+| Source files | ~60 |
+| Lines of code | ~30,000 |
+| Unit tests | 97 build steps, 690 tests (all pass) |
+| Integration tests | 19 slixmpp E2E + 64 cross-thread + Tsung load tests |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
