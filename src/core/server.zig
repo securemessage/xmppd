@@ -193,6 +193,8 @@ pub const Session = struct {
     iq_to: []const u8 = "",
     iq_child_ns: []const u8 = "",
     iq_child_name: []const u8 = "",
+    /// PEP node name from <publish node='...'> or <items node='...'> (XEP-0163).
+    iq_pep_node: []const u8 = "",
     /// Roster item attributes from <item> inside roster query.
     iq_roster_item_jid: []const u8 = "",
     iq_roster_item_name: []const u8 = "",
@@ -3427,7 +3429,17 @@ pub const Server = struct {
         const session = self.sessions[id] orelse return;
 
         // Remove from all MUC rooms (broadcasts unavailable to room occupants)
-        muc_handler.handleSessionClose(self, id, changes);
+        if (session.stream.bound_jid) |bound| {
+            var close_jid_buf: [256]u8 = undefined;
+            var close_jid_fbs = std.io.fixedBufferStream(&close_jid_buf);
+            const cw = close_jid_fbs.writer();
+            cw.writeAll(bound.local) catch {};
+            cw.writeByte('@') catch {};
+            cw.writeAll(bound.domain) catch {};
+            cw.writeByte('/') catch {};
+            cw.writeAll(bound.resource) catch {};
+            muc_handler.handleSessionClose(self, close_jid_fbs.getWritten(), changes);
+        }
 
         // Unregister from session map and broadcast unavailable presence
         if (session.stream.bound_jid) |bound| {

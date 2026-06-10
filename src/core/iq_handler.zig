@@ -84,7 +84,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         // <publish node='...'> inside <pubsub>
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "node")) {
-                session.iq_to = attr.value; // reuse iq_to for node name
+                session.iq_pep_node = attr.value;
                 break;
             }
         }
@@ -93,7 +93,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         session.iq_child_name = elem.local_name;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "node")) {
-                session.iq_to = attr.value; // reuse iq_to for node name
+                session.iq_pep_node = attr.value;
                 break;
             }
         }
@@ -244,6 +244,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_to = "";
         session.iq_child_ns = "";
         session.iq_child_name = "";
+        session.iq_pep_node = "";
         session.iq_roster_item_jid = "";
         session.iq_roster_item_name = "";
         session.iq_roster_item_sub = "";
@@ -357,6 +358,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='http://jabber.org/protocol/pubsub#auto-create'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/pubsub#persistent-items'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/pubsub#retrieve-items'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:avatar:metadata+notify'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
@@ -982,10 +984,9 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
 }
 
 /// Handle XEP-0163 PEP publish — store an item in a PEP node.
-/// The node name is in iq_to (reused), item ID in iq_roster_item_jid (reused),
+/// The node name is in iq_pep_node, item ID in iq_roster_item_jid (reused),
 /// and the payload XML is in vcard_buf (reused).
 fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
-    _ = changes;
     const ps = server.pep_store orelse {
         sendIqError(server, session, iq_id, "item-not-found");
         return;
@@ -1000,7 +1001,7 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     bare_fbs.writer().writeAll(bound.domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    const node = session.iq_to;
+    const node = session.iq_pep_node;
     if (node.len == 0) {
         sendIqError(server, session, iq_id, "bad-request");
         return;
@@ -1029,9 +1030,13 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     w.writeAll(item_id) catch return;
     w.writeAll("'/></publish></pubsub></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+
+    // XEP-0163 §4.3: Send PEP event notification to presence subscribers
+    sendPepNotification(server, session, bare_jid, node, item_id, payload, changes);
 }
 
 /// Handle XEP-0163 PEP items retrieval — get items from a PEP node.
+/// Supports querying self (no 'to') or another user's PEP node (to='user@host').
 fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
     _ = changes;
     const ps = server.pep_store orelse {
@@ -1039,9 +1044,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         return;
     };
 
-    // PEP items can be queried for self or another user's bare JID
-    // iq_to contains the node name (from <items node='...'> parsing)
-    const node = session.iq_to;
+    const node = session.iq_pep_node;
     if (node.len == 0) {
         sendIqError(server, session, iq_id, "bad-request");
         return;
@@ -1051,9 +1054,16 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     const bound = session.stream.bound_jid orelse return;
     var bare_buf: [256]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-    bare_fbs.writer().writeAll(bound.local) catch return;
-    bare_fbs.writer().writeByte('@') catch return;
-    bare_fbs.writer().writeAll(bound.domain) catch return;
+    const iq_to = session.iq_to;
+    if (iq_to.len > 0) {
+        // Query another user's PEP node
+        bare_fbs.writer().writeAll(iq_to) catch return;
+    } else {
+        // Query own PEP node
+        bare_fbs.writer().writeAll(bound.local) catch return;
+        bare_fbs.writer().writeByte('@') catch return;
+        bare_fbs.writer().writeAll(bound.domain) catch return;
+    }
     const bare_jid = bare_fbs.getWritten();
 
     const items = ps.getItems(server.allocator, bare_jid, node) catch {
@@ -1084,6 +1094,156 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     }
     w.writeAll("</items></pubsub></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Send PEP event notification to presence subscribers (XEP-0163 §4.3).
+/// Delivers a <message type='headline'> with a pubsub#event payload to all
+/// online contacts who have a presence subscription from the publisher,
+/// plus the publisher's own other resources (self-notification).
+fn sendPepNotification(
+    server: *Server,
+    session: *Session,
+    publisher_bare: []const u8,
+    node: []const u8,
+    item_id: []const u8,
+    payload: []const u8,
+    changes: *ChangeList,
+) void {
+    const roster = server.roster orelse return;
+    const sm = server.session_map orelse return;
+
+    // Pre-compute the message body after the 'to' attribute value.
+    // Each recipient gets: <message from='PUB' type='headline' to='RECIP'>BODY</message>
+    const body_prefix_1 = "<message from='";
+    const body_prefix_2 = "' type='headline' to='";
+    const body_mid = "'><event xmlns='http://jabber.org/protocol/pubsub#event'><items node='";
+    const body_item_open = "'><item id='";
+    const body_item_mid = "'>";
+    const body_suffix = "</item></items></event></message>";
+
+    // Build the shared suffix (everything after the to='...' value) into a buffer
+    var notif_buf: [16384]u8 = undefined;
+    var nfbs = std.io.fixedBufferStream(&notif_buf);
+    const nw = nfbs.writer();
+    nw.writeAll(body_mid) catch return;
+    nw.writeAll(node) catch return;
+    nw.writeAll(body_item_open) catch return;
+    nw.writeAll(item_id) catch return;
+    nw.writeAll(body_item_mid) catch return;
+    nw.writeAll(payload) catch return;
+    nw.writeAll(body_suffix) catch return;
+    const body_after_to = nfbs.getWritten();
+
+    // Deliver to the publisher's own other resources (self-notification)
+    const bound = session.stream.bound_jid orelse return;
+    var self_entries: [16]SessionEntry = undefined;
+    const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, &self_entries);
+    for (self_entries[0..self_count]) |entry| {
+        if (entry.worker_id == server.worker_id) {
+            const target = server.sessions[entry.local_session_id] orelse continue;
+            if (&target.conn == &session.conn) continue; // skip originator
+
+            var msg_buf: [16384]u8 = undefined;
+            var mfbs = std.io.fixedBufferStream(&msg_buf);
+            const mw = mfbs.writer();
+            mw.writeAll(body_prefix_1) catch continue;
+            mw.writeAll(publisher_bare) catch continue;
+            mw.writeAll(body_prefix_2) catch continue;
+            mw.writeAll(bound.local) catch continue;
+            mw.writeByte('@') catch continue;
+            mw.writeAll(bound.domain) catch continue;
+            mw.writeByte('/') catch continue;
+            mw.writeAll(entry.resource()) catch continue;
+            mw.writeAll(body_after_to) catch continue;
+
+            target.conn.queueSend(mfbs.getWritten()) catch continue;
+            if (target.conn.hasPendingWrite()) {
+                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+            }
+        } else {
+            // Cross-thread: build full stanza and deliver via MPSC
+            if (server.delivery_system) |ds| {
+                var msg_buf: [16384]u8 = undefined;
+                var mfbs = std.io.fixedBufferStream(&msg_buf);
+                const mw = mfbs.writer();
+                mw.writeAll(body_prefix_1) catch continue;
+                mw.writeAll(publisher_bare) catch continue;
+                mw.writeAll(body_prefix_2) catch continue;
+                mw.writeAll(bound.local) catch continue;
+                mw.writeByte('@') catch continue;
+                mw.writeAll(bound.domain) catch continue;
+                mw.writeByte('/') catch continue;
+                mw.writeAll(entry.resource()) catch continue;
+                mw.writeAll(body_after_to) catch continue;
+
+                ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+            }
+        }
+    }
+
+    // Deliver to presence subscribers (contacts with "from" or "both" subscription)
+    const subscriber_jids = roster.getPresenceSubscribers(server.allocator, publisher_bare) catch return;
+    defer {
+        for (subscriber_jids) |s| server.allocator.free(s);
+        server.allocator.free(subscriber_jids);
+    }
+
+    for (subscriber_jids) |sub_bare_jid| {
+        // Skip blocked contacts
+        if (server.block_store) |bs| {
+            if (bs.isBlocked(server.allocator, sub_bare_jid, publisher_bare) catch false) continue;
+        }
+
+        const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
+        const sub_local = sub_bare_jid[0..at_pos];
+        const sub_domain = sub_bare_jid[at_pos + 1 ..];
+
+        // Only deliver to local users for now (S2S PEP notifications are post-V1)
+        if (!std.mem.eql(u8, sub_domain, server.server_host)) continue;
+
+        var entries: [16]SessionEntry = undefined;
+        const count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries);
+        for (entries[0..count]) |entry| {
+            if (entry.worker_id == server.worker_id) {
+                const target = server.sessions[entry.local_session_id] orelse continue;
+
+                var msg_buf: [16384]u8 = undefined;
+                var mfbs = std.io.fixedBufferStream(&msg_buf);
+                const mw = mfbs.writer();
+                mw.writeAll(body_prefix_1) catch continue;
+                mw.writeAll(publisher_bare) catch continue;
+                mw.writeAll(body_prefix_2) catch continue;
+                mw.writeAll(sub_local) catch continue;
+                mw.writeByte('@') catch continue;
+                mw.writeAll(sub_domain) catch continue;
+                mw.writeByte('/') catch continue;
+                mw.writeAll(entry.resource()) catch continue;
+                mw.writeAll(body_after_to) catch continue;
+
+                target.conn.queueSend(mfbs.getWritten()) catch continue;
+                if (target.conn.hasPendingWrite()) {
+                    changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+                }
+            } else {
+                if (server.delivery_system) |ds| {
+                    var msg_buf: [16384]u8 = undefined;
+                    var mfbs = std.io.fixedBufferStream(&msg_buf);
+                    const mw = mfbs.writer();
+                    mw.writeAll(body_prefix_1) catch continue;
+                    mw.writeAll(publisher_bare) catch continue;
+                    mw.writeAll(body_prefix_2) catch continue;
+                    mw.writeAll(sub_local) catch continue;
+                    mw.writeByte('@') catch continue;
+                    mw.writeAll(sub_domain) catch continue;
+                    mw.writeByte('/') catch continue;
+                    mw.writeAll(entry.resource()) catch continue;
+                    mw.writeAll(body_after_to) catch continue;
+
+                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+                }
+            }
+        }
+    }
 }
 
 /// Handle XEP-0191 <blocklist/> get — return the user's block list.

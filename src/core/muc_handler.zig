@@ -94,9 +94,11 @@ pub fn handleMucGroupchat(
         return;
     };
 
-    // Find sender's occupant entry (occupant stores global session ID)
-    const sender_local: usize = session.conn.id;
-    const sender_idx = room.findBySessionId(sender_local) orelse {
+    // Find sender's occupant entry by full JID (globally unique, no worker awareness needed)
+    const bound = session.stream.bound_jid orelse return;
+    var sender_jid_buf: [256]u8 = undefined;
+    const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+    const sender_idx = room.findByRealJid(sender_jid) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "not-acceptable", changes);
         return;
     };
@@ -476,8 +478,10 @@ pub fn handleMucAdminIq(
     };
 
     // Verify requester is moderator+ (for kick) or admin+ (for ban)
-    const requester_local: usize = session.conn.id;
-    const requester_idx = room.findBySessionId(requester_local) orelse {
+    const req_bound = session.stream.bound_jid orelse return;
+    var req_jid_buf: [256]u8 = undefined;
+    const req_jid = buildFullJid(&req_jid_buf, req_bound.local, req_bound.domain, req_bound.resource) orelse return;
+    const requester_idx = room.findByRealJid(req_jid) orelse {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
         return;
     };
@@ -616,8 +620,7 @@ fn handleJoin(
     const r = room.?;
 
     // Check if already in room (rejoin = no-op with self-presence)
-    const local_check: usize = session.conn.id;
-    if (r.findBySessionId(local_check)) |_| {
+    if (r.findByRealJid(real_jid)) |_| {
         sendSelfPresence(server, session, r, nick, muc_host, changes);
         return;
     }
@@ -698,8 +701,10 @@ fn handlePart(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const room = reg.findByJid(room_jid) orelse return;
-    const local_sid: usize = session.conn.id;
-    const removed = room.removeBySessionId(local_sid) orelse return;
+    const part_bound = session.stream.bound_jid orelse return;
+    var part_jid_buf: [256]u8 = undefined;
+    const part_jid = buildFullJid(&part_jid_buf, part_bound.local, part_bound.domain, part_bound.resource) orelse return;
+    const removed = room.removeByRealJid(part_jid) orelse return;
 
     log.info("{s} left {s}", .{ removed.getRealJid(), room_jid });
 
@@ -713,19 +718,18 @@ fn handlePart(
 }
 
 /// Remove occupant from all rooms on session disconnect (called from server.closeSession).
-pub fn handleSessionClose(server: *Server, session_id: usize, changes: *ChangeList) void {
+pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *ChangeList) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
     if (server.delivery_system != null) reg.lock.lock();
     defer if (server.delivery_system != null) reg.lock.unlock();
 
-    // Occupants store local session IDs directly (no global mapping)
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;
         if (!room.active) continue;
 
-        const removed = room.removeBySessionId(session_id) orelse continue;
+        const removed = room.removeByRealJid(real_jid) orelse continue;
 
         broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 

@@ -123,17 +123,17 @@ pub const Room = struct {
         return null;
     }
 
-    /// Find an occupant by session ID.
-    pub fn findBySessionId(self: *const Room, session_id: usize) ?usize {
+    /// Find an occupant by full JID (user@domain/resource). Globally unique key.
+    pub fn findByRealJid(self: *const Room, real_jid: []const u8) ?usize {
         for (&self.occupants, 0..) |*slot, i| {
             if (slot.*) |*occ| {
-                if (occ.session_id == session_id) return i;
+                if (std.mem.eql(u8, occ.getRealJid(), real_jid)) return i;
             }
         }
         return null;
     }
 
-    /// Find an occupant by bare JID.
+    /// Find an occupant by bare JID (user@domain).
     pub fn findByBareJid(self: *const Room, bare_jid: []const u8) ?usize {
         for (&self.occupants, 0..) |*slot, i| {
             if (slot.*) |*occ| {
@@ -184,9 +184,9 @@ pub const Room = struct {
         return occ;
     }
 
-    /// Remove an occupant by session ID. Returns the removed occupant.
-    pub fn removeBySessionId(self: *Room, session_id: usize) ?Occupant {
-        const idx = self.findBySessionId(session_id) orelse return null;
+    /// Remove an occupant by full JID. Returns the removed occupant.
+    pub fn removeByRealJid(self: *Room, real_jid: []const u8) ?Occupant {
+        const idx = self.findByRealJid(real_jid) orelse return null;
         return self.removeOccupant(idx);
     }
 };
@@ -257,14 +257,14 @@ pub const RoomRegistry = struct {
         return false;
     }
 
-    /// Remove all occupants with the given session_id from ALL rooms.
+    /// Remove all occupants with the given full JID from ALL rooms.
     /// Returns the number of rooms the session was removed from.
-    pub fn removeOccupantBySessionId(self: *RoomRegistry, session_id: usize) usize {
+    pub fn removeOccupantByRealJid(self: *RoomRegistry, real_jid: []const u8) usize {
         var removed: usize = 0;
         for (&self.rooms) |*slot| {
             const room = slot.* orelse continue;
             if (!room.active) continue;
-            if (room.removeBySessionId(session_id)) |_| {
+            if (room.removeByRealJid(real_jid)) |_| {
                 removed += 1;
                 // If room is now empty and not persistent, destroy it
                 if (room.occupant_count == 0 and !room.config.persistent) {
@@ -356,9 +356,9 @@ test "Room: add and find occupant" {
     try std.testing.expectEqual(@as(?usize, 0), room.findByNick("alice"));
     try std.testing.expect(room.findByNick("bob") == null);
 
-    // Find by session
-    try std.testing.expectEqual(@as(?usize, 0), room.findBySessionId(5));
-    try std.testing.expect(room.findBySessionId(99) == null);
+    // Find by real JID
+    try std.testing.expectEqual(@as(?usize, 0), room.findByRealJid("alice@localhost/mobile"));
+    try std.testing.expect(room.findByRealJid("nobody@localhost/x") == null);
 }
 
 test "Room: remove occupant" {
@@ -370,7 +370,7 @@ test "Room: remove occupant" {
     _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 
-    const removed = room.removeBySessionId(5).?;
+    const removed = room.removeByRealJid("alice@localhost/mobile").?;
     try std.testing.expectEqualStrings("alice", removed.getNick());
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
     try std.testing.expect(room.findByNick("alice") == null);
@@ -387,7 +387,7 @@ test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {
     _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
     try std.testing.expectEqual(@as(usize, 1), reg.count);
 
-    const removed_count = reg.removeOccupantBySessionId(3);
+    const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
     try std.testing.expectEqual(@as(usize, 1), removed_count);
     // Transient room auto-destroyed
     try std.testing.expectEqual(@as(usize, 0), reg.count);
@@ -402,7 +402,7 @@ test "RoomRegistry: persistent room survives empty" {
     const room = try reg.createRoom("persist@conference.localhost", config);
     _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
 
-    _ = reg.removeOccupantBySessionId(3);
+    _ = reg.removeOccupantByRealJid("alice@localhost/m");
     // Persistent room stays
     try std.testing.expectEqual(@as(usize, 1), reg.count);
     try std.testing.expect(reg.findByJid("persist@conference.localhost") != null);
@@ -504,7 +504,7 @@ test "RoomRegistry: listPublicRooms filters non-public" {
     try std.testing.expectEqualStrings("Public Room", buf[0].config.getName());
 }
 
-test "RoomRegistry: removeOccupantBySessionId from multiple rooms" {
+test "RoomRegistry: removeOccupantByRealJid from multiple rooms" {
     var reg = RoomRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
@@ -517,7 +517,7 @@ test "RoomRegistry: removeOccupantBySessionId from multiple rooms" {
     _ = try room2.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .none);
 
     // Disconnect alice — removed from both rooms
-    const removed_count = reg.removeOccupantBySessionId(3);
+    const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
     try std.testing.expectEqual(@as(usize, 2), removed_count);
 
     // room2 was transient + empty → auto-destroyed
@@ -555,15 +555,15 @@ test "Room: worker_mask cleared on remove when no occupants remain on worker" {
     try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
 
     // Remove alice (worker 0) — carol still on worker 0
-    _ = room.removeBySessionId(1);
+    _ = room.removeByRealJid("alice@localhost/m");
     try std.testing.expectEqual(@as(u16, 0b0011), room.worker_mask);
 
     // Remove carol (worker 0) — no one left on worker 0
-    _ = room.removeBySessionId(3);
+    _ = room.removeByRealJid("carol@localhost/m");
     try std.testing.expectEqual(@as(u16, 0b0010), room.worker_mask);
 
     // Remove bob (worker 1) — empty
-    _ = room.removeBySessionId(2);
+    _ = room.removeByRealJid("bob@localhost/m");
     try std.testing.expectEqual(@as(u16, 0b0000), room.worker_mask);
 }
 
