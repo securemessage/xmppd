@@ -634,7 +634,7 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
 
     server.ipc.send(.{
         .password_change_request = .{
-            .conn_id = @intCast(session.conn.id),
+            .conn_id = session.ipcConnId(),
             .username = bound.local,
             .new_password = new_password,
         },
@@ -687,7 +687,7 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
 
     server.ipc.send(.{
         .register_request = .{
-            .conn_id = @intCast(session.conn.id),
+            .conn_id = session.ipcConnId(),
             .username = reg_username,
             .password = reg_password,
             .invite_code = "",
@@ -722,7 +722,7 @@ fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, ch
 
     server.ipc.send(.{
         .account_delete_request = .{
-            .conn_id = @intCast(session.conn.id),
+            .conn_id = session.ipcConnId(),
             .username = bound.local,
         },
     }) catch {

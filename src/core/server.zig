@@ -157,6 +157,9 @@ pub const Session = struct {
 
     /// Auth daemon IPC exchange state.
     auth_state: AuthState = .none,
+    /// Generation counter for IPC correlation — prevents stale auth responses
+    /// from applying to a session that reused the same slot.
+    auth_ipc_gen: u16 = 0,
     /// Stable copy of authenticated username (IPC message data is transient).
     auth_username_buf: [256]u8 = undefined,
     auth_username_len: usize = 0,
@@ -263,6 +266,14 @@ pub const Session = struct {
         self.sasl_buf_len = 0;
         self.sasl_mechanism = "";
         self.auth_state = .none;
+    }
+
+    /// Encode session slot + auth generation into IPC conn_id.
+    /// Upper 16 bits = auth_ipc_gen, lower 16 bits = conn.id.
+    /// The auth daemon echoes this back unchanged, allowing us to detect
+    /// stale responses from a previous session on a reused slot.
+    pub fn ipcConnId(self: *const Session) u32 {
+        return (@as(u32, self.auth_ipc_gen) << 16) | @as(u32, @intCast(self.conn.id));
     }
 
     fn resetStanza(self: *Session) void {
@@ -1186,10 +1197,13 @@ pub const Server = struct {
         // Extract channel binding data from TLS session
         const cb = session.conn.getChannelBinding();
 
+        // Increment generation before encoding — the response must carry this gen
+        session.auth_ipc_gen +%= 1;
+
         // Send AuthRequest to auth daemon
         self.ipc.send(.{
             .auth_request = .{
-                .conn_id = @intCast(session.conn.id),
+                .conn_id = session.ipcConnId(),
                 .mechanism = mech_id,
                 .client_ip = session.conn.peerAddr(),
                 .cb_type = cb.cb_type,
@@ -1234,7 +1248,7 @@ pub const Server = struct {
 
         // Send SaslResponse to auth daemon
         self.ipc.send(.{ .sasl_response = .{
-            .conn_id = @intCast(session.conn.id),
+            .conn_id = session.ipcConnId(),
             .payload = decoded,
         } }) catch {
             log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
@@ -1312,7 +1326,7 @@ pub const Server = struct {
             else => {},
         }
 
-        const conn_id: usize = switch (msg) {
+        const raw_id: u32 = switch (msg) {
             .auth_challenge => |m| m.conn_id,
             .auth_success => |m| m.conn_id,
             .auth_failure => |m| m.conn_id,
@@ -1322,10 +1336,20 @@ pub const Server = struct {
             else => return,
         };
 
+        // conn_id encodes generation in upper 16 bits, slot index in lower 16
+        const expected_gen: u16 = @truncate(raw_id >> 16);
+        const conn_id: usize = @intCast(raw_id & 0xFFFF);
+
         const session = self.sessions[conn_id] orelse {
             log.warn("auth response for unknown connection {d}", .{conn_id});
             return;
         };
+
+        // Reject stale responses from a previous session that reused this slot
+        if (session.auth_ipc_gen != expected_gen) {
+            log.warn("auth response for connection {d} has stale generation (got {d}, expected {d})", .{ conn_id, expected_gen, session.auth_ipc_gen });
+            return;
+        }
 
         switch (msg) {
             .auth_challenge => |m| {
