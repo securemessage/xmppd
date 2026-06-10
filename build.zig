@@ -317,6 +317,13 @@ pub fn build(b: *std.Build) void {
     });
     server_block_store_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("block_store", server_block_store_mod);
+    const server_pep_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/pep_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_pep_store_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("pep_store", server_pep_store_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -715,6 +722,22 @@ pub fn build(b: *std.Build) void {
 
     const run_generic_offline_store_tests = b.addRunArtifact(generic_offline_store_tests);
 
+    // --- PEP store tests ---
+
+    const pep_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/pep_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pep_store_test_mod.addImport("backend", backend_test_mod);
+
+    const pep_store_tests = b.addTest(.{
+        .name = "pep-store-tests",
+        .root_module = pep_store_test_mod,
+    });
+
+    const run_pep_store_tests = b.addRunArtifact(pep_store_tests);
+
     // --- Block store tests ---
 
     const block_store_test_mod = b.createModule(.{
@@ -936,6 +959,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("room_store", server_room_store_mod);
     core_mod.addImport("room_registry", server_room_registry_mod);
     core_mod.addImport("block_store", server_block_store_mod);
+    core_mod.addImport("pep_store", server_pep_store_mod);
     core_mod.addImport("config", config_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
@@ -1282,6 +1306,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);
     test_step.dependOn(&run_invite_store_tests.step);
+    test_step.dependOn(&run_pep_store_tests.step);
     test_step.dependOn(&run_block_store_tests.step);
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);

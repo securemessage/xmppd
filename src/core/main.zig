@@ -42,6 +42,8 @@ const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const RoomConfig = room_store_mod.RoomConfig;
 const block_store_mod = @import("block_store");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
+const pep_store_mod = @import("pep_store");
+const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
@@ -229,6 +231,7 @@ pub fn main() !void {
     var vcard_store: ?GenericVCardStore = null;
     var rs: ?GenericRoomStore = null;
     var block_store_val: ?GenericBlockStore = null;
+    var pep_store_val: ?GenericPepStore = null;
     if (db_path) |db| {
         var op_path_buf: [1024]u8 = undefined;
         const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
@@ -244,6 +247,7 @@ pub fn main() !void {
         vcard_store = GenericVCardStore.init(&op_backend.?);
         rs = GenericRoomStore.init(&op_backend.?, allocator);
         block_store_val = GenericBlockStore.init(&op_backend.?);
+        pep_store_val = GenericPepStore.init(&op_backend.?);
     }
     defer if (op_backend) |*b| b.close();
 
@@ -321,6 +325,7 @@ pub fn main() !void {
         .room_registry = if (room_registry != null) &room_registry.? else null,
         .room_store = if (rs != null) &rs.? else null,
         .block_store = if (block_store_val != null) &block_store_val.? else null,
+        .pep_store = if (pep_store_val != null) &pep_store_val.? else null,
         .muc_host = effective_muc_host,
         .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
@@ -419,6 +424,7 @@ const WorkerCtx = struct {
     room_registry: ?*RoomRegistry,
     room_store: ?*GenericRoomStore,
     block_store: ?*GenericBlockStore,
+    pep_store: ?*GenericPepStore,
     muc_host: ?[]const u8,
     session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
@@ -469,6 +475,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     }
 
     if (ctx.block_store) |bs| server.configureBlockStore(bs);
+    if (ctx.pep_store) |ps| server.configurePepStore(ps);
 
     if (ctx.room_registry) |reg| {
         server.room_registry = reg;

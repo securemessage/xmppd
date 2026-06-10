@@ -33,6 +33,8 @@ pub const ns = struct {
     pub const db = "urn:xmpp:features:dialback";
     pub const register = "jabber:iq:register";
     pub const blocking = "urn:xmpp:blocking";
+    pub const pubsub = "http://jabber.org/protocol/pubsub";
+    pub const pubsub_event = "http://jabber.org/protocol/pubsub#event";
 };
 
 /// An XML element with its attributes and namespace context.

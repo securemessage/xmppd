@@ -73,6 +73,8 @@ const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 const block_store_mod = @import("block_store");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
+const pep_store_mod = @import("pep_store");
+const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd);
 
@@ -322,6 +324,9 @@ pub const Server = struct {
     /// Block store — per-user block lists (XEP-0191).
     block_store: ?*GenericBlockStore = null,
 
+    /// PEP store — per-user PubSub nodes (XEP-0163).
+    pep_store: ?*GenericPepStore = null,
+
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
 
@@ -462,6 +467,12 @@ pub const Server = struct {
     pub fn configureBlockStore(self: *Server, bs: *GenericBlockStore) void {
         self.block_store = bs;
         log.info("block store configured", .{});
+    }
+
+    /// Configure the PEP store (XEP-0163: Personal Eventing Protocol).
+    pub fn configurePepStore(self: *Server, ps: *GenericPepStore) void {
+        self.pep_store = ps;
+        log.info("PEP store configured", .{});
     }
 
     /// Configure TLS with a certificate and key file.
