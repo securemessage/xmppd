@@ -9,9 +9,11 @@
 
 const std = @import("std");
 const room_store = @import("room_store");
+const room_mailbox_mod = @import("room_mailbox");
 const RoomConfig = room_store.RoomConfig;
 const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
+pub const RoomMailbox = room_mailbox_mod.RoomMailbox;
 
 const log = std.log.scoped(.muc);
 
@@ -106,6 +108,9 @@ pub const Room = struct {
     /// Bitmask of workers that have ≥1 occupant. Bit N set = worker N has occupants.
     /// Used for O(workers) multicast instead of O(occupants) cross-thread delivery.
     worker_mask: u16 = 0,
+    /// Per-room actor message mailbox. Cross-thread messages from MPSC are pushed
+    /// here; owning worker round-robins across rooms for fair scheduling.
+    mailbox: RoomMailbox = .{},
 
     pub fn getJid(self: *const Room) []const u8 {
         return self.jid_buf[0..self.jid_len];
@@ -205,6 +210,26 @@ pub const Room = struct {
     }
 };
 
+/// Maximum entries in the room directory (for disco#items across all workers).
+pub const MAX_DIRECTORY_ENTRIES = 256;
+
+/// An entry in the room directory (local projection of all public rooms across all workers).
+pub const DirectoryEntry = struct {
+    jid_buf: [256]u8 = [_]u8{0} ** 256,
+    jid_len: u16 = 0,
+    name_buf: [128]u8 = [_]u8{0} ** 128,
+    name_len: u8 = 0,
+    active: bool = false,
+
+    pub fn getJid(self: *const DirectoryEntry) []const u8 {
+        return self.jid_buf[0..self.jid_len];
+    }
+
+    pub fn getName(self: *const DirectoryEntry) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
 /// Registry of all active MUC rooms.
 /// Rooms are heap-allocated (each Room is ~10KB due to occupant slots).
 ///
@@ -215,6 +240,11 @@ pub const RoomRegistry = struct {
     rooms: [MAX_ROOMS]?*Room = [_]?*Room{null} ** MAX_ROOMS,
     count: usize = 0,
     allocator: std.mem.Allocator,
+    /// Room directory — local projection of all public rooms across ALL workers.
+    /// Updated via room_directory_update broadcasts. Used by disco#items to return
+    /// a complete room list without scatter-gather.
+    directory: [MAX_DIRECTORY_ENTRIES]DirectoryEntry = [_]DirectoryEntry{.{}} ** MAX_DIRECTORY_ENTRIES,
+    directory_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) RoomRegistry {
         return .{ .allocator = allocator };
@@ -302,6 +332,57 @@ pub const RoomRegistry = struct {
                     buf[count] = room;
                     count += 1;
                 }
+            }
+        }
+        return count;
+    }
+
+    /// Update the room directory (local projection of all public rooms).
+    /// Called when a room_directory_update broadcast arrives from another worker.
+    pub fn updateDirectory(self: *RoomRegistry, jid: []const u8, name: []const u8, active: bool) void {
+        // Look for existing entry with this JID
+        for (&self.directory) |*entry| {
+            if (entry.active and std.mem.eql(u8, entry.getJid(), jid)) {
+                if (active) {
+                    // Update name
+                    const nlen: u8 = @intCast(@min(name.len, entry.name_buf.len));
+                    @memcpy(entry.name_buf[0..nlen], name[0..nlen]);
+                    entry.name_len = nlen;
+                } else {
+                    // Remove
+                    entry.active = false;
+                    self.directory_count -= 1;
+                }
+                return;
+            }
+        }
+
+        if (!active) return; // Nothing to remove
+
+        // Add new entry in first empty slot
+        for (&self.directory) |*entry| {
+            if (!entry.active) {
+                const jlen: u16 = @intCast(@min(jid.len, entry.jid_buf.len));
+                @memcpy(entry.jid_buf[0..jlen], jid[0..jlen]);
+                entry.jid_len = jlen;
+                const nlen: u8 = @intCast(@min(name.len, entry.name_buf.len));
+                @memcpy(entry.name_buf[0..nlen], name[0..nlen]);
+                entry.name_len = nlen;
+                entry.active = true;
+                self.directory_count += 1;
+                return;
+            }
+        }
+    }
+
+    /// List all active directory entries (for disco#items across all workers).
+    pub fn listDirectory(self: *RoomRegistry, buf: []DirectoryEntry) usize {
+        var count: usize = 0;
+        for (&self.directory) |*entry| {
+            if (count >= buf.len) break;
+            if (entry.active) {
+                buf[count] = entry.*;
+                count += 1;
             }
         }
         return count;

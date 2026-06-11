@@ -307,8 +307,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const server_room_mailbox_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_room_mailbox_mod.addImport("delivery_queue", delivery_queue_mod);
     server_room_registry_mod.addImport("room_store", server_room_store_mod);
+    server_room_registry_mod.addImport("room_mailbox", server_room_mailbox_mod);
     server_test_mod.addImport("room_store", server_room_store_mod);
+    server_test_mod.addImport("room_mailbox", server_room_mailbox_mod);
     server_test_mod.addImport("room_registry", server_room_registry_mod);
     const server_block_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/block_store.zig"),
@@ -770,6 +778,22 @@ pub fn build(b: *std.Build) void {
 
     const run_room_store_tests = b.addRunArtifact(room_store_tests);
 
+    // --- Room mailbox tests ---
+
+    const room_mailbox_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    room_mailbox_test_mod.addImport("delivery_queue", delivery_queue_test_mod);
+
+    const room_mailbox_tests = b.addTest(.{
+        .name = "room-mailbox-tests",
+        .root_module = room_mailbox_test_mod,
+    });
+
+    const run_room_mailbox_tests = b.addRunArtifact(room_mailbox_tests);
+
     // --- Room registry tests ---
 
     const room_registry_test_mod = b.createModule(.{
@@ -778,6 +802,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     room_registry_test_mod.addImport("room_store", room_store_test_mod);
+    room_registry_test_mod.addImport("room_mailbox", room_mailbox_test_mod);
 
     const room_registry_tests = b.addTest(.{
         .name = "room-registry-tests",
@@ -973,6 +998,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("vcard_store", server_vcard_store_mod);
     core_mod.addImport("room_store", server_room_store_mod);
     core_mod.addImport("room_registry", server_room_registry_mod);
+    core_mod.addImport("room_mailbox", server_room_mailbox_mod);
     core_mod.addImport("block_store", server_block_store_mod);
     core_mod.addImport("pep_store", server_pep_store_mod);
     core_mod.addImport("config", config_mod);
@@ -1327,6 +1353,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);
     test_step.dependOn(&run_message_tests.step);
+    test_step.dependOn(&run_room_mailbox_tests.step);
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);

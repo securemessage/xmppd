@@ -106,6 +106,36 @@ pub const PepEvent = struct {
     node: []const u8,
 };
 
+/// MUC admin action (kick/ban/voice) routed to owning worker.
+pub const AdminAction = struct {
+    room_jid: []const u8,
+    actor_jid: []const u8,
+    target_nick: []const u8,
+    new_role: []const u8,
+    iq_id: []const u8,
+    reply_to_worker: u16,
+    reply_to_session: u32,
+};
+
+/// Room directory update broadcast (create/destroy) to all workers.
+pub const RoomDirectoryUpdate = struct {
+    room_jid: []const u8,
+    room_name: []const u8,
+    active: bool,
+};
+
+/// MUC MAM query routed to owning worker (T112).
+pub const MamQuery = struct {
+    room_jid: []const u8,
+    query_id: []const u8,
+    start: []const u8,
+    end_field: []const u8,
+    with: []const u8,
+    reply_to_worker: u16,
+    reply_to_session: u32,
+    reply_to_jid: []const u8,
+};
+
 /// Archive confirmation.
 pub const ArchiveEvent = struct {
     bare_jid: []const u8,
@@ -136,6 +166,12 @@ pub const Tag = enum(u8) {
     /// Shadow room update: owning worker → occupant's worker.
     /// Tells the remote worker to remove a local occupant from its shadow room.
     shadow_part = 0x16,
+    /// Admin action (kick/ban/voice) routed to room's owning worker.
+    room_admin = 0x17,
+    /// Room directory update broadcast to all workers.
+    room_directory_update = 0x18,
+    /// MUC MAM query routed to room's owning worker.
+    room_mam_query = 0x19,
     pep_published = 0x20,
     stanza_archived = 0x30,
 };
@@ -154,6 +190,9 @@ pub const Message = union(Tag) {
     room_disco_items: DiscoRequest,
     shadow_join: RoomEvent,
     shadow_part: RoomEvent,
+    room_admin: AdminAction,
+    room_directory_update: RoomDirectoryUpdate,
+    room_mam_query: MamQuery,
     pep_published: PepEvent,
     stanza_archived: ArchiveEvent,
 
@@ -215,6 +254,30 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.id) catch return null;
             writeStr(w, ev.inner_xml) catch return null;
             w.writeByte(@intFromEnum(ev.kind)) catch return null;
+        },
+        .room_admin => |ev| {
+            writeStr(w, ev.room_jid) catch return null;
+            writeStr(w, ev.actor_jid) catch return null;
+            writeStr(w, ev.target_nick) catch return null;
+            writeStr(w, ev.new_role) catch return null;
+            writeStr(w, ev.iq_id) catch return null;
+            writeU16(w, ev.reply_to_worker) catch return null;
+            writeU32(w, ev.reply_to_session) catch return null;
+        },
+        .room_directory_update => |ev| {
+            writeStr(w, ev.room_jid) catch return null;
+            writeStr(w, ev.room_name) catch return null;
+            w.writeByte(if (ev.active) 1 else 0) catch return null;
+        },
+        .room_mam_query => |ev| {
+            writeStr(w, ev.room_jid) catch return null;
+            writeStr(w, ev.query_id) catch return null;
+            writeStr(w, ev.start) catch return null;
+            writeStr(w, ev.end_field) catch return null;
+            writeStr(w, ev.with) catch return null;
+            writeU16(w, ev.reply_to_worker) catch return null;
+            writeU32(w, ev.reply_to_session) catch return null;
+            writeStr(w, ev.reply_to_jid) catch return null;
         },
         .pep_published => |ev| {
             writeStr(w, ev.publisher_local) catch return null;
@@ -349,6 +412,54 @@ pub fn decode(data: []const u8) ?Message {
                 .message_routed => .{ .message_routed = ev },
                 else => unreachable,
             };
+        },
+        .room_admin => {
+            const room_jid = readStr(data, &fbs) orelse return null;
+            const actor_jid = readStr(data, &fbs) orelse return null;
+            const target_nick = readStr(data, &fbs) orelse return null;
+            const new_role = readStr(data, &fbs) orelse return null;
+            const iq_id = readStr(data, &fbs) orelse return null;
+            const reply_to_worker = readU16(r) orelse return null;
+            const reply_to_session = readU32(r) orelse return null;
+            return .{ .room_admin = .{
+                .room_jid = room_jid,
+                .actor_jid = actor_jid,
+                .target_nick = target_nick,
+                .new_role = new_role,
+                .iq_id = iq_id,
+                .reply_to_worker = reply_to_worker,
+                .reply_to_session = reply_to_session,
+            } };
+        },
+        .room_directory_update => {
+            const room_jid = readStr(data, &fbs) orelse return null;
+            const room_name = readStr(data, &fbs) orelse return null;
+            const active_byte = r.readByte() catch return null;
+            return .{ .room_directory_update = .{
+                .room_jid = room_jid,
+                .room_name = room_name,
+                .active = active_byte != 0,
+            } };
+        },
+        .room_mam_query => {
+            const room_jid = readStr(data, &fbs) orelse return null;
+            const query_id = readStr(data, &fbs) orelse return null;
+            const start = readStr(data, &fbs) orelse return null;
+            const end_field = readStr(data, &fbs) orelse return null;
+            const with = readStr(data, &fbs) orelse return null;
+            const reply_to_worker = readU16(r) orelse return null;
+            const reply_to_session = readU32(r) orelse return null;
+            const reply_to_jid = readStr(data, &fbs) orelse return null;
+            return .{ .room_mam_query = .{
+                .room_jid = room_jid,
+                .query_id = query_id,
+                .start = start,
+                .end_field = end_field,
+                .with = with,
+                .reply_to_worker = reply_to_worker,
+                .reply_to_session = reply_to_session,
+                .reply_to_jid = reply_to_jid,
+            } };
         },
         .pep_published => {
             const publisher_local = readStr(data, &fbs) orelse return null;
@@ -742,4 +853,83 @@ test "encode/decode: shadow_part round-trip" {
     const decoded = decode(buf[0..len]).?;
 
     try std.testing.expectEqual(Tag.shadow_part, std.meta.activeTag(decoded));
+}
+
+test "encode/decode: room_admin round-trip" {
+    const msg = Message{ .room_admin = .{
+        .room_jid = "dev@conference.example.com",
+        .actor_jid = "alice@example.com/Mobile",
+        .target_nick = "bob",
+        .new_role = "none",
+        .iq_id = "admin-1",
+        .reply_to_worker = 0,
+        .reply_to_session = 5,
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .room_admin => |ev| {
+            try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.actor_jid);
+            try std.testing.expectEqualStrings("bob", ev.target_nick);
+            try std.testing.expectEqualStrings("none", ev.new_role);
+            try std.testing.expectEqualStrings("admin-1", ev.iq_id);
+            try std.testing.expectEqual(@as(u16, 0), ev.reply_to_worker);
+            try std.testing.expectEqual(@as(u32, 5), ev.reply_to_session);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: room_directory_update round-trip" {
+    const msg = Message{ .room_directory_update = .{
+        .room_jid = "dev@conference.example.com",
+        .room_name = "Dev Room",
+        .active = true,
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .room_directory_update => |ev| {
+            try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("Dev Room", ev.room_name);
+            try std.testing.expect(ev.active);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: room_mam_query round-trip" {
+    const msg = Message{ .room_mam_query = .{
+        .room_jid = "dev@conference.example.com",
+        .query_id = "mam-q1",
+        .start = "2026-06-01T00:00:00Z",
+        .end_field = "",
+        .with = "",
+        .reply_to_worker = 1,
+        .reply_to_session = 42,
+        .reply_to_jid = "alice@example.com/Mobile",
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .room_mam_query => |ev| {
+            try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("mam-q1", ev.query_id);
+            try std.testing.expectEqualStrings("2026-06-01T00:00:00Z", ev.start);
+            try std.testing.expectEqual(@as(u16, 1), ev.reply_to_worker);
+            try std.testing.expectEqual(@as(u32, 42), ev.reply_to_session);
+            try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.reply_to_jid);
+        },
+        else => return error.WrongTag,
+    }
 }

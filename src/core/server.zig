@@ -634,6 +634,7 @@ pub const Server = struct {
                 ds.getState(self.worker_id).setIdle();
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     self.drainDeliveryQueue(&changes);
+                    self.drainRoomMailboxes(&changes);
                     // If still pending after drain (producer reserved slot via CAS but
                     // hasn't stored ready=true yet), self-wake to retry on next iteration.
                     if (ds.getQueue(self.worker_id).hasPending()) {
@@ -2118,11 +2119,13 @@ pub const Server = struct {
     // Cross-thread delivery (MPSC queue consumer)
     // ========================================================================
 
-    /// Handle EVFILT_READ on the wake pipe — drain pipe bytes, then drain the MPSC queue.
+    /// Handle EVFILT_READ on the wake pipe — drain pipe bytes, then drain the MPSC queue,
+    /// then drain per-room mailboxes.
     fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
         const ds = self.delivery_system orelse return;
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
+        self.drainRoomMailboxes(changes);
     }
 
     /// Drain all pending deliveries from this worker's MPSC queue.
@@ -2191,14 +2194,91 @@ pub const Server = struct {
     }
 
     /// Handle a room actor message from the MPSC queue.
-    /// Decodes the message.zig payload and dispatches to the appropriate
-    /// muc_handler function for processing on this worker's local room shard.
+    /// Room-targeted messages (join, part, groupchat, disco) are pushed into the
+    /// target room's per-room mailbox for fair scheduling. Non-room messages
+    /// (shadow updates, session close) are dispatched immediately.
     fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
         const msg = actor_message.decode(payload) orelse {
             log.warn("malformed room actor message ({d} bytes)", .{payload.len});
             return;
         };
 
+        switch (msg) {
+            .room_join, .room_part, .room_message, .room_disco_info, .room_disco_items, .room_admin, .room_mam_query => {
+                // Extract room_jid to find target room's mailbox
+                const room_jid = switch (msg) {
+                    .room_join, .room_part => |ev| ev.room_jid,
+                    .room_message => |ev| ev.room_jid,
+                    .room_disco_info, .room_disco_items => |ev| ev.room_jid,
+                    .room_admin => |ev| ev.room_jid,
+                    .room_mam_query => |ev| ev.room_jid,
+                    else => unreachable,
+                };
+                const reg = self.room_registry orelse return;
+                // Find or create room (join may be for a new room)
+                var room = reg.findByJid(room_jid);
+                if (room == null and std.meta.activeTag(msg) == .room_join) {
+                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
+                }
+                const r = room orelse {
+                    log.debug("room actor msg for unknown room: {s}", .{room_jid});
+                    return;
+                };
+                r.mailbox.enqueue(payload) catch {
+                    log.warn("room mailbox full for {s}, dropping message", .{room_jid});
+                };
+            },
+            .room_directory_update => |ev| {
+                muc_handler.handleRoomDirectoryUpdate(self, ev);
+            },
+            .shadow_join => |ev| {
+                muc_handler.handleShadowJoin(self, ev);
+            },
+            .shadow_part => |ev| {
+                muc_handler.handleShadowPart(self, ev);
+            },
+            .session_closed => |ev| {
+                var jid_buf: [256]u8 = undefined;
+                var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+                const jw = jid_fbs.writer();
+                jw.writeAll(ev.local) catch return;
+                jw.writeByte('@') catch return;
+                jw.writeAll(ev.domain) catch return;
+                if (ev.resource.len > 0) {
+                    jw.writeByte('/') catch return;
+                    jw.writeAll(ev.resource) catch return;
+                }
+                muc_handler.handleSessionClose(self, jid_fbs.getWritten(), changes);
+            },
+            else => {
+                log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
+            },
+        }
+    }
+
+    /// Drain per-room mailboxes with round-robin fair scheduling.
+    /// Called after drainDeliveryQueue in the event loop. Processes one message
+    /// per room per iteration to prevent any single room from monopolizing the worker.
+    fn drainRoomMailboxes(self: *Server, changes: *ChangeList) void {
+        const reg = self.room_registry orelse return;
+        var any_pending = true;
+        // Round-robin: keep iterating until no room has pending messages
+        while (any_pending) {
+            any_pending = false;
+            for (&reg.rooms) |*slot| {
+                const room = slot.* orelse continue;
+                if (!room.active) continue;
+                if (!room.mailbox.hasPending()) continue;
+                any_pending = true;
+                const payload = room.mailbox.dequeue() orelse continue;
+                self.processRoomMailboxMessage(room, payload, changes);
+            }
+        }
+    }
+
+    /// Process a single message from a room's mailbox.
+    fn processRoomMailboxMessage(self: *Server, room: *room_registry_mod.Room, payload: []const u8, changes: *ChangeList) void {
+        const msg = actor_message.decode(payload) orelse return;
         switch (msg) {
             .room_join => |ev| {
                 muc_handler.processRemoteJoin(self, ev, changes);
@@ -2215,30 +2295,15 @@ pub const Server = struct {
             .room_disco_items => |ev| {
                 muc_handler.processRemoteDiscoItems(self, ev, changes);
             },
-            .shadow_join => |ev| {
-                // Owning worker tells us to add a local occupant to our shadow room
-                muc_handler.handleShadowJoin(self, ev);
+            .room_admin => |ev| {
+                muc_handler.processRemoteAdminAction(self, ev, changes);
             },
-            .shadow_part => |ev| {
-                // Owning worker tells us to remove a local occupant from our shadow room
-                muc_handler.handleShadowPart(self, ev);
-            },
-            .session_closed => |ev| {
-                // Session closed on another worker — remove from local rooms
-                var jid_buf: [256]u8 = undefined;
-                var jid_fbs = std.io.fixedBufferStream(&jid_buf);
-                const jw = jid_fbs.writer();
-                jw.writeAll(ev.local) catch return;
-                jw.writeByte('@') catch return;
-                jw.writeAll(ev.domain) catch return;
-                if (ev.resource.len > 0) {
-                    jw.writeByte('/') catch return;
-                    jw.writeAll(ev.resource) catch return;
-                }
-                muc_handler.handleSessionClose(self, jid_fbs.getWritten(), changes);
+            .room_mam_query => |ev| {
+                muc_handler.processRemoteMamQuery(self, ev, changes);
             },
             else => {
-                log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
+                _ = room;
+                log.warn("unexpected message in room mailbox: 0x{x:0>2}", .{msg.tag()});
             },
         }
     }

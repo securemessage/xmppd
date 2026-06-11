@@ -19,6 +19,8 @@ const std = @import("std");
 const xml = @import("xml");
 const mam_handler = @import("mam_handler");
 const muc_handler = @import("muc_handler.zig");
+const room_registry_mod = @import("room_registry");
+const actor_message = @import("message.zig");
 
 const log = std.log.scoped(.xmppd);
 
@@ -821,10 +823,6 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
 /// The archive owner is the room JID (room@conference.host).
 fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8, muc_host: []const u8, iq_id: []const u8, changes: *ChangeList) void {
     _ = changes;
-    const archive = server.archive orelse {
-        sendIqError(server, session, iq_id, "item-not-found");
-        return;
-    };
 
     // Build the room bare JID as archive owner
     var room_buf: [320]u8 = undefined;
@@ -833,6 +831,40 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     room_fbs.writer().writeByte('@') catch return;
     room_fbs.writer().writeAll(muc_host) catch return;
     const room_jid = room_fbs.getWritten();
+
+    // Ownership routing (T112): MAM archives live on the owning worker
+    const owner = room_registry_mod.roomOwner(room_jid, server.getWorkerCount());
+    if (owner != server.worker_id) {
+        // Route to owning worker — they have the archive data
+        const bound = session.stream.bound_jid orelse return;
+        var jid_buf: [256]u8 = undefined;
+        var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+        const jw = jid_fbs.writer();
+        jw.writeAll(bound.local) catch return;
+        jw.writeByte('@') catch return;
+        jw.writeAll(bound.domain) catch return;
+        if (bound.resource.len > 0) {
+            jw.writeByte('/') catch return;
+            jw.writeAll(bound.resource) catch return;
+        }
+
+        server.enqueueRoomActorMessage(owner, .{ .room_mam_query = .{
+            .room_jid = room_jid,
+            .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
+            .start = session.mam_start,
+            .end_field = session.mam_end,
+            .with = session.mam_with,
+            .reply_to_worker = server.worker_id,
+            .reply_to_session = @intCast(session.conn.id),
+            .reply_to_jid = jid_fbs.getWritten(),
+        } });
+        return;
+    }
+
+    const archive = server.archive orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
 
     // Parse max from text (default 50)
     const max: u32 = if (session.mam_max.len > 0)
