@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>xmppd — Carrier-Grade XMPP Server</title>
+    <meta name="description" content="A carrier-grade XMPP server written in Zig. Multi-process architecture, DANE-first federation, thread-per-core scaling. Free and open source under BSD-2-Clause.">
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --surface: #12121a;
+            --border: #1e1e2e;
+            --text: #d4d4dc;
+            --text-muted: #8888a0;
+            --accent: #5b8def;
+            --accent-dim: #3a5a9e;
+            --white: #eeeef2;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 0 24px;
+            width: 100%;
+        }
+
+        header {
+            padding: 80px 0 40px;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 2.8rem;
+            font-weight: 300;
+            color: var(--white);
+            letter-spacing: -0.02em;
+            margin-bottom: 8px;
+        }
+
+        h1 span {
+            font-weight: 600;
+        }
+
+        .tagline {
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            margin-bottom: 40px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            font-size: 0.8rem;
+            color: var(--accent);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        main {
+            flex: 1;
+            padding: 40px 0;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 32px;
+            margin-bottom: 24px;
+        }
+
+        .card h2 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--white);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 16px;
+        }
+
+        .card p {
+            color: var(--text);
+            margin-bottom: 12px;
+        }
+
+        .card p:last-child {
+            margin-bottom: 0;
+        }
+
+        .features {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 16px;
+        }
+
+        .feature {
+            padding: 16px;
+            background: var(--bg);
+            border-radius: 6px;
+        }
+
+        .feature strong {
+            display: block;
+            color: var(--white);
+            font-size: 0.85rem;
+            margin-bottom: 4px;
+        }
+
+        .feature span {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .links {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 16px;
+        }
+
+        .links a {
+            display: inline-block;
+            padding: 8px 20px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: border-color 0.2s, background 0.2s;
+        }
+
+        .links a:hover {
+            border-color: var(--accent-dim);
+            background: rgba(91, 141, 239, 0.06);
+        }
+
+        .notice {
+            text-align: center;
+            padding: 24px;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border);
+            margin-top: 20px;
+        }
+
+        footer {
+            text-align: center;
+            padding: 32px 0;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        footer a {
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            color: var(--accent);
+        }
+
+        @media (max-width: 600px) {
+            header { padding: 48px 0 24px; }
+            h1 { font-size: 2rem; }
+            .features { grid-template-columns: 1fr; }
+            .links { flex-direction: column; }
+            .links a { text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1><span>xmppd</span></h1>
+            <p class="tagline">Carrier-grade XMPP server in Zig</p>
+            <span class="badge">BSD-2-Clause &middot; Free &amp; Open Source</span>
+        </div>
+    </header>
+
+    <main>
+        <div class="container">
+            <div class="card">
+                <h2>About</h2>
+                <p>xmppd is a from-scratch XMPP server written in Zig, inspired by Postfix's multi-process architecture. It targets FreeBSD first with kqueue-based async I/O, DANE-first federation, and thread-per-core scaling.</p>
+                <p>Built for operators who want a fast, auditable, and dependency-minimal messaging server that they fully control.</p>
+            </div>
+
+            <div class="card">
+                <h2>Architecture</h2>
+                <div class="features">
+                    <div class="feature">
+                        <strong>Multi-Process</strong>
+                        <span>Separate daemons for core, auth, S2S federation. Fault-isolated, privilege-separated.</span>
+                    </div>
+                    <div class="feature">
+                        <strong>Thread-Per-Core</strong>
+                        <span>SO_REUSEPORT_LB load balancing with per-worker kqueue event loops and MPSC delivery.</span>
+                    </div>
+                    <div class="feature">
+                        <strong>DANE-First</strong>
+                        <span>DNS-based authentication is the primary S2S trust path. PKIX/CA is the fallback, not the default.</span>
+                    </div>
+                    <div class="feature">
+                        <strong>Zero Runtime Deps</strong>
+                        <span>Static Zig binaries. Only OpenSSL and your chosen storage backend at runtime.</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Source Code</h2>
+                <p>xmppd is 100% free and open source under the BSD-2-Clause license.</p>
+                <div class="links">
+                    <a href="https://github.com/securemessage/xmppd">GitHub</a>
+                    <a href="https://codeberg.org/securemessage/xmppd">Codeberg</a>
+                    <a href="https://pacyworld.dev/securemessage/xmppd">Pacyworld</a>
+                </div>
+            </div>
+
+            <div class="notice">
+                Full documentation, architecture guides, and developer resources are coming soon.<br>
+                xmppd is currently in active development (v0.5.0).
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <div class="container">
+            &copy; Daniel Morante &middot; A <a href="https://www.securemessage.cc">SecureMessage</a> project
+        </div>
+    </footer>
+</body>
+</html>
