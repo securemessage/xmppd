@@ -66,6 +66,7 @@ const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
+const router = @import("router.zig");
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
@@ -89,7 +90,7 @@ const LISTENER_UDATA = std.math.maxInt(usize);
 pub const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
 
 /// Sentinel value for S2S IPC fd in kqueue udata.
-const IPC_S2S_UDATA = LISTENER_UDATA - 2;
+pub const IPC_S2S_UDATA = LISTENER_UDATA - 2;
 
 /// Sentinel value for delivery system wake pipe fd in kqueue udata.
 const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
@@ -128,7 +129,7 @@ const SaslCollecting = enum {
 };
 
 /// Which type of stanza is currently being accumulated for forwarding.
-const StanzaKind = enum {
+pub const StanzaKind = enum {
     none,
     message,
     presence,
@@ -282,7 +283,7 @@ pub const Session = struct {
         return (@as(u32, self.auth_ipc_gen) << 16) | @as(u32, @intCast(self.conn.id));
     }
 
-    fn resetStanza(self: *Session) void {
+    pub fn resetStanza(self: *Session) void {
         self.stanza_kind = .none;
         self.stanza_buf_len = 0;
         self.stanza_to = "";
@@ -1557,80 +1558,6 @@ pub const Server = struct {
     // S2S IPC — federation stanza forwarding
     // ========================================================================
 
-    /// Forward a stanza to a remote domain via the S2S daemon IPC.
-    /// Serializes the full stanza XML and sends an S2sDeliver message.
-    fn forwardToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, type_str: []const u8, id_str: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
-        if (!self.s2s_ipc.connected) {
-            log.info("connection {d} stanza to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
-            self.sendServiceUnavailable(session, id_str, to_str, from_str);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
-            return;
-        }
-
-        const tag_name: []const u8 = switch (session.stanza_kind) {
-            .message => "message",
-            .presence => "presence",
-            .none => return,
-        };
-
-        // Serialize the full stanza XML into a buffer
-        var stanza_buf: [20480]u8 = undefined;
-        var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
-        const sw = stanza_fbs.writer();
-
-        sw.writeByte('<') catch return;
-        sw.writeAll(tag_name) catch return;
-        sw.writeAll(" from='") catch return;
-        sw.writeAll(from_str) catch return;
-        sw.writeAll("' to='") catch return;
-        sw.writeAll(to_str) catch return;
-        sw.writeByte('\'') catch return;
-        if (type_str.len > 0) {
-            if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-                sw.writeAll(" type='") catch return;
-                sw.writeAll(type_str) catch return;
-                sw.writeByte('\'') catch return;
-            }
-        }
-        if (id_str.len > 0) {
-            sw.writeAll(" id='") catch return;
-            sw.writeAll(id_str) catch return;
-            sw.writeByte('\'') catch return;
-        }
-        if (inner_xml.len == 0) {
-            sw.writeAll("/>") catch return;
-        } else {
-            sw.writeByte('>') catch return;
-            sw.writeAll(inner_xml) catch return;
-            sw.writeAll("</") catch return;
-            sw.writeAll(tag_name) catch return;
-            sw.writeByte('>') catch return;
-        }
-
-        const stanza_xml = stanza_fbs.getWritten();
-
-        self.s2s_ipc.send(.{ .s2s_deliver = .{
-            .from_jid = from_str,
-            .to_jid = to_str,
-            .stanza_xml = stanza_xml,
-        } }) catch {
-            log.err("connection {d} failed to forward stanza to S2S daemon", .{session.conn.id});
-            self.sendServiceUnavailable(session, id_str, to_str, from_str);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
-            return;
-        };
-
-        if (self.s2s_ipc.hasPendingSend()) {
-            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-        }
-
-        log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
-    }
-
     /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
     /// Used by subscription/presence handlers where the stanza XML is already built.
     pub fn forwardPresenceXmlToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
@@ -2038,342 +1965,14 @@ pub const Server = struct {
         session.pep_payload.append(a, '>') catch return;
     }
 
-    /// Route a fully accumulated stanza to target session(s).
-    /// Reconstructs the opening tag with the sender's full JID as 'from',
-    /// appends the accumulated child XML, and closes the stanza.
     fn dispatchStanza(self: *Server, session: *Session, changes: *ChangeList) void {
-        defer session.resetStanza();
-
-        const to_str = session.stanza_to;
-        const id_str = session.stanza_id;
-        const type_str = session.stanza_type;
-        const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
-
-        if (to_str.len == 0) return;
-
-        // Parse target JID
-        const to_jid = xmpp.Jid.parse(to_str) catch {
-            log.warn("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
-            return;
-        };
-
-        // Get the sender's bound JID
-        const from_jid = session.stream.bound_jid orelse return;
-
-        // Build the from string (full JID: local@domain/resource)
-        var from_buf: [256]u8 = undefined;
-        var from_fbs = std.io.fixedBufferStream(&from_buf);
-        const from_w = from_fbs.writer();
-        from_w.writeAll(from_jid.local) catch return;
-        from_w.writeByte('@') catch return;
-        from_w.writeAll(from_jid.domain) catch return;
-        if (from_jid.resource.len > 0) {
-            from_w.writeByte('/') catch return;
-            from_w.writeAll(from_jid.resource) catch return;
-        }
-        const from_str = from_fbs.getWritten();
-
-        // XEP-0191: Block check — silently drop stanzas from blocked contacts.
-        // Check if the recipient has blocked the sender (target blocks from).
-        if (self.block_store) |bs| {
-            // Build recipient bare JID
-            var rblk_buf: [256]u8 = undefined;
-            var rblk_fbs = std.io.fixedBufferStream(&rblk_buf);
-            rblk_fbs.writer().writeAll(to_jid.local) catch {};
-            rblk_fbs.writer().writeByte('@') catch {};
-            rblk_fbs.writer().writeAll(to_jid.domain) catch {};
-            const recip_bare = rblk_fbs.getWritten();
-
-            // Build sender bare JID
-            var sblk_buf: [256]u8 = undefined;
-            var sblk_fbs = std.io.fixedBufferStream(&sblk_buf);
-            sblk_fbs.writer().writeAll(from_jid.local) catch {};
-            sblk_fbs.writer().writeByte('@') catch {};
-            sblk_fbs.writer().writeAll(from_jid.domain) catch {};
-            const sender_bare = sblk_fbs.getWritten();
-
-            if (bs.isBlocked(self.allocator, recip_bare, sender_bare) catch false) {
-                // Silently drop — XEP-0191 §3.2: stanzas from blocked JIDs are not delivered
-                return;
-            }
-        }
-
-        // MUC domain? Route to MUC handler for groupchat fan-out.
-        if (self.muc_host) |muc_host| {
-            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
-                if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "groupchat")) {
-                    muc_handler.handleMucGroupchat(self, session, to_jid.local, inner_xml, id_str, changes);
-                }
-                // Presence to MUC is handled separately in handlePresence dispatch
-                return;
-            }
-        }
-
-        // Remote domain? Forward via S2S IPC instead of local delivery.
-        if (!std.mem.eql(u8, to_jid.domain, self.server_host)) {
-            self.forwardToS2s(session, from_str, to_str, type_str, id_str, inner_xml, changes);
-            return;
-        }
-
-        // Route: find target session(s) via unified session map.
-        const sm = self.session_map orelse return;
-        var entries_buf: [16]SessionEntry = undefined;
-        var local_ids: [16]usize = undefined;
-        var target_count: usize = 0;
-
-        var remote_delivered: bool = false;
-
-        const route_count = if (to_jid.resource.len > 0) blk: {
-            if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
-                entries_buf[0] = e;
-                break :blk @as(usize, 1);
-            }
-            break :blk @as(usize, 0);
-        } else sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
-
-        // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
-        // Archive chat messages that contain a <body> element (skip transient chat states).
-        const is_archivable = session.stanza_kind == .message and
-            inner_xml.len > 0 and
-            (std.mem.eql(u8, type_str, "chat") or type_str.len == 0) and
-            std.mem.indexOf(u8, inner_xml, "<body") != null;
-
-        var sid_buf: [32]u8 = undefined;
-        const archive_stanza_id: []const u8 = if (is_archivable) self.generateStanzaId(&sid_buf) else "";
-
-        // Build augmented inner_xml with stanza-id appended (for delivery to recipients)
-        var aug_buf: [16512]u8 = undefined; // 16KB inner + stanza-id element
-        var aug_fbs = std.io.fixedBufferStream(&aug_buf);
-        const delivery_inner_xml: []const u8 = if (archive_stanza_id.len > 0) blk: {
-            const aw = aug_fbs.writer();
-            aw.writeAll(inner_xml) catch break :blk inner_xml;
-            aw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch break :blk inner_xml;
-            aw.writeAll(archive_stanza_id) catch break :blk inner_xml;
-            aw.writeAll("' by='") catch break :blk inner_xml;
-            aw.writeAll(self.server_host) catch break :blk inner_xml;
-            aw.writeAll("'/>") catch break :blk inner_xml;
-            break :blk aug_fbs.getWritten();
-        } else inner_xml;
-
-        for (entries_buf[0..route_count]) |entry| {
-            if (entry.worker_id == self.worker_id) {
-                // Local delivery
-                if (target_count < local_ids.len) {
-                    local_ids[target_count] = entry.local_session_id;
-                    target_count += 1;
-                }
-            } else {
-                // Cross-thread delivery via MPSC (includes stanza-id)
-                self.enqueueCrossThreadStanza(
-                    entry,
-                    from_str,
-                    to_str,
-                    type_str,
-                    id_str,
-                    delivery_inner_xml,
-                    session.stanza_kind,
-                );
-                remote_delivered = true;
-            }
-        }
-
-        // Build sender bare JID for archive
-        var sender_bare_buf: [256]u8 = undefined;
-        var sender_bare_fbs = std.io.fixedBufferStream(&sender_bare_buf);
-        sender_bare_fbs.writer().writeAll(from_jid.local) catch {};
-        sender_bare_fbs.writer().writeByte('@') catch {};
-        sender_bare_fbs.writer().writeAll(from_jid.domain) catch {};
-        const sender_bare = sender_bare_fbs.getWritten();
-
-        // Archive under both sender and recipient bare JIDs (T81 + T82)
-        if (is_archivable) {
-            if (self.archive) |archive| {
-                // Build recipient bare JID
-                var recip_buf: [256]u8 = undefined;
-                var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                recip_fbs.writer().writeAll(to_jid.local) catch {};
-                recip_fbs.writer().writeByte('@') catch {};
-                recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                const recipient_bare = recip_fbs.getWritten();
-
-                // Build full stanza XML for archive (includes stanza-id element)
-                var stanza_buf: [20480]u8 = undefined;
-                var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
-                const sw = stanza_fbs.writer();
-                sw.writeAll("<message from='") catch {};
-                sw.writeAll(from_str) catch {};
-                sw.writeAll("' to='") catch {};
-                sw.writeAll(to_str) catch {};
-                sw.writeByte('\'') catch {};
-                if (type_str.len > 0) {
-                    sw.writeAll(" type='") catch {};
-                    sw.writeAll(type_str) catch {};
-                    sw.writeByte('\'') catch {};
-                }
-                if (id_str.len > 0) {
-                    sw.writeAll(" id='") catch {};
-                    sw.writeAll(id_str) catch {};
-                    sw.writeByte('\'') catch {};
-                }
-                sw.writeByte('>') catch {};
-                sw.writeAll(inner_xml) catch {};
-                sw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch {};
-                sw.writeAll(archive_stanza_id) catch {};
-                sw.writeAll("' by='") catch {};
-                sw.writeAll(self.server_host) catch {};
-                sw.writeAll("'/>") catch {};
-                sw.writeAll("</message>") catch {};
-                const full_stanza = stanza_fbs.getWritten();
-
-                const timestamp: u64 = @intCast(std.time.timestamp());
-
-                // Store under recipient's archive
-                archive.store(recipient_bare, sender_bare, archive_stanza_id, timestamp, full_stanza) catch {};
-                // Store under sender's archive (sender copy)
-                archive.store(sender_bare, recipient_bare, archive_stanza_id, timestamp, full_stanza) catch {};
-            }
-        }
-
-        if (target_count == 0 and !remote_delivered) {
-            // Offline storage for messages (pointer to archive, which is already stored above)
-            if (session.stanza_kind == .message) {
-                if (self.offline) |store| {
-                    if (is_archivable and archive_stanza_id.len > 0) {
-                        // Archive already stored above — just add offline pointer
-                        var recip_buf2: [256]u8 = undefined;
-                        var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                        recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                        recip_fbs2.writer().writeByte('@') catch {};
-                        recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                        const recipient_bare2 = recip_fbs2.getWritten();
-                        const timestamp: u64 = @intCast(std.time.timestamp());
-                        if (store.storePointer(recipient_bare2, sender_bare, archive_stanza_id, timestamp) catch false) {
-                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                            return;
-                        }
-                    } else if (self.archive) |archive| {
-                        // Non-archivable message (no body) going to offline — store full stanza
-                        var recip_buf2: [256]u8 = undefined;
-                        var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                        recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                        recip_fbs2.writer().writeByte('@') catch {};
-                        recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                        const recipient_bare2 = recip_fbs2.getWritten();
-
-                        var stanza_buf2: [20480]u8 = undefined;
-                        var stanza_fbs2 = std.io.fixedBufferStream(&stanza_buf2);
-                        const sw2 = stanza_fbs2.writer();
-                        sw2.writeAll("<message from='") catch {};
-                        sw2.writeAll(from_str) catch {};
-                        sw2.writeAll("' to='") catch {};
-                        sw2.writeAll(to_str) catch {};
-                        sw2.writeByte('\'') catch {};
-                        if (type_str.len > 0) {
-                            sw2.writeAll(" type='") catch {};
-                            sw2.writeAll(type_str) catch {};
-                            sw2.writeByte('\'') catch {};
-                        }
-                        if (id_str.len > 0) {
-                            sw2.writeAll(" id='") catch {};
-                            sw2.writeAll(id_str) catch {};
-                            sw2.writeByte('\'') catch {};
-                        }
-                        if (inner_xml.len == 0) {
-                            sw2.writeAll("/>") catch {};
-                        } else {
-                            sw2.writeByte('>') catch {};
-                            sw2.writeAll(inner_xml) catch {};
-                            sw2.writeAll("</message>") catch {};
-                        }
-                        const full_stanza2 = stanza_fbs2.getWritten();
-                        const timestamp: u64 = @intCast(std.time.timestamp());
-                        const offline_id = if (id_str.len > 0) id_str else "offline";
-                        archive.store(recipient_bare2, sender_bare, offline_id, timestamp, full_stanza2) catch {};
-                        if (store.storePointer(recipient_bare2, sender_bare, offline_id, timestamp) catch false) {
-                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                            return;
-                        }
-                    }
-                }
-            }
-            // No offline store configured or store full — bounce
-            log.info("connection {d} message to {s} — recipient unavailable", .{ session.conn.id, to_str });
-            self.sendServiceUnavailable(session, id_str, to_str, from_str);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
-            return;
-        }
-
-        const tag_name: []const u8 = switch (session.stanza_kind) {
-            .message => "message",
-            .presence => "presence",
-            .none => return,
-        };
-
-        // Forward to each local target session
-        for (local_ids[0..target_count]) |tid| {
-            const target_session = self.sessions[tid] orelse continue;
-            // 20KB buffer: opening tag attrs + 16KB inner XML + closing tag
-            var msg_buf: [20480]u8 = undefined;
-            var msg_fbs = std.io.fixedBufferStream(&msg_buf);
-            const mw = msg_fbs.writer();
-
-            // Opening tag with rewritten 'from'
-            mw.writeByte('<') catch continue;
-            mw.writeAll(tag_name) catch continue;
-            mw.writeAll(" from='") catch continue;
-            mw.writeAll(from_str) catch continue;
-            mw.writeAll("' to='") catch continue;
-            mw.writeAll(to_str) catch continue;
-            mw.writeByte('\'') catch continue;
-            // Omit type='normal' for messages (it's the default)
-            if (type_str.len > 0) {
-                if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-                    mw.writeAll(" type='") catch continue;
-                    mw.writeAll(type_str) catch continue;
-                    mw.writeByte('\'') catch continue;
-                }
-            }
-            if (id_str.len > 0) {
-                mw.writeAll(" id='") catch continue;
-                mw.writeAll(id_str) catch continue;
-                mw.writeByte('\'') catch continue;
-            }
-
-            if (delivery_inner_xml.len == 0) {
-                // No children — self-close
-                mw.writeAll("/>") catch continue;
-            } else {
-                // Emit children (with stanza-id already appended) and close tag
-                mw.writeByte('>') catch continue;
-                mw.writeAll(delivery_inner_xml) catch continue;
-                mw.writeAll("</") catch continue;
-                mw.writeAll(tag_name) catch continue;
-                mw.writeByte('>') catch continue;
-            }
-
-            target_session.conn.queueSend(msg_fbs.getWritten()) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, tid) catch {};
-            }
-        }
-
-        // XEP-0280: Message Carbons — send copies to sender's and recipient's other resources
-        if (session.stanza_kind == .message and
-            (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
-        {
-            // Sent carbon: sender's other resources see what they sent
-            self.sendCarbons("sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
-            // Received carbon: recipient's other resources see what was received
-            self.sendCarbons("received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
-        }
+        router.dispatchStanza(self, session, changes);
     }
 
     /// Generate a unique stanza ID for XEP-0359. Format: hex(timestamp)-hex(worker_id)-hex(counter).
     /// The ID is unique per server instance (worker_id disambiguates threads, counter disambiguates
     /// within the same second). Written into the provided buffer, returns the slice.
-    fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
+    pub fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
         const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         const counter = self.stanza_id_counter;
         self.stanza_id_counter +%= 1;
@@ -2382,99 +1981,6 @@ pub const Server = struct {
         const w = fbs.writer();
         std.fmt.format(w, "{x}-{x}-{x}", .{ timestamp, self.worker_id, counter }) catch {};
         return fbs.getWritten();
-    }
-
-    /// XEP-0280: Send a carbon copy of a message to other resources of a user.
-    /// `carbon_type` is "sent" (for sender's other resources) or "received" (for recipient's other).
-    /// `from_str` is the full JID of the original sender, `to_str` is the original recipient.
-    /// `stanza_xml` is the full message XML including inner elements.
-    fn sendCarbons(
-        self: *Server,
-        carbon_type: []const u8,
-        sender_session: *const Session,
-        user_local: []const u8,
-        user_domain: []const u8,
-        from_str: []const u8,
-        to_str: []const u8,
-        type_str: []const u8,
-        id_str: []const u8,
-        delivery_inner_xml: []const u8,
-        changes: *ChangeList,
-    ) void {
-        const sm = self.session_map orelse return;
-        var entries: [16]SessionEntry = undefined;
-        const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
-        if (count == 0) return;
-
-        for (entries[0..count]) |entry| {
-            // Skip the original session (sender or primary recipient)
-            if (entry.worker_id == self.worker_id) {
-                const target = self.sessions[entry.local_session_id] orelse continue;
-                // Skip if this is the sender session itself
-                if (&target.conn == &sender_session.conn) continue;
-                // Skip if carbons not enabled on this resource
-                if (!target.carbons_enabled) continue;
-
-                // Build carbon wrapper: <message to='full_jid'><{sent|received} xmlns='carbons:2'>
-                //   <forwarded xmlns='urn:xmpp:forward:0'><message ...>...</message></forwarded>
-                // </{sent|received}></message>
-                var cbuf: [20480]u8 = undefined;
-                var cfbs = std.io.fixedBufferStream(&cbuf);
-                const cw = cfbs.writer();
-
-                // Outer <message> to the carbon recipient's full JID
-                cw.writeAll("<message from='") catch continue;
-                cw.writeAll(user_local) catch continue;
-                cw.writeByte('@') catch continue;
-                cw.writeAll(user_domain) catch continue;
-                cw.writeAll("' to='") catch continue;
-                cw.writeAll(user_local) catch continue;
-                cw.writeByte('@') catch continue;
-                cw.writeAll(user_domain) catch continue;
-                cw.writeByte('/') catch continue;
-                cw.writeAll(entry.resource()) catch continue;
-                cw.writeAll("' type='chat'>") catch continue;
-
-                // Carbon wrapper
-                cw.writeByte('<') catch continue;
-                cw.writeAll(carbon_type) catch continue;
-                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
-
-                // Original message (reconstructed)
-                cw.writeAll("<message from='") catch continue;
-                cw.writeAll(from_str) catch continue;
-                cw.writeAll("' to='") catch continue;
-                cw.writeAll(to_str) catch continue;
-                cw.writeByte('\'') catch continue;
-                if (type_str.len > 0) {
-                    cw.writeAll(" type='") catch continue;
-                    cw.writeAll(type_str) catch continue;
-                    cw.writeByte('\'') catch continue;
-                }
-                if (id_str.len > 0) {
-                    cw.writeAll(" id='") catch continue;
-                    cw.writeAll(id_str) catch continue;
-                    cw.writeByte('\'') catch continue;
-                }
-                if (delivery_inner_xml.len == 0) {
-                    cw.writeAll("/>") catch continue;
-                } else {
-                    cw.writeByte('>') catch continue;
-                    cw.writeAll(delivery_inner_xml) catch continue;
-                    cw.writeAll("</message>") catch continue;
-                }
-
-                cw.writeAll("</forwarded></") catch continue;
-                cw.writeAll(carbon_type) catch continue;
-                cw.writeAll("></message>") catch continue;
-
-                target.conn.queueSend(cfbs.getWritten()) catch continue;
-                if (target.conn.hasPendingWrite()) {
-                    changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-                }
-            }
-            // Cross-thread carbon delivery would go via MPSC here (future enhancement)
-        }
     }
 
     fn handlePresence(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
@@ -2496,25 +2002,6 @@ pub const Server = struct {
     /// Dispatch a complete IQ stanza based on accumulated state.
     fn dispatchIq(self: *Server, session: *Session, changes: *ChangeList) void {
         iq_handler.dispatchIq(self, session, changes);
-    }
-
-    /// Send a service-unavailable error for a message that can't be delivered.
-    fn sendServiceUnavailable(self: *Server, session: *Session, id_str: []const u8, to_str: []const u8, from_str: []const u8) void {
-        _ = self;
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const w = fbs.writer();
-        w.writeAll("<message type='error'") catch return;
-        if (id_str.len > 0) {
-            w.writeAll(" id='") catch return;
-            w.writeAll(id_str) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll(" from='") catch return;
-        w.writeAll(to_str) catch return;
-        w.writeAll("' to='") catch return;
-        w.writeAll(from_str) catch return;
-        w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
     }
 
     /// Deliver queued offline messages to a user who just became available.
@@ -2740,64 +2227,6 @@ pub const Server = struct {
         const ds = self.delivery_system orelse return;
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
-    }
-
-    /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
-    fn enqueueCrossThreadStanza(
-        self: *Server,
-        route: SessionEntry,
-        from_str: []const u8,
-        to_str: []const u8,
-        type_str: []const u8,
-        id_str: []const u8,
-        inner_xml: []const u8,
-        kind: StanzaKind,
-    ) void {
-        const ds = self.delivery_system orelse return;
-
-        const tag_name: []const u8 = switch (kind) {
-            .message => "message",
-            .presence => "presence",
-            .none => return,
-        };
-
-        // Serialize the full stanza into a buffer (must fit in MAX_PAYLOAD_SIZE)
-        var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
-
-        w.writeByte('<') catch return;
-        w.writeAll(tag_name) catch return;
-        w.writeAll(" from='") catch return;
-        w.writeAll(from_str) catch return;
-        w.writeAll("' to='") catch return;
-        w.writeAll(to_str) catch return;
-        w.writeByte('\'') catch return;
-        if (type_str.len > 0) {
-            if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-                w.writeAll(" type='") catch return;
-                w.writeAll(type_str) catch return;
-                w.writeByte('\'') catch return;
-            }
-        }
-        if (id_str.len > 0) {
-            w.writeAll(" id='") catch return;
-            w.writeAll(id_str) catch return;
-            w.writeByte('\'') catch return;
-        }
-        if (inner_xml.len == 0) {
-            w.writeAll("/>") catch return;
-        } else {
-            w.writeByte('>') catch return;
-            w.writeAll(inner_xml) catch return;
-            w.writeAll("</") catch return;
-            w.writeAll(tag_name) catch return;
-            w.writeByte('>') catch return;
-        }
-
-        ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
-            log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
-        };
     }
 
     /// Drain all pending deliveries from this worker's MPSC queue.
