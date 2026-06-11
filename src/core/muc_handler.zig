@@ -756,11 +756,14 @@ fn sendOccupantPresence(
     status_code: ?[]const u8,
     changes: *ChangeList,
 ) void {
-    _ = server;
     _ = muc_host;
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
+
+    // Look up avatar hash for this occupant
+    const avatar_hash = getAvatarHash(server, occ.getBareJid());
+    defer if (avatar_hash) |h| server.allocator.free(h);
 
     // from = room@host/nick
     w.writeAll("<presence from='") catch return;
@@ -769,7 +772,9 @@ fn sendOccupantPresence(
     w.writeAll(occ.getNick()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, target) catch return;
-    w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    w.writeAll("'>") catch return;
+    writeVcardUpdate(w, avatar_hash);
+    w.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
     w.writeAll(occ.affiliation.toName()) catch return;
     w.writeAll("' role='") catch return;
     w.writeAll(occ.role.toName()) catch return;
@@ -826,8 +831,12 @@ fn broadcastOccupantJoin(
     new_session_id: usize,
     changes: *ChangeList,
 ) void {
-    _ = real_jid;
     _ = muc_host;
+
+    // Look up avatar hash for the joining user
+    const bare_end = std.mem.indexOfScalar(u8, real_jid, '/') orelse real_jid.len;
+    const avatar_hash = getAvatarHash(server, real_jid[0..bare_end]);
+    defer if (avatar_hash) |h| server.allocator.free(h);
 
     // Build prefix/suffix for multicast (no status 110 — self is always local)
     var prefix_buf: [512]u8 = undefined;
@@ -843,7 +852,9 @@ fn broadcastOccupantJoin(
     var suffix_buf: [512]u8 = undefined;
     var suffix_fbs = std.io.fixedBufferStream(&suffix_buf);
     const sw = suffix_fbs.writer();
-    sw.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    sw.writeAll("'>") catch return;
+    writeVcardUpdate(sw, avatar_hash);
+    sw.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
     sw.writeAll(affiliation.toName()) catch return;
     sw.writeAll("' role='") catch return;
     sw.writeAll(role.toName()) catch return;
@@ -857,7 +868,9 @@ fn broadcastOccupantJoin(
     var suffix_110_buf: [512]u8 = undefined;
     var suffix_110_fbs = std.io.fixedBufferStream(&suffix_110_buf);
     const s110w = suffix_110_fbs.writer();
-    s110w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    s110w.writeAll("'>") catch return;
+    writeVcardUpdate(s110w, avatar_hash);
+    s110w.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
     s110w.writeAll(affiliation.toName()) catch return;
     s110w.writeAll("' role='") catch return;
     s110w.writeAll(role.toName()) catch return;
@@ -1203,4 +1216,38 @@ fn writeSessionJid(w: anytype, session: *const Session) !void {
 
 fn writeOccupantRealJid(w: anytype, occ: *const Occupant) !void {
     try w.writeAll(occ.getRealJid());
+}
+
+/// Look up a user's XEP-0084 avatar hash from PEP metadata node.
+/// Returns the SHA-1 hash string (hex) or null if no avatar published.
+fn getAvatarHash(server: *Server, bare_jid: []const u8) ?[]const u8 {
+    const pep = server.pep_store orelse return null;
+    const maybe_metadata = pep.getItem(
+        server.allocator,
+        bare_jid,
+        "urn:xmpp:avatar:metadata",
+        "current",
+    ) catch return null;
+    const metadata = maybe_metadata orelse return null;
+    defer server.allocator.free(metadata);
+
+    // Extract id='...' from <info id='HASH' .../>
+    const id_attr = "id='";
+    const id_start = std.mem.indexOf(u8, metadata, id_attr) orelse return null;
+    const hash_start = id_start + id_attr.len;
+    if (hash_start >= metadata.len) return null;
+    const remaining = metadata[hash_start..];
+    const hash_end = std.mem.indexOfScalar(u8, remaining, '\'') orelse return null;
+    if (hash_end == 0 or hash_end > 64) return null;
+
+    // Copy to a server-allocator-owned slice (caller-free'd per stanza)
+    return server.allocator.dupe(u8, remaining[0..hash_end]) catch return null;
+}
+
+/// Write XEP-0153 vcard-temp:x:update element with avatar photo hash.
+fn writeVcardUpdate(w: anytype, avatar_hash: ?[]const u8) void {
+    const hash = avatar_hash orelse return;
+    w.writeAll("<x xmlns='vcard-temp:x:update'><photo>") catch return;
+    w.writeAll(hash) catch return;
+    w.writeAll("</photo></x>") catch return;
 }

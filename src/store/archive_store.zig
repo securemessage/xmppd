@@ -240,6 +240,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
             var messages = std.ArrayListUnmanaged(ArchivedMessage){};
             var skipping = opts.after_id != null;
             var count: u32 = 0;
+            var complete = true;
 
             while (iter.next()) |entry| {
                 const ts = self.extractTimestamp(entry.key, owner.len + 1) orelse continue;
@@ -270,12 +271,14 @@ pub fn ArchiveStore(comptime Backend: type) type {
                 // RSM before_id: stop when we hit it
                 if (opts.before_id) |before| {
                     if (std.mem.eql(u8, stanza_id, before)) {
-                        return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = true };
+                        break;
                     }
                 }
 
-                if (count >= opts.max) {
-                    return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = false };
+                // For forward queries, enforce max during collection
+                if (!opts.backward and count >= opts.max) {
+                    complete = false;
+                    break;
                 }
 
                 try messages.append(self.allocator, .{
@@ -286,7 +289,22 @@ pub fn ArchiveStore(comptime Backend: type) type {
                 count += 1;
             }
 
-            return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = true };
+            // For backward queries: keep only the last `max` items, reverse to newest-first
+            if (opts.backward and messages.items.len > opts.max) {
+                const excess = messages.items.len - opts.max;
+                for (messages.items[0..excess]) |msg| {
+                    self.allocator.free(@constCast(msg.stanza_id));
+                    if (msg.stanza_xml.len > 0) self.allocator.free(@constCast(msg.stanza_xml));
+                }
+                std.mem.copyForwards(ArchivedMessage, messages.items[0..opts.max], messages.items[excess..]);
+                messages.items.len = opts.max;
+                complete = false;
+            }
+            if (opts.backward and messages.items.len > 1) {
+                std.mem.reverse(ArchivedMessage, messages.items[0..messages.items.len]);
+            }
+
+            return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = complete };
         }
 
         // -- Key builders --
