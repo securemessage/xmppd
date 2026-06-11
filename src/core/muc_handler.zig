@@ -32,6 +32,8 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
 const PendingFanout = fanout.PendingFanout;
+const actor_message = @import("message.zig");
+const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.muc);
 
@@ -51,15 +53,45 @@ pub fn handleMucPresence(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    if (server.delivery_system != null) reg.lock.lock();
-    defer if (server.delivery_system != null) reg.lock.unlock();
-
     if (to_resource.len == 0) {
-        // Presence to bare room JID (no nick) — error
         sendPresenceError(server, session, to_local, muc_host, "jid-malformed", changes);
         return;
     }
 
+    // Build room JID for ownership check
+    var room_jid_buf: [320]u8 = undefined;
+    const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
+    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+
+    if (owner != server.worker_id and server.delivery_system != null) {
+        // Route to owning worker via MPSC
+        const bound = session.stream.bound_jid orelse return;
+        var real_jid_buf: [256]u8 = undefined;
+        const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
+        _ = join_gen;
+
+        if (std.mem.eql(u8, type_str, "unavailable")) {
+            server.enqueueRoomActorMessage(owner, .{ .room_part = .{
+                .room_jid = room_jid,
+                .real_jid = real_jid,
+                .nick = to_resource,
+                .worker_id = server.worker_id,
+                .session_id = @intCast(session.conn.id),
+            } });
+        } else if (type_str.len == 0) {
+            server.enqueueRoomActorMessage(owner, .{ .room_join = .{
+                .room_jid = room_jid,
+                .real_jid = real_jid,
+                .nick = to_resource,
+                .worker_id = server.worker_id,
+                .session_id = @intCast(session.conn.id),
+            } });
+        }
+        return;
+    }
+
+    // Local: this worker owns the room
     if (std.mem.eql(u8, type_str, "unavailable")) {
         handlePart(server, reg, session, to_local, muc_host, changes);
     } else if (type_str.len == 0) {
@@ -82,12 +114,24 @@ pub fn handleMucGroupchat(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    if (server.delivery_system != null) reg.lock.lockShared();
-    defer if (server.delivery_system != null) reg.lock.unlockShared();
-
     // Build room JID
     var room_jid_buf: [320]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
+    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+
+    if (owner != server.worker_id and server.delivery_system != null) {
+        // Route to owning worker via MPSC
+        const bound = session.stream.bound_jid orelse return;
+        var sender_jid_buf: [256]u8 = undefined;
+        const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        server.enqueueRoomActorMessage(owner, .{ .room_message = .{
+            .room_jid = room_jid,
+            .from_jid = sender_jid,
+            .inner_xml = inner_xml,
+            .stanza_id = id_str,
+        } });
+        return;
+    }
 
     const room = reg.findByJid(room_jid) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "item-not-found", changes);
@@ -216,9 +260,6 @@ pub fn drainPendingFanout(
         return true;
     };
 
-    if (server.delivery_system != null) reg.lock.lockShared();
-    defer if (server.delivery_system != null) reg.lock.unlockShared();
-
     // Re-find the room by JID (it may have been destroyed between ticks)
     const room = reg.findByJid(pf.getRoomJid()) orelse {
         log.debug("fan-out target room gone: {s}", .{pf.getRoomJid()});
@@ -329,9 +370,6 @@ pub fn handleMucDiscoItems(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    if (server.delivery_system != null) reg.lock.lockShared();
-    defer if (server.delivery_system != null) reg.lock.unlockShared();
-
     var buf: [8192]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
@@ -385,11 +423,23 @@ pub fn handleRoomDiscoInfo(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    if (server.delivery_system != null) reg.lock.lockShared();
-    defer if (server.delivery_system != null) reg.lock.unlockShared();
-
     var room_jid_buf: [320]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
+    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+
+    if (owner != server.worker_id and server.delivery_system != null) {
+        var reply_jid_buf: [256]u8 = undefined;
+        const bound = session.stream.bound_jid orelse return;
+        const reply_jid = buildFullJid(&reply_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        server.enqueueRoomActorMessage(owner, .{ .room_disco_info = .{
+            .room_jid = room_jid,
+            .iq_id = iq_id,
+            .reply_to_worker = server.worker_id,
+            .reply_to_session = @intCast(session.conn.id),
+            .reply_to_jid = reply_jid,
+        } });
+        return;
+    }
 
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -465,9 +515,6 @@ pub fn handleMucAdminIq(
 ) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
-
-    if (server.delivery_system != null) reg.lock.lock();
-    defer if (server.delivery_system != null) reg.lock.unlock();
 
     var room_jid_buf: [320]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
@@ -718,13 +765,37 @@ fn handlePart(
 }
 
 /// Remove occupant from all rooms on session disconnect (called from server.closeSession).
+/// In multi-thread mode, broadcasts SessionClosed to all OTHER workers so they can
+/// clean up both canonical rooms (on the owning worker) and shadow rooms (on this worker).
 pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *ChangeList) void {
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    if (server.delivery_system != null) reg.lock.lock();
-    defer if (server.delivery_system != null) reg.lock.unlock();
+    // Broadcast to all other workers so owning workers remove occupant from canonical rooms
+    // and all workers remove from their shadow rooms.
+    if (server.delivery_system) |ds| {
+        // Parse JID components for the SessionClosed message
+        const at_pos = std.mem.indexOfScalar(u8, real_jid, '@') orelse return;
+        const local = real_jid[0..at_pos];
+        const rest = real_jid[at_pos + 1 ..];
+        const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
+        const domain = if (slash_pos) |sp| rest[0..sp] else rest;
+        const resource = if (slash_pos) |sp| rest[sp + 1 ..] else "";
 
+        var i: u16 = 0;
+        while (i < ds.worker_count) : (i += 1) {
+            if (i == server.worker_id) continue;
+            server.enqueueRoomActorMessage(i, .{ .session_closed = .{
+                .local = local,
+                .domain = domain,
+                .resource = resource,
+                .worker_id = server.worker_id,
+                .session_id = 0,
+            } });
+        }
+    }
+
+    // Clean up local rooms (both canonical rooms this worker owns and shadow rooms)
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;
         if (!room.active) continue;
@@ -1163,6 +1234,525 @@ fn sendMessageError(
     session.conn.queueSend(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
+    }
+}
+
+// ============================================================================
+// Room Actor — Cross-thread message processing
+// ============================================================================
+//
+// These functions are called on the OWNING worker via handleRoomActorMessage()
+// when a MUC operation arrives from a non-owning worker through the MPSC queue.
+// They process the operation locally (no locks needed) and send responses back
+// to the originating session via MPSC unicast + shadow room notifications.
+
+/// Process a remote join request on the owning worker.
+/// Called when a session on another worker wants to join a room owned by this worker.
+pub fn processRemoteJoin(
+    server: *Server,
+    ev: actor_message.RoomEvent,
+    changes: *ChangeList,
+) void {
+    const reg = server.room_registry orelse return;
+    const muc_host = server.muc_host orelse return;
+    const ds = server.delivery_system orelse return;
+
+    // Extract bare JID from real JID (everything before '/')
+    const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
+    const bare_jid = ev.real_jid[0..slash_pos];
+
+    // Find or create room
+    var room = reg.findByJid(ev.room_jid);
+    var is_new_room = false;
+    if (room == null) {
+        var config = room_store.RoomConfig{};
+        config.persistent = false;
+        const room_local = if (std.mem.indexOfScalar(u8, ev.room_jid, '@')) |at| ev.room_jid[0..at] else ev.room_jid;
+        config.setName(room_local);
+        config.created_at = @intCast(std.time.timestamp());
+        room = reg.createRoom(ev.room_jid, config) catch return;
+        is_new_room = true;
+    }
+    const r = room.?;
+
+    // Check if already in room (rejoin)
+    if (r.findByRealJid(ev.real_jid)) |_| {
+        // Send self-presence back via MPSC unicast
+        var buf: [2048]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+        w.writeAll("<presence from='") catch return;
+        w.writeAll(ev.room_jid) catch return;
+        w.writeByte('/') catch return;
+        w.writeAll(ev.nick) catch return;
+        w.writeAll("' to='") catch return;
+        w.writeAll(ev.real_jid) catch return;
+        w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, fbs.getWritten()) catch {};
+        return;
+    }
+
+    // Nickname conflict check
+    if (r.findByNick(ev.nick)) |existing_idx| {
+        const existing = r.occupants[existing_idx].?;
+        if (!std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
+            // Send conflict error back via MPSC
+            var err_buf: [1024]u8 = undefined;
+            var err_fbs = std.io.fixedBufferStream(&err_buf);
+            const ew = err_fbs.writer();
+            ew.writeAll("<presence from='") catch return;
+            ew.writeAll(ev.room_jid) catch return;
+            ew.writeAll("' to='") catch return;
+            ew.writeAll(ev.real_jid) catch return;
+            ew.writeAll("' type='error'><error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+            ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+            return;
+        }
+    }
+
+    // Determine affiliation and role
+    var affiliation: Affiliation = .none;
+    var role: Role = .participant;
+    if (is_new_room) {
+        affiliation = .owner;
+        role = .moderator;
+    } else {
+        if (server.room_store) |store| {
+            affiliation = store.getAffiliation(ev.room_jid, bare_jid) catch .none;
+        }
+        if (affiliation == .outcast) {
+            var err_buf: [1024]u8 = undefined;
+            var err_fbs = std.io.fixedBufferStream(&err_buf);
+            const ew = err_fbs.writer();
+            ew.writeAll("<presence from='") catch return;
+            ew.writeAll(ev.room_jid) catch return;
+            ew.writeAll("' to='") catch return;
+            ew.writeAll(ev.real_jid) catch return;
+            ew.writeAll("' type='error'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+            ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+            return;
+        }
+        role = affiliation.defaultRole();
+        if (r.config.moderated and role == .participant and affiliation == .none) {
+            role = .visitor;
+        }
+    }
+
+    // Members-only check
+    if (r.config.members_only and affiliation == .none) {
+        var err_buf: [1024]u8 = undefined;
+        var err_fbs = std.io.fixedBufferStream(&err_buf);
+        const ew = err_fbs.writer();
+        ew.writeAll("<presence from='") catch return;
+        ew.writeAll(ev.room_jid) catch return;
+        ew.writeAll("' to='") catch return;
+        ew.writeAll(ev.real_jid) catch return;
+        ew.writeAll("' type='error'><error type='cancel'><registration-required xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+        return;
+    }
+
+    // Add occupant to canonical room on owning worker
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, 0, role, affiliation) catch {
+        var err_buf: [1024]u8 = undefined;
+        var err_fbs = std.io.fixedBufferStream(&err_buf);
+        const ew = err_fbs.writer();
+        ew.writeAll("<presence from='") catch return;
+        ew.writeAll(ev.room_jid) catch return;
+        ew.writeAll("' to='") catch return;
+        ew.writeAll(ev.real_jid) catch return;
+        ew.writeAll("' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+        return;
+    };
+
+    log.info("{s} joined {s} as '{s}' (remote, worker {d})", .{ ev.real_jid, ev.room_jid, ev.nick, ev.worker_id });
+
+    // Send shadow_join to the remote worker so multicast fan-out works
+    server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_join = .{
+        .room_jid = ev.room_jid,
+        .real_jid = ev.real_jid,
+        .nick = ev.nick,
+        .worker_id = ev.worker_id,
+        .session_id = ev.session_id,
+    } });
+
+    // Send existing occupants' presence to the joiner (via MPSC unicast)
+    for (&r.occupants) |*slot| {
+        const occ = slot.* orelse continue;
+        if (std.mem.eql(u8, occ.getRealJid(), ev.real_jid)) continue; // skip self
+        var occ_buf: [2048]u8 = undefined;
+        var occ_fbs = std.io.fixedBufferStream(&occ_buf);
+        const ow = occ_fbs.writer();
+        ow.writeAll("<presence from='") catch continue;
+        ow.writeAll(r.getJid()) catch continue;
+        ow.writeByte('/') catch continue;
+        ow.writeAll(occ.getNick()) catch continue;
+        ow.writeAll("' to='") catch continue;
+        ow.writeAll(ev.real_jid) catch continue;
+        ow.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch continue;
+        ow.writeAll(occ.affiliation.toName()) catch continue;
+        ow.writeAll("' role='") catch continue;
+        ow.writeAll(occ.role.toName()) catch continue;
+        ow.writeAll("'/></x></presence>") catch continue;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, occ_fbs.getWritten()) catch continue;
+    }
+
+    // Broadcast new occupant's presence to ALL occupants (multicast + local)
+    broadcastOccupantJoin(server, r, ev.nick, ev.real_jid, role, affiliation, muc_host, ev.session_id, changes);
+
+    // Send self-presence with status 110 to the joiner
+    {
+        var self_buf: [2048]u8 = undefined;
+        var self_fbs = std.io.fixedBufferStream(&self_buf);
+        const sw = self_fbs.writer();
+        sw.writeAll("<presence from='") catch return;
+        sw.writeAll(r.getJid()) catch return;
+        sw.writeByte('/') catch return;
+        sw.writeAll(ev.nick) catch return;
+        sw.writeAll("' to='") catch return;
+        sw.writeAll(ev.real_jid) catch return;
+        sw.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+        sw.writeAll(affiliation.toName()) catch return;
+        sw.writeAll("' role='") catch return;
+        sw.writeAll(role.toName()) catch return;
+        sw.writeAll("'/><status code='110'/></x></presence>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, self_fbs.getWritten()) catch {};
+    }
+
+    // Room history + subject sent via MPSC unicast
+    sendRoomHistoryRemote(server, ev.real_jid, ev.worker_id, ev.session_id, r);
+    {
+        const subject = r.config.getSubject();
+        var subj_buf: [2048]u8 = undefined;
+        var subj_fbs = std.io.fixedBufferStream(&subj_buf);
+        const sjw = subj_fbs.writer();
+        sjw.writeAll("<message from='") catch return;
+        sjw.writeAll(r.getJid()) catch return;
+        sjw.writeAll("' to='") catch return;
+        sjw.writeAll(ev.real_jid) catch return;
+        sjw.writeAll("' type='groupchat'><subject>") catch return;
+        sjw.writeAll(subject) catch return;
+        sjw.writeAll("</subject></message>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, subj_fbs.getWritten()) catch {};
+    }
+}
+
+/// Process a remote part request on the owning worker.
+pub fn processRemotePart(
+    server: *Server,
+    ev: actor_message.RoomEvent,
+    changes: *ChangeList,
+) void {
+    const reg = server.room_registry orelse return;
+    const muc_host = server.muc_host orelse return;
+
+    const room = reg.findByJid(ev.room_jid) orelse return;
+    const removed = room.removeByRealJid(ev.real_jid) orelse return;
+
+    log.info("{s} left {s} (remote, worker {d})", .{ ev.real_jid, ev.room_jid, ev.worker_id });
+
+    // Send shadow_part to the remote worker
+    server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_part = .{
+        .room_jid = ev.room_jid,
+        .real_jid = ev.real_jid,
+        .nick = ev.nick,
+        .worker_id = ev.worker_id,
+        .session_id = ev.session_id,
+    } });
+
+    broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
+
+    if (room.occupant_count == 0 and !room.config.persistent) {
+        _ = reg.destroyRoom(ev.room_jid);
+    }
+}
+
+/// Process a remote groupchat message on the owning worker.
+pub fn processRemoteGroupchat(
+    server: *Server,
+    ev: actor_message.RoomMessageEvent,
+    changes: *ChangeList,
+) void {
+    const reg = server.room_registry orelse return;
+    const muc_host = server.muc_host orelse return;
+    _ = muc_host;
+
+    const room = reg.findByJid(ev.room_jid) orelse return;
+
+    // Find sender's occupant entry
+    const sender_idx = room.findByRealJid(ev.from_jid) orelse return;
+    const sender = room.occupants[sender_idx].?;
+
+    // Check role: in moderated rooms, visitors cannot speak
+    if (room.config.moderated and sender.role == .visitor) return;
+
+    // Build the from JID: room@conference.host/sender_nick
+    var from_buf: [384]u8 = undefined;
+    var from_fbs = std.io.fixedBufferStream(&from_buf);
+    const fw = from_fbs.writer();
+    fw.writeAll(ev.room_jid) catch return;
+    fw.writeByte('/') catch return;
+    fw.writeAll(sender.getNick()) catch return;
+    const from_str = from_fbs.getWritten();
+
+    var prefix_buf: [512]u8 = undefined;
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
+    var suffix_buf: [16500]u8 = undefined;
+    const suffix_len = fanout.buildSuffix(&suffix_buf, ev.stanza_id, ev.inner_xml) orelse return;
+    const prefix = prefix_buf[0..prefix_len];
+    const suffix = suffix_buf[0..suffix_len];
+
+    // Cross-thread multicast
+    server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // Local fan-out (same bounded continuation as handleMucGroupchat)
+    const batch_size = server.fanout_queue.batch_size;
+    var delivered: u8 = 0;
+    var resume_slot: u8 = 0;
+    var all_done = true;
+
+    for (&room.occupants, 0..) |*slot, idx| {
+        const occ = slot.* orelse continue;
+        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.worker_id != server.worker_id) continue;
+
+        const local_sid = occ.session_id;
+        const target_session = server.sessions[local_sid] orelse continue;
+        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
+        if (target_session.conn.hasPendingWrite()) {
+            changes.addWrite(target_session.conn.fd, local_sid) catch {};
+        }
+
+        delivered += 1;
+        if (delivered >= batch_size) {
+            resume_slot = @intCast(idx + 1);
+            if (resume_slot < room_registry.MAX_OCCUPANTS) {
+                for (room.occupants[resume_slot..]) |remaining| {
+                    if (remaining) |r| {
+                        if (r.worker_id == server.worker_id) {
+                            all_done = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if (!all_done) {
+        if (server.fanout_queue.alloc()) |pf| {
+            @memcpy(pf.room_jid_buf[0..ev.room_jid.len], ev.room_jid);
+            pf.room_jid_len = @intCast(ev.room_jid.len);
+            @memcpy(pf.prefix_buf[0..prefix_len], prefix);
+            pf.prefix_len = prefix_len;
+            @memcpy(pf.suffix_buf[0..suffix_len], suffix);
+            pf.suffix_len = suffix_len;
+            pf.next_slot = resume_slot;
+        } else {
+            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+        }
+    }
+
+    // Archive
+    if (server.archive) |archive| {
+        const timestamp: u64 = @intCast(std.time.timestamp());
+        const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
+        var arch_buf: [17200]u8 = undefined;
+        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        const aw = arch_fbs.writer();
+        aw.writeAll("<message from='") catch return;
+        aw.writeAll(from_str) catch return;
+        aw.writeAll("' type='groupchat'") catch return;
+        if (ev.stanza_id.len > 0) {
+            aw.writeAll(" id='") catch return;
+            aw.writeAll(ev.stanza_id) catch return;
+            aw.writeByte('\'') catch return;
+        }
+        aw.writeByte('>') catch return;
+        aw.writeAll(ev.inner_xml) catch return;
+        aw.writeAll("</message>") catch return;
+        archive.store(ev.room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+    }
+}
+
+/// Process a remote disco#info request on the owning worker.
+/// Builds the IQ result and sends it back to the requesting session via MPSC unicast.
+pub fn processRemoteDiscoInfo(
+    server: *Server,
+    ev: actor_message.DiscoRequest,
+    changes: *ChangeList,
+) void {
+    _ = changes;
+    const reg = server.room_registry orelse return;
+    const ds = server.delivery_system orelse return;
+
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    w.writeAll("<iq type='result' from='") catch return;
+    w.writeAll(ev.room_jid) catch return;
+    w.writeAll("' to='") catch return;
+    w.writeAll(ev.reply_to_jid) catch return;
+    w.writeAll("' id='") catch return;
+    w.writeAll(ev.iq_id) catch return;
+    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+
+    if (reg.findByJid(ev.room_jid)) |room| {
+        const name = room.config.getName();
+        w.writeAll("<identity category='conference' type='text'") catch return;
+        if (name.len > 0) {
+            w.writeAll(" name='") catch return;
+            w.writeAll(name) catch return;
+            w.writeByte('\'') catch return;
+        }
+        w.writeAll("/>") catch return;
+        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
+        if (room.config.moderated) {
+            w.writeAll("<feature var='muc_moderated'/>") catch return;
+        } else {
+            w.writeAll("<feature var='muc_unmoderated'/>") catch return;
+        }
+        if (room.config.anonymous) {
+            w.writeAll("<feature var='muc_semianonymous'/>") catch return;
+        } else {
+            w.writeAll("<feature var='muc_nonanonymous'/>") catch return;
+        }
+        if (room.config.persistent) {
+            w.writeAll("<feature var='muc_persistent'/>") catch return;
+        } else {
+            w.writeAll("<feature var='muc_temporary'/>") catch return;
+        }
+        if (room.config.members_only) {
+            w.writeAll("<feature var='muc_membersonly'/>") catch return;
+        } else {
+            w.writeAll("<feature var='muc_open'/>") catch return;
+        }
+        if (room.config.password_protected) {
+            w.writeAll("<feature var='muc_passwordprotected'/>") catch return;
+        } else {
+            w.writeAll("<feature var='muc_unsecured'/>") catch return;
+        }
+        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
+    } else {
+        w.writeAll("<identity category='conference' type='text'/>") catch return;
+        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
+    }
+
+    w.writeAll("</query></iq>") catch return;
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
+}
+
+/// Process a remote disco#items request. For now, returns items from local shard only.
+/// Full scatter-gather across all workers is deferred to post-v0.6.0.
+pub fn processRemoteDiscoItems(
+    server: *Server,
+    ev: actor_message.DiscoRequest,
+    changes: *ChangeList,
+) void {
+    _ = changes;
+    _ = server;
+    _ = ev;
+    // Disco#items for the MUC service (list all rooms) in the actor model requires
+    // scatter-gather across all workers. Deferred — the local-only path in
+    // handleMucDiscoItems already covers single-worker and same-worker cases.
+}
+
+/// Handle shadow_join: add a local occupant to the shadow room on this worker.
+/// Called when the owning worker notifies us that one of our sessions joined a room.
+pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
+    const reg = server.room_registry orelse return;
+
+    // Find or create shadow room
+    var room = reg.findByJid(ev.room_jid);
+    if (room == null) {
+        room = reg.createRoom(ev.room_jid, .{ .persistent = false }) catch return;
+    }
+    const r = room.?;
+
+    // Extract bare JID
+    const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
+    const bare_jid = ev.real_jid[0..slash_pos];
+
+    // Add occupant to shadow (ignore errors — shadow is best-effort)
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, 0, .participant, .none) catch {};
+}
+
+/// Handle shadow_part: remove a local occupant from the shadow room on this worker.
+pub fn handleShadowPart(server: *Server, ev: actor_message.RoomEvent) void {
+    const reg = server.room_registry orelse return;
+
+    const room = reg.findByJid(ev.room_jid) orelse return;
+    _ = room.removeByRealJid(ev.real_jid);
+
+    // Destroy shadow room if empty (no more local occupants)
+    if (room.occupant_count == 0) {
+        _ = reg.destroyRoom(ev.room_jid);
+    }
+}
+
+/// Send room history to a remote joiner via MPSC unicast.
+fn sendRoomHistoryRemote(
+    server: *Server,
+    real_jid: []const u8,
+    target_worker: u16,
+    target_session: u32,
+    room: *const Room,
+) void {
+    const archive = server.archive orelse return;
+    const ds = server.delivery_system orelse return;
+    const history_max = room.config.history_length;
+    if (history_max == 0) return;
+
+    const room_jid = room.getJid();
+    const result = archive.query(room_jid, .{
+        .max = @as(u32, history_max),
+        .backward = true,
+    }) catch return;
+    defer {
+        for (result.messages) |msg| {
+            server.allocator.free(msg.stanza_id);
+            if (msg.stanza_xml.len > 0) server.allocator.free(@constCast(msg.stanza_xml));
+        }
+        server.allocator.free(result.messages);
+    }
+
+    if (result.messages.len == 0) return;
+
+    var i: usize = result.messages.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = result.messages[i];
+        if (msg.stanza_xml.len == 0) continue;
+
+        var delay_buf: [64]u8 = undefined;
+        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse continue;
+
+        const stanza = msg.stanza_xml;
+        const close_tag = "</message>";
+        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
+        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+
+        var buf: [delivery_queue.MAX_PAYLOAD_SIZE]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+
+        w.writeAll(stanza[0..first_gt]) catch continue;
+        w.writeAll(" to='") catch continue;
+        w.writeAll(real_jid) catch continue;
+        w.writeByte('\'') catch continue;
+        w.writeAll(stanza[first_gt..close_pos]) catch continue;
+        w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
+        w.writeAll(room_jid) catch continue;
+        w.writeAll("' stamp='") catch continue;
+        w.writeAll(delay_str) catch continue;
+        w.writeAll("'/>") catch continue;
+        w.writeAll(close_tag) catch continue;
+
+        ds.deliver(target_worker, @intCast(target_session), 0, fbs.getWritten()) catch continue;
     }
 }
 

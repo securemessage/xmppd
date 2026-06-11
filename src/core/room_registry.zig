@@ -18,6 +18,20 @@ const log = std.log.scoped(.muc);
 /// Maximum concurrent rooms.
 pub const MAX_ROOMS = 256;
 
+/// Determine which worker owns a room by hashing its JID.
+/// Pure computation — no shared state, no locks.
+/// Returns 0 in single-thread mode (worker_count <= 1).
+pub fn roomOwner(room_jid: []const u8, worker_count: u16) u16 {
+    if (worker_count <= 1) return 0;
+    // FNV-1a hash for deterministic distribution
+    var hash: u32 = 2166136261;
+    for (room_jid) |byte| {
+        hash ^= byte;
+        hash *%= 16777619;
+    }
+    return @intCast(hash % worker_count);
+}
+
 /// Maximum occupants per room.
 pub const MAX_OCCUPANTS = 128;
 
@@ -193,14 +207,14 @@ pub const Room = struct {
 
 /// Registry of all active MUC rooms.
 /// Rooms are heap-allocated (each Room is ~10KB due to occupant slots).
-/// Thread-safe: all mutations protected by RwLock. Readers (fan-out) take shared lock.
+///
+/// In the actor model (v0.6.0+), each worker thread owns its own RoomRegistry
+/// instance. Room ownership is determined by `roomOwner(room_jid, worker_count)`.
+/// No locks needed — single-threaded access by the owning worker only.
 pub const RoomRegistry = struct {
     rooms: [MAX_ROOMS]?*Room = [_]?*Room{null} ** MAX_ROOMS,
     count: usize = 0,
     allocator: std.mem.Allocator,
-    /// Read-write lock for thread safety. Write lock for mutations (join/part/create/destroy),
-    /// shared lock for reads (fan-out, disco queries).
-    lock: std.Thread.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator) RoomRegistry {
         return .{ .allocator = allocator };
@@ -576,4 +590,24 @@ test "Room: hasOccupantOnWorker" {
     _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 2, 0, .participant, .none);
     try std.testing.expect(!room.hasOccupantOnWorker(0));
     try std.testing.expect(room.hasOccupantOnWorker(2));
+}
+
+test "roomOwner: single worker always returns 0" {
+    try std.testing.expectEqual(@as(u16, 0), roomOwner("room@conference.localhost", 0));
+    try std.testing.expectEqual(@as(u16, 0), roomOwner("room@conference.localhost", 1));
+}
+
+test "roomOwner: deterministic distribution" {
+    const owner1 = roomOwner("dev@conference.example.com", 4);
+    const owner2 = roomOwner("dev@conference.example.com", 4);
+    try std.testing.expectEqual(owner1, owner2); // same input → same output
+
+    // Different rooms may land on different workers
+    const a = roomOwner("room-a@conference.example.com", 4);
+    const b = roomOwner("room-b@conference.example.com", 4);
+    _ = a;
+    _ = b;
+    // Both must be < worker_count
+    try std.testing.expect(roomOwner("room-a@conference.example.com", 4) < 4);
+    try std.testing.expect(roomOwner("room-b@conference.example.com", 4) < 4);
 }

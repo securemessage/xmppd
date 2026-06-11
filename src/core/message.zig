@@ -129,6 +129,13 @@ pub const Tag = enum(u8) {
     room_message = 0x12,
     room_disco_info = 0x13,
     room_disco_items = 0x14,
+    /// Shadow room update: owning worker → occupant's worker.
+    /// Tells the remote worker to add a local occupant to its shadow room
+    /// so multicast fan-out can find them.
+    shadow_join = 0x15,
+    /// Shadow room update: owning worker → occupant's worker.
+    /// Tells the remote worker to remove a local occupant from its shadow room.
+    shadow_part = 0x16,
     pep_published = 0x20,
     stanza_archived = 0x30,
 };
@@ -145,6 +152,8 @@ pub const Message = union(Tag) {
     room_message: RoomMessageEvent,
     room_disco_info: DiscoRequest,
     room_disco_items: DiscoRequest,
+    shadow_join: RoomEvent,
+    shadow_part: RoomEvent,
     pep_published: PepEvent,
     stanza_archived: ArchiveEvent,
 
@@ -179,7 +188,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeU16(w, ev.worker_id) catch return null;
             writeU32(w, ev.session_id) catch return null;
         },
-        inline .room_join, .room_part => |ev| {
+        inline .room_join, .room_part, .shadow_join, .shadow_part => |ev| {
             writeStr(w, ev.room_jid) catch return null;
             writeStr(w, ev.real_jid) catch return null;
             writeStr(w, ev.nick) catch return null;
@@ -267,7 +276,7 @@ pub fn decode(data: []const u8) ?Message {
                 else => unreachable,
             };
         },
-        .room_join, .room_part => {
+        .room_join, .room_part, .shadow_join, .shadow_part => {
             const room_jid = readStr(data, &fbs) orelse return null;
             const real_jid = readStr(data, &fbs) orelse return null;
             const nick = readStr(data, &fbs) orelse return null;
@@ -283,6 +292,8 @@ pub fn decode(data: []const u8) ?Message {
             return switch (tag_val) {
                 .room_join => .{ .room_join = ev },
                 .room_part => .{ .room_part = ev },
+                .shadow_join => .{ .shadow_join = ev },
+                .shadow_part => .{ .shadow_part = ev },
                 else => unreachable,
             };
         },
@@ -690,4 +701,45 @@ test "tag method returns correct wire byte" {
         .session_id = 0,
     } };
     try std.testing.expectEqual(@as(u8, 0x10), msg.tag());
+}
+
+test "encode/decode: shadow_join round-trip" {
+    const msg = Message{ .shadow_join = .{
+        .room_jid = "dev@conference.example.com",
+        .real_jid = "alice@example.com/Mobile",
+        .nick = "alice",
+        .worker_id = 1,
+        .session_id = 33,
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .shadow_join => |ev| {
+            try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.real_jid);
+            try std.testing.expectEqualStrings("alice", ev.nick);
+            try std.testing.expectEqual(@as(u16, 1), ev.worker_id);
+            try std.testing.expectEqual(@as(u32, 33), ev.session_id);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: shadow_part round-trip" {
+    const msg = Message{ .shadow_part = .{
+        .room_jid = "chat@conference.example.com",
+        .real_jid = "bob@example.com/Desktop",
+        .nick = "bob",
+        .worker_id = 2,
+        .session_id = 77,
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    try std.testing.expectEqual(Tag.shadow_part, std.meta.activeTag(decoded));
 }

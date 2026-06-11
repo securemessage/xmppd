@@ -74,6 +74,7 @@ const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
+const actor_message = @import("message.zig");
 const block_store_mod = @import("block_store");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
@@ -2146,6 +2147,12 @@ pub const Server = struct {
                     return;
                 }
 
+                // Room actor message: decode and dispatch to local room shard
+                if (local_session_id == delivery_queue_mod.ROOM_ACTOR_SENTINEL) {
+                    c.server.handleRoomActorMessage(payload, c.changes);
+                    return;
+                }
+
                 // Unicast: ABA check then deliver to single session
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
@@ -2168,10 +2175,6 @@ pub const Server = struct {
         };
 
         const reg = self.room_registry orelse return;
-
-        reg.lock.lockShared();
-        defer reg.lock.unlockShared();
-
         const room = reg.findByJid(decoded.room_jid) orelse return;
 
         for (&room.occupants) |*slot| {
@@ -2185,6 +2188,79 @@ pub const Server = struct {
                 changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
             }
         }
+    }
+
+    /// Handle a room actor message from the MPSC queue.
+    /// Decodes the message.zig payload and dispatches to the appropriate
+    /// muc_handler function for processing on this worker's local room shard.
+    fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
+        const msg = actor_message.decode(payload) orelse {
+            log.warn("malformed room actor message ({d} bytes)", .{payload.len});
+            return;
+        };
+
+        switch (msg) {
+            .room_join => |ev| {
+                muc_handler.processRemoteJoin(self, ev, changes);
+            },
+            .room_part => |ev| {
+                muc_handler.processRemotePart(self, ev, changes);
+            },
+            .room_message => |ev| {
+                muc_handler.processRemoteGroupchat(self, ev, changes);
+            },
+            .room_disco_info => |ev| {
+                muc_handler.processRemoteDiscoInfo(self, ev, changes);
+            },
+            .room_disco_items => |ev| {
+                muc_handler.processRemoteDiscoItems(self, ev, changes);
+            },
+            .shadow_join => |ev| {
+                // Owning worker tells us to add a local occupant to our shadow room
+                muc_handler.handleShadowJoin(self, ev);
+            },
+            .shadow_part => |ev| {
+                // Owning worker tells us to remove a local occupant from our shadow room
+                muc_handler.handleShadowPart(self, ev);
+            },
+            .session_closed => |ev| {
+                // Session closed on another worker — remove from local rooms
+                var jid_buf: [256]u8 = undefined;
+                var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+                const jw = jid_fbs.writer();
+                jw.writeAll(ev.local) catch return;
+                jw.writeByte('@') catch return;
+                jw.writeAll(ev.domain) catch return;
+                if (ev.resource.len > 0) {
+                    jw.writeByte('/') catch return;
+                    jw.writeAll(ev.resource) catch return;
+                }
+                muc_handler.handleSessionClose(self, jid_fbs.getWritten(), changes);
+            },
+            else => {
+                log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
+            },
+        }
+    }
+
+    /// Enqueue a room actor message to the owning worker via MPSC.
+    /// Used by muc_handler when a MUC operation lands on a non-owning worker.
+    pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_message.Message) void {
+        const ds = self.delivery_system orelse return;
+        var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
+        const len = actor_message.encode(&buf, msg) orelse {
+            log.warn("room actor message encode failed", .{});
+            return;
+        };
+        ds.deliver(target_worker, delivery_queue_mod.ROOM_ACTOR_SENTINEL, 0, buf[0..len]) catch |err| {
+            log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
+        };
+    }
+
+    /// Get the number of workers (for room ownership computation).
+    pub fn getWorkerCount(self: *const Server) u16 {
+        if (self.delivery_system) |ds| return ds.worker_count;
+        return 1;
     }
 
     /// Encode and enqueue a multicast delivery to each remote worker that has

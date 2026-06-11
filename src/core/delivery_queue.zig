@@ -35,6 +35,12 @@ pub const MAX_PAYLOAD_SIZE = 4080;
 /// counters. max_sessions is validated at Server.init to be < MULTICAST_SENTINEL.
 pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
 
+/// Sentinel value for target_session_id indicating a room actor message.
+/// When the consumer sees this, it decodes the payload as a message.zig-encoded
+/// actor message (JoinRequest, PartRequest, GroupchatMessage, etc.) and dispatches
+/// to the local room shard for processing.
+pub const ROOM_ACTOR_SENTINEL: u32 = 0xFFFFFFFE;
+
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
 
