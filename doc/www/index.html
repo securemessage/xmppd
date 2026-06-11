@@ -184,6 +184,20 @@
             color: var(--accent);
         }
 
+        .mascot {
+            display: block;
+            width: 160px;
+            height: 160px;
+            margin: 0 auto 16px;
+        }
+
+        .mascot-caption {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-bottom: 24px;
+            letter-spacing: 0.04em;
+        }
+
         @media (max-width: 600px) {
             header { padding: 48px 0 24px; }
             h1 { font-size: 2rem; }
@@ -196,8 +210,10 @@
 <body>
     <header>
         <div class="container">
+            <img src="clear.svg" alt="Clear, the xmppd mascot" class="mascot">
             <h1><span>xmppd</span></h1>
             <p class="tagline">Carrier-grade XMPP server in Zig</p>
+            <!--<p class="mascot-caption">Meet <strong>Clear</strong>, the xmppd mascot</p>-->
             <span class="badge">BSD-2-Clause &middot; Free &amp; Open Source</span>
         </div>
     </header>
@@ -244,13 +260,14 @@
 
             <div class="card story">
                 <h2>Why</h2>
+                <p><strong>I want to kill SMS</strong>, and by extension, the phone number.</p>
                 <p>I've been waiting for a good XMPP server since the early 2000s &mdash; back when it was still called Jabber and the RFC process was just getting started. When XMPP became an official standard, I thought <em>surely now someone will build a great server.</em></p>
                 <p>Years went by. Nobody did.</p>
                 <p>Meanwhile, proprietary messaging came and went. AIM disappeared. Slack showed up. WhatsApp. Telegram. Matrix. The world kept shifting toward centralization, and somehow SMS &mdash; an archaic, insecure technology from the 1990s &mdash; became <em>more</em> relevant, not less. Today you're expected to hand over a phone number to sign up for anything. Often it must be a <em>cell phone</em>, not VoIP. More control by legacy carriers. More centralization.</p>
-                <p>Matrix gained traction, but it's an inferior protocol largely controlled by a single entity. Prosody, ejabberd, and Openfire are okay. They are not great.</p>
+                <p>SMS needs to die!</p>
+				<p>Matrix gained traction, but it's an inferior protocol largely controlled by a single entity. Prosody, ejabberd, and Openfire are okay. They are not great.</p>
                 <p>After nearly 25 years of waiting, I finally realized: nobody else is going to do it.</p>
                 <p>So I'm building it myself. Not just a good server &mdash; a <em>great</em> one.</p>
-                <p><strong>I want to kill SMS</strong>, and by extension, the phone number.</p>
             </div>
 
             <div class="notice">

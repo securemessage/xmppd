@@ -803,6 +803,21 @@ pub fn build(b: *std.Build) void {
 
     const run_fanout_tests = b.addRunArtifact(fanout_tests);
 
+    // --- Message (actor model) tests ---
+
+    const message_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/message.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const message_tests = b.addTest(.{
+        .name = "message-tests",
+        .root_module = message_test_mod,
+    });
+
+    const run_message_tests = b.addRunArtifact(message_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -1311,6 +1326,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);
+    test_step.dependOn(&run_message_tests.step);
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
