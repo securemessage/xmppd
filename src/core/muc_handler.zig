@@ -817,9 +817,6 @@ fn handlePart(
 /// In multi-thread mode, broadcasts SessionClosed to all OTHER workers so they can
 /// clean up both canonical rooms (on the owning worker) and shadow rooms (on this worker).
 pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *ChangeList) void {
-    const reg = server.room_registry orelse return;
-    const muc_host = server.muc_host orelse return;
-
     // Broadcast to all other workers so owning workers remove occupant from canonical rooms
     // and all workers remove from their shadow rooms.
     if (server.delivery_system) |ds| {
@@ -844,7 +841,16 @@ pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *Chang
         }
     }
 
-    // Clean up local rooms (both canonical rooms this worker owns and shadow rooms)
+    handleSessionCloseLocal(server, real_jid, changes);
+}
+
+/// Remove occupant from local rooms only (no cross-thread broadcast).
+/// Called when processing a session_closed message received via MPSC from the
+/// originating worker. Must NOT re-broadcast to avoid infinite cascade.
+pub fn handleSessionCloseLocal(server: *Server, real_jid: []const u8, changes: *ChangeList) void {
+    const reg = server.room_registry orelse return;
+    const muc_host = server.muc_host orelse return;
+
     for (&reg.rooms) |*slot| {
         const room = slot.* orelse continue;
         if (!room.active) continue;
@@ -855,8 +861,9 @@ pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *Chang
 
         // Auto-destroy transient empty rooms
         if (room.occupant_count == 0 and !room.config.persistent) {
-            log.info("transient room destroyed (empty): {s}", .{room.getJid()});
-            server.room_registry.?.allocator.destroy(room);
+            broadcastDirectoryUpdate(server, room.getJid(), room.config.getName(), false);
+            room.deinit();
+            reg.allocator.destroy(room);
             slot.* = null;
             reg.count -= 1;
         }

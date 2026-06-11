@@ -634,12 +634,17 @@ pub const Server = struct {
                 ds.getState(self.worker_id).setIdle();
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     self.drainDeliveryQueue(&changes);
-                    self.drainRoomMailboxes(&changes);
-                    // If still pending after drain (producer reserved slot via CAS but
-                    // hasn't stored ready=true yet), self-wake to retry on next iteration.
+                    _ = self.drainRoomMailboxes(&changes);
+                    // Self-wake only for MPSC queue CAS race (producer reserved
+                    // slot but hasn't stored ready=true yet). Room mailboxes
+                    // don't need self-wake — they only grow from MPSC deliveries
+                    // which have their own pipe-based wakeup.
                     if (ds.getQueue(self.worker_id).hasPending()) {
                         ds.pipes[self.worker_id].wake();
                     }
+                } else {
+                    // No MPSC pending, but drain room mailboxes opportunistically
+                    _ = self.drainRoomMailboxes(&changes);
                 }
             }
         }
@@ -2125,7 +2130,7 @@ pub const Server = struct {
         const ds = self.delivery_system orelse return;
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
-        self.drainRoomMailboxes(changes);
+        _ = self.drainRoomMailboxes(changes);
     }
 
     /// Drain all pending deliveries from this worker's MPSC queue.
@@ -2248,7 +2253,9 @@ pub const Server = struct {
                     jw.writeByte('/') catch return;
                     jw.writeAll(ev.resource) catch return;
                 }
-                muc_handler.handleSessionClose(self, jid_fbs.getWritten(), changes);
+                // local_only=true: this is already a broadcast from the originating
+                // worker. Do NOT re-broadcast to avoid infinite cascade.
+                muc_handler.handleSessionCloseLocal(self, jid_fbs.getWritten(), changes);
             },
             else => {
                 log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
@@ -2258,22 +2265,39 @@ pub const Server = struct {
 
     /// Drain per-room mailboxes with round-robin fair scheduling.
     /// Called after drainDeliveryQueue in the event loop. Processes one message
-    /// per room per iteration to prevent any single room from monopolizing the worker.
-    fn drainRoomMailboxes(self: *Server, changes: *ChangeList) void {
-        const reg = self.room_registry orelse return;
-        var any_pending = true;
-        // Round-robin: keep iterating until no room has pending messages
-        while (any_pending) {
-            any_pending = false;
+    /// per room per iteration, bounded to MAX_DRAIN_PER_TICK total messages to
+    /// prevent infinite spinning when cross-thread traffic generates responses.
+    /// Returns true if there are still pending messages (caller should self-wake).
+    fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
+        const reg = self.room_registry orelse return false;
+        const MAX_DRAIN_PER_TICK: usize = 32;
+        var processed: usize = 0;
+        var any_pending = false;
+
+        for (&reg.rooms) |*slot| {
+            if (processed >= MAX_DRAIN_PER_TICK) {
+                any_pending = true;
+                break;
+            }
+            const room = slot.* orelse continue;
+            if (!room.active) continue;
+            if (!room.mailbox.hasPending()) continue;
+            const payload = room.mailbox.dequeue() orelse continue;
+            self.processRoomMailboxMessage(room, payload, changes);
+            processed += 1;
+        }
+
+        // Check if any room still has pending messages
+        if (!any_pending) {
             for (&reg.rooms) |*slot| {
                 const room = slot.* orelse continue;
-                if (!room.active) continue;
-                if (!room.mailbox.hasPending()) continue;
-                any_pending = true;
-                const payload = room.mailbox.dequeue() orelse continue;
-                self.processRoomMailboxMessage(room, payload, changes);
+                if (room.active and room.mailbox.hasPending()) {
+                    any_pending = true;
+                    break;
+                }
             }
         }
+        return any_pending;
     }
 
     /// Process a single message from a room's mailbox.
