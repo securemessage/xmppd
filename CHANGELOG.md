@@ -1,10 +1,14 @@
 # Changelog
 
-## v1.0.0 — 2026-06-10
+## v0.5.0 — 2026-06-11
 
-First stable release. Carrier-grade XMPP server in Zig with Postfix-inspired
-multi-process architecture, thread-per-core scaling, and zero external runtime
-dependencies beyond OpenSSL and the chosen storage backend.
+Functional XMPP server with real client interop. Multi-process architecture,
+thread-per-core scaling, and zero external runtime dependencies beyond OpenSSL
+and the chosen storage backend.
+
+**Not production-ready.** See Phorge XMPP project milestones for roadmap to v1.0.0.
+Missing: SM session resume, Entity Capabilities, persistent MUC restart, PEP
+contact notifications, HTTP File Upload, documentation.
 
 ### Architecture
 
