@@ -100,7 +100,7 @@ pub const Room = struct {
     jid_len: u16 = 0,
     /// Room configuration.
     config: RoomConfig = .{},
-    /// Occupant slots.
+    /// Occupant slots (indexed storage for iteration + PendingFanout continuation).
     occupants: [MAX_OCCUPANTS]?Occupant = [_]?Occupant{null} ** MAX_OCCUPANTS,
     occupant_count: usize = 0,
     /// Whether this room is active (slot in use).
@@ -111,6 +111,21 @@ pub const Room = struct {
     /// Per-room actor message mailbox. Cross-thread messages from MPSC are pushed
     /// here; owning worker round-robins across rooms for fair scheduling.
     mailbox: RoomMailbox = .{},
+    /// Allocator for hash map internals.
+    allocator: std.mem.Allocator = undefined,
+    /// O(1) nick → slot index lookup.
+    nick_map: std.StringHashMapUnmanaged(u8) = .{},
+    /// O(1) real_jid → slot index lookup.
+    jid_map: std.StringHashMapUnmanaged(u8) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) Room {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Room) void {
+        self.nick_map.deinit(self.allocator);
+        self.jid_map.deinit(self.allocator);
+    }
 
     pub fn getJid(self: *const Room) []const u8 {
         return self.jid_buf[0..self.jid_len];
@@ -132,24 +147,14 @@ pub const Room = struct {
         return false;
     }
 
-    /// Find an occupant by nickname.
+    /// Find an occupant by nickname. O(1) via hash map.
     pub fn findByNick(self: *const Room, nick: []const u8) ?usize {
-        for (&self.occupants, 0..) |*slot, i| {
-            if (slot.*) |*occ| {
-                if (std.mem.eql(u8, occ.getNick(), nick)) return i;
-            }
-        }
-        return null;
+        return @as(?usize, self.nick_map.get(nick) orelse return null);
     }
 
-    /// Find an occupant by full JID (user@domain/resource). Globally unique key.
+    /// Find an occupant by full JID (user@domain/resource). O(1) via hash map.
     pub fn findByRealJid(self: *const Room, real_jid: []const u8) ?usize {
-        for (&self.occupants, 0..) |*slot, i| {
-            if (slot.*) |*occ| {
-                if (std.mem.eql(u8, occ.getRealJid(), real_jid)) return i;
-            }
-        }
-        return null;
+        return @as(?usize, self.jid_map.get(real_jid) orelse return null);
     }
 
     /// Find an occupant by bare JID (user@domain).
@@ -184,6 +189,10 @@ pub const Room = struct {
                 slot.* = occ;
                 self.occupant_count += 1;
                 self.worker_mask |= @as(u16, 1) << @intCast(worker_id);
+                // Update hash map indices (keys point into occupant inline buffers)
+                const slot_idx: u8 = @intCast(i);
+                self.nick_map.put(self.allocator, self.occupants[i].?.getNick(), slot_idx) catch {};
+                self.jid_map.put(self.allocator, self.occupants[i].?.getRealJid(), slot_idx) catch {};
                 return i;
             }
         }
@@ -195,6 +204,9 @@ pub const Room = struct {
     pub fn removeOccupant(self: *Room, index: usize) ?Occupant {
         if (index >= MAX_OCCUPANTS) return null;
         const occ = self.occupants[index] orelse return null;
+        // Remove from hash map indices before nulling the slot
+        _ = self.nick_map.fetchRemove(occ.getNick());
+        _ = self.jid_map.fetchRemove(occ.getRealJid());
         self.occupants[index] = null;
         self.occupant_count -= 1;
         if (!self.hasOccupantOnWorker(occ.worker_id)) {
@@ -271,7 +283,7 @@ pub const RoomRegistry = struct {
         for (&self.rooms) |*slot| {
             if (slot.* == null) {
                 const room = try self.allocator.create(Room);
-                room.* = .{};
+                room.* = Room.init(self.allocator);
                 room.setJid(jid);
                 room.config = config;
                 room.active = true;
@@ -290,6 +302,7 @@ pub const RoomRegistry = struct {
         for (&self.rooms) |*slot| {
             if (slot.*) |room| {
                 if (room.active and std.mem.eql(u8, room.getJid(), jid)) {
+                    room.deinit();
                     self.allocator.destroy(room);
                     slot.* = null;
                     self.count -= 1;
@@ -313,6 +326,7 @@ pub const RoomRegistry = struct {
                 // If room is now empty and not persistent, destroy it
                 if (room.occupant_count == 0 and !room.config.persistent) {
                     log.info("transient room destroyed (empty): {s}", .{room.getJid()});
+                    room.deinit();
                     self.allocator.destroy(room);
                     slot.* = null;
                     self.count -= 1;
@@ -392,6 +406,7 @@ pub const RoomRegistry = struct {
     pub fn deinit(self: *RoomRegistry) void {
         for (&self.rooms) |*slot| {
             if (slot.*) |room| {
+                room.deinit();
                 self.allocator.destroy(room);
                 slot.* = null;
             }
@@ -439,7 +454,8 @@ test "RoomRegistry: duplicate room creation fails" {
 }
 
 test "Room: add and find occupant" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -457,7 +473,8 @@ test "Room: add and find occupant" {
 }
 
 test "Room: remove occupant" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -504,7 +521,8 @@ test "RoomRegistry: persistent room survives empty" {
 }
 
 test "Room: nickname conflict" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -514,7 +532,8 @@ test "Room: nickname conflict" {
 }
 
 test "Room: max occupants enforcement" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
     room.config.max_occupants = 2;
@@ -527,7 +546,8 @@ test "Room: max occupants enforcement" {
 }
 
 test "Room: findByBareJid" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -540,7 +560,8 @@ test "Room: findByBareJid" {
 }
 
 test "Room: occupant role and affiliation" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -558,7 +579,8 @@ test "Room: occupant role and affiliation" {
 }
 
 test "Room: remove and re-add occupant reuses slot" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -623,7 +645,8 @@ test "RoomRegistry: removeOccupantByRealJid from multiple rooms" {
 }
 
 test "Room: worker_mask set on add" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
     try std.testing.expectEqual(@as(u16, 0), room.worker_mask);
@@ -640,7 +663,8 @@ test "Room: worker_mask set on add" {
 }
 
 test "Room: worker_mask cleared on remove when no occupants remain on worker" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
@@ -663,7 +687,8 @@ test "Room: worker_mask cleared on remove when no occupants remain on worker" {
 }
 
 test "Room: hasOccupantOnWorker" {
-    var room = Room{};
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
     room.active = true;
     room.setJid("test@conference.localhost");
 
