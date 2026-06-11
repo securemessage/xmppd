@@ -611,6 +611,7 @@ pub fn handleMucAdminIq(
 
         // Auto-destroy transient empty rooms
         if (room.occupant_count == 0 and !room.config.persistent) {
+            broadcastDirectoryUpdate(server, room_jid, room.config.getName(), false);
             _ = reg.destroyRoom(room_jid);
         }
     } else if (std.mem.eql(u8, new_role_str, "visitor")) {
@@ -709,6 +710,7 @@ fn handleJoin(
             return;
         };
         is_new_room = true;
+        broadcastDirectoryUpdate(server, room_jid, room_local, true);
     }
     const r = room.?;
 
@@ -806,6 +808,7 @@ fn handlePart(
 
     // Auto-destroy transient empty rooms
     if (room.occupant_count == 0 and !room.config.persistent) {
+        broadcastDirectoryUpdate(server, room_jid, room.config.getName(), false);
         _ = reg.destroyRoom(room_jid);
     }
 }
@@ -1318,6 +1321,7 @@ pub fn processRemoteJoin(
         config.created_at = @intCast(std.time.timestamp());
         room = reg.createRoom(ev.room_jid, config) catch return;
         is_new_room = true;
+        broadcastDirectoryUpdate(server, ev.room_jid, room_local, true);
     }
     const r = room.?;
 
@@ -1510,6 +1514,7 @@ pub fn processRemotePart(
     broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 
     if (room.occupant_count == 0 and !room.config.persistent) {
+        broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
         _ = reg.destroyRoom(ev.room_jid);
     }
 }
@@ -1944,6 +1949,7 @@ pub fn processRemoteAdminAction(
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         if (room.occupant_count == 0 and !room.config.persistent) {
+            broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
             _ = reg.destroyRoom(ev.room_jid);
         }
     } else if (std.mem.eql(u8, ev.new_role, "visitor")) {
@@ -1971,6 +1977,8 @@ pub fn processRemoteAdminAction(
 }
 
 /// Process a remote MUC MAM query on the owning worker (T112).
+/// Queries the local archive (authoritative for this room) and sends each
+/// result message + final fin IQ back to the querying session via MPSC unicast.
 pub fn processRemoteMamQuery(
     server: *Server,
     ev: actor_message.MamQuery,
@@ -1978,44 +1986,82 @@ pub fn processRemoteMamQuery(
 ) void {
     _ = changes;
     const reg = server.room_registry orelse return;
-    const room = reg.findByJid(ev.room_jid) orelse {
+    if (reg.findByJid(ev.room_jid) == null) {
         sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, "item-not-found");
         return;
-    };
-    _ = room;
+    }
 
-    // Query the archive on this worker (the owning worker has the authoritative data)
-    // Then send results back via MPSC unicast to the querying session
     const ds = server.delivery_system orelse return;
     const archive = server.archive orelse {
         // No archive configured — send empty fin
         var buf: [512]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
-        w.writeAll("<iq type='result' from='") catch return;
-        w.writeAll(ev.room_jid) catch return;
-        w.writeAll("' to='") catch return;
-        w.writeAll(ev.reply_to_jid) catch return;
-        w.writeAll("' id='") catch return;
-        w.writeAll(ev.query_id) catch return;
-        w.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
+        const fw = fbs.writer();
+        fw.writeAll("<iq type='result' from='") catch return;
+        fw.writeAll(ev.room_jid) catch return;
+        fw.writeAll("' to='") catch return;
+        fw.writeAll(ev.reply_to_jid) catch return;
+        fw.writeAll("' id='") catch return;
+        fw.writeAll(ev.query_id) catch return;
+        fw.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
         ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
         return;
     };
-    _ = archive;
 
-    // TODO: Full MAM query with pagination — for now send empty fin
-    var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
-    w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
-    w.writeAll("' to='") catch return;
-    w.writeAll(ev.reply_to_jid) catch return;
-    w.writeAll("' id='") catch return;
-    w.writeAll(ev.query_id) catch return;
-    w.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
+    // Parse timestamps from ISO text
+    const mam_handler = @import("mam_handler");
+    const parseTs = @import("iq_handler.zig").parseTimestamp;
+    const start_ts = if (ev.start.len > 0) parseTs(ev.start) else null;
+    const end_ts = if (ev.end_field.len > 0) parseTs(ev.end_field) else null;
+
+    const query = mam_handler.MamQuery{
+        .iq_id = ev.query_id,
+        .owner = ev.room_jid,
+        .query_id = ev.query_id,
+        .with = if (ev.with.len > 0) ev.with else null,
+        .start = start_ts,
+        .end = end_ts,
+        .after_id = null,
+        .before_id = null,
+        .max = 50,
+    };
+
+    const ArchBackend = @import("archive_backend").Backend;
+    var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
+        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, "internal-server-error");
+        return;
+    };
+    defer response.deinit();
+
+    // Send each result message via MPSC unicast
+    for (response.messages) |msg| {
+        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, msg.xml) catch continue;
+    }
+
+    // Send the fin IQ
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, response.fin_iq) catch {};
+}
+
+/// Broadcast a room directory update to all other workers.
+/// Called when a canonical (non-shadow) public room is created or destroyed.
+fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []const u8, active: bool) void {
+    const ds = server.delivery_system orelse return;
+    const wc = server.getWorkerCount();
+    if (wc <= 1) return;
+
+    var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
+    const msg = actor_message.Message{ .room_directory_update = .{
+        .room_jid = room_jid,
+        .room_name = room_name,
+        .active = active,
+    } };
+    const len = actor_message.encode(&buf, msg) orelse return;
+
+    var w: u16 = 0;
+    while (w < wc) : (w += 1) {
+        if (w == server.worker_id) continue;
+        ds.deliver(w, delivery_queue.ROOM_ACTOR_SENTINEL, 0, buf[0..len]) catch {};
+    }
 }
 
 /// Send an IQ error back to a remote worker via MPSC unicast.

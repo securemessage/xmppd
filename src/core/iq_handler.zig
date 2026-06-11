@@ -906,7 +906,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
 /// Parse a subset of ISO 8601 timestamps (YYYY-MM-DDThh:mm:ssZ) to unix epoch.
 /// Returns null if parsing fails.
-fn parseTimestamp(text: []const u8) ?u64 {
+pub fn parseTimestamp(text: []const u8) ?u64 {
     // Minimal parser: "2023-11-14T22:13:20Z" (20 chars)
     if (text.len < 19) return null;
     const year = std.fmt.parseInt(u16, text[0..4], 10) catch return null;
