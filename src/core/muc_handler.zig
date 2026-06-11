@@ -608,6 +608,16 @@ pub fn handleMucAdminIq(
         // Kick — remove occupant and broadcast with status 307
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
+        // T114: Send shadow_part to the kicked occupant's worker
+        if (removed.worker_id != server.worker_id) {
+            server.enqueueRoomActorMessage(removed.worker_id, .{ .shadow_part = .{
+                .room_jid = room_jid,
+                .real_jid = removed.getRealJid(),
+                .nick = removed.getNick(),
+                .worker_id = removed.worker_id,
+                .session_id = @intCast(removed.session_id),
+            } });
+        }
 
         // Auto-destroy transient empty rooms
         if (room.occupant_count == 0 and !room.config.persistent) {
@@ -1955,6 +1965,17 @@ pub fn processRemoteAdminAction(
         // Kick
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
+        // T114: Send shadow_part to the kicked occupant's worker so it removes the
+        // stale shadow entry. Without this, the shadow room retains a ghost occupant.
+        if (removed.worker_id != server.worker_id) {
+            server.enqueueRoomActorMessage(removed.worker_id, .{ .shadow_part = .{
+                .room_jid = ev.room_jid,
+                .real_jid = removed.getRealJid(),
+                .nick = removed.getNick(),
+                .worker_id = removed.worker_id,
+                .session_id = @intCast(removed.session_id),
+            } });
+        }
         if (room.occupant_count == 0 and !room.config.persistent) {
             broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
             _ = reg.destroyRoom(ev.room_jid);
