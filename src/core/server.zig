@@ -219,12 +219,16 @@ pub const Session = struct {
     /// Current <field var='...'> name being parsed inside <x> data form.
     mam_field_var: []const u8 = "",
 
-    /// vCard XML accumulation (for IQ set vcard-temp, also reused for PEP item payload).
+    /// vCard XML accumulation (for IQ set vcard-temp).
     vcard_collecting: bool = false,
     vcard_buf: [4096]u8 = undefined,
     vcard_buf_len: usize = 0,
     /// Depth at which vcard_collecting was started (to detect the matching close tag).
     vcard_collect_depth: u8 = 0,
+
+    /// PEP item payload accumulation (dynamic — avatars can be 100KB+).
+    pep_collecting: bool = false,
+    pep_payload: std.ArrayListUnmanaged(u8) = .{},
 
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
@@ -257,6 +261,7 @@ pub const Session = struct {
     }
 
     fn deinit(self: *Session) void {
+        if (self.pep_payload.capacity > 0) self.pep_payload.deinit(self.reader.allocator);
         self.reader.deinit();
         if (!self.conn.isClosed()) self.conn.close();
     }
@@ -1919,7 +1924,10 @@ pub const Server = struct {
     // ========================================================================
 
     fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Element) void {
-        _ = self;
+        if (session.pep_collecting) {
+            self.accumulatePepElement(session, elem);
+            return;
+        }
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
         const w = fbs.writer();
 
@@ -1960,20 +1968,73 @@ pub const Server = struct {
     }
 
     fn accumulateVcardText(self: *Server, session: *Session, text: []const u8) void {
-        _ = self;
+        if (session.pep_collecting) {
+            self.accumulatePepText(session, text);
+            return;
+        }
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
         xmlEscapeWrite(fbs.writer(), text) catch return;
         session.vcard_buf_len += fbs.pos;
     }
 
     fn accumulateVcardClose(self: *Server, session: *Session, name: []const u8) void {
-        _ = self;
+        if (session.pep_collecting) {
+            self.accumulatePepClose(session, name);
+            return;
+        }
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
         const w = fbs.writer();
         w.writeAll("</") catch return;
         w.writeAll(name) catch return;
         w.writeByte('>') catch return;
         session.vcard_buf_len += fbs.pos;
+    }
+
+    fn accumulatePepElement(self: *Server, session: *Session, elem: xml.Element) void {
+        const a = self.allocator;
+        session.pep_payload.append(a, '<') catch return;
+        session.pep_payload.appendSlice(a, elem.name) catch return;
+
+        if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client) and
+            !std.mem.eql(u8, elem.namespace_uri, xml.ns.pubsub))
+        {
+            if (elem.prefix.len > 0) {
+                session.pep_payload.appendSlice(a, " xmlns:") catch return;
+                session.pep_payload.appendSlice(a, elem.prefix) catch return;
+                session.pep_payload.appendSlice(a, "='") catch return;
+                session.pep_payload.appendSlice(a, elem.namespace_uri) catch return;
+                session.pep_payload.append(a, '\'') catch return;
+            } else {
+                session.pep_payload.appendSlice(a, " xmlns='") catch return;
+                session.pep_payload.appendSlice(a, elem.namespace_uri) catch return;
+                session.pep_payload.append(a, '\'') catch return;
+            }
+        }
+
+        for (elem.attributes) |attr| {
+            session.pep_payload.append(a, ' ') catch return;
+            session.pep_payload.appendSlice(a, attr.name) catch return;
+            session.pep_payload.appendSlice(a, "='") catch return;
+            session.pep_payload.appendSlice(a, attr.value) catch return;
+            session.pep_payload.append(a, '\'') catch return;
+        }
+
+        if (elem.self_closing) {
+            session.pep_payload.appendSlice(a, "/>") catch return;
+        } else {
+            session.pep_payload.append(a, '>') catch return;
+        }
+    }
+
+    fn accumulatePepText(self: *Server, session: *Session, text: []const u8) void {
+        session.pep_payload.appendSlice(self.allocator, text) catch return;
+    }
+
+    fn accumulatePepClose(self: *Server, session: *Session, name: []const u8) void {
+        const a = self.allocator;
+        session.pep_payload.appendSlice(a, "</") catch return;
+        session.pep_payload.appendSlice(a, name) catch return;
+        session.pep_payload.append(a, '>') catch return;
     }
 
     /// Route a fully accumulated stanza to target session(s).

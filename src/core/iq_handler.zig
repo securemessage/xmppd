@@ -77,9 +77,20 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
                 }
             }
         }
-    } else if (std.mem.eql(u8, elem.local_name, "pubsub") and std.mem.eql(u8, ns, xml.ns.pubsub)) {
+    } else if (std.mem.eql(u8, elem.local_name, "pubsub") and
+        (std.mem.eql(u8, ns, xml.ns.pubsub) or std.mem.eql(u8, ns, xml.ns.pubsub_owner)))
+    {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
+    } else if (std.mem.eql(u8, elem.local_name, "configure") and std.mem.eql(u8, ns, xml.ns.pubsub_owner)) {
+        // <configure node='...'> inside <pubsub xmlns='...#owner'>
+        session.iq_child_name = elem.local_name;
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "node")) {
+                session.iq_pep_node = attr.value;
+                break;
+            }
+        }
     } else if (std.mem.eql(u8, elem.local_name, "publish") and std.mem.eql(u8, ns, xml.ns.pubsub)) {
         // <publish node='...'> inside <pubsub>
         for (elem.attributes) |attr| {
@@ -105,9 +116,10 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
                 break;
             }
         }
-        // Start collecting the item payload XML (reuse vcard buf)
+        // Start collecting the item payload XML (dynamic buffer for large payloads)
         session.vcard_collecting = true;
-        session.vcard_buf_len = 0;
+        session.pep_collecting = true;
+        session.pep_payload.clearRetainingCapacity();
         session.vcard_collect_depth = 4; // <iq><pubsub><publish><item>
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.blocking)) {
         // Block/unblock item: <item jid='...'> inside <block>/<unblock>
@@ -259,9 +271,10 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.mam_field_var = "";
         session.mam_collecting = .none;
         session.mam_text_len = 0;
-        // Reset vCard accumulation
+        // Reset vCard/PEP accumulation
         session.vcard_collecting = false;
         session.vcard_buf_len = 0;
+        session.pep_collecting = false;
         // Reset registration accumulation
         session.reg_collecting_username = false;
         session.reg_username_len = 0;
@@ -462,6 +475,14 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         } else if (std.mem.eql(u8, iq_type, "get") and std.mem.eql(u8, session.iq_child_name, "items")) {
             // Items retrieval
             handlePepItems(server, session, iq_id, changes);
+            return;
+        }
+    }
+
+    // XEP-0163/XEP-0060: PEP node configuration (pubsub#owner)
+    if (std.mem.eql(u8, child_ns, xml.ns.pubsub_owner)) {
+        if (std.mem.eql(u8, iq_type, "get") and std.mem.eql(u8, session.iq_child_name, "configure")) {
+            handlePepNodeConfig(server, session, iq_id);
             return;
         }
     }
@@ -985,7 +1006,7 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
 
 /// Handle XEP-0163 PEP publish — store an item in a PEP node.
 /// The node name is in iq_pep_node, item ID in iq_roster_item_jid (reused),
-/// and the payload XML is in vcard_buf (reused).
+/// and the payload XML is in pep_payload (dynamic ArrayList).
 fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
     const ps = server.pep_store orelse {
         sendIqError(server, session, iq_id, "item-not-found");
@@ -1009,7 +1030,7 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
 
     // Item ID — use provided or default to "current"
     const item_id = if (session.iq_roster_item_jid.len > 0) session.iq_roster_item_jid else "current";
-    const payload = session.vcard_buf[0..session.vcard_buf_len];
+    const payload = session.pep_payload.items;
 
     ps.publish(bare_jid, node, item_id, payload) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
@@ -1035,8 +1056,32 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     sendPepNotification(server, session, bare_jid, node, item_id, payload, changes);
 }
 
+/// Handle XEP-0060 §8.2: PEP node configuration query (pubsub#owner).
+/// Returns default PEP node settings (persist_items=true, access_model=presence, max_items=1).
+fn handlePepNodeConfig(server: *Server, session: *Session, iq_id: []const u8) void {
+    const node = session.iq_pep_node;
+
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub#owner'><configure") catch return;
+    if (node.len > 0) {
+        w.writeAll(" node='") catch return;
+        w.writeAll(node) catch return;
+        w.writeByte('\'') catch return;
+    }
+    w.writeAll("><x xmlns='jabber:x:data' type='form'>") catch return;
+    w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/pubsub#node_config</value></field>") catch return;
+    w.writeAll("<field var='pubsub#persist_items' type='boolean'><value>1</value></field>") catch return;
+    w.writeAll("<field var='pubsub#access_model' type='list-single'><value>presence</value></field>") catch return;
+    w.writeAll("<field var='pubsub#max_items' type='text-single'><value>1</value></field>") catch return;
+    w.writeAll("</x></configure></pubsub></iq>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
 /// Handle XEP-0163 PEP items retrieval — get items from a PEP node.
 /// Supports querying self (no 'to') or another user's PEP node (to='user@host').
+/// If a specific item ID is requested, returns only that item.
 fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
     _ = changes;
     const ps = server.pep_store orelse {
@@ -1056,8 +1101,14 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     const iq_to = session.iq_to;
     if (iq_to.len > 0) {
-        // Query another user's PEP node
-        bare_fbs.writer().writeAll(iq_to) catch return;
+        // Query another user's PEP node — strip resource if full JID
+        const at_pos = std.mem.indexOf(u8, iq_to, "@") orelse {
+            sendIqError(server, session, iq_id, "bad-request");
+            return;
+        };
+        const slash_pos = std.mem.indexOf(u8, iq_to[at_pos..], "/");
+        const bare_end = if (slash_pos) |sp| at_pos + sp else iq_to.len;
+        bare_fbs.writer().writeAll(iq_to[0..bare_end]) catch return;
     } else {
         // Query own PEP node
         bare_fbs.writer().writeAll(bound.local) catch return;
@@ -1066,34 +1117,92 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     }
     const bare_jid = bare_fbs.getWritten();
 
-    const items = ps.getItems(server.allocator, bare_jid, node) catch {
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
-    defer {
-        for (items) |item| {
-            server.allocator.free(item.id);
-            server.allocator.free(item.payload);
-        }
-        server.allocator.free(items);
-    }
+    // Check if a specific item ID was requested
+    const requested_id = session.iq_roster_item_jid;
 
-    // PEP payloads can be large (OMEMO bundles ~4KB) — use stanza_buf (16KB) instead of write_scratch (4KB)
-    var fbs = std.io.fixedBufferStream(&session.stanza_buf);
-    const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
-    w.writeAll(node) catch return;
-    w.writeAll("'>") catch return;
-    for (items) |item| {
-        w.writeAll("<item id='") catch return;
-        w.writeAll(item.id) catch return;
-        w.writeAll("'>") catch return;
-        w.writeAll(item.payload) catch return;
-        w.writeAll("</item>") catch return;
+    if (requested_id.len > 0) {
+        // Single item retrieval
+        const payload = ps.getItem(server.allocator, bare_jid, node, requested_id) catch {
+            sendIqError(server, session, iq_id, "internal-server-error");
+            return;
+        };
+        if (payload == null) {
+            sendIqError(server, session, iq_id, "item-not-found");
+            return;
+        }
+        defer server.allocator.free(payload.?);
+
+        // Build response — use dynamic buffer since PEP payloads (avatars) can be large
+        var resp = std.ArrayListUnmanaged(u8){};
+        defer resp.deinit(server.allocator);
+        const rw = resp.writer(server.allocator);
+        writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
+        rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
+        rw.writeAll(node) catch return;
+        rw.writeAll("'><item id='") catch return;
+        rw.writeAll(requested_id) catch return;
+        rw.writeAll("'>") catch return;
+        rw.writeAll(payload.?) catch return;
+        rw.writeAll("</item></items></pubsub></iq>") catch return;
+        session.conn.queueSend(resp.items) catch return;
+    } else {
+        // All items retrieval
+        const items = ps.getItems(server.allocator, bare_jid, node) catch {
+            sendIqError(server, session, iq_id, "internal-server-error");
+            return;
+        };
+        defer {
+            for (items) |item| {
+                server.allocator.free(item.id);
+                server.allocator.free(item.payload);
+            }
+            server.allocator.free(items);
+        }
+
+        // Build response — use dynamic buffer since PEP payloads can be large
+        var resp = std.ArrayListUnmanaged(u8){};
+        defer resp.deinit(server.allocator);
+        const rw = resp.writer(server.allocator);
+        writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
+        rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
+        rw.writeAll(node) catch return;
+        rw.writeAll("'>") catch return;
+        for (items) |item| {
+            rw.writeAll("<item id='") catch return;
+            rw.writeAll(item.id) catch return;
+            rw.writeAll("'>") catch return;
+            rw.writeAll(item.payload) catch return;
+            rw.writeAll("</item>") catch return;
+        }
+        rw.writeAll("</items></pubsub></iq>") catch return;
+        session.conn.queueSend(resp.items) catch return;
     }
-    w.writeAll("</items></pubsub></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Write IQ header for PEP responses with correct 'from' (target user's bare JID).
+fn writePepIqHeader(w: anytype, from_bare: []const u8, session: *Session, iq_type: []const u8, iq_id: []const u8) !void {
+    try w.writeAll("<iq type='");
+    try w.writeAll(iq_type);
+    try w.writeByte('\'');
+    try w.writeAll(" from='");
+    try w.writeAll(from_bare);
+    try w.writeByte('\'');
+    if (session.stream.bound_jid) |bound_val| {
+        try w.writeAll(" to='");
+        try w.writeAll(bound_val.local);
+        try w.writeByte('@');
+        try w.writeAll(bound_val.domain);
+        if (bound_val.resource.len > 0) {
+            try w.writeByte('/');
+            try w.writeAll(bound_val.resource);
+        }
+        try w.writeByte('\'');
+    }
+    if (iq_id.len > 0) {
+        try w.writeAll(" id='");
+        try w.writeAll(iq_id);
+        try w.writeByte('\'');
+    }
 }
 
 /// Send PEP event notification to presence subscribers (XEP-0163 §4.3).
@@ -1134,14 +1243,14 @@ fn sendPepNotification(
     nw.writeAll(body_suffix) catch return;
     const body_after_to = nfbs.getWritten();
 
-    // Deliver to the publisher's own other resources (self-notification)
+    // Deliver to the publisher's own resources (self-notification per XEP-0163 §4.3)
     const bound = session.stream.bound_jid orelse return;
     var self_entries: [16]SessionEntry = undefined;
     const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, &self_entries);
     for (self_entries[0..self_count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
-            if (&target.conn == &session.conn) continue; // skip originator
+            // XEP-0163 §4.3: notify ALL subscribed resources including the publisher
 
             var msg_buf: [16384]u8 = undefined;
             var mfbs = std.io.fixedBufferStream(&msg_buf);
