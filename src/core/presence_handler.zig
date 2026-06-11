@@ -27,6 +27,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const generic_roster = @import("roster_store");
 const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
+const session_lifecycle = @import("session_lifecycle.zig");
 
 const log = std.log.scoped(.presence);
 
@@ -64,7 +65,7 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
             sendPresenceProbes(server, session, bound.local, bound.domain, changes);
 
             // Deliver any offline messages queued for this user
-            server.deliverOfflineMessages(session, bound.local, bound.domain, changes);
+            session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
 
             log.info("connection {d} now available: {s}@{s}/{s}", .{
                 session.conn.id, bound.local, bound.domain, bound.resource,

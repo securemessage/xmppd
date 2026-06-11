@@ -67,6 +67,7 @@ const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 const router = @import("router.zig");
+const session_lifecycle = @import("session_lifecycle.zig");
 const room_registry_mod = @import("room_registry");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
@@ -254,7 +255,7 @@ pub const Session = struct {
     /// Outbound stanza counter (stanzas sent to client).
     sm_out_h: u32 = 0,
 
-    fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
+    pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
             .conn = Connection.init(fd, id),
             .reader = xml.Reader.init(allocator),
@@ -262,7 +263,7 @@ pub const Session = struct {
         };
     }
 
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         if (self.pep_payload.capacity > 0) self.pep_payload.deinit(self.reader.allocator);
         self.reader.deinit();
         if (!self.conn.isClosed()) self.conn.close();
@@ -582,7 +583,7 @@ pub const Server = struct {
                 switch (ev) {
                     .fd_readable => |e| {
                         if (e.udata == LISTENER_UDATA) {
-                            self.acceptConnections(&changes);
+                            session_lifecycle.acceptConnections(self, &changes);
                         } else if (e.udata == IPC_AUTH_UDATA) {
                             self.handleIpcReadable(&changes);
                         } else if (e.udata == IPC_S2S_UDATA) {
@@ -609,7 +610,7 @@ pub const Server = struct {
                     },
                     .fd_error => |e| {
                         if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA and e.udata != IPC_S2S_UDATA and e.udata != WAKE_PIPE_UDATA) {
-                            self.closeSession(e.udata, &changes);
+                            session_lifecycle.closeSession(self, e.udata, &changes);
                         }
                     },
                     else => {},
@@ -651,49 +652,6 @@ pub const Server = struct {
     // Accept
     // ========================================================================
 
-    fn acceptConnections(self: *Server, changes: *ChangeList) void {
-        // Drain all pending connections
-        while (true) {
-            const id = self.allocateId() orelse {
-                log.warn("connection limit reached ({d})", .{self.max_sessions});
-                break;
-            };
-
-            var conn = self.listener.accept(id) catch |err| {
-                switch (err) {
-                    error.WouldBlock => break, // No more pending
-                    else => {
-                        log.err("accept failed: {}", .{err});
-                        break;
-                    },
-                }
-            };
-
-            // Create session
-            const session = self.allocator.create(Session) catch {
-                log.err("out of memory for session", .{});
-                conn.close();
-                self.freeId(id);
-                break;
-            };
-            session.* = Session.init(conn.fd, id, self.server_host, self.listener.direct_tls, self.allocator);
-            // Transfer the fd (don't double-close)
-            session.conn = conn;
-            self.sessions[id] = session;
-
-            // Register for read events — batched into changelist
-            changes.addRead(conn.fd, id) catch {
-                log.err("changelist full on accept", .{});
-                session.deinit();
-                self.allocator.destroy(session);
-                self.sessions[id] = null;
-                break;
-            };
-
-            log.info("accepted connection id={d} fd={d}", .{ id, conn.fd });
-        }
-    }
-
     // ========================================================================
     // Read handler — XML parsing → stream FSM → response
     // ========================================================================
@@ -723,7 +681,7 @@ pub const Server = struct {
     fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes: *ChangeList) void {
         const complete = session.conn.continueHandshake() catch {
             log.err("connection {d} TLS handshake failed", .{id});
-            self.closeSession(id, changes);
+            session_lifecycle.closeSession(self, id, changes);
             return;
         };
 
@@ -772,7 +730,7 @@ pub const Server = struct {
                 error.WouldBlock => return,
                 else => {
                     log.info("connection {d} recv error: {}", .{ id, err });
-                    self.closeSession(id, changes);
+                    session_lifecycle.closeSession(self, id, changes);
                     return;
                 },
             }
@@ -781,7 +739,7 @@ pub const Server = struct {
         if (n == 0) {
             // EOF
             log.info("connection {d} closed by peer", .{id});
-            self.closeSession(id, changes);
+            session_lifecycle.closeSession(self, id, changes);
             return;
         }
 
@@ -796,7 +754,7 @@ pub const Server = struct {
             const event = session.reader.next(data, &pos) catch |err| {
                 log.err("connection {d} XML parse error: {}", .{ id, err });
                 self.sendStreamError(session, .not_well_formed);
-                self.closeSession(id, changes);
+                session_lifecycle.closeSession(self, id, changes);
                 return;
             };
 
@@ -806,7 +764,7 @@ pub const Server = struct {
             if (session.reader.depth > MAX_ELEMENT_DEPTH) {
                 log.warn("connection {d} exceeded max depth ({d})", .{ id, MAX_ELEMENT_DEPTH });
                 self.sendStreamError(session, .policy_violation);
-                self.closeSession(id, changes);
+                session_lifecycle.closeSession(self, id, changes);
                 return;
             }
 
@@ -844,7 +802,7 @@ pub const Server = struct {
             .stream_close => {
                 _ = session.stream.handleClose();
                 self.sendRaw(session, "</stream:stream>");
-                self.closeSession(session.conn.id, changes);
+                session_lifecycle.closeSession(self, session.conn.id, changes);
             },
             .element_start => |elem| {
                 self.handleElementStart(session, elem, changes);
@@ -1084,7 +1042,7 @@ pub const Server = struct {
             if (session.reader.depth == 1) {
                 // </iq> at stream-child level — perform bind with collected resource
                 const resource = session.bind_resource_buf[0..session.bind_resource_len];
-                self.handleBind(session, resource, changes);
+                session_lifecycle.handleBind(self, session, resource);
                 session.bind_pending = false;
                 session.bind_resource_len = 0;
                 session.bind_iq_id = "";
@@ -2004,47 +1962,6 @@ pub const Server = struct {
         iq_handler.dispatchIq(self, session, changes);
     }
 
-    /// Deliver queued offline messages to a user who just became available.
-    /// Uses the generic offline store (pointers) + archive store (payloads).
-    pub fn deliverOfflineMessages(self: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
-        const store = self.offline orelse return;
-        const archive = self.archive orelse return;
-
-        // Build bare JID for lookup
-        var bare_buf: [256]u8 = undefined;
-        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-        bare_fbs.writer().writeAll(local) catch return;
-        bare_fbs.writer().writeByte('@') catch return;
-        bare_fbs.writer().writeAll(domain) catch return;
-        const bare_jid = bare_fbs.getWritten();
-
-        const count = store.countMessages(bare_jid) catch return;
-        if (count == 0) return;
-
-        // Retrieve pointers and deliver messages from archive
-        const pointers = store.getPointers(bare_jid) catch return;
-        defer store.freePointers(pointers);
-
-        var delivered: usize = 0;
-        for (pointers) |ptr| {
-            // Fetch stanza XML from archive
-            const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch continue;
-            if (stanza_xml) |xml_data| {
-                defer self.allocator.free(xml_data);
-                session.conn.queueSend(xml_data) catch continue;
-                delivered += 1;
-            }
-        }
-
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
-
-        // Clear all delivered pointers
-        store.clearAll(bare_jid) catch {};
-        log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
-    }
-
     /// Write an ISO 8601 timestamp from a unix timestamp.
     fn writeTimestamp(_: *Server, writer: anytype, timestamp: i64) !void {
         // Simple UTC timestamp: YYYY-MM-DDThh:mm:ssZ
@@ -2064,33 +1981,11 @@ pub const Server = struct {
         });
     }
 
-    fn handleBind(self: *Server, session: *Session, resource: []const u8, _: *ChangeList) void {
-        const action = session.stream.handleBind(resource);
-        self.executeAction(session, action);
-
-        if (session.stream.isActive()) {
-            if (session.stream.bound_jid) |bound| {
-                // Register in unified session map
-                const sm = self.session_map orelse {
-                    log.err("connection {d} bind failed: session_map not configured", .{session.conn.id});
-                    return;
-                };
-                _ = sm.bind(self.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err| {
-                    log.err("connection {d} session_map bind failed: {}", .{ session.conn.id, err });
-                    return;
-                };
-                log.info("connection {d} session established: {s}@{s}/{s}", .{
-                    session.conn.id, bound.local, bound.domain, bound.resource,
-                });
-            }
-        }
-    }
-
     // ========================================================================
     // Execute StreamAction — write XML responses
     // ========================================================================
 
-    fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction) void {
+    pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction) void {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const writer = fbs.writer();
 
@@ -2191,7 +2086,7 @@ pub const Server = struct {
             switch (err) {
                 error.WouldBlock => return,
                 else => {
-                    self.closeSession(id, changes);
+                    session_lifecycle.closeSession(self, id, changes);
                     return;
                 },
             }
@@ -2348,61 +2243,6 @@ pub const Server = struct {
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
-    }
-
-    fn closeSession(self: *Server, id: usize, changes: *ChangeList) void {
-        const session = self.sessions[id] orelse return;
-
-        // Remove from all MUC rooms (broadcasts unavailable to room occupants)
-        if (session.stream.bound_jid) |bound| {
-            var close_jid_buf: [256]u8 = undefined;
-            var close_jid_fbs = std.io.fixedBufferStream(&close_jid_buf);
-            const cw = close_jid_fbs.writer();
-            cw.writeAll(bound.local) catch {};
-            cw.writeByte('@') catch {};
-            cw.writeAll(bound.domain) catch {};
-            cw.writeByte('/') catch {};
-            cw.writeAll(bound.resource) catch {};
-            muc_handler.handleSessionClose(self, close_jid_fbs.getWritten(), changes);
-        }
-
-        // Unregister from session map and broadcast unavailable presence
-        if (session.stream.bound_jid) |bound| {
-            if (self.session_map) |sm| {
-                const removed = sm.unbind(bound.local, bound.domain, bound.resource);
-                if (removed) |entry| {
-                    if (entry.presence_available) {
-                        presence_handler.broadcastUnavailable(self, bound.local, bound.domain, bound.resource, changes);
-                    }
-                }
-            }
-        }
-
-        // Remove from kqueue (closing fd does this implicitly, but be explicit)
-        changes.removeRead(session.conn.fd) catch {};
-        changes.removeWrite(session.conn.fd) catch {};
-
-        session.deinit();
-        self.allocator.destroy(session);
-        self.sessions[id] = null;
-    }
-
-    fn allocateId(self: *Server) ?usize {
-        // Linear scan for a free slot
-        var i: usize = 0;
-        while (i < self.max_sessions) : (i += 1) {
-            const id = (self.next_id + i) % self.max_sessions;
-            if (id == 0) continue; // Skip slot 0
-            if (self.sessions[id] == null) {
-                self.next_id = (id + 1) % self.max_sessions;
-                return id;
-            }
-        }
-        return null;
-    }
-
-    fn freeId(_: *Server, _: usize) void {
-        // No-op — slot is freed in closeSession by setting to null
     }
 };
 
@@ -2599,7 +2439,7 @@ test "Server: accept and close session" {
     // Accept via the server
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    server.acceptConnections(&changes);
+    session_lifecycle.acceptConnections(&server, &changes);
 
     // Should have accepted one connection
     var found: bool = false;
