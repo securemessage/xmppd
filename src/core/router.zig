@@ -547,8 +547,61 @@ fn sendCarbons(
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
             }
+        } else {
+            // T89: Cross-thread carbon delivery via MPSC
+            const ds = server.delivery_system orelse continue;
+
+            var cbuf: [20480]u8 = undefined;
+            var cfbs = std.io.fixedBufferStream(&cbuf);
+            const cw = cfbs.writer();
+
+            cw.writeAll("<message from='") catch continue;
+            cw.writeAll(user_local) catch continue;
+            cw.writeByte('@') catch continue;
+            cw.writeAll(user_domain) catch continue;
+            cw.writeAll("' to='") catch continue;
+            cw.writeAll(user_local) catch continue;
+            cw.writeByte('@') catch continue;
+            cw.writeAll(user_domain) catch continue;
+            cw.writeByte('/') catch continue;
+            cw.writeAll(entry.resource()) catch continue;
+            cw.writeAll("' type='chat'>") catch continue;
+
+            cw.writeByte('<') catch continue;
+            cw.writeAll(carbon_type) catch continue;
+            cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
+
+            cw.writeAll("<message from='") catch continue;
+            cw.writeAll(from_str) catch continue;
+            cw.writeAll("' to='") catch continue;
+            cw.writeAll(to_str) catch continue;
+            cw.writeByte('\'') catch continue;
+            if (type_str.len > 0) {
+                cw.writeAll(" type='") catch continue;
+                cw.writeAll(type_str) catch continue;
+                cw.writeByte('\'') catch continue;
+            }
+            if (id_str.len > 0) {
+                cw.writeAll(" id='") catch continue;
+                cw.writeAll(id_str) catch continue;
+                cw.writeByte('\'') catch continue;
+            }
+            if (delivery_inner_xml.len == 0) {
+                cw.writeAll("/>") catch continue;
+            } else {
+                cw.writeByte('>') catch continue;
+                cw.writeAll(delivery_inner_xml) catch continue;
+                cw.writeAll("</message>") catch continue;
+            }
+
+            cw.writeAll("</forwarded></") catch continue;
+            cw.writeAll(carbon_type) catch continue;
+            cw.writeAll("></message>") catch continue;
+
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
+                log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
+            };
         }
-        // Cross-thread carbon delivery would go via MPSC here (T89)
     }
 }
 
