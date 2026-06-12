@@ -2220,15 +2220,21 @@ pub const Server = struct {
                     else => unreachable,
                 };
                 const reg = self.room_registry orelse return;
-                // Find or create room (join may be for a new room)
+                // Find room — for room_join, the room may not exist yet.
+                // processRemoteJoin will create it (with proper is_new_room logic).
                 var room = reg.findByJid(room_jid);
-                if (room == null and std.meta.activeTag(msg) == .room_join) {
-                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
+                if (room == null) {
+                    if (std.meta.activeTag(msg) == .room_join) {
+                        // Create a minimal room so the mailbox exists for enqueue
+                        room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
+                        // Mark that processRemoteJoin should treat this as new
+                        room.?.occupant_count = 0;
+                    } else {
+                        log.debug("room actor msg for unknown room: {s}", .{room_jid});
+                        return;
+                    }
                 }
-                const r = room orelse {
-                    log.debug("room actor msg for unknown room: {s}", .{room_jid});
-                    return;
-                };
+                const r = room.?;
                 r.mailbox.enqueue(payload) catch {
                     log.warn("room mailbox full for {s}, dropping message", .{room_jid});
                 };

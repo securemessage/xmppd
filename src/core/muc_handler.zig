@@ -69,7 +69,6 @@ pub fn handleMucPresence(
         var real_jid_buf: [256]u8 = undefined;
         const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
-        _ = join_gen;
 
         if (std.mem.eql(u8, type_str, "unavailable")) {
             server.enqueueRoomActorMessage(owner, .{ .room_part = .{
@@ -78,6 +77,7 @@ pub fn handleMucPresence(
                 .nick = to_resource,
                 .worker_id = server.worker_id,
                 .session_id = @intCast(session.conn.id),
+                .generation = join_gen,
             } });
         } else if (type_str.len == 0) {
             server.enqueueRoomActorMessage(owner, .{ .room_join = .{
@@ -86,6 +86,7 @@ pub fn handleMucPresence(
                 .nick = to_resource,
                 .worker_id = server.worker_id,
                 .session_id = @intCast(session.conn.id),
+                .generation = join_gen,
             } });
         }
         return;
@@ -616,6 +617,7 @@ pub fn handleMucAdminIq(
                 .nick = removed.getNick(),
                 .worker_id = removed.worker_id,
                 .session_id = @intCast(removed.session_id),
+                .generation = 0,
             } });
         }
 
@@ -1327,9 +1329,8 @@ pub fn processRemoteJoin(
     const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
     const bare_jid = ev.real_jid[0..slash_pos];
 
-    // Find or create room
+    // Find or create room (may already exist from handleRoomActorMessage pre-creation)
     var room = reg.findByJid(ev.room_jid);
-    var is_new_room = false;
     if (room == null) {
         var config = room_store.RoomConfig{};
         config.persistent = false;
@@ -1337,10 +1338,11 @@ pub fn processRemoteJoin(
         config.setName(room_local);
         config.created_at = @intCast(std.time.timestamp());
         room = reg.createRoom(ev.room_jid, config) catch return;
-        is_new_room = true;
-        broadcastDirectoryUpdate(server, ev.room_jid, room_local, true);
     }
     const r = room.?;
+    // Detect new room by occupant count — the room may have been pre-created
+    // by handleRoomActorMessage for its mailbox, but has no occupants yet.
+    const is_new_room = (r.occupant_count == 0);
 
     // Check if already in room (rejoin)
     if (r.findByRealJid(ev.real_jid)) |_| {
@@ -1355,7 +1357,7 @@ pub fn processRemoteJoin(
         w.writeAll("' to='") catch return;
         w.writeAll(ev.real_jid) catch return;
         w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, fbs.getWritten()) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
         return;
     }
 
@@ -1372,7 +1374,7 @@ pub fn processRemoteJoin(
             ew.writeAll("' to='") catch return;
             ew.writeAll(ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-            ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+            ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
         }
     }
@@ -1383,6 +1385,8 @@ pub fn processRemoteJoin(
     if (is_new_room) {
         affiliation = .owner;
         role = .moderator;
+        const room_local = if (std.mem.indexOfScalar(u8, ev.room_jid, '@')) |at| ev.room_jid[0..at] else ev.room_jid;
+        broadcastDirectoryUpdate(server, ev.room_jid, room_local, true);
     } else {
         if (server.room_store) |store| {
             affiliation = store.getAffiliation(ev.room_jid, bare_jid) catch .none;
@@ -1396,7 +1400,7 @@ pub fn processRemoteJoin(
             ew.writeAll("' to='") catch return;
             ew.writeAll(ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-            ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+            ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
         }
         role = affiliation.defaultRole();
@@ -1415,7 +1419,7 @@ pub fn processRemoteJoin(
         ew.writeAll("' to='") catch return;
         ew.writeAll(ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><registration-required xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
     }
 
@@ -1429,7 +1433,7 @@ pub fn processRemoteJoin(
         ew.writeAll("' to='") catch return;
         ew.writeAll(ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, err_fbs.getWritten()) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
     };
 
@@ -1442,6 +1446,7 @@ pub fn processRemoteJoin(
         .nick = ev.nick,
         .worker_id = ev.worker_id,
         .session_id = ev.session_id,
+        .generation = ev.generation,
     } });
 
     // Send existing occupants' presence to the joiner (via MPSC unicast)
@@ -1462,7 +1467,7 @@ pub fn processRemoteJoin(
         ow.writeAll("' role='") catch continue;
         ow.writeAll(occ.role.toName()) catch continue;
         ow.writeAll("'/></x></presence>") catch continue;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, occ_fbs.getWritten()) catch continue;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, occ_fbs.getWritten()) catch continue;
     }
 
     // Broadcast new occupant's presence to ALL occupants (multicast + local)
@@ -1484,11 +1489,11 @@ pub fn processRemoteJoin(
         sw.writeAll("' role='") catch return;
         sw.writeAll(role.toName()) catch return;
         sw.writeAll("'/><status code='110'/></x></presence>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, self_fbs.getWritten()) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, self_fbs.getWritten()) catch {};
     }
 
     // Room history + subject sent via MPSC unicast
-    sendRoomHistoryRemote(server, ev.real_jid, ev.worker_id, ev.session_id, r);
+    sendRoomHistoryRemote(server, ev.real_jid, ev.worker_id, ev.session_id, ev.generation, r);
     {
         const subject = r.config.getSubject();
         var subj_buf: [2048]u8 = undefined;
@@ -1501,7 +1506,7 @@ pub fn processRemoteJoin(
         sjw.writeAll("' type='groupchat'><subject>") catch return;
         sjw.writeAll(subject) catch return;
         sjw.writeAll("</subject></message>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), 0, subj_fbs.getWritten()) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, subj_fbs.getWritten()) catch {};
     }
 }
 
@@ -1526,6 +1531,7 @@ pub fn processRemotePart(
         .nick = ev.nick,
         .worker_id = ev.worker_id,
         .session_id = ev.session_id,
+        .generation = ev.generation,
     } });
 
     broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
@@ -1769,6 +1775,7 @@ fn sendRoomHistoryRemote(
     real_jid: []const u8,
     target_worker: u16,
     target_session: u32,
+    target_generation: u32,
     room: *const Room,
 ) void {
     const archive = server.archive orelse return;
@@ -1821,7 +1828,7 @@ fn sendRoomHistoryRemote(
         w.writeAll("'/>") catch continue;
         w.writeAll(close_tag) catch continue;
 
-        ds.deliver(target_worker, @intCast(target_session), 0, fbs.getWritten()) catch continue;
+        ds.deliver(target_worker, @intCast(target_session), target_generation, fbs.getWritten()) catch continue;
     }
 }
 
@@ -1974,6 +1981,7 @@ pub fn processRemoteAdminAction(
                 .nick = removed.getNick(),
                 .worker_id = removed.worker_id,
                 .session_id = @intCast(removed.session_id),
+                .generation = 0,
             } });
         }
         if (room.occupant_count == 0 and !room.config.persistent) {

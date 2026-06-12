@@ -79,6 +79,7 @@ pub const RoomEvent = struct {
     nick: []const u8,
     worker_id: u16,
     session_id: u32,
+    generation: u32,
 };
 
 /// MUC groupchat message to fan out.
@@ -233,6 +234,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.nick) catch return null;
             writeU16(w, ev.worker_id) catch return null;
             writeU32(w, ev.session_id) catch return null;
+            writeU32(w, ev.generation) catch return null;
         },
         .room_message => |ev| {
             writeStr(w, ev.room_jid) catch return null;
@@ -345,12 +347,14 @@ pub fn decode(data: []const u8) ?Message {
             const nick = readStr(data, &fbs) orelse return null;
             const worker_id = readU16(r) orelse return null;
             const session_id = readU32(r) orelse return null;
+            const generation = readU32(r) orelse return null;
             const ev = RoomEvent{
                 .room_jid = room_jid,
                 .real_jid = real_jid,
                 .nick = nick,
                 .worker_id = worker_id,
                 .session_id = session_id,
+                .generation = generation,
             };
             return switch (tag_val) {
                 .room_join => .{ .room_join = ev },
@@ -563,6 +567,7 @@ test "encode/decode: room_join round-trip" {
         .nick = "alice",
         .worker_id = 2,
         .session_id = 42,
+        .generation = 7,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -576,6 +581,7 @@ test "encode/decode: room_join round-trip" {
             try std.testing.expectEqualStrings("alice", ev.nick);
             try std.testing.expectEqual(@as(u16, 2), ev.worker_id);
             try std.testing.expectEqual(@as(u32, 42), ev.session_id);
+            try std.testing.expectEqual(@as(u32, 7), ev.generation);
         },
         else => return error.WrongTag,
     }
@@ -588,6 +594,7 @@ test "encode/decode: room_part round-trip" {
         .nick = "bob",
         .worker_id = 0,
         .session_id = 7,
+        .generation = 3,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -782,6 +789,7 @@ test "encode: buffer too small returns null" {
         .nick = "alice",
         .worker_id = 0,
         .session_id = 1,
+        .generation = 0,
     } };
 
     var tiny: [4]u8 = undefined;
@@ -810,6 +818,7 @@ test "tag method returns correct wire byte" {
         .nick = "",
         .worker_id = 0,
         .session_id = 0,
+        .generation = 0,
     } };
     try std.testing.expectEqual(@as(u8, 0x10), msg.tag());
 }
@@ -821,6 +830,7 @@ test "encode/decode: shadow_join round-trip" {
         .nick = "alice",
         .worker_id = 1,
         .session_id = 33,
+        .generation = 5,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -846,6 +856,7 @@ test "encode/decode: shadow_part round-trip" {
         .nick = "bob",
         .worker_id = 2,
         .session_id = 77,
+        .generation = 0,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
