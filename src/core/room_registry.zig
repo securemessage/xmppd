@@ -169,6 +169,9 @@ pub const Room = struct {
 
     /// Add an occupant to the room. Returns slot index or error.
     pub fn addOccupant(self: *Room, nick: []const u8, real_jid: []const u8, bare_jid: []const u8, session_id: usize, worker_id: u16, generation: u32, role: Role, affiliation: Affiliation) !usize {
+        // Idempotent: if already present by JID, return existing slot
+        if (self.findByRealJid(real_jid)) |existing_idx| return existing_idx;
+
         // Check capacity
         if (self.config.max_occupants > 0 and self.occupant_count >= self.config.max_occupants) {
             return error.RoomFull;

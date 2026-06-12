@@ -1748,6 +1748,9 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     }
     const r = room.?;
 
+    // Idempotent: skip if already present (prevents duplicate entries from race conditions)
+    if (r.findByRealJid(ev.real_jid) != null) return;
+
     // Extract bare JID
     const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
     const bare_jid = ev.real_jid[0..slash_pos];
