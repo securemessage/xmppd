@@ -76,6 +76,11 @@ pub const OidcStore = struct {
     /// Timestamp of last JWKS refresh (Unix seconds).
     jwks_last_refresh: i64 = 0,
 
+    /// Stable buffer for the last validated username (JWT claim slices
+    /// point into stack-local buffers that die when validateToken returns).
+    username_buf: [256]u8 = undefined,
+    username_len: usize = 0,
+
     pub fn init(allocator: Allocator, config: OidcConfig) OidcStore {
         return OidcStore{
             .config = config,
@@ -148,7 +153,13 @@ pub const OidcStore = struct {
 
         // Strip domain from email-style usernames to get JID localpart
         // e.g., "alice@morante.dev" → "alice"
-        const username = extractLocalpart(raw_username);
+        // Copy into stable buffer — JWT claim slices point into stack-local
+        // buffers inside jwt.parse() that die when this function returns.
+        const localpart = extractLocalpart(raw_username);
+        if (localpart.len > self.username_buf.len) return null;
+        @memcpy(self.username_buf[0..localpart.len], localpart);
+        self.username_len = localpart.len;
+        const username = self.username_buf[0..self.username_len];
 
         log.info("OAUTHBEARER: validated token for '{s}'", .{username});
         return username;

@@ -319,6 +319,8 @@ pub const RoomRegistry = struct {
 
     /// Remove all occupants with the given full JID from ALL rooms.
     /// Returns the number of rooms the session was removed from.
+    /// NOTE: Does NOT destroy empty rooms — cleanup is deferred to
+    /// drainRoomMailboxes in the event loop to avoid ordering conflicts.
     pub fn removeOccupantByRealJid(self: *RoomRegistry, real_jid: []const u8) usize {
         var removed: usize = 0;
         for (&self.rooms) |*slot| {
@@ -326,14 +328,6 @@ pub const RoomRegistry = struct {
             if (!room.active) continue;
             if (room.removeByRealJid(real_jid)) |_| {
                 removed += 1;
-                // If room is now empty and not persistent, destroy it
-                if (room.occupant_count == 0 and !room.config.persistent) {
-                    log.info("transient room destroyed (empty): {s}", .{room.getJid()});
-                    room.deinit();
-                    self.allocator.destroy(room);
-                    slot.* = null;
-                    self.count -= 1;
-                }
             }
         }
         return removed;
@@ -504,8 +498,10 @@ test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {
 
     const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
     try std.testing.expectEqual(@as(usize, 1), removed_count);
-    // Transient room auto-destroyed
-    try std.testing.expectEqual(@as(usize, 0), reg.count);
+    // Room still exists (empty) — destruction is deferred to event loop cleanup
+    try std.testing.expectEqual(@as(usize, 1), reg.count);
+    const room2 = reg.findByJid("temp@conference.localhost").?;
+    try std.testing.expectEqual(@as(usize, 0), room2.occupant_count);
 }
 
 test "RoomRegistry: persistent room survives empty" {
@@ -640,11 +636,13 @@ test "RoomRegistry: removeOccupantByRealJid from multiple rooms" {
     const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
     try std.testing.expectEqual(@as(usize, 2), removed_count);
 
-    // room2 was transient + empty → auto-destroyed
-    // room1 still has bob
-    try std.testing.expectEqual(@as(usize, 1), reg.count);
+    // Both rooms still exist — destruction deferred to event loop cleanup
+    // room1 still has bob, room2 is empty
+    try std.testing.expectEqual(@as(usize, 2), reg.count);
     const remaining = reg.findByJid("room1@conference.localhost").?;
     try std.testing.expectEqual(@as(usize, 1), remaining.occupant_count);
+    const empty = reg.findByJid("room2@conference.localhost").?;
+    try std.testing.expectEqual(@as(usize, 0), empty.occupant_count);
 }
 
 test "Room: worker_mask set on add" {

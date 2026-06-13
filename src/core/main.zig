@@ -271,31 +271,12 @@ pub fn main() !void {
     }
     defer if (archive_backend) |*b| b.close();
 
-    // MUC host resolution
+    // MUC host resolution — each worker creates its own RoomRegistry in configureServer
     var muc_host_buf: [256]u8 = undefined;
-    var room_registry: ?RoomRegistry = null;
     const effective_muc_host: ?[]const u8 = if (muc_host_arg) |h| h else blk: {
         const muc_default = std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch null;
         break :blk muc_default;
     };
-    if (effective_muc_host) |_| {
-        room_registry = RoomRegistry.init(allocator);
-
-        // Load persistent rooms from RoomStore (T45)
-        if (rs) |*room_store| {
-            var room_jids: [256][]const u8 = undefined;
-            const count = room_store.listRooms(&room_jids) catch 0;
-            for (room_jids[0..count]) |room_jid| {
-                defer allocator.free(room_jid);
-                if (room_store.loadRoom(room_jid) catch null) |config| {
-                    _ = room_registry.?.createRoom(room_jid, config) catch continue;
-                    log.info("loaded persistent room: {s}", .{room_jid});
-                }
-            }
-            if (count > 0) log.info("loaded {d} persistent rooms from store", .{count});
-        }
-    }
-    defer if (room_registry) |*reg| reg.deinit();
 
     // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
     var session_map = SessionMap.init(allocator, worker_count > 1);
@@ -327,7 +308,7 @@ pub fn main() !void {
         .offline = if (offline_store != null) &offline_store.? else null,
         .archive = if (archive_store != null) &archive_store.? else null,
         .vcard = if (vcard_store != null) &vcard_store.? else null,
-        .room_registry = if (room_registry != null) &room_registry.? else null,
+        .muc_enabled = (effective_muc_host != null),
         .room_store = if (rs != null) &rs.? else null,
         .block_store = if (block_store_val != null) &block_store_val.? else null,
         .pep_store = if (pep_store_val != null) &pep_store_val.? else null,
@@ -427,7 +408,7 @@ const WorkerCtx = struct {
     offline: ?*GenericOfflineStore(OpBackendType),
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
     vcard: ?*GenericVCardStore,
-    room_registry: ?*RoomRegistry,
+    muc_enabled: bool,
     room_store: ?*GenericRoomStore,
     block_store: ?*GenericBlockStore,
     pep_store: ?*GenericPepStore,
@@ -483,7 +464,9 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     if (ctx.block_store) |bs| server.configureBlockStore(bs);
     if (ctx.pep_store) |ps| server.configurePepStore(ps);
 
-    if (ctx.room_registry) |reg| {
+    if (ctx.muc_enabled) {
+        const reg = ctx.allocator.create(RoomRegistry) catch return;
+        reg.* = RoomRegistry.init(ctx.allocator);
         server.room_registry = reg;
         server.room_store = ctx.room_store;
         server.muc_host = ctx.muc_host;

@@ -334,6 +334,51 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         }
     }
 
+    // IQ addressed to a local bare JID (user@domain) that is NOT the sender's own.
+    // Per XEP-0030 §8: return service-unavailable/empty for disco to bare JIDs.
+    // Per XEP-0054 §3.2/§3.3: server responds on behalf, blocks SET to others.
+    if (iq_to.len > 0 and std.mem.indexOfScalar(u8, iq_to, '@') != null) {
+        // Check if it's the sender's own bare JID — if so, fall through to normal handlers
+        const is_own_jid = if (session.stream.bound_jid) |bound| blk: {
+            const at_pos = std.mem.indexOfScalar(u8, iq_to, '@') orelse break :blk false;
+            const local_part = iq_to[0..at_pos];
+            break :blk std.mem.eql(u8, local_part, bound.local) and
+                std.mem.eql(u8, iq_to[at_pos + 1 ..], bound.domain);
+        } else false;
+
+        if (!is_own_jid) {
+            if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
+                // disco#items on a bare JID: always return empty result
+                var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                const w = fbs.writer();
+                writeIqHeader(server, w, session, "result", iq_id);
+                w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
+                session.conn.queueSend(fbs.getWritten()) catch return;
+                return;
+            }
+            if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
+                // disco#info on a bare JID: return service-unavailable per XEP-0030 §8
+                var fbs = std.io.fixedBufferStream(&session.write_scratch);
+                const w = fbs.writer();
+                writeIqHeader(server, w, session, "error", iq_id);
+                w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+                session.conn.queueSend(fbs.getWritten()) catch return;
+                return;
+            }
+            if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
+                // vCard GET for another user — server responds on behalf
+                handleVcardGetFor(server, session, iq_id, iq_to);
+                return;
+            }
+            if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "set")) {
+                // vCard SET for another user — not allowed
+                sendIqError(server, session, iq_id, "not-allowed");
+                return;
+            }
+        }
+        // Own bare JID or other IQs: fall through to normal handlers
+    }
+
     // Roster query
     if (std.mem.eql(u8, child_ns, xml.ns.roster)) {
         if (std.mem.eql(u8, iq_type, "get")) {
@@ -943,15 +988,17 @@ fn isLeapYear(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
-/// Write IQ opening tag with type, from (server), to (client full JID), and id.
-/// Per RFC 6120 §8.1.2.1, server-generated IQ results MUST include from/to.
+/// Write IQ opening tag with type, from, to (client full JID), and id.
+/// Per RFC 6120 §8.1.2.1, the 'from' in a response MUST be the JID to which
+/// the original stanza was sent (i.e., the 'to' from the request).
 pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []const u8, iq_id: []const u8) void {
     w.writeAll("<iq type='") catch return;
     w.writeAll(iq_type) catch return;
     w.writeByte('\'') catch return;
-    // from = server host for server-directed IQs
+    // from = iq_to if set (echo back request's 'to'), otherwise server host
+    const from = if (session.iq_to.len > 0) session.iq_to else server.server_host;
     w.writeAll(" from='") catch return;
-    w.writeAll(server.server_host) catch return;
+    w.writeAll(from) catch return;
     w.writeByte('\'') catch return;
     // to = client's full JID
     if (session.stream.bound_jid) |bound| {
@@ -973,6 +1020,8 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
 }
 
 /// Handle vCard-temp GET — return stored vCard or empty fallback.
+/// Uses multiple queueSend calls to avoid write_scratch overflow when
+/// the stored vCard XML is large (vcard_buf and write_scratch are both 4KB).
 fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
     const bound = session.stream.bound_jid orelse return;
 
@@ -992,9 +1041,13 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
         const xml_data = vcard.get(server.allocator, bare_jid) catch null;
         if (xml_data) |data| {
             defer server.allocator.free(data);
+            // Send header + '>' first, then vCard data, then closing tag
+            // to avoid overflowing write_scratch with large vCards.
             w.writeByte('>') catch return;
-            w.writeAll(data) catch return;
-            w.writeAll("</iq>") catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            session.conn.queueSend(data) catch return;
+            session.conn.queueSend("</iq>") catch return;
+            return;
         } else {
             w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
         }
@@ -1003,6 +1056,74 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
     }
 
     session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Handle vCard-temp GET for a specific bare JID (another user).
+/// Per XEP-0054 §3.3: server MUST respond on behalf of the requestee.
+/// Returns the stored vCard, empty vCard if user exists but has none,
+/// or item-not-found if the user does not exist.
+fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, target_jid: []const u8) void {
+    // Strip resource if present (use bare JID for lookup)
+    const at_pos = std.mem.indexOfScalar(u8, target_jid, '@') orelse {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    };
+    const slash_pos = std.mem.indexOfScalar(u8, target_jid[at_pos..], '/');
+    const bare_end = if (slash_pos) |sp| at_pos + sp else target_jid.len;
+    const bare_jid = target_jid[0..bare_end];
+
+    // Check if target domain matches our server — we can only serve local users
+    const target_domain = target_jid[at_pos + 1 .. bare_end];
+    if (!std.mem.eql(u8, target_domain, server.server_host)) {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    }
+
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+
+    if (server.vcard) |vcard| {
+        const xml_data = vcard.get(server.allocator, bare_jid) catch null;
+        if (xml_data) |data| {
+            defer server.allocator.free(data);
+            // User has a vCard — return it (split send to avoid overflow)
+            writeIqHeader(server, w, session, "result", iq_id);
+            w.writeByte('>') catch return;
+            session.conn.queueSend(fbs.getWritten()) catch return;
+            session.conn.queueSend(data) catch return;
+            session.conn.queueSend("</iq>") catch return;
+            return;
+        }
+    }
+
+    // No vCard stored — check if user exists via session_map (online/bound)
+    // or roster store (has any contacts). If neither, user doesn't exist.
+    const target_local = target_jid[0..at_pos];
+    const user_exists = blk: {
+        // Check if user has any bound session (online)
+        if (server.session_map) |sm| {
+            var entry_buf: [1]session_map_mod.SessionEntry = undefined;
+            if (sm.findByBareJid(target_local, target_domain, &entry_buf) > 0) break :blk true;
+        }
+        // Check if user has any roster entries (owner prefix scan)
+        if (server.roster) |roster| {
+            const items = roster.getAllItems(server.allocator, bare_jid) catch break :blk false;
+            const has_items = items.len > 0;
+            GenericRosterStore.freeAllItems(server.allocator, items);
+            if (has_items) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (user_exists) {
+        // User exists but has no vCard — return empty vCard
+        writeIqHeader(server, w, session, "result", iq_id);
+        w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+    } else {
+        // User does not exist — return item-not-found per XEP-0054 §3.3
+        sendIqError(server, session, iq_id, "item-not-found");
+    }
 }
 
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.

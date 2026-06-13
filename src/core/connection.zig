@@ -318,6 +318,15 @@ pub const Connection = struct {
         }
     }
 
+    /// Returns the number of bytes buffered inside OpenSSL's internal read
+    /// buffer (already decrypted but not yet returned to the application).
+    /// Non-zero means read() can return data without a syscall — and kqueue
+    /// won't fire because the socket buffer is empty.
+    pub fn tlsPending(self: *Connection) usize {
+        if (self.tls_conn) |*tls| return tls.pending();
+        return 0;
+    }
+
     /// Returns true if TLS is active (handshake complete).
     pub fn isTlsEstablished(self: *const Connection) bool {
         return self.tls_state == .established;

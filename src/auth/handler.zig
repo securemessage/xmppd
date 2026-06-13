@@ -230,13 +230,33 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         /// Handle OAUTHBEARER mechanism — delegates to Store.validateToken.
+        /// The SASL initial response is RFC 7628 format:
+        ///   gs2-header kvsep "auth=Bearer " token kvsep kvsep
+        ///   n,,\x01auth=Bearer TOKEN\x01\x01
         fn handleOAuthBearerAuth(self: *Self, req: protocol.AuthRequest) protocol.Message {
             if (comptime !@hasDecl(Store, "validateToken")) {
                 return authFailure(req.conn_id, "mechanism-not-supported");
             }
 
-            // OAUTHBEARER payload: the bearer token directly
-            const token = req.payload;
+            // Extract bearer token from RFC 7628 OAUTHBEARER initial response
+            const payload = req.payload;
+            if (payload.len == 0) {
+                return authFailure(req.conn_id, "invalid-encoding");
+            }
+
+            // Find "auth=Bearer " after the first \x01 separator
+            const bearer_prefix = "auth=Bearer ";
+            const token = blk: {
+                if (std.mem.indexOf(u8, payload, bearer_prefix)) |pos| {
+                    const start = pos + bearer_prefix.len;
+                    // Token ends at the next \x01 separator
+                    const rest = payload[start..];
+                    const end = std.mem.indexOfScalar(u8, rest, 0x01) orelse rest.len;
+                    break :blk rest[0..end];
+                }
+                // Fallback: treat entire payload as token (for simple clients)
+                break :blk payload;
+            };
             if (token.len == 0) {
                 return authFailure(req.conn_id, "invalid-encoding");
             }

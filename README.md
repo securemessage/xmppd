@@ -25,6 +25,36 @@ polymorphism for performance at scale.
 - **Primary:** FreeBSD (kqueue)
 - **Secondary:** Linux (epoll, post-MVP)
 
+## Standards Compliance
+
+| Standard | Description | Support | Tested |
+|----------|-------------|---------|--------|
+| RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
+| RFC 6121 | XMPP IM (roster, presence, messaging) | Full | E2E, Unit |
+| XEP-0030 | Service Discovery | Full | 15/15 Interop |
+| XEP-0045 | Multi-User Chat | Partial | E2E, Unit¹ |
+| XEP-0054 | vCard-temp | Full | 6/6 Interop |
+| XEP-0077 | In-Band Registration | Full | E2E, Unit |
+| XEP-0084 | User Avatar (via PEP) | Full | E2E |
+| XEP-0085 | Chat State Notifications | Full | 1/1 Interop |
+| XEP-0092 | Software Version | Full | 2/2 Interop |
+| XEP-0163 | Personal Eventing Protocol | Partial | E2E |
+| XEP-0191 | Blocking Command | Full | E2E, Unit |
+| XEP-0198 | Stream Management | Full | E2E |
+| XEP-0199 | XMPP Ping | Full | 3/3 Interop |
+| XEP-0220 | Server Dialback | Partial | E2E |
+| XEP-0280 | Message Carbons | Full | E2E, Unit |
+| XEP-0313 | Message Archive Management | Full | E2E, Unit |
+| XEP-0359 | Unique and Stable Stanza IDs | Full | Unit |
+| XEP-0440 | SASL Channel-Binding Type Negotiation | Full | Unit |
+
+**Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2,
+**E2E** = verified with Gajim, Conversations, and/or Dino,
+**Unit** = Zig unit tests (738 tests).
+
+¹ MUC core functionality works (join, part, groupchat, kick, ban, history, MAM) but Smack's
+interop framework cannot run MUC tests due to room preflight disco checks on transient rooms.
+
 ## Building
 
 Requires Zig 0.15.2+.

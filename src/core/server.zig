@@ -100,13 +100,6 @@ const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
 /// Maximum changelist entries per event loop iteration.
 const CHANGE_BUF_SIZE = 256;
 
-/// Maximum XML events processed per connection per event loop tick.
-/// Prevents a single client from monopolizing the event loop by sending
-/// thousands of tiny XML elements packed into one TCP segment.
-/// After this limit, control returns to the event loop; remaining data
-/// stays in the read buffer and kqueue will fire fd_readable again.
-const MAX_EVENTS_PER_TICK = 100;
-
 /// Maximum XML element nesting depth allowed.
 /// XMPP stanzas are shallow (stream=1, stanza=2, children=3-5 typically).
 /// Anything deeper than this is either malformed or an attack (deep nesting DoS).
@@ -704,11 +697,14 @@ pub const Server = struct {
 
             // OpenSSL may have buffered application data internally during
             // the handshake (client pipelines Finished + new stream open).
-            // kqueue won't fire for data already consumed from the socket.
-            // Drain in a loop — handleReadable returns on WouldBlock.
-            self.handleReadable(id, changes);
-
-            // If the session is still alive, ensure kqueue monitors the fd.
+            // handleReadable's TLS drain loop handles this — just ensure
+            // kqueue is armed so the next readable event triggers it.
+            // If OpenSSL already consumed all socket data, tlsPending() > 0
+            // won't help here since handleReadable needs a kqueue trigger.
+            // Force an immediate drain to handle the pipelined case.
+            if (session.conn.tlsPending() > 0) {
+                self.handleReadable(id, changes);
+            }
             if (self.sessions[id] != null and !session.conn.isClosed()) {
                 changes.addRead(session.conn.fd, id) catch {};
             }
@@ -728,67 +724,77 @@ pub const Server = struct {
     // Read handler — XML parsing → stream FSM → response
     // ========================================================================
 
+    /// Read and parse all available data from a connection.
+    ///
+    /// Outer loop drains OpenSSL's internal buffer: after parsing all data from
+    /// one recv(), if TLS has buffered decrypted bytes (SSL_pending > 0), we
+    /// recv() again immediately. kqueue only fires on new *socket* data, so
+    /// without this loop, OpenSSL-buffered data would stall indefinitely.
+    ///
+    /// The parse loop runs until the parser needs more data (event == null).
+    /// Per-connection work is naturally bounded by the 8KB read buffer — one
+    /// recv() produces at most 8KB of XML regardless of element count.
     fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
 
-        // Read from socket
-        const n = session.conn.recv() catch |err| {
-            switch (err) {
-                error.WouldBlock => return,
-                else => {
-                    log.info("connection {d} recv error: {}", .{ id, err });
-                    session_lifecycle.closeSession(self, id, changes);
-                    return;
-                },
-            }
-        };
-
-        if (n == 0) {
-            // EOF
-            log.info("connection {d} closed by peer", .{id});
-            session_lifecycle.closeSession(self, id, changes);
-            return;
-        }
-
-        // Parse XML events from the read buffer.
-        // Capped at MAX_EVENTS_PER_TICK to ensure fair scheduling across
-        // all connections — a single client cannot monopolize the event loop.
-        const data = session.conn.readableSlice();
-        var pos: usize = 0;
-        var events_processed: usize = 0;
-
-        while (events_processed < MAX_EVENTS_PER_TICK) {
-            const event = session.reader.next(data, &pos) catch |err| {
-                log.err("connection {d} XML parse error: {}", .{ id, err });
-                self.sendStreamError(session, .not_well_formed);
-                session_lifecycle.closeSession(self, id, changes);
-                return;
+        while (true) {
+            // Read from socket (or OpenSSL's internal buffer via tls.read)
+            const n = session.conn.recv() catch |err| {
+                switch (err) {
+                    error.WouldBlock => break,
+                    else => {
+                        log.info("connection {d} recv error: {}", .{ id, err });
+                        session_lifecycle.closeSession(self, id, changes);
+                        return;
+                    },
+                }
             };
 
-            if (event == null) break; // Need more data
-
-            // Depth limit check — defend against deep nesting DoS
-            if (session.reader.depth > MAX_ELEMENT_DEPTH) {
-                log.warn("connection {d} exceeded max depth ({d})", .{ id, MAX_ELEMENT_DEPTH });
-                self.sendStreamError(session, .policy_violation);
+            if (n == 0) {
+                log.info("connection {d} closed by peer", .{id});
                 session_lifecycle.closeSession(self, id, changes);
                 return;
             }
 
-            self.processXmlEvent(session, event.?, changes);
-            events_processed += 1;
+            // Parse all XML events from the read buffer
+            const data = session.conn.readableSlice();
+            var pos: usize = 0;
 
-            // Session may have been closed/freed by processXmlEvent (stream
-            // error, close, etc.) — check the slot, not the stale pointer.
-            if (self.sessions[id] == null) return;
-            // After STARTTLS upgrade, stop processing pre-TLS buffer
-            if (session.conn.isTlsHandshaking()) break;
+            while (true) {
+                const event = session.reader.next(data, &pos) catch |err| {
+                    log.err("connection {d} XML parse error: {}", .{ id, err });
+                    self.sendStreamError(session, .not_well_formed);
+                    session_lifecycle.closeSession(self, id, changes);
+                    return;
+                };
+
+                if (event == null) break; // Need more data
+
+                if (session.reader.depth > MAX_ELEMENT_DEPTH) {
+                    log.warn("connection {d} exceeded max depth ({d})", .{ id, MAX_ELEMENT_DEPTH });
+                    self.sendStreamError(session, .policy_violation);
+                    session_lifecycle.closeSession(self, id, changes);
+                    return;
+                }
+
+                self.processXmlEvent(session, event.?, changes);
+
+                if (self.sessions[id] == null) return;
+                if (session.conn.isTlsHandshaking()) {
+                    session.conn.consume(pos);
+                    return;
+                }
+            }
+
+            session.conn.consume(pos);
+
+            // If OpenSSL has more decrypted data buffered internally, loop
+            // to recv() again — kqueue won't fire for it.
+            if (session.conn.tlsPending() == 0) break;
         }
 
-        // Consume processed bytes
-        session.conn.consume(pos);
+        if (self.sessions[id] == null) return;
 
-        // If we have pending writes, register for write events
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, id) catch {};
         }
@@ -2292,6 +2298,12 @@ pub const Server = struct {
             self.processRoomMailboxMessage(room, payload, changes);
             processed += 1;
         }
+
+        // Deferred room cleanup: destroy empty transient rooms AFTER all mailbox
+        // processing. This is the single destruction point — avoids ordering
+        // conflicts between session_closed (immediate) and room_part (mailbox),
+        // and avoids use-after-free of decoded payload slices during processing.
+        muc_handler.cleanupEmptyRooms(self);
 
         // Check if any room still has pending messages
         if (!any_pending) {

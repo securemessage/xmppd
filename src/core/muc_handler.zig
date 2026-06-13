@@ -818,11 +818,7 @@ fn handlePart(
     // Broadcast unavailable presence to remaining occupants
     broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 
-    // Auto-destroy transient empty rooms
-    if (room.occupant_count == 0 and !room.config.persistent) {
-        broadcastDirectoryUpdate(server, room_jid, room.config.getName(), false);
-        _ = reg.destroyRoom(room_jid);
-    }
+    // Room destruction deferred to drainRoomMailboxes cleanup pass.
 }
 
 /// Remove occupant from all rooms on session disconnect (called from server.closeSession).
@@ -871,14 +867,37 @@ pub fn handleSessionCloseLocal(server: *Server, real_jid: []const u8, changes: *
 
         broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 
-        // Auto-destroy transient empty rooms
-        if (room.occupant_count == 0 and !room.config.persistent) {
-            broadcastDirectoryUpdate(server, room.getJid(), room.config.getName(), false);
-            room.deinit();
-            reg.allocator.destroy(room);
-            slot.* = null;
-            reg.count -= 1;
-        }
+        // Do NOT destroy rooms here — deferred to drainRoomMailboxes cleanup pass.
+        // Immediate destruction races with pending room_part messages in the mailbox,
+        // causing use-after-free when processRemotePart reads decoded payload slices
+        // that point into the freed room's mailbox buffer.
+    }
+}
+
+/// Destroy empty transient rooms that have no pending mailbox messages.
+/// Called from drainRoomMailboxes AFTER all message processing is complete.
+/// This is the ONLY place rooms are destroyed — all other paths (handlePart,
+/// processRemotePart, handleSessionCloseLocal) only remove occupants.
+pub fn cleanupEmptyRooms(server: *Server) void {
+    const reg = server.room_registry orelse return;
+
+    for (&reg.rooms) |*slot| {
+        const room = slot.* orelse continue;
+        if (!room.active) continue;
+        if (room.occupant_count != 0) continue;
+        if (room.config.persistent) continue;
+        if (room.mailbox.hasPending()) continue;
+
+        // Safe to destroy: no occupants, no pending messages, not persistent.
+        // room.getJid() and room.config.getName() point into the room's own
+        // buffers (not decoded mailbox payloads), so they remain valid until
+        // allocator.destroy below.
+        broadcastDirectoryUpdate(server, room.getJid(), room.config.getName(), false);
+        log.info("transient room destroyed (empty): {s}", .{room.getJid()});
+        room.deinit();
+        reg.allocator.destroy(room);
+        slot.* = null;
+        reg.count -= 1;
     }
 }
 
@@ -1536,10 +1555,9 @@ pub fn processRemotePart(
 
     broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
 
-    if (room.occupant_count == 0 and !room.config.persistent) {
-        broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
-        _ = reg.destroyRoom(ev.room_jid);
-    }
+    // Do NOT destroy rooms here — deferred to drainRoomMailboxes cleanup pass.
+    // ev.room_jid points into the room's mailbox buffer (the decoded payload);
+    // calling destroyRoom here would free that memory while we still hold the slice.
 }
 
 /// Process a remote groupchat message on the owning worker.
