@@ -56,9 +56,9 @@ polymorphism for performance at scale.
 **Unit** = Zig unit tests (738 tests),
 **Pass-through** = server forwards stanzas without interpretation; no server-side logic required.
 
-¹ Single-resource messaging and presence work. Multi-resource routing (§8.5) has known
-issues: presence to bare JIDs is not broadcast to all resources, messages to offline
-resources are stored instead of routed to the highest-priority online resource (T118).
+¹ Multi-resource routing (§8.5) implemented: priority-based delivery, full JID forwarding,
+chat fallback. Roster push notifications after subscription changes not yet implemented.
+Roster set validation (multi-item, unauthorized, duplicate groups) incomplete.
 
 ² MUC core functionality works (join, part, groupchat, kick, ban, history, MAM, disco).
 Missing: room configuration forms (XEP-0045 §10), invitations (§7.8), voice requests.
