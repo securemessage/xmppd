@@ -37,6 +37,7 @@ pub const SessionEntry = struct {
     local_session_id: u32,
     generation: u32,
     presence_available: bool = false,
+    priority: i8 = 0,
     resource_buf: [MAX_RESOURCE_LEN]u8 = undefined,
     resource_len: u8 = 0,
 
@@ -326,6 +327,38 @@ pub const SessionMap = struct {
                         entry.local_session_id == full_entry.local_session_id)
                     {
                         entry.presence_available = available;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set resource priority for a session (RFC 6121 §4.7.2.3).
+    pub fn setPriority(
+        self: *SessionMap,
+        local: []const u8,
+        domain: []const u8,
+        resource: []const u8,
+        prio: i8,
+    ) void {
+        if (self.multi_worker) self.lock.lock();
+        defer if (self.multi_worker) self.lock.unlock();
+
+        var full_buf: [384]u8 = undefined;
+        const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
+        if (self.full_map.getPtr(full_jid)) |entry| {
+            entry.priority = prio;
+        }
+
+        var bare_buf: [320]u8 = undefined;
+        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
+        if (self.bare_map.getPtr(bare_jid)) |list| {
+            if (self.full_map.get(full_jid)) |full_entry| {
+                for (list.slice()) |*entry| {
+                    if (entry.worker_id == full_entry.worker_id and
+                        entry.local_session_id == full_entry.local_session_id)
+                    {
+                        entry.priority = prio;
                     }
                 }
             }

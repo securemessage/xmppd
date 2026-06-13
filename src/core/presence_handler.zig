@@ -53,27 +53,37 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
     }
 
     const ptype = xmpp.PresenceType.fromString(type_str);
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     switch (ptype) {
         .available => {
-            // Initial presence — mark session as available, broadcast to subscribers
-            if (server.session_map) |sm| sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
-            broadcastPresence(server, bound.local, bound.domain, bound.resource, changes);
+            // Start presence accumulation — defer action to </presence> to capture <priority>.
+            session.stanza_kind = .presence;
+            session.stanza_buf_len = 0;
+            session.stanza_to = "";
+            session.stanza_id = "";
+            session.stanza_type = "";
+            session.pres_priority_collecting = false;
+            session.pres_priority_len = 0;
 
-            // Send presence probes to contacts we're subscribed to
-            sendPresenceProbes(server, session, bound.local, bound.domain, changes);
-
-            // Deliver any offline messages queued for this user
-            session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
-
-            log.info("connection {d} now available: {s}@{s}/{s}", .{
-                session.conn.id, bound.local, bound.domain, bound.resource,
-            });
+            // Self-closing <presence/> — dispatch immediately
+            if (elem.self_closing) {
+                dispatchPresence(server, session, changes);
+            }
         },
         .unavailable => {
-            if (server.session_map) |sm| sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
-            broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
+            // Start accumulation for unavailable too (consistent handling).
+            session.stanza_kind = .presence;
+            session.stanza_buf_len = 0;
+            session.stanza_to = "";
+            session.stanza_id = "";
+            session.stanza_type = "unavailable";
+            session.pres_priority_collecting = false;
+            session.pres_priority_len = 0;
+
+            if (elem.self_closing) {
+                dispatchPresence(server, session, changes);
+            }
         },
         .subscribe => {
             handleSubscribe(server, session, elem, changes);
@@ -88,6 +98,47 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
             handleUnsubscribed(server, session, elem, changes);
         },
         else => {},
+    }
+}
+
+/// Dispatch a completed presence stanza — called from handleElementEnd on </presence>.
+/// Extracts priority from accumulated buffer, updates SessionMap, and broadcasts.
+pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList) void {
+    defer session.resetStanza();
+
+    const bound = session.stream.bound_jid orelse return;
+    const type_str = session.stanza_type;
+
+    // Parse priority from accumulated <priority> text (RFC 6121 §4.7.2.3)
+    var prio: i8 = 0;
+    if (session.pres_priority_len > 0) {
+        const prio_text = session.pres_priority_buf[0..session.pres_priority_len];
+        prio = std.fmt.parseInt(i8, prio_text, 10) catch 0;
+    }
+
+    if (type_str.len == 0) {
+        // Available presence
+        if (server.session_map) |sm| {
+            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
+            sm.setPriority(bound.local, bound.domain, bound.resource, prio);
+        }
+        broadcastPresence(server, bound.local, bound.domain, bound.resource, changes);
+
+        // Send presence probes to contacts we're subscribed to
+        sendPresenceProbes(server, session, bound.local, bound.domain, changes);
+
+        // Deliver any offline messages queued for this user
+        session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
+
+        log.info("connection {d} now available: {s}@{s}/{s} (priority={d})", .{
+            session.conn.id, bound.local, bound.domain, bound.resource, prio,
+        });
+    } else if (std.mem.eql(u8, type_str, "unavailable")) {
+        if (server.session_map) |sm| {
+            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
+            sm.setPriority(bound.local, bound.domain, bound.resource, -128);
+        }
+        broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
     }
 }
 

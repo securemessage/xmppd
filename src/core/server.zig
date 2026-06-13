@@ -227,6 +227,11 @@ pub const Session = struct {
     pep_collecting: bool = false,
     pep_payload: std.ArrayListUnmanaged(u8) = .{},
 
+    /// Presence priority accumulation — tracks <priority> child text during presence stanza.
+    pres_priority_collecting: bool = false,
+    pres_priority_buf: [8]u8 = undefined,
+    pres_priority_len: u8 = 0,
+
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
 
@@ -848,6 +853,11 @@ pub const Server = struct {
     fn handleElementStart(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         // If accumulating a message/presence stanza, serialize child elements into buffer
         if (session.stanza_kind != .none) {
+            // Detect <priority> child inside presence stanza for RFC 6121 §4.7.2.3
+            if (session.stanza_kind == .presence and std.mem.eql(u8, elem.local_name, "priority")) {
+                session.pres_priority_collecting = true;
+                session.pres_priority_len = 0;
+            }
             self.accumulateStanzaElement(session, elem);
             return;
         }
@@ -971,6 +981,15 @@ pub const Server = struct {
     fn handleText(self: *Server, session: *Session, text: []const u8) void {
         // Stanza content accumulation (message/presence body text)
         if (session.stanza_kind != .none) {
+            // Also capture <priority> text for presence stanzas (RFC 6121 §4.7.2.3)
+            if (session.pres_priority_collecting) {
+                const remaining = session.pres_priority_buf.len - session.pres_priority_len;
+                const to_copy: u8 = @intCast(@min(text.len, remaining));
+                if (to_copy > 0) {
+                    @memcpy(session.pres_priority_buf[session.pres_priority_len .. session.pres_priority_len + to_copy], text[0..to_copy]);
+                    session.pres_priority_len += to_copy;
+                }
+            }
             self.accumulateStanzaText(session, text);
             return;
         }
@@ -1040,9 +1059,17 @@ pub const Server = struct {
             if (session.reader.depth > 1) {
                 // Still inside the stanza — accumulate the child close tag
                 self.accumulateStanzaClose(session, name);
+                // Stop collecting <priority> text on </priority>
+                if (session.pres_priority_collecting and std.mem.eql(u8, name, "priority")) {
+                    session.pres_priority_collecting = false;
+                }
             } else {
                 // Stanza complete (depth back to stream level) — route to targets
-                self.dispatchStanza(session, changes);
+                if (session.stanza_kind == .presence) {
+                    presence_handler.dispatchPresence(self, session, changes);
+                } else {
+                    self.dispatchStanza(session, changes);
+                }
             }
             return;
         }

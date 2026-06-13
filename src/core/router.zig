@@ -114,6 +114,26 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             entries_buf[0] = e;
             break :blk @as(usize, 1);
         }
+        // RFC 6121 §8.5.3.2: resource not found — fall back to highest-priority
+        // available resource instead of treating as offline.
+        if (session.stanza_kind == .message) {
+            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+            if (avail_count > 0) {
+                // Find highest non-negative priority resource
+                var best_idx: usize = 0;
+                var best_prio: i8 = -128;
+                for (entries_buf[0..avail_count], 0..) |entry, i| {
+                    if (entry.priority >= 0 and entry.priority > best_prio) {
+                        best_prio = entry.priority;
+                        best_idx = i;
+                    }
+                }
+                if (best_prio >= 0) {
+                    entries_buf[0] = entries_buf[best_idx];
+                    break :blk @as(usize, 1);
+                }
+            }
+        }
         break :blk @as(usize, 0);
     } else sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
 
@@ -141,6 +161,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     } else inner_xml;
 
     for (entries_buf[0..route_count]) |entry| {
+        // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
+        if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
+
         if (entry.worker_id == server.worker_id) {
             if (target_count < local_ids.len) {
                 local_ids[target_count] = entry.local_session_id;
