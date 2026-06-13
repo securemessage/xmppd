@@ -282,6 +282,15 @@ pub const Connection = struct {
         return n;
     }
 
+    /// Synchronous flush — blocks until all pending write data is sent.
+    /// Used for graceful shutdown (sending </stream:stream> before close).
+    pub fn flushSync(self: *Connection) void {
+        var attempts: u32 = 0;
+        while (self.hasPendingWrite() and attempts < 100) : (attempts += 1) {
+            _ = self.flushSend() catch return;
+        }
+    }
+
     /// Upgrade the connection to TLS.
     ///
     /// Creates an SSL session from the given context and begins a non-blocking

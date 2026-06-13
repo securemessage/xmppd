@@ -41,15 +41,42 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
         if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
     }
 
-    // Directed presence to MUC domain → MUC join/part
+    // Directed presence — has a 'to' attribute
     if (to_str.len > 0) {
+        const to_jid = xmpp.Jid.parse(to_str) catch return;
+
+        // MUC domain → MUC join/part
         if (server.muc_host) |muc_host| {
-            const to_jid = xmpp.Jid.parse(to_str) catch return;
             if (std.mem.eql(u8, to_jid.domain, muc_host)) {
                 muc_handler.handleMucPresence(server, session, to_jid.local, to_jid.resource, type_str, changes);
                 return;
             }
         }
+
+        // RFC 6121 §8.5.3: Directed presence to a full JID on this domain —
+        // forward via stanza accumulation pipeline.
+        if (to_jid.resource.len > 0 and std.mem.eql(u8, to_jid.domain, server.server_host)) {
+            var id_str: []const u8 = "";
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+            }
+            session.stanza_kind = .presence;
+            session.stanza_buf_len = 0;
+            session.stanza_to = to_str;
+            session.stanza_id = id_str;
+            session.stanza_type = type_str;
+            session.pres_priority_collecting = false;
+            session.pres_priority_len = 0;
+            if (elem.self_closing) {
+                // Directed presence uses dispatchStanza (router) for delivery, not dispatchPresence
+                const router = @import("router.zig");
+                router.dispatchStanza(server, session, changes);
+            }
+            return;
+        }
+
+        // Remote domain directed presence — forward via S2S (not implemented for directed yet)
+        return;
     }
 
     const ptype = xmpp.PresenceType.fromString(type_str);

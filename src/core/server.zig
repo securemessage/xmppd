@@ -128,6 +128,7 @@ pub const StanzaKind = enum {
     none,
     message,
     presence,
+    iq,
 };
 
 /// Which MAM query text field we're currently collecting.
@@ -820,6 +821,10 @@ pub const Server = struct {
             .stream_close => {
                 _ = session.stream.handleClose();
                 self.sendRaw(session, "</stream:stream>");
+                // Flush the closing tag before teardown so the peer receives it.
+                if (session.conn.hasPendingWrite()) {
+                    session.conn.flushSync();
+                }
                 session_lifecycle.closeSession(self, session.conn.id, changes);
             },
             .element_start => |elem| {
@@ -890,7 +895,7 @@ pub const Server = struct {
         if (session.stream.state == .features_sasl or session.stream.state == .sasl_negotiating) {
             if (std.mem.eql(u8, elem.local_name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
                 // Start IQ accumulation for registration
-                iq_handler.handleIq(session, elem);
+                iq_handler.handleIq(session, elem, self.server_host);
                 return;
             }
             // IQ child elements during pre-auth registration
@@ -1065,9 +1070,11 @@ pub const Server = struct {
                 }
             } else {
                 // Stanza complete (depth back to stream level) — route to targets
-                if (session.stanza_kind == .presence) {
+                if (session.stanza_kind == .presence and session.stanza_to.len == 0) {
+                    // Own presence (no 'to') — update availability + broadcast
                     presence_handler.dispatchPresence(self, session, changes);
                 } else {
+                    // Message, IQ, or directed presence — route to target
                     self.dispatchStanza(session, changes);
                 }
             }
@@ -1986,9 +1993,8 @@ pub const Server = struct {
     }
 
     fn handleIq(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
-        _ = self;
         _ = changes;
-        iq_handler.handleIq(session, elem);
+        iq_handler.handleIq(session, elem, self.server_host);
     }
 
     /// Handle child elements inside an IQ stanza (query, item, etc.)

@@ -110,32 +110,30 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var remote_delivered: bool = false;
 
     const route_count = if (to_jid.resource.len > 0) blk: {
+        // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
+        // If resource not found: store offline or bounce (§8.5.3.2). Do NOT reroute.
         if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
             entries_buf[0] = e;
             break :blk @as(usize, 1);
         }
-        // RFC 6121 §8.5.3.2: resource not found — fall back to highest-priority
-        // available resource instead of treating as offline.
-        if (session.stanza_kind == .message) {
-            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
-            if (avail_count > 0) {
-                // Find highest non-negative priority resource
-                var best_idx: usize = 0;
-                var best_prio: i8 = -128;
-                for (entries_buf[0..avail_count], 0..) |entry, i| {
-                    if (entry.priority >= 0 and entry.priority > best_prio) {
-                        best_prio = entry.priority;
-                        best_idx = i;
-                    }
-                }
-                if (best_prio >= 0) {
-                    entries_buf[0] = entries_buf[best_idx];
-                    break :blk @as(usize, 1);
-                }
-            }
-        }
         break :blk @as(usize, 0);
-    } else sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+    } else blk: {
+        // RFC 6121 §8.5.2: Message addressed to bare JID — deliver to available resources.
+        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+        if (avail_count == 0) break :blk @as(usize, 0);
+
+        // For messages, select best resource(s) by priority (§8.5.2.1.1).
+        if (session.stanza_kind == .message) {
+            // Find highest non-negative priority
+            var best_prio: i8 = -128;
+            for (entries_buf[0..avail_count]) |entry| {
+                if (entry.priority > best_prio) best_prio = entry.priority;
+            }
+            // If all priorities are negative, don't deliver (§8.5.2.1.1)
+            if (best_prio < 0) break :blk @as(usize, 0);
+        }
+        break :blk avail_count;
+    };
 
     // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
     const is_archivable = session.stanza_kind == .message and
@@ -310,6 +308,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const tag_name: []const u8 = switch (session.stanza_kind) {
         .message => "message",
         .presence => "presence",
+        .iq => "iq",
         .none => return,
     };
 
@@ -379,6 +378,7 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
     const tag_name: []const u8 = switch (session.stanza_kind) {
         .message => "message",
         .presence => "presence",
+        .iq => "iq",
         .none => return,
     };
 
@@ -453,6 +453,7 @@ fn enqueueCrossThreadStanza(
     const tag_name: []const u8 = switch (kind) {
         .message => "message",
         .presence => "presence",
+        .iq => "iq",
         .none => return,
     };
 

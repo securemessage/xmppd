@@ -41,20 +41,53 @@ const ns_rsm = "http://jabber.org/protocol/rsm";
 const ns_xdata = "jabber:x:data";
 
 /// Start IQ accumulation — called from handleElementStart when an <iq> is seen.
-pub fn handleIq(session: *Session, elem: xml.Element) void {
+/// If the IQ is addressed to another local user's full JID, switches to stanza
+/// accumulation mode (stanza_kind = .iq) for forwarding via dispatchStanza.
+pub fn handleIq(session: *Session, elem: xml.Element, server_host: []const u8) void {
+    var to_str: []const u8 = "";
+    var type_str: []const u8 = "";
+    var id_str: []const u8 = "";
+
+    for (elem.attributes) |attr| {
+        if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
+        if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+        if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
+    }
+
+    // RFC 6121 §8.5.3: IQ addressed to another user's full JID — forward via stanza
+    // accumulation pipeline instead of server-side IQ handling.
+    if (to_str.len > 0) {
+        const xmpp2 = @import("xmpp");
+        if (xmpp2.Jid.parse(to_str)) |to_jid| {
+            if (to_jid.resource.len > 0 and std.mem.eql(u8, to_jid.domain, server_host)) {
+                // Check it's not our own full JID
+                const is_own = if (session.stream.bound_jid) |bound|
+                    std.mem.eql(u8, to_jid.local, bound.local) and
+                        std.mem.eql(u8, to_jid.resource, bound.resource)
+                else
+                    false;
+                if (!is_own) {
+                    // Use stanza accumulation pipeline for forwarding
+                    session.stanza_kind = .iq;
+                    session.stanza_buf_len = 0;
+                    session.stanza_to = to_str;
+                    session.stanza_id = id_str;
+                    session.stanza_type = type_str;
+                    return;
+                }
+            }
+        } else |_| {}
+    }
+
     session.iq_active = true;
     session.iq_child_ns = "";
     session.iq_child_name = "";
-    session.iq_to = "";
+    session.iq_to = to_str;
     session.iq_roster_item_jid = "";
     session.iq_roster_item_name = "";
     session.iq_roster_item_sub = "";
-
-    for (elem.attributes) |attr| {
-        if (std.mem.eql(u8, attr.local_name, "type")) session.iq_type = attr.value;
-        if (std.mem.eql(u8, attr.local_name, "id")) session.iq_id = attr.value;
-        if (std.mem.eql(u8, attr.local_name, "to")) session.iq_to = attr.value;
-    }
+    session.iq_type = type_str;
+    session.iq_id = id_str;
 }
 
 /// Handle child elements inside an IQ stanza (query, item, etc.)
@@ -335,15 +368,19 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     }
 
     // IQ addressed to a local bare JID (user@domain) that is NOT the sender's own.
+    // Note: full-JID forwarding is handled in handleIq() before iq_active is set.
     // Per XEP-0030 §8: return service-unavailable/empty for disco to bare JIDs.
     // Per XEP-0054 §3.2/§3.3: server responds on behalf, blocks SET to others.
     if (iq_to.len > 0 and std.mem.indexOfScalar(u8, iq_to, '@') != null) {
         // Check if it's the sender's own bare JID — if so, fall through to normal handlers
+        const xmpp2 = @import("xmpp");
+        const to_jid = xmpp2.Jid.parse(iq_to) catch {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        };
         const is_own_jid = if (session.stream.bound_jid) |bound| blk: {
-            const at_pos = std.mem.indexOfScalar(u8, iq_to, '@') orelse break :blk false;
-            const local_part = iq_to[0..at_pos];
-            break :blk std.mem.eql(u8, local_part, bound.local) and
-                std.mem.eql(u8, iq_to[at_pos + 1 ..], bound.domain);
+            break :blk std.mem.eql(u8, to_jid.local, bound.local) and
+                std.mem.eql(u8, to_jid.domain, bound.domain);
         } else false;
 
         if (!is_own_jid) {
