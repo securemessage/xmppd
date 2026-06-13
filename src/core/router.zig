@@ -111,10 +111,28 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     const route_count = if (to_jid.resource.len > 0) blk: {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
-        // If resource not found: store offline or bounce (§8.5.3.2). Do NOT reroute.
         if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
             entries_buf[0] = e;
             break :blk @as(usize, 1);
+        }
+        // Resource not found (§8.5.3.2). For type='chat', fall back to best
+        // available resource (§8.5.3.2.1). For others, store offline or bounce.
+        if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "chat")) {
+            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+            if (avail_count > 0) {
+                var best_idx: usize = 0;
+                var best_prio: i8 = -128;
+                for (entries_buf[0..avail_count], 0..) |entry, i| {
+                    if (entry.priority >= 0 and entry.priority > best_prio) {
+                        best_prio = entry.priority;
+                        best_idx = i;
+                    }
+                }
+                if (best_prio >= 0) {
+                    entries_buf[0] = entries_buf[best_idx];
+                    break :blk @as(usize, 1);
+                }
+            }
         }
         break :blk @as(usize, 0);
     } else blk: {
