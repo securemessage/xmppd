@@ -30,30 +30,44 @@ polymorphism for performance at scale.
 | Standard | Description | Support | Tested |
 |----------|-------------|---------|--------|
 | RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
-| RFC 6121 | XMPP IM (roster, presence, messaging) | Full | E2E, Unit |
-| XEP-0030 | Service Discovery | Full | 15/15 Interop |
-| XEP-0045 | Multi-User Chat | Partial | E2E, Unit¹ |
-| XEP-0054 | vCard-temp | Full | 6/6 Interop |
+| RFC 6121 | XMPP IM (roster, presence, messaging) | Partial¹ | Interop, E2E, Unit |
+| XEP-0030 | Service Discovery | Full | Interop |
+| XEP-0045 | Multi-User Chat | Partial² | Interop, E2E, Unit |
+| XEP-0054 | vCard-temp | Full | Interop |
 | XEP-0077 | In-Band Registration | Full | E2E, Unit |
 | XEP-0084 | User Avatar (via PEP) | Full | E2E |
-| XEP-0085 | Chat State Notifications | Full | 1/1 Interop |
-| XEP-0092 | Software Version | Full | 2/2 Interop |
-| XEP-0163 | Personal Eventing Protocol | Partial | E2E |
+| XEP-0085 | Chat State Notifications | Full | Interop |
+| XEP-0092 | Software Version | Full | Interop |
+| XEP-0160 | Offline Message Storage | Full | E2E, Unit |
+| XEP-0163 | Personal Eventing Protocol | Partial³ | E2E |
+| XEP-0184 | Message Delivery Receipts | Pass-through | E2E |
 | XEP-0191 | Blocking Command | Full | E2E, Unit |
-| XEP-0198 | Stream Management | Full | E2E |
-| XEP-0199 | XMPP Ping | Full | 3/3 Interop |
+| XEP-0198 | Stream Management | Partial⁴ | E2E |
+| XEP-0199 | XMPP Ping | Full | Interop |
 | XEP-0220 | Server Dialback | Partial | E2E |
 | XEP-0280 | Message Carbons | Full | E2E, Unit |
+| XEP-0308 | Last Message Correction | Pass-through | E2E |
 | XEP-0313 | Message Archive Management | Full | E2E, Unit |
 | XEP-0359 | Unique and Stable Stanza IDs | Full | Unit |
 | XEP-0440 | SASL Channel-Binding Type Negotiation | Full | Unit |
 
-**Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2,
+**Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2 (495 tests available),
 **E2E** = verified with Gajim, Conversations, and/or Dino,
-**Unit** = Zig unit tests (738 tests).
+**Unit** = Zig unit tests (738 tests),
+**Pass-through** = server forwards stanzas without interpretation; no server-side logic required.
 
-¹ MUC core functionality works (join, part, groupchat, kick, ban, history, MAM) but Smack's
-interop framework cannot run MUC tests due to room preflight disco checks on transient rooms.
+¹ Single-resource messaging and presence work. Multi-resource routing (§8.5) has known
+issues: presence to bare JIDs is not broadcast to all resources, messages to offline
+resources are stored instead of routed to the highest-priority online resource (T118).
+
+² MUC core functionality works (join, part, groupchat, kick, ban, history, MAM, disco).
+Missing: room configuration forms (XEP-0045 §10), invitations (§7.8), voice requests.
+
+³ PEP supports publish, subscribe, auto-subscribe, auto-create, persistent items, and
+avatar metadata notifications. Not a full XEP-0060 PubSub service.
+
+⁴ SM supports enable, ack requests (`<r/>`), and ack responses (`<a/>`). Session resume
+is **not implemented** — sessions cannot be resumed after disconnection.
 
 ## Building
 
