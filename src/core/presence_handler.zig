@@ -28,6 +28,7 @@ const generic_roster = @import("roster_store");
 const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
+const iq_handler = @import("iq_handler.zig");
 
 const log = std.log.scoped(.presence);
 
@@ -41,42 +42,67 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
         if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
     }
 
-    // Directed presence — has a 'to' attribute
+    // Directed presence — has a 'to' attribute.
+    // Subscription stanzas also have 'to' but are NOT directed presence;
+    // they fall through to the switch below.
     if (to_str.len > 0) {
-        const to_jid = xmpp.Jid.parse(to_str) catch return;
+        const ptype_directed = xmpp.PresenceType.fromString(type_str);
+        const is_subscription = switch (ptype_directed) {
+            .subscribe, .subscribed, .unsubscribe, .unsubscribed => true,
+            else => false,
+        };
 
-        // MUC domain → MUC join/part
-        if (server.muc_host) |muc_host| {
-            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
-                muc_handler.handleMucPresence(server, session, to_jid.local, to_jid.resource, type_str, changes);
+        if (!is_subscription) {
+            const to_jid = xmpp.Jid.parse(to_str) catch return;
+
+            // MUC domain → MUC join/part
+            if (server.muc_host) |muc_host| {
+                if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+                    muc_handler.handleMucPresence(server, session, to_jid.local, to_jid.resource, type_str, changes);
+                    return;
+                }
+            }
+
+            // Local domain directed presence
+            if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+                if (to_jid.resource.len > 0) {
+                    // RFC 6121 §8.5.3: Directed presence to a full JID —
+                    // forward via stanza accumulation pipeline.
+                    var id_str: []const u8 = "";
+                    for (elem.attributes) |attr| {
+                        if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+                    }
+                    session.stanza_kind = .presence;
+                    session.stanza_buf_len = 0;
+                    session.stanza_to = to_str;
+                    session.stanza_id = id_str;
+                    session.stanza_type = type_str;
+                    session.pres_priority_collecting = false;
+                    session.pres_priority_len = 0;
+                    if (elem.self_closing) {
+                        const router = @import("router.zig");
+                        router.dispatchStanza(server, session, changes);
+                    }
+                } else {
+                    // RFC 6121 §8.5.2.1.2: Directed presence to a bare JID —
+                    // deliver to ALL available resources of the target user.
+                    session.stanza_kind = .presence;
+                    session.stanza_buf_len = 0;
+                    session.stanza_to = to_str;
+                    session.stanza_id = "";
+                    session.stanza_type = type_str;
+                    session.pres_priority_collecting = false;
+                    session.pres_priority_len = 0;
+                    if (elem.self_closing) {
+                        dispatchDirectedPresenceToBareJid(server, session, to_jid.local, to_jid.domain, changes);
+                    }
+                }
                 return;
             }
-        }
 
-        // RFC 6121 §8.5.3: Directed presence to a full JID on this domain —
-        // forward via stanza accumulation pipeline.
-        if (to_jid.resource.len > 0 and std.mem.eql(u8, to_jid.domain, server.server_host)) {
-            var id_str: []const u8 = "";
-            for (elem.attributes) |attr| {
-                if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
-            }
-            session.stanza_kind = .presence;
-            session.stanza_buf_len = 0;
-            session.stanza_to = to_str;
-            session.stanza_id = id_str;
-            session.stanza_type = type_str;
-            session.pres_priority_collecting = false;
-            session.pres_priority_len = 0;
-            if (elem.self_closing) {
-                // Directed presence uses dispatchStanza (router) for delivery, not dispatchPresence
-                const router = @import("router.zig");
-                router.dispatchStanza(server, session, changes);
-            }
+            // Remote domain directed presence — forward via S2S (not implemented for directed yet)
             return;
         }
-
-        // Remote domain directed presence — forward via S2S (not implemented for directed yet)
-        return;
     }
 
     const ptype = xmpp.PresenceType.fromString(type_str);
@@ -149,7 +175,14 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
             sm.setPriority(bound.local, bound.domain, bound.resource, prio);
         }
-        broadcastPresence(server, bound.local, bound.domain, bound.resource, changes);
+        const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
+        broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);
+
+        // RFC 6121 §4.4.2: Send presence to all of the user's own available resources.
+        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
+
+        // RFC 6121 §4.4.2: Send the user's other available resources' presence to this new resource.
+        sendOtherResourcesPresence(server, session, bound.local, bound.domain, bound.resource, changes);
 
         // Send presence probes to contacts we're subscribed to
         sendPresenceProbes(server, session, bound.local, bound.domain, changes);
@@ -166,11 +199,15 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             sm.setPriority(bound.local, bound.domain, bound.resource, -128);
         }
         broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
+
+        // RFC 6121 §4.4.2: Send unavailable presence to user's own remaining resources.
+        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
     }
 }
 
 /// Broadcast available presence to all roster subscribers.
-pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
+/// inner_xml contains child elements (priority, show, status) serialized from the client stanza.
+pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
 
     // Build the from JID string
@@ -198,13 +235,20 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
         for (subscriber_jids) |s| server.allocator.free(s);
         server.allocator.free(subscriber_jids);
     }
-    // Build presence stanza
-    var pres_buf: [512]u8 = undefined;
+    // Build presence stanza with inner XML content
+    var pres_buf: [16896]u8 = undefined;
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
     pw.writeAll(from_str) catch return;
-    pw.writeAll("'/>") catch return;
+    pw.writeByte('\'') catch return;
+    if (inner_xml.len > 0) {
+        pw.writeByte('>') catch return;
+        pw.writeAll(inner_xml) catch return;
+        pw.writeAll("</presence>") catch return;
+    } else {
+        pw.writeAll("/>") catch return;
+    }
     const presence_xml = pres_fbs.getWritten();
 
     // Deliver to each subscriber
@@ -360,12 +404,17 @@ fn handleSubscribe(server: *Server, session: *Session, elem: xml.Element, change
     const owner_bare = bare_fbs.getWritten();
 
     // Update owner's roster: set ask='subscribe'
+    var result_sub: Subscription = .none;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
+        result_sub = existing.subscription;
         roster.setItem(owner_bare, to_str, "", existing.subscription, true) catch return;
     } else {
         roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
     }
+
+    // RFC 6121 §3.1.2: Push roster item to all of owner's interested resources
+    iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", result_sub, true, changes);
 
     // Forward subscribe to the target
     const to_jid = xmpp.Jid.parse(to_str) catch return;
@@ -411,33 +460,44 @@ fn handleSubscribed(server: *Server, session: *Session, elem: xml.Element, chang
     const owner_bare = bare_fbs.getWritten();
 
     // Update our roster: contact's subscription gains "from" direction
+    var owner_new_sub: Subscription = .from;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        owner_new_sub = switch (existing.subscription) {
             .none => .from,
             .to => .both,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", new_sub, false) catch return;
+        roster.setItem(owner_bare, to_str, "", owner_new_sub, false) catch return;
     } else {
         roster.setItem(owner_bare, to_str, "", .from, false) catch return;
     }
 
+    // RFC 6121 §3.1.5: Push updated roster to owner's interested resources
+    iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
+
     // Update contact's roster: their subscription gains "to" direction
+    var contact_new_sub: Subscription = .to;
     if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        contact_new_sub = switch (existing.subscription) {
             .none => .to,
             .from => .both,
             else => existing.subscription,
         };
-        roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
+        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
     } else {
         roster.setItem(to_str, owner_bare, "", .to, false) catch {};
     }
 
+    // RFC 6121 §3.1.5: Push updated roster to contact's interested resources
+    const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
+    if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
+        iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
+    }
+
     // Forward subscribed to the target
-    const to_jid = xmpp.Jid.parse(to_str) catch return;
+    const to_jid = to_jid_parsed;
 
     // Build presence stanza
     var sd_pres_buf: [512]u8 = undefined;
@@ -461,7 +521,7 @@ fn handleSubscribed(server: *Server, session: *Session, elem: xml.Element, chang
     const sd_sm = server.session_map orelse return;
     if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
         if (ent.presence_available) {
-            broadcastPresence(server, bound.local, bound.domain, bound.resource, changes);
+            broadcastPresence(server, bound.local, bound.domain, bound.resource, "", changes);
         }
     }
 
@@ -487,29 +547,40 @@ fn handleUnsubscribe(server: *Server, session: *Session, elem: xml.Element, chan
     const owner_bare = bare_fbs.getWritten();
 
     // Update our roster: remove "to" direction
+    var owner_new_sub: Subscription = .none;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        owner_new_sub = switch (existing.subscription) {
             .to => .none,
             .both => .from,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", new_sub, false) catch {};
+        roster.setItem(owner_bare, to_str, "", owner_new_sub, false) catch {};
     }
 
+    // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
+    iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
+
     // Update contact's roster: remove "from" direction
+    var contact_new_sub: Subscription = .none;
     if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        contact_new_sub = switch (existing.subscription) {
             .from => .none,
             .both => .to,
             else => existing.subscription,
         };
-        roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
+        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+    }
+
+    // RFC 6121 §3.2.2: Push updated roster to contact's interested resources
+    const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
+    if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
+        iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
     }
 
     // Forward unsubscribe
-    const to_jid = xmpp.Jid.parse(to_str) catch return;
+    const to_jid = to_jid_parsed;
 
     // Build presence stanza
     var unsub_pres_buf: [512]u8 = undefined;
@@ -551,29 +622,42 @@ fn handleUnsubscribed(server: *Server, session: *Session, elem: xml.Element, cha
     const owner_bare = bare_fbs.getWritten();
 
     // Update our roster: remove "from" direction
+    var owner_new_sub: Subscription = .none;
+    var owner_ask: bool = false;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        owner_ask = existing.ask;
+        owner_new_sub = switch (existing.subscription) {
             .from => .none,
             .both => .to,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", new_sub, existing.ask) catch {};
+        roster.setItem(owner_bare, to_str, "", owner_new_sub, existing.ask) catch {};
     }
 
+    // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
+    iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, owner_ask, changes);
+
     // Update contact's roster: remove "to" direction
+    var contact_new_sub: Subscription = .none;
     if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        const new_sub: Subscription = switch (existing.subscription) {
+        contact_new_sub = switch (existing.subscription) {
             .to => .none,
             .both => .from,
             else => existing.subscription,
         };
-        roster.setItem(to_str, owner_bare, "", new_sub, false) catch {};
+        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+    }
+
+    // RFC 6121 §3.2.2: Push updated roster to contact's interested resources
+    const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
+    if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
+        iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
     }
 
     // Forward unsubscribed
-    const to_jid = xmpp.Jid.parse(to_str) catch return;
+    const to_jid = to_jid_parsed;
 
     // Build presence stanza
     var unsd_pres_buf: [512]u8 = undefined;
@@ -599,6 +683,182 @@ fn handleUnsubscribed(server: *Server, session: *Session, elem: xml.Element, cha
 // ========================================================================
 // Internal delivery helpers
 // ========================================================================
+
+/// RFC 6121 §4.4.2: Send presence from a resource to all of the user's own
+/// available resources (including the originator). This allows multi-resource
+/// clients to see each other's presence updates.
+fn broadcastToOwnResources(
+    server: *Server,
+    sender_session: *Session,
+    local: []const u8,
+    domain: []const u8,
+    resource: []const u8,
+    changes: *ChangeList,
+) void {
+    const sm = server.session_map orelse return;
+
+    // Build the from full JID
+    var from_buf: [256]u8 = undefined;
+    var from_fbs = std.io.fixedBufferStream(&from_buf);
+    const fw = from_fbs.writer();
+    fw.writeAll(local) catch return;
+    fw.writeByte('@') catch return;
+    fw.writeAll(domain) catch return;
+    fw.writeByte('/') catch return;
+    fw.writeAll(resource) catch return;
+    const from_str = from_fbs.getWritten();
+
+    // Build presence stanza including inner XML (priority, show, status, etc.)
+    const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
+    var pres_buf: [16896]u8 = undefined;
+    var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+    const pw = pres_fbs.writer();
+    pw.writeAll("<presence from='") catch return;
+    pw.writeAll(from_str) catch return;
+    pw.writeByte('\'') catch return;
+    if (sender_session.stanza_type.len > 0) {
+        pw.writeAll(" type='") catch return;
+        pw.writeAll(sender_session.stanza_type) catch return;
+        pw.writeByte('\'') catch return;
+    }
+    if (inner_xml.len > 0) {
+        pw.writeByte('>') catch return;
+        pw.writeAll(inner_xml) catch return;
+        pw.writeAll("</presence>") catch return;
+    } else {
+        pw.writeAll("/>") catch return;
+    }
+    const presence_xml = pres_fbs.getWritten();
+
+    var entries: [16]SessionEntry = undefined;
+    const count = sm.findByBareJid(local, domain, &entries);
+
+    for (entries[0..count]) |entry| {
+        if (entry.worker_id == server.worker_id) {
+            const target = server.sessions[entry.local_session_id] orelse continue;
+            target.conn.queueSend(presence_xml) catch continue;
+            _ = target.conn.flushSend() catch {};
+            if (target.conn.hasPendingWrite()) {
+                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+            }
+        } else if (server.delivery_system) |ds| {
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
+        }
+    }
+}
+
+/// RFC 6121 §4.4.2 (reverse direction): When a new resource becomes available,
+/// send the current presence of all OTHER already-available resources to it.
+/// This allows the new resource to know the full presence state of the account.
+fn sendOtherResourcesPresence(
+    server: *Server,
+    new_session: *Session,
+    local: []const u8,
+    domain: []const u8,
+    new_resource: []const u8,
+    changes: *ChangeList,
+) void {
+    const sm = server.session_map orelse return;
+
+    var entries: [16]SessionEntry = undefined;
+    const count = sm.findAvailableByBareJid(local, domain, &entries);
+
+    for (entries[0..count]) |entry| {
+        const entry_resource = entry.resource();
+        // Skip self — the new resource already knows its own presence.
+        if (std.mem.eql(u8, entry_resource, new_resource)) continue;
+
+        // Build presence from the existing resource with its current priority.
+        var pres_buf: [512]u8 = undefined;
+        var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+        const pw = pres_fbs.writer();
+        pw.writeAll("<presence from='") catch continue;
+        pw.writeAll(local) catch continue;
+        pw.writeByte('@') catch continue;
+        pw.writeAll(domain) catch continue;
+        pw.writeByte('/') catch continue;
+        pw.writeAll(entry_resource) catch continue;
+        pw.writeByte('\'') catch continue;
+        if (entry.priority != 0) {
+            pw.writeAll("><priority>") catch continue;
+            pw.print("{d}", .{entry.priority}) catch continue;
+            pw.writeAll("</priority></presence>") catch continue;
+        } else {
+            pw.writeAll("/>") catch continue;
+        }
+        const presence_xml = pres_fbs.getWritten();
+
+        new_session.conn.queueSend(presence_xml) catch continue;
+        if (new_session.conn.hasPendingWrite()) {
+            changes.addWrite(new_session.conn.fd, new_session.conn.id) catch {};
+        }
+    }
+}
+
+/// RFC 6121 §8.5.2.1.2: Dispatch directed presence to all available resources
+/// of a bare JID target. Called when presence has a 'to' targeting a bare JID
+/// on the local domain (e.g., <presence type='unavailable' to='bob@domain'/>).
+pub fn dispatchDirectedPresenceToBareJid(
+    server: *Server,
+    sender_session: *Session,
+    target_local: []const u8,
+    target_domain: []const u8,
+    changes: *ChangeList,
+) void {
+    defer sender_session.resetStanza();
+
+    const sm = server.session_map orelse return;
+    const bound = sender_session.stream.bound_jid orelse return;
+
+    // Build the from full JID
+    var from_buf: [256]u8 = undefined;
+    var from_fbs = std.io.fixedBufferStream(&from_buf);
+    const fw = from_fbs.writer();
+    fw.writeAll(bound.local) catch return;
+    fw.writeByte('@') catch return;
+    fw.writeAll(bound.domain) catch return;
+    fw.writeByte('/') catch return;
+    fw.writeAll(bound.resource) catch return;
+    const from_str = from_fbs.getWritten();
+
+    // Build presence stanza with inner XML
+    const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
+    var pres_buf: [16896]u8 = undefined;
+    var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+    const pw = pres_fbs.writer();
+    pw.writeAll("<presence from='") catch return;
+    pw.writeAll(from_str) catch return;
+    pw.writeByte('\'') catch return;
+    if (sender_session.stanza_type.len > 0) {
+        pw.writeAll(" type='") catch return;
+        pw.writeAll(sender_session.stanza_type) catch return;
+        pw.writeByte('\'') catch return;
+    }
+    if (inner_xml.len > 0) {
+        pw.writeByte('>') catch return;
+        pw.writeAll(inner_xml) catch return;
+        pw.writeAll("</presence>") catch return;
+    } else {
+        pw.writeAll("/>") catch return;
+    }
+    const presence_xml = pres_fbs.getWritten();
+
+    // Deliver to all available resources of the target bare JID
+    var entries: [16]SessionEntry = undefined;
+    const count = sm.findAvailableByBareJid(target_local, target_domain, &entries);
+
+    for (entries[0..count]) |entry| {
+        if (entry.worker_id == server.worker_id) {
+            const target = server.sessions[entry.local_session_id] orelse continue;
+            target.conn.queueSend(presence_xml) catch continue;
+            if (target.conn.hasPendingWrite()) {
+                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+            }
+        } else if (server.delivery_system) |ds| {
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
+        }
+    }
+}
 
 /// Deliver a presence stanza to all available sessions of subscriber JIDs.
 /// Handles local delivery + cross-thread MPSC + S2S forwarding.

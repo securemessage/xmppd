@@ -136,12 +136,38 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
         break :blk @as(usize, 0);
     } else blk: {
-        // RFC 6121 §8.5.2: Message addressed to bare JID — deliver to available resources.
+        // RFC 6121 §8.5.2: Stanza addressed to bare JID — deliver to available resources.
         const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
         if (avail_count == 0) break :blk @as(usize, 0);
 
+        if (session.stanza_kind == .iq) {
+            // RFC 6121 §8.5.2.1.3: IQ to bare JID — deliver to ONE best resource.
+            var best_idx: usize = 0;
+            var best_prio: i8 = -128;
+            for (entries_buf[0..avail_count], 0..) |entry, i| {
+                if (entry.priority > best_prio) {
+                    best_prio = entry.priority;
+                    best_idx = i;
+                }
+            }
+            if (best_prio < 0) break :blk @as(usize, 0);
+            entries_buf[0] = entries_buf[best_idx];
+            break :blk @as(usize, 1);
+        }
+
         // For messages, select best resource(s) by priority (§8.5.2.1.1).
         if (session.stanza_kind == .message) {
+            // RFC 6121 §8.5.2.1.1: groupchat and error to bare JID MUST NOT be delivered.
+            if (std.mem.eql(u8, type_str, "groupchat") or std.mem.eql(u8, type_str, "error")) {
+                if (std.mem.eql(u8, type_str, "groupchat")) {
+                    sendServiceUnavailable(session, id_str, to_str, from_str);
+                    if (session.conn.hasPendingWrite()) {
+                        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                    }
+                }
+                // type='error' to bare JID: silently drop (no error response for error stanzas)
+                return;
+            }
             // Find highest non-negative priority
             var best_prio: i8 = -128;
             for (entries_buf[0..avail_count]) |entry| {
@@ -255,6 +281,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     if (target_count == 0 and !remote_delivered) {
+        // RFC 6121 §8.5.2.1a: Presence stanzas to non-existent users are silently ignored.
+        if (session.stanza_kind == .presence) return;
+
         // Offline storage for messages
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
@@ -647,11 +676,20 @@ fn sendCarbons(
     }
 }
 
-/// Send a service-unavailable error for a message that can't be delivered.
+/// Send a service-unavailable error for a stanza that can't be delivered.
+/// Uses the correct element name based on the stanza kind (message or iq).
 pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []const u8, from_str: []const u8) void {
+    const tag_name: []const u8 = switch (session.stanza_kind) {
+        .iq => "iq",
+        .message => "message",
+        else => "message",
+    };
+
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    w.writeAll("<message type='error'") catch return;
+    w.writeByte('<') catch return;
+    w.writeAll(tag_name) catch return;
+    w.writeAll(" type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
         w.writeAll(id_str) catch return;
@@ -661,6 +699,8 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
     w.writeAll(to_str) catch return;
     w.writeAll("' to='") catch return;
     w.writeAll(from_str) catch return;
-    w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+    w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
+    w.writeAll(tag_name) catch return;
+    w.writeByte('>') catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
 }
