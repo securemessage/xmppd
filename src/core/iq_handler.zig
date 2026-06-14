@@ -41,8 +41,10 @@ const ns_rsm = "http://jabber.org/protocol/rsm";
 const ns_xdata = "jabber:x:data";
 
 /// Start IQ accumulation — called from handleElementStart when an <iq> is seen.
-/// If the IQ is addressed to another local user's full JID, switches to stanza
-/// accumulation mode (stanza_kind = .iq) for forwarding via dispatchStanza.
+/// If the IQ is addressed to another local user (full or bare JID), switches to
+/// stanza accumulation mode (stanza_kind = .iq) for forwarding via dispatchStanza.
+/// Per RFC 6121 §8.5.2.1.3 and §8.5.3, the server delivers IQs to the target
+/// user's resource(s) rather than handling them server-side.
 pub fn handleIq(session: *Session, elem: xml.Element, server_host: []const u8) void {
     var to_str: []const u8 = "";
     var type_str: []const u8 = "";
@@ -56,6 +58,9 @@ pub fn handleIq(session: *Session, elem: xml.Element, server_host: []const u8) v
 
     // RFC 6121 §8.5.3: IQ addressed to another user's full JID — forward via stanza
     // accumulation pipeline instead of server-side IQ handling.
+    // Bare-JID IQs to other users are handled server-side in dispatchIq (roster,
+    // disco, vCard), with unknown namespaces returning service-unavailable per
+    // RFC 6121 §8.5.2.1.3.
     if (to_str.len > 0) {
         const xmpp2 = @import("xmpp");
         if (xmpp2.Jid.parse(to_str)) |to_jid| {
@@ -166,10 +171,24 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         }
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.roster)) {
         // Roster item inside <query xmlns='jabber:iq:roster'>
+        session.iq_roster_item_count += 1;
+        // Reset per-item group tracking for this new item
+        session.iq_roster_group_count = 0;
+        session.iq_roster_group_hash_count = 0;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "jid")) session.iq_roster_item_jid = attr.value;
             if (std.mem.eql(u8, attr.local_name, "name")) session.iq_roster_item_name = attr.value;
             if (std.mem.eql(u8, attr.local_name, "subscription")) session.iq_roster_item_sub = attr.value;
+        }
+    } else if (std.mem.eql(u8, elem.local_name, "group") and std.mem.eql(u8, ns, xml.ns.roster)) {
+        // <group> inside a roster <item>
+        session.iq_roster_group_count += 1;
+        session.iq_roster_collecting_group = true;
+        session.iq_roster_group_text_len = 0;
+        // Self-closing <group/> is an empty group
+        if (elem.self_closing) {
+            session.iq_roster_collecting_group = false;
+            session.iq_roster_has_empty_group = true;
         }
     } else if (std.mem.eql(u8, elem.local_name, "item") and std.mem.eql(u8, ns, xml.ns.muc_admin)) {
         // MUC admin item: reuse roster item fields (nick→jid, role→sub)
@@ -295,6 +314,13 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_roster_item_jid = "";
         session.iq_roster_item_name = "";
         session.iq_roster_item_sub = "";
+        session.iq_roster_item_count = 0;
+        session.iq_roster_group_count = 0;
+        session.iq_roster_has_empty_group = false;
+        session.iq_roster_has_duplicate_group = false;
+        session.iq_roster_collecting_group = false;
+        session.iq_roster_group_text_len = 0;
+        session.iq_roster_group_hash_count = 0;
         // Reset MAM accumulation
         session.mam_query_id = "";
         session.mam_with = "";
@@ -368,11 +394,10 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     }
 
     // IQ addressed to a local bare JID (user@domain) that is NOT the sender's own.
-    // Note: full-JID forwarding is handled in handleIq() before iq_active is set.
-    // Per XEP-0030 §8: return service-unavailable/empty for disco to bare JIDs.
-    // Per XEP-0054 §3.2/§3.3: server responds on behalf, blocks SET to others.
+    // Full-JID IQs to other users are forwarded via stanza accumulation in handleIq().
+    // Bare-JID IQs are handled server-side for known namespaces (disco, vCard),
+    // with unknown namespaces returning service-unavailable per RFC 6121 §8.5.2.1.3.
     if (iq_to.len > 0 and std.mem.indexOfScalar(u8, iq_to, '@') != null) {
-        // Check if it's the sender's own bare JID — if so, fall through to normal handlers
         const xmpp2 = @import("xmpp");
         const to_jid = xmpp2.Jid.parse(iq_to) catch {
             sendIqError(server, session, iq_id, "jid-malformed");
@@ -385,7 +410,6 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
 
         if (!is_own_jid) {
             if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
-                // disco#items on a bare JID: always return empty result
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
                 writeIqHeader(server, w, session, "result", iq_id);
@@ -394,7 +418,6 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
-                // disco#info on a bare JID: return service-unavailable per XEP-0030 §8
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
                 writeIqHeader(server, w, session, "error", iq_id);
@@ -403,17 +426,22 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
-                // vCard GET for another user — server responds on behalf
                 handleVcardGetFor(server, session, iq_id, iq_to);
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "set")) {
-                // vCard SET for another user — not allowed
                 sendIqError(server, session, iq_id, "not-allowed");
                 return;
             }
+            // RFC 6121 §2.1.5: Roster set/get to another user — forbidden.
+            if (std.mem.eql(u8, child_ns, xml.ns.roster)) {
+                sendIqErrorWithType(server, session, iq_id, "auth", "forbidden");
+                return;
+            }
+            // RFC 6121 §8.5.2.1.3: Unknown IQ to another user — return service-unavailable.
+            sendIqError(server, session, iq_id, "service-unavailable");
+            return;
         }
-        // Own bare JID or other IQs: fall through to normal handlers
     }
 
     // Roster query
@@ -611,8 +639,10 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
 }
 
 /// Handle IQ roster get — return the user's roster.
+/// Marks the session as "interested" for receiving roster pushes (RFC 6121 §2.1.6).
 fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
     _ = changes;
+    session.roster_interested = true;
     const roster = server.roster orelse {
         // No roster configured — return empty roster
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
@@ -666,16 +696,50 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
 }
 
 /// Handle IQ roster set — add/update/remove a roster item.
+/// Performs validation per RFC 6121 §2.1.5 and §2.3.
 fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
-    _ = changes;
     const roster = server.roster orelse {
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
 
     const bound = session.stream.bound_jid orelse return;
+    const iq_to = session.iq_to;
+
+    // RFC 6121 §2.1.5: Roster set addressed to another user's bare JID is forbidden.
+    if (iq_to.len > 0) {
+        const xmpp2 = @import("xmpp");
+        if (xmpp2.Jid.parse(iq_to)) |to_jid| {
+            const is_own = std.mem.eql(u8, to_jid.local, bound.local) and
+                std.mem.eql(u8, to_jid.domain, bound.domain);
+            if (!is_own) {
+                sendIqErrorWithType(server, session, iq_id, "auth", "forbidden");
+                return;
+            }
+        } else |_| {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        }
+    }
+
+    // RFC 6121 §2.1.5: Roster set MUST contain exactly one <item>.
+    if (session.iq_roster_item_count != 1) {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    }
+
     const item_jid = session.iq_roster_item_jid;
     if (item_jid.len == 0) {
+        sendIqError(server, session, iq_id, "bad-request");
+        return;
+    }
+
+    // Validate group elements: reject empty groups and duplicate group names.
+    if (session.iq_roster_has_empty_group) {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return;
+    }
+    if (session.iq_roster_has_duplicate_group) {
         sendIqError(server, session, iq_id, "bad-request");
         return;
     }
@@ -691,16 +755,21 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     const item_sub = session.iq_roster_item_sub;
     const Subscription = @import("roster_store").Subscription;
 
+    var result_sub: Subscription = .none;
+    var result_ask: bool = false;
+
     if (std.mem.eql(u8, item_sub, "remove")) {
         // Remove roster item
         roster.removeItem(bare_jid, item_jid) catch {};
+        result_sub = .remove;
     } else {
         // Add or update — preserve existing subscription if item exists
-        const sub = if (roster.getItem(server.allocator, bare_jid, item_jid) catch null) |existing| blk: {
+        if (roster.getItem(server.allocator, bare_jid, item_jid) catch null) |existing| {
             defer if (existing.name.len > 0) server.allocator.free(existing.name);
-            break :blk existing.subscription;
-        } else Subscription.none;
-        roster.setItem(bare_jid, item_jid, session.iq_roster_item_name, sub, false) catch {
+            result_sub = existing.subscription;
+            result_ask = existing.ask;
+        }
+        roster.setItem(bare_jid, item_jid, session.iq_roster_item_name, result_sub, result_ask) catch {
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
@@ -712,6 +781,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+
+    // RFC 6121 §2.1.6: Send roster push to all interested resources.
+    pushRosterItem(server, bound.local, bound.domain, item_jid, session.iq_roster_item_name, result_sub, result_ask, changes);
 }
 
 /// Handle password change (XEP-0077 §3.3). Sends PasswordChangeRequest to auth daemon.
@@ -1715,11 +1787,114 @@ fn pushBlockPush(
 }
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
+    sendIqErrorWithType(server, session, iq_id, "cancel", condition);
+}
+
+pub fn sendIqErrorWithType(server: *Server, session: *Session, iq_id: []const u8, err_type: []const u8, condition: []const u8) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
     writeIqHeader(server, w, session, "error", iq_id);
-    w.writeAll("><error type='cancel'><") catch return;
+    w.writeAll("><error type='") catch return;
+    w.writeAll(err_type) catch return;
+    w.writeAll("'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// RFC 6121 §2.1.6: Push a roster item update to all interested resources of a user.
+/// Sends an IQ type='set' with the updated item to each connected resource that
+/// has previously requested the roster.
+pub fn pushRosterItem(
+    server: *Server,
+    user_local: []const u8,
+    user_domain: []const u8,
+    item_jid: []const u8,
+    item_name: []const u8,
+    subscription: generic_roster.Subscription,
+    ask: bool,
+    changes: *ChangeList,
+) void {
+    const sm = server.session_map orelse return;
+    var entries: [16]SessionEntry = undefined;
+    const count = sm.findByBareJid(user_local, user_domain, &entries);
+    if (count == 0) return;
+
+    for (entries[0..count]) |entry| {
+        if (entry.worker_id == server.worker_id) {
+            const target = server.sessions[entry.local_session_id] orelse continue;
+            if (!target.roster_interested) continue;
+
+            var push_buf: [1024]u8 = undefined;
+            var pfbs = std.io.fixedBufferStream(&push_buf);
+            const pw = pfbs.writer();
+            // Generate a unique push ID
+            var id_buf: [32]u8 = undefined;
+            const push_id = server.generateStanzaId(&id_buf);
+
+            pw.writeAll("<iq type='set' to='") catch continue;
+            pw.writeAll(user_local) catch continue;
+            pw.writeByte('@') catch continue;
+            pw.writeAll(user_domain) catch continue;
+            pw.writeByte('/') catch continue;
+            pw.writeAll(entry.resource()) catch continue;
+            pw.writeAll("' id='") catch continue;
+            pw.writeAll(push_id) catch continue;
+            pw.writeAll("'><query xmlns='jabber:iq:roster'><item jid='") catch continue;
+            pw.writeAll(item_jid) catch continue;
+            pw.writeByte('\'') catch continue;
+            if (item_name.len > 0) {
+                pw.writeAll(" name='") catch continue;
+                pw.writeAll(item_name) catch continue;
+                pw.writeByte('\'') catch continue;
+            }
+            pw.writeAll(" subscription='") catch continue;
+            pw.writeAll(subscription.toString()) catch continue;
+            pw.writeByte('\'') catch continue;
+            if (ask) {
+                pw.writeAll(" ask='subscribe'") catch continue;
+            }
+            pw.writeAll("/></query></iq>") catch continue;
+
+            target.conn.queueSend(pfbs.getWritten()) catch continue;
+            if (target.conn.hasPendingWrite()) {
+                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
+            }
+        } else {
+            // Cross-thread roster push via MPSC delivery queue
+            if (server.delivery_system) |ds| {
+                var push_buf: [1024]u8 = undefined;
+                var pfbs = std.io.fixedBufferStream(&push_buf);
+                const pw = pfbs.writer();
+                var id_buf: [32]u8 = undefined;
+                const push_id = server.generateStanzaId(&id_buf);
+
+                pw.writeAll("<iq type='set' to='") catch continue;
+                pw.writeAll(user_local) catch continue;
+                pw.writeByte('@') catch continue;
+                pw.writeAll(user_domain) catch continue;
+                pw.writeByte('/') catch continue;
+                pw.writeAll(entry.resource()) catch continue;
+                pw.writeAll("' id='") catch continue;
+                pw.writeAll(push_id) catch continue;
+                pw.writeAll("'><query xmlns='jabber:iq:roster'><item jid='") catch continue;
+                pw.writeAll(item_jid) catch continue;
+                pw.writeByte('\'') catch continue;
+                if (item_name.len > 0) {
+                    pw.writeAll(" name='") catch continue;
+                    pw.writeAll(item_name) catch continue;
+                    pw.writeByte('\'') catch continue;
+                }
+                pw.writeAll(" subscription='") catch continue;
+                pw.writeAll(subscription.toString()) catch continue;
+                pw.writeByte('\'') catch continue;
+                if (ask) {
+                    pw.writeAll(" ask='subscribe'") catch continue;
+                }
+                pw.writeAll("/></query></iq>") catch continue;
+
+                ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, pfbs.getWritten()) catch {};
+            }
+        }
+    }
 }

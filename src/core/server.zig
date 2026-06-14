@@ -98,7 +98,9 @@ pub const IPC_S2S_UDATA = LISTENER_UDATA - 2;
 const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
 
 /// Maximum changelist entries per event loop iteration.
-const CHANGE_BUF_SIZE = 256;
+/// Must be large enough to accommodate presence broadcasts, roster pushes,
+/// and SM acks across many concurrent connections without silent drops.
+const CHANGE_BUF_SIZE = 1024;
 
 /// Maximum XML element nesting depth allowed.
 /// XMPP stanzas are shallow (stream=1, stanza=2, children=3-5 typically).
@@ -200,6 +202,23 @@ pub const Session = struct {
     iq_roster_item_jid: []const u8 = "",
     iq_roster_item_name: []const u8 = "",
     iq_roster_item_sub: []const u8 = "",
+    /// Number of <item> elements seen inside a roster set IQ (for multi-item rejection).
+    iq_roster_item_count: u8 = 0,
+    /// Number of <group> elements seen inside the current roster <item>.
+    iq_roster_group_count: u8 = 0,
+    /// Whether a zero-length <group/> or <group></group> was seen.
+    iq_roster_has_empty_group: bool = false,
+    /// Whether duplicate group names were seen within the current <item>.
+    iq_roster_has_duplicate_group: bool = false,
+    /// Buffer for collecting <group> text content.
+    iq_roster_group_text_buf: [256]u8 = undefined,
+    iq_roster_group_text_len: usize = 0,
+    /// Whether we're currently collecting text inside a <group> element.
+    iq_roster_collecting_group: bool = false,
+    /// Buffer of group name hashes seen in the current item (for duplicate detection).
+    /// Stores FNV-1a hashes of group names — up to 16 groups per item.
+    iq_roster_group_hashes: [16]u64 = undefined,
+    iq_roster_group_hash_count: u8 = 0,
 
     /// MAM query accumulation (XEP-0313) — populated by handleIqChild.
     mam_query_id: []const u8 = "",
@@ -235,6 +254,10 @@ pub const Session = struct {
 
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
+
+    /// RFC 6121 §2.1.6: Whether this resource has requested the roster (is "interested").
+    /// Interested resources receive roster pushes for subscription changes.
+    roster_interested: bool = false,
 
     /// Registration (XEP-0077) text accumulation.
     reg_collecting_password: bool = false,
@@ -1036,6 +1059,17 @@ pub const Server = struct {
             return;
         }
 
+        // Roster <group> text accumulation
+        if (session.iq_roster_collecting_group) {
+            const remaining = session.iq_roster_group_text_buf.len - session.iq_roster_group_text_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.iq_roster_group_text_buf[session.iq_roster_group_text_len .. session.iq_roster_group_text_len + to_copy], text[0..to_copy]);
+                session.iq_roster_group_text_len += to_copy;
+            }
+            return;
+        }
+
         // MAM query text accumulation (field values, RSM elements)
         if (session.mam_collecting != .none) {
             const remaining = session.mam_text_buf.len - session.mam_text_len;
@@ -1126,6 +1160,31 @@ pub const Server = struct {
                     self.accumulateVcardClose(session, name);
                 }
                 session.vcard_collecting = false;
+            }
+        }
+
+        // Roster <group> text — commit on </group>
+        if (session.iq_active and session.iq_roster_collecting_group) {
+            session.iq_roster_collecting_group = false;
+            const group_text = session.iq_roster_group_text_buf[0..session.iq_roster_group_text_len];
+            if (group_text.len == 0) {
+                session.iq_roster_has_empty_group = true;
+            } else {
+                // Check for duplicate via FNV-1a hash
+                const hash = std.hash.Fnv1a_64.hash(group_text);
+                var is_dup = false;
+                for (session.iq_roster_group_hashes[0..session.iq_roster_group_hash_count]) |h| {
+                    if (h == hash) {
+                        is_dup = true;
+                        break;
+                    }
+                }
+                if (is_dup) {
+                    session.iq_roster_has_duplicate_group = true;
+                } else if (session.iq_roster_group_hash_count < session.iq_roster_group_hashes.len) {
+                    session.iq_roster_group_hashes[session.iq_roster_group_hash_count] = hash;
+                    session.iq_roster_group_hash_count += 1;
+                }
             }
         }
 
@@ -2448,6 +2507,7 @@ pub const Server = struct {
     }
 
     /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.
+    /// Flushes immediately to avoid latency from changelist-based deferred writes.
     fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) void {
         _ = self;
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
@@ -2456,6 +2516,9 @@ pub const Server = struct {
         std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
         w.writeAll("'/>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
+        // Attempt immediate flush — SM acks are latency-critical.
+        // If flush leaves pending data (WouldBlock), fall back to kqueue write.
+        _ = session.conn.flushSend() catch {};
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
