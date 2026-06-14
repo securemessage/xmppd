@@ -219,6 +219,9 @@ pub const Session = struct {
     /// Stores FNV-1a hashes of group names — up to 16 groups per item.
     iq_roster_group_hashes: [16]u64 = undefined,
     iq_roster_group_hash_count: u8 = 0,
+    /// Accumulated serialized groups: [len_be(2) | text] * N for storage.
+    iq_roster_groups_buf: [2048]u8 = undefined,
+    iq_roster_groups_len: usize = 0,
 
     /// MAM query accumulation (XEP-0313) — populated by handleIqChild.
     mam_query_id: []const u8 = "",
@@ -1184,6 +1187,13 @@ pub const Server = struct {
                 } else if (session.iq_roster_group_hash_count < session.iq_roster_group_hashes.len) {
                     session.iq_roster_group_hashes[session.iq_roster_group_hash_count] = hash;
                     session.iq_roster_group_hash_count += 1;
+                    // Append to serialized groups buffer: [len_be(2) | text]
+                    const needed = 2 + group_text.len;
+                    if (session.iq_roster_groups_len + needed <= session.iq_roster_groups_buf.len) {
+                        std.mem.writeInt(u16, session.iq_roster_groups_buf[session.iq_roster_groups_len..][0..2], @intCast(group_text.len), .big);
+                        @memcpy(session.iq_roster_groups_buf[session.iq_roster_groups_len + 2 .. session.iq_roster_groups_len + needed], group_text);
+                        session.iq_roster_groups_len += needed;
+                    }
                 }
             }
         }

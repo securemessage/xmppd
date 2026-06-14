@@ -11,6 +11,7 @@
 //!
 //! ```
 //! | subscription (1) | ask (1) | name_len_be (2) | name (variable) |
+//! | group_count (1) | [group_len_be (2) | group (variable)] * group_count |
 //! ```
 //!
 //! Subscription: 0=none, 1=to, 2=from, 3=both, 4=remove
@@ -53,6 +54,9 @@ pub const RosterEntry = struct {
     subscription: Subscription = .none,
     ask: bool = false,
     name: []const u8 = "",
+    /// Serialized groups: [len_be(2) | text] * N. Caller-owned if from getItem/getAllItems.
+    groups: []const u8 = "",
+    group_count: u8 = 0,
 };
 
 pub fn RosterStore(comptime Backend: type) type {
@@ -83,11 +87,17 @@ pub fn RosterStore(comptime Backend: type) type {
 
         /// Set or update a roster item.
         pub fn setItem(self: *Self, owner: []const u8, contact: []const u8, name: []const u8, subscription: Subscription, ask: bool) !void {
+            return self.setItemWithGroups(owner, contact, name, subscription, ask, "", 0);
+        }
+
+        /// Set or update a roster item with groups.
+        /// groups_data is pre-serialized: [len_be(2) | text] * group_count.
+        pub fn setItemWithGroups(self: *Self, owner: []const u8, contact: []const u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) !void {
             var key_buf: [512]u8 = undefined;
             const key = compositeKey(&key_buf, owner, contact);
 
-            var val_buf: [512]u8 = undefined;
-            const val = serializeEntry(&val_buf, name, subscription, ask);
+            var val_buf: [4096]u8 = undefined;
+            const val = serializeEntry(&val_buf, name, subscription, ask, groups_data, group_count);
             try self.backend.put(NAMESPACE, key, val);
         }
 
@@ -124,8 +134,8 @@ pub fn RosterStore(comptime Backend: type) type {
         };
 
         /// Get all roster items for an owner.
-        /// Caller owns the returned slice and must free each item's contact_jid
-        /// and name (if non-empty), then free the slice itself.
+        /// Caller owns the returned slice and must free each item's contact_jid,
+        /// name (if non-empty), and groups (if non-empty), then free the slice itself.
         pub fn getAllItems(self: *Self, allocator: std.mem.Allocator, owner: []const u8) ![]RosterItem {
             var prefix_buf: [256]u8 = undefined;
             const prefix = ownerPrefix(&prefix_buf, owner);
@@ -138,6 +148,7 @@ pub fn RosterStore(comptime Backend: type) type {
                 for (list.items) |item| {
                     allocator.free(item.contact_jid);
                     if (item.entry.name.len > 0) allocator.free(item.entry.name);
+                    if (item.entry.groups.len > 0) allocator.free(item.entry.groups);
                 }
                 list.deinit(allocator);
             }
@@ -149,11 +160,13 @@ pub fn RosterStore(comptime Backend: type) type {
                 list.append(allocator, .{
                     .contact_jid = allocator.dupe(u8, contact) catch {
                         if (entry.name.len > 0) allocator.free(entry.name);
+                        if (entry.groups.len > 0) allocator.free(entry.groups);
                         continue;
                     },
                     .entry = entry,
                 }) catch {
                     if (entry.name.len > 0) allocator.free(entry.name);
+                    if (entry.groups.len > 0) allocator.free(entry.groups);
                     continue;
                 };
             }
@@ -166,6 +179,7 @@ pub fn RosterStore(comptime Backend: type) type {
             for (items) |item| {
                 allocator.free(item.contact_jid);
                 if (item.entry.name.len > 0) allocator.free(item.entry.name);
+                if (item.entry.groups.len > 0) allocator.free(item.entry.groups);
             }
             allocator.free(items);
         }
@@ -242,12 +256,17 @@ fn ownerPrefix(buf: []u8, owner: []const u8) []const u8 {
     return buf[0 .. owner.len + 1];
 }
 
-fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: bool) []const u8 {
+fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) []const u8 {
     buf[0] = @intFromEnum(subscription);
     buf[1] = if (ask) 1 else 0;
     std.mem.writeInt(u16, buf[2..4], @intCast(name.len), .big);
     @memcpy(buf[4 .. 4 + name.len], name);
-    return buf[0 .. 4 + name.len];
+    const pos = 4 + name.len;
+    buf[pos] = group_count;
+    if (groups_data.len > 0) {
+        @memcpy(buf[pos + 1 .. pos + 1 + groups_data.len], groups_data);
+    }
+    return buf[0 .. pos + 1 + groups_data.len];
 }
 
 pub fn deserializeEntry(allocator: std.mem.Allocator, data: []const u8) !RosterEntry {
@@ -258,10 +277,24 @@ pub fn deserializeEntry(allocator: std.mem.Allocator, data: []const u8) !RosterE
     if (data.len < 4 + name_len) return error.InvalidFormat;
 
     const name_slice = data[4 .. 4 + name_len];
+    const pos = 4 + name_len;
+
+    // Parse groups (if present — backward compatible with old format)
+    var group_count: u8 = 0;
+    var groups_slice: []const u8 = "";
+    if (data.len > pos) {
+        group_count = data[pos];
+        if (group_count > 0 and data.len > pos + 1) {
+            groups_slice = data[pos + 1 ..];
+        }
+    }
+
     return .{
         .subscription = @enumFromInt(if (sub_byte <= 4) sub_byte else 0),
         .ask = ask_byte != 0,
         .name = if (name_len > 0) try allocator.dupe(u8, name_slice) else "",
+        .groups = if (groups_slice.len > 0) try allocator.dupe(u8, groups_slice) else "",
+        .group_count = group_count,
     };
 }
 

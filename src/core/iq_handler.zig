@@ -175,6 +175,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         // Reset per-item group tracking for this new item
         session.iq_roster_group_count = 0;
         session.iq_roster_group_hash_count = 0;
+        session.iq_roster_groups_len = 0;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "jid")) session.iq_roster_item_jid = attr.value;
             if (std.mem.eql(u8, attr.local_name, "name")) session.iq_roster_item_name = attr.value;
@@ -321,6 +322,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_roster_collecting_group = false;
         session.iq_roster_group_text_len = 0;
         session.iq_roster_group_hash_count = 0;
+        session.iq_roster_groups_len = 0;
         // Reset MAM accumulation
         session.mam_query_id = "";
         session.mam_with = "";
@@ -688,7 +690,13 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         if (item.entry.ask) {
             w.writeAll(" ask='subscribe'") catch return;
         }
-        w.writeAll("/>") catch return;
+        if (item.entry.group_count > 0) {
+            w.writeByte('>') catch return;
+            writeGroupElements(w, item.entry.groups, item.entry.group_count);
+            w.writeAll("</item>") catch return;
+        } else {
+            w.writeAll("/>") catch return;
+        }
     }
 
     w.writeAll("</query></iq>") catch return;
@@ -766,10 +774,13 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         // Add or update — preserve existing subscription if item exists
         if (roster.getItem(server.allocator, bare_jid, item_jid) catch null) |existing| {
             defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
             result_sub = existing.subscription;
             result_ask = existing.ask;
         }
-        roster.setItem(bare_jid, item_jid, session.iq_roster_item_name, result_sub, result_ask) catch {
+        const groups_data = session.iq_roster_groups_buf[0..session.iq_roster_groups_len];
+        const group_count_val = session.iq_roster_group_hash_count;
+        roster.setItemWithGroups(bare_jid, item_jid, session.iq_roster_item_name, result_sub, result_ask, groups_data, group_count_val) catch {
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
@@ -1802,6 +1813,24 @@ pub fn sendIqErrorWithType(server: *Server, session: *Session, iq_id: []const u8
     session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
+/// Write <group>text</group> elements from serialized groups data.
+/// Format: [len_be(2) | text] * group_count.
+fn writeGroupElements(w: anytype, groups_data: []const u8, group_count: u8) void {
+    var offset: usize = 0;
+    var i: u8 = 0;
+    while (i < group_count) : (i += 1) {
+        if (offset + 2 > groups_data.len) break;
+        const glen = std.mem.readInt(u16, groups_data[offset..][0..2], .big);
+        offset += 2;
+        if (offset + glen > groups_data.len) break;
+        const gtext = groups_data[offset .. offset + glen];
+        offset += glen;
+        w.writeAll("<group>") catch continue;
+        w.writeAll(gtext) catch continue;
+        w.writeAll("</group>") catch continue;
+    }
+}
+
 /// RFC 6121 §2.1.6: Push a roster item update to all interested resources of a user.
 /// Sends an IQ type='set' with the updated item to each connected resource that
 /// has previously requested the roster.
@@ -1820,81 +1849,83 @@ pub fn pushRosterItem(
     const count = sm.findByBareJid(user_local, user_domain, &entries);
     if (count == 0) return;
 
+    // Look up current item to get groups for the push.
+    var groups_data: []const u8 = "";
+    var group_count: u8 = 0;
+    if (server.roster) |roster| {
+        var owner_buf: [256]u8 = undefined;
+        var owner_fbs = std.io.fixedBufferStream(&owner_buf);
+        owner_fbs.writer().writeAll(user_local) catch {};
+        owner_fbs.writer().writeByte('@') catch {};
+        owner_fbs.writer().writeAll(user_domain) catch {};
+        const owner_bare = owner_fbs.getWritten();
+        if (roster.getItem(server.allocator, owner_bare, item_jid) catch null) |existing| {
+            defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            // groups_data is allocator-owned — will free after push loop
+            groups_data = existing.groups;
+            group_count = existing.group_count;
+        }
+    }
+    defer if (groups_data.len > 0) server.allocator.free(groups_data);
+
+    // Build the push XML once (same for all targets)
+    var push_buf: [4096]u8 = undefined;
+    var pfbs = std.io.fixedBufferStream(&push_buf);
+    const pw = pfbs.writer();
+    // We'll prepend per-target header, so build item portion first
+    pw.writeAll("<item jid='") catch return;
+    pw.writeAll(item_jid) catch return;
+    pw.writeByte('\'') catch return;
+    if (item_name.len > 0) {
+        pw.writeAll(" name='") catch return;
+        pw.writeAll(item_name) catch return;
+        pw.writeByte('\'') catch return;
+    }
+    pw.writeAll(" subscription='") catch return;
+    pw.writeAll(subscription.toString()) catch return;
+    pw.writeByte('\'') catch return;
+    if (ask) {
+        pw.writeAll(" ask='subscribe'") catch return;
+    }
+    if (group_count > 0) {
+        pw.writeByte('>') catch return;
+        writeGroupElements(pw, groups_data, group_count);
+        pw.writeAll("</item>") catch return;
+    } else {
+        pw.writeAll("/>") catch return;
+    }
+    const item_xml = pfbs.getWritten();
+
     for (entries[0..count]) |entry| {
+        // Build full push IQ per target (different 'to' and 'id')
+        var full_buf: [4096]u8 = undefined;
+        var ffbs = std.io.fixedBufferStream(&full_buf);
+        const fw = ffbs.writer();
+        var id_buf: [32]u8 = undefined;
+        const push_id = server.generateStanzaId(&id_buf);
+
+        fw.writeAll("<iq type='set' to='") catch continue;
+        fw.writeAll(user_local) catch continue;
+        fw.writeByte('@') catch continue;
+        fw.writeAll(user_domain) catch continue;
+        fw.writeByte('/') catch continue;
+        fw.writeAll(entry.resource()) catch continue;
+        fw.writeAll("' id='") catch continue;
+        fw.writeAll(push_id) catch continue;
+        fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch continue;
+        fw.writeAll(item_xml) catch continue;
+        fw.writeAll("</query></iq>") catch continue;
+        const full_xml = ffbs.getWritten();
+
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (!target.roster_interested) continue;
-
-            var push_buf: [1024]u8 = undefined;
-            var pfbs = std.io.fixedBufferStream(&push_buf);
-            const pw = pfbs.writer();
-            // Generate a unique push ID
-            var id_buf: [32]u8 = undefined;
-            const push_id = server.generateStanzaId(&id_buf);
-
-            pw.writeAll("<iq type='set' to='") catch continue;
-            pw.writeAll(user_local) catch continue;
-            pw.writeByte('@') catch continue;
-            pw.writeAll(user_domain) catch continue;
-            pw.writeByte('/') catch continue;
-            pw.writeAll(entry.resource()) catch continue;
-            pw.writeAll("' id='") catch continue;
-            pw.writeAll(push_id) catch continue;
-            pw.writeAll("'><query xmlns='jabber:iq:roster'><item jid='") catch continue;
-            pw.writeAll(item_jid) catch continue;
-            pw.writeByte('\'') catch continue;
-            if (item_name.len > 0) {
-                pw.writeAll(" name='") catch continue;
-                pw.writeAll(item_name) catch continue;
-                pw.writeByte('\'') catch continue;
-            }
-            pw.writeAll(" subscription='") catch continue;
-            pw.writeAll(subscription.toString()) catch continue;
-            pw.writeByte('\'') catch continue;
-            if (ask) {
-                pw.writeAll(" ask='subscribe'") catch continue;
-            }
-            pw.writeAll("/></query></iq>") catch continue;
-
-            target.conn.queueSend(pfbs.getWritten()) catch continue;
+            target.conn.queueSend(full_xml) catch continue;
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
             }
-        } else {
-            // Cross-thread roster push via MPSC delivery queue
-            if (server.delivery_system) |ds| {
-                var push_buf: [1024]u8 = undefined;
-                var pfbs = std.io.fixedBufferStream(&push_buf);
-                const pw = pfbs.writer();
-                var id_buf: [32]u8 = undefined;
-                const push_id = server.generateStanzaId(&id_buf);
-
-                pw.writeAll("<iq type='set' to='") catch continue;
-                pw.writeAll(user_local) catch continue;
-                pw.writeByte('@') catch continue;
-                pw.writeAll(user_domain) catch continue;
-                pw.writeByte('/') catch continue;
-                pw.writeAll(entry.resource()) catch continue;
-                pw.writeAll("' id='") catch continue;
-                pw.writeAll(push_id) catch continue;
-                pw.writeAll("'><query xmlns='jabber:iq:roster'><item jid='") catch continue;
-                pw.writeAll(item_jid) catch continue;
-                pw.writeByte('\'') catch continue;
-                if (item_name.len > 0) {
-                    pw.writeAll(" name='") catch continue;
-                    pw.writeAll(item_name) catch continue;
-                    pw.writeByte('\'') catch continue;
-                }
-                pw.writeAll(" subscription='") catch continue;
-                pw.writeAll(subscription.toString()) catch continue;
-                pw.writeByte('\'') catch continue;
-                if (ask) {
-                    pw.writeAll(" ask='subscribe'") catch continue;
-                }
-                pw.writeAll("/></query></iq>") catch continue;
-
-                ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, pfbs.getWritten()) catch {};
-            }
+        } else if (server.delivery_system) |ds| {
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch {};
         }
     }
 }
