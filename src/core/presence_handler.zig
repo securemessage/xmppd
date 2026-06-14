@@ -158,8 +158,27 @@ pub fn isSubscriptionType(type_str: []const u8) bool {
 
 /// Dispatch a subscription stanza with accumulated inner XML (extensions).
 /// Called from handlePresence (self-closing) or handleElementEnd (accumulated).
+/// RFC 6121 §3.1: Subscription processing always uses bare JIDs — strip any resource.
 pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.PresenceType, inner_xml: []const u8, changes: *ChangeList) void {
     defer session.resetStanza();
+
+    // Normalize stanza_to to bare JID (strip resource if present).
+    const to_str = session.stanza_to;
+    if (to_str.len > 0) {
+        const to_jid = xmpp.Jid.parse(to_str) catch {
+            return;
+        };
+        if (to_jid.resource.len > 0) {
+            // Rebuild as bare JID in a stable buffer within session's write_scratch.
+            var bare_fbs = std.io.fixedBufferStream(&session.write_scratch);
+            const bw = bare_fbs.writer();
+            bw.writeAll(to_jid.local) catch return;
+            bw.writeByte('@') catch return;
+            bw.writeAll(to_jid.domain) catch return;
+            session.stanza_to = bare_fbs.getWritten();
+        }
+    }
+
     switch (ptype) {
         .subscribe => handleSubscribe(server, session, inner_xml, changes),
         .subscribed => handleSubscribed(server, session, inner_xml, changes),
@@ -191,6 +210,13 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             sm.setPriority(bound.local, bound.domain, bound.resource, prio);
         }
         const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
+
+        // RFC 6121 §3.1.5: Store the presence inner XML so that subscription
+        // approval can forward the full current presence (with status/show/priority).
+        const store_len = @min(inner_xml.len, session.last_presence_inner.len);
+        @memcpy(session.last_presence_inner[0..store_len], inner_xml[0..store_len]);
+        session.last_presence_inner_len = store_len;
+
         broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);
 
         // RFC 6121 §4.4.2: Send presence to all of the user's own available resources.
@@ -415,13 +441,13 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     bare_fbs.writer().writeAll(bound.domain) catch return;
     const owner_bare = bare_fbs.getWritten();
 
-    // Update owner's roster: set ask='subscribe'
+    // Update owner's roster: set ask='subscribe' (preserve existing name/subscription)
     var result_sub: Subscription = .none;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
         defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
         result_sub = existing.subscription;
-        roster.setItem(owner_bare, to_str, "", existing.subscription, true) catch return;
+        roster.setItem(owner_bare, to_str, existing.name, existing.subscription, true) catch return;
     } else {
         roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
     }
@@ -486,7 +512,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             .to => .both,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", owner_new_sub, false) catch return;
+        roster.setItem(owner_bare, to_str, existing.name, owner_new_sub, false) catch return;
     } else {
         roster.setItem(owner_bare, to_str, "", .from, false) catch return;
     }
@@ -496,6 +522,8 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
 
     // Update contact's roster: their subscription gains "to" direction
     var contact_new_sub: Subscription = .to;
+    var contact_name_buf: [256]u8 = undefined;
+    var contact_name_len: usize = 0;
     if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
         contact_new_sub = switch (existing.subscription) {
@@ -503,7 +531,13 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             .from => .both,
             else => existing.subscription,
         };
-        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+        // Preserve existing display name
+        if (existing.name.len > 0) {
+            const copy_len = @min(existing.name.len, contact_name_buf.len);
+            @memcpy(contact_name_buf[0..copy_len], existing.name[0..copy_len]);
+            contact_name_len = copy_len;
+        }
+        roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch {};
     } else {
         roster.setItem(to_str, owner_bare, "", .to, false) catch {};
     }
@@ -535,11 +569,14 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
         deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sd_pres_xml, changes);
     }
 
-    // Also send our current presence to the newly subscribed contact (they can now see us)
+    // Also send our current presence to the newly subscribed contact (they can now see us).
+    // Use the stored last_presence_inner so the subscriber receives the full presence
+    // including status, show, and priority (RFC 6121 §3.1.5).
     const sd_sm = server.session_map orelse return;
     if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
         if (ent.presence_available) {
-            broadcastPresence(server, bound.local, bound.domain, bound.resource, "", changes);
+            const own_inner = session.last_presence_inner[0..session.last_presence_inner_len];
+            broadcastPresence(server, bound.local, bound.domain, bound.resource, own_inner, changes);
         }
     }
 
@@ -549,7 +586,13 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
         var probe_entries: [16]SessionEntry = undefined;
         const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &probe_entries);
         for (probe_entries[0..probe_count]) |pentry| {
-            var cpres_buf: [512]u8 = undefined;
+            // Look up the contact's session to retrieve their stored presence inner XML.
+            const contact_inner = if (pentry.worker_id == server.worker_id) blk: {
+                const contact_sess = server.sessions[pentry.local_session_id] orelse break :blk @as([]const u8, "");
+                break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
+            } else @as([]const u8, "");
+
+            var cpres_buf: [4608]u8 = undefined;
             var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
             const cpw = cpres_fbs.writer();
             cpw.writeAll("<presence from='") catch continue;
@@ -558,7 +601,14 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             cpw.writeAll(to_jid.domain) catch continue;
             cpw.writeByte('/') catch continue;
             cpw.writeAll(pentry.resource()) catch continue;
-            cpw.writeAll("'/>") catch continue;
+            cpw.writeByte('\'') catch continue;
+            if (contact_inner.len > 0) {
+                cpw.writeByte('>') catch continue;
+                cpw.writeAll(contact_inner) catch continue;
+                cpw.writeAll("</presence>") catch continue;
+            } else {
+                cpw.writeAll("/>") catch continue;
+            }
             // Deliver to the approver's session
             session.conn.queueSend(cpres_fbs.getWritten()) catch continue;
         }

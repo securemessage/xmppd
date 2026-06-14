@@ -255,6 +255,12 @@ pub const Session = struct {
     pres_priority_buf: [8]u8 = undefined,
     pres_priority_len: u8 = 0,
 
+    /// RFC 6121 §3.1.5: Last broadcast presence inner XML (priority, show, status).
+    /// Stored on each available presence dispatch so that subscription approval can
+    /// forward the full current presence (not just bare `<presence/>`).
+    last_presence_inner: [4096]u8 = undefined,
+    last_presence_inner_len: usize = 0,
+
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
 

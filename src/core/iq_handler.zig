@@ -774,6 +774,12 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
             if (e.groups.len > 0) server.allocator.free(e.groups);
         };
 
+        // RFC 6121 §2.5: Removing a non-existing item is an error.
+        if (old_entry == null) {
+            sendIqErrorWithType(server, session, iq_id, "cancel", "item-not-found");
+            return;
+        }
+
         roster.removeItem(bare_jid, item_jid) catch {};
         result_sub = .remove;
 
@@ -1931,9 +1937,10 @@ pub fn pushRosterItem(
     const count = sm.findByBareJid(user_local, user_domain, &entries);
     if (count == 0) return;
 
-    // Look up current item to get groups for the push.
+    // Look up current item to get groups and name for the push.
     var groups_data: []const u8 = "";
     var group_count: u8 = 0;
+    var stored_name: []const u8 = "";
     if (server.roster) |roster| {
         var owner_buf: [256]u8 = undefined;
         var owner_fbs = std.io.fixedBufferStream(&owner_buf);
@@ -1942,13 +1949,17 @@ pub fn pushRosterItem(
         owner_fbs.writer().writeAll(user_domain) catch {};
         const owner_bare = owner_fbs.getWritten();
         if (roster.getItem(server.allocator, owner_bare, item_jid) catch null) |existing| {
-            defer if (existing.name.len > 0) server.allocator.free(existing.name);
-            // groups_data is allocator-owned — will free after push loop
+            // groups_data and stored_name are allocator-owned — will free after push loop
             groups_data = existing.groups;
             group_count = existing.group_count;
+            stored_name = existing.name;
         }
     }
     defer if (groups_data.len > 0) server.allocator.free(groups_data);
+    defer if (stored_name.len > 0) server.allocator.free(stored_name);
+
+    // Use stored name from roster if caller didn't provide one.
+    const effective_name = if (item_name.len > 0) item_name else stored_name;
 
     // Build the push XML once (same for all targets)
     var push_buf: [4096]u8 = undefined;
@@ -1958,9 +1969,9 @@ pub fn pushRosterItem(
     pw.writeAll("<item jid='") catch return;
     pw.writeAll(item_jid) catch return;
     pw.writeByte('\'') catch return;
-    if (item_name.len > 0) {
+    if (effective_name.len > 0) {
         pw.writeAll(" name='") catch return;
-        pw.writeAll(item_name) catch return;
+        pw.writeAll(effective_name) catch return;
         pw.writeByte('\'') catch return;
     }
     pw.writeAll(" subscription='") catch return;
