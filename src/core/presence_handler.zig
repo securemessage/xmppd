@@ -138,18 +138,33 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
                 dispatchPresence(server, session, changes);
             }
         },
-        .subscribe => {
-            handleSubscribe(server, session, elem, changes);
+        .subscribe, .subscribed, .unsubscribe, .unsubscribed => {
+            // Subscription stanzas are dispatched immediately (extensions not forwarded yet).
+            session.stanza_to = to_str;
+            session.stanza_type = type_str;
+            dispatchSubscription(server, session, ptype, "", changes);
         },
-        .subscribed => {
-            handleSubscribed(server, session, elem, changes);
-        },
-        .unsubscribe => {
-            handleUnsubscribe(server, session, elem, changes);
-        },
-        .unsubscribed => {
-            handleUnsubscribed(server, session, elem, changes);
-        },
+        else => {},
+    }
+}
+
+/// Check if a presence type string is a subscription management type.
+pub fn isSubscriptionType(type_str: []const u8) bool {
+    return std.mem.eql(u8, type_str, "subscribe") or
+        std.mem.eql(u8, type_str, "subscribed") or
+        std.mem.eql(u8, type_str, "unsubscribe") or
+        std.mem.eql(u8, type_str, "unsubscribed");
+}
+
+/// Dispatch a subscription stanza with accumulated inner XML (extensions).
+/// Called from handlePresence (self-closing) or handleElementEnd (accumulated).
+pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.PresenceType, inner_xml: []const u8, changes: *ChangeList) void {
+    defer session.resetStanza();
+    switch (ptype) {
+        .subscribe => handleSubscribe(server, session, inner_xml, changes),
+        .subscribed => handleSubscribed(server, session, inner_xml, changes),
+        .unsubscribe => handleUnsubscribe(server, session, inner_xml, changes),
+        .unsubscribed => handleUnsubscribed(server, session, inner_xml, changes),
         else => {},
     }
 }
@@ -385,14 +400,11 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 // ========================================================================
 
 /// Handle <presence type='subscribe' to='contact@host'/> — outbound subscription request.
-fn handleSubscribe(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
 
-    var to_str: []const u8 = "";
-    for (elem.attributes) |attr| {
-        if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
-    }
+    const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
     // Build owner bare JID
@@ -407,6 +419,7 @@ fn handleSubscribe(server: *Server, session: *Session, elem: xml.Element, change
     var result_sub: Subscription = .none;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
+        defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
         result_sub = existing.subscription;
         roster.setItem(owner_bare, to_str, "", existing.subscription, true) catch return;
     } else {
@@ -419,15 +432,22 @@ fn handleSubscribe(server: *Server, session: *Session, elem: xml.Element, change
     // Forward subscribe to the target
     const to_jid = xmpp.Jid.parse(to_str) catch return;
 
-    // Build presence stanza
-    var sub_pres_buf: [512]u8 = undefined;
+    // Build presence stanza (include extensions from inner_xml)
+    var sub_pres_buf: [16896]u8 = undefined;
     var sub_pres_fbs = std.io.fixedBufferStream(&sub_pres_buf);
     const spw = sub_pres_fbs.writer();
     spw.writeAll("<presence from='") catch return;
     spw.writeAll(owner_bare) catch return;
     spw.writeAll("' to='") catch return;
     spw.writeAll(to_str) catch return;
-    spw.writeAll("' type='subscribe'/>") catch return;
+    spw.writeAll("' type='subscribe'") catch return;
+    if (inner_xml.len > 0) {
+        spw.writeByte('>') catch return;
+        spw.writeAll(inner_xml) catch return;
+        spw.writeAll("</presence>") catch return;
+    } else {
+        spw.writeAll("/>") catch return;
+    }
     const sub_pres_xml = sub_pres_fbs.getWritten();
 
     // Remote domain? Forward via S2S.
@@ -441,14 +461,12 @@ fn handleSubscribe(server: *Server, session: *Session, elem: xml.Element, change
 }
 
 /// Handle <presence type='subscribed' to='contact@host'/> — approve inbound subscription.
-fn handleSubscribed(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+    _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
 
-    var to_str: []const u8 = "";
-    for (elem.attributes) |attr| {
-        if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
-    }
+    const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
     // Build owner bare JID
@@ -517,7 +535,7 @@ fn handleSubscribed(server: *Server, session: *Session, elem: xml.Element, chang
         deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sd_pres_xml, changes);
     }
 
-    // Also send our current presence to the newly subscribed contact
+    // Also send our current presence to the newly subscribed contact (they can now see us)
     const sd_sm = server.session_map orelse return;
     if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
         if (ent.presence_available) {
@@ -525,18 +543,40 @@ fn handleSubscribed(server: *Server, session: *Session, elem: xml.Element, chang
         }
     }
 
+    // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
+    // The approver now has 'from' the contact = contact's presence should be visible.
+    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+        var probe_entries: [16]SessionEntry = undefined;
+        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &probe_entries);
+        for (probe_entries[0..probe_count]) |pentry| {
+            var cpres_buf: [512]u8 = undefined;
+            var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
+            const cpw = cpres_fbs.writer();
+            cpw.writeAll("<presence from='") catch continue;
+            cpw.writeAll(to_jid.local) catch continue;
+            cpw.writeByte('@') catch continue;
+            cpw.writeAll(to_jid.domain) catch continue;
+            cpw.writeByte('/') catch continue;
+            cpw.writeAll(pentry.resource()) catch continue;
+            cpw.writeAll("'/>") catch continue;
+            // Deliver to the approver's session
+            session.conn.queueSend(cpres_fbs.getWritten()) catch continue;
+        }
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    }
+
     log.info("{s} approved subscription from {s}", .{ owner_bare, to_str });
 }
 
 /// Handle <presence type='unsubscribe' to='contact@host'/> — cancel outbound subscription.
-fn handleUnsubscribe(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+    _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
 
-    var to_str: []const u8 = "";
-    for (elem.attributes) |attr| {
-        if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
-    }
+    const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
     var bare_buf: [256]u8 = undefined;
@@ -604,14 +644,12 @@ fn handleUnsubscribe(server: *Server, session: *Session, elem: xml.Element, chan
 }
 
 /// Handle <presence type='unsubscribed' to='contact@host'/> — deny/revoke inbound subscription.
-fn handleUnsubscribed(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+    _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
 
-    var to_str: []const u8 = "";
-    for (elem.attributes) |attr| {
-        if (std.mem.eql(u8, attr.local_name, "to")) to_str = attr.value;
-    }
+    const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
     var bare_buf: [256]u8 = undefined;
@@ -907,7 +945,7 @@ fn deliverPresenceToSubscribers(
 
 /// Deliver a presence stanza to all sessions of a target bare JID (local domain).
 /// Used by subscription handlers for forwarding subscribe/subscribed/etc.
-fn deliverPresenceToTarget(
+pub fn deliverPresenceToTarget(
     server: *Server,
     target_local: []const u8,
     target_domain: []const u8,

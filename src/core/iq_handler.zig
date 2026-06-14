@@ -767,9 +767,91 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     var result_ask: bool = false;
 
     if (std.mem.eql(u8, item_sub, "remove")) {
-        // Remove roster item
+        // RFC 6121 §2.5: Remove roster item and cancel existing subscriptions.
+        const old_entry = roster.getItem(server.allocator, bare_jid, item_jid) catch null;
+        defer if (old_entry) |e| {
+            if (e.name.len > 0) server.allocator.free(e.name);
+            if (e.groups.len > 0) server.allocator.free(e.groups);
+        };
+
         roster.removeItem(bare_jid, item_jid) catch {};
         result_sub = .remove;
+
+        // Send unsubscribe/unsubscribed to contact and update contact's roster.
+        if (old_entry) |entry| {
+            const presence_handler = @import("presence_handler.zig");
+            const to_jid_parsed = @import("xmpp").Jid.parse(item_jid) catch null;
+
+            // If we had subscription TO the contact, send unsubscribe
+            if (entry.subscription == .to or entry.subscription == .both) {
+                var unsub_buf: [512]u8 = undefined;
+                var unsub_fbs = std.io.fixedBufferStream(&unsub_buf);
+                const uw = unsub_fbs.writer();
+                uw.writeAll("<presence from='") catch {};
+                uw.writeAll(bare_jid) catch {};
+                uw.writeAll("' to='") catch {};
+                uw.writeAll(item_jid) catch {};
+                uw.writeAll("' type='unsubscribe'/>") catch {};
+                if (to_jid_parsed) |to_jid| {
+                    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+                        presence_handler.deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unsub_fbs.getWritten(), changes);
+                    } else {
+                        server.sendPresenceViaS2s(bare_jid, item_jid, unsub_fbs.getWritten(), changes);
+                    }
+                }
+                // Update contact's roster: remove "to" direction (they lose "from" us)
+                if (to_jid_parsed) |to_jid| {
+                    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+                        if (roster.getItem(server.allocator, item_jid, bare_jid) catch null) |contact_entry| {
+                            defer if (contact_entry.name.len > 0) server.allocator.free(contact_entry.name);
+                            defer if (contact_entry.groups.len > 0) server.allocator.free(contact_entry.groups);
+                            const new_sub: Subscription = switch (contact_entry.subscription) {
+                                .from => .none,
+                                .both => .to,
+                                else => contact_entry.subscription,
+                            };
+                            roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch {};
+                            pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
+                        }
+                    }
+                }
+            }
+
+            // If we had subscription FROM the contact, send unsubscribed
+            if (entry.subscription == .from or entry.subscription == .both) {
+                var unsd_buf: [512]u8 = undefined;
+                var unsd_fbs = std.io.fixedBufferStream(&unsd_buf);
+                const udw = unsd_fbs.writer();
+                udw.writeAll("<presence from='") catch {};
+                udw.writeAll(bare_jid) catch {};
+                udw.writeAll("' to='") catch {};
+                udw.writeAll(item_jid) catch {};
+                udw.writeAll("' type='unsubscribed'/>") catch {};
+                if (to_jid_parsed) |to_jid| {
+                    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+                        presence_handler.deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unsd_fbs.getWritten(), changes);
+                    } else {
+                        server.sendPresenceViaS2s(bare_jid, item_jid, unsd_fbs.getWritten(), changes);
+                    }
+                }
+                // Update contact's roster: remove "from" direction (they lose "to" us)
+                if (to_jid_parsed) |to_jid| {
+                    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+                        if (roster.getItem(server.allocator, item_jid, bare_jid) catch null) |contact_entry| {
+                            defer if (contact_entry.name.len > 0) server.allocator.free(contact_entry.name);
+                            defer if (contact_entry.groups.len > 0) server.allocator.free(contact_entry.groups);
+                            const new_sub: Subscription = switch (contact_entry.subscription) {
+                                .to => .none,
+                                .both => .from,
+                                else => contact_entry.subscription,
+                            };
+                            roster.setItem(item_jid, bare_jid, "", new_sub, false) catch {};
+                            pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
+                        }
+                    }
+                }
+            }
+        }
     } else {
         // Add or update — preserve existing subscription if item exists
         if (roster.getItem(server.allocator, bare_jid, item_jid) catch null) |existing| {
