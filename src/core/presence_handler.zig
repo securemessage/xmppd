@@ -139,10 +139,19 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
             }
         },
         .subscribe, .subscribed, .unsubscribe, .unsubscribed => {
-            // Subscription stanzas are dispatched immediately (extensions not forwarded yet).
             session.stanza_to = to_str;
             session.stanza_type = type_str;
-            dispatchSubscription(server, session, ptype, "", changes);
+            if (elem.self_closing) {
+                dispatchSubscription(server, session, ptype, "", changes);
+            } else {
+                // Non-self-closing: accumulate child elements (extensions) until </presence>.
+                // Dispatch happens in handleElementEnd via the subscription type check.
+                session.stanza_kind = .presence;
+                session.stanza_buf_len = 0;
+                session.stanza_id = "";
+                session.pres_priority_collecting = false;
+                session.pres_priority_len = 0;
+            }
         },
         else => {},
     }

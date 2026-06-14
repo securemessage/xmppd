@@ -1117,8 +1117,14 @@ pub const Server = struct {
                     // Own presence (no 'to') — update availability + broadcast
                     presence_handler.dispatchPresence(self, session, changes);
                 } else {
-                    // Message, IQ, or directed presence — route to target
-                    self.dispatchStanza(session, changes);
+                    // Message, IQ, or directed/subscription presence — route to target
+                    if (session.stanza_kind == .presence and presence_handler.isSubscriptionType(session.stanza_type)) {
+                        const ptype = xmpp.PresenceType.fromString(session.stanza_type);
+                        const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
+                        presence_handler.dispatchSubscription(self, session, ptype, inner_xml, changes);
+                    } else {
+                        self.dispatchStanza(session, changes);
+                    }
                 }
             }
             return;
