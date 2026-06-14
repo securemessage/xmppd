@@ -660,22 +660,21 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
 
-    // Update contact's roster: remove "from" direction
-    var contact_new_sub: Subscription = .none;
-    if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
-        defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        contact_new_sub = switch (existing.subscription) {
-            .from => .none,
-            .both => .to,
-            else => existing.subscription,
-        };
-        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
-    }
-
-    // RFC 6121 §3.2.2: Push updated roster to contact's interested resources
+    // Update contact's roster: remove "from" direction (idempotent — skip if already done)
     const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
     if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
-        iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
+        if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
+            defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            const contact_new_sub: Subscription = switch (existing.subscription) {
+                .from => .none,
+                .both => .to,
+                else => existing.subscription,
+            };
+            if (contact_new_sub != existing.subscription) {
+                roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+                iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
+            }
+        }
     }
 
     // Forward unsubscribe
@@ -735,22 +734,21 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, owner_ask, changes);
 
-    // Update contact's roster: remove "to" direction
-    var contact_new_sub: Subscription = .none;
-    if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
-        defer if (existing.name.len > 0) server.allocator.free(existing.name);
-        contact_new_sub = switch (existing.subscription) {
-            .to => .none,
-            .both => .from,
-            else => existing.subscription,
-        };
-        roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
-    }
-
-    // RFC 6121 §3.2.2: Push updated roster to contact's interested resources
+    // Update contact's roster: remove "to" direction (idempotent — skip if already done)
     const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
     if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
-        iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
+        if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
+            defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            const contact_new_sub: Subscription = switch (existing.subscription) {
+                .to => .none,
+                .both => .from,
+                else => existing.subscription,
+            };
+            if (contact_new_sub != existing.subscription) {
+                roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+                iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
+            }
+        }
     }
 
     // Forward unsubscribed
