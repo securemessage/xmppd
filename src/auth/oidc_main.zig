@@ -15,6 +15,9 @@
 //! SCRAM-SHA-256 is not supported (IdP doesn't expose stored_key/server_key).
 
 const std = @import("std");
+const xmppd_log = @import("xmppd_log");
+pub const std_options = xmppd_log.std_options;
+
 const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const handler_mod = @import("handler");

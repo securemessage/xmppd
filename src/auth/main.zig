@@ -16,6 +16,9 @@
 //! - SIGTERM: graceful shutdown
 
 const std = @import("std");
+const xmppd_log = @import("xmppd_log");
+pub const std_options = xmppd_log.std_options;
+
 const posix = std.posix;
 const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;

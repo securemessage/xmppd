@@ -22,6 +22,9 @@
 //! SCM_RIGHTS for proper privilege separation.
 
 const std = @import("std");
+const xmppd_log = @import("xmppd_log");
+pub const std_options = xmppd_log.std_options;
+
 const posix = std.posix;
 const Supervisor = @import("supervisor.zig").Supervisor;
 const event_loop_mod = @import("event_loop");

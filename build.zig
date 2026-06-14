@@ -971,6 +971,13 @@ pub fn build(b: *std.Build) void {
 
     const run_jwt_tests = b.addRunArtifact(jwt_tests);
 
+    // --- Shared logging module ---
+    const xmppd_log_mod = b.createModule(.{
+        .root_source_file = b.path("src/log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- Executables ---
 
     // xmppd-core: the connection handler worker
@@ -1002,6 +1009,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("block_store", server_block_store_mod);
     core_mod.addImport("pep_store", server_pep_store_mod);
     core_mod.addImport("config", config_mod);
+    core_mod.addImport("xmppd_log", xmppd_log_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -1025,6 +1033,7 @@ pub fn build(b: *std.Build) void {
     });
     master_mod.addImport("event_loop", master_event_loop_mod);
     master_mod.addImport("config", config_mod);
+    master_mod.addImport("xmppd_log", xmppd_log_mod);
 
     const master_exe = b.addExecutable(.{
         .name = "xmppd",
@@ -1117,6 +1126,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("event_loop", auth_event_loop_mod);
     auth_mod.addImport("config", config_mod);
     auth_mod.addImport("backend", auth_backend_mod);
+    auth_mod.addImport("xmppd_log", xmppd_log_mod);
 
     const auth_exe = b.addExecutable(.{
         .name = "xmppd-auth",
@@ -1185,6 +1195,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
     oidc_main_mod.linkSystemLibrary("crypto", .{});
 
@@ -1226,6 +1237,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("xml", xml_mod);
     s2s_main_mod.addImport("ssl", ssl_test_mod);
     s2s_main_mod.addImport("dns", dns_test_mod);
+    s2s_main_mod.addImport("xmppd_log", xmppd_log_mod);
     s2s_main_mod.linkSystemLibrary("ssl", .{});
     s2s_main_mod.linkSystemLibrary("crypto", .{});
 
@@ -1277,6 +1289,7 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    ctl_mod.addImport("xmppd_log", xmppd_log_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -1296,6 +1309,7 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
+    ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",

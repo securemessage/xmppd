@@ -22,6 +22,9 @@
 //! ```
 
 const std = @import("std");
+const xmppd_log = @import("xmppd_log");
+pub const std_options = xmppd_log.std_options;
+
 const Server = @import("server.zig").Server;
 const config_mod = @import("config");
 const generic_roster = @import("roster_store");
