@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.6.0 — 2026-06-14
+
+RFC 6121 interop compliance and XEP-0198 session resumption.
+
+### XEP-0198: Session Resume
+
+- Full session resume implementation: detach on abnormal disconnect, resume on
+  reconnect without full re-authentication
+- SM-ID generation (worker_id-prefixed for multi-threaded routing)
+- Unacked stanza queue (bounded ring buffer, 256 entries) with heap-allocated copies
+- Resume flow: find detached session by SM-ID, verify authenticated user, transfer
+  session state (counters, bound JID, roster interest, carbons, presence), re-bind
+  in session map, replay unacked stanzas
+- Periodic expiry sweep (30s timer) destroys detached sessions after 300s timeout
+- Outbound stanza sequence tracking at dispatch, carbon copy, and MPSC delivery paths
+- `forceCloseSession` for intentional/protocol-error closes (no detach on stream close,
+  XML parse errors, depth exceeded)
+
+### RFC 6121 Interop (SINT Compliance)
+
+- **360/367 tests pass** (both workers=1 and workers=4)
+- 1 failure: upstream Smack test bug (filed as SINT #166)
+- Extension element forwarding in subscription stanzas
+- Idempotent subscription handlers (skip no-op roster modifications)
+- Presence with status after subscription approval
+- Full roster group storage, retrieval, and push
+- Roster delete with unsubscribe/unsubscribed cascade
+- Subscription dispatch normalizes to bare JID (RFC 6121 §3.1)
+- Roster push preserves display names across subscription operations
+
+### Metrics
+
+| Metric | Value |
+|--------|-------|
+| Unit tests | 744 (was 738) |
+| SINT interop | 360/367 RFC 6121 |
+
 ## v0.5.0 — 2026-06-11
 
 Functional XMPP server with real client interop. Multi-process architecture,
