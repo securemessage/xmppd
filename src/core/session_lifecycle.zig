@@ -17,6 +17,7 @@ const xmpp = @import("xmpp");
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
+const sm_state = server_mod.sm_state;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
@@ -84,11 +85,55 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8) void
     }
 }
 
-/// Full session teardown: MUC cleanup, presence broadcast, session map unbind,
-/// kqueue deregistration, and memory deallocation.
+/// Session close: either detach for SM resume or full teardown.
+///
+/// If the session has SM resume enabled and is not already detached, the session
+/// is "detached" — connection resources are freed but the session state is preserved
+/// for potential reconnection within the resume timeout window.
+///
+/// Otherwise, performs full teardown: MUC cleanup, presence broadcast, session map
+/// unbind, kqueue deregistration, and memory deallocation.
 pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
     const session = server.sessions[id] orelse return;
 
+    // Detach for SM resume if eligible (resume enabled, not already detached, not closing gracefully)
+    if (session.sm_resume_enabled and !session.sm_detached and session.stream.isActive()) {
+        detachSession(server, id, session, changes);
+        return;
+    }
+
+    destroySession(server, id, session, changes);
+}
+
+/// Force-close a session without SM resume consideration.
+/// Used for intentional closes (stream close, protocol errors) where detach is inappropriate.
+pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void {
+    const session = server.sessions[id] orelse return;
+    session.sm_resume_enabled = false; // Prevent detach
+    destroySession(server, id, session, changes);
+}
+
+/// Detach a session for SM resume: free connection resources, preserve session state.
+/// The session remains in sessions[] and session_map for the resume timeout period.
+fn detachSession(_: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+    session.sm_detached = true;
+    session.sm_detach_time = std.time.timestamp();
+
+    // Remove from kqueue and close the fd
+    changes.removeRead(session.conn.fd) catch {};
+    changes.removeWrite(session.conn.fd) catch {};
+    session.conn.close();
+
+    log.info("session {d} detached for SM resume (id={s}, timeout={d}s)", .{
+        id,
+        session.sm_id[0..session.sm_id_len],
+        sm_state.DEFAULT_RESUME_TIMEOUT,
+    });
+}
+
+/// Full session teardown: MUC cleanup, presence broadcast, session map unbind,
+/// kqueue deregistration, and memory deallocation.
+fn destroySession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
     if (session.stream.bound_jid) |bound| {
         var close_jid_buf: [256]u8 = undefined;
@@ -115,12 +160,34 @@ pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
     }
 
     // Remove from kqueue (closing fd does this implicitly, but be explicit)
-    changes.removeRead(session.conn.fd) catch {};
-    changes.removeWrite(session.conn.fd) catch {};
+    if (!session.conn.isClosed()) {
+        changes.removeRead(session.conn.fd) catch {};
+        changes.removeWrite(session.conn.fd) catch {};
+    }
 
     session.deinit();
     server.allocator.destroy(session);
     server.sessions[id] = null;
+}
+
+/// Sweep detached sessions that have exceeded the resume timeout.
+/// Called periodically from the event loop (e.g., every 30 seconds via timer).
+pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
+    const now = std.time.timestamp();
+    for (server.sessions, 0..) |slot, i| {
+        const session = slot orelse continue;
+        if (!session.sm_detached) continue;
+        const elapsed = now - session.sm_detach_time;
+        if (elapsed >= sm_state.DEFAULT_RESUME_TIMEOUT) {
+            log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
+                i,
+                session.sm_id[0..session.sm_id_len],
+                elapsed,
+            });
+            session.sm_resume_enabled = false; // Prevent re-detach
+            destroySession(server, i, session, changes);
+        }
+    }
 }
 
 /// Deliver queued offline messages to a user who just became available.

@@ -828,6 +828,21 @@ pub fn build(b: *std.Build) void {
 
     const run_fanout_tests = b.addRunArtifact(fanout_tests);
 
+    // --- SM state tests ---
+
+    const sm_state_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/sm_state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const sm_state_tests = b.addTest(.{
+        .name = "sm-state-tests",
+        .root_module = sm_state_test_mod,
+    });
+
+    const run_sm_state_tests = b.addRunArtifact(sm_state_tests);
+
     // --- Message (actor model) tests ---
 
     const message_test_mod = b.createModule(.{
@@ -1366,6 +1381,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);
+    test_step.dependOn(&run_sm_state_tests.step);
     test_step.dependOn(&run_message_tests.step);
     test_step.dependOn(&run_room_mailbox_tests.step);
     test_step.dependOn(&run_config_tests.step);

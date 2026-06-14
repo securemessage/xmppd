@@ -75,6 +75,7 @@ const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 const actor_message = @import("message.zig");
+pub const sm_state = @import("sm_state.zig");
 const block_store_mod = @import("block_store");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
@@ -96,6 +97,12 @@ pub const IPC_S2S_UDATA = LISTENER_UDATA - 2;
 
 /// Sentinel value for delivery system wake pipe fd in kqueue udata.
 const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
+
+/// Timer ident for periodic SM resume expiry sweep.
+const SM_EXPIRY_TIMER_IDENT = LISTENER_UDATA - 4;
+
+/// Interval for SM detached session expiry sweep (milliseconds).
+const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
 
 /// Maximum changelist entries per event loop iteration.
 /// Must be large enough to accommodate presence broadcasts, roster pushes,
@@ -284,8 +291,22 @@ pub const Session = struct {
     sm_enabled: bool = false,
     /// Inbound stanza counter (stanzas received from client).
     sm_in_h: u32 = 0,
-    /// Outbound stanza counter (stanzas sent to client).
+    /// Outbound stanza counter (stanzas sent to client — last acked by client).
     sm_out_h: u32 = 0,
+    /// Server's outbound stanza sequence (incremented on each stanza sent to client).
+    sm_out_seq: u32 = 0,
+    /// Whether resume was negotiated (client sent resume='true' on enable).
+    sm_resume_enabled: bool = false,
+    /// Hex-encoded SM-ID (32 chars) for resume token.
+    sm_id: [sm_state.SM_ID_HEX_LEN]u8 = undefined,
+    /// Length of valid SM-ID data (0 = no SM-ID assigned).
+    sm_id_len: u8 = 0,
+    /// Whether this session is detached (connection closed, awaiting resume).
+    sm_detached: bool = false,
+    /// Monotonic timestamp (seconds) when the session was detached.
+    sm_detach_time: i64 = 0,
+    /// Unacked stanza queue for resume replay. Allocated when resume is enabled.
+    sm_unacked: ?*sm_state.SmUnackedQueue = null,
 
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -296,6 +317,11 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.sm_unacked) |queue| {
+            queue.deinit();
+            self.reader.allocator.destroy(queue);
+            self.sm_unacked = null;
+        }
         if (self.pep_payload.capacity > 0) self.pep_payload.deinit(self.reader.allocator);
         self.reader.deinit();
         if (!self.conn.isClosed()) self.conn.close();
@@ -322,6 +348,17 @@ pub const Session = struct {
         self.stanza_to = "";
         self.stanza_id = "";
         self.stanza_type = "";
+    }
+
+    /// Track an outbound stanza for SM purposes.
+    /// Increments sm_out_seq and buffers the stanza in the unacked queue (if resume enabled).
+    /// Call this after successfully queueing a complete stanza (message/presence/iq) to the client.
+    pub fn smTrackOutbound(self: *Session, stanza_data: []const u8) void {
+        if (!self.sm_enabled) return;
+        self.sm_out_seq +%= 1;
+        if (self.sm_unacked) |queue| {
+            queue.push(stanza_data);
+        }
     }
 };
 
@@ -589,6 +626,9 @@ pub const Server = struct {
             try changes.addRead(ds.getPipeReadFd(self.worker_id), WAKE_PIPE_UDATA);
         }
 
+        // Register periodic timer for SM resume expiry sweep
+        try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
+
         while (self.running) {
             // Mark active before processing events (coalesced signaling)
             if (self.delivery_system) |ds| {
@@ -638,6 +678,11 @@ pub const Server = struct {
                     .signal => |s| {
                         if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
                             self.running = false;
+                        }
+                    },
+                    .timer => |t| {
+                        if (t.ident == SM_EXPIRY_TIMER_IDENT) {
+                            session_lifecycle.expireDetachedSessions(self, &changes);
                         }
                     },
                     .fd_error => |e| {
@@ -802,7 +847,7 @@ pub const Server = struct {
                 const event = session.reader.next(data, &pos) catch |err| {
                     log.err("connection {d} XML parse error: {}", .{ id, err });
                     self.sendStreamError(session, .not_well_formed);
-                    session_lifecycle.closeSession(self, id, changes);
+                    session_lifecycle.forceCloseSession(self, id, changes);
                     return;
                 };
 
@@ -811,7 +856,7 @@ pub const Server = struct {
                 if (session.reader.depth > MAX_ELEMENT_DEPTH) {
                     log.warn("connection {d} exceeded max depth ({d})", .{ id, MAX_ELEMENT_DEPTH });
                     self.sendStreamError(session, .policy_violation);
-                    session_lifecycle.closeSession(self, id, changes);
+                    session_lifecycle.forceCloseSession(self, id, changes);
                     return;
                 }
 
@@ -857,7 +902,7 @@ pub const Server = struct {
                 if (session.conn.hasPendingWrite()) {
                     session.conn.flushSync();
                 }
-                session_lifecycle.closeSession(self, session.conn.id, changes);
+                session_lifecycle.forceCloseSession(self, session.conn.id, changes);
             },
             .element_start => |elem| {
                 self.handleElementStart(session, elem, changes);
@@ -970,7 +1015,7 @@ pub const Server = struct {
         // XEP-0198: Stream Management namespace — handle in active or just-bound state
         if (std.mem.eql(u8, ns, xml.ns.sm)) {
             if (std.mem.eql(u8, elem.local_name, "enable") and session.stream.isActive()) {
-                self.handleSmEnable(session, changes);
+                self.handleSmEnable(session, elem, changes);
             } else if (std.mem.eql(u8, elem.local_name, "r") and session.sm_enabled) {
                 self.handleSmRequest(session, changes);
             } else if (std.mem.eql(u8, elem.local_name, "a") and session.sm_enabled) {
@@ -979,9 +1024,14 @@ pub const Server = struct {
                     if (std.mem.eql(u8, attr.local_name, "h")) {
                         const client_h = std.fmt.parseInt(u32, attr.value, 10) catch 0;
                         session.sm_out_h = client_h;
+                        if (session.sm_unacked) |queue| {
+                            queue.ack(client_h);
+                        }
                         break;
                     }
                 }
+            } else if (std.mem.eql(u8, elem.local_name, "resume") and session.stream.state == .features_bind) {
+                self.handleSmResume(session, elem, changes);
             }
             return;
         }
@@ -2285,7 +2335,9 @@ pub const Server = struct {
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
                 const target_session = c.server.sessions[local_session_id] orelse return;
+                if (target_session.sm_detached) return; // Detached sessions can't receive
                 target_session.conn.queueSend(payload) catch return;
+                target_session.smTrackOutbound(payload);
                 if (target_session.conn.hasPendingWrite()) {
                     c.changes.addWrite(target_session.conn.fd, local_session_id) catch {};
                 }
@@ -2512,20 +2564,214 @@ pub const Server = struct {
     // ========================================================================
 
     /// Handle <enable xmlns='urn:xmpp:sm:3'/> — activate SM for this session.
-    fn handleSmEnable(self: *Server, session: *Session, changes: *ChangeList) void {
-        _ = self;
+    /// If the client includes resume='true', session resumption is enabled and
+    /// an SM-ID is generated for future reconnection.
+    fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         session.sm_enabled = true;
         session.sm_in_h = 0;
         session.sm_out_h = 0;
+        session.sm_out_seq = 0;
+
+        // Check for resume='true' attribute
+        var resume_requested = false;
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "resume")) {
+                resume_requested = std.mem.eql(u8, attr.value, "true");
+                break;
+            }
+        }
 
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
+
+        if (resume_requested) {
+            // Generate SM-ID and enable resume
+            sm_state.generateSmId(self.worker_id, &session.sm_id);
+            session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+            session.sm_resume_enabled = true;
+
+            // Allocate unacked stanza queue
+            const queue = self.allocator.create(sm_state.SmUnackedQueue) catch {
+                log.err("connection {d} failed to allocate SM unacked queue", .{session.conn.id});
+                // Fall back to SM without resume
+                session.sm_resume_enabled = false;
+                session.sm_id_len = 0;
+                w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
+                session.conn.queueSend(fbs.getWritten()) catch return;
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                }
+                return;
+            };
+            queue.* = sm_state.SmUnackedQueue.init(self.allocator);
+            session.sm_unacked = queue;
+
+            w.writeAll("<enabled xmlns='urn:xmpp:sm:3' id='") catch return;
+            w.writeAll(&session.sm_id) catch return;
+            w.writeAll("' resume='true' max='") catch return;
+            std.fmt.format(w, "{d}", .{sm_state.DEFAULT_RESUME_TIMEOUT}) catch return;
+            w.writeAll("'/>") catch return;
+
+            log.info("connection {d} stream management enabled with resume (id={s})", .{
+                session.conn.id, &session.sm_id,
+            });
+        } else {
+            w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
+            log.info("connection {d} stream management enabled", .{session.conn.id});
+        }
+
         session.conn.queueSend(fbs.getWritten()) catch return;
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
-        log.info("connection {d} stream management enabled", .{session.conn.id});
+    }
+
+    /// Handle <resume xmlns='urn:xmpp:sm:3' previd='...' h='N'/> — attempt session resume.
+    /// Finds the detached session by SM-ID, verifies the authenticated user matches,
+    /// transfers the resumed state to the current session, and replays unacked stanzas.
+    fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        var previd: []const u8 = "";
+        var h_value: u32 = 0;
+        var h_found = false;
+
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "previd")) {
+                previd = attr.value;
+            } else if (std.mem.eql(u8, attr.local_name, "h")) {
+                h_value = std.fmt.parseInt(u32, attr.value, 10) catch 0;
+                h_found = true;
+            }
+        }
+
+        if (previd.len == 0 or !h_found) {
+            self.sendSmFailed(session, "unexpected-request", changes);
+            return;
+        }
+
+        // Find the detached session with matching SM-ID
+        const detached_id = self.findDetachedSession(previd) orelse {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        };
+
+        const detached = self.sessions[detached_id] orelse {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        };
+
+        // Verify the authenticated user matches the detached session's user
+        const auth_jid = session.stream.authenticated_jid orelse {
+            self.sendSmFailed(session, "not-authorized", changes);
+            return;
+        };
+        const detached_jid = detached.stream.bound_jid orelse {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        };
+
+        if (!std.mem.eql(u8, auth_jid.local, detached_jid.local) or
+            !std.mem.eql(u8, auth_jid.domain, detached_jid.domain))
+        {
+            self.sendSmFailed(session, "not-authorized", changes);
+            return;
+        }
+
+        // Process client's h value — ack stanzas the client received before disconnect
+        if (detached.sm_unacked) |queue| {
+            queue.ack(h_value);
+        }
+
+        // Transfer resumed state to the current session
+        session.sm_enabled = true;
+        session.sm_in_h = detached.sm_in_h;
+        session.sm_out_h = h_value;
+        session.sm_out_seq = detached.sm_out_seq;
+        session.sm_resume_enabled = detached.sm_resume_enabled;
+        session.sm_id = detached.sm_id;
+        session.sm_id_len = detached.sm_id_len;
+        session.sm_unacked = detached.sm_unacked;
+        detached.sm_unacked = null; // Ownership transferred
+
+        // Transfer XMPP session state
+        session.stream.bound_jid = detached.stream.bound_jid;
+        session.stream.state = .active;
+        session.roster_interested = detached.roster_interested;
+        session.carbons_enabled = detached.carbons_enabled;
+        @memcpy(
+            session.last_presence_inner[0..detached.last_presence_inner_len],
+            detached.last_presence_inner[0..detached.last_presence_inner_len],
+        );
+        session.last_presence_inner_len = detached.last_presence_inner_len;
+
+        // Re-bind in session map: unbind old slot, bind new slot with same JID
+        if (self.session_map) |sm| {
+            _ = sm.unbind(detached_jid.local, detached_jid.domain, detached_jid.resource);
+            _ = sm.bind(self.worker_id, @intCast(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource) catch {
+                log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}", .{
+                    detached_jid.local, detached_jid.domain, detached_jid.resource,
+                });
+            };
+        }
+
+        // Destroy the detached session (slot freed for reuse)
+        detached.sm_resume_enabled = false; // Prevent re-detach during destroy
+        detached.deinit();
+        self.allocator.destroy(detached);
+        self.sessions[detached_id] = null;
+
+        // Send <resumed/> to the client
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<resumed xmlns='urn:xmpp:sm:3' h='") catch return;
+        std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
+        w.writeAll("' previd='") catch return;
+        w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
+        w.writeAll("'/>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+
+        // Replay unacked stanzas
+        if (session.sm_unacked) |queue| {
+            var iter = queue.getUnacked();
+            while (iter.next()) |stanza| {
+                session.conn.queueSend(stanza) catch break;
+            }
+        }
+
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+
+        log.info("connection {d} session resumed (id={s}, replayed {d} stanzas)", .{
+            session.conn.id,
+            session.sm_id[0..session.sm_id_len],
+            if (session.sm_unacked) |q| q.pending() else 0,
+        });
+    }
+
+    /// Send SM <failed/> with a specific error condition.
+    fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, changes: *ChangeList) void {
+        _ = self;
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<failed xmlns='urn:xmpp:sm:3'><") catch return;
+        w.writeAll(condition) catch return;
+        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    }
+
+    /// Find a detached session by SM-ID. Returns the session slot index or null.
+    fn findDetachedSession(self: *Server, sm_id: []const u8) ?usize {
+        if (sm_id.len != sm_state.SM_ID_HEX_LEN) return null;
+        for (self.sessions, 0..) |slot, i| {
+            const s = slot orelse continue;
+            if (!s.sm_detached) continue;
+            if (s.sm_id_len != sm_state.SM_ID_HEX_LEN) continue;
+            if (std.mem.eql(u8, s.sm_id[0..s.sm_id_len], sm_id)) return i;
+        }
+        return null;
     }
 
     /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.

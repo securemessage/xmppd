@@ -396,7 +396,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             mw.writeByte('>') catch continue;
         }
 
-        target_session.conn.queueSend(msg_fbs.getWritten()) catch continue;
+        const sent_data = msg_fbs.getWritten();
+        target_session.conn.queueSend(sent_data) catch continue;
+        target_session.smTrackOutbound(sent_data);
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, tid) catch {};
         }
@@ -614,7 +616,9 @@ fn sendCarbons(
             cw.writeAll(carbon_type) catch continue;
             cw.writeAll("></message>") catch continue;
 
-            target.conn.queueSend(cfbs.getWritten()) catch continue;
+            const carbon_data = cfbs.getWritten();
+            target.conn.queueSend(carbon_data) catch continue;
+            target.smTrackOutbound(carbon_data);
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
             }
