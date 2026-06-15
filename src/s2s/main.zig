@@ -209,6 +209,11 @@ pub const S2sDaemon = struct {
             };
         };
 
+        // Disable Nagle — S2S stanzas should be sent immediately.
+        // TCP_NODELAY = 1 (netinet/tcp.h), IPPROTO_TCP = 6
+        const nodelay_one: c_int = 1;
+        posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+
         // Find a free slot
         const slot = self.allocateInboundSlot() orelse {
             posix.close(client_fd);
@@ -339,6 +344,11 @@ pub const S2sDaemon = struct {
             };
             addr.addr = ip;
         }
+
+        // Disable Nagle — S2S stanzas should be sent immediately.
+        // TCP_NODELAY = 1 (netinet/tcp.h), IPPROTO_TCP = 6
+        const nodelay_one: c_int = 1;
+        posix.setsockopt(sock, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
 
         // Non-blocking connect
         posix.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {

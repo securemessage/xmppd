@@ -49,6 +49,20 @@ pub const RegistrationConfig = struct {
 /// Maximum concurrent SCRAM exchanges (one per XMPP connection doing auth).
 const MAX_SCRAM_SESSIONS = 256;
 
+/// Number of credential cache entries (power of 2 for fast modulo).
+const CRED_CACHE_SIZE = 64;
+
+/// Credential cache TTL in seconds.
+const CRED_CACHE_TTL_SECONDS = 30;
+
+/// Cached credential entry — avoids store lookups for repeated auth.
+const CachedCredential = struct {
+    username_hash: u64,
+    creds: sasl.StoredCredentials,
+    timestamp: i64,
+    occupied: bool,
+};
+
 /// Per-connection SCRAM state. Keyed by conn_id.
 const ScramSession = struct {
     conn_id: u32,
@@ -75,6 +89,13 @@ pub fn AuthHandler(comptime Store: type) type {
         reg_config: RegistrationConfig = .{},
         /// Invite code validator (optional — required when reg_config.require_invite is true).
         invite_validator: ?InviteValidator = null,
+        /// Credential lookup cache — avoids store reads for rapid reconnections.
+        cred_cache: [CRED_CACHE_SIZE]CachedCredential = [_]CachedCredential{.{
+            .username_hash = 0,
+            .creds = undefined,
+            .timestamp = 0,
+            .occupied = false,
+        }} ** CRED_CACHE_SIZE,
 
         const Self = @This();
 
@@ -98,6 +119,37 @@ pub fn AuthHandler(comptime Store: type) type {
         /// Set the lock checker (call after init).
         pub fn setLockChecker(self: *Self, checker: LockChecker) void {
             self.lock_checker = checker;
+        }
+
+        /// Look up credentials in cache by precomputed hash.
+        /// Returns cached creds if entry matches and is within TTL, null otherwise.
+        fn cacheLookup(self: *Self, hash: u64, now: i64) ?sasl.StoredCredentials {
+            const entry = &self.cred_cache[hash & (CRED_CACHE_SIZE - 1)];
+            if (!entry.occupied or entry.username_hash != hash) return null;
+            if (now - entry.timestamp > CRED_CACHE_TTL_SECONDS) {
+                entry.occupied = false;
+                return null;
+            }
+            return entry.creds;
+        }
+
+        /// Store credentials in cache by precomputed hash.
+        fn cacheStore(self: *Self, hash: u64, now: i64, creds: sasl.StoredCredentials) void {
+            self.cred_cache[hash & (CRED_CACHE_SIZE - 1)] = .{
+                .username_hash = hash,
+                .creds = creds,
+                .timestamp = now,
+                .occupied = true,
+            };
+        }
+
+        /// Invalidate cache entry for a username (on password change).
+        fn cacheInvalidate(self: *Self, username: []const u8) void {
+            const hash = hashUsername(username);
+            const entry = &self.cred_cache[hash & (CRED_CACHE_SIZE - 1)];
+            if (entry.occupied and entry.username_hash == hash) {
+                entry.occupied = false;
+            }
         }
 
         pub fn deinit(self: *Self) void {
@@ -303,15 +355,21 @@ pub fn AuthHandler(comptime Store: type) type {
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
 
-                // Look up credentials
-                const maybe_creds = self.store.lookup(self.allocator, username) catch {
-                    session.deinit();
-                    return authFailure(req.conn_id, "temporary-auth-failure");
-                };
-                const creds = maybe_creds orelse {
-                    log.info("SCRAM auth failed: user '{s}' not found", .{username});
-                    session.deinit();
-                    return authFailure(req.conn_id, "not-authorized");
+                // Look up credentials — try cache first, fall back to store
+                const name_hash = hashUsername(username);
+                const now = std.time.timestamp();
+                const creds = self.cacheLookup(name_hash, now) orelse blk: {
+                    const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                        session.deinit();
+                        return authFailure(req.conn_id, "temporary-auth-failure");
+                    };
+                    const c = maybe_creds orelse {
+                        log.info("SCRAM auth failed: user '{s}' not found", .{username});
+                        session.deinit();
+                        return authFailure(req.conn_id, "not-authorized");
+                    };
+                    self.cacheStore(name_hash, now, c);
+                    break :blk c;
                 };
 
                 session.server.setCredentials(creds);
@@ -395,6 +453,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
+            self.cacheInvalidate(req.username);
             log.info("password changed for '{s}'", .{req.username});
             return protocol.Message{ .password_change_result = .{
                 .conn_id = req.conn_id,
@@ -580,6 +639,16 @@ fn authFailure(conn_id: u32, reason: []const u8) protocol.Message {
     } };
 }
 
+/// FNV-1a hash of a username string for cache indexing.
+fn hashUsername(username: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (username) |byte| {
+        h ^= byte;
+        h *%= 0x100000001b3;
+    }
+    return if (h == 0) 1 else h;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -730,4 +799,121 @@ test "AuthHandler: SCRAM unknown user" {
     } }) orelse return error.NoResponse;
 
     try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+}
+
+test "AuthHandler: credential cache hit on second SCRAM auth" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "cached", "pass123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // First auth — populates cache
+    {
+        var client = sasl.ScramClient.init(allocator, "cached", "pass123");
+        defer client.deinit();
+        const client_first = try client.clientFirst();
+
+        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = 20,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.5",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "cached",
+            .payload = client_first,
+        } }) orelse return error.NoResponse;
+
+        const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
+        const success_msg = handler.handleMessage(.{ .sasl_response = .{
+            .conn_id = 20,
+            .payload = client_final,
+        } }) orelse return error.NoResponse;
+
+        try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
+        handler.cleanupSession(20);
+    }
+
+    // Verify cache is populated
+    try std.testing.expect(handler.cacheLookup(hashUsername("cached"), std.time.timestamp()) != null);
+
+    // Second auth — uses cache (store lookup skipped)
+    {
+        var client = sasl.ScramClient.init(allocator, "cached", "pass123");
+        defer client.deinit();
+        const client_first = try client.clientFirst();
+
+        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = 21,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.5",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "cached",
+            .payload = client_first,
+        } }) orelse return error.NoResponse;
+
+        const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
+        const success_msg = handler.handleMessage(.{ .sasl_response = .{
+            .conn_id = 21,
+            .payload = client_final,
+        } }) orelse return error.NoResponse;
+
+        try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
+        handler.cleanupSession(21);
+    }
+}
+
+test "AuthHandler: credential cache invalidated on password change" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "rotate", "oldpass");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // Auth to populate cache
+    {
+        var client = sasl.ScramClient.init(allocator, "rotate", "oldpass");
+        defer client.deinit();
+        const client_first = try client.clientFirst();
+
+        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = 30,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.6",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "rotate",
+            .payload = client_first,
+        } }) orelse return error.NoResponse;
+
+        const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
+        _ = handler.handleMessage(.{ .sasl_response = .{
+            .conn_id = 30,
+            .payload = client_final,
+        } }) orelse return error.NoResponse;
+
+        handler.cleanupSession(30);
+    }
+
+    // Cache should be populated
+    try std.testing.expect(handler.cacheLookup(hashUsername("rotate"), std.time.timestamp()) != null);
+
+    // Change password — invalidates cache
+    _ = handler.handleMessage(.{ .password_change_request = .{
+        .conn_id = 31,
+        .username = "rotate",
+        .new_password = "newpass",
+    } });
+
+    // Cache should be invalidated
+    try std.testing.expect(handler.cacheLookup(hashUsername("rotate"), std.time.timestamp()) == null);
 }

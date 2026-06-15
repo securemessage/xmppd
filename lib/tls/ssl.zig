@@ -127,6 +127,11 @@ pub const SslContext = struct {
         // Custom callback always returns OK — we do DANE ourselves after handshake.
         c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, &alwaysAcceptVerify);
 
+        // Enable FreeBSD KTLS — offloads symmetric crypto to kernel.
+        // Silently ignored if kernel or OpenSSL lacks KTLS support.
+        // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) = 1 << 3 = 0x8
+        _ = c.SSL_CTX_set_options(ctx, 0x8);
+
         return SslContext{ .ctx = ctx };
     }
 
@@ -165,6 +170,11 @@ pub const SslContext = struct {
                 return SslError.KeyMismatch;
             }
         }
+
+        // Enable FreeBSD KTLS — offloads symmetric crypto to kernel.
+        // Silently ignored if kernel or OpenSSL lacks KTLS support.
+        // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) = 1 << 3 = 0x8
+        _ = c.SSL_CTX_set_options(ctx, 0x8);
 
         return SslContext{ .ctx = ctx };
     }

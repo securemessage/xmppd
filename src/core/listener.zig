@@ -121,6 +121,12 @@ pub const Listener = struct {
             };
         };
 
+        // Disable Nagle's algorithm — XMPP is interactive, small stanzas
+        // should be sent immediately without coalescing delay.
+        // TCP_NODELAY = 1 (netinet/tcp.h), IPPROTO_TCP = 6
+        const nodelay: c_int = 1;
+        posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay)) catch {};
+
         // Format peer IP into the connection
         var conn = Connection.init(client_fd, conn_id);
         const ip_bytes = @as(*const [4]u8, @ptrCast(&addr.addr));

@@ -261,7 +261,7 @@ pub fn main() !void {
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch break;
 
                             // Send MechanismList immediately on connect
-                            const mechs = [_]protocol.MechanismId{ .plain, .scram_sha_256 };
+                            const mechs = [_]protocol.MechanismId{ .scram_sha_256, .plain };
                             const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&mechs) };
                             conn.queueSend(ml_msg) catch {
                                 ipc.closeClient(slot);
