@@ -749,8 +749,31 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
         }
     }
 
-    // Forward unsubscribed
+    // RFC 6121 §3.2.2: Send unavailable from all of owner's available resources
+    // to the contact BEFORE the unsubscribed stanza.
     const to_jid = to_jid_parsed;
+    if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
+        const unsub_sm = server.session_map orelse return;
+        var owner_entries: [16]SessionEntry = undefined;
+        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, &owner_entries);
+        for (owner_entries[0..owner_count]) |oent| {
+            var unavail_buf: [512]u8 = undefined;
+            var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
+            const uw = unavail_fbs.writer();
+            uw.writeAll("<presence from='") catch continue;
+            uw.writeAll(bound.local) catch continue;
+            uw.writeByte('@') catch continue;
+            uw.writeAll(bound.domain) catch continue;
+            uw.writeByte('/') catch continue;
+            uw.writeAll(oent.resource()) catch continue;
+            uw.writeAll("' to='") catch continue;
+            uw.writeAll(to_str) catch continue;
+            uw.writeAll("' type='unavailable'/>") catch continue;
+            deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unavail_fbs.getWritten(), changes);
+        }
+    }
+
+    // Forward unsubscribed
 
     // Build presence stanza
     var unsd_pres_buf: [512]u8 = undefined;
