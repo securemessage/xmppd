@@ -1651,12 +1651,11 @@ fn sendPepNotification(
         }
     }
 
-    // Deliver to presence subscribers (contacts with "from" or "both" subscription)
-    const subscriber_jids = roster.getPresenceSubscribers(server.allocator, publisher_bare) catch return;
-    defer {
-        for (subscriber_jids) |s| server.allocator.free(s);
-        server.allocator.free(subscriber_jids);
-    }
+    // Deliver to presence subscribers (contacts with "from" or "both" subscription) — zero-alloc (T125)
+    var pep_sub_buf: [16384]u8 = undefined;
+    var pep_sub_ptrs: [256][]const u8 = undefined;
+    const pep_sub_count = roster.getPresenceSubscribersFixed(publisher_bare, &pep_sub_buf, &pep_sub_ptrs) catch return;
+    const subscriber_jids = pep_sub_ptrs[0..pep_sub_count];
 
     for (subscriber_jids) |sub_bare_jid| {
         // Skip blocked contacts

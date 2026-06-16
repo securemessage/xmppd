@@ -612,21 +612,16 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         fn findOrCreateScramSlot(self: *Self, conn_id: u32) ?usize {
-            // First try to find existing
-            for (&self.scram_sessions, 0..) |*s, i| {
-                if (s.active and s.conn_id == conn_id) return i;
-            }
-            // Then find a free slot
-            for (&self.scram_sessions, 0..) |*s, i| {
-                if (!s.active) return i;
-            }
-            return null;
+            const slot = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
+            const s = &self.scram_sessions[slot];
+            if (s.active and s.conn_id != conn_id) return null; // Collision
+            return slot;
         }
 
         fn findScramSlot(self: *Self, conn_id: u32) ?usize {
-            for (&self.scram_sessions, 0..) |*s, i| {
-                if (s.active and s.conn_id == conn_id) return i;
-            }
+            const slot = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
+            const s = &self.scram_sessions[slot];
+            if (s.active and s.conn_id == conn_id) return slot;
             return null;
         }
     };

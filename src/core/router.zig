@@ -234,6 +234,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     sender_bare_fbs.writer().writeAll(from_jid.domain) catch {};
     const sender_bare = sender_bare_fbs.getWritten();
 
+    // Single timestamp for all archive operations in this dispatch (T123)
+    const archive_timestamp: u64 = @intCast(std.time.timestamp());
+
     // Archive under both sender and recipient bare JIDs (T81 + T82)
     if (is_archivable) {
         if (server.archive) |archive| {
@@ -273,10 +276,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             sw.writeAll("</message>") catch {};
             const full_stanza = stanza_fbs.getWritten();
 
-            const timestamp: u64 = @intCast(std.time.timestamp());
-
-            archive.store(recipient_bare, sender_bare, archive_stanza_id, timestamp, full_stanza) catch {};
-            archive.store(sender_bare, recipient_bare, archive_stanza_id, timestamp, full_stanza) catch {};
+            archive.store(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, full_stanza) catch {};
+            archive.store(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, full_stanza) catch {};
         }
     }
 
@@ -294,8 +295,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     recip_fbs2.writer().writeByte('@') catch {};
                     recip_fbs2.writer().writeAll(to_jid.domain) catch {};
                     const recipient_bare2 = recip_fbs2.getWritten();
-                    const timestamp: u64 = @intCast(std.time.timestamp());
-                    if (store.storePointer(recipient_bare2, sender_bare, archive_stanza_id, timestamp) catch false) {
+                    if (store.storePointer(recipient_bare2, sender_bare, archive_stanza_id, archive_timestamp) catch false) {
                         log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
                         return;
                     }
@@ -333,10 +333,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                         sw2.writeAll("</message>") catch {};
                     }
                     const full_stanza2 = stanza_fbs2.getWritten();
-                    const timestamp: u64 = @intCast(std.time.timestamp());
                     const offline_id = if (id_str.len > 0) id_str else "offline";
-                    archive.store(recipient_bare2, sender_bare, offline_id, timestamp, full_stanza2) catch {};
-                    if (store.storePointer(recipient_bare2, sender_bare, offline_id, timestamp) catch false) {
+                    archive.store(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch {};
+                    if (store.storePointer(recipient_bare2, sender_bare, offline_id, archive_timestamp) catch false) {
                         log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
                         return;
                     }

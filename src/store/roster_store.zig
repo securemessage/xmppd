@@ -127,6 +127,24 @@ pub fn RosterStore(comptime Backend: type) type {
             return self.scanBySubscription(allocator, owner, .{ .to = true, .both = true });
         }
 
+        /// Result of a fixed-buffer presence subscriber scan (T125).
+        pub const FixedScanResult = struct {
+            jids: [][]const u8,
+            count: usize,
+        };
+
+        /// Get presence subscribers into caller-provided fixed buffers — zero heap allocation (T125).
+        /// `jid_buf` stores JID byte data; `out` stores slices into `jid_buf`.
+        /// Returns the number of JIDs written. Stops when either buffer is full.
+        pub fn getPresenceSubscribersFixed(self: *Self, owner: []const u8, jid_buf: []u8, out: [][]const u8) !usize {
+            return self.scanBySubscriptionFixed(owner, .{ .from = true, .both = true }, jid_buf, out);
+        }
+
+        /// Get presence subscriptions into caller-provided fixed buffers — zero heap allocation (T125).
+        pub fn getPresenceSubscriptionsFixed(self: *Self, owner: []const u8, jid_buf: []u8, out: [][]const u8) !usize {
+            return self.scanBySubscriptionFixed(owner, .{ .to = true, .both = true }, jid_buf, out);
+        }
+
         /// A roster item with its contact JID for enumeration.
         pub const RosterItem = struct {
             contact_jid: []const u8,
@@ -204,6 +222,38 @@ pub fn RosterStore(comptime Backend: type) type {
             to: bool = false,
             both: bool = false,
         };
+
+        fn scanBySubscriptionFixed(self: *Self, owner: []const u8, filter: SubFilter, jid_buf: []u8, out: [][]const u8) !usize {
+            var prefix_buf: [256]u8 = undefined;
+            const prefix = ownerPrefix(&prefix_buf, owner);
+
+            var iter = try self.backend.iterator(NAMESPACE, prefix);
+            defer iter.deinit();
+
+            var count: usize = 0;
+            var buf_offset: usize = 0;
+
+            while (iter.next()) |entry| {
+                if (count >= out.len) break;
+                const sub_byte = if (entry.value.len > 0) entry.value[0] else 0;
+                const sub: Subscription = @enumFromInt(sub_byte);
+
+                const match = (filter.from and sub == .from) or
+                    (filter.to and sub == .to) or
+                    (filter.both and sub == .both);
+
+                if (match) {
+                    const contact = entry.key[owner.len + 1 ..];
+                    if (buf_offset + contact.len > jid_buf.len) break;
+                    @memcpy(jid_buf[buf_offset..][0..contact.len], contact);
+                    out[count] = jid_buf[buf_offset..][0..contact.len];
+                    buf_offset += contact.len;
+                    count += 1;
+                }
+            }
+
+            return count;
+        }
 
         fn scanBySubscription(self: *Self, allocator: std.mem.Allocator, owner: []const u8, filter: SubFilter) ![][]const u8 {
             var prefix_buf: [256]u8 = undefined;

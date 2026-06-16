@@ -115,8 +115,10 @@ pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void 
 
 /// Detach a session for SM resume: free connection resources, preserve session state.
 /// The session remains in sessions[] and session_map for the resume timeout period.
-fn detachSession(_: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+fn detachSession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
     session.sm_detached = true;
+    server.detached_count += 1;
+    server.smIdMapInsert(session.sm_id[0..session.sm_id_len], id);
     session.sm_detach_time = std.time.timestamp();
 
     // Remove from kqueue and close the fd
@@ -134,6 +136,11 @@ fn detachSession(_: *Server, id: usize, session: *Session, changes: *ChangeList)
 /// Full session teardown: MUC cleanup, presence broadcast, session map unbind,
 /// kqueue deregistration, and memory deallocation.
 fn destroySession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+    if (session.sm_detached and server.detached_count > 0) {
+        server.detached_count -= 1;
+        server.smIdMapRemove(session.sm_id[0..session.sm_id_len]);
+    }
+
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
     if (session.stream.bound_jid) |bound| {
         var close_jid_buf: [256]u8 = undefined;
@@ -168,11 +175,16 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     session.deinit();
     server.allocator.destroy(session);
     server.sessions[id] = null;
+
+    // Return ID to free-list (T128)
+    server.free_ids[server.free_count] = id;
+    server.free_count += 1;
 }
 
 /// Sweep detached sessions that have exceeded the resume timeout.
 /// Called periodically from the event loop (e.g., every 30 seconds via timer).
 pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
+    if (server.detached_count == 0) return;
     const now = std.time.timestamp();
     for (server.sessions, 0..) |slot, i| {
         const session = slot orelse continue;
@@ -226,16 +238,9 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
 }
 
-/// Allocate a free session ID slot. Returns null if full.
+/// Allocate a free session ID slot. O(1) via free-list stack (T128).
 fn allocateId(server: *Server) ?usize {
-    var i: usize = 0;
-    while (i < server.max_sessions) : (i += 1) {
-        const id = (server.next_id + i) % server.max_sessions;
-        if (id == 0) continue;
-        if (server.sessions[id] == null) {
-            server.next_id = (id + 1) % server.max_sessions;
-            return id;
-        }
-    }
-    return null;
+    if (server.free_count == 0) return null;
+    server.free_count -= 1;
+    return server.free_ids[server.free_count];
 }

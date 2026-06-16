@@ -362,6 +362,23 @@ pub const Session = struct {
     }
 };
 
+/// Entry in the SM-ID → session slot hash map (T127).
+const SmIdEntry = struct {
+    occupied: bool = false,
+    sm_id: [sm_state.SM_ID_HEX_LEN]u8 = undefined,
+    slot: usize = 0,
+};
+
+/// FNV-1a hash of an SM-ID for map indexing (T127).
+fn hashSmId(id: *const [sm_state.SM_ID_HEX_LEN]u8) usize {
+    var h: u64 = 0xcbf29ce484222325;
+    for (id) |byte| {
+        h ^= byte;
+        h *%= 0x100000001b3;
+    }
+    return @intCast(h % 64);
+}
+
 /// The XMPP core server.
 pub const Server = struct {
     loop: EventLoop,
@@ -373,7 +390,10 @@ pub const Server = struct {
     /// Session table — indexed by session ID. Heap-allocated, size configurable.
     sessions: []?*Session = &.{},
     max_sessions: usize = DEFAULT_MAX_SESSIONS,
-    next_id: usize = 1, // 0 reserved
+
+    /// Free-list stack for O(1) session ID allocation (T128).
+    free_ids: []usize = &.{},
+    free_count: usize = 0,
 
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
@@ -425,6 +445,13 @@ pub const Server = struct {
     /// Pending fan-out queue — bounded continuation for MUC groupchat delivery.
     fanout_queue: FanoutQueue = .{},
 
+    /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
+    detached_count: u16 = 0,
+
+    /// SM-ID → session slot index map for O(1) resume lookup (T127).
+    /// Open-addressing table with FNV-1a hash. Capacity must exceed max concurrent detached sessions.
+    sm_id_map: [64]SmIdEntry = [_]SmIdEntry{SmIdEntry{}} ** 64,
+
     /// Monotonic counter for generating unique stanza IDs (XEP-0359).
     /// Combined with worker_id to ensure uniqueness across threads.
     stanza_id_counter: u32 = 0,
@@ -465,6 +492,16 @@ pub const Server = struct {
         const sessions = try allocator.alloc(?*Session, max_sessions);
         @memset(sessions, null);
 
+        // Pre-populate free-list with all valid IDs (1..max_sessions-1) in reverse order
+        const free_ids = try allocator.alloc(usize, max_sessions);
+        var fc: usize = 0;
+        var idx: usize = max_sessions - 1;
+        while (idx >= 1) : (idx -= 1) {
+            free_ids[fc] = idx;
+            fc += 1;
+            if (idx == 1) break;
+        }
+
         const loop = try EventLoop.init(allocator, 256);
         errdefer {
             var l = loop;
@@ -478,6 +515,8 @@ pub const Server = struct {
             .listener = listener,
             .sessions = sessions,
             .max_sessions = max_sessions,
+            .free_ids = free_ids,
+            .free_count = fc,
             .allocator = allocator,
             .server_host = host,
         };
@@ -508,6 +547,16 @@ pub const Server = struct {
         const sessions = try allocator.alloc(?*Session, max_sessions);
         @memset(sessions, null);
 
+        // Pre-populate free-list with all valid IDs (1..max_sessions-1) in reverse order
+        const free_ids = try allocator.alloc(usize, max_sessions);
+        var fc: usize = 0;
+        var idx: usize = max_sessions - 1;
+        while (idx >= 1) : (idx -= 1) {
+            free_ids[fc] = idx;
+            fc += 1;
+            if (idx == 1) break;
+        }
+
         const loop = try EventLoop.init(allocator, 256);
         errdefer {
             var l = loop;
@@ -521,6 +570,8 @@ pub const Server = struct {
             .listener = listener,
             .sessions = sessions,
             .max_sessions = max_sessions,
+            .free_ids = free_ids,
+            .free_count = fc,
             .allocator = allocator,
             .server_host = host,
         };
@@ -596,6 +647,7 @@ pub const Server = struct {
             }
         }
         self.allocator.free(self.sessions);
+        if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
         self.listener.deinit();
         self.loop.deinit();
         if (self.ssl_ctx) |*ctx| ctx.deinit();
@@ -1779,6 +1831,9 @@ pub const Server = struct {
                     break :blk @as(usize, 0);
                 } else s2s_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &s2s_entries);
 
+                // Single timestamp for all S2S archive operations (T123)
+                const s2s_archive_ts: u64 = @intCast(std.time.timestamp());
+
                 if (target_count == 0) {
                     // Try offline storage for messages — only if this is a <message> stanza
                     if (self.offline) |store| {
@@ -1792,12 +1847,11 @@ pub const Server = struct {
                                 recip_fbs.writer().writeAll(to_jid.domain) catch {};
                                 const recipient_bare = recip_fbs.getWritten();
 
-                                const timestamp: u64 = @intCast(std.time.timestamp());
                                 const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
 
                                 // Store full stanza in archive, pointer in offline
-                                archive.store(recipient_bare, m.from_jid, stanza_id, timestamp, m.stanza_xml) catch {};
-                                if (store.storePointer(recipient_bare, m.from_jid, stanza_id, timestamp) catch false) {
+                                archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch {};
+                                if (store.storePointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts) catch false) {
                                     log.info("S2S inbound to {s} stored offline", .{m.to_jid});
                                     return;
                                 }
@@ -1821,10 +1875,9 @@ pub const Server = struct {
 
                         var s2s_sid_buf: [32]u8 = undefined;
                         const s2s_stanza_id = self.generateStanzaId(&s2s_sid_buf);
-                        const timestamp: u64 = @intCast(std.time.timestamp());
 
                         // Archive under recipient bare JID
-                        archive.store(recipient_bare, m.from_jid, s2s_stanza_id, timestamp, m.stanza_xml) catch {};
+                        archive.store(recipient_bare, m.from_jid, s2s_stanza_id, s2s_archive_ts, m.stanza_xml) catch {};
                     }
                 }
 
@@ -2762,16 +2815,54 @@ pub const Server = struct {
         }
     }
 
-    /// Find a detached session by SM-ID. Returns the session slot index or null.
+    /// Find a detached session by SM-ID. O(1) via hash map (T127).
     fn findDetachedSession(self: *Server, sm_id: []const u8) ?usize {
         if (sm_id.len != sm_state.SM_ID_HEX_LEN) return null;
-        for (self.sessions, 0..) |slot, i| {
-            const s = slot orelse continue;
-            if (!s.sm_detached) continue;
-            if (s.sm_id_len != sm_state.SM_ID_HEX_LEN) continue;
-            if (std.mem.eql(u8, s.sm_id[0..s.sm_id_len], sm_id)) return i;
+        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        var idx = hash % 64;
+        var probes: usize = 0;
+        while (probes < 64) : (probes += 1) {
+            const entry = &self.sm_id_map[idx];
+            if (!entry.occupied) return null;
+            if (std.mem.eql(u8, &entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN])) return entry.slot;
+            idx = (idx + 1) % 64;
         }
         return null;
+    }
+
+    /// Insert an SM-ID → slot mapping.
+    pub fn smIdMapInsert(self: *Server, sm_id: []const u8, slot: usize) void {
+        if (sm_id.len != sm_state.SM_ID_HEX_LEN) return;
+        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        var idx = hash % 64;
+        var probes: usize = 0;
+        while (probes < 64) : (probes += 1) {
+            const entry = &self.sm_id_map[idx];
+            if (!entry.occupied) {
+                entry.occupied = true;
+                @memcpy(&entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+                entry.slot = slot;
+                return;
+            }
+            idx = (idx + 1) % 64;
+        }
+    }
+
+    /// Remove an SM-ID from the map.
+    pub fn smIdMapRemove(self: *Server, sm_id: []const u8) void {
+        if (sm_id.len != sm_state.SM_ID_HEX_LEN) return;
+        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        var idx = hash % 64;
+        var probes: usize = 0;
+        while (probes < 64) : (probes += 1) {
+            const entry = &self.sm_id_map[idx];
+            if (!entry.occupied) return;
+            if (std.mem.eql(u8, &entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN])) {
+                entry.occupied = false;
+                return;
+            }
+            idx = (idx + 1) % 64;
+        }
     }
 
     /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.

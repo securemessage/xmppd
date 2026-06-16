@@ -279,12 +279,12 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    // Find subscribers (contacts with "from" or "both" in our roster)
-    const subscriber_jids = roster.getPresenceSubscribers(server.allocator, bare_jid) catch return;
-    defer {
-        for (subscriber_jids) |s| server.allocator.free(s);
-        server.allocator.free(subscriber_jids);
-    }
+    // Find subscribers (contacts with "from" or "both" in our roster) — zero-alloc (T125)
+    var sub_jid_buf: [16384]u8 = undefined;
+    var sub_jid_ptrs: [256][]const u8 = undefined;
+    const sub_count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf, &sub_jid_ptrs) catch return;
+    const subscriber_jids = sub_jid_ptrs[0..sub_count];
+
     // Build presence stanza with inner XML content
     var pres_buf: [16896]u8 = undefined;
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
@@ -326,11 +326,10 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    const subscriber_jids = roster.getPresenceSubscribers(server.allocator, bare_jid) catch return;
-    defer {
-        for (subscriber_jids) |s| server.allocator.free(s);
-        server.allocator.free(subscriber_jids);
-    }
+    var sub_jid_buf2: [16384]u8 = undefined;
+    var sub_jid_ptrs2: [256][]const u8 = undefined;
+    const sub_count2 = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf2, &sub_jid_ptrs2) catch return;
+    const subscriber_jids = sub_jid_ptrs2[0..sub_count2];
 
     var pres_buf: [512]u8 = undefined;
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
@@ -359,12 +358,11 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    // Get contacts whose presence we should receive (to/both)
-    const contact_jids = roster.getPresenceSubscriptions(server.allocator, bare_jid) catch return;
-    defer {
-        for (contact_jids) |s| server.allocator.free(s);
-        server.allocator.free(contact_jids);
-    }
+    // Get contacts whose presence we should receive (to/both) — zero-alloc (T125)
+    var probe_jid_buf: [16384]u8 = undefined;
+    var probe_jid_ptrs: [256][]const u8 = undefined;
+    const probe_count = roster.getPresenceSubscriptionsFixed(bare_jid, &probe_jid_buf, &probe_jid_ptrs) catch return;
+    const contact_jids = probe_jid_ptrs[0..probe_count];
 
     // Build our full JID as the 'to' attribute for cross-thread deliveries
     const bound = session.stream.bound_jid orelse return;
