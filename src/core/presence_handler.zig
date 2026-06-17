@@ -240,6 +240,9 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
         // Deliver any offline messages queued for this user
         session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
 
+        // RFC 6121 §3.1.3 rule 4: Deliver pending subscription requests
+        deliverPendingSubscriptions(server, session, bound.local, bound.domain, changes);
+
         log.info("connection {d} now available: {s}@{s}/{s} (priority={d})", .{
             session.conn.id, bound.local, bound.domain, bound.resource, prio,
         });
@@ -401,8 +404,14 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
         const target_count = sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
 
         for (probe_entries[0..target_count]) |entry| {
+            // Retrieve the contact's stored presence inner XML (status/show/priority)
+            const contact_inner = if (entry.worker_id == server.worker_id) blk: {
+                const contact_sess = server.sessions[entry.local_session_id] orelse break :blk @as([]const u8, "");
+                break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
+            } else @as([]const u8, "");
+
             // Build presence from the contact's full JID (per-resource)
-            var pres_buf: [512]u8 = undefined;
+            var pres_buf: [4608]u8 = undefined;
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
             const ppw = pres_fbs.writer();
             ppw.writeAll("<presence from='") catch continue;
@@ -413,7 +422,14 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             ppw.writeAll(entry.resource()) catch continue;
             ppw.writeAll("' to='") catch continue;
             ppw.writeAll(to_str) catch continue;
-            ppw.writeAll("'/>") catch continue;
+            ppw.writeByte('\'') catch continue;
+            if (contact_inner.len > 0) {
+                ppw.writeByte('>') catch continue;
+                ppw.writeAll(contact_inner) catch continue;
+                ppw.writeAll("</presence>") catch continue;
+            } else {
+                ppw.writeAll("/>") catch continue;
+            }
             const presence_xml = pres_fbs.getWritten();
 
             // The presence stanza is directed TO us (the session that just
@@ -487,7 +503,21 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
         server.forwardPresenceXmlToS2s(session, owner_bare, to_str, sub_pres_xml, changes);
     } else {
-        deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
+        // RFC 6121 §3.1.3 rule 4: If the contact has no available sessions,
+        // store the subscription request for deferred delivery when they come online.
+        const sm = server.session_map orelse {
+            deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
+            log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
+            return;
+        };
+        var target_entries: [16]SessionEntry = undefined;
+        const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_entries);
+        if (target_count > 0) {
+            deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
+        } else {
+            // Target is offline — store for deferred delivery
+            storePendingSubscription(server, to_str, sub_pres_xml);
+        }
     }
 
     log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
@@ -647,12 +677,16 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     var owner_new_sub: Subscription = .none;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
+        defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
         owner_new_sub = switch (existing.subscription) {
             .to => .none,
             .both => .from,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", owner_new_sub, false) catch {};
+        roster.setItemWithGroups(owner_bare, to_str, existing.name, owner_new_sub, false, existing.groups, existing.group_count) catch |e| {
+            log.err("handleUnsubscribe: setItem owner failed: {}", .{e});
+            return;
+        };
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -663,13 +697,17 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
         if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
             defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
             const contact_new_sub: Subscription = switch (existing.subscription) {
                 .from => .none,
                 .both => .to,
                 else => existing.subscription,
             };
             if (contact_new_sub != existing.subscription) {
-                roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+                roster.setItemWithGroups(to_str, owner_bare, existing.name, contact_new_sub, false, existing.groups, existing.group_count) catch |e| {
+                    log.err("handleUnsubscribe: setItem contact failed: {}", .{e});
+                    return;
+                };
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -720,13 +758,17 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     var owner_ask: bool = false;
     if (roster.getItem(server.allocator, owner_bare, to_str) catch null) |existing| {
         defer if (existing.name.len > 0) server.allocator.free(existing.name);
+        defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
         owner_ask = existing.ask;
         owner_new_sub = switch (existing.subscription) {
             .from => .none,
             .both => .to,
             else => existing.subscription,
         };
-        roster.setItem(owner_bare, to_str, "", owner_new_sub, existing.ask) catch {};
+        roster.setItemWithGroups(owner_bare, to_str, existing.name, owner_new_sub, existing.ask, existing.groups, existing.group_count) catch |e| {
+            log.err("handleUnsubscribed: setItem owner failed: {}", .{e});
+            return;
+        };
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -737,13 +779,17 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     if (std.mem.eql(u8, to_jid_parsed.domain, server.server_host)) {
         if (roster.getItem(server.allocator, to_str, owner_bare) catch null) |existing| {
             defer if (existing.name.len > 0) server.allocator.free(existing.name);
+            defer if (existing.groups.len > 0) server.allocator.free(existing.groups);
             const contact_new_sub: Subscription = switch (existing.subscription) {
                 .to => .none,
                 .both => .from,
                 else => existing.subscription,
             };
             if (contact_new_sub != existing.subscription) {
-                roster.setItem(to_str, owner_bare, "", contact_new_sub, false) catch {};
+                roster.setItemWithGroups(to_str, owner_bare, existing.name, contact_new_sub, false, existing.groups, existing.group_count) catch |e| {
+                    log.err("handleUnsubscribed: setItem contact failed: {}", .{e});
+                    return;
+                };
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -794,6 +840,79 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     }
 
     log.info("{s} denied/revoked subscription from {s}", .{ owner_bare, to_str });
+}
+
+// ========================================================================
+// Pending subscription storage (RFC 6121 §3.1.3 rule 4)
+// ========================================================================
+
+const PENDING_SUB_NS = "pending_sub";
+
+/// Store a pending subscription request for deferred delivery to an offline contact.
+/// Key: contact_bare\x00subscriber_bare. Value: raw subscribe presence XML.
+/// Deduplication: only one pending subscribe per subscriber→contact pair (overwrites).
+fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_xml: []const u8) void {
+    const roster = server.roster orelse return;
+
+    // Extract subscriber bare JID from the presence XML's 'from' attribute.
+    // The XML format is: <presence from='subscriber@host' to='contact@host' type='subscribe'...
+    // Use the contact_bare as prefix and the from JID as suffix for the key.
+    const from_start = std.mem.indexOf(u8, sub_pres_xml, "from='") orelse return;
+    const from_value_start = from_start + 6;
+    const from_end = std.mem.indexOfPos(u8, sub_pres_xml, from_value_start, "'") orelse return;
+    const subscriber_bare = sub_pres_xml[from_value_start..from_end];
+
+    var key_buf: [512]u8 = undefined;
+    const key_len = contact_bare.len + 1 + subscriber_bare.len;
+    if (key_len > key_buf.len) return;
+    @memcpy(key_buf[0..contact_bare.len], contact_bare);
+    key_buf[contact_bare.len] = 0;
+    @memcpy(key_buf[contact_bare.len + 1 .. key_len], subscriber_bare);
+    const key = key_buf[0..key_len];
+
+    roster.backend.put(PENDING_SUB_NS, key, sub_pres_xml) catch |e| {
+        log.err("storePendingSubscription failed for {s}: {}", .{ contact_bare, e });
+    };
+    log.info("stored pending subscribe for offline contact {s} from {s}", .{ contact_bare, subscriber_bare });
+}
+
+/// Deliver any pending subscription requests to a user who just became available.
+/// Called from dispatchPresence on initial available presence.
+pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+    const roster = server.roster orelse return;
+
+    var bare_buf: [256]u8 = undefined;
+    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
+    bare_fbs.writer().writeAll(local) catch return;
+    bare_fbs.writer().writeByte('@') catch return;
+    bare_fbs.writer().writeAll(domain) catch return;
+    const bare_jid = bare_fbs.getWritten();
+
+    // Prefix scan: all keys starting with "contact_bare\x00"
+    var prefix_buf: [256]u8 = undefined;
+    @memcpy(prefix_buf[0..bare_jid.len], bare_jid);
+    prefix_buf[bare_jid.len] = 0;
+    const prefix = prefix_buf[0 .. bare_jid.len + 1];
+
+    var iter = roster.backend.iterator(PENDING_SUB_NS, prefix) catch return;
+    defer iter.deinit();
+
+    var delivered: usize = 0;
+    while (iter.next()) |kv| {
+        // Value is the stored subscribe presence XML
+        session.conn.queueSend(kv.value) catch continue;
+        delivered += 1;
+
+        // Delete after delivery (dequeue)
+        roster.backend.delete(PENDING_SUB_NS, kv.key) catch {};
+    }
+
+    if (delivered > 0) {
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+        log.info("delivered {d} pending subscriptions to {s}", .{ delivered, bare_jid });
+    }
 }
 
 // ========================================================================

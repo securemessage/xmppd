@@ -63,10 +63,15 @@ def record(name, passed, detail=''):
     print(msg)
 
 def make_client(jid, password):
-    """Create a slixmpp client with TLS disabled (plaintext to 127.0.0.1)."""
+    """Create a slixmpp client with TLS disabled (plaintext to 127.0.0.1).
+    Auto-subscription is disabled to prevent clients from automatically
+    re-subscribing after unsubscribed/unsubscribe, which would mask server bugs."""
     client = slixmpp.ClientXMPP(jid, password)
     client.register_plugin('xep_0030')  # disco
     client.register_plugin('xep_0199')  # ping
+    # Disable auto-subscription handling — tests must be explicit
+    client.auto_authorize = False
+    client.auto_subscribe = False
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
