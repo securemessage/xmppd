@@ -781,6 +781,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         }
 
         roster.removeItem(bare_jid, item_jid) catch {};
+        server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(bare_jid));
         result_sub = .remove;
 
         // Send unsubscribe/unsubscribed to contact and update contact's roster.
@@ -817,6 +818,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch {};
+                            server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(item_jid));
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
                         }
                     }
@@ -852,6 +854,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, false) catch {};
+                            server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(item_jid));
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
                         }
                     }
@@ -872,6 +875,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
+        server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(bare_jid));
     }
 
     // Ack with result
@@ -1651,10 +1655,16 @@ fn sendPepNotification(
         }
     }
 
-    // Deliver to presence subscribers (contacts with "from" or "both" subscription) — zero-alloc (T125)
+    // Deliver to presence subscribers (contacts with "from" or "both" subscription) — cached (T129)
     var pep_sub_buf: [16384]u8 = undefined;
     var pep_sub_ptrs: [256][]const u8 = undefined;
-    const pep_sub_count = roster.getPresenceSubscribersFixed(publisher_bare, &pep_sub_buf, &pep_sub_ptrs) catch return;
+    const pep_hash = server_mod.sub_cache_mod.hashBareJid(publisher_bare);
+    const pep_now = std.time.timestamp();
+    const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, &pep_sub_buf, &pep_sub_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(publisher_bare, &pep_sub_buf, &pep_sub_ptrs) catch return;
+        server.sub_cache.storeSubscribers(pep_hash, pep_now, pep_sub_ptrs[0..count]);
+        break :blk count;
+    };
     const subscriber_jids = pep_sub_ptrs[0..pep_sub_count];
 
     for (subscriber_jids) |sub_bare_jid| {

@@ -66,6 +66,7 @@ const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
+pub const sub_cache_mod = @import("subscription_cache.zig");
 const router = @import("router.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const room_registry_mod = @import("room_registry");
@@ -438,6 +439,9 @@ pub const Server = struct {
 
     /// PEP store — per-user PubSub nodes (XEP-0163).
     pep_store: ?*GenericPepStore = null,
+
+    /// Subscription cache — avoids LMDB prefix scans on presence broadcast (T129).
+    sub_cache: sub_cache_mod.SubscriptionCache = .{},
 
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
@@ -1716,6 +1720,7 @@ pub const Server = struct {
                 if (item.entry.name.len > 0) self.allocator.free(item.entry.name);
             }
             self.allocator.free(items);
+            self.sub_cache.invalidate(sub_cache_mod.hashBareJid(bare_jid));
         }
 
         // Remove vCard

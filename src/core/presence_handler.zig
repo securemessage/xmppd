@@ -29,6 +29,7 @@ const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const iq_handler = @import("iq_handler.zig");
+const sub_cache_mod = server_mod.sub_cache_mod;
 
 const log = std.log.scoped(.presence);
 
@@ -282,10 +283,16 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    // Find subscribers (contacts with "from" or "both" in our roster) — zero-alloc (T125)
+    // Find subscribers (contacts with "from" or "both" in our roster) — cached (T129)
     var sub_jid_buf: [16384]u8 = undefined;
     var sub_jid_ptrs: [256][]const u8 = undefined;
-    const sub_count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf, &sub_jid_ptrs) catch return;
+    const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
+    const now = std.time.timestamp();
+    const sub_count = server.sub_cache.lookupSubscribers(bare_hash, now, &sub_jid_buf, &sub_jid_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf, &sub_jid_ptrs) catch return;
+        server.sub_cache.storeSubscribers(bare_hash, now, sub_jid_ptrs[0..count]);
+        break :blk count;
+    };
     const subscriber_jids = sub_jid_ptrs[0..sub_count];
 
     // Build presence stanza with inner XML content
@@ -331,7 +338,13 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
 
     var sub_jid_buf2: [16384]u8 = undefined;
     var sub_jid_ptrs2: [256][]const u8 = undefined;
-    const sub_count2 = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf2, &sub_jid_ptrs2) catch return;
+    const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
+    const now = std.time.timestamp();
+    const sub_count2 = server.sub_cache.lookupSubscribers(bare_hash, now, &sub_jid_buf2, &sub_jid_ptrs2) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf2, &sub_jid_ptrs2) catch return;
+        server.sub_cache.storeSubscribers(bare_hash, now, sub_jid_ptrs2[0..count]);
+        break :blk count;
+    };
     const subscriber_jids = sub_jid_ptrs2[0..sub_count2];
 
     var pres_buf: [512]u8 = undefined;
@@ -361,10 +374,16 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    // Get contacts whose presence we should receive (to/both) — zero-alloc (T125)
+    // Get contacts whose presence we should receive (to/both) — cached (T129)
     var probe_jid_buf: [16384]u8 = undefined;
     var probe_jid_ptrs: [256][]const u8 = undefined;
-    const probe_count = roster.getPresenceSubscriptionsFixed(bare_jid, &probe_jid_buf, &probe_jid_ptrs) catch return;
+    const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
+    const now = std.time.timestamp();
+    const probe_count = server.sub_cache.lookupSubscriptions(bare_hash, now, &probe_jid_buf, &probe_jid_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscriptionsFixed(bare_jid, &probe_jid_buf, &probe_jid_ptrs) catch return;
+        server.sub_cache.storeSubscriptions(bare_hash, now, probe_jid_ptrs[0..count]);
+        break :blk count;
+    };
     const contact_jids = probe_jid_ptrs[0..probe_count];
 
     // Build our full JID as the 'to' attribute for cross-thread deliveries
@@ -474,6 +493,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     } else {
         roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
     }
+    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
 
     // RFC 6121 §3.1.2: Push roster item to all of owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", result_sub, true, changes);
@@ -553,6 +573,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     } else {
         roster.setItem(owner_bare, to_str, "", .from, false) catch return;
     }
+    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
 
     // RFC 6121 §3.1.5: Push updated roster to owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
@@ -578,6 +599,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     } else {
         roster.setItem(to_str, owner_bare, "", .to, false) catch {};
     }
+    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
 
     // RFC 6121 §3.1.5: Push updated roster to contact's interested resources
     const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
@@ -687,6 +709,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
             log.err("handleUnsubscribe: setItem owner failed: {}", .{e});
             return;
         };
+        server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -708,6 +731,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
                     log.err("handleUnsubscribe: setItem contact failed: {}", .{e});
                     return;
                 };
+                server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -769,6 +793,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
             log.err("handleUnsubscribed: setItem owner failed: {}", .{e});
             return;
         };
+        server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -790,6 +815,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
                     log.err("handleUnsubscribed: setItem contact failed: {}", .{e});
                     return;
                 };
+                server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
