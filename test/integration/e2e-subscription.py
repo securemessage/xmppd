@@ -19,11 +19,11 @@ Tests RFC 6121 §3 (Managing Presence Subscriptions) exhaustively:
 Prerequisites:
     - xmppd running in the xmppd jail (morante.dev), interop config (no-TLS)
     - Users: alice, bob, charlie (password: test1234)
-    - FRESH roster state — clear op DB before running
+    - Each test cleans up its own subscription state via roster remove (§2.5)
 
 Usage:
-    # From freebsd-dev1 (after clearing op DB and restarting xmppd):
-    doas rm -f /usr/local/jails/xmppd/var/db/xmppd/op/data.mdb /usr/local/jails/xmppd/var/db/xmppd/op/lock.mdb
+    # From freebsd-dev1 (start xmppd in interop mode):
+    doas sysrc -j xmppd xmppd_config="/usr/local/etc/xmppd/xmppd-interop-notls.conf"
     doas jexec xmppd service xmppd restart
     python3 test/integration/e2e-subscription.py
 """
@@ -104,6 +104,17 @@ async def disconnect_client(client):
     await asyncio.sleep(0.3)
     client.disconnect()
     await asyncio.sleep(0.3)
+
+
+async def cleanup_subscription(client, contact_jid):
+    """Remove a contact from the roster via IQ set subscription='remove'.
+    Per RFC 6121 §2.5, this triggers unsubscribe/unsubscribed automatically
+    and fully clears the subscription state on both sides."""
+    try:
+        await client.del_roster_item(contact_jid)
+    except (IqError, IqTimeout):
+        pass  # item may not exist — that's fine
+    await asyncio.sleep(0.2)
 
 
 # ============================================================================
@@ -230,6 +241,8 @@ async def test_basic_subscription():
         record("Bob gets roster push (subscription=from)", bob_got_from)
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -304,6 +317,8 @@ async def test_mutual_subscription():
         record("Bob→Alice subscription='both'", bob_sub == 'both', f"got '{bob_sub}'")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -386,6 +401,8 @@ async def test_subscription_cancel():
         record("Cancel: Alice subscription downgraded", valid, f"got '{alice_sub}'")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -456,6 +473,8 @@ async def test_unsubscribe():
         record("Unsubscribe: Alice subscription downgraded", valid, f"got '{alice_sub}'")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -497,6 +516,8 @@ async def test_duplicate_subscribe():
         record("Duplicate subscribe: no error/crash", True)
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -540,6 +561,8 @@ async def test_subscribe_full_jid():
             record("Full JID subscribe: Bob receives it", False, "TIMEOUT")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -618,6 +641,7 @@ async def test_presence_after_subscription():
         await disconnect_client(bob2)
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
         await disconnect_client(alice)
 
 
@@ -684,6 +708,8 @@ async def test_presence_with_status():
                 print(f"      {s}")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
@@ -739,6 +765,8 @@ async def test_roster_push_multiple_resources():
         record("Multi-resource: resource2 got roster push", len(alice2_pushes) > 0, f"count={len(alice2_pushes)}")
 
     finally:
+        await cleanup_subscription(alice1, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice1)
         await disconnect_client(alice2)
         await disconnect_client(bob)
@@ -786,9 +814,11 @@ async def test_subscribe_contact_offline():
         except asyncio.TimeoutError:
             record("Offline subscribe: Charlie receives deferred request", False, "TIMEOUT")
 
+        await cleanup_subscription(charlie, ALICE_JID)
         await disconnect_client(charlie)
 
     finally:
+        await cleanup_subscription(alice, CHARLIE_JID)
         await disconnect_client(alice)
 
 
@@ -812,12 +842,15 @@ async def test_subscription_timing():
 
     def alice_on_presence(presence):
         ptype = presence['type']
-        if presence['from'].bare == BOB_JID and ptype not in ('subscribe', 'subscribed', 'unsubscribe', 'unsubscribed', 'unavailable', 'error', 'probe'):
+        from_jid = presence['from']
+        if hasattr(from_jid, 'bare') and from_jid.bare == BOB_JID and ptype not in ('subscribe', 'subscribed', 'unsubscribe', 'unsubscribed', 'unavailable', 'error', 'probe'):
             if not alice_presence.done():
                 alice_presence.set_result(presence)
 
     bob.add_event_handler('presence_subscribe', bob_on_subscribe)
-    alice.add_event_handler('presence_available', alice_on_presence)
+    # Use raw 'presence' event — slixmpp's 'presence_available' depends on internal
+    # roster state being synchronized, which races during subscription establishment.
+    alice.add_event_handler('presence', alice_on_presence)
 
     try:
         await connect_client(alice)
@@ -850,6 +883,8 @@ async def test_subscription_timing():
             record(f"Timing: total subscribe→presence", False, f"TIMEOUT after {elapsed:.1f}s — 47s STALL DETECTED!")
 
     finally:
+        await cleanup_subscription(alice, BOB_JID)
+        await cleanup_subscription(bob, ALICE_JID)
         await disconnect_client(alice)
         await disconnect_client(bob)
 
