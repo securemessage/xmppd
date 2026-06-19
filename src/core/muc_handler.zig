@@ -953,13 +953,30 @@ fn handleJoin(
         return;
     }
 
-    // Nickname conflict check — allow same bare JID to share nick (XEP-0045 §7.2.14 multi-session)
+    // Nickname conflict check + multi-session collapsing (XEP-0045 §7.2.14)
     if (r.findByNick(nick)) |existing_idx| {
-        const existing = r.occupants[existing_idx].?;
+        const existing = &r.occupants[existing_idx].?;
         if (!std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
+            // Different user trying to use the same nick → conflict
             sendPresenceError(server, session, room_local, muc_host, "conflict", changes);
             return;
         }
+        // Same user, same nick, different resource → collapse (latest resource wins)
+        const local_sid: usize = session.conn.id;
+        const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
+        existing.session_id = local_sid;
+        existing.worker_id = server.worker_id;
+        existing.generation = join_gen;
+        // Update the real JID to the new resource
+        const rjlen: u8 = @intCast(@min(real_jid.len, existing.real_jid_buf.len));
+        @memcpy(existing.real_jid_buf[0..rjlen], real_jid[0..rjlen]);
+        existing.real_jid_len = rjlen;
+        // Update worker mask for new resource's worker
+        r.worker_mask |= (@as(u16, 1) << @intCast(server.worker_id));
+        // Send self-presence to confirm the resource takeover
+        sendSelfPresence(server, session, r, nick, muc_host, changes);
+        log.info("{s} collapsed into existing occupant '{s}' in {s}", .{ real_jid, nick, room_jid });
+        return;
     }
 
     // Determine affiliation and role
