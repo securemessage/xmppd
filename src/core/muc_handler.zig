@@ -686,6 +686,227 @@ fn sendIqErrorFromRoom(
 }
 
 // ============================================================================
+// Room Configuration (XEP-0045 §10.1)
+// ============================================================================
+
+/// Handle IQ get for room configuration form (owner queries current config).
+pub fn handleMucOwnerGet(
+    server: *Server,
+    session: *Session,
+    room_local: []const u8,
+    iq_id: []const u8,
+    changes: *ChangeList,
+) void {
+    const muc_host = server.muc_host orelse return;
+    var room_jid_buf: [320]u8 = undefined;
+    const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
+
+    const reg = server.room_registry orelse return;
+    const room = reg.findByJid(room_jid) orelse {
+        sendIqErrorFromRoom(server, session, room_jid, iq_id, "item-not-found", changes);
+        return;
+    };
+
+    // Verify requester is owner
+    const bound = session.stream.bound_jid orelse return;
+    var bare_buf: [256]u8 = undefined;
+    const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
+    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
+    if (aff != .owner) {
+        sendIqErrorFromRoom(server, session, room_jid, iq_id, "forbidden", changes);
+        return;
+    }
+
+    // Build XEP-0004 data form with current room config
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    w.writeAll("<iq type='result' from='") catch return;
+    w.writeAll(room_jid) catch return;
+    w.writeAll("' to='") catch return;
+    writeSessionJid(w, session) catch return;
+    w.writeAll("' id='") catch return;
+    w.writeAll(iq_id) catch return;
+    w.writeAll("'><query xmlns='http://jabber.org/protocol/muc#owner'>") catch return;
+    w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
+    w.writeAll("<title>Room Configuration</title>") catch return;
+
+    // FORM_TYPE (required for proper form identification)
+    w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/muc#roomconfig</value></field>") catch return;
+
+    // Room name
+    w.writeAll("<field var='muc#roomconfig_roomname' type='text-single' label='Room Name'><value>") catch return;
+    w.writeAll(room.config.getName()) catch return;
+    w.writeAll("</value></field>") catch return;
+
+    // Room description
+    w.writeAll("<field var='muc#roomconfig_roomdesc' type='text-single' label='Description'><value>") catch return;
+    w.writeAll(room.config.getSubject()) catch return;
+    w.writeAll("</value></field>") catch return;
+
+    // Boolean fields
+    writeConfigBoolField(w, "muc#roomconfig_persistentroom", "Persistent", room.config.persistent);
+    writeConfigBoolField(w, "muc#roomconfig_publicroom", "Public", room.config.public_room);
+    writeConfigBoolField(w, "muc#roomconfig_membersonly", "Members Only", room.config.members_only);
+    writeConfigBoolField(w, "muc#roomconfig_moderatedroom", "Moderated", room.config.moderated);
+    writeConfigBoolField(w, "muc#roomconfig_passwordprotectedroom", "Password Protected", room.config.password_protected);
+    writeConfigBoolField(w, "muc#roomconfig_allowinvites", "Allow Invites", room.config.allow_invites);
+
+    // Password
+    w.writeAll("<field var='muc#roomconfig_roomsecret' type='text-private' label='Password'><value>") catch return;
+    w.writeAll(room.config.getPassword()) catch return;
+    w.writeAll("</value></field>") catch return;
+
+    w.writeAll("</x></query></iq>") catch return;
+
+    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+    }
+}
+
+/// Handle IQ set for room configuration form submission.
+pub fn handleMucOwnerSet(
+    server: *Server,
+    session: *Session,
+    room_local: []const u8,
+    iq_id: []const u8,
+    changes: *ChangeList,
+) void {
+    const muc_host = server.muc_host orelse return;
+    var room_jid_buf: [320]u8 = undefined;
+    const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
+
+    const reg = server.room_registry orelse return;
+    const room = reg.findByJid(room_jid) orelse {
+        sendIqErrorFromRoom(server, session, room_jid, iq_id, "item-not-found", changes);
+        return;
+    };
+
+    // Verify requester is owner
+    const bound = session.stream.bound_jid orelse return;
+    var bare_buf: [256]u8 = undefined;
+    const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
+    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
+
+    // New rooms allow the creator (first owner) to configure even without stored affiliation
+    const is_owner = aff == .owner or room.occupant_count == 1;
+    if (!is_owner) {
+        sendIqErrorFromRoom(server, session, room_jid, iq_id, "forbidden", changes);
+        return;
+    }
+
+    // Parse form fields from accumulated stanza buffer.
+    // The form XML is in session.stanza_buf — parse key/value pairs from <field var='...'><value>...</value></field>
+    const form_xml = session.stanza_buf[0..session.stanza_buf_len];
+    var config = room.config;
+    const was_persistent = config.persistent;
+
+    // Parse each field we recognize
+    config.persistent = parseFormBool(form_xml, "muc#roomconfig_persistentroom") orelse config.persistent;
+    config.public_room = parseFormBool(form_xml, "muc#roomconfig_publicroom") orelse config.public_room;
+    config.members_only = parseFormBool(form_xml, "muc#roomconfig_membersonly") orelse config.members_only;
+    config.moderated = parseFormBool(form_xml, "muc#roomconfig_moderatedroom") orelse config.moderated;
+    config.password_protected = parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom") orelse config.password_protected;
+    config.allow_invites = parseFormBool(form_xml, "muc#roomconfig_allowinvites") orelse config.allow_invites;
+
+    // Text fields
+    if (parseFormValue(form_xml, "muc#roomconfig_roomname")) |name| config.setName(name);
+    if (parseFormValue(form_xml, "muc#roomconfig_roomdesc")) |desc| config.setSubject(desc);
+    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret")) |pw| config.setPassword(pw);
+
+    // Apply config to the in-memory room
+    room.config = config;
+
+    // Persist or remove from store based on persistent flag
+    if (server.room_store) |store| {
+        if (config.persistent) {
+            store.saveRoom(room_jid, &config) catch {};
+            // Ensure owner affiliation is persisted
+            store.setAffiliation(room_jid, bare_jid, .owner) catch {};
+        } else if (was_persistent and !config.persistent) {
+            // Room changed from persistent to transient — remove from store
+            store.destroyRoom(room_jid) catch {};
+        }
+    }
+
+    // Send result IQ
+    var result_buf: [512]u8 = undefined;
+    var result_fbs = std.io.fixedBufferStream(&result_buf);
+    const rw = result_fbs.writer();
+    rw.writeAll("<iq type='result' from='") catch return;
+    rw.writeAll(room_jid) catch return;
+    rw.writeAll("' to='") catch return;
+    writeSessionJid(rw, session) catch return;
+    rw.writeAll("' id='") catch return;
+    rw.writeAll(iq_id) catch return;
+    rw.writeAll("'/>") catch return;
+
+    session.conn.queueSend(result_fbs.getWritten()) catch return;
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+    }
+
+    // Broadcast status 104 (room config changed) to occupants
+    broadcastConfigChange(server, room, muc_host, changes);
+}
+
+/// Write a boolean form field element.
+fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, value: bool) void {
+    w.writeAll("<field var='") catch return;
+    w.writeAll(var_name) catch return;
+    w.writeAll("' type='boolean' label='") catch return;
+    w.writeAll(label) catch return;
+    w.writeAll("'><value>") catch return;
+    w.writeAll(if (value) "1" else "0") catch return;
+    w.writeAll("</value></field>") catch return;
+}
+
+/// Parse a boolean value from a form field in XML.
+fn parseFormBool(xml_data: []const u8, field_var: []const u8) ?bool {
+    const value = parseFormValue(xml_data, field_var) orelse return null;
+    if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
+    return null;
+}
+
+/// Parse the <value>...</value> content for a given field var from form XML.
+fn parseFormValue(xml_data: []const u8, field_var: []const u8) ?[]const u8 {
+    // Find field_var in the XML
+    const var_pos = std.mem.indexOf(u8, xml_data, field_var) orelse return null;
+    // Find the next <value> after this field
+    const after_var = xml_data[var_pos..];
+    const value_start_tag = std.mem.indexOf(u8, after_var, "<value>") orelse return null;
+    const content_start = value_start_tag + 7; // len("<value>")
+    const remaining = after_var[content_start..];
+    const value_end = std.mem.indexOf(u8, remaining, "</value>") orelse return null;
+    return remaining[0..value_end];
+}
+
+/// Broadcast status code 104 (config changed) to all room occupants.
+fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u8, changes: *ChangeList) void {
+    _ = muc_host;
+    for (&room.occupants) |*slot| {
+        const occ = slot.* orelse continue;
+        if (occ.worker_id != server.worker_id) continue;
+        const target = server.sessions[occ.session_id] orelse continue;
+        var buf: [512]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+        w.writeAll("<message from='") catch continue;
+        w.writeAll(room.getJid()) catch continue;
+        w.writeAll("' to='") catch continue;
+        writeSessionJid(w, target) catch continue;
+        w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch continue;
+        target.conn.queueSend(fbs.getWritten()) catch continue;
+        if (target.conn.hasPendingWrite()) {
+            changes.addWrite(target.conn.fd, target.conn.id) catch {};
+        }
+    }
+}
+
+// ============================================================================
 // Join / Part
 // ============================================================================
 
@@ -766,6 +987,24 @@ fn handleJoin(
     if (r.config.members_only and affiliation == .none) {
         sendPresenceError(server, session, room_local, muc_host, "registration-required", changes);
         return;
+    }
+
+    // Password-protected room check (T67) — require matching <password> in join presence
+    if (r.config.password_protected and r.config.password_len > 0) {
+        const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
+        const expected = r.config.getPassword();
+        const has_correct_password = blk: {
+            // Look for <password xmlns='http://jabber.org/protocol/muc'>PASS</password>
+            const pw_start = std.mem.indexOf(u8, inner_xml, "<password") orelse break :blk false;
+            const gt = std.mem.indexOfScalarPos(u8, inner_xml, pw_start, '>') orelse break :blk false;
+            const after = inner_xml[gt + 1 ..];
+            const pw_end = std.mem.indexOf(u8, after, "</password>") orelse break :blk false;
+            break :blk std.mem.eql(u8, after[0..pw_end], expected);
+        };
+        if (!has_correct_password) {
+            sendPresenceError(server, session, room_local, muc_host, "not-authorized", changes);
+            return;
+        }
     }
 
     // Add occupant — store local session ID directly (no global mapping).

@@ -377,6 +377,16 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                         muc_handler.handleMucAdminIq(server, session, to_jid.local, iq_id, changes);
                         return;
                     }
+                    // Room configuration (XEP-0045 §10.1 — owner only)
+                    if (std.mem.eql(u8, child_ns, xml.ns.muc_owner)) {
+                        if (std.mem.eql(u8, iq_type, "get")) {
+                            muc_handler.handleMucOwnerGet(server, session, to_jid.local, iq_id, changes);
+                            return;
+                        } else if (std.mem.eql(u8, iq_type, "set")) {
+                            muc_handler.handleMucOwnerSet(server, session, to_jid.local, iq_id, changes);
+                            return;
+                        }
+                    }
                     // disco#info for a specific room
                     if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
                         muc_handler.handleRoomDiscoInfo(server, session, to_jid.local, iq_id, changes);
