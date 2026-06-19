@@ -858,6 +858,21 @@ pub fn build(b: *std.Build) void {
 
     const run_message_tests = b.addRunArtifact(message_tests);
 
+    // --- Caps (XEP-0115) tests ---
+
+    const caps_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/caps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const caps_tests = b.addTest(.{
+        .name = "caps-tests",
+        .root_module = caps_test_mod,
+    });
+
+    const run_caps_tests = b.addRunArtifact(caps_tests);
+
     // --- RocksDB backend tests ---
 
     const rocksdb_backend_test_mod = b.createModule(.{
@@ -1382,6 +1397,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);
     test_step.dependOn(&run_sm_state_tests.step);
+    test_step.dependOn(&run_caps_tests.step);
     test_step.dependOn(&run_message_tests.step);
     test_step.dependOn(&run_room_mailbox_tests.step);
     test_step.dependOn(&run_config_tests.step);

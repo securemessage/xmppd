@@ -486,6 +486,12 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='http://jabber.org/protocol/pubsub#persistent-items'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/pubsub#retrieve-items'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:avatar:metadata+notify'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:bookmarks:1#notify'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:chat-markers:0'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:hints'/>") catch return;
+        w.writeAll("<feature var='jabber:iq:last'/>") catch return;
+        w.writeAll("<feature var='urn:xmpp:csi:0'/>") catch return;
+        w.writeAll("<feature var='http://jabber.org/protocol/caps'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
@@ -551,6 +557,19 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<version>0.1.0</version>") catch return;
         w.writeAll("<os>FreeBSD</os>") catch return;
         w.writeAll("</query></iq>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        return;
+    }
+
+    // Last Activity (XEP-0012)
+    if (std.mem.eql(u8, child_ns, xml.ns.last) and std.mem.eql(u8, iq_type, "get")) {
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        writeIqHeader(server, w, session, "result", iq_id);
+        // Query own last activity: return 0 (currently online)
+        // TODO: For querying other users, look up stored last_online timestamp
+        w.writeAll("><query xmlns='jabber:iq:last' seconds='0'/>") catch return;
+        w.writeAll("</iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
     }

@@ -133,6 +133,7 @@ pub const FeatureSet = struct {
     sasl_mechanisms: []const []const u8 = &.{},
     bind: bool = false,
     sm: bool = false,
+    csi: bool = false,
 };
 
 /// Server-side XMPP stream state machine.
@@ -226,6 +227,7 @@ pub const Stream = struct {
             .features_bind => FeatureSet{
                 .bind = true,
                 .sm = true,
+                .csi = true,
             },
             else => null,
         };
@@ -373,6 +375,10 @@ pub fn writeFeatures(writer: anytype, features: FeatureSet) !void {
 
     if (features.sm) {
         try writer.writeAll("<sm xmlns='urn:xmpp:sm:3'/>");
+    }
+
+    if (features.csi) {
+        try writer.writeAll("<csi xmlns='urn:xmpp:csi:0'/>");
     }
 
     try writer.writeAll("</stream:features>");

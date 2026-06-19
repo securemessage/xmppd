@@ -20,6 +20,7 @@ const xmpp = @import("xmpp");
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
+const caps_mod = server_mod.caps_mod;
 const ChangeList = @import("event_loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
@@ -226,6 +227,13 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
         const store_len = @min(inner_xml.len, session.last_presence_inner.len);
         @memcpy(session.last_presence_inner[0..store_len], inner_xml[0..store_len]);
         session.last_presence_inner_len = store_len;
+
+        // XEP-0115: Extract caps `ver` hash from <c> element in presence
+        if (caps_mod.extractVerFromPresence(inner_xml)) |ver| {
+            const vlen: u8 = @intCast(@min(ver.len, caps_mod.MAX_VER_LEN));
+            @memcpy(session.caps_ver_buf[0..vlen], ver[0..vlen]);
+            session.caps_ver_len = vlen;
+        }
 
         broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);
 

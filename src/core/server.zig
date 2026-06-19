@@ -67,6 +67,7 @@ const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 pub const sub_cache_mod = @import("subscription_cache.zig");
+pub const caps_mod = @import("caps.zig");
 const router = @import("router.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const room_registry_mod = @import("room_registry");
@@ -272,6 +273,13 @@ pub const Session = struct {
     /// XEP-0280: Message Carbons enabled for this session.
     carbons_enabled: bool = false,
 
+    /// XEP-0352: Client State Indication — false when client is backgrounded/inactive.
+    csi_active: bool = true,
+
+    /// XEP-0115: Client's caps `ver` hash from presence (for PEP +notify filtering).
+    caps_ver_buf: [caps_mod.MAX_VER_LEN]u8 = undefined,
+    caps_ver_len: u8 = 0,
+
     /// RFC 6121 §2.1.6: Whether this resource has requested the roster (is "interested").
     /// Interested resources receive roster pushes for subscription changes.
     roster_interested: bool = false,
@@ -442,6 +450,9 @@ pub const Server = struct {
 
     /// Subscription cache — avoids LMDB prefix scans on presence broadcast (T129).
     sub_cache: sub_cache_mod.SubscriptionCache = .{},
+
+    /// XEP-0115: Entity Capabilities cache — maps client ver hash → feature bitmap.
+    caps_cache: caps_mod.CapsCache = .{},
 
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
@@ -1064,6 +1075,16 @@ pub const Server = struct {
                         break;
                     }
                 }
+            }
+            return;
+        }
+
+        // XEP-0352: Client State Indication — stream-level active/inactive signals
+        if (std.mem.eql(u8, ns, xml.ns.csi)) {
+            if (std.mem.eql(u8, elem.local_name, "active")) {
+                session.csi_active = true;
+            } else if (std.mem.eql(u8, elem.local_name, "inactive")) {
+                session.csi_active = false;
             }
             return;
         }
@@ -2771,11 +2792,21 @@ pub const Server = struct {
             };
         }
 
+        // Clean up detached session bookkeeping before destroying
+        if (self.detached_count > 0) self.detached_count -= 1;
+        self.smIdMapRemove(detached.sm_id[0..detached.sm_id_len]);
+
         // Destroy the detached session (slot freed for reuse)
-        detached.sm_resume_enabled = false; // Prevent re-detach during destroy
+        detached.sm_resume_enabled = false; // Prevent re-detach
         detached.deinit();
         self.allocator.destroy(detached);
         self.sessions[detached_id] = null;
+
+        // Return detached slot to free-list
+        if (self.free_count < self.free_ids.len) {
+            self.free_ids[self.free_count] = detached_id;
+            self.free_count += 1;
+        }
 
         // Send <resumed/> to the client
         var fbs = std.io.fixedBufferStream(&session.write_scratch);

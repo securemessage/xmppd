@@ -36,6 +36,8 @@ pub const ns = struct {
     pub const pubsub = "http://jabber.org/protocol/pubsub";
     pub const pubsub_owner = "http://jabber.org/protocol/pubsub#owner";
     pub const pubsub_event = "http://jabber.org/protocol/pubsub#event";
+    pub const last = "jabber:iq:last";
+    pub const csi = "urn:xmpp:csi:0";
 };
 
 /// An XML element with its attributes and namespace context.

@@ -179,11 +179,18 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         break :blk avail_count;
     };
 
+    // XEP-0334: Message Processing Hints
+    const has_no_store = std.mem.indexOf(u8, inner_xml, "urn:xmpp:hints") != null and
+        std.mem.indexOf(u8, inner_xml, "<no-store") != null;
+    const has_no_copy = std.mem.indexOf(u8, inner_xml, "urn:xmpp:hints") != null and
+        std.mem.indexOf(u8, inner_xml, "<no-copy") != null;
+
     // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
     const is_archivable = session.stanza_kind == .message and
         inner_xml.len > 0 and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0) and
-        std.mem.indexOf(u8, inner_xml, "<body") != null;
+        std.mem.indexOf(u8, inner_xml, "<body") != null and
+        !has_no_store;
 
     var sid_buf: [32]u8 = undefined;
     const archive_stanza_id: []const u8 = if (is_archivable) server.generateStanzaId(&sid_buf) else "";
@@ -358,9 +365,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         .none => return,
     };
 
+    // XEP-0352 CSI: for bodyless messages (typing indicators), skip delivery to inactive sessions
+    const is_typing_only = session.stanza_kind == .message and !is_archivable and
+        std.mem.indexOf(u8, inner_xml, "<body") == null;
+
     // Forward to each local target session
     for (local_ids[0..target_count]) |tid| {
         const target_session = server.sessions[tid] orelse continue;
+        if (is_typing_only and !target_session.csi_active) continue;
         var msg_buf: [20480]u8 = undefined;
         var msg_fbs = std.io.fixedBufferStream(&msg_buf);
         const mw = msg_fbs.writer();
@@ -404,7 +416,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     // XEP-0280: Message Carbons — send copies to sender's and recipient's other resources
-    if (session.stanza_kind == .message and
+    // XEP-0334: Skip carbons if <no-copy xmlns='urn:xmpp:hints'/> is present
+    if (session.stanza_kind == .message and !has_no_copy and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
     {
         sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
