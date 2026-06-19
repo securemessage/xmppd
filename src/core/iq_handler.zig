@@ -1260,7 +1260,7 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
     }
 }
 
-/// Handle vCard-temp GET — return stored vCard or empty fallback.
+/// Handle vCard-temp GET — return stored vCard or Gravatar fallback.
 /// Uses multiple queueSend calls to avoid write_scratch overflow when
 /// the stored vCard XML is large (vcard_buf and write_scratch are both 4KB).
 fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
@@ -1282,20 +1282,18 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
         const xml_data = vcard.get(server.allocator, bare_jid) catch null;
         if (xml_data) |data| {
             defer server.allocator.free(data);
-            // Send header + '>' first, then vCard data, then closing tag
-            // to avoid overflowing write_scratch with large vCards.
             w.writeByte('>') catch return;
             session.conn.queueSend(fbs.getWritten()) catch return;
             session.conn.queueSend(data) catch return;
             session.conn.queueSend("</iq>") catch return;
             return;
-        } else {
-            w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
         }
-    } else {
-        w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
     }
 
+    // No stored vCard — return Gravatar fallback
+    w.writeAll("><vCard xmlns='vcard-temp'><PHOTO><EXTVAL>https://www.gravatar.com/avatar/") catch return;
+    writeGravatarHash(w, bare_jid);
+    w.writeAll("?d=mp&amp;s=96</EXTVAL></PHOTO></vCard></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
@@ -2059,4 +2057,18 @@ pub fn pushRosterItem(
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch {};
         }
     }
+}
+
+/// Write the MD5 hex hash of a bare JID for Gravatar URL construction.
+/// Gravatar uses MD5(lowercase(email)) — bare JIDs are already email-like.
+fn writeGravatarHash(writer: anytype, bare_jid: []const u8) void {
+    var lower_buf: [256]u8 = undefined;
+    const len = @min(bare_jid.len, lower_buf.len);
+    for (bare_jid[0..len], 0..) |c, i| {
+        lower_buf[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(lower_buf[0..len], &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    writer.writeAll(&hex) catch {};
 }
