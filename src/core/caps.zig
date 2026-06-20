@@ -11,6 +11,7 @@
 //! Each entry stores which +notify PEP nodes the client supports as a bitmap.
 
 const std = @import("std");
+const Sha1 = std.crypto.hash.Sha1;
 
 const log = std.log.scoped(.caps);
 
@@ -136,6 +137,67 @@ pub fn extractVerFromPresence(inner_xml: []const u8) ?[]const u8 {
     return inner_xml[ver_start..ver_end];
 }
 
+/// Extract the `node` attribute value from a `<c ... node='...'/>` element in presence XML.
+/// Returns the node string slice within the input, or null if not found.
+pub fn extractNodeFromPresence(inner_xml: []const u8) ?[]const u8 {
+    const caps_ns = "http://jabber.org/protocol/caps";
+    const c_pos = std.mem.indexOf(u8, inner_xml, caps_ns) orelse return null;
+
+    const search_start = if (c_pos > 200) c_pos - 200 else 0;
+    const search_end = @min(inner_xml.len, c_pos + 200);
+    const region = inner_xml[search_start..search_end];
+
+    // Find node=' or node="
+    const node_prefix = "node='";
+    const node_prefix_dq = "node=\"";
+    var node_start: usize = 0;
+    var quote_char: u8 = '\'';
+
+    if (std.mem.indexOf(u8, region, node_prefix)) |pos| {
+        node_start = search_start + pos + node_prefix.len;
+        quote_char = '\'';
+    } else if (std.mem.indexOf(u8, region, node_prefix_dq)) |pos| {
+        node_start = search_start + pos + node_prefix_dq.len;
+        quote_char = '"';
+    } else {
+        return null;
+    }
+
+    const node_end = std.mem.indexOfScalarPos(u8, inner_xml, node_start, quote_char) orelse return null;
+    if (node_end - node_start > 256) return null;
+    return inner_xml[node_start..node_end];
+}
+
+/// Build a disco#info query IQ stanza for caps verification (XEP-0115 §5.3).
+/// Writes `<iq type='get' from='server' to='jid' id='caps-N'><query xmlns='disco#info' node='node#ver'/></iq>`
+/// into the provided buffer. Returns the written slice, or null if buffer too small.
+pub fn buildCapsQuery(
+    buf: []u8,
+    server_host: []const u8,
+    to_jid: []const u8,
+    node: []const u8,
+    ver: []const u8,
+    query_id: u32,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeAll("<iq type='get' from='") catch return null;
+    w.writeAll(server_host) catch return null;
+    w.writeAll("' to='") catch return null;
+    w.writeAll(to_jid) catch return null;
+    w.writeAll("' id='caps-") catch return null;
+    // Write query_id as decimal
+    var id_buf: [10]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{query_id}) catch return null;
+    w.writeAll(id_str) catch return null;
+    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return null;
+    w.writeAll(node) catch return null;
+    w.writeByte('#') catch return null;
+    w.writeAll(ver) catch return null;
+    w.writeAll("'/></iq>") catch return null;
+    return fbs.getWritten();
+}
+
 /// FNV-1a hash of ver string, masked to cache index.
 fn hashVer(ver: []const u8) usize {
     var h: u32 = 2166136261;
@@ -144,6 +206,111 @@ fn hashVer(ver: []const u8) usize {
         h *%= 16777619;
     }
     return @intCast(h & (CACHE_SIZE - 1));
+}
+
+// ============================================================================
+// XEP-0115 §5: Server Caps Verification String
+// ============================================================================
+
+/// The server's caps node URI (used in the `node` attribute of `<c>`).
+pub const SERVER_NODE: []const u8 = "https://securemessage.cc/xmppd";
+
+/// Maximum length of a base64-encoded SHA-1 hash (28 chars).
+const MAX_CAPS_HASH_LEN: usize = 28;
+
+/// Pre-computed server caps verification string (base64-encoded SHA-1).
+/// Computed once at startup from the server's disco#info features.
+pub const ServerCaps = struct {
+    ver_hash: [MAX_CAPS_HASH_LEN]u8 = undefined,
+    ver_len: u8 = 0,
+    caps_xml: [256]u8 = undefined,
+    caps_xml_len: u8 = 0,
+
+    pub fn getVer(self: *const ServerCaps) []const u8 {
+        return self.ver_hash[0..self.ver_len];
+    }
+
+    pub fn getCapsXml(self: *const ServerCaps) []const u8 {
+        return self.caps_xml[0..self.caps_xml_len];
+    }
+};
+
+/// Server disco#info features — must match exactly what iq_handler returns.
+/// Sorted alphabetically per XEP-0115 §5.1 step 3.
+const SERVER_FEATURES = [_][]const u8{
+    "http://jabber.org/protocol/caps",
+    "http://jabber.org/protocol/chatstates",
+    "http://jabber.org/protocol/disco#info",
+    "http://jabber.org/protocol/disco#items",
+    "http://jabber.org/protocol/pubsub#auto-create",
+    "http://jabber.org/protocol/pubsub#auto-subscribe",
+    "http://jabber.org/protocol/pubsub#persistent-items",
+    "http://jabber.org/protocol/pubsub#publish",
+    "http://jabber.org/protocol/pubsub#retrieve-items",
+    "http://jabber.org/protocol/pubsub#subscribe",
+    "jabber:iq:last",
+    "jabber:iq:roster",
+    "jabber:iq:version",
+    "msgoffline",
+    "urn:xmpp:avatar:metadata+notify",
+    "urn:xmpp:blocking",
+    "urn:xmpp:bookmarks:1#notify",
+    "urn:xmpp:carbons:2",
+    "urn:xmpp:chat-markers:0",
+    "urn:xmpp:csi:0",
+    "urn:xmpp:hints",
+    "urn:xmpp:mam:2",
+    "urn:xmpp:message-correct:0",
+    "urn:xmpp:ping",
+    "urn:xmpp:receipts",
+    "urn:xmpp:sid:0",
+    "urn:xmpp:sm:3",
+    "vcard-temp",
+};
+
+/// Compute the XEP-0115 §5.1 verification string for the server's disco#info.
+/// Returns a ServerCaps with the base64-encoded SHA-1 hash and a pre-built
+/// `<c>` XML element for injection into presence stanzas.
+pub fn computeServerCaps() ServerCaps {
+    var caps = ServerCaps{};
+
+    // XEP-0115 §5.1:
+    // 1. Sort identities by category/type/lang/name (server has one identity)
+    // 2. For each identity: S += "category/type/lang/name<"
+    // 3. Sort features alphabetically (SERVER_FEATURES is already sorted)
+    // 4. For each feature: S += "feature<"
+    // 5. SHA-1 hash → base64
+
+    var hasher = Sha1.init(.{});
+
+    // Step 2: Server identity — category=server, type=im, lang=(empty), name=xmppd
+    hasher.update("server/im//xmppd<");
+
+    // Step 4: Features (already sorted)
+    for (SERVER_FEATURES) |feature| {
+        hasher.update(feature);
+        hasher.update("<");
+    }
+
+    const digest = hasher.finalResult();
+    const encoder = std.base64.standard.Encoder;
+    const enc_len = encoder.calcSize(digest.len);
+    if (enc_len <= MAX_CAPS_HASH_LEN) {
+        const encoded = encoder.encode(caps.ver_hash[0..enc_len], &digest);
+        caps.ver_len = @intCast(encoded.len);
+    }
+
+    // Pre-build the <c> XML element
+    var fbs = std.io.fixedBufferStream(&caps.caps_xml);
+    const w = fbs.writer();
+    w.writeAll("<c xmlns='http://jabber.org/protocol/caps' hash='sha-1' node='") catch {};
+    w.writeAll(SERVER_NODE) catch {};
+    w.writeAll("' ver='") catch {};
+    w.writeAll(caps.getVer()) catch {};
+    w.writeAll("'/>") catch {};
+    caps.caps_xml_len = @intCast(fbs.pos);
+
+    return caps;
 }
 
 // ============================================================================
@@ -199,4 +366,77 @@ test "parseFeaturesFromXml: no +notify features" {
     const xml = "<feature var='http://jabber.org/protocol/disco#info'/>";
     const features = parseFeaturesFromXml(xml);
     try std.testing.expectEqual(@as(u64, 0), features);
+}
+
+test "extractNodeFromPresence: standard caps element" {
+    const xml = "<c xmlns='http://jabber.org/protocol/caps' hash='sha-1' node='http://gajim.org' ver='ABC123=='/>";
+    const node = extractNodeFromPresence(xml);
+    try std.testing.expect(node != null);
+    try std.testing.expectEqualStrings("http://gajim.org", node.?);
+}
+
+test "extractNodeFromPresence: double quotes" {
+    const xml = "<c xmlns=\"http://jabber.org/protocol/caps\" hash=\"sha-1\" node=\"http://conversations.im\" ver=\"XYZ==\"/>";
+    const node = extractNodeFromPresence(xml);
+    try std.testing.expect(node != null);
+    try std.testing.expectEqualStrings("http://conversations.im", node.?);
+}
+
+test "extractNodeFromPresence: no caps element" {
+    const xml = "<priority>5</priority>";
+    try std.testing.expect(extractNodeFromPresence(xml) == null);
+}
+
+test "buildCapsQuery: well-formed" {
+    var buf: [512]u8 = undefined;
+    const result = buildCapsQuery(&buf, "example.com", "alice@example.com/res", "http://gajim.org", "ABC123==", 42);
+    try std.testing.expect(result != null);
+    const xml = result.?;
+    try std.testing.expect(std.mem.indexOf(u8, xml, "type='get'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "from='example.com'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "to='alice@example.com/res'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "id='caps-42'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "node='http://gajim.org#ABC123=='") != null);
+}
+
+test "computeServerCaps: produces valid base64 SHA-1 hash" {
+    const caps = computeServerCaps();
+    // SHA-1 base64 is always 28 chars
+    try std.testing.expectEqual(@as(u8, 28), caps.ver_len);
+    // Hash must be non-empty
+    try std.testing.expect(caps.ver_len > 0);
+    // Verify it's valid base64 (all chars in alphabet + padding)
+    for (caps.getVer()) |ch| {
+        try std.testing.expect(
+            (ch >= 'A' and ch <= 'Z') or
+                (ch >= 'a' and ch <= 'z') or
+                (ch >= '0' and ch <= '9') or
+                ch == '+' or ch == '/' or ch == '=',
+        );
+    }
+}
+
+test "computeServerCaps: deterministic" {
+    const caps1 = computeServerCaps();
+    const caps2 = computeServerCaps();
+    try std.testing.expectEqualStrings(caps1.getVer(), caps2.getVer());
+}
+
+test "computeServerCaps: XML element well-formed" {
+    const caps = computeServerCaps();
+    const xml = caps.getCapsXml();
+    try std.testing.expect(xml.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, xml, "<c xmlns='http://jabber.org/protocol/caps'"));
+    try std.testing.expect(std.mem.endsWith(u8, xml, "'/>"));
+    try std.testing.expect(std.mem.indexOf(u8, xml, "hash='sha-1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, SERVER_NODE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, caps.getVer()) != null);
+}
+
+test "SERVER_FEATURES: sorted alphabetically" {
+    var i: usize = 1;
+    while (i < SERVER_FEATURES.len) : (i += 1) {
+        const order = std.mem.order(u8, SERVER_FEATURES[i - 1], SERVER_FEATURES[i]);
+        try std.testing.expect(order == .lt);
+    }
 }

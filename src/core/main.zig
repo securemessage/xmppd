@@ -432,6 +432,8 @@ const WorkerArgs = struct {
 fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     server.worker_id = worker_id;
     server.session_map = ctx.session_map;
+    const caps = @import("server.zig").caps_mod;
+    server.server_caps = caps.computeServerCaps();
     if (ctx.delivery_system) |ds| {
         server.delivery_system = ds;
     }

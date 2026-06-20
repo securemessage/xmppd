@@ -320,10 +320,15 @@ pub fn AuthHandler(comptime Store: type) type {
             if (result) |validated_user| {
                 log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
                 if (self.rate_limiter) |rl| rl.recordSuccess(validated_user);
+                const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
+                    self.store.getPhotoUrl()
+                else
+                    "";
                 return protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
                     .username = validated_user,
                     .server_final = "",
+                    .photo_url = photo_url,
                 } };
             } else {
                 log.info("OAUTHBEARER auth failed", .{});

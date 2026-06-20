@@ -81,6 +81,11 @@ pub const OidcStore = struct {
     username_buf: [256]u8 = undefined,
     username_len: usize = 0,
 
+    /// Stable buffer for the last validated user's profile photo URL.
+    /// Extracted from the OIDC `picture` claim (standard OpenID Connect claim).
+    photo_url_buf: [512]u8 = undefined,
+    photo_url_len: usize = 0,
+
     pub fn init(allocator: Allocator, config: OidcConfig) OidcStore {
         return OidcStore{
             .config = config,
@@ -160,6 +165,16 @@ pub const OidcStore = struct {
         @memcpy(self.username_buf[0..localpart.len], localpart);
         self.username_len = localpart.len;
         const username = self.username_buf[0..self.username_len];
+
+        // Capture profile photo URL from OIDC `picture` claim (standard OpenID Connect).
+        // Copy into stable buffer for the same lifetime reason as username.
+        const picture = parsed.claims.picture;
+        if (picture.len > 0 and picture.len <= self.photo_url_buf.len) {
+            @memcpy(self.photo_url_buf[0..picture.len], picture);
+            self.photo_url_len = picture.len;
+        } else {
+            self.photo_url_len = 0;
+        }
 
         log.info("OAUTHBEARER: validated token for '{s}'", .{username});
         return username;
@@ -262,6 +277,11 @@ pub const OidcStore = struct {
         const username = extractLocalpart(username_claim);
         log.info("OAUTHBEARER: introspection validated for '{s}'", .{username});
         return username;
+    }
+
+    /// Return the photo URL from the last successful token validation, or empty slice.
+    pub fn getPhotoUrl(self: *const OidcStore) []const u8 {
+        return self.photo_url_buf[0..self.photo_url_len];
     }
 
     // NOTE: No `lookup` function — OIDC backends don't support SCRAM-SHA-256.

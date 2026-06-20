@@ -44,6 +44,7 @@ pub const JwtClaims = struct {
     aud: []const u8,
     exp: i64,
     preferred_username: []const u8,
+    picture: []const u8,
 };
 
 /// A parsed (but not yet verified) JWT.
@@ -281,6 +282,7 @@ fn parseClaims(json: []const u8) ?JwtClaims {
         .exp = extractIntField(json, "\"exp\"") orelse 0,
         .preferred_username = extractStringField(json, "\"preferred_username\"") orelse
             extractStringField(json, "\"email\"") orelse "",
+        .picture = extractStringField(json, "\"picture\"") orelse "",
     };
 }
 
@@ -373,22 +375,22 @@ test "parse: invalid format" {
 }
 
 test "validateExpiry: not expired" {
-    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 9999999999, .preferred_username = "" };
+    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 9999999999, .preferred_username = "", .picture = "" };
     try validateExpiry(&claims);
 }
 
 test "validateExpiry: expired" {
-    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 1000000000, .preferred_username = "" };
+    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 1000000000, .preferred_username = "", .picture = "" };
     try std.testing.expectError(JwtError.TokenExpired, validateExpiry(&claims));
 }
 
 test "validateIssuer: match" {
-    const claims = JwtClaims{ .sub = "", .iss = "https://auth.example.com", .aud = "", .exp = 0, .preferred_username = "" };
+    const claims = JwtClaims{ .sub = "", .iss = "https://auth.example.com", .aud = "", .exp = 0, .preferred_username = "", .picture = "" };
     try validateIssuer(&claims, "https://auth.example.com");
 }
 
 test "validateIssuer: mismatch" {
-    const claims = JwtClaims{ .sub = "", .iss = "https://wrong.com", .aud = "", .exp = 0, .preferred_username = "" };
+    const claims = JwtClaims{ .sub = "", .iss = "https://wrong.com", .aud = "", .exp = 0, .preferred_username = "", .picture = "" };
     try std.testing.expectError(JwtError.InvalidIssuer, validateIssuer(&claims, "https://auth.example.com"));
 }
 

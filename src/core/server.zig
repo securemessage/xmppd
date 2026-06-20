@@ -232,6 +232,12 @@ pub const Session = struct {
     iq_roster_groups_buf: [2048]u8 = undefined,
     iq_roster_groups_len: usize = 0,
 
+    /// XEP-0115 §5.3: disco#info query node attribute (for caps verification).
+    disco_node: []const u8 = "",
+
+    /// XEP-0115: Accumulated feature bitmap from disco#info response to our caps query.
+    caps_disco_features: u64 = 0,
+
     /// MAM query accumulation (XEP-0313) — populated by handleIqChild.
     mam_query_id: []const u8 = "",
     mam_with: []const u8 = "",
@@ -453,6 +459,10 @@ pub const Server = struct {
 
     /// XEP-0115: Entity Capabilities cache — maps client ver hash → feature bitmap.
     caps_cache: caps_mod.CapsCache = .{},
+
+    /// XEP-0115: Server's own caps hash + pre-built <c> element.
+    /// Initialized at runtime in configureServer().
+    server_caps: caps_mod.ServerCaps = .{},
 
     /// MUC service hostname (e.g., "conference.example.com").
     muc_host: ?[]const u8 = null,
@@ -1604,6 +1614,36 @@ pub const Server = struct {
                 @memcpy(session.auth_username_buf[0..ulen], m.username[0..ulen]);
                 session.auth_username_len = ulen;
                 const stable_username = session.auth_username_buf[0..ulen];
+
+                // OIDC profile photo import: if the IdP provided a picture URL
+                // and the user has no stored vCard, create one with the photo.
+                if (m.photo_url.len > 0) {
+                    if (self.vcard) |vcard| {
+                        // Build bare JID for vCard lookup
+                        var jid_buf: [512]u8 = undefined;
+                        var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+                        const jw = jid_fbs.writer();
+                        jw.writeAll(stable_username) catch {};
+                        jw.writeByte('@') catch {};
+                        jw.writeAll(self.server_host) catch {};
+                        const bare_jid = jid_fbs.getWritten();
+
+                        const existing = vcard.get(self.allocator, bare_jid) catch null;
+                        if (existing) |data| {
+                            self.allocator.free(data);
+                        } else {
+                            // No existing vCard — create one with OIDC photo
+                            var vc_buf: [1024]u8 = undefined;
+                            var vc_fbs = std.io.fixedBufferStream(&vc_buf);
+                            const vw = vc_fbs.writer();
+                            vw.writeAll("<vCard xmlns='vcard-temp'><PHOTO><EXTVAL>") catch {};
+                            vw.writeAll(m.photo_url) catch {};
+                            vw.writeAll("</EXTVAL></PHOTO></vCard>") catch {};
+                            vcard.set(bare_jid, vc_fbs.getWritten()) catch {};
+                            log.info("OIDC photo imported for '{s}'", .{stable_username});
+                        }
+                    }
+                }
 
                 const success_action = session.stream.saslSuccess(stable_username, server_final_b64);
                 self.executeAction(session, success_action);

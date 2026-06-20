@@ -142,6 +142,8 @@ pub const AuthSuccess = struct {
     conn_id: u32,
     username: []const u8,
     server_final: []const u8,
+    /// OIDC profile photo URL (from `picture` claim). Empty for non-OIDC auth.
+    photo_url: []const u8 = "",
 };
 
 pub const AuthFailure = struct {
@@ -319,6 +321,7 @@ pub fn encode(msg: Message, buf: []u8) !usize {
             pos += 4;
             pos = try writeField(buf, pos, s.username);
             pos = try writeField(buf, pos, s.server_final);
+            pos = try writeField(buf, pos, s.photo_url);
         },
         .auth_failure => |f| {
             buf[pos] = @intFromEnum(Tag.auth_failure);
@@ -474,10 +477,12 @@ pub fn decode(payload: []const u8) !Message {
             var pos: usize = 4;
             const username = try readField(data, &pos);
             const server_final = try readField(data, &pos);
+            const photo_url = if (pos < data.len) try readField(data, &pos) else "";
             break :blk Message{ .auth_success = .{
                 .conn_id = conn_id,
                 .username = username,
                 .server_final = server_final,
+                .photo_url = photo_url,
             } };
         },
         @intFromEnum(Tag.auth_failure) => blk: {

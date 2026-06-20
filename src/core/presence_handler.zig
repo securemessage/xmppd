@@ -233,6 +233,31 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             const vlen: u8 = @intCast(@min(ver.len, caps_mod.MAX_VER_LEN));
             @memcpy(session.caps_ver_buf[0..vlen], ver[0..vlen]);
             session.caps_ver_len = vlen;
+
+            // If this ver hash is not in the cache, send a disco#info query
+            // to the client to discover its features (XEP-0115 §5.3).
+            if (server.caps_cache.lookup(ver) == null) {
+                if (caps_mod.extractNodeFromPresence(inner_xml)) |node| {
+                    // Build the full JID for the query target
+                    var jid_buf: [512]u8 = undefined;
+                    var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+                    const jw = jid_fbs.writer();
+                    jw.writeAll(bound.local) catch {};
+                    jw.writeByte('@') catch {};
+                    jw.writeAll(bound.domain) catch {};
+                    jw.writeByte('/') catch {};
+                    jw.writeAll(bound.resource) catch {};
+                    const full_jid = jid_fbs.getWritten();
+
+                    var query_buf: [1024]u8 = undefined;
+                    if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
+                        session.conn.queueSend(query_xml) catch {};
+                        if (session.conn.hasPendingWrite()) {
+                            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                        }
+                    }
+                }
+            }
         }
 
         broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);

@@ -117,6 +117,16 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
                 }
             }
         }
+        // disco#info query — extract node attribute (XEP-0115 §5.3)
+        if (std.mem.eql(u8, ns, xml.ns.disco_info)) {
+            session.disco_node = "";
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "node")) {
+                    session.disco_node = attr.value;
+                    break;
+                }
+            }
+        }
     } else if (std.mem.eql(u8, elem.local_name, "pubsub") and
         (std.mem.eql(u8, ns, xml.ns.pubsub) or std.mem.eql(u8, ns, xml.ns.pubsub_owner)))
     {
@@ -200,6 +210,19 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     } else if (std.mem.eql(u8, elem.local_name, "ping") and std.mem.eql(u8, ns, xml.ns.ping)) {
         session.iq_child_ns = ns;
         session.iq_child_name = elem.local_name;
+    } else if (std.mem.eql(u8, elem.local_name, "feature") and std.mem.eql(u8, ns, xml.ns.disco_info)) {
+        // XEP-0115: Accumulate +notify features from disco#info result
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "var")) {
+                const caps_mod2 = @import("caps.zig");
+                if (std.mem.eql(u8, attr.value, "urn:xmpp:avatar:metadata+notify")) {
+                    session.caps_disco_features |= (@as(u64, 1) << @intFromEnum(caps_mod2.Feature.avatar_metadata));
+                } else if (std.mem.eql(u8, attr.value, "urn:xmpp:bookmarks:1#notify")) {
+                    session.caps_disco_features |= (@as(u64, 1) << @intFromEnum(caps_mod2.Feature.bookmarks));
+                }
+                break;
+            }
+        }
     } else if (std.mem.eql(u8, elem.local_name, "field") and std.mem.eql(u8, ns, ns_xdata)) {
         // <field var='with|start|end'> inside <x xmlns='jabber:x:data'>
         for (elem.attributes) |attr| {
@@ -338,6 +361,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.vcard_collecting = false;
         session.vcard_buf_len = 0;
         session.pep_collecting = false;
+        // Reset XEP-0115 caps disco accumulation
+        session.disco_node = "";
+        session.caps_disco_features = 0;
         // Reset registration accumulation
         session.reg_collecting_username = false;
         session.reg_username_len = 0;
@@ -350,6 +376,26 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     const iq_id = session.iq_id;
     const iq_to = session.iq_to;
     const child_ns = session.iq_child_ns;
+
+    // XEP-0115: Handle disco#info result for our caps query.
+    // When we sent a caps query (id='caps-N'), the client responds with features.
+    // Insert the accumulated bitmap into the caps cache keyed by the session's ver hash.
+    if (std.mem.eql(u8, iq_type, "result") and std.mem.startsWith(u8, iq_id, "caps-")) {
+        if (session.caps_ver_len > 0) {
+            const ver = session.caps_ver_buf[0..session.caps_ver_len];
+            server.caps_cache.insert(ver, session.caps_disco_features);
+            log.info("XEP-0115: cached caps for ver='{s}' features=0x{x}", .{ ver, session.caps_disco_features });
+        }
+        session.caps_disco_features = 0;
+        return;
+    }
+
+    // IQ type='result' or 'error' for other server-initiated IQs — silently consume.
+    if (std.mem.eql(u8, iq_type, "result") or std.mem.eql(u8, iq_type, "error")) {
+        // Clients may send IQ results in response to roster pushes or other
+        // server-initiated IQs. These are acknowledgements — nothing to do.
+        return;
+    }
 
     // IQ addressed to MUC service domain — handle MUC disco and admin commands
     if (server.muc_host) |muc_host| {
@@ -469,10 +515,35 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
 
     // Service Discovery — disco#info (XEP-0030)
     if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
+        // XEP-0115 §5.3: If the query includes a node attribute, check if it matches
+        // our server's caps node#ver. If it does, return the same features. If not,
+        // return item-not-found per XEP-0030 §3.3.
+        const disco_node = session.disco_node;
+        if (disco_node.len > 0) {
+            const caps_mod = @import("caps.zig");
+            const expected_node = caps_mod.SERVER_NODE;
+            const server_ver = server.server_caps.getVer();
+            // Expected format: "node#ver"
+            if (disco_node.len != expected_node.len + 1 + server_ver.len or
+                !std.mem.startsWith(u8, disco_node, expected_node) or
+                disco_node[expected_node.len] != '#' or
+                !std.mem.eql(u8, disco_node[expected_node.len + 1 ..], server_ver))
+            {
+                sendIqError(server, session, iq_id, "item-not-found");
+                return;
+            }
+            // Node matches — fall through to return features with node attribute
+        }
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+        if (disco_node.len > 0) {
+            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return;
+            w.writeAll(disco_node) catch return;
+            w.writeAll("'>") catch return;
+        } else {
+            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+        }
         w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/disco#info'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/disco#items'/>") catch return;
