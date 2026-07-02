@@ -373,6 +373,46 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     for (local_ids[0..target_count]) |tid| {
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
+        // T153: a detached (SM resume pending) session has no live connection —
+        // its conn.fd was already closed by detachSession(). Attempting
+        // conn.queueSend()/changes.addWrite() here would register a kqueue
+        // watch on a stale fd number that the OS may have already recycled
+        // for an unrelated connection, misrouting future events onto this
+        // session slot. Track the stanza for resume replay instead of
+        // attempting live delivery.
+        if (target_session.sm_detached) {
+            var msg_buf: [20480]u8 = undefined;
+            var msg_fbs = std.io.fixedBufferStream(&msg_buf);
+            const mw = msg_fbs.writer();
+            mw.writeByte('<') catch continue;
+            mw.writeAll(tag_name) catch continue;
+            mw.writeAll(" from='") catch continue;
+            mw.writeAll(from_str) catch continue;
+            mw.writeAll("' to='") catch continue;
+            mw.writeAll(to_str) catch continue;
+            mw.writeByte('\'') catch continue;
+            if (type_str.len > 0 and !(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
+                mw.writeAll(" type='") catch continue;
+                mw.writeAll(type_str) catch continue;
+                mw.writeByte('\'') catch continue;
+            }
+            if (id_str.len > 0) {
+                mw.writeAll(" id='") catch continue;
+                mw.writeAll(id_str) catch continue;
+                mw.writeByte('\'') catch continue;
+            }
+            if (delivery_inner_xml.len == 0) {
+                mw.writeAll("/>") catch continue;
+            } else {
+                mw.writeByte('>') catch continue;
+                mw.writeAll(delivery_inner_xml) catch continue;
+                mw.writeAll("</") catch continue;
+                mw.writeAll(tag_name) catch continue;
+                mw.writeByte('>') catch continue;
+            }
+            target_session.smTrackOutbound(msg_fbs.getWritten());
+            continue;
+        }
         var msg_buf: [20480]u8 = undefined;
         var msg_fbs = std.io.fixedBufferStream(&msg_buf);
         const mw = msg_fbs.writer();

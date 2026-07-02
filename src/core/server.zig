@@ -2470,7 +2470,12 @@ pub const Server = struct {
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
                 const target_session = c.server.sessions[local_session_id] orelse return;
-                if (target_session.sm_detached) return; // Detached sessions can't receive
+                if (target_session.sm_detached) {
+                    // T153: no live connection to deliver to — track for resume
+                    // replay instead of silently dropping the stanza.
+                    target_session.smTrackOutbound(payload);
+                    return;
+                }
                 target_session.conn.queueSend(payload) catch return;
                 target_session.smTrackOutbound(payload);
                 if (target_session.conn.hasPendingWrite()) {
