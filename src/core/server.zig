@@ -956,7 +956,10 @@ pub const Server = struct {
         if (self.sessions[id] == null) return;
 
         if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, id) catch {};
+            _ = session.conn.flushSend() catch {};
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, id) catch {};
+            }
         }
     }
 
@@ -1072,6 +1075,14 @@ pub const Server = struct {
             } else if (std.mem.eql(u8, elem.local_name, "resource") and session.bind_pending) {
                 session.bind_collecting_resource = true;
                 session.bind_resource_len = 0;
+            }
+            return;
+        }
+
+        // XEP-0198: SM resume at features_bind — client sends <resume/> instead of <bind/>
+        if (session.stream.state == .features_bind and std.mem.eql(u8, ns, xml.ns.sm)) {
+            if (std.mem.eql(u8, elem.local_name, "resume")) {
+                self.handleSmResume(session, elem, changes);
             }
             return;
         }
@@ -1648,11 +1659,14 @@ pub const Server = struct {
                 const success_action = session.stream.saslSuccess(stable_username, server_final_b64);
                 self.executeAction(session, success_action);
                 session.resetSasl();
-
                 if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
+                    // Flush immediately rather than deferring to kqueue
+                    // EVFILT_WRITE which intermittently fails to fire.
+                    _ = session.conn.flushSend() catch {};
+                    if (session.conn.hasPendingWrite()) {
+                        changes.addWrite(session.conn.fd, conn_id) catch {};
+                    }
                 }
-
                 // OpenSSL may have buffered the client's post-auth stream open
                 // internally. kqueue won't fire for data already consumed from
                 // the socket. Drain the SSL buffer immediately — same pattern
@@ -2867,7 +2881,10 @@ pub const Server = struct {
         }
 
         if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            _ = session.conn.flushSend() catch {};
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
         }
 
         log.info("connection {d} session resumed (id={s}, replayed {d} stanzas)", .{
@@ -2887,7 +2904,10 @@ pub const Server = struct {
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            _ = session.conn.flushSend() catch {};
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
         }
     }
 

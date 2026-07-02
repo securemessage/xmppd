@@ -255,8 +255,16 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
                 else => {},
             }
 
+            // Flush IPC response immediately — deferred addWriteOnce was
+            // causing auth responses to be permanently stuck in send buffer.
             if (conn.hasPendingSend()) {
-                batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+                _ = conn.flush() catch {
+                    ipc.closeClient(slot);
+                    return;
+                };
+                if (conn.hasPendingSend()) {
+                    batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+                }
             }
         }
     }

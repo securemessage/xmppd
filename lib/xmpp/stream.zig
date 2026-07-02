@@ -159,13 +159,18 @@ pub const Stream = struct {
             .server_host = server_host,
             .tls_active = direct_tls,
         };
-        std.crypto.random.bytes(&s.stream_id);
-        s.stream_id_hex = std.fmt.bytesToHex(s.stream_id, .lower);
+        s.regenerateStreamId();
         // If already on TLS, skip the TLS negotiation phase
         if (direct_tls) {
             s.state = .awaiting_stream_open;
         }
         return s;
+    }
+
+    /// Generate a new random stream ID (RFC 6120 §4.7.3).
+    fn regenerateStreamId(self: *Stream) void {
+        std.crypto.random.bytes(&self.stream_id);
+        self.stream_id_hex = std.fmt.bytesToHex(self.stream_id, .lower);
     }
 
     /// Process a stream open from the client.
@@ -177,6 +182,9 @@ pub const Stream = struct {
         if (!std.mem.eql(u8, to, self.server_host)) {
             return .{ .send_error = .host_unknown };
         }
+
+        // RFC 6120 §4.7.3: each stream restart MUST use a new unique stream ID
+        self.regenerateStreamId();
 
         switch (self.state) {
             .awaiting_stream_open => {
