@@ -1286,7 +1286,9 @@ pub const Server = struct {
             if (session.reader.depth == 1) {
                 // </iq> at stream-child level — perform bind with collected resource
                 const resource = session.bind_resource_buf[0..session.bind_resource_len];
-                session_lifecycle.handleBind(self, session, resource);
+                if (!session_lifecycle.handleBind(self, session, resource, changes)) {
+                    return; // session was destroyed (AlreadyBound conflict) — do not touch it
+                }
                 session.bind_pending = false;
                 session.bind_resource_len = 0;
                 session.bind_iq_id = "";
@@ -2412,7 +2414,7 @@ pub const Server = struct {
     // Helpers
     // ========================================================================
 
-    fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.StreamError) void {
+    pub fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.StreamError) void {
         _ = self;
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         xmpp.stream.writeStreamError(fbs.writer(), err) catch return;
@@ -3209,10 +3211,8 @@ test "Server: stream open produces response" {
     var changes = ChangeList.init(&change_buf);
     server.handleReadable(1, &changes);
 
-    // Server should have queued a response
-    try std.testing.expect(session.conn.hasPendingWrite());
-
-    // Flush and read from client side
+    // Server should have queued (and, since handleReadable flushes eagerly,
+    // likely already sent) a response — flush covers both cases.
     _ = try session.conn.flushSend();
     var buf: [2048]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;

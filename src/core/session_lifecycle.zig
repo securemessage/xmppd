@@ -64,7 +64,16 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
 }
 
 /// Process resource bind and register session in the unified session map.
-pub fn handleBind(server: *Server, session: *Session, resource: []const u8) void {
+///
+/// T152: if the JID/resource is already bound (e.g. a stale session left over
+/// from an unclean disconnect), evict the old resource per RFC 6120 §7.7.3
+/// ("the server MAY terminate the old session in favor of the new") rather
+/// than silently leaving the new (already-acknowledged-to-the-client) bind
+/// unregistered in the session map.
+/// Returns `false` if the session was destroyed as part of handling the bind
+/// (e.g. an unrecoverable AlreadyBound conflict) — callers MUST NOT touch
+/// `session` again if this returns false.
+pub fn handleBind(server: *Server, session: *Session, resource: []const u8, changes: *ChangeList) bool {
     const action = session.stream.handleBind(resource);
     server.executeAction(session, action);
 
@@ -72,17 +81,69 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8) void
         if (session.stream.bound_jid) |bound| {
             const sm = server.session_map orelse {
                 log.err("connection {d} bind failed: session_map not configured", .{session.conn.id});
-                return;
+                return true;
             };
             _ = sm.bind(server.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err| {
+                if (err == error.AlreadyBound) {
+                    if (evictStaleResource(server, sm, bound.local, bound.domain, bound.resource, changes)) {
+                        _ = sm.bind(server.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err2| {
+                            log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
+                            server.sendStreamError(session, .conflict);
+                            forceCloseSession(server, session.conn.id, changes);
+                            return false;
+                        };
+                        log.info("connection {d} session established (evicted stale resource): {s}@{s}/{s}", .{
+                            session.conn.id, bound.local, bound.domain, bound.resource,
+                        });
+                        return true;
+                    }
+                    // Cross-worker stale entry: no safe local mechanism to evict a
+                    // connection owned by another worker thread yet (see T152 follow-up).
+                    // Fail loud instead of leaving the client believing it's bound.
+                    log.err("connection {d} session_map bind failed: resource held by another worker, cannot evict", .{session.conn.id});
+                    server.sendStreamError(session, .conflict);
+                    forceCloseSession(server, session.conn.id, changes);
+                    return false;
+                }
                 log.err("connection {d} session_map bind failed: {}", .{ session.conn.id, err });
-                return;
+                return true;
             };
             log.info("connection {d} session established: {s}@{s}/{s}", .{
                 session.conn.id, bound.local, bound.domain, bound.resource,
             });
         }
     }
+    return true;
+}
+
+/// Evict a stale same-worker session occupying the target full JID so a new
+/// bind can take its place. Returns true if eviction happened locally (the
+/// caller should retry the bind), false if the entry belongs to another
+/// worker (cannot be safely evicted from here).
+fn evictStaleResource(
+    server: *Server,
+    sm: *@import("session_map").SessionMap,
+    local: []const u8,
+    domain: []const u8,
+    resource: []const u8,
+    changes: *ChangeList,
+) bool {
+    const entry = sm.findByFullJid(local, domain, resource) orelse return false;
+    if (entry.worker_id != server.worker_id) return false;
+
+    const old_id: usize = @intCast(entry.local_session_id);
+    const old_session = server.sessions[old_id] orelse {
+        // Entry is stale but the slot is already empty — just unbind and retry.
+        _ = sm.unbind(local, domain, resource);
+        return true;
+    };
+
+    log.warn("evicting stale resource {s}@{s}/{s} (old session {d}) for new bind", .{
+        local, domain, resource, old_id,
+    });
+    server.sendStreamError(old_session, .conflict);
+    forceCloseSession(server, old_id, changes);
+    return true;
 }
 
 /// Session close: either detach for SM resume or full teardown.
@@ -243,4 +304,72 @@ fn allocateId(server: *Server) ?usize {
     if (server.free_count == 0) return null;
     server.free_count -= 1;
     return server.free_ids[server.free_count];
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const posix = std.posix;
+const ChangeListT = @import("event_loop.zig").ChangeList;
+const SessionMap = @import("session_map").SessionMap;
+const xmpp_lib = @import("xmpp");
+
+fn testSocketPair() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    return fds;
+}
+
+/// Puts a session's stream into an authenticated, features_bind-ready state
+/// without going through the full STARTTLS/SASL negotiation, for test setup.
+fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Session {
+    const fds = try testSocketPair();
+    posix.close(fds[1]); // unused peer end, avoid leaking fds across test cases
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], @intCast(id), server.server_host, false, server.allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = local, .domain = server.server_host };
+    server.sessions[id] = session;
+    return session;
+}
+
+// T152 regression test: a stale (already-bound) resource must be evicted so
+// the new connection is actually registered in the session map, instead of
+// silently leaving the client believing it's bound while unroutable.
+test "T152: rebind with same resource evicts stale session" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var sm = SessionMap.init(allocator, false);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // First connection binds resource "phone".
+    const session1 = try makeAuthenticatedSession(&server, 1, "alice");
+    const alive1 = handleBind(&server, session1, "phone", &changes);
+    try std.testing.expect(alive1);
+    try std.testing.expect(server.sessions[1] != null);
+    const entry1 = sm.findByFullJid("alice", "localhost", "phone").?;
+    try std.testing.expectEqual(@as(u32, 1), entry1.local_session_id);
+
+    // Second connection (same worker) binds the SAME resource — simulates a
+    // reconnect racing ahead of the old session's cleanup.
+    const session2 = try makeAuthenticatedSession(&server, 2, "alice");
+    const alive2 = handleBind(&server, session2, "phone", &changes);
+    try std.testing.expect(alive2);
+
+    // The old session must have been evicted (force-closed, slot freed)...
+    try std.testing.expect(server.sessions[1] == null);
+
+    // ...and the session map must now point at the NEW session, not be left
+    // stale or unregistered.
+    const entry2 = sm.findByFullJid("alice", "localhost", "phone").?;
+    try std.testing.expectEqual(@as(u32, 2), entry2.local_session_id);
 }

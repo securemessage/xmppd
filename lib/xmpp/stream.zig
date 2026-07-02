@@ -39,6 +39,7 @@ pub const StreamState = enum {
 pub const StreamError = enum {
     bad_format,
     bad_namespace_prefix,
+    conflict,
     connection_timeout,
     host_gone,
     host_unknown,
@@ -64,6 +65,7 @@ pub const StreamError = enum {
         return switch (self) {
             .bad_format => "bad-format",
             .bad_namespace_prefix => "bad-namespace-prefix",
+            .conflict => "conflict",
             .connection_timeout => "connection-timeout",
             .host_gone => "host-gone",
             .host_unknown => "host-unknown",
