@@ -63,6 +63,7 @@ in development mode.
 | `introspection_endpoint` | no | RFC 7662 introspection (for opaque tokens) |
 | `ca_file` | no | CA bundle path for IdP TLS verification |
 | `user_domain` | no | Domain appended to bare usernames for ROPC (e.g., `morante.dev`) |
+| `import_avatar` | no | Import IdP `picture` claim into vCard on first login (`true`/`false`, default `false`) |
 
 ## Example
 

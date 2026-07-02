@@ -470,6 +470,9 @@ pub const Server = struct {
     /// Pending fan-out queue — bounded continuation for MUC groupchat delivery.
     fanout_queue: FanoutQueue = .{},
 
+    /// Whether OIDC photo import to vCard is enabled ([oidc] import_avatar config flag).
+    oidc_import_avatar: bool = false,
+
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
@@ -1628,9 +1631,9 @@ pub const Server = struct {
                 session.auth_username_len = ulen;
                 const stable_username = session.auth_username_buf[0..ulen];
 
-                // OIDC profile photo import: if the IdP provided a picture URL
+                // OIDC profile photo import: if enabled and the IdP provided a picture URL
                 // and the user has no stored vCard, create one with the photo.
-                if (m.photo_url.len > 0) {
+                if (self.oidc_import_avatar and m.photo_url.len > 0) {
                     if (self.vcard) |vcard| {
                         // Build bare JID for vCard lookup
                         var jid_buf: [512]u8 = undefined;

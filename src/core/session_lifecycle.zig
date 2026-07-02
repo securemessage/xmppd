@@ -336,6 +336,123 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
     return session;
 }
 
+// T158 regression test: SM detach timer (300s) must expire sessions correctly —
+// not early (which would kill resumable sessions) and not late/never (memory leak).
+test "T158: detach timer expires sessions at 300s, not before" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const now = std.time.timestamp();
+
+    // Session 1: detached 301 seconds ago — MUST be expired
+    const s1 = try makeAuthenticatedSession(&server, 1, "alice");
+    s1.sm_resume_enabled = true;
+    s1.sm_detached = true;
+    s1.sm_detach_time = now - 301;
+    s1.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id1 = "aaaa1111bbbb2222cccc3333dddd4444";
+    @memcpy(&s1.sm_id, id1);
+    server.detached_count = 2;
+    server.smIdMapInsert(&s1.sm_id, 1);
+
+    // Session 2: detached only 10 seconds ago — MUST NOT be expired
+    const s2 = try makeAuthenticatedSession(&server, 2, "bob");
+    s2.sm_resume_enabled = true;
+    s2.sm_detached = true;
+    s2.sm_detach_time = now - 10;
+    s2.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
+    @memcpy(&s2.sm_id, id2);
+    server.smIdMapInsert(&s2.sm_id, 2);
+
+    // Mark slots 1 and 2 as consumed from the free list (tests bypass normal alloc)
+    server.free_count -= 2;
+
+    // Run expiry sweep
+    expireDetachedSessions(&server, &changes);
+
+    // Session 1 must be destroyed (expired)
+    try std.testing.expect(server.sessions[1] == null);
+
+    // Session 2 must still be alive (not expired)
+    try std.testing.expect(server.sessions[2] != null);
+    try std.testing.expect(server.sessions[2].?.sm_detached);
+
+    // Detached count must reflect only the surviving session
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+
+    // Clean up session 2 manually to avoid allocator leak
+    server.sessions[2].?.sm_resume_enabled = false;
+    destroySession(&server, 2, server.sessions[2].?, &changes);
+}
+
+test "T158: detach timer does not expire session at exactly 299s" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const now = std.time.timestamp();
+
+    // Session detached 299 seconds ago — must NOT be expired (boundary check)
+    const s1 = try makeAuthenticatedSession(&server, 1, "carol");
+    s1.sm_resume_enabled = true;
+    s1.sm_detached = true;
+    s1.sm_detach_time = now - 299;
+    s1.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id1 = "cccc3333dddd4444eeee5555ffff6666";
+    @memcpy(&s1.sm_id, id1);
+    server.detached_count = 1;
+    server.smIdMapInsert(&s1.sm_id, 1);
+    server.free_count -= 1;
+
+    expireDetachedSessions(&server, &changes);
+
+    // Session must survive — 299 < 300 (DEFAULT_RESUME_TIMEOUT)
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(server.sessions[1].?.sm_detached);
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+
+    // Clean up
+    server.sessions[1].?.sm_resume_enabled = false;
+    destroySession(&server, 1, server.sessions[1].?, &changes);
+}
+
+test "T158: detach timer expires session at exactly 300s" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const now = std.time.timestamp();
+
+    // Session detached exactly 300 seconds ago — MUST be expired (>= comparison)
+    const s1 = try makeAuthenticatedSession(&server, 1, "dave");
+    s1.sm_resume_enabled = true;
+    s1.sm_detached = true;
+    s1.sm_detach_time = now - 300;
+    s1.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id1 = "dddd4444eeee5555ffff6666aaaa7777";
+    @memcpy(&s1.sm_id, id1);
+    server.detached_count = 1;
+    server.smIdMapInsert(&s1.sm_id, 1);
+    server.free_count -= 1;
+
+    expireDetachedSessions(&server, &changes);
+
+    // Session must be destroyed — 300 >= 300 (exact boundary)
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expectEqual(@as(u16, 0), server.detached_count);
+}
+
 // T152 regression test: a stale (already-bound) resource must be evicted so
 // the new connection is actually registered in the session map, instead of
 // silently leaving the client believing it's bound while unroutable.

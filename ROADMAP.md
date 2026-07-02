@@ -59,6 +59,16 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
   cross-thread (`server.zig` MPSC unicast) delivery paths. Root-cause fd
   hazard in `Connection.close()` deferred as hardening follow-up (T155).
 
+### Test Verification (T158)
+
+- [x] SM detach-timer (300s) correctness — unit tests added
+  (`session_lifecycle.zig`): boundary checks at 299s (survive), 300s (expire),
+  and mixed-set selective expiry. No clock injection needed — tests set
+  `sm_detach_time` directly to simulate elapsed time.
+- [ ] SINT full run with `enabledSpecifications="XEP-0198"` — blocked: Smack
+  SINT hardcodes port 5222, production jail occupies it, dev user can't bind
+  privileged port. Needs CI with ephemeral instance or maintenance window.
+
 ### Deferred Follow-ups
 
 - [ ] T154 — cross-worker resource eviction (needs new cross-thread kick

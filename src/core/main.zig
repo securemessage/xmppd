@@ -76,6 +76,7 @@ pub fn main() !void {
     var listen_fd_str: ?[]const u8 = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
+    var oidc_import_avatar: bool = false;
 
     // Skip argv[0]
     _ = args.next();
@@ -203,6 +204,11 @@ pub fn main() !void {
         if (c.get("core", "fan_out_batch_size")) |v| {
             fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("fanout.zig").DEFAULT_BATCH_SIZE;
         }
+
+        // [oidc] section (core-side options)
+        if (c.get("oidc", "import_avatar")) |v| {
+            oidc_import_avatar = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes");
+        }
     }
     defer if (cfg) |*c| c.deinit();
 
@@ -318,6 +324,7 @@ pub fn main() !void {
         .muc_host = effective_muc_host,
         .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
+        .oidc_import_avatar = oidc_import_avatar,
         .allocator = allocator,
     };
 
@@ -418,6 +425,7 @@ const WorkerCtx = struct {
     muc_host: ?[]const u8,
     session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
+    oidc_import_avatar: bool,
     allocator: std.mem.Allocator,
 };
 
@@ -462,6 +470,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
 
     if (ctx.roster) |r| server.configureRoster(r);
     if (ctx.vcard) |v| server.configureVcard(v);
+    server.oidc_import_avatar = ctx.oidc_import_avatar;
     if (ctx.offline != null and ctx.archive != null) {
         server.configureOffline(ctx.offline.?, ctx.archive.?);
     }
