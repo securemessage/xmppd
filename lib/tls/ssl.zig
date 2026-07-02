@@ -127,6 +127,12 @@ pub const SslContext = struct {
         // Custom callback always returns OK — we do DANE ourselves after handshake.
         c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, &alwaysAcceptVerify);
 
+        // Set session ID context — required when SSL_VERIFY_PEER is active,
+        // otherwise OpenSSL rejects the second concurrent handshake with
+        // SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED (error 0x0A000115).
+        const sid_ctx = "xmppd";
+        _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
+
         // Enable FreeBSD KTLS — offloads symmetric crypto to kernel.
         // Silently ignored if kernel or OpenSSL lacks KTLS support.
         // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) = 1 << 3 = 0x8
@@ -255,7 +261,18 @@ pub const SslConn = struct {
         return switch (err) {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
-            else => SslError.HandshakeFailed,
+            else => {
+                // Log the OpenSSL error queue for diagnostics
+                var err_buf: [256]u8 = undefined;
+                while (true) {
+                    const e = c.ERR_get_error();
+                    if (e == 0) break;
+                    c.ERR_error_string_n(e, &err_buf, err_buf.len);
+                    const log = std.log.scoped(.ssl);
+                    log.err("TLS handshake error: SSL_get_error={d} detail={s}", .{ err, @as([*:0]const u8, @ptrCast(&err_buf)) });
+                }
+                return SslError.HandshakeFailed;
+            },
         };
     }
 
