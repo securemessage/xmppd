@@ -2835,8 +2835,24 @@ pub const Server = struct {
         session.sm_unacked = detached.sm_unacked;
         detached.sm_unacked = null; // Ownership transferred
 
-        // Transfer XMPP session state
-        session.stream.bound_jid = detached.stream.bound_jid;
+        // Transfer XMPP session state — copy JID strings into session-owned buffers
+        // because the detached session's buffers will be freed below.
+        const d_username_len = detached.auth_username_len;
+        @memcpy(session.auth_username_buf[0..d_username_len], detached.auth_username_buf[0..d_username_len]);
+        session.auth_username_len = d_username_len;
+        const d_resource_len = detached.bind_resource_len;
+        @memcpy(session.bind_resource_buf[0..d_resource_len], detached.bind_resource_buf[0..d_resource_len]);
+        session.bind_resource_len = d_resource_len;
+        session.stream.bound_jid = .{
+            .local = session.auth_username_buf[0..d_username_len],
+            .domain = self.server_host,
+            .resource = session.bind_resource_buf[0..d_resource_len],
+        };
+        session.stream.authenticated_jid = .{
+            .local = session.auth_username_buf[0..d_username_len],
+            .domain = self.server_host,
+        };
+        session.stream.authenticated = true;
         session.stream.state = .active;
         session.roster_interested = detached.roster_interested;
         session.carbons_enabled = detached.carbons_enabled;

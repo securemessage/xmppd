@@ -136,6 +136,7 @@ pub const FeatureSet = struct {
     bind: bool = false,
     sm: bool = false,
     csi: bool = false,
+    register: bool = false,
 };
 
 /// Server-side XMPP stream state machine.
@@ -233,6 +234,7 @@ pub const Stream = struct {
             },
             .features_sasl => FeatureSet{
                 .sasl_mechanisms = &.{ "SCRAM-SHA-256", "PLAIN" },
+                .register = true,
             },
             .features_bind => FeatureSet{
                 .bind = true,
@@ -391,6 +393,10 @@ pub fn writeFeatures(writer: anytype, features: FeatureSet) !void {
         try writer.writeAll("<csi xmlns='urn:xmpp:csi:0'/>");
     }
 
+    if (features.register) {
+        try writer.writeAll("<register xmlns='http://jabber.org/features/iq-register'/>");
+    }
+
     try writer.writeAll("</stream:features>");
 }
 
@@ -436,9 +442,10 @@ test "Stream: full lifecycle (STARTTLS path)" {
     try std.testing.expect(action3 == .send_stream_open);
     try std.testing.expectEqual(StreamState.features_sasl, stream.state);
 
-    // Features should offer SASL
+    // Features should offer SASL + IBR
     const features2 = stream.getFeatures().?;
     try std.testing.expect(features2.sasl_mechanisms.len > 0);
+    try std.testing.expect(features2.register);
 
     // Client initiates SASL
     const action4 = stream.handleSaslAuth("SCRAM-SHA-256");
@@ -481,6 +488,7 @@ test "Stream: direct TLS path (skips STARTTLS)" {
 
     const features = stream.getFeatures().?;
     try std.testing.expect(features.sasl_mechanisms.len > 0);
+    try std.testing.expect(features.register);
     try std.testing.expect(!features.starttls);
 }
 
@@ -545,6 +553,35 @@ test "writeFeatures: SASL mechanisms" {
     const result = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, result, "<mechanism>SCRAM-SHA-256</mechanism>") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "<mechanism>PLAIN</mechanism>") != null);
+}
+
+test "writeFeatures: SASL with IBR (XEP-0077)" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try writeFeatures(fbs.writer(), .{
+        .sasl_mechanisms = &.{"SCRAM-SHA-256"},
+        .register = true,
+    });
+
+    const result = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, result, "<register xmlns='http://jabber.org/features/iq-register'/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<mechanism>SCRAM-SHA-256</mechanism>") != null);
+}
+
+test "writeFeatures: bind features do not include register" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try writeFeatures(fbs.writer(), .{
+        .bind = true,
+        .sm = true,
+        .csi = true,
+    });
+
+    const result = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, result, "<bind") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "iq-register") == null);
 }
 
 test "writeStreamError" {

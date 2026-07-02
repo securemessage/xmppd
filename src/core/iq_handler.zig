@@ -573,6 +573,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<feature var='jabber:iq:last'/>") catch return;
         w.writeAll("<feature var='urn:xmpp:csi:0'/>") catch return;
         w.writeAll("<feature var='http://jabber.org/protocol/caps'/>") catch return;
+        w.writeAll("<feature var='jabber:iq:register'/>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
