@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-06-09
+Last updated: 2026-07-02
 
 ## Current Status
 
@@ -22,6 +22,51 @@ Last updated: 2026-06-09
 | 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
 | 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
+| 13. Session Robustness Hardening | ✅ Complete | SM resume dispatch bug, stream ID reuse, stale-bind eviction, detached-session delivery. Tagged v0.8.6 |
+
+---
+
+## Phase 13 — Session Robustness Hardening (v0.8.6) ✅
+
+Critical reconnection-stability fixes discovered via real-world client testing
+(Conversations Android) and a new comprehensive E2E regression suite
+(`test/integration/e2e-sm-resume.py`). Full investigation writeup:
+BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnection".
+
+- [x] **SM resume silently dropped** — `handleElementStart`'s pre-bind IQ
+  catch-all had an unconditional `return` that consumed ALL elements at
+  `features_bind` state, including `<resume/>`. Fixed by reordering the
+  SM resume check before the catch-all.
+- [x] **Stream ID reuse across restarts** — same stream ID reused across
+  STARTTLS/SASL stream restarts, violating RFC 6120 §4.7.3. Fixed via
+  `regenerateStreamId()` called on every `handleStreamOpen()`.
+- [x] **T152 — stale resource not evicted on rebind conflict** — a
+  reconnect racing ahead of the old session's cleanup got `AlreadyBound`
+  and was silently left unregistered in `SessionMap` despite the client
+  believing it was bound. Fixed via `evictStaleResource()` (RFC 6120
+  §7.7.3 — evict old resource, send `<conflict/>`, retry bind). New
+  `conflict` `StreamError` variant added (was missing from the enum).
+  Cross-worker eviction deferred (T154).
+- [x] **T153 — message to detached session corrupts kqueue via stale fd
+  reuse** — found via the new E2E suite's stanza-replay test. Delivering
+  a stanza to a detached (SM-resume-pending) session used the session's
+  stale, already-`close()`d fd for `changes.addWrite()`. If the OS
+  recycled that fd for an unrelated connection, this misrouted kqueue
+  events and caused premature session destruction (`item-not-found` on
+  the client's subsequent resume). Fixed by tracking outbound stanzas to
+  detached sessions via `smTrackOutbound()` for replay instead of
+  attempting live delivery, in both the same-worker (`router.zig`) and
+  cross-thread (`server.zig` MPSC unicast) delivery paths. Root-cause fd
+  hazard in `Connection.close()` deferred as hardening follow-up (T155).
+
+### Deferred Follow-ups
+
+- [ ] T154 — cross-worker resource eviction (needs new cross-thread kick
+  message type; only relevant with `[core] workers > 1`)
+- [ ] T155 — `Connection.close()` should reset `fd` to a sentinel to
+  eliminate the stale-fd hazard class systemically
+- [ ] T151 — evaluate reverting eager `flushSend()` in `handleReadable`
+  (harmless but unnecessary micro-optimization from the v0.8.6 debug session)
 
 ---
 
@@ -634,8 +679,8 @@ one process). The hybrid model is where large servers converge.
 | Language | Zig 0.15.2 |
 | Source files | ~60 |
 | Lines of code | ~30,000 |
-| Unit tests | 97 build steps, 690 tests (all pass) |
-| Integration tests | 19 slixmpp E2E + 64 cross-thread + Tsung load tests |
+| Unit tests | 105 build steps, 791 tests (all pass) |
+| Integration tests | 20 slixmpp E2E (incl. e2e-sm-resume.py) + 64 cross-thread + Tsung load tests |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |
 | License | BSD-2-Clause |
