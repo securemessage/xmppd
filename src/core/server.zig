@@ -1115,8 +1115,13 @@ pub const Server = struct {
 
         // XEP-0198: Stream Management namespace — handle in active or just-bound state
         if (std.mem.eql(u8, ns, xml.ns.sm)) {
-            if (std.mem.eql(u8, elem.local_name, "enable") and session.stream.isActive()) {
-                self.handleSmEnable(session, elem, changes);
+            if (std.mem.eql(u8, elem.local_name, "enable")) {
+                if (session.stream.isActive()) {
+                    self.handleSmEnable(session, elem, changes);
+                } else {
+                    // XEP-0198 §3.1: SM enable before resource bind — reject
+                    self.sendSmFailed(session, "unexpected-request", changes);
+                }
             } else if (std.mem.eql(u8, elem.local_name, "r") and session.sm_enabled) {
                 self.handleSmRequest(session, changes);
             } else if (std.mem.eql(u8, elem.local_name, "a") and session.sm_enabled) {

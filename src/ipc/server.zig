@@ -19,7 +19,8 @@ const protocol = @import("ipc_protocol");
 const log = std.log.scoped(.ipc_server);
 
 /// Maximum simultaneous IPC client connections.
-const MAX_IPC_CLIENTS = 16;
+/// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
+const MAX_IPC_CLIENTS = 80;
 
 /// Per-IPC-client receive buffer size.
 const CLIENT_BUF_SIZE = 8192;
