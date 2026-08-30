@@ -68,38 +68,34 @@ tracks the release-level shape.
       because SINT skips all SM tests when `accountRegistration` is disabled.
       Not yet run end-to-end — that is the actual open work here.
 
-### v0.8.9 — Bugfix + Doc-Consistency
+### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 
 A code audit at `e922681` (v0.8.8+2) filed T163–T170: feature-list drift,
-stubbed features with overclaiming docs, and small operational gaps. All are
-patch-scale; bundle with the leftover hardening items:
+stubbed features with overclaiming docs, and small operational gaps. All
+eleven items landed; see CHANGELOG for details:
 
-- [ ] **T163** (High) — XEP-0115 caps hash omits `jabber:iq:register`: add it to
-      `caps.zig` `SERVER_FEATURES` in sorted position + a unit test asserting the
-      disco#info set and `SERVER_FEATURES` are identical
-- [ ] **T165** — invite-required IBR broken: parse the `jabber:x:data` invite
-      field in `handleRegisterSubmit()` and pass it through; add E2E test
-- [ ] **T166** — directed presence to remote domains silently dropped: route
-      through the S2S outbound path instead of the early return
-- [ ] **T167** — listener bind address: general dotted-quad IPv4 (and IPv6
-      literal) parsing via `std.net.Address.parseIp*` + tests
-- [ ] **T168** — XEP-0092 hardcoded `<version>0.1.0</version>`: source from a
-      single build-time version constant shared with `--version`
-- [ ] **T169** — README footnote ¹ correction: roster push after subscription
-      changes IS implemented (verify the roster-set-validation clause before
-      editing)
-- [ ] **T164** — XEP-0012 is a constant `seconds='0'` stub: downgrade the README
-      claim now; full last-activity tracking deferred to v0.9.0
-- [ ] **T170** — land the `poc/ci-xep-consistency-check` branch (fix the
-      `runs-on` label; decide Python check vs Zig `@embedFile` test)
-- [ ] **T161** — Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the
-      struct to ~1.97 MB (80 × 24.6 KB) and it is a stack local in
-      `auth/main.zig`, `auth/oidc_main.zig`, and embedded by value in a
-      stack-local `S2sDaemon`
-- [ ] **T160** — TLS ClientHello on the STARTTLS C2S port reports an XML parse
-      error instead of a clear rejection (peek first bytes; log a useful message)
-- [ ] **T151** — Evaluate reverting eager `flushSend()` in `handleReadable` to
-      deferred `addWrite` (record the verdict either way)
+- [x] **T163** (High) — caps/disco drift: disco#info now iterates
+      `caps.SERVER_FEATURES` (single source; `writeDiscoFeatures`) + unit tests
+- [x] **T165** — invite code parsed from the `jabber:x:data` registration form
+      and passed to the auth daemon; form advertises the invite field;
+      new `e2e-register-invite.py` (6/6)
+- [x] **T166** — remote directed presence routes via the S2S outbound path
+- [x] **T167** — `std.net.Address.parseIp4/parseIp6` bind parsing + IPv6-safe
+      accept() + tests
+- [x] **T168** — single build-time version constant in `build.zig`; XEP-0092
+      and new `xmppd --version` both consume it
+- [x] **T169** — README footnote ¹ corrected (roster push + roster set
+      validation both verified implemented; remaining gap: §2.6 versioning)
+- [x] **T164** — README XEP-0012 downgraded to Partial; full implementation
+      stays open on the task for v0.9.0
+- [x] **T170** — CI consistency check landed (sh+awk on the FreeBSD runner),
+      adapted to the single-source disco wiring
+- [x] **T161** — `IpcServer` heap-allocated in all three daemons; s2s IPC
+      fan-out de-hardcoded from 16 slots to `MAX_IPC_CLIENTS`
+- [x] **T160** — TLS ClientHello on the STARTTLS port gets a clear log line
+      and close instead of an XML parse error
+- [x] **T151** — evaluated: keep eager `flushSend()` (verdict recorded on the
+      task; no code change)
 
 ### v0.9.0 — Performance + Refactor
 

@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.8.9 — 2026-08-30
+
+Bugfix/doc-consistency release (T163–T170 audit batch + T160/T161/T151).
+
+### Fixes
+
+- T163 (High): XEP-0115 caps `ver` omitted `jabber:iq:register` which
+  disco#info advertised — the hash could never verify (clients doing §5
+  verification discarded the caps). disco#info now iterates
+  `caps.SERVER_FEATURES` via `caps.writeDiscoFeatures`, one list by
+  construction
+- T165: invite-gated IBR (XEP-0077, the secure default) could never succeed —
+  the invite code in the `jabber:x:data` form was never parsed. The
+  invite/token field is now passed through to the auth daemon, and the
+  registration form advertises an optional `invite` field
+- T166: directed presence to remote domains was silently dropped; it now
+  routes through the S2S outbound path like subscription/broadcast presence
+- T167: listener bind address parsing — any IPv4 dotted-quad and IPv6 literals
+  now work (was: only `0.0.0.0`/`127.0.0.1`); accept() no longer truncates
+  IPv6 peers
+- T168: XEP-0092 Software Version reported a hardcoded `0.1.0`; single
+  build-time version constant in `build.zig` now feeds both
+  `jabber:iq:version` and the new `xmppd --version`
+- T161: `IpcServer` (~1.97 MB since T156) heap-allocated in xmppd-auth,
+  xmppd-auth-oidc, xmppd-s2s (was stack-resident). Also fixes s2s IPC fan-out
+  still limited to the first 16 client slots (workers 17+ never received
+  federated stanzas)
+- T160: TLS ClientHello on the STARTTLS port now logs "TLS handshake on the
+  STARTTLS port — client is configured for direct TLS" and closes, instead of
+  a misleading `error.InvalidEntityReference` XML parse failure
+
+### Docs / CI
+
+- T170: CI feature-matrix consistency check (`.forgejo/workflows/consistency.yml`,
+  `test/consistency/`, base-system sh+awk on the FreeBSD runner) — guards
+  caps/disco#info/README drift; adapted to the single-source disco features
+- T169/T164: README XEP matrix corrections — RFC 6121 footnote 1 stale clauses
+  removed (roster push and roster set validation are implemented; remaining
+  gap is roster versioning §2.6), XEP-0012 downgraded to Partial (online-self
+  stub; full implementation deferred to v0.9.0)
+- T151 evaluated and closed: keep the eager `flushSend()` in `handleReadable`
+  (fewer syscalls in the common request/response case; verdict on the task)
+- New `test/integration/e2e-register-invite.py` (raw-socket suite, 6/6)
+
+Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps;
+e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins 12/12;
+e2e-mam 7/7; e2e-subscription 29/29; e2e-register-invite 6/6.
+
 ## v0.8.8 — 2026-08-30
 
 Bugfix/hardening release on top of v0.8.7 (8 commits). Tagged from `95e9c5c`;
