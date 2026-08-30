@@ -519,9 +519,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // XEP-0115 §5.3: If the query includes a node attribute, check if it matches
         // our server's caps node#ver. If it does, return the same features. If not,
         // return item-not-found per XEP-0030 §3.3.
+        const caps_mod = @import("caps.zig");
         const disco_node = session.disco_node;
         if (disco_node.len > 0) {
-            const caps_mod = @import("caps.zig");
             const expected_node = caps_mod.SERVER_NODE;
             const server_ver = server.server_caps.getVer();
             // Expected format: "node#ver"
@@ -546,35 +546,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
         }
         w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/disco#info'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/disco#items'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:ping'/>") catch return;
-        w.writeAll("<feature var='jabber:iq:roster'/>") catch return;
-        w.writeAll("<feature var='vcard-temp'/>") catch return;
-        w.writeAll("<feature var='jabber:iq:version'/>") catch return;
-        w.writeAll("<feature var='msgoffline'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:sid:0'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:carbons:2'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/chatstates'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:receipts'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:message-correct:0'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:blocking'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:sm:3'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#publish'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#subscribe'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#auto-subscribe'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#auto-create'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#persistent-items'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/pubsub#retrieve-items'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:avatar:metadata+notify'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:bookmarks:1#notify'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:chat-markers:0'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:hints'/>") catch return;
-        w.writeAll("<feature var='jabber:iq:last'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:csi:0'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/caps'/>") catch return;
-        w.writeAll("<feature var='jabber:iq:register'/>") catch return;
+        caps_mod.writeDiscoFeatures(w) catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         return;
