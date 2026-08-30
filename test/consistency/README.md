@@ -1,0 +1,63 @@
+# Consistency checks
+
+Source-level guards that catch drift between things that must agree but are
+maintained by hand in separate places. These are *not* runtime tests — they
+parse the source and docs and diff them. They run on any Python 2.7 / 3.x with
+no third-party dependencies.
+
+## `check_xep_matrix.py`
+
+Keeps the server's advertised feature set consistent across three sources:
+
+| Source | What it is |
+|--------|-----------|
+| `src/core/caps.zig` → `SERVER_FEATURES` | the feature list hashed into the XEP-0115 entity-caps `ver` string |
+| `src/core/iq_handler.zig` → disco#info block | the `<feature/>` elements actually sent to clients |
+| `README.md` → Standards Compliance table | the human-facing support claims |
+
+### Why this exists
+
+The audit that produced **T163** found `jabber:iq:register` was advertised in
+disco#info but missing from `SERVER_FEATURES`. Because the XEP-0115 `ver` hash
+is computed over `SERVER_FEATURES`, the advertised caps hash no longer matched
+the actual disco#info — so any client doing XEP-0115 §5 verification discards
+the caps, silently defeating the whole caching mechanism. The code comment in
+`caps.zig` even said the two lists "must match exactly," but nothing enforced
+it. **T164** and **T169** are the same failure mode (advertised vs. documented
+drift).
+
+### What it checks
+
+- **[HARD]** `caps.SERVER_FEATURES` == the disco#info feature set. *(Catches T163.)*
+- **[HARD]** `SERVER_FEATURES` is sorted ascending — `computeServerCaps()`
+  assumes XEP-0115 §5.1 canonical order; an out-of-order entry silently hashes
+  wrong. *(Mirrors the existing Zig unit test, restated here so the check is
+  self-contained.)*
+- **[SOFT]** every advertised namespace maps to a documented README XEP row
+  (advisory; does not fail CI unless `--strict`). *(Catches T169-shape drift.)*
+
+### What it deliberately does NOT check
+
+Semantic completeness behind an advertised namespace — a stub handler that
+answers a query but does nothing (e.g. **T164** XEP-0012 always returns
+`seconds='0'`, **T165** invite code never parsed). A matrix check sees
+*advertisement*, not *behaviour*; those need their own targeted tests.
+
+### Usage
+
+```sh
+python3 test/consistency/check_xep_matrix.py           # HARD checks fail CI
+python3 test/consistency/check_xep_matrix.py --strict   # advisory warnings fail too
+```
+
+Exit `0` = clean, `1` = drift, `2` = a source file/anchor could not be parsed.
+
+### A note on the Zig-native alternative
+
+The most idiomatic home for the HARD checks would be a Zig unit test inside
+`zig build test`, e.g. `@embedFile("iq_handler.zig")`, scrape the feature vars,
+and compare against the imported `caps.SERVER_FEATURES` array. That keeps
+everything in one toolchain. It was done in Python for this PoC because the
+check also reads `README.md` and because it can run in a minimal CI image with
+no Zig toolchain. Either form catches T163; if the Zig test lands, this script
+can be dropped or kept as the README-facing half.
