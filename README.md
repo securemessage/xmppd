@@ -31,7 +31,7 @@ polymorphism for performance at scale.
 |----------|-------------|---------|--------|
 | RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
 | RFC 6121 | XMPP IM (roster, presence, messaging) | Partial¹ | Interop, E2E, Unit |
-| XEP-0012 | Last Activity | Full | Unit |
+| XEP-0012 | Last Activity | Partial⁵ | Unit |
 | XEP-0030 | Service Discovery | Full | Interop |
 | XEP-0045 | Multi-User Chat | Partial² | Interop, E2E, Unit |
 | XEP-0054 | vCard-temp | Full | Interop |
@@ -63,8 +63,10 @@ polymorphism for performance at scale.
 **Pass-through** = server forwards stanzas without interpretation; no server-side logic required.
 
 ¹ Multi-resource routing (§8.5) implemented: priority-based delivery, full JID forwarding,
-chat fallback. Roster push notifications after subscription changes not yet implemented.
-Roster set validation (multi-item, unauthorized, duplicate groups) incomplete.
+chat fallback. Roster pushes to interested resources on subscription changes are
+implemented (§2.1.6), as is roster set validation (§2.1.5: exactly-one-item, forbidden
+for other users' rosters, empty/duplicate group rejection). Missing: roster
+versioning (§2.6 'ver' attribute).
 
 ² MUC core functionality works (join, part, groupchat, kick, ban, history, MAM, disco),
 plus persistent rooms, owner configuration forms (XEP-0045 §10 via XEP-0004),
@@ -78,6 +80,10 @@ avatar metadata notifications. Not a full XEP-0060 PubSub service.
 resume: sessions detach on abnormal disconnect and resume on reconnect without
 re-authentication, replaying unacked stanzas from a bounded queue. Detached sessions
 expire after 300s. Shipped in v0.6.0; hardened in v0.8.6 (T152/T153).
+
+⁵ Last Activity answers only the online-self case (`seconds='0'`); querying another
+user, or an offline user's time-since-logout (§2), is not yet implemented — no
+last-online timestamp is stored. Full implementation is planned for v0.9.0 (T164).
 
 ## Building
 
