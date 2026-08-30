@@ -30,7 +30,8 @@ const xmppd_log = @import("xmppd_log");
 pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
-const IpcServer = @import("ipc_server").IpcServer;
+const ipc_server_mod = @import("ipc_server");
+const IpcServer = ipc_server_mod.IpcServer;
 const protocol = @import("ipc_protocol");
 const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
@@ -58,8 +59,8 @@ const log = std.log.scoped(.@"xmppd-s2s");
 /// Sentinel udata values for kqueue events.
 const LISTENER_UDATA: usize = std.math.maxInt(usize);
 const IPC_LISTEN_UDATA: usize = LISTENER_UDATA - 1;
-/// Base udata for IPC client connections (16 slots).
-const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - 17;
+/// Base udata for IPC client connections (one udata per IPC slot).
+const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - (ipc_server_mod.MAX_IPC_CLIENTS + 1);
 
 /// Base udata for inbound S2S sessions.
 const INBOUND_UDATA_BASE: usize = 0x10000;
@@ -78,7 +79,9 @@ pub const S2sDaemon = struct {
     running: bool = true,
 
     /// IPC server for communication with xmppd-core.
-    ipc: IpcServer = .{},
+    /// Heap-allocated: the struct is ~2 MB since MAX_IPC_CLIENTS went
+    /// 16 -> 80, too big to embed in this (already large) struct (T161).
+    ipc: *IpcServer,
 
     /// TLS context for inbound connections (server-side).
     tls_ctx: ?SslContext = null,
@@ -113,10 +116,13 @@ pub const S2sDaemon = struct {
     /// Inbound listener port.
     listener_port: u16 = 5269,
 
-    pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) S2sDaemon {
+    pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) !S2sDaemon {
+        const ipc = try allocator.create(IpcServer);
+        ipc.* = .{};
         var d = S2sDaemon{
             .allocator = allocator,
             .local_domain = local_domain,
+            .ipc = ipc,
             .pool = ConnectionPool.init(allocator),
         };
         d.dialback_secret = dialback.generateSecret();
@@ -152,6 +158,7 @@ pub const S2sDaemon = struct {
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
         self.pool.deinit();
         self.ipc.deinit();
+        self.allocator.destroy(self.ipc);
 
         if (self.listener_fd >= 0) {
             posix.close(self.listener_fd);
@@ -449,7 +456,7 @@ pub const S2sDaemon = struct {
         } };
         // Send to all connected core clients
         var i: usize = 0;
-        while (i < 16) : (i += 1) {
+        while (i < ipc_server_mod.MAX_IPC_CLIENTS) : (i += 1) {
             if (self.ipc.getClient(i)) |client| {
                 client.queueSend(msg) catch {
                     log.err("failed to queue delivery-failed to IPC client {d}", .{i});
@@ -666,7 +673,7 @@ pub fn main() !void {
 
     log.info("xmppd-s2s starting host={s} port={d} listen_fd={any}", .{ host, port, listen_fd });
 
-    var daemon = S2sDaemon.init(allocator, host);
+    var daemon = try S2sDaemon.init(allocator, host);
     defer daemon.deinit();
 
     // Configure TLS if cert and key are provided
@@ -1136,9 +1143,9 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
 
     // Find next connected client via round-robin
     var attempts: usize = 0;
-    while (attempts < 16) : (attempts += 1) {
-        const idx = daemon.next_ipc_rr % 16;
-        daemon.next_ipc_rr = (daemon.next_ipc_rr + 1) % 16;
+    while (attempts < ipc_server_mod.MAX_IPC_CLIENTS) : (attempts += 1) {
+        const idx = daemon.next_ipc_rr % ipc_server_mod.MAX_IPC_CLIENTS;
+        daemon.next_ipc_rr = (daemon.next_ipc_rr + 1) % ipc_server_mod.MAX_IPC_CLIENTS;
         if (daemon.ipc.getClient(idx)) |client| {
             client.queueSend(msg) catch {
                 log.err("failed to queue inbound stanza to IPC client {d}", .{idx});
@@ -1972,7 +1979,7 @@ test "extractDomain: bare domain with resource" {
 
 test "S2sDaemon: init and deinit" {
     const alloc = std.testing.allocator;
-    var daemon = S2sDaemon.init(alloc, "a.example");
+    var daemon = try S2sDaemon.init(alloc, "a.example");
     defer daemon.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), daemon.pool.count());
@@ -1982,7 +1989,7 @@ test "S2sDaemon: init and deinit" {
 
 test "S2sDaemon: listen on high port" {
     const alloc = std.testing.allocator;
-    var daemon = S2sDaemon.init(alloc, "a.example");
+    var daemon = try S2sDaemon.init(alloc, "a.example");
     defer daemon.deinit();
 
     try daemon.listen("127.0.0.1", 0);
@@ -1991,7 +1998,7 @@ test "S2sDaemon: listen on high port" {
 
 test "S2sDaemon: accept inbound" {
     const alloc = std.testing.allocator;
-    var daemon = S2sDaemon.init(alloc, "a.example");
+    var daemon = try S2sDaemon.init(alloc, "a.example");
     defer daemon.deinit();
 
     try daemon.listen("127.0.0.1", 0);
@@ -2026,7 +2033,7 @@ test "S2sDaemon: accept inbound" {
 
 test "S2sDaemon: closeInbound" {
     const alloc = std.testing.allocator;
-    var daemon = S2sDaemon.init(alloc, "a.example");
+    var daemon = try S2sDaemon.init(alloc, "a.example");
     defer daemon.deinit();
 
     try daemon.listen("127.0.0.1", 0);
@@ -2057,7 +2064,7 @@ test "S2sDaemon: closeInbound" {
 
 test "S2sDaemon: stop" {
     const alloc = std.testing.allocator;
-    var daemon = S2sDaemon.init(alloc, "a.example");
+    var daemon = try S2sDaemon.init(alloc, "a.example");
     defer daemon.deinit();
 
     try std.testing.expect(daemon.running);

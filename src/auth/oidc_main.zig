@@ -146,9 +146,14 @@ pub fn main() !void {
     handler.setRateLimiter(&rate_limiter);
     defer handler.deinit();
 
-    // Start IPC server
-    var ipc = IpcServer{};
-    defer ipc.deinit();
+    // Start IPC server (heap-allocated: the struct is ~2 MB since
+    // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
+    const ipc = try allocator.create(IpcServer);
+    ipc.* = .{};
+    defer {
+        ipc.deinit();
+        allocator.destroy(ipc);
+    }
     try ipc.listen(socket_path);
 
     // Initialize event loop
@@ -203,13 +208,13 @@ pub fn main() !void {
                         }
                     } else if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        handleIpcClient(&ipc, &handler, &batch, slot);
+                        handleIpcClient(ipc, &handler, &batch, slot);
                     }
                 },
                 .fd_writable => |e| {
                     if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        flushIpcClient(&ipc, &batch, slot);
+                        flushIpcClient(ipc, &batch, slot);
                     }
                 },
                 else => {},
