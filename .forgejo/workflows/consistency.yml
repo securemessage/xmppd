@@ -4,10 +4,14 @@
 # disco#info response, and the README XEP matrix in agreement. See
 # test/consistency/README.md for the rationale (originates from T163).
 #
-# NOTE: `runs-on` uses a generic label. Adjust it to match a label this
-# Forgejo instance's runner actually advertises (e.g. `docker`, `native`,
-# or a self-hosted FreeBSD label). The step itself needs only python3 and no
-# third-party packages.
+# Runs on the FreeBSD runner (runner01: labels FreeBSD / FreeBSD-15.0 /
+# FreeBSD-container) — the project's target platform. The check itself is pure
+# python3 with no third-party packages, so any of those labels works; the
+# generic `FreeBSD` label is used so it isn't pinned to one OS minor.
+#
+# If this runner cannot execute JS actions (no node for actions/checkout),
+# switch to the `FreeBSD-container` label or replace the checkout step with a
+# manual `git clone`.
 name: consistency
 
 on:
@@ -16,7 +20,7 @@ on:
 
 jobs:
   xep-matrix:
-    runs-on: ubuntu-latest
+    runs-on: FreeBSD
     steps:
       - uses: actions/checkout@v4
       - name: XEP feature-matrix consistency
