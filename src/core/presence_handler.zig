@@ -66,44 +66,43 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
                 }
             }
 
-            // Local domain directed presence
-            if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-                if (to_jid.resource.len > 0) {
-                    // RFC 6121 §8.5.3: Directed presence to a full JID —
-                    // forward via stanza accumulation pipeline.
-                    var id_str: []const u8 = "";
-                    for (elem.attributes) |attr| {
-                        if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
-                    }
-                    session.stanza_kind = .presence;
-                    session.stanza_buf_len = 0;
-                    session.stanza_to = to_str;
-                    session.stanza_id = id_str;
-                    session.stanza_type = type_str;
-                    session.pres_priority_collecting = false;
-                    session.pres_priority_len = 0;
-                    if (elem.self_closing) {
-                        const router = @import("router.zig");
-                        router.dispatchStanza(server, session, changes);
-                    }
-                } else {
-                    // RFC 6121 §8.5.2.1.2: Directed presence to a bare JID —
-                    // deliver to ALL available resources of the target user.
-                    session.stanza_kind = .presence;
-                    session.stanza_buf_len = 0;
-                    session.stanza_to = to_str;
-                    session.stanza_id = "";
-                    session.stanza_type = type_str;
-                    session.pres_priority_collecting = false;
-                    session.pres_priority_len = 0;
-                    if (elem.self_closing) {
-                        dispatchDirectedPresenceToBareJid(server, session, to_jid.local, to_jid.domain, changes);
-                    }
+            const is_local = std.mem.eql(u8, to_jid.domain, server.server_host);
+
+            if (is_local and to_jid.resource.len == 0) {
+                // RFC 6121 §8.5.2.1.2: Directed presence to a local bare JID —
+                // deliver to ALL available resources of the target user.
+                session.stanza_kind = .presence;
+                session.stanza_buf_len = 0;
+                session.stanza_to = to_str;
+                session.stanza_id = "";
+                session.stanza_type = type_str;
+                session.pres_priority_collecting = false;
+                session.pres_priority_len = 0;
+                if (elem.self_closing) {
+                    dispatchDirectedPresenceToBareJid(server, session, to_jid.local, to_jid.domain, changes);
                 }
                 return;
             }
 
-            // Remote domain directed presence — forward via S2S (not implemented for directed yet)
+            // RFC 6121 §8.5.3: Directed presence to a full JID — forward via
+            // stanza accumulation pipeline. Remote-domain directed presence
+            // (full or bare JID) takes the same path: dispatchStanza forwards
+            // non-local domains to the S2S daemon (T166).
+            var id_str: []const u8 = "";
+            for (elem.attributes) |attr| {
+                if (std.mem.eql(u8, attr.local_name, "id")) id_str = attr.value;
+            }
+            session.stanza_kind = .presence;
+            session.stanza_buf_len = 0;
+            session.stanza_to = to_str;
+            session.stanza_id = id_str;
+            session.stanza_type = type_str;
+            session.pres_priority_collecting = false;
+            session.pres_priority_len = 0;
+            if (elem.self_closing) {
+                const router = @import("router.zig");
+                router.dispatchStanza(server, session, changes);
+            }
             return;
         }
     }
