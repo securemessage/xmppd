@@ -5,13 +5,9 @@
 # test/consistency/README.md for the rationale (originates from T163).
 #
 # Runs on the FreeBSD runner (runner01: labels FreeBSD / FreeBSD-15.0 /
-# FreeBSD-container) — the project's target platform. The check itself is pure
-# python3 with no third-party packages, so any of those labels works; the
-# generic `FreeBSD` label is used so it isn't pinned to one OS minor.
-#
-# If this runner cannot execute JS actions (no node for actions/checkout),
-# switch to the `FreeBSD-container` label or replace the checkout step with a
-# manual `git clone`.
+# FreeBSD-container) — the project's target platform. The check uses only
+# base-system sh + awk (no python, no packages), so it runs on a bare FreeBSD
+# host executor; the generic `FreeBSD` label keeps it off a pinned OS minor.
 name: consistency
 
 on:
@@ -24,4 +20,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: XEP feature-matrix consistency
-        run: python3 test/consistency/check_xep_matrix.py
+        run: sh test/consistency/check_xep_matrix.sh

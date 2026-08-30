@@ -2,10 +2,13 @@
 
 Source-level guards that catch drift between things that must agree but are
 maintained by hand in separate places. These are *not* runtime tests — they
-parse the source and docs and diff them. They run on any Python 2.7 / 3.x with
-no third-party dependencies.
+parse the source and docs and diff them.
 
-## `check_xep_matrix.py`
+Implemented with base-system `sh` + `awk` only — **no python, no packages** — so
+they run on a bare FreeBSD CI runner (a host executor with nothing but the base
+system), which is the project's target platform.
+
+## `check_xep_matrix.sh` (+ `check_xep_matrix.awk`)
 
 Keeps the server's advertised feature set consistent across three sources:
 
@@ -46,18 +49,20 @@ answers a query but does nothing (e.g. **T164** XEP-0012 always returns
 ### Usage
 
 ```sh
-python3 test/consistency/check_xep_matrix.py           # HARD checks fail CI
-python3 test/consistency/check_xep_matrix.py --strict   # advisory warnings fail too
+sh test/consistency/check_xep_matrix.sh            # HARD checks fail CI
+sh test/consistency/check_xep_matrix.sh --strict    # advisory warnings fail too
 ```
 
-Exit `0` = clean, `1` = drift, `2` = a source file/anchor could not be parsed.
+Exit `0` = clean, `1` = drift, `2` = a source file could not be found. The awk
+program keeps to the base one-true-awk feature set, so it runs identically under
+FreeBSD's `awk` and gawk.
 
 ### A note on the Zig-native alternative
 
 The most idiomatic home for the HARD checks would be a Zig unit test inside
 `zig build test`, e.g. `@embedFile("iq_handler.zig")`, scrape the feature vars,
-and compare against the imported `caps.SERVER_FEATURES` array. That keeps
-everything in one toolchain. It was done in Python for this PoC because the
-check also reads `README.md` and because it can run in a minimal CI image with
-no Zig toolchain. Either form catches T163; if the Zig test lands, this script
-can be dropped or kept as the README-facing half.
+and compare against the imported `caps.SERVER_FEATURES` array. That keeps the
+first two checks in one toolchain. It lives here as sh/awk because the check
+also reads `README.md` and because CI must run it on a base FreeBSD host with no
+Zig build step. Either form catches T163; if the Zig test lands, this can be
+reduced to the README-facing half.
