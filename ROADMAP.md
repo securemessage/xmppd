@@ -4,7 +4,7 @@ This document tracks the development roadmap for xmppd. Each phase builds on
 the previous one. Phases are not versioned — they represent implementation
 milestones, not releases.
 
-Last updated: 2026-07-02
+Last updated: 2026-08-30
 
 ## Current Status
 
@@ -23,6 +23,77 @@ Last updated: 2026-07-02
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
 | 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
 | 13. Session Robustness Hardening | ✅ Complete | SM resume dispatch bug, stream ID reuse, stale-bind eviction, detached-session delivery. Tagged v0.8.6 |
+
+**Current tree:** `master` at 4 commits past `v0.8.7` (TLS session-id-context fix,
+XEP-0077 IBR advertisement, SM-resume dangling JID fix, T156 IPC pool). These are
+unreleased — see "Next Up".
+
+---
+
+## Next Up
+
+All phases 1–13 are closed, and every plan in
+[windsurf-plans](https://git.morante.net/daniel/windsurf-plans) is marked complete
+or superseded. The live work item backlog is in Phorge (T-numbers); this section
+tracks the release-level shape.
+
+### Immediate
+
+- [ ] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
+      — four good fixes are currently stranded unreleased
+- [ ] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
+      (see Phase 13 Deferred Follow-ups)
+- [ ] Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the struct to
+      ~1.97 MB (80 × 24.6 KB) and it is a stack local in `auth/main.zig`,
+      `auth/oidc_main.zig`, and embedded by value in a stack-local `S2sDaemon`
+- [x] Integration-harness rot — the six slixmpp suites had rotted against
+      slixmpp 1.17 and could not run at all. Ported on branch
+      `fix/integration-suite-slixmpp-1.17`: `connect()` takes `(host, port)`
+      rather than a tuple (a tuple silently falls back to DNS and hits
+      whatever is on port 5222); `enable_direct_tls = False` so clients stop
+      sending a TLS ClientHello at the STARTTLS port, which the server logged
+      as `error.InvalidEntityReference` (filed as T160) and which was the source of the flaky
+      connect timeouts; and `e2e-subscription.py` now uses STARTTLS instead of
+      a plaintext path that modern slixmpp cannot open. All six are
+      parameterised via `XMPP_HOST`/`XMPP_PORT`/`XMPP_DOMAIN` and no longer
+      default at the shared test jail.
+- [ ] SINT full XEP-0198 run — **the long-standing "SINT hardcodes port 5222"
+      rationale is wrong.** SINT runs with `dnsResolver=javax` and follows SRV,
+      and `/var/unbound/conf.d/s2s-test.conf` on freebsd-dev1 already maps
+      `_xmpp-client._tcp.xmppd.test` to port 15222 (verified resolving
+      2026-08-30). So it can be pointed at a throwaway dev instance without
+      touching port 5222 at all. The remaining real prerequisite is an
+      IBR-capable auth daemon (`--enable-registration --no-require-invite`),
+      because SINT skips all SM tests when `accountRegistration` is disabled.
+      Not yet run end-to-end — that is the actual open work here.
+
+### v0.9.0 — Performance + Refactor
+
+Deferred out of the v0.8.0 feature release:
+
+- [ ] T112 — MUC MAM routing
+- [ ] T130 — batch presence
+- [ ] T121 — auth thread pool
+- [ ] T110 — backpressure
+- [ ] T87 — async archive writer
+
+### v0.10.0 — Feature: Web Transport
+
+Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
+
+- [ ] `xmppd-ws` — RFC 7395 XMPP-over-WebSocket process (`src/ws/`, `[ws]` config
+      section, port 5280). Not yet scaffolded.
+- [ ] XEP-0363 HTTP File Upload — slot-allocation IQ handler in core plus an
+      `xmppd-httpupload` binary (~1100–1500 LOC)
+- [ ] XEP-0049 Private XML Storage
+
+### Non-code
+
+- [ ] xmppd.org refresh — `doc/www/index.html` still advertises v0.5.0; the plan
+      calls for a HydePHP site in a new `xmppd/xmppd.org` repo (not yet created)
+- [ ] `securemessage/chat` web client — repo exists on pacyworld but is scaffold
+      only (last touched 2026-06-19)
+
 
 ---
 
@@ -66,15 +137,60 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
   and mixed-set selective expiry. No clock injection needed — tests set
   `sm_detach_time` directly to simulate elapsed time.
 - [ ] SINT full run with `enabledSpecifications="XEP-0198"` — blocked: Smack
-  SINT hardcodes port 5222, production jail occupies it, dev user can't bind
-  privileged port. Needs CI with ephemeral instance or maintenance window.
+  Superseded — see "Next Up". SINT follows SRV, and an `xmppd.test` SRV
+  record pointing at port 15222 already exists on freebsd-dev1; the port was
+  never the real blocker. What SINT actually needs is in-band registration
+  enabled on the auth daemon.
 
 ### Deferred Follow-ups
 
 - [ ] T154 — cross-worker resource eviction (needs new cross-thread kick
   message type; only relevant with `[core] workers > 1`)
-- [ ] T155 — `Connection.close()` should reset `fd` to a sentinel to
-  eliminate the stale-fd hazard class systemically
+- [x] T155 — `Connection.close()` now resets `fd` to -1, and
+  `Connection.queueSend()` rejects writes to a closed connection with
+  `error.ConnectionClosed` (mirroring `S2sSession.queueSend`). Together these
+  turn the stale-fd hazard from silent kqueue corruption into a loud, harmless
+  error at every delivery site. Verified on freebsd-dev1: `zig build test`
+  105/105 steps, 809/809 tests pass (master baseline 795).
+- [x] T153 follow-up — the detached-session guard had only been applied at two
+  delivery sites (`router.zig` unicast, `server.zig` MPSC unicast); every other
+  fan-out path wrote to `target.conn` unguarded. Introduced
+  `fanout.deliverToSession()` / `fanout.deliverPrebuiltToSession()` as the single
+  delivery primitive (detached → `smTrackOutbound()` for replay; live → send,
+  track, arm kqueue) and routed **21 call sites** through it: 9 in
+  `muc_handler.zig`, 4 in `presence_handler.zig`, 4 in `iq_handler.zig`, 3 in
+  `server.zig` (S2S inbound, S2S delivery-error, cross-worker multicast), and
+  the XEP-0280 carbons path in `router.zig`. The now-dead `fanout.deliverPrebuilt()`
+  was removed so the unguarded path cannot be reintroduced.
+
+  This also fixes a **latent XEP-0198 counter bug**: MUC fan-out, presence
+  broadcast and S2S inbound never called `smTrackOutbound()`, so `sm_out_seq`
+  ran behind the client's count. `SmUnackedQueue.ack()` treats an `h` larger
+  than the buffered range as "client acked more than we have" and calls
+  `discardAll()` — silently dropping genuinely unacked *unicast* stanzas from
+  the replay queue. All delivery paths now count.
+
+  Verified on freebsd-dev1 against a throwaway single-worker instance on port
+  15222 (built from this branch, local `xmppd-auth` backend):
+  - `zig build test` — 105/105 steps, 809/809 tests pass, no pre-existing test
+    changed count (master baseline 795)
+  - `e2e-sm-resume.py` — **29/29 assertions, 0 failed**, matching the v0.8.6
+    baseline. Test 6 (stanza replay to a detached session) is the test that
+    originally caught T153 and exercises the rewritten path directly.
+  - `e2e-chat.py` — all pass (routing, full stanza forwarding)
+  - `muc-test.py` — 12/12, covering groupchat fan-out, occupant join/leave
+    presence and kick — 9 of the 21 rerouted sites
+
+  - `e2e-subscription.py` — 29/29, covering the `presence_handler` sites
+    (available/unavailable broadcast, directed presence, roster-subscriber
+    routing)
+  - `e2e-quick-wins.py` — 12/12 and `e2e-mam.py` — 7/7, covering the
+    `iq_handler` sites (PEP notification, roster push) plus MUC history and MAM
+
+  All six suites match the master baseline exactly, with zero server-side
+  errors logged across the run. Still not exercised: the two S2S sites in
+  `server.zig`, which need a federation peer (`s2s-federation.py` expects a
+  Prosody instance).
 - [ ] T151 — evaluate reverting eager `flushSend()` in `handleReadable`
   (harmless but unnecessary micro-optimization from the v0.8.6 debug session)
 
@@ -466,15 +582,15 @@ hardened. Tagged `v0.1.0`.
 
 ### Standards (Post-MVP)
 
-- [ ] XEP-0198: Stream Management (mobile reconnection)
-- [ ] XEP-0280: Message Carbons (multi-device)
-- [ ] XEP-0363: HTTP File Upload (media sharing)
+- [x] XEP-0198: Stream Management (mobile reconnection) — v0.6.0, hardened v0.8.6
+- [x] XEP-0280: Message Carbons (multi-device)
+- [ ] XEP-0363: HTTP File Upload (media sharing) — planned for v0.10.0
 
 ### Documentation (Post-MVP)
 
-- [ ] `doc/ARCHITECTURE.md` — multi-process design, IPC protocol
-- [ ] `doc/CONFIGURATION.md` — all config options
-- [ ] `doc/DEPLOYMENT.md` — FreeBSD setup guide
+- [x] `doc/ARCHITECTURE.md` — multi-process design, IPC protocol
+- [x] `doc/CONFIGURATION.md` — all config options
+- [x] `doc/DEPLOYMENT.md` — FreeBSD setup guide
 - [ ] `doc/FEDERATION.md` — S2S setup, DANE, dialback
 - [ ] Man pages for all binaries
 
@@ -491,10 +607,15 @@ hardened. Tagged `v0.1.0`.
 
 ---
 
-## V1 — Thread-Per-Core (Next after MVP)
+## V1 — Thread-Per-Core ✅ (shipped v0.5.0)
+
+**Status:** Shipped in v0.5.0 (SO_REUSEPORT_LB, per-worker kqueue loops, MPSC
+cross-thread delivery, shared SessionMap) and superseded by the v0.6.0 actor
+refactor. This section is retained as design history, not as pending work.
 
 Multi-threaded xmppd-core for horizontal scaling across CPU cores.
-Design document: `~/.windsurf/plans/xmppd-giant-thread-fix-1e17cd.md`
+Design document: `windsurf-plans/xmppd-giant-thread-fix-1e17cd.md`
+(git.morante.net/daniel/windsurf-plans).
 
 ### Pre-requisites ✅
 
@@ -664,6 +785,7 @@ one process). The hybrid model is where large servers converge.
 |-----|------|-------|
 | RFC 6120 | XMPP Core | 1–2 |
 | RFC 6121 | XMPP IM | 7 |
+| XEP-0012 | Last Activity | v0.8.0 |
 | XEP-0030 | Service Discovery | 7 |
 | XEP-0045 | Multi-User Chat | 10 |
 | XEP-0054 | vcard-temp | 7 |
@@ -671,16 +793,26 @@ one process). The hybrid model is where large servers converge.
 | XEP-0084 | User Avatar (PEP) | V1 |
 | XEP-0085 | Chat State Notifications | V1 |
 | XEP-0092 | Software Version | 7 |
+| XEP-0115 | Entity Capabilities | v0.8.0 |
 | XEP-0160 | Offline Message Storage | 7 |
 | XEP-0163 | Personal Eventing Protocol | V1 |
+| XEP-0184 | Message Delivery Receipts | pass-through |
 | XEP-0191 | Blocking Command | V1 |
 | XEP-0198 | Stream Management | V1 |
 | XEP-0199 | XMPP Ping | 7 |
 | XEP-0220 | Server Dialback | 8 |
 | XEP-0280 | Message Carbons | V1 |
+| XEP-0308 | Last Message Correction | pass-through |
 | XEP-0313 | Message Archive Management | 5+7 |
+| XEP-0333 | Chat Markers | v0.8.0 |
+| XEP-0334 | Message Processing Hints | v0.8.0 |
+| XEP-0352 | Client State Indication | v0.8.0 |
 | XEP-0359 | Unique Message and Stanza IDs | V1 |
+| XEP-0402 | PEP Native Bookmarks | v0.8.0 |
 | XEP-0440 | SASL Channel-Binding Type Capability | 9 |
+
+"V1" in the Phase column refers to the thread-per-core / actor work that shipped
+in v0.5.0–v0.6.0, not to pending work.
 
 ## Metrics
 
@@ -689,7 +821,7 @@ one process). The hybrid model is where large servers converge.
 | Language | Zig 0.15.2 |
 | Source files | ~60 |
 | Lines of code | ~30,000 |
-| Unit tests | 105 build steps, 791 tests (all pass) |
+| Unit tests | 105 build steps, 809 tests (all pass) |
 | Integration tests | 20 slixmpp E2E (incl. e2e-sm-resume.py) + 64 cross-thread + Tsung load tests |
 | Binaries | 6 (`xmppd`, `xmppd-core`, `xmppd-auth`, `xmppd-auth-oidc`, `xmppd-s2s`, `xmppctl`) |
 | Primary platform | FreeBSD (kqueue) |

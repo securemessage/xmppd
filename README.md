@@ -11,7 +11,7 @@ architectural inspiration from Postfix — separation of concerns, privilege
 separation, sensible defaults — while leveraging Zig's async I/O and compile-time
 polymorphism for performance at scale.
 
-### Key Features (planned)
+### Key Features
 
 - **Hybrid process model** — master daemon supervises isolated components
 - **Async I/O** — kqueue/kevent event loop handles millions of concurrent connections
@@ -31,6 +31,7 @@ polymorphism for performance at scale.
 |----------|-------------|---------|--------|
 | RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
 | RFC 6121 | XMPP IM (roster, presence, messaging) | Partial¹ | Interop, E2E, Unit |
+| XEP-0012 | Last Activity | Full | Unit |
 | XEP-0030 | Service Discovery | Full | Interop |
 | XEP-0045 | Multi-User Chat | Partial² | Interop, E2E, Unit |
 | XEP-0054 | vCard-temp | Full | Interop |
@@ -38,36 +39,45 @@ polymorphism for performance at scale.
 | XEP-0084 | User Avatar (via PEP) | Full | E2E |
 | XEP-0085 | Chat State Notifications | Full | Interop |
 | XEP-0092 | Software Version | Full | Interop |
+| XEP-0115 | Entity Capabilities | Full | Unit |
 | XEP-0160 | Offline Message Storage | Full | E2E, Unit |
 | XEP-0163 | Personal Eventing Protocol | Partial³ | E2E |
 | XEP-0184 | Message Delivery Receipts | Pass-through | E2E |
 | XEP-0191 | Blocking Command | Full | E2E, Unit |
-| XEP-0198 | Stream Management | Partial⁴ | E2E |
+| XEP-0198 | Stream Management | Full | Interop, E2E, Unit |
 | XEP-0199 | XMPP Ping | Full | Interop |
 | XEP-0220 | Server Dialback | Partial | E2E |
 | XEP-0280 | Message Carbons | Full | E2E, Unit |
 | XEP-0308 | Last Message Correction | Pass-through | E2E |
 | XEP-0313 | Message Archive Management | Full | E2E, Unit |
+| XEP-0333 | Chat Markers | Pass-through | E2E |
+| XEP-0334 | Message Processing Hints | Full | Unit |
+| XEP-0352 | Client State Indication | Full | E2E |
 | XEP-0359 | Unique and Stable Stanza IDs | Full | Unit |
+| XEP-0402 | PEP Native Bookmarks | Full | E2E |
 | XEP-0440 | SASL Channel-Binding Type Negotiation | Full | Unit |
 
 **Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2 (495 tests available),
 **E2E** = verified with Gajim, Conversations, and/or Dino,
-**Unit** = Zig unit tests (738 tests),
+**Unit** = Zig unit tests (809 tests),
 **Pass-through** = server forwards stanzas without interpretation; no server-side logic required.
 
 ¹ Multi-resource routing (§8.5) implemented: priority-based delivery, full JID forwarding,
 chat fallback. Roster push notifications after subscription changes not yet implemented.
 Roster set validation (multi-item, unauthorized, duplicate groups) incomplete.
 
-² MUC core functionality works (join, part, groupchat, kick, ban, history, MAM, disco).
-Missing: room configuration forms (XEP-0045 §10), invitations (§7.8), voice requests.
+² MUC core functionality works (join, part, groupchat, kick, ban, history, MAM, disco),
+plus persistent rooms, owner configuration forms (XEP-0045 §10 via XEP-0004),
+password-protected rooms, outcast enforcement, and moderator voice grant/revoke.
+Missing: invitations (§7.8) and occupant voice requests (§7.13).
 
 ³ PEP supports publish, subscribe, auto-subscribe, auto-create, persistent items, and
 avatar metadata notifications. Not a full XEP-0060 PubSub service.
 
-⁴ SM supports enable, ack requests (`<r/>`), and ack responses (`<a/>`). Session resume
-is **not implemented** — sessions cannot be resumed after disconnection.
+⁴ SM supports enable, ack requests (`<r/>`), ack responses (`<a/>`), and full session
+resume: sessions detach on abnormal disconnect and resume on reconnect without
+re-authentication, replaying unacked stanzas from a bounded queue. Detached sessions
+expire after 300s. Shipped in v0.6.0; hardened in v0.8.6 (T152/T153).
 
 ## Building
 
