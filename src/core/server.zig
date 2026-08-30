@@ -927,6 +927,21 @@ pub const Server = struct {
 
             // Parse all XML events from the read buffer
             const data = session.conn.readableSlice();
+
+            // T160: a TLS ClientHello on the STARTTLS port would otherwise be
+            // fed to the XML parser and surface as a misleading
+            // InvalidEntityReference. Detect the TLS record header (content
+            // type 0x16 = handshake, major version 0x03) on a fresh plaintext
+            // stream and close with a clear log line instead.
+            if (session.stream.state == .awaiting_stream_open and
+                session.conn.tls_conn == null and
+                data.len >= 2 and data[0] == 0x16 and data[1] == 0x03)
+            {
+                log.info("connection {d}: TLS handshake on the STARTTLS port — client is configured for direct TLS, closing", .{id});
+                session_lifecycle.forceCloseSession(self, id, changes);
+                return;
+            }
+
             var pos: usize = 0;
 
             while (true) {
@@ -3260,6 +3275,34 @@ test "Server: stream open produces response" {
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:features>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<starttls") != null);
+}
+
+test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 3, "localhost", false, std.testing.allocator);
+    server.sessions[3] = session;
+
+    // Simulate a direct-TLS client sending a TLS record header (ClientHello)
+    const client_hello_prefix = "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03";
+    _ = try posix.write(fds[1], client_hello_prefix);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleReadable(3, &changes);
+
+    // Session must be closed immediately, without feeding bytes to the XML parser
+    try std.testing.expect(server.sessions[3] == null);
+
+    // No stream error / features should have been sent to the TLS client
+    var buf: [256]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
 test "Server: direct TLS skips STARTTLS features" {
