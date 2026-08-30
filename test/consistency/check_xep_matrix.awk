@@ -47,6 +47,7 @@ BEGIN {
 
     ncaps=0; ndisco=0
     in_caps=0; in_disco=0
+    generated=0
 }
 
 # ---- caps.zig: the SERVER_FEATURES array (ordered) ----
@@ -63,6 +64,10 @@ index(FILENAME, "caps.zig") {
 # ---- iq_handler.zig: the server disco#info feature block ----
 index(FILENAME, "iq_handler.zig") {
     if (index($0, "<identity category='server' type='im'")) { in_disco=1 }
+    # T163 single-source mode: the disco#info features are emitted by
+    # iterating caps.SERVER_FEATURES via caps.writeDiscoFeatures(), so the
+    # two sets are identical by construction.
+    if (in_disco && index($0, "writeDiscoFeatures")) { generated=1 }
     if (in_disco && match($0, /var='[^']+'/)) {
         f = substr($0, RSTART+5, RLENGTH-6)
         disco_set[f]=1; ndisco++
@@ -80,8 +85,18 @@ $0 ~ /^\| *XEP-/ {
 }
 
 END {
+    # Single-source mode: when the disco#info result is generated from
+    # caps.SERVER_FEATURES (writeDiscoFeatures), the sets cannot drift;
+    # synthesize the disco set from caps so the remaining checks still run.
+    gen_note=0
+    if (generated && ndisco == 0) {
+        for (f in caps_set) disco_set[f]=1
+        ndisco=ncaps
+        gen_note=1
+    }
+
     printf "caps.SERVER_FEATURES : %d features\n", ncaps
-    printf "disco#info response  : %d features\n", ndisco
+    printf "disco#info response  : %d features%s\n", ndisco, (gen_note ? " (generated)" : "")
     n=0; for (x in readme_set) n++
     printf "README XEP matrix     : %d XEP rows\n\n", n
 
@@ -101,6 +116,8 @@ END {
         for (f in caps_set) if (!(f in disco_set))
             print "        - hashed in caps.zig but NOT advertised in disco#info: " f
         print ""
+    } else if (gen_note) {
+        print "ok    disco#info features generated from caps.SERVER_FEATURES (single source)"
     } else {
         print "ok    caps.SERVER_FEATURES == disco#info feature set"
     }
