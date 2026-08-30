@@ -128,6 +128,9 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--background") or std.mem.eql(u8, arg, "-b")) {
             daemonize = true;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            printVersion();
+            return;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -694,12 +697,22 @@ fn printUsage() void {
         \\  --config PATH, -c  Config file path (passed to children)
         \\  --log-file PATH    Log file path (default: /var/log/xmppd/xmppd.log)
         \\  --background, -b   Daemonize (fork, detach from terminal)
+        \\  --version, -v      Print version and exit
         \\  --help, -h         Show this help
         \\
     ;
     var buf: [0]u8 = .{};
     var stdout = std.fs.File.stdout().writer(&buf);
     stdout.interface.writeAll(usage) catch {};
+}
+
+fn printVersion() void {
+    const build_options = @import("build_options");
+    var line_buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "xmppd {s}\n", .{build_options.version}) catch return;
+    var buf: [0]u8 = .{};
+    var stdout = std.fs.File.stdout().writer(&buf);
+    stdout.interface.writeAll(line) catch {};
 }
 
 /// Bind a non-blocking, SO_REUSEADDR TCP socket on the given address and port.

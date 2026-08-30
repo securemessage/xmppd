@@ -1,8 +1,18 @@
 const std = @import("std");
 
+/// Project version — the single source of truth (T168). Exposed to the code
+/// via the "build_options" module; consumed by `xmppd --version` and the
+/// XEP-0092 Software Version answer. Bump at release time (must equal the
+/// git tag without the leading 'v').
+const version = "0.8.9";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", version);
+    const build_options_mod = version_options.createModule();
 
     const op_storage = b.option([]const u8, "op-storage", "Operational storage backend: lmdb (default), rocksdb, sqlite") orelse "lmdb";
     const archive_storage = b.option([]const u8, "archive-storage", "Archive storage backend: rocksdb (default), lmdb, sqlite") orelse "rocksdb";
@@ -332,6 +342,7 @@ pub fn build(b: *std.Build) void {
     });
     server_pep_store_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("pep_store", server_pep_store_mod);
+    server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1040,6 +1051,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("pep_store", server_pep_store_mod);
     core_mod.addImport("config", config_mod);
     core_mod.addImport("xmppd_log", xmppd_log_mod);
+    core_mod.addImport("build_options", build_options_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -1064,6 +1076,7 @@ pub fn build(b: *std.Build) void {
     master_mod.addImport("event_loop", master_event_loop_mod);
     master_mod.addImport("config", config_mod);
     master_mod.addImport("xmppd_log", xmppd_log_mod);
+    master_mod.addImport("build_options", build_options_mod);
 
     const master_exe = b.addExecutable(.{
         .name = "xmppd",

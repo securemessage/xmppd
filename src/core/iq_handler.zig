@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const xml = @import("xml");
+const build_options = @import("build_options");
 const mam_handler = @import("mam_handler");
 const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
@@ -623,7 +624,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         writeIqHeader(server, w, session, "result", iq_id);
         w.writeAll("><query xmlns='jabber:iq:version'>") catch return;
         w.writeAll("<name>xmppd</name>") catch return;
-        w.writeAll("<version>0.1.0</version>") catch return;
+        w.writeAll("<version>") catch return;
+        w.writeAll(build_options.version) catch return;
+        w.writeAll("</version>") catch return;
         w.writeAll("<os>FreeBSD</os>") catch return;
         w.writeAll("</query></iq>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
