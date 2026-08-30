@@ -47,9 +47,6 @@ tracks the release-level shape.
       full test matrix), deployed to the test jail the same day
 - [x] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
       (shipped in v0.8.8; see Phase 13 Deferred Follow-ups)
-- [ ] **T161** — Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the struct to
-      ~1.97 MB (80 × 24.6 KB) and it is a stack local in `auth/main.zig`,
-      `auth/oidc_main.zig`, and embedded by value in a stack-local `S2sDaemon`
 - [x] Integration-harness rot — the six slixmpp suites had rotted against
       slixmpp 1.17 and could not run at all. Ported on branch
       `fix/integration-suite-slixmpp-1.17`: `connect()` takes `(host, port)`
@@ -61,10 +58,6 @@ tracks the release-level shape.
       a plaintext path that modern slixmpp cannot open. All six are
       parameterised via `XMPP_HOST`/`XMPP_PORT`/`XMPP_DOMAIN` and no longer
       default at the shared test jail.
-- [ ] **T160** — TLS ClientHello on the STARTTLS C2S port reports an XML parse
-      error instead of a clear rejection (peek first bytes; log a useful message)
-- [ ] **T151** — Evaluate reverting eager `flushSend()` in `handleReadable` to
-      deferred `addWrite`
 - [ ] SINT full XEP-0198 run — **the long-standing "SINT hardcodes port 5222"
       rationale is wrong.** SINT runs with `dnsResolver=javax` and follows SRV,
       and `/var/unbound/conf.d/s2s-test.conf` on freebsd-dev1 already maps
@@ -75,6 +68,39 @@ tracks the release-level shape.
       because SINT skips all SM tests when `accountRegistration` is disabled.
       Not yet run end-to-end — that is the actual open work here.
 
+### v0.8.9 — Bugfix + Doc-Consistency
+
+A code audit at `e922681` (v0.8.8+2) filed T163–T170: feature-list drift,
+stubbed features with overclaiming docs, and small operational gaps. All are
+patch-scale; bundle with the leftover hardening items:
+
+- [ ] **T163** (High) — XEP-0115 caps hash omits `jabber:iq:register`: add it to
+      `caps.zig` `SERVER_FEATURES` in sorted position + a unit test asserting the
+      disco#info set and `SERVER_FEATURES` are identical
+- [ ] **T165** — invite-required IBR broken: parse the `jabber:x:data` invite
+      field in `handleRegisterSubmit()` and pass it through; add E2E test
+- [ ] **T166** — directed presence to remote domains silently dropped: route
+      through the S2S outbound path instead of the early return
+- [ ] **T167** — listener bind address: general dotted-quad IPv4 (and IPv6
+      literal) parsing via `std.net.Address.parseIp*` + tests
+- [ ] **T168** — XEP-0092 hardcoded `<version>0.1.0</version>`: source from a
+      single build-time version constant shared with `--version`
+- [ ] **T169** — README footnote ¹ correction: roster push after subscription
+      changes IS implemented (verify the roster-set-validation clause before
+      editing)
+- [ ] **T164** — XEP-0012 is a constant `seconds='0'` stub: downgrade the README
+      claim now; full last-activity tracking deferred to v0.9.0
+- [ ] **T170** — land the `poc/ci-xep-consistency-check` branch (fix the
+      `runs-on` label; decide Python check vs Zig `@embedFile` test)
+- [ ] **T161** — Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the
+      struct to ~1.97 MB (80 × 24.6 KB) and it is a stack local in
+      `auth/main.zig`, `auth/oidc_main.zig`, and embedded by value in a
+      stack-local `S2sDaemon`
+- [ ] **T160** — TLS ClientHello on the STARTTLS C2S port reports an XML parse
+      error instead of a clear rejection (peek first bytes; log a useful message)
+- [ ] **T151** — Evaluate reverting eager `flushSend()` in `handleReadable` to
+      deferred `addWrite` (record the verdict either way)
+
 ### v0.9.0 — Performance + Refactor
 
 Deferred out of the v0.8.0 feature release:
@@ -84,6 +110,9 @@ Deferred out of the v0.8.0 feature release:
 - [ ] T121 — auth thread pool
 - [ ] T110 — backpressure
 - [ ] T87 — async archive writer
+- [ ] T154 — cross-worker resource eviction (workers>1)
+- [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
+      store, offline elapsed seconds, privacy rules)
 
 ### v0.10.0 — Feature: Web Transport
 
