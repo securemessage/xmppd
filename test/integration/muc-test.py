@@ -33,19 +33,24 @@ import logging
 import ssl
 import sys
 import uuid
+import os
 
 import slixmpp
 from slixmpp.plugins.xep_0045 import XEP_0045
 
 # Configuration
-HOST = '127.0.0.1'
-PORT = 15222
-MUC_SERVICE = 'conference.localhost'
+# Configuration — override via environment for CI or an alternate instance.
+# Defaults target a local throwaway instance (see doc/TESTING.md), NOT the
+# shared test jail.
+HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
+PORT = int(os.environ.get('XMPP_PORT', '15222'))
+DOMAIN = os.environ.get('XMPP_DOMAIN', 'localhost')
+MUC_SERVICE = os.environ.get('XMPP_MUC_SERVICE', f'conference.{DOMAIN}')
 
-ALICE_JID = 'alice@localhost'
-ALICE_PASS = 'pass1'
-BOB_JID = 'bob@localhost'
-BOB_PASS = 'pass2'
+ALICE_JID = f'alice@{DOMAIN}'
+ALICE_PASS = os.environ.get('XMPP_ALICE_PASS', 'pass1')
+BOB_JID = f'bob@{DOMAIN}'
+BOB_PASS = os.environ.get('XMPP_BOB_PASS', 'pass2')
 
 TIMEOUT = 10  # seconds
 
@@ -132,8 +137,15 @@ async def connect_client(jid, password, label):
     client.ssl_context = ssl.create_default_context()
     client.ssl_context.check_hostname = False
     client.ssl_context.verify_mode = ssl.CERT_NONE
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
 
-    client.connect((HOST, PORT))
+    client.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(client.session_ready.wait(), timeout=15)

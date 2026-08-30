@@ -33,21 +33,25 @@ import logging
 import ssl
 import sys
 import time
+import os
 
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
 
 # -- Configuration --
-HOST = '127.0.0.1'
-PORT = 5222
-DOMAIN = 'morante.dev'
+# Configuration — override via environment for CI or an alternate instance.
+# Defaults target a local throwaway instance (see doc/TESTING.md), NOT the
+# shared test jail.
+HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
+PORT = int(os.environ.get('XMPP_PORT', '15222'))
+DOMAIN = os.environ.get('XMPP_DOMAIN', 'localhost')
 
 ALICE_JID = f'alice@{DOMAIN}'
-ALICE_PASS = 'test1234'
+ALICE_PASS = os.environ.get('XMPP_ALICE_PASS', 'pass1')
 BOB_JID = f'bob@{DOMAIN}'
-BOB_PASS = 'test1234'
+BOB_PASS = os.environ.get('XMPP_BOB_PASS', 'pass2')
 CHARLIE_JID = f'charlie@{DOMAIN}'
-CHARLIE_PASS = 'test1234'
+CHARLIE_PASS = os.environ.get('XMPP_CHARLIE_PASS', 'pass3')
 
 TIMEOUT = 15  # seconds per wait — generous to catch the 47s stall if it regresses
 
@@ -63,7 +67,7 @@ def record(name, passed, detail=''):
     print(msg)
 
 def make_client(jid, password):
-    """Create a slixmpp client with TLS disabled (plaintext to 127.0.0.1).
+    """Create a slixmpp client that connects over STARTTLS.
     Auto-subscription is disabled to prevent clients from automatically
     re-subscribing after unsubscribed/unsubscribe, which would mask server bugs."""
     client = slixmpp.ClientXMPP(jid, password)
@@ -76,8 +80,18 @@ def make_client(jid, password):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     client.ssl_context = ctx
-    # Force plaintext (no STARTTLS) for interop testing
-    client.use_tls = False
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
+    # This suite used to force plaintext via connect(disable_starttls=True,
+    # use_ssl=False). slixmpp >= 1.9 removed those kwargs, and with both
+    # enable_starttls and enable_direct_tls off it never opens a socket at all.
+    # STARTTLS is what every other suite here uses and what real clients do,
+    # so the plaintext path was dropped rather than reconstructed.
     return client
 
 
@@ -90,7 +104,7 @@ async def connect_client(client):
             connected.set_result(True)
 
     client.add_event_handler('session_start', on_session)
-    client.connect((HOST, PORT), disable_starttls=True, use_ssl=False)
+    client.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(connected, timeout=TIMEOUT)

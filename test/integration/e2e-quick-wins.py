@@ -17,19 +17,23 @@ import logging
 import ssl
 import sys
 import uuid
+import os
 
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
 
-HOST = '127.0.0.1'
-PORT = 5222
-DOMAIN = 'morante.dev'
-MUC_SERVICE = 'conference.morante.dev'
+# Configuration — override via environment for CI or an alternate instance.
+# Defaults target a local throwaway instance (see doc/TESTING.md), NOT the
+# shared test jail.
+HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
+PORT = int(os.environ.get('XMPP_PORT', '15222'))
+DOMAIN = os.environ.get('XMPP_DOMAIN', 'localhost')
+MUC_SERVICE = os.environ.get('XMPP_MUC_SERVICE', f'conference.{DOMAIN}')
 
-ALICE_JID = 'alice@morante.dev'
-ALICE_PASS = 'test1234'
-BOB_JID = 'bob@morante.dev'
-BOB_PASS = 'test1234'
+ALICE_JID = f'alice@{DOMAIN}'
+ALICE_PASS = os.environ.get('XMPP_ALICE_PASS', 'pass1')
+BOB_JID = f'bob@{DOMAIN}'
+BOB_PASS = os.environ.get('XMPP_BOB_PASS', 'pass2')
 
 TIMEOUT = 10
 results = []
@@ -52,6 +56,13 @@ def make_client(jid, password):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     client.ssl_context = ctx
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
     return client
 
 
@@ -61,7 +72,7 @@ async def test_disco_features():
     client = make_client(ALICE_JID, ALICE_PASS)
     connected = asyncio.Event()
     client.add_event_handler('session_start', lambda _: connected.set())
-    client.connect((HOST, PORT))
+    client.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(connected.wait(), timeout=TIMEOUT)
@@ -106,7 +117,7 @@ async def test_muc_history():
     alice = make_client(ALICE_JID, ALICE_PASS)
     alice_connected = asyncio.Event()
     alice.add_event_handler('session_start', lambda _: alice_connected.set())
-    alice.connect((HOST, PORT))
+    alice.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(alice_connected.wait(), timeout=TIMEOUT)
@@ -155,7 +166,7 @@ async def test_muc_history():
             })
 
     bob.add_event_handler('groupchat_message', on_groupchat)
-    bob.connect((HOST, PORT))
+    bob.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(bob_connected.wait(), timeout=TIMEOUT)
@@ -217,8 +228,8 @@ async def test_chat_state_forwarding():
 
     bob.add_event_handler('message', on_chatstate)
 
-    alice.connect((HOST, PORT))
-    bob.connect((HOST, PORT))
+    alice.connect(HOST, PORT)
+    bob.connect(HOST, PORT)
 
     try:
         await asyncio.wait_for(alice_connected.wait(), timeout=TIMEOUT)

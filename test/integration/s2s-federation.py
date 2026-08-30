@@ -22,19 +22,21 @@ import logging
 import ssl
 import sys
 import uuid
+import os
 
 import slixmpp
 
 # Configuration
-XMPPD_HOST = '127.0.0.1'
-XMPPD_C2S_PORT = 15222
-PROSODY_HOST = '127.0.0.1'
-PROSODY_C2S_PORT = 25222
+# Configuration — override via environment for CI or alternate instances.
+XMPPD_HOST = os.environ.get('XMPPD_HOST', '127.0.0.1')
+XMPPD_C2S_PORT = int(os.environ.get('XMPPD_C2S_PORT', '15222'))
+PROSODY_HOST = os.environ.get('PROSODY_HOST', '127.0.0.1')
+PROSODY_C2S_PORT = int(os.environ.get('PROSODY_C2S_PORT', '25222'))
 
-XMPPD_USER = 'alice@xmppd.test'
-XMPPD_PASS = 'pass1'
-PROSODY_USER = 'alice@prosody.test'
-PROSODY_PASS = 'pass123'
+XMPPD_USER = os.environ.get('XMPPD_USER', 'alice@xmppd.test')
+XMPPD_PASS = os.environ.get('XMPPD_PASS', 'pass1')
+PROSODY_USER = os.environ.get('PROSODY_USER', 'alice@prosody.test')
+PROSODY_PASS = os.environ.get('PROSODY_PASS', 'pass123')
 
 TIMEOUT = 30  # seconds for message delivery
 
@@ -108,8 +110,15 @@ async def connect_client(jid, password, host, port, label):
     client.ssl_context = ssl.create_default_context()
     client.ssl_context.check_hostname = False
     client.ssl_context.verify_mode = ssl.CERT_NONE
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
 
-    client.connect((host, port))
+    client.connect(host, port)
 
     try:
         await asyncio.wait_for(client.session_ready.wait(), timeout=15)

@@ -21,13 +21,15 @@ import logging
 import sys
 import ssl
 import traceback
+import os
 
 import slixmpp
 from slixmpp.exceptions import IqError, IqTimeout
 
-HOST = '127.0.0.1'
-PORT = 15222
-DOMAIN = 'xmppd.test'
+# Configuration — override via environment for CI or an alternate instance.
+HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
+PORT = int(os.environ.get('XMPP_PORT', '15222'))
+DOMAIN = os.environ.get('XMPP_DOMAIN', 'xmppd.test')
 
 # Track test results
 results = []
@@ -82,6 +84,13 @@ async def test_connect_and_auth(mechanism='PLAIN'):
     client.ssl_context = ssl.create_default_context()
     client.ssl_context.check_hostname = False
     client.ssl_context.verify_mode = ssl.CERT_NONE
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
 
     # Force specific SASL mechanism
     if mechanism == 'PLAIN':
@@ -90,7 +99,7 @@ async def test_connect_and_auth(mechanism='PLAIN'):
         client.sasl_mechanism = 'SCRAM-SHA-256'
 
     try:
-        client.connect((HOST, PORT))
+        client.connect(HOST, PORT)
         try:
             await asyncio.wait_for(client.session_started.wait(), timeout=10)
             record(f'Connect + STARTTLS + {mechanism} + Bind', True,
@@ -280,12 +289,19 @@ async def test_messaging():
         c.ssl_context = ssl.create_default_context()
         c.ssl_context.check_hostname = False
         c.ssl_context.verify_mode = ssl.CERT_NONE
+        # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+        # enable_direct_tls to True, which makes it open a throwaway connection and
+        # send a TLS ClientHello first; the server parses those bytes as XML, logs
+        # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+        # STARTTLS. Harmless but it doubles connection count and the retry
+        # occasionally overruns the per-test timeout.
+        c.enable_direct_tls = False
 
     try:
         # Connect both with minimal stagger to allow asyncio scheduling
-        alice.connect((HOST, PORT))
+        alice.connect(HOST, PORT)
         await asyncio.sleep(0.05)
-        bob.connect((HOST, PORT))
+        bob.connect(HOST, PORT)
 
         try:
             await asyncio.wait_for(alice.session_started.wait(), timeout=10)
@@ -359,6 +375,13 @@ async def test_wrong_password():
     client.ssl_context = ssl.create_default_context()
     client.ssl_context.check_hostname = False
     client.ssl_context.verify_mode = ssl.CERT_NONE
+    # The C2S port speaks STARTTLS, not direct TLS. slixmpp defaults
+    # enable_direct_tls to True, which makes it open a throwaway connection and
+    # send a TLS ClientHello first; the server parses those bytes as XML, logs
+    # an InvalidEntityReference and drops it, and slixmpp then reconnects with
+    # STARTTLS. Harmless but it doubles connection count and the retry
+    # occasionally overruns the per-test timeout.
+    client.enable_direct_tls = False
 
     auth_failed = asyncio.Event()
 
@@ -368,7 +391,7 @@ async def test_wrong_password():
     client.add_event_handler('failed_auth', on_failed)
 
     try:
-        client.connect((HOST, PORT))
+        client.connect(HOST, PORT)
         try:
             # Should NOT reach session_start
             done, pending = await asyncio.wait(
