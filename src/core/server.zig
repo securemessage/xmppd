@@ -297,6 +297,12 @@ pub const Session = struct {
     reg_collecting_username: bool = false,
     reg_username_buf: [256]u8 = undefined,
     reg_username_len: usize = 0,
+    /// Whether the current jabber:x:data <field> in the registration form is
+    /// the invite/token field (set on <field>, consumed on <value>).
+    reg_invite_field: bool = false,
+    reg_collecting_invite: bool = false,
+    reg_invite_buf: [256]u8 = undefined,
+    reg_invite_len: usize = 0,
     /// Whether a <remove/> element was seen inside jabber:iq:register (account deletion).
     reg_has_remove: bool = false,
     /// IQ id for a pending password change/deletion response (awaiting auth daemon reply).
@@ -1223,6 +1229,15 @@ pub const Server = struct {
             }
             return;
         }
+        if (session.reg_collecting_invite) {
+            const remaining = session.reg_invite_buf.len - session.reg_invite_len;
+            const to_copy = @min(text.len, remaining);
+            if (to_copy > 0) {
+                @memcpy(session.reg_invite_buf[session.reg_invite_len .. session.reg_invite_len + to_copy], text[0..to_copy]);
+                session.reg_invite_len += to_copy;
+            }
+            return;
+        }
 
         // Roster <group> text accumulation
         if (session.iq_roster_collecting_group) {
@@ -1368,12 +1383,15 @@ pub const Server = struct {
             }
         }
 
-        // Registration text — stop collecting on </username> or </password>
+        // Registration text — stop collecting on </username>, </password> or </value>
         if (session.iq_active and session.reg_collecting_username) {
             session.reg_collecting_username = false;
         }
         if (session.iq_active and session.reg_collecting_password) {
             session.reg_collecting_password = false;
+        }
+        if (session.iq_active and session.reg_collecting_invite) {
+            session.reg_collecting_invite = false;
         }
 
         // MAM text accumulation — commit collected text on element close

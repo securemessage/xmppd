@@ -226,9 +226,16 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         }
     } else if (std.mem.eql(u8, elem.local_name, "field") and std.mem.eql(u8, ns, ns_xdata)) {
         // <field var='with|start|end'> inside <x xmlns='jabber:x:data'>
+        // XEP-0077: also track the invite/token field of a registration form
+        const in_register = std.mem.eql(u8, session.iq_child_ns, xml.ns.register);
+        if (in_register) session.reg_invite_field = false;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "var")) {
                 session.mam_field_var = attr.value;
+                if (in_register) {
+                    session.reg_invite_field = std.mem.eql(u8, attr.value, "invite") or
+                        std.mem.eql(u8, attr.value, "token");
+                }
                 break;
             }
         }
@@ -236,6 +243,10 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         // <value> inside a <field> — start collecting text
         session.mam_collecting = .field_value;
         session.mam_text_len = 0;
+        if (session.reg_invite_field) {
+            session.reg_collecting_invite = true;
+            session.reg_invite_len = 0;
+        }
     } else if (std.mem.eql(u8, ns, ns_rsm)) {
         // RSM elements: <max>, <after>, <before>
         if (std.mem.eql(u8, elem.local_name, "max")) {
@@ -370,6 +381,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.reg_username_len = 0;
         session.reg_collecting_password = false;
         session.reg_password_len = 0;
+        session.reg_invite_field = false;
+        session.reg_collecting_invite = false;
+        session.reg_invite_len = 0;
         session.reg_has_remove = false;
     }
 
@@ -1016,6 +1030,15 @@ fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void
     w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
     w.writeAll("<username/>") catch return;
     w.writeAll("<password/>") catch return;
+    // XEP-0004 data form mirroring the legacy fields, plus the optional
+    // invite field (T165) — marked optional because whether an invite is
+    // required is the auth daemon's configuration, unknown to core.
+    w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
+    w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
+    w.writeAll("<field var='username' type='text-single' label='Username'><required/></field>") catch return;
+    w.writeAll("<field var='password' type='text-private' label='Password'><required/></field>") catch return;
+    w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/></field>") catch return;
+    w.writeAll("</x>") catch return;
     w.writeAll("</query></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;
 }
@@ -1036,15 +1059,17 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
         return;
     }
 
-    // TODO: extract invite code from <x xmlns='jabber:x:data'> form field
-    // For now, invite code is empty (works when --no-require-invite is set)
+    // Invite code from the <x xmlns='jabber:x:data'> invite/token field (T165).
+    // Empty when the client did not supply one — the auth daemon decides
+    // whether an invite is required.
+    const reg_invite = session.reg_invite_buf[0..session.reg_invite_len];
 
     server.ipc.send(.{
         .register_request = .{
             .conn_id = session.ipcConnId(),
             .username = reg_username,
             .password = reg_password,
-            .invite_code = "",
+            .invite_code = reg_invite,
             .client_ip = session.conn.peerAddr(),
         },
     }) catch {

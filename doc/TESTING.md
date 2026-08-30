@@ -78,6 +78,22 @@ their own variables (`XMPPD_HOST`, `XMPPD_C2S_PORT`, `PROSODY_HOST`,
 | `e2e-quick-wins.py` | 12/12 |
 | `e2e-mam.py` | 7/7 |
 | `e2e-subscription.py` | 29/29 |
+| `e2e-register-invite.py` | 6/6 (XEP-0077 invite-gated registration, T165) |
+
+`e2e-register-invite.py` needs a *separate* instance: registration enabled
+with invites **required** (do not pass `--no-require-invite` / set
+`[auth] registration = true` and leave `require_invite` unset), plus an
+invite created up front and passed via `XMPP_INVITE_CODE`:
+
+```sh
+./zig-out/bin/xmppctl --db /tmp/xmppd-test-db invite create --max-uses 5
+# -> prints e.g. INV-XXXXXXXXXXXX
+XMPP_INVITE_CODE=INV-XXXXXXXXXXXX python3 test/integration/e2e-register-invite.py
+```
+
+It uses a raw socket (STARTTLS via `ssl` module), not slixmpp — slixmpp's
+xep_0077 client flow only fires when the server advertises `<register/>`
+instead of SASL mechanisms, which xmppd does not do.
 
 Notes:
 
