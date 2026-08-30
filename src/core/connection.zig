@@ -59,7 +59,8 @@ const WRITE_BUF_SIZE = 16384;
 
 /// Per-client XMPP connection state.
 pub const Connection = struct {
-    /// The client socket file descriptor.
+    /// The client socket file descriptor. Set to -1 by `close()` (T155) so a
+    /// stale Connection cannot leak a recycled descriptor number to kqueue.
     fd: posix.fd_t,
 
     /// Incoming data buffer. Data arrives from the socket at `read_end`,
@@ -207,10 +208,16 @@ pub const Connection = struct {
 
     /// Append data to the write buffer for later sending.
     ///
-    /// Returns `error.WriteBufferFull` if there isn't enough space.
-    /// In that case, the caller should wait for `flushSend()` to drain
-    /// some data before queueing more.
+    /// Returns `error.WriteBufferFull` if there is not enough space — the
+    /// caller should wait for `flushSend()` to drain some data before queueing
+    /// more. Returns `error.ConnectionClosed` if the connection is already
+    /// closed; the stanza should be dropped or tracked for SM replay instead.
     pub fn queueSend(self: *Connection, data: []const u8) !void {
+        // T155: refuse to buffer for a closed connection. Without this the data
+        // lands in write_buf, hasPendingWrite() then reports true, and the
+        // caller arms kqueue on a dead fd. Mirrors S2sSession.queueSend.
+        if (self.closed) return error.ConnectionClosed;
+
         const space = WRITE_BUF_SIZE - self.write_end;
         if (data.len > space) {
             // Try compacting first
@@ -359,6 +366,12 @@ pub const Connection = struct {
                 self.tls_state = null;
             }
             posix.close(self.fd);
+            // T155: reset fd to a sentinel. Any code path still holding this
+            // Connection (a detached SM session lingering in server.sessions,
+            // a room occupant slot) would otherwise hand a recycled descriptor
+            // number to kqueue. EBADF is a loud, harmless failure; a recycled
+            // fd silently misroutes events onto an unrelated connection (T153).
+            self.fd = -1;
             self.closed = true;
         }
     }
@@ -502,4 +515,31 @@ test "Connection: recv WouldBlock when no data" {
     var conn = Connection.init(fds[0], 1);
     const result = conn.recv();
     try std.testing.expectError(error.WouldBlock, result);
+}
+
+test "Connection: close resets fd to sentinel (T155)" {
+    const fds = try makeSocketPair();
+    // Don't defer close fds[0] — connection will close it
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    try std.testing.expect(conn.fd >= 0);
+    conn.close();
+    // The descriptor number must not survive close — a recycled fd handed to
+    // kqueue misroutes events onto an unrelated connection (T153).
+    try std.testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+}
+
+test "Connection: queueSend on closed connection is rejected (T155)" {
+    const fds = try makeSocketPair();
+    // Don't defer close fds[0] — connection will close it
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    conn.close();
+
+    try std.testing.expectError(error.ConnectionClosed, conn.queueSend("<message/>"));
+    // Critically, the rejected data must not leave the connection looking
+    // writable — callers gate `changes.addWrite(conn.fd, ..)` on this.
+    try std.testing.expect(!conn.hasPendingWrite());
 }

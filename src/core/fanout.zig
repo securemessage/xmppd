@@ -145,25 +145,6 @@ pub fn buildSuffix(
     return @intCast(fbs.pos);
 }
 
-/// Deliver a pre-built stanza to a single session by assembling
-/// prefix + recipient JID + suffix into a contiguous buffer.
-pub fn deliverPrebuilt(
-    prefix: []const u8,
-    recipient_jid: []const u8,
-    suffix: []const u8,
-    conn: anytype,
-) !void {
-    var msg_buf: [20480]u8 = undefined;
-    const total = prefix.len + recipient_jid.len + suffix.len;
-    if (total > msg_buf.len) return error.StanzaTooLarge;
-
-    @memcpy(msg_buf[0..prefix.len], prefix);
-    @memcpy(msg_buf[prefix.len .. prefix.len + recipient_jid.len], recipient_jid);
-    @memcpy(msg_buf[prefix.len + recipient_jid.len .. total], suffix);
-
-    try conn.queueSend(msg_buf[0..total]);
-}
-
 /// Build a complete stanza from pre-built prefix + recipient JID + suffix into a buffer.
 /// Returns the total length, or null if the buffer would overflow.
 /// Used for cross-thread MPSC delivery where we need the full stanza as contiguous bytes.
@@ -180,6 +161,59 @@ pub fn buildComplete(
     @memcpy(buf[prefix.len .. prefix.len + recipient_jid.len], recipient_jid);
     @memcpy(buf[prefix.len + recipient_jid.len .. total], suffix);
     return total;
+}
+
+// ============================================================================
+// Session delivery (T153)
+// ============================================================================
+
+/// Deliver a fully-serialized stanza to a local session.
+///
+/// A detached session (SM resume pending) has no live connection —
+/// `detachSession()` already closed its fd. Writing to it would arm kqueue on a
+/// descriptor number the OS may have recycled for an unrelated connection,
+/// misrouting future events onto this session slot (T153). Such stanzas are
+/// tracked for replay on resume instead of being delivered live.
+///
+/// This also keeps `sm_out_seq` accurate. XEP-0198 counts *every* outbound
+/// stanza; fan-out paths that bypassed `smTrackOutbound` used to leave the
+/// server's counter behind the client's, which makes `SmUnackedQueue.ack()`
+/// take its "client acked more than we have buffered" branch and discard the
+/// whole replay queue.
+///
+/// `session` is a `*Session` and `changes` a `*ChangeList`; both are taken as
+/// `anytype` because `Session` lives in server.zig, which imports this module.
+pub fn deliverToSession(
+    session: anytype,
+    data: []const u8,
+    session_id: usize,
+    changes: anytype,
+) void {
+    if (session.sm_detached) {
+        session.smTrackOutbound(data);
+        return;
+    }
+    session.conn.queueSend(data) catch return;
+    session.smTrackOutbound(data);
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session_id) catch {};
+    }
+}
+
+/// Pre-built variant of `deliverToSession`: assembles `prefix + recipient_jid +
+/// suffix` into a scratch buffer, then delivers it. Replaces the
+/// `queueSend()` + `hasPendingWrite()`/`addWrite()` pair at fan-out sites.
+pub fn deliverPrebuiltToSession(
+    session: anytype,
+    prefix: []const u8,
+    recipient_jid: []const u8,
+    suffix: []const u8,
+    session_id: usize,
+    changes: anytype,
+) void {
+    var msg_buf: [20480]u8 = undefined;
+    const total = buildComplete(&msg_buf, prefix, recipient_jid, suffix) orelse return;
+    deliverToSession(session, msg_buf[0..total], session_id, changes);
 }
 
 // ============================================================================
@@ -342,4 +376,108 @@ test "decodeMulticastPayload rejects short payload" {
 test "encodeMulticastPayload rejects overflow" {
     var tiny: [8]u8 = undefined;
     try std.testing.expect(encodeMulticastPayload(&tiny, "room@conf", "prefix", "suffix") == null);
+}
+
+// ============================================================================
+// Session delivery tests (T153)
+// ============================================================================
+
+const MockConn = struct {
+    fd: std.posix.fd_t = 7,
+    closed: bool = false,
+    sent: [1024]u8 = undefined,
+    sent_len: usize = 0,
+
+    pub fn queueSend(self: *MockConn, data: []const u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        @memcpy(self.sent[self.sent_len .. self.sent_len + data.len], data);
+        self.sent_len += data.len;
+    }
+
+    pub fn hasPendingWrite(self: *const MockConn) bool {
+        return self.sent_len > 0;
+    }
+};
+
+const MockSession = struct {
+    sm_detached: bool = false,
+    conn: MockConn = .{},
+    tracked: [1024]u8 = undefined,
+    tracked_len: usize = 0,
+    track_calls: usize = 0,
+
+    pub fn smTrackOutbound(self: *MockSession, data: []const u8) void {
+        @memcpy(self.tracked[self.tracked_len .. self.tracked_len + data.len], data);
+        self.tracked_len += data.len;
+        self.track_calls += 1;
+    }
+};
+
+const MockChanges = struct {
+    add_write_calls: usize = 0,
+    last_fd: std.posix.fd_t = -99,
+
+    pub fn addWrite(self: *MockChanges, fd: std.posix.fd_t, udata: usize) !void {
+        _ = udata;
+        self.add_write_calls += 1;
+        self.last_fd = fd;
+    }
+};
+
+test "deliverToSession: live session sends, tracks, and arms kqueue" {
+    var session = MockSession{};
+    var changes = MockChanges{};
+
+    deliverToSession(&session, "<message/>", 3, &changes);
+
+    try std.testing.expectEqualStrings("<message/>", session.conn.sent[0..session.conn.sent_len]);
+    try std.testing.expectEqual(@as(usize, 1), session.track_calls);
+    try std.testing.expectEqual(@as(usize, 1), changes.add_write_calls);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 7), changes.last_fd);
+}
+
+test "deliverToSession: detached session tracks for replay, never touches the fd (T153)" {
+    var session = MockSession{ .sm_detached = true };
+    // detachSession() already closed the connection; fd is a sentinel (T155).
+    session.conn.closed = true;
+    session.conn.fd = -1;
+    var changes = MockChanges{};
+
+    deliverToSession(&session, "<message/>", 3, &changes);
+
+    // Tracked for resume replay...
+    try std.testing.expectEqualStrings("<message/>", session.tracked[0..session.tracked_len]);
+    try std.testing.expectEqual(@as(usize, 1), session.track_calls);
+    // ...and nothing was written or registered with kqueue.
+    try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
+    try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);
+}
+
+test "deliverPrebuiltToSession: assembles prefix + JID + suffix" {
+    var session = MockSession{};
+    var changes = MockChanges{};
+
+    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+
+    try std.testing.expectEqualStrings(
+        "<message to='bob@example.com'/>",
+        session.conn.sent[0..session.conn.sent_len],
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.track_calls);
+}
+
+test "deliverPrebuiltToSession: detached occupant is not delivered live" {
+    var session = MockSession{ .sm_detached = true };
+    session.conn.closed = true;
+    session.conn.fd = -1;
+    var changes = MockChanges{};
+
+    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
+    try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);
+    try std.testing.expectEqualStrings(
+        "<message to='bob@example.com'/>",
+        session.tracked[0..session.tracked_len],
+    );
 }

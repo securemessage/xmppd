@@ -188,10 +188,7 @@ pub fn handleMucGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, local_sid) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -282,10 +279,7 @@ pub fn drainPendingFanout(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, local_sid) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -325,10 +319,7 @@ fn deliverRemainingSync(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, local_sid) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
     }
 }
 
@@ -899,10 +890,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
         w.writeAll("' to='") catch continue;
         writeSessionJid(w, target) catch continue;
         w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch continue;
-        target.conn.queueSend(fbs.getWritten()) catch continue;
-        if (target.conn.hasPendingWrite()) {
-            changes.addWrite(target.conn.fd, target.conn.id) catch {};
-        }
+        fanout.deliverToSession(target, fbs.getWritten(), target.conn.id, changes);
     }
 }
 
@@ -1200,10 +1188,7 @@ fn sendOccupantPresence(
     }
     w.writeAll("</x></presence>") catch return;
 
-    target.conn.queueSend(fbs.getWritten()) catch return;
-    if (target.conn.hasPendingWrite()) {
-        changes.addWrite(target.conn.fd, target.conn.id) catch {};
-    }
+    fanout.deliverToSession(target, fbs.getWritten(), target.conn.id, changes);
 }
 
 fn sendSelfPresence(
@@ -1298,10 +1283,7 @@ fn broadcastOccupantJoin(
         const target = server.sessions[occ.session_id] orelse continue;
 
         const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), use_suffix, &target.conn) catch continue;
-        if (target.conn.hasPendingWrite()) {
-            changes.addWrite(target.conn.fd, occ.session_id) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
     }
 }
 
@@ -1350,10 +1332,7 @@ fn broadcastOccupantLeave(
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target.conn) catch continue;
-        if (target.conn.hasPendingWrite()) {
-            changes.addWrite(target.conn.fd, occ.session_id) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
@@ -1375,10 +1354,7 @@ fn broadcastOccupantLeave(
         }
         s110w.writeAll("</x></presence>") catch return;
 
-        fanout.deliverPrebuilt(prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), &self_target.conn) catch return;
-        if (self_target.conn.hasPendingWrite()) {
-            changes.addWrite(self_target.conn.fd, removed.session_id) catch {};
-        }
+        fanout.deliverPrebuiltToSession(self_target, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
     }
 }
 
@@ -1867,10 +1843,7 @@ pub fn processRemoteGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuilt(prefix, occ.getRealJid(), suffix, &target_session.conn) catch continue;
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, local_sid) catch {};
-        }
+        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {

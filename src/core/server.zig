@@ -1974,10 +1974,7 @@ pub const Server = struct {
                 for (s2s_entries[0..target_count]) |entry| {
                     if (entry.worker_id == self.worker_id) {
                         const target_session = self.sessions[entry.local_session_id] orelse continue;
-                        target_session.conn.queueSend(m.stanza_xml) catch continue;
-                        if (target_session.conn.hasPendingWrite()) {
-                            changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
-                        }
+                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
                     } else if (self.delivery_system) |ds| {
                         ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml) catch {};
                     }
@@ -2014,10 +2011,7 @@ pub const Server = struct {
                 for (sender_entries[0..sender_count]) |sentry| {
                     if (sentry.worker_id == self.worker_id) {
                         const sender_session = self.sessions[sentry.local_session_id] orelse continue;
-                        sender_session.conn.queueSend(err_xml) catch continue;
-                        if (sender_session.conn.hasPendingWrite()) {
-                            changes.addWrite(sender_session.conn.fd, sentry.local_session_id) catch {};
-                        }
+                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id, changes);
                     } else if (self.delivery_system) |ds| {
                         ds.deliver(sentry.worker_id, sentry.local_session_id, sentry.generation, err_xml) catch {};
                     }
@@ -2511,10 +2505,7 @@ pub const Server = struct {
             if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
 
             const target_session = self.sessions[occ.session_id] orelse continue;
-            fanout_mod.deliverPrebuilt(decoded.prefix, occ.getRealJid(), decoded.suffix, &target_session.conn) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, occ.session_id) catch {};
-            }
+            fanout_mod.deliverPrebuiltToSession(target_session, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id, changes);
         }
     }
 

@@ -19,6 +19,7 @@ const std = @import("std");
 const xml = @import("xml");
 const mam_handler = @import("mam_handler");
 const muc_handler = @import("muc_handler.zig");
+const fanout = @import("fanout.zig");
 const room_registry_mod = @import("room_registry");
 const actor_message = @import("message.zig");
 
@@ -1729,10 +1730,7 @@ fn sendPepNotification(
             mw.writeAll(entry.resource()) catch continue;
             mw.writeAll(body_after_to) catch continue;
 
-            target.conn.queueSend(mfbs.getWritten()) catch continue;
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
         } else {
             // Cross-thread: build full stanza and deliver via MPSC
             if (server.delivery_system) |ds| {
@@ -1798,10 +1796,7 @@ fn sendPepNotification(
                 mw.writeAll(entry.resource()) catch continue;
                 mw.writeAll(body_after_to) catch continue;
 
-                target.conn.queueSend(mfbs.getWritten()) catch continue;
-                if (target.conn.hasPendingWrite()) {
-                    changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-                }
+                fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
             } else {
                 if (server.delivery_system) |ds| {
                     var msg_buf: [16384]u8 = undefined;
@@ -1984,10 +1979,7 @@ fn pushBlockPush(
             pw.writeAll(action) catch continue;
             pw.writeAll("></iq>") catch continue;
 
-            target.conn.queueSend(pfbs.getWritten()) catch continue;
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target, pfbs.getWritten(), entry.local_session_id, changes);
         }
         // Cross-thread push: deferred to post-V1 (T89 pattern)
     }
@@ -2121,10 +2113,7 @@ pub fn pushRosterItem(
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (!target.roster_interested) continue;
-            target.conn.queueSend(full_xml) catch continue;
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target, full_xml, entry.local_session_id, changes);
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch {};
         }

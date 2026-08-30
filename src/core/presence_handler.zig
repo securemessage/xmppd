@@ -30,6 +30,7 @@ const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const iq_handler = @import("iq_handler.zig");
+const fanout = @import("fanout.zig");
 const sub_cache_mod = server_mod.sub_cache_mod;
 
 const log = std.log.scoped(.presence);
@@ -1030,7 +1031,13 @@ fn broadcastToOwnResources(
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
+            // T153: detached (SM resume pending) session — no live connection.
+            if (target.sm_detached) {
+                target.smTrackOutbound(presence_xml);
+                continue;
+            }
             target.conn.queueSend(presence_xml) catch continue;
+            target.smTrackOutbound(presence_xml);
             _ = target.conn.flushSend() catch {};
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
@@ -1144,10 +1151,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
-            target.conn.queueSend(presence_xml) catch continue;
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target, presence_xml, entry.local_session_id, changes);
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
         }
@@ -1186,10 +1190,7 @@ fn deliverPresenceToSubscribers(
         for (entries_buf[0..route_count]) |entry| {
             if (entry.worker_id == server.worker_id) {
                 const target_session = server.sessions[entry.local_session_id] orelse continue;
-                target_session.conn.queueSend(presence_xml) catch continue;
-                if (target_session.conn.hasPendingWrite()) {
-                    changes.addWrite(target_session.conn.fd, entry.local_session_id) catch {};
-                }
+                fanout.deliverToSession(target_session, presence_xml, entry.local_session_id, changes);
             } else {
                 if (server.delivery_system) |ds| {
                     ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
@@ -1215,10 +1216,7 @@ pub fn deliverPresenceToTarget(
     for (entries[0..count]) |ent| {
         if (ent.worker_id == server.worker_id) {
             const target_session = server.sessions[ent.local_session_id] orelse continue;
-            target_session.conn.queueSend(presence_xml) catch continue;
-            if (target_session.conn.hasPendingWrite()) {
-                changes.addWrite(target_session.conn.fd, ent.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target_session, presence_xml, ent.local_session_id, changes);
         } else if (server.delivery_system) |ds| {
             ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, presence_xml) catch {};
         }

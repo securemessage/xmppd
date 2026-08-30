@@ -25,6 +25,7 @@ const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("muc_handler.zig");
+const fanout = @import("fanout.zig");
 const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
@@ -669,11 +670,7 @@ fn sendCarbons(
             cw.writeAll("></message>") catch continue;
 
             const carbon_data = cfbs.getWritten();
-            target.conn.queueSend(carbon_data) catch continue;
-            target.smTrackOutbound(carbon_data);
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
+            fanout.deliverToSession(target, carbon_data, entry.local_session_id, changes);
         } else {
             // T89: Cross-thread carbon delivery via MPSC
             const ds = server.delivery_system orelse continue;
