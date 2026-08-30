@@ -47,7 +47,7 @@ tracks the release-level shape.
       full test matrix), deployed to the test jail the same day
 - [x] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
       (shipped in v0.8.8; see Phase 13 Deferred Follow-ups)
-- [ ] Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the struct to
+- [ ] **T161** — Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the struct to
       ~1.97 MB (80 × 24.6 KB) and it is a stack local in `auth/main.zig`,
       `auth/oidc_main.zig`, and embedded by value in a stack-local `S2sDaemon`
 - [x] Integration-harness rot — the six slixmpp suites had rotted against
@@ -61,6 +61,10 @@ tracks the release-level shape.
       a plaintext path that modern slixmpp cannot open. All six are
       parameterised via `XMPP_HOST`/`XMPP_PORT`/`XMPP_DOMAIN` and no longer
       default at the shared test jail.
+- [ ] **T160** — TLS ClientHello on the STARTTLS C2S port reports an XML parse
+      error instead of a clear rejection (peek first bytes; log a useful message)
+- [ ] **T151** — Evaluate reverting eager `flushSend()` in `handleReadable` to
+      deferred `addWrite`
 - [ ] SINT full XEP-0198 run — **the long-standing "SINT hardcodes port 5222"
       rationale is wrong.** SINT runs with `dnsResolver=javax` and follows SRV,
       and `/var/unbound/conf.d/s2s-test.conf` on freebsd-dev1 already maps
@@ -85,11 +89,11 @@ Deferred out of the v0.8.0 feature release:
 
 Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
 
-- [ ] `xmppd-ws` — RFC 7395 XMPP-over-WebSocket process (`src/ws/`, `[ws]` config
+- [ ] **T40** — `xmppd-ws` — RFC 7395 XMPP-over-WebSocket process (`src/ws/`, `[ws]` config
       section, port 5280). Not yet scaffolded.
-- [ ] XEP-0363 HTTP File Upload — slot-allocation IQ handler in core plus an
+- [ ] **T37** — XEP-0363 HTTP File Upload — slot-allocation IQ handler in core plus an
       `xmppd-httpupload` binary (~1100–1500 LOC)
-- [ ] XEP-0049 Private XML Storage
+- [ ] **T162** — XEP-0049 Private XML Storage
 
 ### Non-code
 
