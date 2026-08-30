@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.8.8 — 2026-08-30
+
+Bugfix/hardening release on top of v0.8.7 (8 commits). Tagged from `95e9c5c`;
+deployed to the freebsd-dev1 test jail (10.10.219.38).
+
+### Fixes
+
+- Concurrent TLS handshake failure (SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED)
+- T158: SM resume dangling JID; advertise XEP-0077 IBR in stream features and
+  disco#info (when registration enabled)
+- T156: `MAX_IPC_CLIENTS` 16 → 80; reject pre-auth SM enable with `<failed/>`
+- T155: `Connection.close()` resets `fd` to −1 and `queueSend()` rejects closed
+  connections with `error.ConnectionClosed` — turns the stale-fd hazard class
+  from silent kqueue corruption into a loud, harmless error
+- T153 follow-up: single session-delivery primitive
+  (`fanout.deliverToSession()` / `deliverPrebuiltToSession()`) across 21 call
+  sites (MUC fan-out, presence broadcast, PEP/block/roster push, S2S inbound,
+  cross-worker multicast, XEP-0280 carbons). Detached SM sessions now buffer
+  for replay instead of being written to dead fds. Also fixes a latent
+  XEP-0198 counter bug: fan-out paths never called `smTrackOutbound()`, letting
+  `SmUnackedQueue.ack()` discard genuinely unacked unicast stanzas
+- T157: `[oidc] import_avatar` config gate (default off)
+
+### Tests / Docs
+
+- Integration suites ported to slixmpp 1.17; parameterised via `XMPP_*` env
+  vars (default: local throwaway instance, no longer the shared test jail)
+- New `doc/TESTING.md` — throwaway-instance e2e procedure
+- README/ROADMAP corrections; ROADMAP gained a forward-looking "Next Up"
+
+Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` 105/105 steps;
+e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins 12/12;
+e2e-mam 7/7; e2e-subscription 29/29.
+
+## v0.8.7 — 2026-07-01
+
+- T152: stale-bind eviction — reconnecting with the same resource before the
+  old session was cleaned up got `AlreadyBound` and was left unregistered in
+  SessionMap; fixed with RFC 6120 §7.7.3-style eviction (`<conflict/>` + retry)
+- T153: detached-session delivery corruption — stanzas routed to a detached
+  (SM resume pending) session were written to its dead connection; guarded at
+  the router and MPSC unicast delivery sites
+- New `e2e-sm-resume.py` regression suite (29 assertions)
+
+## v0.8.6 — 2026-07-01
+
+- SM resume silently dropped at features_bind: the pre-bind IQ catch-all in
+  `handleElementStart` consumed `<resume/>`; clients timed out waiting for a
+  reply
+- Stream ID reuse fix (RFC 6120)
+
+## v0.8.5 — 2026-06-19
+
+- XEP-0115 Entity Capabilities: server caps hash (SHA-1 over disco features),
+  pre-built `<c>` element for presence injection, node-based disco#info
+  response for caps verification (§5.3), disco query mechanism
+- OIDC profile photo import
+
 ## v0.6.0 — 2026-06-14
 
 RFC 6121 interop compliance and XEP-0198 session resumption.

@@ -24,9 +24,12 @@ Last updated: 2026-08-30
 | 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
 | 13. Session Robustness Hardening | ✅ Complete | SM resume dispatch bug, stream ID reuse, stale-bind eviction, detached-session delivery. Tagged v0.8.6 |
 
-**Current tree:** `master` at 4 commits past `v0.8.7` (TLS session-id-context fix,
-XEP-0077 IBR advertisement, SM-resume dangling JID fix, T156 IPC pool). These are
-unreleased — see "Next Up".
+**Current tree:** `master` = **v0.8.8** (`95e9c5c`, tagged 2026-08-30) +
+CHANGELOG backfill. v0.8.8 collects the TLS session-id-context fix, XEP-0077
+IBR advertisement, SM-resume dangling JID fix, T156 IPC pool bump, the
+T155/T153 stale-fd/detached-session delivery hardening, and the slixmpp 1.17
+suite port. Deployed to the freebsd-dev1 test jail (10.10.219.38) from a
+ReleaseSafe tarball build.
 
 ---
 
@@ -39,10 +42,11 @@ tracks the release-level shape.
 
 ### Immediate
 
-- [ ] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
-      — four good fixes are currently stranded unreleased
-- [ ] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
-      (see Phase 13 Deferred Follow-ups)
+- [x] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
+      — verified and tagged 2026-08-30 (see Phase 13 Deferred Follow-ups for the
+      full test matrix), deployed to the test jail the same day
+- [x] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
+      (shipped in v0.8.8; see Phase 13 Deferred Follow-ups)
 - [ ] Heap-allocate `IpcServer` — `MAX_IPC_CLIENTS` 16→80 grew the struct to
       ~1.97 MB (80 × 24.6 KB) and it is a stack local in `auth/main.zig`,
       `auth/oidc_main.zig`, and embedded by value in a stack-local `S2sDaemon`
@@ -89,8 +93,9 @@ Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
 
 ### Non-code
 
-- [ ] xmppd.org refresh — `doc/www/index.html` still advertises v0.5.0; the plan
-      calls for a HydePHP site in a new `xmppd/xmppd.org` repo (not yet created)
+- [x] xmppd.org refresh — HydePHP site live at xmppd.org, repo
+      `pacyworld.dev/xmppd/website`, CI deploy to web03 via Fabrix. Keep
+      version references current as releases ship (v0.8.8 latest)
 - [ ] `securemessage/chat` web client — repo exists on pacyworld but is scaffold
       only (last touched 2026-06-19)
 
