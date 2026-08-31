@@ -84,6 +84,10 @@ tracks the release-level shape.
       `fix/t179-register-form-xml`, verified (incl. SINT 10/10)
 - [ ] **T178** — XEP-0198 unacked-queue overflow: fail the stream instead of
       silently discarding stanzas (ejabberd/Prosody behavior)
+- [ ] **T180** — XEP-0054 §3.3: another user's missing vCard must return
+      `service-unavailable` (both no-vCard and no-such-user), not an empty
+      vCard / item-not-found (spec tightened in v1.3.0; found by T175's
+      full-spec SINT run)
 
 ### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 
