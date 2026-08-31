@@ -6,10 +6,13 @@ binds resources, exchanges presence, sends a message with body,
 and verifies the recipient receives the full stanza including <body>.
 """
 
-import socket, ssl, time, base64, sys, select
+import socket, ssl, time, base64, sys, select, os
 
-HOST = '127.0.0.1'
-PORT = 15222
+# Configuration — override via environment for CI or an alternate instance
+# (see doc/TESTING.md). Defaults target a local throwaway instance.
+# NOTE: the domain is hardcoded to 'localhost' throughout this suite.
+HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
+PORT = int(os.environ.get('XMPP_PORT', '15222'))
 
 def make_sasl_plain(user, password):
     """SASL PLAIN: \\0authzid\\0password (authzid=username for XMPP)"""

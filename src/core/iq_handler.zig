@@ -872,7 +872,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         }
 
         roster.removeItem(bare_jid, item_jid) catch {};
-        server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(bare_jid));
+        server.invalidateSubCache(bare_jid);
         result_sub = .remove;
 
         // Send unsubscribe/unsubscribed to contact and update contact's roster.
@@ -909,7 +909,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch {};
-                            server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(item_jid));
+                            server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
                         }
                     }
@@ -945,7 +945,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, false) catch {};
-                            server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(item_jid));
+                            server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
                         }
                     }
@@ -966,7 +966,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
-        server.sub_cache.invalidate(server_mod.sub_cache_mod.hashBareJid(bare_jid));
+        server.invalidateSubCache(bare_jid);
     }
 
     // Ack with result

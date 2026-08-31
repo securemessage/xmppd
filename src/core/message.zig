@@ -104,6 +104,11 @@ pub const DiscoRequest = struct {
     reply_to_jid: []const u8,
 };
 
+/// Subscription-cache invalidation for one bare JID, broadcast to all workers.
+pub const CacheInvalidate = struct {
+    bare_jid: []const u8,
+};
+
 /// PEP publish notification.
 pub const PepEvent = struct {
     publisher_local: []const u8,
@@ -185,6 +190,10 @@ pub const Tag = enum(u8) {
     room_directory_update = 0x18,
     /// MUC MAM query routed to room's owning worker.
     room_mam_query = 0x19,
+    /// Subscription-cache invalidation broadcast to all workers (the
+    /// sub_cache is per-worker memory; roster/subscription changes on one
+    /// worker must invalidate everywhere).
+    invalidate_subscription = 0x1a,
     pep_published = 0x20,
     stanza_archived = 0x30,
 };
@@ -206,6 +215,7 @@ pub const Message = union(Tag) {
     room_admin: AdminAction,
     room_directory_update: RoomDirectoryUpdate,
     room_mam_query: MamQuery,
+    invalidate_subscription: CacheInvalidate,
     pep_published: PepEvent,
     stanza_archived: ArchiveEvent,
 
@@ -295,6 +305,9 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeU32(w, ev.reply_to_session) catch return null;
             writeU32(w, ev.reply_to_generation) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
+        },
+        .invalidate_subscription => |ev| {
+            writeStr(w, ev.bare_jid) catch return null;
         },
         .pep_published => |ev| {
             writeStr(w, ev.publisher_local) catch return null;
@@ -485,6 +498,10 @@ pub fn decode(data: []const u8) ?Message {
                 .reply_to_generation = reply_to_generation,
                 .reply_to_jid = reply_to_jid,
             } };
+        },
+        .invalidate_subscription => {
+            const bare_jid = readStr(data, &fbs) orelse return null;
+            return .{ .invalidate_subscription = .{ .bare_jid = bare_jid } };
         },
         .pep_published => {
             const publisher_local = readStr(data, &fbs) orelse return null;
@@ -936,6 +953,21 @@ test "encode/decode: room_directory_update round-trip" {
             try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
             try std.testing.expectEqualStrings("Dev Room", ev.room_name);
             try std.testing.expect(ev.active);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: invalidate_subscription round-trip" {
+    const msg = Message{ .invalidate_subscription = .{ .bare_jid = "alice@example.com" } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .invalidate_subscription => |ev| {
+            try std.testing.expectEqualStrings("alice@example.com", ev.bare_jid);
         },
         else => return error.WrongTag,
     }

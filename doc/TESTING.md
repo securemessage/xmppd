@@ -105,6 +105,32 @@ Notes:
   silently leaves `custom_address` unset and the client falls back to DNS SRV,
   connecting to whatever is on port 5222.
 
+### Multi-worker lane
+
+`workers = 1` makes every route local — the whole cross-worker surface (room
+sharding, actor messages, MPSC delivery with ABA generation validation) goes
+untested, which is how T173 slipped through. `test/integration/run-multiworker.sh`
+spins up a self-contained throwaway instance at N workers (default 4, port
+15333) and runs the given suites (default: `muc-test.py`):
+
+```sh
+zig build
+sh test/integration/run-multiworker.sh            # muc-test at workers=4
+sh test/integration/run-multiworker.sh 4 muc-test.py e2e-subscription.py ...
+```
+
+Notes:
+
+- Only one xmppd master can run per host (fixed PID file) — stop any other
+  instance first. The lane uses its own auth socket/db/cert in a mktemp dir.
+- `e2e-sm-resume.py` is excluded on purpose: SM resume state is per-worker,
+  and a reconnect lands on a random worker via SO_REUSEPORT, so resume fails
+  with `item-not-found` at workers>1 by design (cross-worker resume is not
+  implemented).
+
+Known-good at workers=4 (post-T173): muc-test 12/12, e2e-quick-wins 12/12,
+e2e-chat all pass, e2e-mam 7/7, e2e-subscription 29/29.
+
 ## Interop (SINT)
 
 `smack-sint-server-extensions` follows DNS SRV records (`dnsResolver=javax`).

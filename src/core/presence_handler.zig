@@ -526,7 +526,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     } else {
         roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
     }
-    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
+    server.invalidateSubCache(owner_bare);
 
     // RFC 6121 §3.1.2: Push roster item to all of owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", result_sub, true, changes);
@@ -606,7 +606,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     } else {
         roster.setItem(owner_bare, to_str, "", .from, false) catch return;
     }
-    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
+    server.invalidateSubCache(owner_bare);
 
     // RFC 6121 §3.1.5: Push updated roster to owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
@@ -632,7 +632,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     } else {
         roster.setItem(to_str, owner_bare, "", .to, false) catch {};
     }
-    server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
+    server.invalidateSubCache(to_str);
 
     // RFC 6121 §3.1.5: Push updated roster to contact's interested resources
     const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
@@ -742,7 +742,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
             log.err("handleUnsubscribe: setItem owner failed: {}", .{e});
             return;
         };
-        server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
+        server.invalidateSubCache(owner_bare);
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -764,7 +764,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
                     log.err("handleUnsubscribe: setItem contact failed: {}", .{e});
                     return;
                 };
-                server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
+                server.invalidateSubCache(to_str);
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -826,7 +826,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
             log.err("handleUnsubscribed: setItem owner failed: {}", .{e});
             return;
         };
-        server.sub_cache.invalidate(sub_cache_mod.hashBareJid(owner_bare));
+        server.invalidateSubCache(owner_bare);
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -848,7 +848,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
                     log.err("handleUnsubscribed: setItem contact failed: {}", .{e});
                     return;
                 };
-                server.sub_cache.invalidate(sub_cache_mod.hashBareJid(to_str));
+                server.invalidateSubCache(to_str);
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }

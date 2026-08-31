@@ -1838,7 +1838,7 @@ pub const Server = struct {
                 if (item.entry.name.len > 0) self.allocator.free(item.entry.name);
             }
             self.allocator.free(items);
-            self.sub_cache.invalidate(sub_cache_mod.hashBareJid(bare_jid));
+            self.invalidateSubCache(bare_jid);
         }
 
         // Remove vCard
@@ -2586,6 +2586,11 @@ pub const Server = struct {
             .room_directory_update => |ev| {
                 muc_handler.handleRoomDirectoryUpdate(self, ev);
             },
+            .invalidate_subscription => |ev| {
+                // Cross-worker cache invalidation — local invalidate only;
+                // do NOT re-broadcast (would cascade).
+                self.sub_cache.invalidate(sub_cache_mod.hashBareJid(ev.bare_jid));
+            },
             .shadow_join => |ev| {
                 muc_handler.handleShadowJoin(self, ev);
             },
@@ -2685,6 +2690,22 @@ pub const Server = struct {
                 _ = room;
                 log.warn("unexpected message in room mailbox: 0x{x:0>2}", .{msg.tag()});
             },
+        }
+    }
+
+    /// Invalidate a bare JID's subscription-cache entry locally AND on all
+    /// other workers. The sub_cache is per-worker memory with a 30s TTL —
+    /// a roster/subscription change on one worker must not leave the others
+    /// serving a stale subscriber list (cross-worker presence broadcast was
+    /// silently skipped: e2e-subscription Test 7 at workers>1).
+    pub fn invalidateSubCache(self: *Server, bare_jid: []const u8) void {
+        self.sub_cache.invalidate(sub_cache_mod.hashBareJid(bare_jid));
+        const wc = self.getWorkerCount();
+        if (wc <= 1) return;
+        var w: u16 = 0;
+        while (w < wc) : (w += 1) {
+            if (w == self.worker_id) continue;
+            self.enqueueRoomActorMessage(w, .{ .invalidate_subscription = .{ .bare_jid = bare_jid } });
         }
     }
 
