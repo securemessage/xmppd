@@ -1207,6 +1207,10 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
             jw.writeAll(bound.resource) catch return;
         }
 
+        // T173: capture the requester's ABA generation here, where its session
+        // is live — the reply's ds.deliver() validates it.
+        const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
+
         server.enqueueRoomActorMessage(owner, .{ .room_mam_query = .{
             .room_jid = room_jid,
             .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
@@ -1215,6 +1219,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
             .with = session.mam_with,
             .reply_to_worker = server.worker_id,
             .reply_to_session = @intCast(session.conn.id),
+            .reply_to_generation = reply_gen,
             .reply_to_jid = jid_fbs.getWritten(),
         } });
         return;

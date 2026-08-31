@@ -445,11 +445,15 @@ pub fn handleRoomDiscoInfo(
         var reply_jid_buf: [256]u8 = undefined;
         const bound = session.stream.bound_jid orelse return;
         const reply_jid = buildFullJid(&reply_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        // T173: capture the requester's ABA generation here, where its session
+        // is live — the reply's ds.deliver() validates it.
+        const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
         server.enqueueRoomActorMessage(owner, .{ .room_disco_info = .{
             .room_jid = room_jid,
             .iq_id = iq_id,
             .reply_to_worker = server.worker_id,
             .reply_to_session = @intCast(session.conn.id),
+            .reply_to_generation = reply_gen,
             .reply_to_jid = reply_jid,
         } });
         return;
@@ -544,6 +548,10 @@ pub fn handleMucAdminIq(
         const target_nick = session.iq_roster_item_jid;
         const new_role_str = session.iq_roster_item_sub;
 
+        // T173: capture the requester's ABA generation here, where its session
+        // is live — the reply's ds.deliver() validates it.
+        const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(req_bound.local, req_bound.domain, req_bound.resource) orelse 0 else 0;
+
         server.enqueueRoomActorMessage(owner, .{ .room_admin = .{
             .room_jid = room_jid,
             .actor_jid = req_jid,
@@ -552,6 +560,7 @@ pub fn handleMucAdminIq(
             .iq_id = iq_id,
             .reply_to_worker = server.worker_id,
             .reply_to_session = @intCast(session.conn.id),
+            .reply_to_generation = reply_gen,
         } });
         return;
     }
@@ -1964,7 +1973,7 @@ pub fn processRemoteDiscoInfo(
     }
 
     w.writeAll("</query></iq>") catch return;
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
 }
 
 /// Process a remote disco#items request.
@@ -2195,26 +2204,26 @@ pub fn processRemoteAdminAction(
     const muc_host = server.muc_host orelse return;
     const room = reg.findByJid(ev.room_jid) orelse {
         // Room doesn't exist — send error back
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     };
 
     // Verify requester is in the room
     const requester_idx = room.findByRealJid(ev.actor_jid) orelse {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, "not-allowed");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "not-allowed");
         return;
     };
     const requester = room.occupants[requester_idx].?;
 
     // Moderator for kick, admin/owner for ban
     if (requester.role != .moderator and requester.affiliation != .admin and requester.affiliation != .owner) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, "forbidden");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "forbidden");
         return;
     }
 
     // Find target by nick
     const target_idx = room.findByNick(ev.target_nick) orelse {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     };
 
@@ -2259,7 +2268,7 @@ pub fn processRemoteAdminAction(
     w.writeAll("'/>") catch return;
 
     const ds = server.delivery_system orelse return;
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
 }
 
 /// Process a remote MUC MAM query on the owning worker (T112).
@@ -2273,7 +2282,7 @@ pub fn processRemoteMamQuery(
     _ = changes;
     const reg = server.room_registry orelse return;
     if (reg.findByJid(ev.room_jid) == null) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     }
 
@@ -2290,7 +2299,7 @@ pub fn processRemoteMamQuery(
         fw.writeAll("' id='") catch return;
         fw.writeAll(ev.query_id) catch return;
         fw.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
-        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, fbs.getWritten()) catch {};
+        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
         return;
     };
 
@@ -2314,18 +2323,18 @@ pub fn processRemoteMamQuery(
 
     const ArchBackend = @import("archive_backend").Backend;
     var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, "internal-server-error");
+        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "internal-server-error");
         return;
     };
     defer response.deinit();
 
     // Send each result message via MPSC unicast
     for (response.messages) |msg| {
-        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, msg.xml) catch continue;
+        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, msg.xml) catch continue;
     }
 
     // Send the fin IQ
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), 0, response.fin_iq) catch {};
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, response.fin_iq) catch {};
 }
 
 /// Broadcast a room directory update to all other workers.
@@ -2351,7 +2360,9 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
 }
 
 /// Send an IQ error back to a remote worker via MPSC unicast.
-fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8, target_worker: u16, target_session: u32, error_type: []const u8) void {
+/// target_generation is the ABA generation captured on the originating worker
+/// (T173) — the drain side drops deliveries whose generation doesn't match.
+fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8, target_worker: u16, target_session: u32, target_generation: u32, error_type: []const u8) void {
     const ds = server.delivery_system orelse return;
     var buf: [512]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -2363,5 +2374,5 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     w.writeAll("'><error type='cancel'><") catch return;
     w.writeAll(error_type) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-    ds.deliver(target_worker, @intCast(target_session), 0, fbs.getWritten()) catch {};
+    ds.deliver(target_worker, @intCast(target_session), target_generation, fbs.getWritten()) catch {};
 }

@@ -96,6 +96,10 @@ pub const DiscoRequest = struct {
     iq_id: []const u8,
     reply_to_worker: u16,
     reply_to_session: u32,
+    /// ABA generation of the requesting session, captured on the originating
+    /// worker where that session is live (T173). The reply's ds.deliver()
+    /// validates it — a hardcoded 0 is silently dropped.
+    reply_to_generation: u32,
     /// Full JID of the querying session (for the 'to' attribute in the response).
     reply_to_jid: []const u8,
 };
@@ -116,6 +120,10 @@ pub const AdminAction = struct {
     iq_id: []const u8,
     reply_to_worker: u16,
     reply_to_session: u32,
+    /// ABA generation of the requesting session, captured on the originating
+    /// worker where that session is live (T173). The reply's ds.deliver()
+    /// validates it — a hardcoded 0 is silently dropped.
+    reply_to_generation: u32,
 };
 
 /// Room directory update broadcast (create/destroy) to all workers.
@@ -134,6 +142,10 @@ pub const MamQuery = struct {
     with: []const u8,
     reply_to_worker: u16,
     reply_to_session: u32,
+    /// ABA generation of the querying session, captured on the originating
+    /// worker where that session is live (T173). The reply's ds.deliver()
+    /// validates it — a hardcoded 0 is silently dropped.
+    reply_to_generation: u32,
     reply_to_jid: []const u8,
 };
 
@@ -247,6 +259,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.iq_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
             writeU32(w, ev.reply_to_session) catch return null;
+            writeU32(w, ev.reply_to_generation) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
         },
         inline .message_received, .message_routed => |ev| {
@@ -265,6 +278,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.iq_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
             writeU32(w, ev.reply_to_session) catch return null;
+            writeU32(w, ev.reply_to_generation) catch return null;
         },
         .room_directory_update => |ev| {
             writeStr(w, ev.room_jid) catch return null;
@@ -279,6 +293,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.with) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
             writeU32(w, ev.reply_to_session) catch return null;
+            writeU32(w, ev.reply_to_generation) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
         },
         .pep_published => |ev| {
@@ -381,12 +396,14 @@ pub fn decode(data: []const u8) ?Message {
             const iq_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
             const reply_to_session = readU32(r) orelse return null;
+            const reply_to_generation = readU32(r) orelse return null;
             const reply_to_jid = readStr(data, &fbs) orelse return null;
             const ev = DiscoRequest{
                 .room_jid = room_jid,
                 .iq_id = iq_id,
                 .reply_to_worker = reply_to_worker,
                 .reply_to_session = reply_to_session,
+                .reply_to_generation = reply_to_generation,
                 .reply_to_jid = reply_to_jid,
             };
             return switch (tag_val) {
@@ -425,6 +442,7 @@ pub fn decode(data: []const u8) ?Message {
             const iq_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
             const reply_to_session = readU32(r) orelse return null;
+            const reply_to_generation = readU32(r) orelse return null;
             return .{ .room_admin = .{
                 .room_jid = room_jid,
                 .actor_jid = actor_jid,
@@ -433,6 +451,7 @@ pub fn decode(data: []const u8) ?Message {
                 .iq_id = iq_id,
                 .reply_to_worker = reply_to_worker,
                 .reply_to_session = reply_to_session,
+                .reply_to_generation = reply_to_generation,
             } };
         },
         .room_directory_update => {
@@ -453,6 +472,7 @@ pub fn decode(data: []const u8) ?Message {
             const with = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
             const reply_to_session = readU32(r) orelse return null;
+            const reply_to_generation = readU32(r) orelse return null;
             const reply_to_jid = readStr(data, &fbs) orelse return null;
             return .{ .room_mam_query = .{
                 .room_jid = room_jid,
@@ -462,6 +482,7 @@ pub fn decode(data: []const u8) ?Message {
                 .with = with,
                 .reply_to_worker = reply_to_worker,
                 .reply_to_session = reply_to_session,
+                .reply_to_generation = reply_to_generation,
                 .reply_to_jid = reply_to_jid,
             } };
         },
@@ -696,6 +717,7 @@ test "encode/decode: disco_info round-trip" {
         .iq_id = "disco-1",
         .reply_to_worker = 2,
         .reply_to_session = 99,
+        .reply_to_generation = 7,
         .reply_to_jid = "alice@example.com/Mobile",
     } };
 
@@ -709,6 +731,7 @@ test "encode/decode: disco_info round-trip" {
             try std.testing.expectEqualStrings("disco-1", ev.iq_id);
             try std.testing.expectEqual(@as(u16, 2), ev.reply_to_worker);
             try std.testing.expectEqual(@as(u32, 99), ev.reply_to_session);
+            try std.testing.expectEqual(@as(u32, 7), ev.reply_to_generation);
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.reply_to_jid);
         },
         else => return error.WrongTag,
@@ -875,6 +898,7 @@ test "encode/decode: room_admin round-trip" {
         .iq_id = "admin-1",
         .reply_to_worker = 0,
         .reply_to_session = 5,
+        .reply_to_generation = 3,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -890,6 +914,7 @@ test "encode/decode: room_admin round-trip" {
             try std.testing.expectEqualStrings("admin-1", ev.iq_id);
             try std.testing.expectEqual(@as(u16, 0), ev.reply_to_worker);
             try std.testing.expectEqual(@as(u32, 5), ev.reply_to_session);
+            try std.testing.expectEqual(@as(u32, 3), ev.reply_to_generation);
         },
         else => return error.WrongTag,
     }
@@ -925,6 +950,7 @@ test "encode/decode: room_mam_query round-trip" {
         .with = "",
         .reply_to_worker = 1,
         .reply_to_session = 42,
+        .reply_to_generation = 9,
         .reply_to_jid = "alice@example.com/Mobile",
     } };
 
@@ -939,6 +965,7 @@ test "encode/decode: room_mam_query round-trip" {
             try std.testing.expectEqualStrings("2026-06-01T00:00:00Z", ev.start);
             try std.testing.expectEqual(@as(u16, 1), ev.reply_to_worker);
             try std.testing.expectEqual(@as(u32, 42), ev.reply_to_session);
+            try std.testing.expectEqual(@as(u32, 9), ev.reply_to_generation);
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.reply_to_jid);
         },
         else => return error.WrongTag,
