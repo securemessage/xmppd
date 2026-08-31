@@ -1,7 +1,8 @@
 #!/bin/sh
 # Multi-worker e2e regression lane (T173).
 #
-# Starts a throwaway xmppd instance with [core] workers = N (default 4) and
+# Starts a throwaway xmppd instance with [core] workers = N (default 4) on a
+# random free port (override with XMPP_PORT) and
 # runs the given slixmpp suites against it (default: muc-test.py). The whole
 # cross-worker surface (MUC room sharding, actor messages, MPSC delivery with
 # generation validation) is only exercised when workers > 1 — at workers = 1
@@ -32,7 +33,26 @@ else
 fi
 
 PYTHON=${SLIXPYTHON:-/tmp/slixvenv/bin/python}
-PORT=${XMPP_PORT:-15333}
+
+# Pick a random free high port by default. A fixed port collides when two
+# lane runs execute concurrently on one runner (e.g. branch + tag push):
+# xmppd's SO_REUSEPORT listener then load-splits incoming connections across
+# BOTH instances, cross-connecting each suite's clients to the other run's
+# server and db (observed 2026-08-31 as cross-worker-looking timeouts).
+pick_port() {
+    i=0
+    while [ $i -lt 20 ]; do
+        p=$(jot -r 1 20000 45000 2>/dev/null || echo $((20000 + $(date +%s) % 20000)))
+        if ! nc -z 127.0.0.1 "$p" 2>/dev/null; then
+            echo "$p"
+            return
+        fi
+        i=$((i + 1))
+    done
+    echo "error: could not find a free port" >&2
+    exit 2
+}
+PORT=${XMPP_PORT:-$(pick_port)}
 
 for f in zig-out/bin/xmppd zig-out/bin/xmppd-core zig-out/bin/xmppd-auth zig-out/bin/xmppctl; do
     if [ ! -x "$root/$f" ]; then

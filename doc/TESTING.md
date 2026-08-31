@@ -110,8 +110,9 @@ Notes:
 `workers = 1` makes every route local — the whole cross-worker surface (room
 sharding, actor messages, MPSC delivery with ABA generation validation) goes
 untested, which is how T173 slipped through. `test/integration/run-multiworker.sh`
-spins up a self-contained throwaway instance at N workers (default 4, port
-15333) and runs the given suites (default: `muc-test.py`):
+spins up a self-contained throwaway instance at N workers (default 4) on a
+random free port (override with `XMPP_PORT`) and runs the given suites
+(default: `muc-test.py`):
 
 ```sh
 zig build
@@ -122,8 +123,10 @@ sh test/integration/run-multiworker.sh 4 muc-test.py e2e-subscription.py ...
 Notes:
 
 - The lane uses its own run dir (`--run-dir`), auth socket, db and cert in a
-  mktemp dir, so it can coexist with other throwaway instances as long as
-  ports differ (default 15333).
+  mktemp dir, so it can coexist with other throwaway instances. The port is
+  randomised because a fixed port is NOT enough: xmppd's listener uses
+  SO_REUSEPORT, so two concurrently-running lane instances on the same port
+  would load-split incoming connections across both servers.
 - `e2e-sm-resume.py` is excluded on purpose: SM resume state is per-worker,
   and a reconnect lands on a random worker via SO_REUSEPORT, so resume fails
   with `item-not-found` at workers>1 by design (cross-worker resume is not

@@ -6,8 +6,15 @@
 # workers = 1 cannot reach. Driver: test/integration/run-multiworker.sh.
 name: multiworker-e2e
 
+# Tag pushes are excluded: pushing master + a release tag together would
+# otherwise start two runs concurrently on the same runner, and two lane
+# instances sharing the fixed port via SO_REUSEPORT cross-connect each
+# other's clients (observed 2026-08-31: runs 1529/1531 failing on
+# cross-worker timeouts while the same suites passed locally).
 on:
   push:
+    branches:
+      - '**'
   pull_request:
 
 jobs:
