@@ -88,6 +88,13 @@ tracks the release-level shape.
       `service-unavailable` (both no-vCard and no-such-user), not an empty
       vCard / item-not-found (spec tightened in v1.3.0; found by T175's
       full-spec SINT run)
+- [ ] **T181** — RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
+      resources must bounce `service-unavailable` (never store offline);
+      type='error' must be silently dropped — both currently hit the offline
+      store path
+- [ ] **T182** — pre-auth/pre-bind stanzas silently dropped: return
+      `not-authorized` for message/IQ (IQs MUST always be answered); presence
+      may stay ignored
 
 ### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 
