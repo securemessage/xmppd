@@ -24,7 +24,12 @@ SINT runs (T175 follow-ups).
   reports overflow and the session is failed (ejabberd/Prosody behavior):
   live sessions get a `resource-constraint` stream error and close;
   detached sessions are destroyed, so a later `<resume/>` fails
-  `item-not-found` and the client resyncs via MAM (cc70366)
+  `item-not-found` and the client resyncs via MAM (cc70366). The server
+  also now sends `<r/>` ack requests once the queue crosses half capacity
+  (4c54410) — XEP-0198 only obliges clients to ack on request, so without
+  this the overflow policy would kill compliant clients that never ack
+  unsolicited (SINT-proven with Smack: busy SM sessions died after ~256
+  unacked stanzas in ~20s of presence flood)
 - T180: XEP-0054 §3.3 (v1.3.0) — vCard GET for another user now returns
   `service-unavailable` for both no-vCard and no-such-user
   (anti-harvesting; the two cases must be indistinguishable). The
@@ -34,9 +39,11 @@ SINT runs (T175 follow-ups).
   offline; type='error' stanzas are silently dropped instead of stored
   (cc70366)
 - T182: stanzas received before authentication/resource binding were
-  silently dropped. Message and IQ now get a `not-authorized` stanza
-  error (IQs must always be answered); presence stays ignored; the
-  connection stays open (stanza error, not stream error) (cc70366)
+  silently dropped. Per RFC 6120 §7.1, message/IQ addressed to a third
+  party now close the stream with a `not-authorized` stream error;
+  server/account-addressed IQs get a `not-authorized` stanza error (IQs
+  must always be answered) and the connection stays open; presence stays
+  ignored (cc70366, §7.1 rework)
 
 ### CI
 

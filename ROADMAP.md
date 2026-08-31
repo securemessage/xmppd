@@ -84,17 +84,20 @@ tracks the release-level shape.
       (7bc5980), verified incl. SINT 10/10
 - [x] **T178** — XEP-0198 unacked-queue overflow: fail the session instead of
       silently discarding stanzas (live: resource-constraint stream error;
-      detached: destroyed so resume fails item-not-found) — merged 2026-08-31
-      (cc70366)
+      detached: destroyed so resume fails item-not-found), plus `<r/>` ack
+      requests at half capacity so ack-on-request clients are never killed
+      (SINT-proven necessity) — merged 2026-08-31 (cc70366, 4c54410)
 - [x] **T180** — XEP-0054 §3.3: another user's missing vCard returns
       `service-unavailable` for both no-vCard and no-such-user (spec v1.3.0
       anti-harvesting) — merged 2026-08-31 (cc70366)
 - [x] **T181** — RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
       resources bounces `service-unavailable`; type='error' silently dropped;
       neither stored offline — merged 2026-08-31 (cc70366)
-- [x] **T182** — pre-auth/pre-bind message/IQ get a `not-authorized` stanza
-      error (IQs always answered; connection stays open); presence pre-bind
-      stays ignored — merged 2026-08-31 (cc70366)
+- [x] **T182** — pre-auth/pre-bind stanzas: third-party message/IQ close the
+      stream with `not-authorized` (RFC 6120 §7.1 MUST; supersedes the
+      task's stanza-error sketch after SINT verification);
+      server/account-addressed IQs get a stanza error and the connection
+      stays open; presence pre-bind stays ignored — merged 2026-08-31
 
 ### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 

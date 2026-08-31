@@ -1074,12 +1074,72 @@ pub const Server = struct {
         self.executeAction(session, action);
     }
 
-    /// RFC 6120 §7.6 (T182): bounce a message received before authentication
-    /// or resource binding with a not-authorized stanza error. This is a
-    /// stanza error, not a stream error — the connection stays open so the
-    /// client can proceed to authenticate. Error stanzas are never answered
-    /// with further errors (RFC 6120 §8.3.1).
-    fn sendPreBindMessageError(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+    /// Verdict of enforcePreBindStanzaPolicy (T182).
+    const PreBindVerdict = enum {
+        /// Not a message/IQ (e.g. presence) — pre-bind presence stays
+        /// silently ignored; caller continues.
+        not_stanza,
+        /// Stanza addressed to the server itself or the client's own account
+        /// — not processed pre-bind, but answered with a not-authorized
+        /// stanza error (IQs must always be answered). Connection stays open.
+        server_addressed,
+        /// Stanza addressed to a third party — RFC 6120 §7.1: MUST NOT be
+        /// processed, stream closed with a not-authorized stream error.
+        /// The session is destroyed; the caller must return immediately
+        /// without touching the session again.
+        third_party_closed,
+    };
+
+    /// RFC 6120 §7.1 (T182): enforce the pre-bind stanza policy for a
+    /// message/IQ element received before resource binding completes.
+    /// Third-party-addressed stanzas close the stream with a not-authorized
+    /// stream error; server/account-addressed stanzas are only classified
+    /// (the caller answers with a stanza error or proceeds for bind/register).
+    fn enforcePreBindStanzaPolicy(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) PreBindVerdict {
+        const is_message = std.mem.eql(u8, elem.local_name, "message");
+        const is_iq = std.mem.eql(u8, elem.local_name, "iq");
+        if (!is_message and !is_iq) return .not_stanza;
+
+        var to_attr: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "to")) {
+                to_attr = attr.value;
+                break;
+            }
+        }
+
+        // Addressed to the server itself (no 'to', or the bare domain) or to
+        // the client's own account (its authenticated bare JID)?
+        var server_addressed = to_attr.len == 0 or std.mem.eql(u8, to_attr, self.server_host);
+        if (!server_addressed) {
+            if (session.stream.authenticated_jid) |aj| {
+                var acc_buf: [256]u8 = undefined;
+                var acc_fbs = std.io.fixedBufferStream(&acc_buf);
+                const aw = acc_fbs.writer();
+                aw.writeAll(aj.local) catch {};
+                aw.writeByte('@') catch {};
+                aw.writeAll(aj.domain) catch {};
+                const account = acc_fbs.getWritten();
+                const to_bare = if (std.mem.indexOfScalar(u8, to_attr, '/')) |sp| to_attr[0..sp] else to_attr;
+                server_addressed = std.mem.eql(u8, to_bare, account);
+            }
+        }
+        if (server_addressed) return .server_addressed;
+
+        log.info("connection {d} {s} to a third party before resource binding — closing stream (not-authorized)", .{ session.conn.id, elem.local_name });
+        // writeStreamError includes the closing </stream:stream> tag.
+        self.sendStreamError(session, .not_authorized);
+        // Flush the error and closing tag before teardown so the client sees them.
+        session.conn.flushSync();
+        session_lifecycle.forceCloseSession(self, session.conn.id, changes);
+        return .third_party_closed;
+    }
+
+    /// Answer a pre-bind stanza addressed to the server/own account with a
+    /// not-authorized stanza error (T182). Stanza error, not stream error —
+    /// the connection stays open so the client can proceed to bind. Error
+    /// stanzas are never answered with further errors (RFC 6120 §8.3.1).
+    fn sendPreBindStanzaError(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         _ = self;
         var to_attr: []const u8 = "";
         var id_attr: []const u8 = "";
@@ -1095,9 +1155,12 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, type_attr, "error")) return;
 
+        const tag_name: []const u8 = if (std.mem.eql(u8, elem.local_name, "iq")) "iq" else "message";
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        w.writeAll("<message type='error'") catch return;
+        w.writeByte('<') catch return;
+        w.writeAll(tag_name) catch return;
+        w.writeAll(" type='error'") catch return;
         if (to_attr.len > 0) {
             w.writeAll(" from='") catch return;
             w.writeAll(to_attr) catch return;
@@ -1108,7 +1171,9 @@ pub const Server = struct {
             w.writeAll(id_attr) catch return;
             w.writeByte('\'') catch return;
         }
-        w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+        w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
+        w.writeAll(tag_name) catch return;
+        w.writeByte('>') catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
@@ -1154,6 +1219,9 @@ pub const Server = struct {
         // Pre-auth IQ for registration (XEP-0077) — in features_sasl state
         if (session.stream.state == .features_sasl or session.stream.state == .sasl_negotiating) {
             if (std.mem.eql(u8, elem.local_name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
+                // RFC 6120 §7.1 (T182): a pre-auth stanza addressed to a third
+                // party is not processed — the stream is closed instead.
+                if (self.enforcePreBindStanzaPolicy(session, elem, changes) == .third_party_closed) return;
                 // Start IQ accumulation for registration
                 iq_handler.handleIq(session, elem, self.server_host);
                 return;
@@ -1192,6 +1260,15 @@ pub const Server = struct {
 
         // Pre-bind IQ wrapper — capture the IQ id for the bind result
         if (!session.stream.isActive() and session.stream.state == .features_bind) {
+            // RFC 6120 §7.1 (T182): a stanza addressed to a third party
+            // before resource binding is not processed — the stream closes
+            // with a not-authorized stream error. The bind wrapper IQ itself
+            // is server-addressed and continues below.
+            switch (self.enforcePreBindStanzaPolicy(session, elem, changes)) {
+                .third_party_closed => return,
+                .not_stanza => return, // presence pre-bind: silently ignored
+                .server_addressed => {},
+            }
             if (std.mem.eql(u8, elem.local_name, "iq")) {
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "id")) {
@@ -1200,9 +1277,9 @@ pub const Server = struct {
                     }
                 }
             } else if (std.mem.eql(u8, elem.local_name, "message")) {
-                // RFC 6120 §7.6 (T182): message before resource bind —
-                // bounce not-authorized. Presence stays silently ignored.
-                self.sendPreBindMessageError(session, elem, changes);
+                // Server/account-addressed message pre-bind — not processed,
+                // but answered with a not-authorized stanza error.
+                self.sendPreBindStanzaError(session, elem, changes);
             }
             return;
         }
@@ -1247,15 +1324,23 @@ pub const Server = struct {
             return;
         }
 
-        // RFC 6120 §7.6 (T182): stanzas received before authentication are not
-        // processed. Messages bounce with not-authorized (IQs in these states
-        // are answered via dispatchIq's pre-bind gate or the features_bind
-        // wrapper above); presence stays silently ignored.
+        // RFC 6120 §7.1 (T182): stanzas received before authentication are not
+        // processed. Third-party-addressed message/IQ close the stream with a
+        // not-authorized stream error; server/account-addressed ones get a
+        // stanza error instead (IQs are answered via dispatchIq's pre-bind
+        // gate); presence stays silently ignored.
         if (!session.stream.isActive()) {
-            if (std.mem.eql(u8, elem.local_name, "message")) {
-                self.sendPreBindMessageError(session, elem, changes);
+            switch (self.enforcePreBindStanzaPolicy(session, elem, changes)) {
+                .third_party_closed, .not_stanza => return,
+                .server_addressed => {
+                    // Client-namespace IQs were handled above (registration /
+                    // dispatchIq). A server-addressed message is bounced.
+                    if (std.mem.eql(u8, elem.local_name, "message")) {
+                        self.sendPreBindStanzaError(session, elem, changes);
+                    }
+                    return;
+                },
             }
-            return;
         }
 
         // Active state — stanzas (message, presence, iq)

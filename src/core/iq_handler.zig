@@ -413,10 +413,13 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         return;
     }
 
-    // RFC 6120 §7.6 (T182): an IQ received before resource binding (pre-auth
+    // RFC 6120 §7.1 (T182): an IQ received before resource binding (pre-auth
     // or pre-bind) MUST NOT be processed, but IQs MUST always be answered —
-    // reply with not-authorized. XEP-0077 registration is the only legal
-    // pre-bind IQ namespace; <bind/> itself never reaches dispatchIq.
+    // reply with a not-authorized stanza error; the connection stays open.
+    // (Third-party-addressed pre-bind stanzas never get here — the
+    // handleElementStart gates close those streams per §7.1.) XEP-0077
+    // registration is the only legal pre-bind IQ namespace; <bind/> itself
+    // never reaches dispatchIq.
     if (session.stream.bound_jid == null and !std.mem.eql(u8, child_ns, xml.ns.register)) {
         sendIqErrorWithType(server, session, iq_id, "auth", "not-authorized");
         return;

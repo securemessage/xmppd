@@ -50,9 +50,11 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     };
 
     // Get the sender's bound JID. Stanzas received before resource binding
-    // MUST NOT be processed (RFC 6120 §7.6 / T182): message and IQ get a
-    // not-authorized stanza error (IQs must always be answered); presence
-    // stays silently ignored. The connection stays open.
+    // MUST NOT be processed (RFC 6120 §7.1 / T182). Unreachable in practice —
+    // the handleElementStart gates close third-party-addressed streams and
+    // bounce server-addressed ones upstream — but if a message/IQ ever gets
+    // here unbound, answer with a not-authorized stanza error (IQs must
+    // always be answered); presence stays silently ignored.
     const from_jid = session.stream.bound_jid orelse {
         if (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) {
             sendNotAuthorized(session, id_str, to_str);
