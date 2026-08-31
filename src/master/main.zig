@@ -62,6 +62,7 @@ pub fn main() !void {
     var config_path: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
     var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
+    var run_dir: []const u8 = "/var/run/xmppd";
     var daemonize: bool = false;
     var workers: u16 = 0; // 0 = auto-detect CPU count
 
@@ -124,6 +125,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--log-file")) {
             log_file = args.next() orelse {
                 log.err("--log-file requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--run-dir")) {
+            run_dir = args.next() orelse {
+                log.err("--run-dir requires a value", .{});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--background") or std.mem.eql(u8, arg, "-b")) {
@@ -263,7 +269,8 @@ pub fn main() !void {
     log.info("xmppd master starting, host={s} port={s}", .{ host, port });
 
     // --- Single-instance enforcement via PID file lock ---
-    const pidfile_path = "/var/run/xmppd/xmppd.pid";
+    var pidfile_path_buf: [4096]u8 = undefined;
+    const pidfile_path = std.fmt.bufPrint(&pidfile_path_buf, "{s}/xmppd.pid", .{run_dir}) catch return error.PathTooLong;
     const pidfile = std.fs.cwd().openFile(pidfile_path, .{ .mode = .read_write }) catch blk: {
         break :blk std.fs.cwd().createFile(pidfile_path, .{ .read = true }) catch |err| {
             log.err("cannot open/create PID file {s}: {}", .{ pidfile_path, err });
@@ -294,9 +301,14 @@ pub fn main() !void {
 
     // --- Orphan child cleanup ---
     // Kill any stale children from a previous master that died ungracefully
-    cleanupOrphan("/var/run/xmppd/auth.pid");
-    cleanupOrphan("/var/run/xmppd/s2s.pid");
-    cleanupOrphan("/var/run/xmppd/core.pid");
+    {
+        var orphan_buf: [4096]u8 = undefined;
+        const orphan_names = [_][]const u8{ "auth.pid", "s2s.pid", "core.pid" };
+        for (orphan_names) |name| {
+            const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, name }) catch continue;
+            cleanupOrphan(p);
+        }
+    }
 
     // Ensure storage sub-directories exist
     const sub_dirs = [_][]const u8{ "auth", "op", "archive" };
@@ -696,6 +708,7 @@ fn printUsage() void {
         \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
         \\  --config PATH, -c  Config file path (passed to children)
         \\  --log-file PATH    Log file path (default: /var/log/xmppd/xmppd.log)
+        \\  --run-dir PATH     Runtime dir for PID files (default: /var/run/xmppd)
         \\  --background, -b   Daemonize (fork, detach from terminal)
         \\  --version, -v      Print version and exit
         \\  --help, -h         Show this help

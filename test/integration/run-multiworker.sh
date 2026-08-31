@@ -81,14 +81,16 @@ key = $tmp/key.pem
 socket = $tmp/auth.sock
 EOF
 
-# NOTE: only one xmppd master can run per host (PID file is fixed at
-# /var/run/xmppd/xmppd.pid). The auth socket is pointed into $tmp so xmppctl
-# talks to THIS instance's daemon, never a neighbour's.
+# NOTE: only one xmppd master per run-dir may run (PID file lock); this lane
+# uses its own run dir inside $tmp. The auth socket is likewise pointed into
+# $tmp so xmppctl talks to THIS instance's daemon, never a neighbour's.
 "$root/zig-out/bin/xmppctl" --db "$tmp/db" --auth-socket "$tmp/auth.sock" adduser alice@localhost   --password pass1 > /dev/null
 "$root/zig-out/bin/xmppctl" --db "$tmp/db" --auth-socket "$tmp/auth.sock" adduser bob@localhost     --password pass2 > /dev/null
 "$root/zig-out/bin/xmppctl" --db "$tmp/db" --auth-socket "$tmp/auth.sock" adduser charlie@localhost --password pass3 > /dev/null
 
+mkdir -p "$tmp/run"
 "$root/zig-out/bin/xmppd" --config "$tmp/xmppd.conf" --no-s2s \
+    --run-dir "$tmp/run" \
     --core-path "$root/zig-out/bin/xmppd-core" \
     --auth-path "$root/zig-out/bin/xmppd-auth" > "$tmp/server.log" 2>&1 &
 srvpid=$!

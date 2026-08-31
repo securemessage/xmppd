@@ -121,8 +121,9 @@ sh test/integration/run-multiworker.sh 4 muc-test.py e2e-subscription.py ...
 
 Notes:
 
-- Only one xmppd master can run per host (fixed PID file) — stop any other
-  instance first. The lane uses its own auth socket/db/cert in a mktemp dir.
+- The lane uses its own run dir (`--run-dir`), auth socket, db and cert in a
+  mktemp dir, so it can coexist with other throwaway instances as long as
+  ports differ (default 15333).
 - `e2e-sm-resume.py` is excluded on purpose: SM resume state is per-worker,
   and a reconnect lands on a random worker via SO_REUSEPORT, so resume fails
   with `item-not-found` at workers>1 by design (cross-worker resume is not
