@@ -58,15 +58,32 @@ tracks the release-level shape.
       a plaintext path that modern slixmpp cannot open. All six are
       parameterised via `XMPP_HOST`/`XMPP_PORT`/`XMPP_DOMAIN` and no longer
       default at the shared test jail.
-- [ ] SINT full XEP-0198 run — **the long-standing "SINT hardcodes port 5222"
-      rationale is wrong.** SINT runs with `dnsResolver=javax` and follows SRV,
-      and `/var/unbound/conf.d/s2s-test.conf` on freebsd-dev1 already maps
-      `_xmpp-client._tcp.xmppd.test` to port 15222 (verified resolving
-      2026-08-30). So it can be pointed at a throwaway dev instance without
-      touching port 5222 at all. The remaining real prerequisite is an
-      IBR-capable auth daemon (`--enable-registration --no-require-invite`),
-      because SINT skips all SM tests when `accountRegistration` is disabled.
-      Not yet run end-to-end — that is the actual open work here.
+- [x] SINT full XEP-0198 run — **DONE 2026-08-31: 10/10 pass** against a
+      throwaway instance (domain xmppd.test via the existing SRV override,
+      workers=1, IBR with `[auth] registration=true require_invite=false`).
+      Invocation: `java -Dsinttest.service=xmppd.test -Dsinttest.dnsResolver=javax
+      -Dsinttest.enabledSpecifications=XEP-0198 -Dsinttest.accountRegistration=inBandRegistration
+      -Dsinttest.acceptAllCertificates=true
+      -Dsinttest.disableHostnameVerificationForTlsCertificates=true
+      -Dsinttest.securityMode=required -jar ci/smack-sint-server-extensions.jar`.
+      Note: `securityMode=ifPossible` is rejected by this jar's enum; use
+      `required`. The run also caught the T179 regression (v0.8.9's malformed
+      registration form broke SINT's IBR account provisioning).
+
+### v0.8.10 — Bugfix (cross-worker + regression)
+
+- [x] **T173** — MUC admin IQ result dropped cross-worker (generation carried
+      in actor replies) — merged 2026-08-31 (bf77eae)
+- [x] **T176** — cross-worker subscription-cache invalidation — merged
+      2026-08-31 (c6fc287); found by the new multi-worker lane
+- [x] Multi-worker e2e lane in CI (`.forgejo/workflows/multiworker.yml`,
+      `test/integration/run-multiworker.sh`, `--run-dir` flag, build.zig
+      same-backend module sharing) — merged 2026-08-31
+- [ ] **T179** — v0.8.9 regression: malformed registration form XML (stray
+      `</field>`) breaks strict parsers (Smack proven) — fix on branch
+      `fix/t179-register-form-xml`, verified (incl. SINT 10/10)
+- [ ] **T178** — XEP-0198 unacked-queue overflow: fail the stream instead of
+      silently discarding stanzas (ejabberd/Prosody behavior)
 
 ### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 
