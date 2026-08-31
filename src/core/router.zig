@@ -49,8 +49,26 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         return;
     };
 
-    // Get the sender's bound JID
-    const from_jid = session.stream.bound_jid orelse return;
+    // Get the sender's bound JID. Stanzas received before resource binding
+    // MUST NOT be processed (RFC 6120 §7.6 / T182): message and IQ get a
+    // not-authorized stanza error (IQs must always be answered); presence
+    // stays silently ignored. The connection stays open.
+    const from_jid = session.stream.bound_jid orelse {
+        if (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) {
+            sendNotAuthorized(session, id_str, to_str);
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+        } else if (session.stanza_kind == .iq and
+            (std.mem.eql(u8, type_str, "get") or std.mem.eql(u8, type_str, "set")))
+        {
+            sendNotAuthorized(session, id_str, to_str);
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+        }
+        return;
+    };
 
     // Build the from string (full JID: local@domain/resource)
     var from_buf: [256]u8 = undefined;
@@ -292,6 +310,20 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (target_count == 0 and !remote_delivered) {
         // RFC 6121 §8.5.2.1a: Presence stanzas to non-existent users are silently ignored.
         if (session.stanza_kind == .presence) return;
+
+        // RFC 6121 §8.5.2.2.1: type='error' to an unavailable bare JID is
+        // silently dropped; type='groupchat' bounces service-unavailable.
+        // Neither may be stored offline or answered with further errors.
+        if (session.stanza_kind == .message) {
+            if (std.mem.eql(u8, type_str, "error")) return;
+            if (std.mem.eql(u8, type_str, "groupchat")) {
+                sendServiceUnavailable(session, id_str, to_str, from_str);
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                }
+                return;
+            }
+        }
 
         // Offline storage for messages
         if (session.stanza_kind == .message) {
@@ -727,6 +759,37 @@ fn sendCarbons(
             };
         }
     }
+}
+
+/// Send a not-authorized error for a stanza received before resource
+/// binding (RFC 6120 §7.6). There is no established sender JID yet, so the
+/// error carries only from=<original-to> and the original stanza id.
+pub fn sendNotAuthorized(session: *Session, id_str: []const u8, to_str: []const u8) void {
+    const tag_name: []const u8 = switch (session.stanza_kind) {
+        .iq => "iq",
+        .message => "message",
+        else => "message",
+    };
+
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    w.writeByte('<') catch return;
+    w.writeAll(tag_name) catch return;
+    w.writeAll(" type='error'") catch return;
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return;
+        w.writeAll(id_str) catch return;
+        w.writeByte('\'') catch return;
+    }
+    if (to_str.len > 0) {
+        w.writeAll(" from='") catch return;
+        w.writeAll(to_str) catch return;
+        w.writeByte('\'') catch return;
+    }
+    w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
+    w.writeAll(tag_name) catch return;
+    w.writeByte('>') catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
 /// Send a service-unavailable error for a stanza that can't be delivered.

@@ -328,6 +328,11 @@ pub const Session = struct {
     sm_detach_time: i64 = 0,
     /// Unacked stanza queue for resume replay. Allocated when resume is enabled.
     sm_unacked: ?*sm_state.SmUnackedQueue = null,
+    /// T178: set when the unacked queue overflowed (oldest stanza evicted).
+    /// XEP-0198 has no gap signaling, so the session must be failed —
+    /// reaped by session_lifecycle.reapSmOverflow at the end of the event
+    /// batch (live: resource-constraint stream error; detached: destroy).
+    sm_overflow: bool = false,
 
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -374,11 +379,23 @@ pub const Session = struct {
     /// Track an outbound stanza for SM purposes.
     /// Increments sm_out_seq and buffers the stanza in the unacked queue (if resume enabled).
     /// Call this after successfully queueing a complete stanza (message/presence/iq) to the client.
+    /// On queue overflow the session is flagged for failure (T178) and reaped
+    /// by session_lifecycle.reapSmOverflow at the end of the event batch.
     pub fn smTrackOutbound(self: *Session, stanza_data: []const u8) void {
         if (!self.sm_enabled) return;
         self.sm_out_seq +%= 1;
         if (self.sm_unacked) |queue| {
-            queue.push(stanza_data);
+            switch (queue.push(stanza_data)) {
+                .pushed, .alloc_failed => {},
+                .overflow => {
+                    // T178: XEP-0198 has no gap signaling — an evicted stanza
+                    // breaks the at-least-once promise invisibly. Fail the
+                    // session (ejabberd/Prosody behavior) instead of silently
+                    // continuing with a corrupted replay queue.
+                    self.sm_overflow = true;
+                    log.warn("connection {d} SM unacked queue overflow ({d} stanzas) — failing session", .{ self.conn.id, sm_state.UNACKED_CAPACITY });
+                },
+            }
         }
     }
 };
@@ -809,6 +826,10 @@ pub const Server = struct {
                     _ = self.drainRoomMailboxes(&changes);
                 }
             }
+
+            // T178: fail sessions whose SM unacked queue overflowed during
+            // this batch (any delivery path may have set the flag).
+            session_lifecycle.reapSmOverflow(self, &changes);
         }
     }
 
@@ -1036,6 +1057,47 @@ pub const Server = struct {
         self.executeAction(session, action);
     }
 
+    /// RFC 6120 §7.6 (T182): bounce a message received before authentication
+    /// or resource binding with a not-authorized stanza error. This is a
+    /// stanza error, not a stream error — the connection stays open so the
+    /// client can proceed to authenticate. Error stanzas are never answered
+    /// with further errors (RFC 6120 §8.3.1).
+    fn sendPreBindMessageError(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+        _ = self;
+        var to_attr: []const u8 = "";
+        var id_attr: []const u8 = "";
+        var type_attr: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "to")) {
+                to_attr = attr.value;
+            } else if (std.mem.eql(u8, attr.local_name, "id")) {
+                id_attr = attr.value;
+            } else if (std.mem.eql(u8, attr.local_name, "type")) {
+                type_attr = attr.value;
+            }
+        }
+        if (std.mem.eql(u8, type_attr, "error")) return;
+
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<message type='error'") catch return;
+        if (to_attr.len > 0) {
+            w.writeAll(" from='") catch return;
+            w.writeAll(to_attr) catch return;
+            w.writeByte('\'') catch return;
+        }
+        if (id_attr.len > 0) {
+            w.writeAll(" id='") catch return;
+            w.writeAll(id_attr) catch return;
+            w.writeByte('\'') catch return;
+        }
+        w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    }
+
     fn handleElementStart(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         // If accumulating a message/presence stanza, serialize child elements into buffer
         if (session.stanza_kind != .none) {
@@ -1120,6 +1182,10 @@ pub const Server = struct {
                         break;
                     }
                 }
+            } else if (std.mem.eql(u8, elem.local_name, "message")) {
+                // RFC 6120 §7.6 (T182): message before resource bind —
+                // bounce not-authorized. Presence stays silently ignored.
+                self.sendPreBindMessageError(session, elem, changes);
             }
             return;
         }
@@ -1159,6 +1225,17 @@ pub const Server = struct {
                 }
             } else if (std.mem.eql(u8, elem.local_name, "resume") and session.stream.state == .features_bind) {
                 self.handleSmResume(session, elem, changes);
+            }
+            return;
+        }
+
+        // RFC 6120 §7.6 (T182): stanzas received before authentication are not
+        // processed. Messages bounce with not-authorized (IQs in these states
+        // are answered via dispatchIq's pre-bind gate or the features_bind
+        // wrapper above); presence stays silently ignored.
+        if (!session.stream.isActive()) {
+            if (std.mem.eql(u8, elem.local_name, "message")) {
+                self.sendPreBindMessageError(session, elem, changes);
             }
             return;
         }
@@ -1334,6 +1411,18 @@ pub const Server = struct {
                     changes.addWrite(session.conn.fd, session.conn.id) catch {};
                 }
                 return;
+            }
+            return;
+        }
+
+        // Pre-bind IQ that was not a bind request — IQs MUST always be
+        // answered (RFC 6120 §7.6 / T182): reply not-authorized, stanza
+        // error only, the connection stays open.
+        if (session.stream.state == .features_bind and session.reader.depth == 1 and session.bind_iq_id.len > 0) {
+            iq_handler.sendIqErrorWithType(self, session, session.bind_iq_id, "auth", "not-authorized");
+            session.bind_iq_id = "";
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
             return;
         }
@@ -2851,6 +2940,14 @@ pub const Server = struct {
             self.sendSmFailed(session, "item-not-found", changes);
             return;
         };
+
+        // T178: the detached session's unacked queue overflowed in this event
+        // batch — its replay queue is corrupt. Fail the resume as if the
+        // session were already gone; reapSmOverflow destroys it at batch end.
+        if (detached.sm_overflow) {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        }
 
         // Verify the authenticated user matches the detached session's user
         const auth_jid = session.stream.authenticated_jid orelse {

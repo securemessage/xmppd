@@ -24,8 +24,23 @@ const log = std.log.scoped(.sm);
 
 /// Maximum number of unacknowledged stanzas buffered per session.
 /// Each entry is heap-allocated (variable size). If the queue is full,
-/// the oldest unacked stanza is discarded to bound memory usage.
+/// the oldest unacked stanza is discarded to bound memory usage — but
+/// `push()` reports the eviction (T178): XEP-0198 has no gap signaling,
+/// so the session must be failed rather than silently losing stanzas.
 pub const UNACKED_CAPACITY: u32 = 256;
+
+/// Result of `SmUnackedQueue.push()`.
+pub const PushResult = enum {
+    /// Stanza buffered without eviction.
+    pushed,
+    /// Queue was full — the oldest stanza was evicted to make room.
+    /// The caller must fail the session (live: resource-constraint stream
+    /// error; detached: destroy) because the client can no longer be told
+    /// the truth about what was delivered.
+    overflow,
+    /// Heap allocation for the stanza copy failed — stanza not buffered.
+    alloc_failed,
+};
 
 /// Default session resume timeout in seconds.
 pub const DEFAULT_RESUME_TIMEOUT: u32 = 300;
@@ -74,22 +89,28 @@ pub const SmUnackedQueue = struct {
         self.tail = 0;
     }
 
-    /// Push a stanza into the queue. If full, the oldest entry is discarded.
-    pub fn push(self: *SmUnackedQueue, stanza: []const u8) void {
+    /// Push a stanza into the queue. If full, the oldest entry is discarded
+    /// to keep the ring bounded and the result reports `.overflow` (T178) —
+    /// the caller is expected to fail the session rather than continue with
+    /// a silently corrupted replay queue.
+    pub fn push(self: *SmUnackedQueue, stanza: []const u8) PushResult {
+        var result: PushResult = .pushed;
         if (self.count == UNACKED_CAPACITY) {
             // Queue full — discard oldest to make room
             self.discardHead();
+            result = .overflow;
         }
 
         const copy = self.allocator.alloc(u8, stanza.len) catch {
             log.warn("SM unacked queue: allocation failed ({d} bytes)", .{stanza.len});
-            return;
+            return .alloc_failed;
         };
         @memcpy(copy, stanza);
 
         self.entries[self.tail] = .{ .data = copy };
         self.tail = (self.tail + 1) % UNACKED_CAPACITY;
         self.count += 1;
+        return result;
     }
 
     /// Acknowledge stanzas up to and including sequence number `h`.
@@ -191,9 +212,9 @@ test "SmUnackedQueue: push and ack" {
     var queue = SmUnackedQueue.init(allocator);
     defer queue.deinit();
 
-    queue.push("<message>hello</message>");
-    queue.push("<message>world</message>");
-    queue.push("<presence/>");
+    _ = queue.push("<message>hello</message>");
+    _ = queue.push("<message>world</message>");
+    _ = queue.push("<presence/>");
 
     try std.testing.expectEqual(@as(u32, 3), queue.count);
     try std.testing.expectEqual(@as(u32, 1), queue.base_seq);
@@ -210,22 +231,30 @@ test "SmUnackedQueue: push and ack" {
     try std.testing.expect(iter.next() == null);
 }
 
-test "SmUnackedQueue: overflow discards oldest" {
+test "SmUnackedQueue: overflow discards oldest and reports it (T178)" {
     const allocator = std.testing.allocator;
     var queue = SmUnackedQueue.init(allocator);
     defer queue.deinit();
 
-    // Fill to capacity
+    // Fill to capacity — every push reports .pushed
     var i: u32 = 0;
     while (i < UNACKED_CAPACITY) : (i += 1) {
-        queue.push("x");
+        try std.testing.expectEqual(PushResult.pushed, queue.push("x"));
     }
     try std.testing.expectEqual(UNACKED_CAPACITY, queue.count);
 
-    // Push one more — oldest should be discarded
-    queue.push("new");
+    // Push one more — oldest evicted, overflow signaled so the caller can
+    // fail the session instead of silently losing stanzas.
+    try std.testing.expectEqual(PushResult.overflow, queue.push("new"));
     try std.testing.expectEqual(UNACKED_CAPACITY, queue.count);
     try std.testing.expectEqual(@as(u32, 2), queue.base_seq);
+
+    // The overflow signal fires on EVERY push past capacity — the policy
+    // (fail the session) must be applied once, by the first caller that
+    // sees it; the queue itself stays bounded and consistent.
+    try std.testing.expectEqual(PushResult.overflow, queue.push("newer"));
+    try std.testing.expectEqual(UNACKED_CAPACITY, queue.count);
+    try std.testing.expectEqual(@as(u32, 3), queue.base_seq);
 }
 
 test "SmUnackedQueue: ack all" {
@@ -233,9 +262,9 @@ test "SmUnackedQueue: ack all" {
     var queue = SmUnackedQueue.init(allocator);
     defer queue.deinit();
 
-    queue.push("a");
-    queue.push("b");
-    queue.push("c");
+    _ = queue.push("a");
+    _ = queue.push("b");
+    _ = queue.push("c");
 
     queue.ack(3);
     try std.testing.expectEqual(@as(u32, 0), queue.count);
@@ -247,7 +276,7 @@ test "SmUnackedQueue: ack beyond buffered" {
     var queue = SmUnackedQueue.init(allocator);
     defer queue.deinit();
 
-    queue.push("a");
+    _ = queue.push("a");
     // Ack more than we have (client saw stanzas we already dropped)
     queue.ack(10);
     try std.testing.expectEqual(@as(u32, 0), queue.count);

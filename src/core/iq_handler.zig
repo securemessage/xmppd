@@ -413,6 +413,15 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         return;
     }
 
+    // RFC 6120 §7.6 (T182): an IQ received before resource binding (pre-auth
+    // or pre-bind) MUST NOT be processed, but IQs MUST always be answered —
+    // reply with not-authorized. XEP-0077 registration is the only legal
+    // pre-bind IQ namespace; <bind/> itself never reaches dispatchIq.
+    if (session.stream.bound_jid == null and !std.mem.eql(u8, child_ns, xml.ns.register)) {
+        sendIqErrorWithType(server, session, iq_id, "auth", "not-authorized");
+        return;
+    }
+
     // IQ addressed to MUC service domain — handle MUC disco and admin commands
     if (server.muc_host) |muc_host| {
         if (iq_to.len > 0) {
@@ -1377,8 +1386,9 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
 
 /// Handle vCard-temp GET for a specific bare JID (another user).
 /// Per XEP-0054 §3.3: server MUST respond on behalf of the requestee.
-/// Returns the stored vCard, empty vCard if user exists but has none,
-/// or item-not-found if the user does not exist.
+/// Returns the stored vCard, or service-unavailable both when the user
+/// has no vCard and when the user does not exist (spec v1.3.0 — the two
+/// cases must be indistinguishable to prevent account harvesting).
 fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, target_jid: []const u8) void {
     // Strip resource if present (use bare JID for lookup)
     const at_pos = std.mem.indexOfScalar(u8, target_jid, '@') orelse {
@@ -1413,34 +1423,9 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
         }
     }
 
-    // No vCard stored — check if user exists via session_map (online/bound)
-    // or roster store (has any contacts). If neither, user doesn't exist.
-    const target_local = target_jid[0..at_pos];
-    const user_exists = blk: {
-        // Check if user has any bound session (online)
-        if (server.session_map) |sm| {
-            var entry_buf: [1]session_map_mod.SessionEntry = undefined;
-            if (sm.findByBareJid(target_local, target_domain, &entry_buf) > 0) break :blk true;
-        }
-        // Check if user has any roster entries (owner prefix scan)
-        if (server.roster) |roster| {
-            const items = roster.getAllItems(server.allocator, bare_jid) catch break :blk false;
-            const has_items = items.len > 0;
-            GenericRosterStore.freeAllItems(server.allocator, items);
-            if (has_items) break :blk true;
-        }
-        break :blk false;
-    };
-
-    if (user_exists) {
-        // User exists but has no vCard — return empty vCard
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><vCard xmlns='vcard-temp'/></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
-    } else {
-        // User does not exist — return item-not-found per XEP-0054 §3.3
-        sendIqError(server, session, iq_id, "item-not-found");
-    }
+    // No vCard stored — return service-unavailable whether or not the
+    // user exists (XEP-0054 §3.3, v1.3.0 anti-harvesting rule).
+    sendIqError(server, session, iq_id, "service-unavailable");
 }
 
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
