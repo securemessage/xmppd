@@ -20,10 +20,15 @@ jobs:
           uname -a
           id
           for t in zig python3 nc openssl git; do command -v $t || echo "MISSING: $t"; done
-          doas -n true 2>&1 || true
-          sudo -n true 2>&1 || true
+      - name: Provision python3 (if missing)
+        run: |
+          command -v python3 || doas pkg install -y python3
+          python3 --version
+      # archive-storage=lmdb: no system rocksdb on the bare runner (lmdb is a
+      # zig-fetchable dependency, sqlite3 is a private base lib — neither of
+      # the other backends links on a package-free host).
       - name: Build
-        run: zig build
+        run: zig build -Darchive-storage=lmdb
       - name: slixmpp venv
         run: |
           python3 -m venv /tmp/slixvenv-ci

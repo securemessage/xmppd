@@ -264,7 +264,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const server_op_backend_mod = createBackendMod(b, op_storage, target, optimize, server_backend_mod, lmdb_dep);
-    const server_archive_backend_mod = createBackendMod(b, archive_storage, target, optimize, server_backend_mod, lmdb_dep);
+    // Zig forbids two modules sharing a root file in one compilation; reuse
+    // the module when both stores select the same backend.
+    const server_archive_backend_mod = if (std.mem.eql(u8, archive_storage, op_storage))
+        server_op_backend_mod
+    else
+        createBackendMod(b, archive_storage, target, optimize, server_backend_mod, lmdb_dep);
     const server_archive_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/archive_store.zig"),
         .target = target,
