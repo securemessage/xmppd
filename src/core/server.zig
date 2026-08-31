@@ -333,6 +333,11 @@ pub const Session = struct {
     /// reaped by session_lifecycle.reapSmOverflow at the end of the event
     /// batch (live: resource-constraint stream error; detached: destroy).
     sm_overflow: bool = false,
+    /// T178: an <r/> ack request is in flight (sent when the unacked queue
+    /// crossed the threshold, cleared on <a/>). Prevents <r/> spam while
+    /// waiting for the client — and guarantees that a queue reaching full
+    /// capacity belongs to a client that ignored our ack requests.
+    sm_r_outstanding: bool = false,
 
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -395,6 +400,18 @@ pub const Session = struct {
                     self.sm_overflow = true;
                     log.warn("connection {d} SM unacked queue overflow ({d} stanzas) — failing session", .{ self.conn.id, sm_state.UNACKED_CAPACITY });
                 },
+            }
+            // T178: give the client the chance to ack before the queue can
+            // fill — XEP-0198 only requires acks when the server requests
+            // them, so without <r/> a compliant client (Smack) may never ack
+            // and overflow-kill would hit innocent busy sessions. One <r/>
+            // outstanding at a time; <r/> is not a stanza (not counted in
+            // sm_out_seq). Nothing to request from a detached session.
+            if (!self.sm_detached and !self.sm_r_outstanding and
+                queue.pending() >= sm_state.SM_R_THRESHOLD)
+            {
+                self.conn.queueSend("<r xmlns='urn:xmpp:sm:3'/>") catch return;
+                self.sm_r_outstanding = true;
             }
         }
     }
@@ -1213,6 +1230,7 @@ pub const Server = struct {
                 self.handleSmRequest(session, changes);
             } else if (std.mem.eql(u8, elem.local_name, "a") and session.sm_enabled) {
                 // Client acknowledges our stanzas
+                session.sm_r_outstanding = false;
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "h")) {
                         const client_h = std.fmt.parseInt(u32, attr.value, 10) catch 0;

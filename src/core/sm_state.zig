@@ -42,6 +42,13 @@ pub const PushResult = enum {
     alloc_failed,
 };
 
+/// Unacked-queue depth at which the server sends the client an <r/> ack
+/// request (T178). XEP-0198 only obliges clients to ack on request, so
+/// without this a compliant client may never ack and the overflow policy
+/// would kill innocent busy sessions. Half of capacity leaves headroom for
+/// one full burst between request and answer.
+pub const SM_R_THRESHOLD: u32 = UNACKED_CAPACITY / 2;
+
 /// Default session resume timeout in seconds.
 pub const DEFAULT_RESUME_TIMEOUT: u32 = 300;
 
