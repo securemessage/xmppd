@@ -1040,7 +1040,7 @@ fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void
     w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
     w.writeAll("<field var='username' type='text-single' label='Username'><required/></field>") catch return;
     w.writeAll("<field var='password' type='text-private' label='Password'><required/></field>") catch return;
-    w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/></field>") catch return;
+    w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/>") catch return;
     w.writeAll("</x>") catch return;
     w.writeAll("</query></iq>") catch return;
     session.conn.queueSend(fbs.getWritten()) catch return;

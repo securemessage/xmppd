@@ -27,6 +27,7 @@ import socket
 import ssl
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 
 HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
 PORT = int(os.environ.get('XMPP_PORT', '15222'))
@@ -130,12 +131,19 @@ class XmppConnection:
             self.buf += chunk
 
     def iq_register(self, iq_type, inner):
-        """Send a jabber:iq:register IQ and return the response stanza."""
+        """Send a jabber:iq:register IQ and return the response stanza.
+
+        The response is strict-parsed with ElementTree — substring
+        assertions alone miss malformed server XML (the v0.8.9
+        stray-</field> regression only surfaced under Smack's parser).
+        """
         iq_id = uuid.uuid4().hex[:12]
         self.send(
             f"<iq type='{iq_type}' id='{iq_id}' to='{DOMAIN}'>"
             f"<query xmlns='jabber:iq:register'>{inner}</query></iq>")
-        return self.recv_iq_response(iq_id)
+        resp = self.recv_iq_response(iq_id)
+        ET.fromstring(resp)
+        return resp
 
 
 def register_set_inner(username, password, invite=None):
