@@ -198,11 +198,10 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
   (`session_lifecycle.zig`): boundary checks at 299s (survive), 300s (expire),
   and mixed-set selective expiry. No clock injection needed — tests set
   `sm_detach_time` directly to simulate elapsed time.
-- [ ] SINT full run with `enabledSpecifications="XEP-0198"` — blocked: Smack
-  Superseded — see "Next Up". SINT follows SRV, and an `xmppd.test` SRV
-  record pointing at port 15222 already exists on freebsd-dev1; the port was
-  never the real blocker. What SINT actually needs is in-band registration
-  enabled on the auth daemon.
+- [x] SINT full run with `enabledSpecifications="XEP-0198"` — DONE 2026-08-31:
+  10/10 against a throwaway IBR instance (invocation in Next Up → v0.8.10
+  preamble). The full-spec SINT run also happened (twice): see T175 and the
+  T180/T181/T182 follow-ups it produced.
 
 ### Deferred Follow-ups
 
@@ -253,8 +252,9 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
   errors logged across the run. Still not exercised: the two S2S sites in
   `server.zig`, which need a federation peer (`s2s-federation.py` expects a
   Prosody instance).
-- [ ] T151 — evaluate reverting eager `flushSend()` in `handleReadable`
-  (harmless but unnecessary micro-optimization from the v0.8.6 debug session)
+- [x] T151 — evaluated 2026-08-30 (v0.8.9 batch): KEEP the eager flushSend —
+  it is strictly fewer syscalls in the common request/response case; verdict
+  recorded on the task, closed.
 
 ---
 
