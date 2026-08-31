@@ -20,19 +20,24 @@ jobs:
           uname -a
           id
           for t in zig python3 nc openssl git; do command -v $t || echo "MISSING: $t"; done
-      - name: Provision python3 (if missing)
+      - name: Provision python3 + slixmpp deps (if missing)
         run: |
           command -v python3 || doas pkg install -y python3
+          # slixmpp's C deps from packages — pip would build pycares from
+          # source (needs cmake). py312-* matches the python3 metaport (3.12).
+          doas pkg install -y py312-pycares py312-aiodns py312-cffi \
+            py312-pycparser py312-pyasn1 py312-pyasn1-modules
           python3 --version
+      - name: slixmpp venv (system site-packages for the C deps)
+        run: |
+          python3 -m venv --system-site-packages /tmp/slixvenv-ci
+          /tmp/slixvenv-ci/bin/pip install --quiet --no-deps slixmpp==1.17.0
+          /tmp/slixvenv-ci/bin/python -c "import slixmpp; print(slixmpp.__version__)"
       # archive-storage=lmdb: no system rocksdb on the bare runner (lmdb is a
       # zig-fetchable dependency, sqlite3 is a private base lib — neither of
       # the other backends links on a package-free host).
       - name: Build
         run: zig build -Darchive-storage=lmdb
-      - name: slixmpp venv
-        run: |
-          python3 -m venv /tmp/slixvenv-ci
-          /tmp/slixvenv-ci/bin/pip install --quiet slixmpp==1.17.0
       - name: MUC + subscription at workers=4
         run: |
           SLIXPYTHON=/tmp/slixvenv-ci/bin/python \
