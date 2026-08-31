@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.8.10 — 2026-08-31
+
+Bugfix release: cross-worker delivery, a v0.8.9 regression, and four
+stanza error-handling correctness fixes found by the first full-spec
+SINT runs (T175 follow-ups).
+
+### Fixes
+
+- T173 (High): MUC admin IQ results (kick/ban/voice) were dropped when
+  the room shard lived on a different worker than the requester — the
+  cross-worker reply carried a hardcoded generation 0 and the ABA-guarded
+  drain discarded it. The admin actor message now carries the requester's
+  generation (bf77eae)
+- T176: per-worker subscription cache was never invalidated cross-worker,
+  so presence routing on other workers used stale subscription state
+  (c6fc287, found by the new multi-worker lane)
+- T179 (v0.8.9 regression): the XEP-0077 registration data form emitted
+  malformed XML (stray `</field>`), breaking strict parsers (Smack/StAX
+  proven) and SINT's IBR provisioning (7bc5980)
+- T178: XEP-0198 unacked-queue overflow silently discarded the oldest
+  stanza, invisibly breaking the at-least-once promise. The queue now
+  reports overflow and the session is failed (ejabberd/Prosody behavior):
+  live sessions get a `resource-constraint` stream error and close;
+  detached sessions are destroyed, so a later `<resume/>` fails
+  `item-not-found` and the client resyncs via MAM (cc70366)
+- T180: XEP-0054 §3.3 (v1.3.0) — vCard GET for another user now returns
+  `service-unavailable` for both no-vCard and no-such-user
+  (anti-harvesting; the two cases must be indistinguishable). The
+  own-vCard path keeps its empty-vCard/Gravatar behavior (cc70366)
+- T181: RFC 6121 §8.5.2.2.1 — groupchat to a bare JID with no available
+  resources bounces `service-unavailable` instead of being stored
+  offline; type='error' stanzas are silently dropped instead of stored
+  (cc70366)
+- T182: stanzas received before authentication/resource binding were
+  silently dropped. Message and IQ now get a `not-authorized` stanza
+  error (IQs must always be answered); presence stays ignored; the
+  connection stays open (stanza error, not stream error) (cc70366)
+
+### CI
+
+- New multi-worker e2e lane (`.forgejo/workflows/multiworker.yml`,
+  `test/integration/run-multiworker.sh`): spins a workers=4 throwaway
+  instance so the cross-worker surface (room sharding, actor messages,
+  MPSC delivery with generation validation) is exercised — at workers=1
+  every route is local, which is how T173 shipped
+
+Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps;
+e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins
+12/12; e2e-mam 7/7; e2e-subscription 29/29; e2e-register-invite 6/6;
+multi-worker lane (workers=4) green; SINT XEP-0198 10/10.
+
 ## v0.8.9 — 2026-08-30
 
 Bugfix/doc-consistency release (T163–T170 audit batch + T160/T161/T151).

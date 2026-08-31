@@ -70,7 +70,7 @@ tracks the release-level shape.
       `required`. The run also caught the T179 regression (v0.8.9's malformed
       registration form broke SINT's IBR account provisioning).
 
-### v0.8.10 — Bugfix (cross-worker + regression)
+### v0.8.10 — Bugfix (cross-worker + regression) — SHIPPED 2026-08-31
 
 - [x] **T173** — MUC admin IQ result dropped cross-worker (generation carried
       in actor replies) — merged 2026-08-31 (bf77eae)
@@ -79,22 +79,22 @@ tracks the release-level shape.
 - [x] Multi-worker e2e lane in CI (`.forgejo/workflows/multiworker.yml`,
       `test/integration/run-multiworker.sh`, `--run-dir` flag, build.zig
       same-backend module sharing) — merged 2026-08-31
-- [ ] **T179** — v0.8.9 regression: malformed registration form XML (stray
-      `</field>`) breaks strict parsers (Smack proven) — fix on branch
-      `fix/t179-register-form-xml`, verified (incl. SINT 10/10)
-- [ ] **T178** — XEP-0198 unacked-queue overflow: fail the stream instead of
-      silently discarding stanzas (ejabberd/Prosody behavior)
-- [ ] **T180** — XEP-0054 §3.3: another user's missing vCard must return
-      `service-unavailable` (both no-vCard and no-such-user), not an empty
-      vCard / item-not-found (spec tightened in v1.3.0; found by T175's
-      full-spec SINT run)
-- [ ] **T181** — RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
-      resources must bounce `service-unavailable` (never store offline);
-      type='error' must be silently dropped — both currently hit the offline
-      store path
-- [ ] **T182** — pre-auth/pre-bind stanzas silently dropped: return
-      `not-authorized` for message/IQ (IQs MUST always be answered); presence
-      may stay ignored
+- [x] **T179** — v0.8.9 regression: malformed registration form XML (stray
+      `</field>`) breaks strict parsers (Smack proven) — merged 2026-08-31
+      (7bc5980), verified incl. SINT 10/10
+- [x] **T178** — XEP-0198 unacked-queue overflow: fail the session instead of
+      silently discarding stanzas (live: resource-constraint stream error;
+      detached: destroyed so resume fails item-not-found) — merged 2026-08-31
+      (cc70366)
+- [x] **T180** — XEP-0054 §3.3: another user's missing vCard returns
+      `service-unavailable` for both no-vCard and no-such-user (spec v1.3.0
+      anti-harvesting) — merged 2026-08-31 (cc70366)
+- [x] **T181** — RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
+      resources bounces `service-unavailable`; type='error' silently dropped;
+      neither stored offline — merged 2026-08-31 (cc70366)
+- [x] **T182** — pre-auth/pre-bind message/IQ get a `not-authorized` stanza
+      error (IQs always answered; connection stays open); presence pre-bind
+      stays ignored — merged 2026-08-31 (cc70366)
 
 ### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
 

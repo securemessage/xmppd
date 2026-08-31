@@ -4,7 +4,7 @@ const std = @import("std");
 /// via the "build_options" module; consumed by `xmppd --version` and the
 /// XEP-0092 Software Version answer. Bump at release time (must equal the
 /// git tag without the leading 'v').
-const version = "0.8.9";
+const version = "0.8.10";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
