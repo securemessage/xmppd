@@ -140,6 +140,14 @@ Deferred out of the v0.8.0 feature release:
 - [ ] T154 — cross-worker resource eviction (workers>1)
 - [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
       store, offline elapsed seconds, privacy rules)
+- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `[auth]`
+      rate-limit disable knob, `lib/xmppc` client-core module (in-repo for
+      now, extract to a canonical repo when a second consumer appears), load
+      driver built on it, then benchmarks: connections/sec at workers=1/N,
+      message throughput, cross-thread delivery latency. Benchmarks double as
+      the measurement gate for T31 (allocator contention premise).
+- [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
+      measurements showing actual DebugAllocator lock contention
 
 ### v0.10.0 — Feature: Web Transport
 
@@ -150,6 +158,10 @@ Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
 - [ ] **T37** — XEP-0363 HTTP File Upload — slot-allocation IQ handler in core plus an
       `xmppd-httpupload` binary (~1100–1500 LOC)
 - [ ] **T162** — XEP-0049 Private XML Storage
+- [ ] **T184** — XEP-0060 PubSub, enough to legitimately claim the
+      `pubsub/service` disco identity (service identity + node
+      create/publish/subscribe beyond the PEP subset; do NOT advertise the
+      identity before the implementation exists)
 
 ### Non-code
 
