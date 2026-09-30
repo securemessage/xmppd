@@ -140,12 +140,13 @@ Deferred out of the v0.8.0 feature release:
 - [ ] T154 — cross-worker resource eviction (workers>1)
 - [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
       store, offline elapsed seconds, privacy rules)
-- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `[auth]`
-      rate-limit disable knob, `lib/xmppc` client-core module (in-repo for
-      now, extract to a canonical repo when a second consumer appears), load
-      driver built on it, then benchmarks: connections/sec at workers=1/N,
-      message throughput, cross-thread delivery latency. Benchmarks double as
-      the measurement gate for T31 (allocator contention premise).
+- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
+      client-core module (in-repo for now, extract to a canonical repo when
+      a second consumer appears), load driver built on it, then benchmarks:
+      connections/sec at workers=1/N, message throughput, cross-thread
+      delivery latency. Benchmarks double as the measurement gate for T31
+      (allocator contention premise). `[auth]` rate-limit knob landed
+      2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
 - [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
       measurements showing actual DebugAllocator lock contention
 
