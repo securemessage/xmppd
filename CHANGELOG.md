@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.8.11 — 2026-09-30
+
+Hardening release. **Operationally significant:** the authentication
+rate limiter was silently inert in all previous releases and now actually
+enforces. Deployments upgrading from ≤ 0.8.10 gain brute-force protection
+for the first time: 5 attempts per account and 20 per IP per 120s window,
+temporary account lockout after 10 consecutive failures. Clients that
+repeatedly fail auth will now see `policy-violation` / `account-disabled`
+instead of unlimited `not-authorized` retries.
+
+### Fixes
+
+- Auth rate limiting was inert on the live path: core sends an empty
+  username in the auth request (the daemon extracts the identity from the
+  SASL payload), so per-account rate checks and lockouts evaluated an
+  empty key and never engaged; and the per-IP attempt ring (8 slots) could
+  never count up to the default per-IP limit (20). Per-IP checks still run
+  at request entry; per-account checks and lockouts now run in the
+  PLAIN/SCRAM handlers once the username is parsed, and the ring holds 32
+  entries so configured maxima up to 32 engage (8a100f4)
+- SASL failure reason is now passed through to the wire: rate-limit denial
+  surfaces as `policy-violation` / `account-disabled` (RFC 6120 §6.5
+  conditions, whitelisted) instead of a generic `not-authorized` (8a100f4)
+
+### Tooling
+
+- New `[auth] rate_limit = false` config switch (and `--no-rate-limit` on
+  xmppd-auth, `[oidc] rate_limit = false` on xmppd-auth-oidc) to disable
+  auth rate limiting for benchmark/load-test rigs; the multi-worker e2e
+  lane enables it since connect-heavy suites now trip the real limits
+  (ee4d113). Logs a prominent warning at startup when disabled. Never use
+  on a reachable deployment.
+
+Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps
+(including new rate-limiter enforcement and SASL-condition tests);
+live 25-attempt single-IP auth hammer: unlimited when disabled, exactly
+5× `not-authorized` then `policy-violation` with defaults; seven e2e
+suites at workers=1, cross-worker subset at workers=4.
+
 ## v0.8.10 — 2026-08-31
 
 Bugfix release: cross-worker delivery, a v0.8.9 regression, and four
