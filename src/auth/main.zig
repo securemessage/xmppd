@@ -63,6 +63,7 @@ pub fn main() !void {
     var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var rate_policy = RatePolicy{};
+    var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
 
     var config_path: ?[]const u8 = null;
@@ -110,6 +111,8 @@ pub fn main() !void {
                 log.err("--lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
             });
+        } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
+            rate_limit_enabled = false;
         } else if (std.mem.eql(u8, arg, "--enable-registration")) {
             reg_config.enabled = true;
         } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
@@ -165,6 +168,9 @@ pub fn main() !void {
                 rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch 10);
             }
         }
+        if (c.get("auth", "rate_limit")) |v| {
+            if (std.mem.eql(u8, v, "false")) rate_limit_enabled = false;
+        }
         if (c.get("auth", "registration")) |v| {
             if (std.mem.eql(u8, v, "true")) reg_config.enabled = true;
         }
@@ -183,13 +189,6 @@ pub fn main() !void {
         return error.InvalidArgs;
     };
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
-    log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
-        rate_policy.max_per_account,
-        rate_policy.max_per_ip,
-        rate_policy.window_seconds,
-        rate_policy.lockout_duration,
-        rate_policy.lockout_threshold,
-    });
 
     // Open storage backend
     var backend = try OpBackendType.open(auth_path, .{});
@@ -203,7 +202,18 @@ pub fn main() !void {
 
     // Initialize auth handler
     var handler = AuthHandler.init(allocator, &store);
-    handler.setRateLimiter(&rate_limiter);
+    if (rate_limit_enabled) {
+        handler.setRateLimiter(&rate_limiter);
+        log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
+            rate_policy.max_per_account,
+            rate_policy.max_per_ip,
+            rate_policy.window_seconds,
+            rate_policy.lockout_duration,
+            rate_policy.lockout_threshold,
+        });
+    } else {
+        log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
+    }
     handler.setLockChecker(makeLockChecker(&lock_store, allocator));
     handler.reg_config = reg_config;
     if (reg_config.enabled and reg_config.require_invite) {
@@ -416,6 +426,7 @@ fn printUsage() void {
         \\  --auth-window N            Rate window in seconds (default: 120)
         \\  --lockout-duration N       Temp lockout duration in seconds (default: 300)
         \\  --lockout-threshold N      Consecutive failures before lockout (default: 10)
+        \\  --no-rate-limit            Disable auth rate limiting entirely (testing/benchmarks only)
         \\  --enable-registration      Enable in-band registration (XEP-0077)
         \\  --no-require-invite        Allow registration without invitation code
         \\  --help, -h                 Show this help

@@ -33,6 +33,10 @@ zig build
 #   [tls]                # REQUIRED for e2e-sm-resume.py (it does STARTTLS)
 #   cert = /tmp/xmppd-test-cert.pem
 #   key = /tmp/xmppd-test-key.pem
+#   [auth]
+#   rate_limit = false   # e2e suites make many connects per account/IP; the
+#                        # default policy (5/account, 20/IP per 120s) trips
+#                        # mid-suite. Same knob for benchmark/load runs.
 
 # self-signed cert (suites use CERT_NONE contexts):
 openssl req -x509 -newkey rsa:2048 -keyout /tmp/xmppd-test-key.pem \
@@ -51,6 +55,11 @@ openssl req -x509 -newkey rsa:2048 -keyout /tmp/xmppd-test-key.pem \
 ```
 
 `--no-s2s` avoids colliding with any real instance on port 5269.
+
+The `rate_limit = false` line above is load-bearing for e2e and
+load/benchmark runs (the T32 harness needs it). It can equivalently come
+from `--no-rate-limit` on xmppd-auth when running the daemon standalone.
+Never set it on a reachable deployment — it removes brute-force protection.
 
 ### Environment overrides
 
