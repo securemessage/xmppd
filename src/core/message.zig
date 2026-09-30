@@ -154,6 +154,36 @@ pub const MamQuery = struct {
     reply_to_jid: []const u8,
 };
 
+/// T177 cross-worker SM resume: request from the worker that received
+/// <resume/> to the worker owning the detached session. Small and slot-safe —
+/// the unacked queue itself travels via the shared handoff store, not here.
+pub const SmResumeRequest = struct {
+    /// 32-hex-char SM-ID from the client's previd.
+    previd: []const u8,
+    /// Client's last-acked h from the <resume/> element.
+    h: u32,
+    /// Worker holding the new connection.
+    req_worker: u16,
+    /// Session slot on the requesting worker.
+    req_session: u32,
+    /// Per-session epoch captured at enqueue (ABA guard on slot reuse).
+    req_epoch: u32,
+    /// Authenticated identity of the new connection, validated against the
+    /// detached session's JID by the owning worker.
+    auth_local: []const u8,
+    auth_domain: []const u8,
+};
+
+/// T177: owning worker → requesting worker. status "ok" means the state
+/// bundle was parked in sm_handoff; any other value is the XEP-0198
+/// <failed/> error condition to send the client.
+pub const SmResumeReply = struct {
+    previd: []const u8,
+    req_session: u32,
+    req_epoch: u32,
+    status: []const u8,
+};
+
 /// Archive confirmation.
 pub const ArchiveEvent = struct {
     bare_jid: []const u8,
@@ -196,6 +226,9 @@ pub const Tag = enum(u8) {
     invalidate_subscription = 0x1a,
     pep_published = 0x20,
     stanza_archived = 0x30,
+    /// Cross-worker SM resume handoff (T177), flagged via SM_ACTOR_SENTINEL.
+    sm_resume_request = 0x40,
+    sm_resume_reply = 0x41,
 };
 
 pub const Message = union(Tag) {
@@ -218,6 +251,8 @@ pub const Message = union(Tag) {
     invalidate_subscription: CacheInvalidate,
     pep_published: PepEvent,
     stanza_archived: ArchiveEvent,
+    sm_resume_request: SmResumeRequest,
+    sm_resume_reply: SmResumeReply,
 
     /// Get the wire tag byte for this message.
     pub fn tag(self: Message) u8 {
@@ -318,6 +353,21 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.bare_jid) catch return null;
             writeStr(w, ev.stanza_id) catch return null;
             writeU64(w, ev.timestamp) catch return null;
+        },
+        .sm_resume_request => |ev| {
+            writeStr(w, ev.previd) catch return null;
+            writeU32(w, ev.h) catch return null;
+            writeU16(w, ev.req_worker) catch return null;
+            writeU32(w, ev.req_session) catch return null;
+            writeU32(w, ev.req_epoch) catch return null;
+            writeStr(w, ev.auth_local) catch return null;
+            writeStr(w, ev.auth_domain) catch return null;
+        },
+        .sm_resume_reply => |ev| {
+            writeStr(w, ev.previd) catch return null;
+            writeU32(w, ev.req_session) catch return null;
+            writeU32(w, ev.req_epoch) catch return null;
+            writeStr(w, ev.status) catch return null;
         },
     }
 
@@ -521,6 +571,36 @@ pub fn decode(data: []const u8) ?Message {
                 .bare_jid = bare_jid,
                 .stanza_id = stanza_id,
                 .timestamp = timestamp,
+            } };
+        },
+        .sm_resume_request => {
+            const previd = readStr(data, &fbs) orelse return null;
+            const h = readU32(r) orelse return null;
+            const req_worker = readU16(r) orelse return null;
+            const req_session = readU32(r) orelse return null;
+            const req_epoch = readU32(r) orelse return null;
+            const auth_local = readStr(data, &fbs) orelse return null;
+            const auth_domain = readStr(data, &fbs) orelse return null;
+            return .{ .sm_resume_request = .{
+                .previd = previd,
+                .h = h,
+                .req_worker = req_worker,
+                .req_session = req_session,
+                .req_epoch = req_epoch,
+                .auth_local = auth_local,
+                .auth_domain = auth_domain,
+            } };
+        },
+        .sm_resume_reply => {
+            const previd = readStr(data, &fbs) orelse return null;
+            const req_session = readU32(r) orelse return null;
+            const req_epoch = readU32(r) orelse return null;
+            const status = readStr(data, &fbs) orelse return null;
+            return .{ .sm_resume_reply = .{
+                .previd = previd,
+                .req_session = req_session,
+                .req_epoch = req_epoch,
+                .status = status,
             } };
         },
     }
@@ -968,6 +1048,57 @@ test "encode/decode: invalidate_subscription round-trip" {
     switch (decoded) {
         .invalidate_subscription => |ev| {
             try std.testing.expectEqualStrings("alice@example.com", ev.bare_jid);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: sm_resume_request round-trip" {
+    const msg = Message{ .sm_resume_request = .{
+        .previd = "0001abcdef0123456789abcdef01234567",
+        .h = 41,
+        .req_worker = 3,
+        .req_session = 17,
+        .req_epoch = 5,
+        .auth_local = "alice",
+        .auth_domain = "example.com",
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .sm_resume_request => |ev| {
+            try std.testing.expectEqualStrings("0001abcdef0123456789abcdef01234567", ev.previd);
+            try std.testing.expectEqual(@as(u32, 41), ev.h);
+            try std.testing.expectEqual(@as(u16, 3), ev.req_worker);
+            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 5), ev.req_epoch);
+            try std.testing.expectEqualStrings("alice", ev.auth_local);
+            try std.testing.expectEqualStrings("example.com", ev.auth_domain);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: sm_resume_reply round-trip" {
+    const msg = Message{ .sm_resume_reply = .{
+        .previd = "0002abcdef0123456789abcdef01234567",
+        .req_session = 9,
+        .req_epoch = 2,
+        .status = "ok",
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .sm_resume_reply => |ev| {
+            try std.testing.expectEqualStrings("ok", ev.status);
+            try std.testing.expectEqual(@as(u32, 9), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 2), ev.req_epoch);
         },
         else => return error.WrongTag,
     }

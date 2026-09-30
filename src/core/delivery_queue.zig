@@ -41,6 +41,11 @@ pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
 /// to the local room shard for processing.
 pub const ROOM_ACTOR_SENTINEL: u32 = 0xFFFFFFFE;
 
+/// Sentinel value for target_session_id indicating an SM resume handoff
+/// message (T177). Payload decodes as a message.zig sm_resume_request (on the
+/// owning worker) or sm_resume_reply (on the requesting worker).
+pub const SM_ACTOR_SENTINEL: u32 = 0xFFFFFFFD;
+
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
 

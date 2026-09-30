@@ -78,6 +78,7 @@ const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 const actor_message = @import("message.zig");
 pub const sm_state = @import("sm_state.zig");
+const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
@@ -338,6 +339,15 @@ pub const Session = struct {
     /// waiting for the client — and guarantees that a queue reaching full
     /// capacity belongs to a client that ignored our ack requests.
     sm_r_outstanding: bool = false,
+
+    /// T177: async cross-worker resume in flight. This session received a
+    /// <resume/> whose SM-ID belongs to another worker; it stays parked in
+    /// features_bind until the owning worker's handoff reply arrives on the
+    /// MPSC queue. The epoch is bumped per request so a late reply can never
+    /// apply to a different session that reused this slot.
+    sm_resume_pending: bool = false,
+    sm_resume_epoch: u32 = 0,
+    sm_resume_previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined,
 
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
@@ -2693,6 +2703,12 @@ pub const Server = struct {
                     return;
                 }
 
+                // SM resume handoff actor message (T177)
+                if (local_session_id == delivery_queue_mod.SM_ACTOR_SENTINEL) {
+                    c.server.handleSmActorMessage(payload, c.changes);
+                    return;
+                }
+
                 // Unicast: ABA check then deliver to single session
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
@@ -3033,6 +3049,18 @@ pub const Server = struct {
             return;
         }
 
+        // T177: SM-IDs embed the owning worker id (sm_state.generateSmId).
+        // A resume arriving on the wrong worker goes through the cross-worker
+        // handoff instead of failing item-not-found.
+        if (self.getWorkerCount() > 1) {
+            if (sm_state.workerIdFromSmId(previd)) |owner| {
+                if (owner != self.worker_id and owner < self.getWorkerCount()) {
+                    self.startCrossWorkerResume(session, previd, h_value, owner, changes);
+                    return;
+                }
+            }
+        }
+
         // Find the detached session with matching SM-ID
         const detached_id = self.findDetachedSession(previd) orelse {
             self.sendSmFailed(session, "item-not-found", changes);
@@ -3168,6 +3196,340 @@ pub const Server = struct {
             session.sm_id[0..session.sm_id_len],
             if (session.sm_unacked) |q| q.pending() else 0,
         });
+    }
+
+    /// T177 step 1 — requesting worker. Park the resuming session and ask the
+    /// owning worker (decoded from the SM-ID prefix) to hand off the detached
+    /// session's state. Nothing is sent to the client until the reply arrives.
+    fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const u8, h_value: u32, owner: u16, changes: *ChangeList) void {
+        const auth_jid = session.stream.authenticated_jid orelse {
+            self.sendSmFailed(session, "not-authorized", changes);
+            return;
+        };
+        if (session.sm_resume_pending) {
+            self.sendSmFailed(session, "unexpected-request", changes);
+            return;
+        }
+
+        session.sm_resume_pending = true;
+        session.sm_resume_epoch +%= 1;
+        @memcpy(&session.sm_resume_previd, previd[0..sm_state.SM_ID_HEX_LEN]);
+
+        log.info("connection {d} cross-worker SM resume: previd={s} owned by worker {d}", .{
+            session.conn.id, previd, owner,
+        });
+
+        self.enqueueSmActor(owner, .{ .sm_resume_request = .{
+            .previd = previd,
+            .h = h_value,
+            .req_worker = self.worker_id,
+            .req_session = @intCast(session.conn.id),
+            .req_epoch = session.sm_resume_epoch,
+            .auth_local = auth_jid.local,
+            .auth_domain = auth_jid.domain,
+        } }) catch |err| {
+            log.warn("cross-worker SM resume: enqueue to worker {d} failed: {}", .{ owner, err });
+            session.sm_resume_pending = false;
+            self.sendSmFailed(session, "item-not-found", changes);
+        };
+    }
+
+    /// T177 step 2 — owning worker. Validate, snapshot the detached session
+    /// into the handoff store, dismantle the slot, reply.
+    ///
+    /// Runs on this worker's MPSC drain, after any stanza deliveries that were
+    /// queued to the detached slot ahead of this request, so the snapshot
+    /// includes them. Stanzas arriving after the unbind fall to the offline
+    /// path until the requesting worker re-binds (known micro-window).
+    fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) void {
+        const fail = struct {
+            fn send(server: *Server, r: actor_message.SmResumeRequest, status: []const u8, why: []const u8) void {
+                log.info("cross-worker SM resume handoff for {s} rejected: {s}", .{ r.previd, why });
+                server.enqueueSmActor(r.req_worker, .{ .sm_resume_reply = .{
+                    .previd = r.previd,
+                    .req_session = r.req_session,
+                    .req_epoch = r.req_epoch,
+                    .status = status,
+                } }) catch {};
+            }
+        }.send;
+
+        const detached_id = self.findDetachedSession(req.previd) orelse
+            return fail(self, req, "item-not-found", "no such detached session");
+        const detached = self.sessions[detached_id] orelse
+            return fail(self, req, "item-not-found", "slot empty");
+
+        if (detached.sm_overflow)
+            return fail(self, req, "item-not-found", "unacked queue overflowed");
+        if (std.time.timestamp() - detached.sm_detach_time > sm_state.DEFAULT_RESUME_TIMEOUT)
+            return fail(self, req, "item-not-found", "resume window expired");
+        if (detached.sm_detached == false)
+            return fail(self, req, "unexpected-request", "session not detached");
+
+        const dj = detached.stream.bound_jid orelse
+            return fail(self, req, "item-not-found", "no bound JID");
+        if (!std.mem.eql(u8, dj.local, req.auth_local) or !std.mem.eql(u8, dj.domain, req.auth_domain))
+            return fail(self, req, "not-authorized", "JID mismatch");
+
+        // v1 limitation: MUC occupant records are not migrated — fall back to
+        // full re-bind so the client rejoins rooms cleanly (T177 follow-up).
+        if (self.sessionOccupiesAnyRoom(self.worker_id, detached_id))
+            return fail(self, req, "item-not-found", "MUC occupancy migration not yet supported");
+
+        if (detached.sm_unacked) |q| q.ack(req.h);
+
+        const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch
+            return fail(self, req, "item-not-found", "bundle alloc failed");
+        bundle.* = .{
+            .previd = undefined,
+            .sm_in_h = detached.sm_in_h,
+            .sm_out_seq = detached.sm_out_seq,
+            .sm_out_h = req.h,
+            .r_outstanding = detached.sm_r_outstanding,
+            .roster_interested = detached.roster_interested,
+            .carbons_enabled = detached.carbons_enabled,
+            .csi_active = detached.csi_active,
+            .username = sm_handoff.allocator.dupe(u8, detached.auth_username_buf[0..detached.auth_username_len]) catch {
+                sm_handoff.allocator.destroy(bundle);
+                return fail(self, req, "item-not-found", "bundle alloc failed");
+            },
+            .resource = sm_handoff.allocator.dupe(u8, dj.resource) catch {
+                sm_handoff.allocator.free(bundle.username);
+                sm_handoff.allocator.destroy(bundle);
+                return fail(self, req, "item-not-found", "bundle alloc failed");
+            },
+            .last_presence = sm_handoff.allocator.dupe(u8, detached.last_presence_inner[0..detached.last_presence_inner_len]) catch {
+                sm_handoff.allocator.free(bundle.resource);
+                sm_handoff.allocator.free(bundle.username);
+                sm_handoff.allocator.destroy(bundle);
+                return fail(self, req, "item-not-found", "bundle alloc failed");
+            },
+            .base_seq = if (detached.sm_unacked) |q| q.base_seq else 1,
+            .created = std.time.timestamp(),
+        };
+        @memcpy(&bundle.previd, req.previd[0..sm_state.SM_ID_HEX_LEN]);
+
+        if (detached.sm_unacked) |q| {
+            var iter = q.getUnacked();
+            while (iter.next()) |stanza| {
+                const copy = sm_handoff.allocator.dupe(u8, stanza) catch {
+                    bundle.deinit();
+                    sm_handoff.allocator.destroy(bundle);
+                    return fail(self, req, "item-not-found", "bundle alloc failed");
+                };
+                bundle.stanzas.append(sm_handoff.allocator, copy) catch {
+                    sm_handoff.allocator.free(copy);
+                    bundle.deinit();
+                    sm_handoff.allocator.destroy(bundle);
+                    return fail(self, req, "item-not-found", "bundle alloc failed");
+                };
+            }
+        }
+
+        sm_handoff.put(req.previd, bundle) catch {
+            bundle.deinit();
+            sm_handoff.allocator.destroy(bundle);
+            self.enqueueSmActor(req.req_worker, .{ .sm_resume_reply = .{
+                .previd = req.previd,
+                .req_session = req.req_session,
+                .req_epoch = req.req_epoch,
+                .status = "item-not-found",
+            } }) catch {};
+            return;
+        };
+
+        // Dismantle the detached slot: same teardown as a successful local
+        // resume (session-map unbind, sm-id map removal, free the slot).
+        if (self.session_map) |sm| {
+            _ = sm.unbind(dj.local, dj.domain, dj.resource);
+        }
+        if (self.detached_count > 0) self.detached_count -= 1;
+        self.smIdMapRemove(detached.sm_id[0..detached.sm_id_len]);
+        detached.sm_resume_enabled = false; // Prevent re-detach
+        detached.deinit();
+        self.allocator.destroy(detached);
+        self.sessions[detached_id] = null;
+        if (self.free_count < self.free_ids.len) {
+            self.free_ids[self.free_count] = detached_id;
+            self.free_count += 1;
+        }
+
+        log.info("cross-worker SM resume: handed off {s} to worker {d} ({d} stanzas)", .{
+            req.previd, req.req_worker, bundle.stanzas.items.len,
+        });
+
+        self.enqueueSmActor(req.req_worker, .{ .sm_resume_reply = .{
+            .previd = req.previd,
+            .req_session = req.req_session,
+            .req_epoch = req.req_epoch,
+            .status = "ok",
+        } }) catch |err| {
+            log.warn("cross-worker SM resume: reply to worker {d} failed: {}", .{ req.req_worker, err });
+        };
+    }
+
+    /// T177 step 3 — requesting worker. Apply the handed-off state to the
+    /// parked session, re-bind it in the session map, send <resumed/> and
+    /// replay. The epoch check makes stale replies to a reused slot harmless.
+    fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, changes: *ChangeList) void {
+        const session = self.sessions[rep.req_session] orelse {
+            // Requesting connection is gone — drop any parked bundle.
+            if (sm_handoff.take(rep.previd)) |orphan| sm_handoff.release(orphan);
+            return;
+        };
+
+        if (!session.sm_resume_pending or
+            session.sm_resume_epoch != rep.req_epoch or
+            !std.mem.eql(u8, session.sm_resume_previd[0..], rep.previd))
+        {
+            log.warn("cross-worker SM resume: stale reply for {s} ignored", .{rep.previd});
+            if (std.mem.eql(u8, rep.status, "ok")) {
+                if (sm_handoff.take(rep.previd)) |orphan| sm_handoff.release(orphan);
+            }
+            return;
+        }
+        session.sm_resume_pending = false;
+
+        if (!std.mem.eql(u8, rep.status, "ok")) {
+            log.info("connection {d} cross-worker SM resume failed: {s}", .{ session.conn.id, rep.status });
+            self.sendSmFailed(session, rep.status, changes);
+            return;
+        }
+
+        const bundle = sm_handoff.take(rep.previd) orelse {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        };
+        defer sm_handoff.release(bundle);
+
+        // Rebuild the unacked queue on this worker's allocator.
+        const queue = self.allocator.create(sm_state.SmUnackedQueue) catch {
+            self.sendSmFailed(session, "item-not-found", changes);
+            return;
+        };
+        queue.* = sm_state.SmUnackedQueue.init(self.allocator);
+        queue.base_seq = bundle.base_seq;
+        var replay_count: u32 = 0;
+        for (bundle.stanzas.items) |stanza| {
+            switch (queue.push(stanza)) {
+                .pushed => replay_count += 1,
+                else => {
+                    // Source was already ack-trimmed and bounded by
+                    // UNACKED_CAPACITY — an overflow here means corruption.
+                    log.err("cross-worker SM resume: rebuilt queue overflow", .{});
+                    queue.deinit();
+                    self.allocator.destroy(queue);
+                    self.sendSmFailed(session, "item-not-found", changes);
+                    return;
+                },
+            }
+        }
+
+        session.sm_enabled = true;
+        session.sm_in_h = bundle.sm_in_h;
+        session.sm_out_h = bundle.sm_out_h;
+        session.sm_out_seq = bundle.sm_out_seq;
+        session.sm_r_outstanding = bundle.r_outstanding;
+        session.sm_resume_enabled = true;
+        @memcpy(&session.sm_id, &bundle.previd);
+        session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+        session.sm_unacked = queue;
+
+        @memcpy(session.auth_username_buf[0..bundle.username.len], bundle.username);
+        session.auth_username_len = bundle.username.len;
+        @memcpy(session.bind_resource_buf[0..bundle.resource.len], bundle.resource);
+        session.bind_resource_len = bundle.resource.len;
+        session.stream.bound_jid = .{
+            .local = session.auth_username_buf[0..session.auth_username_len],
+            .domain = self.server_host,
+            .resource = session.bind_resource_buf[0..session.bind_resource_len],
+        };
+        session.stream.authenticated_jid = .{
+            .local = session.auth_username_buf[0..session.auth_username_len],
+            .domain = self.server_host,
+        };
+        session.stream.authenticated = true;
+        session.stream.state = .active;
+        session.roster_interested = bundle.roster_interested;
+        session.carbons_enabled = bundle.carbons_enabled;
+        session.csi_active = bundle.csi_active;
+        @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
+        session.last_presence_inner_len = bundle.last_presence.len;
+
+        if (self.session_map) |sm| {
+            _ = sm.bind(self.worker_id, @intCast(session.conn.id), bundle.username, self.server_host, bundle.resource) catch |err| {
+                log.err("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
+                    bundle.username, self.server_host, bundle.resource, err,
+                });
+            };
+        }
+
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<resumed xmlns='urn:xmpp:sm:3' h='") catch return;
+        std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
+        w.writeAll("' previd='") catch return;
+        w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
+        w.writeAll("'/>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+
+        if (session.sm_unacked) |q| {
+            var iter = q.getUnacked();
+            while (iter.next()) |stanza| {
+                session.conn.queueSend(stanza) catch break;
+            }
+        }
+
+        if (session.conn.hasPendingWrite()) {
+            _ = session.conn.flushSend() catch {};
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+        }
+
+        log.info("connection {d} cross-worker session resumed (id={s}, replayed {d} stanzas)", .{
+            session.conn.id,
+            session.sm_id[0..session.sm_id_len],
+            replay_count,
+        });
+    }
+
+    /// Dispatch an SM handoff actor message (MPSC, SM_ACTOR_SENTINEL).
+    fn handleSmActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
+        const msg = actor_message.decode(payload) orelse {
+            log.warn("malformed SM actor message ({d} bytes)", .{payload.len});
+            return;
+        };
+        switch (msg) {
+            .sm_resume_request => |ev| self.handleSmResumeRequest(ev),
+            .sm_resume_reply => |ev| self.handleSmResumeReply(ev, changes),
+            else => log.warn("unexpected tag in SM actor dispatch: 0x{x:0>2}", .{msg.tag()}),
+        }
+    }
+
+    /// Encode an actor message and enqueue it to a target worker's MPSC queue
+    /// under the SM handoff sentinel.
+    fn enqueueSmActor(self: *Server, target_worker: u16, msg: actor_message.Message) !void {
+        const ds = self.delivery_system orelse return error.NoDeliverySystem;
+        var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
+        const len = actor_message.encode(&buf, msg) orelse return error.EncodeFailed;
+        try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_SENTINEL, 0, buf[0..len]);
+    }
+
+    /// True if this worker's session occupies any MUC room (authoritative
+    /// occupant records for local sessions live in every worker's registry
+    /// via the shadow-room replication).
+    fn sessionOccupiesAnyRoom(self: *Server, worker_id: u16, session_id: usize) bool {
+        const reg = self.room_registry orelse return false;
+        for (&reg.rooms) |*slot| {
+            const room = slot.* orelse continue;
+            if (!room.active) continue;
+            for (&room.occupants) |*occ_slot| {
+                const occ = occ_slot.* orelse continue;
+                if (occ.worker_id == worker_id and occ.session_id == session_id) return true;
+            }
+        }
+        return false;
     }
 
     /// Send SM <failed/> with a specific error condition.

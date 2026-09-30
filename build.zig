@@ -538,6 +538,22 @@ pub fn build(b: *std.Build) void {
 
     const run_delivery_queue_tests = b.addRunArtifact(delivery_queue_tests);
 
+    // --- SM handoff store tests ---
+
+    const sm_handoff_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/sm_handoff.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const sm_handoff_tests = b.addTest(.{
+        .name = "sm-handoff-tests",
+        .root_module = sm_handoff_test_mod,
+    });
+
+    const run_sm_handoff_tests = b.addRunArtifact(sm_handoff_tests);
+
     // --- Offline store tests ---
 
     const offline_store_test_mod = b.createModule(.{
@@ -1389,6 +1405,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
+    test_step.dependOn(&run_sm_handoff_tests.step);
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);
