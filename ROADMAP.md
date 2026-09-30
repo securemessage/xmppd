@@ -138,6 +138,12 @@ Deferred out of the v0.8.0 feature release:
 - [ ] T110 — backpressure
 - [ ] T87 — async archive writer
 - [ ] T154 — cross-worker resource eviction (workers>1)
+- [ ] **T177** — cross-worker SM resume: Option A state handoff landed
+      2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
+      MPSC request/reply, mutex-guarded handoff store for the unacked queue,
+      ABA epoch guard, e2e-sm-resume passes at workers=4. REMAINING: MUC
+      occupant-record migration (currently falls back to full re-bind) and the
+      unbind→re-bind offline-routing micro-window
 - [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
       store, offline elapsed seconds, privacy rules)
 - [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
