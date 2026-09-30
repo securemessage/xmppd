@@ -42,6 +42,13 @@ tracks the release-level shape.
 
 ### Immediate
 
+- [ ] Tag **v0.8.11** — hardening patch: auth rate limiting was silently
+      inert in every prior release (empty-username checks + 8-slot ring <
+      20-attempt default). Fixed and verified with a live single-IP hammer;
+      SASL failure reasons (policy-violation/account-disabled) now reach the
+      wire. New `[auth] rate_limit = false` switch for benchmark rigs.
+      UPGRADE NOTE: first release where the brute-force policy actually
+      enforces (5/account, 20/IP per 120s, lockout after 10 fails).
 - [x] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
       — verified and tagged 2026-08-30 (see Phase 13 Deferred Follow-ups for the
       full test matrix), deployed to the test jail the same day
