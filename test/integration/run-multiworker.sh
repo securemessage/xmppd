@@ -99,6 +99,8 @@ cert = $tmp/cert.pem
 key = $tmp/key.pem
 [auth]
 socket = $tmp/auth.sock
+# Connect-heavy suites would trip per-account/IP auth limits otherwise.
+rate_limit = false
 EOF
 
 # NOTE: only one xmppd master per run-dir may run (PID file lock); this lane

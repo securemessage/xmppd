@@ -36,6 +36,14 @@ in development mode.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `socket` | `/var/run/xmppd/auth.sock` | IPC socket path |
+| `rate_limit` | `true` | Authentication rate limiting master switch; `false` disables it entirely (testing/benchmarks only) |
+| `max_per_account` | `5` | Max auth attempts per account per window |
+| `max_per_ip` | `20` | Max auth attempts per IP per window |
+| `window_seconds` | `120` | Rate window size |
+| `lockout_duration` | `300` | Temporary lockout length in seconds |
+| `lockout_threshold` | `10` | Consecutive failures before temporary lockout |
+| `registration` | `false` | In-band registration (XEP-0077) |
+| `require_invite` | `true` | Require invitation code for registration |
 
 ### [muc]
 

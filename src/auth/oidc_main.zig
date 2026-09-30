@@ -143,7 +143,12 @@ pub fn main() !void {
 
     // Initialize auth handler (generic over OidcStore)
     var handler = AuthHandler.init(allocator, &oidc_store);
-    handler.setRateLimiter(&rate_limiter);
+    const rate_limit_disabled = if (cfg.get("oidc", "rate_limit")) |v| std.mem.eql(u8, v, "false") else false;
+    if (!rate_limit_disabled) {
+        handler.setRateLimiter(&rate_limiter);
+    } else {
+        log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
+    }
     defer handler.deinit();
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
