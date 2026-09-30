@@ -1648,7 +1648,7 @@ pub const Server = struct {
 
         if (!self.ipc.connected) {
             log.warn("connection {d} auth request but no auth daemon", .{session.conn.id});
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         }
@@ -1658,14 +1658,14 @@ pub const Server = struct {
         var decoded_buf: [3072]u8 = undefined;
         const decoded = b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL auth", .{session.conn.id});
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         };
 
         // Determine mechanism ID
         const mech_id = ipc_protocol.MechanismId.fromName(session.sasl_mechanism) orelse {
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         };
@@ -1689,7 +1689,7 @@ pub const Server = struct {
             },
         }) catch {
             log.err("connection {d} failed to send auth request via IPC", .{session.conn.id});
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         };
@@ -1707,7 +1707,7 @@ pub const Server = struct {
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         }
@@ -1717,7 +1717,7 @@ pub const Server = struct {
         var decoded_buf: [3072]u8 = undefined;
         const decoded = b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL response", .{session.conn.id});
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         };
@@ -1728,7 +1728,7 @@ pub const Server = struct {
             .payload = decoded,
         } }) catch {
             log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
-            const fail_action = session.stream.saslFailure();
+            const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action);
             return;
         };
@@ -1914,7 +1914,7 @@ pub const Server = struct {
             },
             .auth_failure => |m| {
                 log.info("connection {d} auth failed: {s}", .{ conn_id, m.reason });
-                const fail_action = session.stream.saslFailure();
+                const fail_action = session.stream.saslFailure(m.reason);
                 self.executeAction(session, fail_action);
                 session.resetSasl();
 
