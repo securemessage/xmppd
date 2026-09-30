@@ -179,12 +179,15 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
             }
 
-            // Rate limiting check (if enabled)
+            // Rate limiting (if enabled). Per-IP only here: core sends
+            // username="" (the daemon extracts it from the SASL payload), so
+            // the per-account check runs in each mechanism handler once the
+            // username is known.
             if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed(req.username, req.client_ip)) |reason| {
+                if (rl.checkAllowed("", req.client_ip)) |reason| {
                     return authFailure(req.conn_id, reason);
                 }
-                rl.recordAttempt(req.username, req.client_ip);
+                rl.recordAttempt("", req.client_ip);
             }
 
             return switch (req.mechanism) {
@@ -229,6 +232,14 @@ pub fn AuthHandler(comptime Store: type) type {
 
             const username = payload[authcid_start..authcid_end];
             const password = payload[passwd_start..];
+
+            // Per-account rate limiting (username was "" at auth_request entry)
+            if (self.rate_limiter) |rl| {
+                if (rl.checkAllowed(username, "")) |reason| {
+                    return authFailure(req.conn_id, reason);
+                }
+                rl.recordAttempt(username, "");
+            }
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
@@ -359,6 +370,15 @@ pub fn AuthHandler(comptime Store: type) type {
                     session.deinit();
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
+
+                // Per-account rate limiting (username was "" at auth_request entry)
+                if (self.rate_limiter) |rl| {
+                    if (rl.checkAllowed(username, "")) |reason| {
+                        session.deinit();
+                        return authFailure(req.conn_id, reason);
+                    }
+                    rl.recordAttempt(username, "");
+                }
 
                 // Look up credentials — try cache first, fall back to store
                 const name_hash = hashUsername(username);
@@ -916,4 +936,123 @@ test "AuthHandler: credential cache invalidated on password change" {
 
     // Cache should be invalidated
     try std.testing.expect(handler.cacheLookup(hashUsername("rotate"), std.time.timestamp()) == null);
+}
+
+test "AuthHandler: unlimited attempts when rate limiter is not attached" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "hammer", "pass");
+
+    // No setRateLimiter call — the [auth] rate_limit = false configuration.
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var payload: [12]u8 = undefined;
+    payload[0] = 0;
+    const user = "hammer";
+    @memcpy(payload[1 .. 1 + user.len], user);
+    payload[1 + user.len] = 0;
+    const pass = "pass";
+    @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+    const auth_b64 = payload[0 .. 2 + user.len + pass.len];
+
+    // Far beyond the default per-IP limit (20); every attempt must succeed.
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) {
+        const result = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = 100 + i,
+            .mechanism = .plain,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "hammer",
+            .payload = auth_b64,
+        } }) orelse return error.NoResponse;
+        try std.testing.expectEqualStrings("hammer", result.auth_success.username);
+    }
+}
+
+/// Build a PLAIN payload "\0user\0pass" for tests.
+fn plainPayload(buf: []u8, user: []const u8, pass: []const u8) []const u8 {
+    buf[0] = 0;
+    @memcpy(buf[1 .. 1 + user.len], user);
+    buf[1 + user.len] = 0;
+    @memcpy(buf[2 + user.len .. 2 + user.len + pass.len], pass);
+    return buf[0 .. 2 + user.len + pass.len];
+}
+
+fn plainRequest(conn_id: u32, ip: []const u8, payload: []const u8) protocol.Message {
+    return .{ .auth_request = .{
+        .conn_id = conn_id,
+        .mechanism = .plain,
+        .client_ip = ip,
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload,
+    } };
+}
+
+test "AuthHandler: PLAIN per-account rate limit engages on parsed username" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "carol", "pw");
+
+    var limiter = RateLimiter.init(.{
+        .max_per_account = 2,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+    });
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [16]u8 = undefined;
+    const req = plainPayload(&buf, "carol", "pw");
+
+    // First two attempts pass the rate check (auth itself succeeds)
+    try std.testing.expectEqualStrings("carol", (handler.handleMessage(plainRequest(1, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
+    try std.testing.expectEqualStrings("carol", (handler.handleMessage(plainRequest(2, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
+
+    // Third exceeds max_per_account = 2
+    const third = handler.handleMessage(plainRequest(3, "10.9.0.1", req)) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("policy-violation", third.auth_failure.reason);
+}
+
+test "AuthHandler: PLAIN account lockout engages on parsed username" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "rightpw");
+
+    var limiter = RateLimiter.init(.{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+    });
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [20]u8 = undefined;
+    const wrong = plainPayload(&buf, "dave", "wrongpw");
+
+    // Two consecutive failures hit the lockout threshold
+    _ = handler.handleMessage(plainRequest(10, "10.9.0.2", wrong));
+    _ = handler.handleMessage(plainRequest(11, "10.9.0.2", wrong));
+
+    const locked = handler.handleMessage(plainRequest(12, "10.9.0.3", wrong)) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("account-disabled", locked.auth_failure.reason);
 }
