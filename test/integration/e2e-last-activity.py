@@ -10,6 +10,9 @@ Covers the full semantic matrix:
      a 2s window), then back to 0 on reconnect.
   5. Privacy gate: non-subscribed requester gets 'forbidden' for online,
      offline, and nonexistent targets alike.
+  6. Full-JID queries forward to the resource per RFC 6121 §8.5.3; the
+     resource's client answers its own idle time (XEP-0012 §2.1). Unbound
+     full JIDs get a server-side error bounce.
 
 Pre-T164 every one of these answered seconds='0' — this suite fails on the
 stub.
@@ -22,6 +25,8 @@ import socket, ssl, time, base64, sys, re, os
 HOST = os.environ.get('XMPP_HOST', '127.0.0.1')
 PORT = int(os.environ.get('XMPP_PORT', '15222'))
 DOMAIN = os.environ.get('XMPP_DOMAIN', 'localhost')
+SERVER_LOG = os.environ.get('XMPP_SERVER_LOG', '')
+WORKERS = int(os.environ.get('XMPP_WORKERS', '1'))
 
 CREDS = {'alice': 'pass1', 'bob': 'pass2', 'charlie': 'pass3'}
 
@@ -35,6 +40,9 @@ class XmppClient:
         self.password = CREDS[user]
         self.sock = None
         self.tls = None
+        # Client-side idle clock (XEP-0012 §2.1): last interaction in either
+        # direction — the client answers its own idle time.
+        self.idle_since = time.time()
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -42,6 +50,7 @@ class XmppClient:
         self.sock.settimeout(5)
 
     def send(self, data):
+        self.idle_since = time.time()
         target = self.tls or self.sock
         if isinstance(data, str):
             data = data.encode()
@@ -100,7 +109,25 @@ class XmppClient:
         self.send(f"<iq type='set' id='bind1'>"
                   f"<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>"
                   f"<resource>{resource}</resource></bind></iq>")
-        return self.recv()
+        resp = self.recv()
+        # Announce presence: without it the server holds subscription requests
+        # as pending and routes bare-JID traffic to the offline store.
+        self.send('<presence/>')
+        self.drain(0.3)
+        return resp
+
+    def ask_last_activity(self, target, iq_id):
+        """Send a last-activity query WITHOUT waiting (used when the answer
+        must be produced by the peer before we read it)."""
+        to = f" to='{target}'" if target else ''
+        self.send(f"<iq type='get' id='{iq_id}'{to}><query xmlns='jabber:iq:last'/></iq>")
+
+    def answer_last_activity(self, iq_id, from_full, to_full):
+        """Answer a forwarded full-JID last-activity query client-side
+        (XEP-0012 §2.1: the resource answers its own idle time)."""
+        idle = max(0, int(time.time() - self.idle_since))
+        self.send(f"<iq type='result' from='{from_full}' to='{to_full}' id='{iq_id}'>"
+                  f"<query xmlns='jabber:iq:last' seconds='{idle}'/></iq>")
 
     def last_activity(self, target, iq_id):
         to = f" to='{target}'" if target else ''
@@ -130,9 +157,13 @@ def check(label, condition, detail=''):
 
 
 def last_seconds(resp, iq_id):
-    m = re.search(r"<iq type='result'[^>]*id='" + re.escape(iq_id) + r"'[^>]*>"
-                  r"<query xmlns='jabber:iq:last' seconds='(\d+)'/>", resp)
-    return int(m.group(1)) if m else None
+    # Attribute order is not stable across server-written vs forwarded
+    # answers — match id anywhere in the IQ tag, then read seconds.
+    m = re.search(r"<iq[^>]*id='" + re.escape(iq_id) + r"'[^>]*>", resp)
+    if not m:
+        return None
+    s = re.search(r"<query xmlns='jabber:iq:last' seconds='(\d+)'", resp[m.start():])
+    return int(s.group(1)) if s else None
 
 
 def mutual_subscribe(a, b):
@@ -194,6 +225,46 @@ if __name__ == '__main__':
         mutual_subscribe(alice, bob)
         r = alice.last_activity(f'bob@{DOMAIN}', 'la-bob-online')
         check('online subscribed contact is 0', last_seconds(r, 'la-bob-online') == 0, r[-200:])
+
+        # ---- 3b: full-JID forwarding + client-side idle (XEP-0012 §2.1) ---
+        print('\n[3b] Full-JID query forwarded; bob answers his own idle time')
+        # bob stays silent 2.2s, then alice asks his full JID for idle time.
+        # (ask = send only; bob's client must answer before alice reads.)
+        time.sleep(2.2)
+        alice.ask_last_activity(f'bob@{DOMAIN}/laptop', 'la-bob-idle-1')
+        fwd = bob.recv_until("jabber:iq:last", timeout=5)
+        check('full-JID query forwarded to bob resource', "id='la-bob-idle-1'" in fwd,
+              fwd[-200:])
+        if "id='la-bob-idle-1'" in fwd:
+            bob.answer_last_activity('la-bob-idle-1', f'bob@{DOMAIN}/laptop', f'alice@{DOMAIN}/phone')
+            r = alice.recv_until("id='la-bob-idle-1'", timeout=5)
+            s = last_seconds(r, 'la-bob-idle-1')
+            check('client idle answer routed back (>= 1 after silence)',
+                  s is not None and 1 <= s <= 60,
+                  f'seconds={s}' if s is not None else r[-200:])
+
+        # Activity resets bob's clock (send side)
+        bob.send(f"<message to='alice@{DOMAIN}/phone'><body>activity-marker</body></message>")
+        alice.recv_until('activity-marker', timeout=5)
+        alice.ask_last_activity(f'bob@{DOMAIN}/laptop', 'la-bob-idle-2')
+        fwd = bob.recv_until("id='la-bob-idle-2'", timeout=5)
+        check('second full-JID query forwarded', "jabber:iq:last" in fwd, fwd[-200:])
+        if 'jabber:iq:last' in fwd:
+            bob.answer_last_activity('la-bob-idle-2', f'bob@{DOMAIN}/laptop', f'alice@{DOMAIN}/phone')
+            r = alice.recv_until("id='la-bob-idle-2'", timeout=5)
+            s = last_seconds(r, 'la-bob-idle-2')
+            check('client idle resets to 0 after activity', s == 0,
+                  f'seconds={s}' if s is not None else r[-200:])
+
+        # Unbound full JID: server answers the bounce itself (RFC 6121 §8.5.4)
+        r = alice.last_activity(f'bob@{DOMAIN}/nonexistent', 'la-bob-badres')
+        check('unbound resource -> error bounce',
+              "type='error'" in r and ('<service-unavailable' in r or '<recipient-unavailable' in r),
+              r[-200:])
+
+        # Full-JID queries follow RFC 6121 §8.5.3 forwarding (not the server
+        # answering on behalf), so worker placement is irrelevant — no
+        # server-side probe path exists to hunt for.
 
         # ---- 4: contact goes offline --------------------------------------
         print('\n[4] bob disconnects; elapsed seconds accrue')

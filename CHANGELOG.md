@@ -12,8 +12,10 @@
   ops DB written when an account's final resource unbinds — consistent
   across workers with no new actor traffic). Disclosure follows presence
   visibility (target's roster entry for the requester must be from/both,
-  else forbidden; nonexistent accounts are indistinguishable). Per-
-  resource idle timing is documented as the remaining gap (9d6daff).
+  else forbidden; nonexistent accounts are indistinguishable). Full-JID
+  queries forward to the addressed resource per RFC 6121 §8.5.3 — the
+  resource's client answers its own idle time (XEP-0012 §2.1), so no
+  server-side idle clock is kept (9d6daff).
 - T177 MUC occupant migration: cross-worker XEP-0198 resume now works for
   sessions that occupy MUC rooms (previously refused, forcing a full
   re-bind + rejoin). The handoff bundle carries the detached session's room
