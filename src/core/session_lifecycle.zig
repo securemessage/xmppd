@@ -110,6 +110,22 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
         return true;
     } else |err| {
         if (err == error.AlreadyBound) {
+            // T154: entry lives on ANOTHER worker — cannot touch that session
+            // locally. Ask the holder to destroy it (session_kick); the bind
+            // completes in completeBindAfterKick when the reply lands. The
+            // client waits bind-pending until then.
+            const existing = sm.findByFullJid(local.local, local.domain, eff_resource);
+            if (existing != null and existing.?.worker_id != server.worker_id) {
+                if (!server.startSessionKick(session, local.local, local.domain, eff_resource, existing.?.worker_id, changes)) {
+                    log.err("connection {d} session_map bind failed: resource held by another worker, kick unavailable", .{session.conn.id});
+                    server.sendStreamError(session, .conflict);
+                    forceCloseSession(server, session.conn.id, changes);
+                    return false;
+                }
+                return true;
+            }
+
+            // local (or vanished) entry — the T152 in-worker eviction path
             if (evictStaleResource(server, sm, local.local, local.domain, eff_resource, changes)) {
                 _ = sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource) catch |err2| {
                     log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
@@ -124,10 +140,11 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
                 });
                 return true;
             }
-            // Cross-worker stale entry: no safe local mechanism to evict a
-            // connection owned by another worker thread yet (see T152 follow-up).
-            // Fail loud instead of leaving the client believing it's bound.
-            log.err("connection {d} session_map bind failed: resource held by another worker, cannot evict", .{session.conn.id});
+
+            // Eviction found nothing local that we could close (entry vanished
+            // between findByFullJid and evict attempt): retry path handled none
+            // of this — close with conflict rather than desync the client.
+            log.err("connection {d} session_map bind failed: entry raced away", .{session.conn.id});
             server.sendStreamError(session, .conflict);
             forceCloseSession(server, session.conn.id, changes);
             return false;
@@ -161,6 +178,65 @@ fn sendBindRejected(session: *Session) void {
     session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
+/// T154: the session_kick reply arrived — the full JID is free now. Retry
+/// the parked bind; if yet another worker won meanwhile, kick again up to
+/// the round cap, then give up with conflict.
+pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *ChangeList) void {
+    const resource = session.bind_kick_resource_buf[0..session.bind_kick_resource_len];
+    const local = session.stream.authenticated_jid orelse return;
+    const sm = server.session_map orelse return;
+
+    const bind_and_finish = struct {
+        fn run(srv: *Server, sess: *Session, res: []const u8, changes_: *ChangeList) void {
+            const action = sess.stream.handleBind(res);
+            srv.executeAction(sess, action);
+            log.info("connection {d} session established (kicked remote resource)", .{sess.conn.id});
+            if (sess.conn.hasPendingWrite()) {
+                _ = sess.conn.flushSend() catch {};
+                if (sess.conn.hasPendingWrite()) {
+                    changes_.addWrite(sess.conn.fd, sess.conn.id) catch {};
+                }
+            }
+        }
+    }.run;
+
+    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, resource)) |_| {
+        bind_and_finish(server, session, resource, changes);
+        return;
+    } else |err| {
+        if (err == error.AlreadyBound and session.bind_kick_rounds < MAX_BIND_KICK_ROUNDS) {
+            if (sm.findByFullJid(local.local, local.domain, resource)) |entry| {
+                if (entry.worker_id != server.worker_id and
+                    server.startSessionKick(session, local.local, local.domain, resource, entry.worker_id, changes))
+                {
+                    return; // parked again
+                }
+                if (entry.worker_id == server.worker_id and evictStaleResource(server, sm, local.local, local.domain, resource, changes)) {
+                    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, resource)) |_| {
+                        bind_and_finish(server, session, resource, changes);
+                        return;
+                    } else |_| {}
+                }
+            }
+        }
+        log.err("connection {d} bind after kick failed: {} (rounds={d})", .{ session.conn.id, err, session.bind_kick_rounds });
+        if (err == error.AlreadyBound) {
+            server.sendStreamError(session, .conflict);
+            forceCloseSession(server, session.conn.id, changes);
+            return;
+        }
+        sendBindRejected(session);
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    }
+}
+
+/// Max cross-worker kick rounds per bind attempt. Each round requires a real
+/// registration by somebody in between, but cap anyway — two live takers can
+/// otherwise ping-pong a JID indefinitely.
+pub const MAX_BIND_KICK_ROUNDS: u8 = 3;
+
 /// Evict a stale same-worker session occupying the target full JID so a new
 /// bind can take its place. Returns true if eviction happened locally (the
 /// caller should retry the bind), false if the entry belongs to another
@@ -187,6 +263,7 @@ fn evictStaleResource(
         local, domain, resource, old_id,
     });
     server.sendStreamError(old_session, .conflict);
+    old_session.conn.flushSync(); // deliver the conflict before teardown closes the fd
     forceCloseSession(server, old_id, changes);
     return true;
 }

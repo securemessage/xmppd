@@ -206,6 +206,29 @@ pub const SmResumeReply = struct {
     status: []const u8,
 };
 
+/// T154 cross-worker resource takeover: ask the worker holding a full-JID
+/// binding to destroy that session (RFC 6120 §7.7.3) so the requesting
+/// worker's bind can register. The client waits bind-pending while this
+/// round-trips; a new kick round follows if another worker won meanwhile.
+pub const SessionKickRequest = struct {
+    /// Full-JID identity of the binding to evict.
+    local: []const u8,
+    domain: []const u8,
+    resource: []const u8,
+    /// Worker holding the new connection that wants to bind.
+    req_worker: u16,
+    /// Session slot + per-session epoch on the requesting worker (ABA guard).
+    req_session: u32,
+    req_epoch: u32,
+};
+
+/// T154: owner (or previous owner) → requester. The binding, if it existed,
+/// is gone by the time this reply is drained; the requester retries its bind.
+pub const SessionKickReply = struct {
+    req_session: u32,
+    req_epoch: u32,
+};
+
 /// Archive confirmation.
 pub const ArchiveEvent = struct {
     bare_jid: []const u8,
@@ -255,6 +278,9 @@ pub const Tag = enum(u8) {
     /// Cross-worker SM resume handoff (T177), flagged via SM_ACTOR_SENTINEL.
     sm_resume_request = 0x40,
     sm_resume_reply = 0x41,
+    /// T154 cross-worker resource takeover (RFC 6120 §7.7.3 eviction).
+    session_kick_request = 0x42,
+    session_kick_reply = 0x43,
 };
 
 pub const Message = union(Tag) {
@@ -280,6 +306,8 @@ pub const Message = union(Tag) {
     stanza_archived: ArchiveEvent,
     sm_resume_request: SmResumeRequest,
     sm_resume_reply: SmResumeReply,
+    session_kick_request: SessionKickRequest,
+    session_kick_reply: SessionKickReply,
 
     /// Get the wire tag byte for this message.
     pub fn tag(self: Message) u8 {
@@ -404,6 +432,18 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeU32(w, ev.req_session) catch return null;
             writeU32(w, ev.req_epoch) catch return null;
             writeStr(w, ev.status) catch return null;
+        },
+        .session_kick_request => |ev| {
+            writeStr(w, ev.local) catch return null;
+            writeStr(w, ev.domain) catch return null;
+            writeStr(w, ev.resource) catch return null;
+            writeU16(w, ev.req_worker) catch return null;
+            writeU32(w, ev.req_session) catch return null;
+            writeU32(w, ev.req_epoch) catch return null;
+        },
+        .session_kick_reply => |ev| {
+            writeU32(w, ev.req_session) catch return null;
+            writeU32(w, ev.req_epoch) catch return null;
         },
     }
 
@@ -655,6 +695,30 @@ pub fn decode(data: []const u8) ?Message {
                 .req_session = req_session,
                 .req_epoch = req_epoch,
                 .status = status,
+            } };
+        },
+        .session_kick_request => {
+            const local = readStr(data, &fbs) orelse return null;
+            const domain = readStr(data, &fbs) orelse return null;
+            const resource = readStr(data, &fbs) orelse return null;
+            const req_worker = readU16(r) orelse return null;
+            const req_session = readU32(r) orelse return null;
+            const req_epoch = readU32(r) orelse return null;
+            return .{ .session_kick_request = .{
+                .local = local,
+                .domain = domain,
+                .resource = resource,
+                .req_worker = req_worker,
+                .req_session = req_session,
+                .req_epoch = req_epoch,
+            } };
+        },
+        .session_kick_reply => {
+            const req_session = readU32(r) orelse return null;
+            const req_epoch = readU32(r) orelse return null;
+            return .{ .session_kick_reply = .{
+                .req_session = req_session,
+                .req_epoch = req_epoch,
             } };
         },
     }
@@ -1182,6 +1246,40 @@ test "encode/decode: room_occupant_move round-trip" {
             try std.testing.expectEqual(@as(u16, 3), ev.new_worker_id);
             try std.testing.expectEqual(@as(u32, 271), ev.new_session_id);
             try std.testing.expectEqual(@as(u32, 41), ev.new_generation);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: session_kick round-trips" {
+    const req = Message{ .session_kick_request = .{
+        .local = "alice",
+        .domain = "example.com",
+        .resource = "phone",
+        .req_worker = 2,
+        .req_session = 17,
+        .req_epoch = 9,
+    } };
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, req).?;
+    switch (decode(buf[0..len]).?) {
+        .session_kick_request => |ev| {
+            try std.testing.expectEqualStrings("alice", ev.local);
+            try std.testing.expectEqualStrings("example.com", ev.domain);
+            try std.testing.expectEqualStrings("phone", ev.resource);
+            try std.testing.expectEqual(@as(u16, 2), ev.req_worker);
+            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 9), ev.req_epoch);
+        },
+        else => return error.WrongTag,
+    }
+
+    const rep = Message{ .session_kick_reply = .{ .req_session = 17, .req_epoch = 9 } };
+    const len2 = encode(&buf, rep).?;
+    switch (decode(buf[0..len2]).?) {
+        .session_kick_reply => |ev| {
+            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 9), ev.req_epoch);
         },
         else => return error.WrongTag,
     }

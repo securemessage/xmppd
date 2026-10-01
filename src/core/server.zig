@@ -351,6 +351,17 @@ pub const Session = struct {
     sm_resume_epoch: u32 = 0,
     sm_resume_previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined,
 
+    /// T154: async cross-worker resource takeover in flight. The bind hit
+    /// AlreadyBound against a session owned by another worker; this session
+    /// waits for the session_kick reply, then retries the bind. Epoch is
+    /// bumped per kick round (ABA on slot reuse); rounds bound ping-pong
+    /// retries against concurrent takers.
+    bind_kick_pending: bool = false,
+    bind_kick_epoch: u32 = 0,
+    bind_kick_rounds: u8 = 0,
+    bind_kick_resource_buf: [64]u8 = undefined,
+    bind_kick_resource_len: u8 = 0,
+
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
         return .{
             .conn = Connection.init(fd, id),
@@ -3692,7 +3703,8 @@ pub const Server = struct {
         });
     }
 
-    /// Dispatch an SM handoff actor message (MPSC, SM_ACTOR_SENTINEL).
+    /// Dispatch an SM-handoff/session actor message (MPSC, SM_ACTOR_SENTINEL).
+    /// Covers the T177 resume handoff pair and the T154 session_kick pair.
     fn handleSmActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
         const msg = actor_message.decode(payload) orelse {
             log.warn("malformed SM actor message ({d} bytes)", .{payload.len});
@@ -3701,8 +3713,88 @@ pub const Server = struct {
         switch (msg) {
             .sm_resume_request => |ev| self.handleSmResumeRequest(ev),
             .sm_resume_reply => |ev| self.handleSmResumeReply(ev, changes),
+            .session_kick_request => |ev| self.handleSessionKickRequest(ev, changes),
+            .session_kick_reply => |ev| self.handleSessionKickReply(ev, changes),
             else => log.warn("unexpected tag in SM actor dispatch: 0x{x:0>2}", .{msg.tag()}),
         }
+    }
+
+    /// T154 step 1 — requesting worker. The bind hit AlreadyBound against a
+    /// session owned by `owner`; park the bind and ask that worker to evict.
+    /// Returns false when the kick couldn't even be armed (caller falls back
+    /// to conflict + close).
+    pub fn startSessionKick(self: *Server, session: *Session, local: []const u8, domain: []const u8, resource: []const u8, owner: u16, changes: *ChangeList) bool {
+        _ = changes;
+        if (session.bind_kick_pending) return false;
+        if (session.bind_kick_rounds >= session_lifecycle.MAX_BIND_KICK_ROUNDS) return false;
+        if (resource.len > session.bind_kick_resource_buf.len) return false;
+
+        session.bind_kick_pending = true;
+        session.bind_kick_epoch +%= 1;
+        session.bind_kick_rounds += 1;
+        @memcpy(session.bind_kick_resource_buf[0..resource.len], resource);
+        session.bind_kick_resource_len = @intCast(resource.len);
+
+        self.enqueueSmActor(owner, .{ .session_kick_request = .{
+            .local = local,
+            .domain = domain,
+            .resource = resource,
+            .req_worker = self.worker_id,
+            .req_session = @intCast(session.conn.id),
+            .req_epoch = session.bind_kick_epoch,
+        } }) catch |err| {
+            log.warn("session_kick to worker {d} failed to enqueue: {}", .{ owner, err });
+            session.bind_kick_pending = false;
+            return false;
+        };
+        log.info("connection {d} bind parked: kicking {s}@{s}/{s} on worker {d} (round {d})", .{
+            session.conn.id, local, domain, resource, owner, session.bind_kick_rounds,
+        });
+        return true;
+    }
+
+    /// T154 step 2 — holding worker. Destroy the session owning the full JID
+    /// (RFC 6120 §7.7.3 conflict), then confirm. The destroySession teardown
+    /// removes the session-map entry, so the requester's retry bind succeeds.
+    fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickRequest, changes: *ChangeList) void {
+        if (self.session_map) |sm| {
+            if (sm.findByFullJid(req.local, req.domain, req.resource)) |entry| {
+                if (entry.worker_id == self.worker_id) {
+                    const old_id: usize = @intCast(entry.local_session_id);
+                    if (self.sessions[old_id]) |old| {
+                        log.warn("session {d} evicted: resource {s}@{s}/{s} taken by worker {d}", .{
+                            old_id, req.local, req.domain, req.resource, req.req_worker,
+                        });
+                        self.sendStreamError(old, .conflict);
+                        old.conn.flushSync(); // deliver the conflict before teardown closes the fd
+                        session_lifecycle.forceCloseSession(self, old_id, changes);
+                    } else {
+                        // Dangling entry with no session — just drop it.
+                        _ = sm.unbind(req.local, req.domain, req.resource);
+                    }
+                }
+            }
+        }
+
+        self.enqueueSmActor(req.req_worker, .{ .session_kick_reply = .{
+            .req_session = req.req_session,
+            .req_epoch = req.req_epoch,
+        } }) catch |err| {
+            log.warn("session_kick reply to worker {d} failed: {}", .{ req.req_worker, err });
+        };
+    }
+
+    /// T154 step 3 — requesting worker. Epoch-guarded, then retry the bind.
+    fn handleSessionKickReply(self: *Server, rep: actor_message.SessionKickReply, changes: *ChangeList) void {
+        const session = self.sessions[rep.req_session] orelse return;
+
+        if (!session.bind_kick_pending or session.bind_kick_epoch != rep.req_epoch) {
+            log.warn("stale session_kick reply for conn {d} ignored", .{rep.req_session});
+            return;
+        }
+        session.bind_kick_pending = false;
+
+        session_lifecycle.completeBindAfterKick(self, session, changes);
     }
 
     /// Encode an actor message and enqueue it to a target worker's MPSC queue

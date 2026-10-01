@@ -45,8 +45,8 @@ jobs:
       # the other backends links on a package-free host).
       - name: Build
         run: zig build -Darchive-storage=lmdb
-      - name: MUC + subscription + SM resume at workers=4
+      - name: MUC + subscription + SM resume + resource takeover at workers=4
         run: |
           SLIXPYTHON=/tmp/slixvenv-ci/bin/python \
             sh test/integration/run-multiworker.sh 4 \
-              muc-test.py e2e-subscription.py e2e-sm-resume.py e2e-muc-resume.py
+              muc-test.py e2e-subscription.py e2e-sm-resume.py e2e-muc-resume.py e2e-resource-takeover.py
