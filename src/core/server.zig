@@ -62,6 +62,7 @@ const OfflinePointer = generic_offline.OfflinePointer;
 const archive_store_mod = @import("archive_store");
 const ArchiveBackendMod = @import("archive_backend");
 const ArchiveBackendType = ArchiveBackendMod.Backend;
+const archive_queue_mod = @import("archive_queue");
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
@@ -501,8 +502,15 @@ pub const Server = struct {
     /// Generic offline store — delivery pointers for unavailable recipients.
     offline: ?*GenericOfflineStore(OpBackendType) = null,
 
-    /// Archive store — MAM message archive (stanza payloads).
+    /// Archive store — MAM message archive (stanza payloads). Read path
+    /// (queries/history/offline fetch) stays inline; WRITES go through
+    /// archive_writer when attached.
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType) = null,
+
+    /// T87 async archive writer queue. Null in dev/single-process setups
+    /// without a writer thread — writers then fall back to inline store()
+    /// against `archive`.
+    archive_writer: ?*archive_queue_mod.ArchiveWriteQueue = null,
 
     /// VCard store — per-user vCard XML blobs (XEP-0054).
     vcard: ?*GenericVCardStore = null,
@@ -711,6 +719,24 @@ pub const Server = struct {
         self.offline = offline_store;
         self.archive = arch_store;
         log.info("offline + archive stores configured", .{});
+    }
+
+    /// Attach the shared T87 archive writer queue.
+    pub fn configureArchiveWriter(self: *Server, queue: *archive_queue_mod.ArchiveWriteQueue) void {
+        self.archive_writer = queue;
+    }
+
+    /// T87: archive a stanza. Enqueues onto the writer thread's queue when
+    /// wired (never blocks the event loop on storage); otherwise falls back
+    /// to an inline store() (unchanged legacy behavior).
+    pub fn archiveStore(self: *Server, owner: []const u8, with: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) void {
+        if (self.archive_writer) |q| {
+            q.enqueue(owner, with, stanza_id, timestamp, stanza_xml);
+            return;
+        }
+        if (self.archive) |archive| {
+            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch {};
+        }
     }
 
     /// Configure the vCard store (XEP-0054).
@@ -2199,7 +2225,10 @@ pub const Server = struct {
 
                                 const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
 
-                                // Store full stanza in archive, pointer in offline
+                                // Store full stanza in archive, pointer in offline.
+                                // Inline store (NOT the T87 queue): the offline
+                                // pointer goes down right after, and offline fetch
+                                // reads the archive row via getMessage.
                                 archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch {};
                                 if (store.storePointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts) catch false) {
                                     log.info("S2S inbound to {s} stored offline", .{m.to_jid});
@@ -2213,7 +2242,7 @@ pub const Server = struct {
                 }
 
                 // Archive S2S inbound messages delivered to online recipients (T81)
-                if (self.archive) |archive| {
+                if (self.archive != null) {
                     const parts = extractStanzaParts(m.stanza_xml);
                     if (parts.is_message and std.mem.indexOf(u8, parts.inner_xml, "<body") != null) {
                         var recip_buf: [256]u8 = undefined;
@@ -2226,8 +2255,8 @@ pub const Server = struct {
                         var s2s_sid_buf: [32]u8 = undefined;
                         const s2s_stanza_id = self.generateStanzaId(&s2s_sid_buf);
 
-                        // Archive under recipient bare JID
-                        archive.store(recipient_bare, m.from_jid, s2s_stanza_id, s2s_archive_ts, m.stanza_xml) catch {};
+                        // Archive under recipient bare JID (via the T87 queue when wired)
+                        self.archiveStore(recipient_bare, m.from_jid, s2s_stanza_id, s2s_archive_ts, m.stanza_xml);
                     }
                 }
 

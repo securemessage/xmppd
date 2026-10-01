@@ -267,7 +267,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Archive under both sender and recipient bare JIDs (T81 + T82)
     if (is_archivable) {
-        if (server.archive) |archive| {
+        if (server.archive != null) {
             var recip_buf: [256]u8 = undefined;
             var recip_fbs = std.io.fixedBufferStream(&recip_buf);
             recip_fbs.writer().writeAll(to_jid.local) catch {};
@@ -304,8 +304,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             sw.writeAll("</message>") catch {};
             const full_stanza = stanza_fbs.getWritten();
 
-            archive.store(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, full_stanza) catch {};
-            archive.store(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, full_stanza) catch {};
+            server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, full_stanza);
+            server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, full_stanza);
         }
     }
 

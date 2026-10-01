@@ -224,7 +224,7 @@ pub fn handleMucGroupchat(
     }
 
     // Store in archive for room history replay (T44)
-    if (server.archive) |archive| {
+    if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (id_str.len > 0) id_str else "muc";
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
@@ -242,7 +242,7 @@ pub fn handleMucGroupchat(
         aw.writeByte('>') catch return;
         aw.writeAll(inner_xml) catch return;
         aw.writeAll("</message>") catch return;
-        archive.store(room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+        server.archiveStore(room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten());
     }
 }
 
@@ -1886,7 +1886,7 @@ pub fn processRemoteGroupchat(
     }
 
     // Archive
-    if (server.archive) |archive| {
+    if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
         var arch_buf: [17200]u8 = undefined;
@@ -1903,7 +1903,7 @@ pub fn processRemoteGroupchat(
         aw.writeByte('>') catch return;
         aw.writeAll(ev.inner_xml) catch return;
         aw.writeAll("</message>") catch return;
-        archive.store(ev.room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+        server.archiveStore(ev.room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten());
     }
 }
 

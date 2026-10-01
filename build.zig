@@ -47,6 +47,13 @@ pub fn build(b: *std.Build) void {
     });
     crypto_pool_mod.addImport("sasl", sasl_mod);
 
+    // T87: async archive write queue — no deps beyond std
+    const archive_queue_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/archive_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     _ = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
         .target = target,
@@ -315,6 +322,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("delivery_queue", delivery_queue_mod);
     server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
     server_test_mod.addImport("archive_store", server_archive_store_mod);
+    server_test_mod.addImport("archive_queue", archive_queue_mod);
     server_test_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("op_backend", server_op_backend_mod);
     server_test_mod.addImport("archive_backend", server_archive_backend_mod);
@@ -1077,6 +1085,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
     core_mod.addImport("archive_store", server_archive_store_mod);
+    core_mod.addImport("archive_queue", archive_queue_mod);
     core_mod.addImport("backend", server_backend_mod);
     core_mod.addImport("op_backend", server_op_backend_mod);
     core_mod.addImport("archive_backend", server_archive_backend_mod);
@@ -1402,6 +1411,13 @@ pub fn build(b: *std.Build) void {
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
+    // T87: archive write queue tests (module defined next to core_mod)
+    const archive_queue_tests = b.addTest(.{
+        .name = "archive-queue-tests",
+        .root_module = archive_queue_mod,
+    });
+    const run_archive_queue_tests = b.addRunArtifact(archive_queue_tests);
+
     // --- Test step ---
 
     const test_step = b.step("test", "Run all library tests");
@@ -1459,6 +1475,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
+    test_step.dependOn(&run_archive_queue_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.
