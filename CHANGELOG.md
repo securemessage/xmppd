@@ -49,6 +49,14 @@
 
 ### Fixes
 
+- T112: MUC MAM queries routed to a room's owning worker were degraded at
+  the actor-message boundary: the response IQ id was the client's MAM
+  queryid (XEP-0313 allows queryid != stanza id, breaking IQ matching),
+  RSM <max/> was replaced by a hardcoded 50, <after/>/<before/> paging was
+  dropped, and the no-archive answer diverged from the local path. The
+  room_mam_query actor message now carries iq_id + full RSM text; local
+  and remote answers are identical (e2e-muc-mam-routing 82/82 at
+  workers=4, wired into the CI multiworker lane) (c1f53e9).
 - T198: a bind whose session-map registration failed (e.g. over the
   resource cap) previously sent the success IQ first and only logged —
   the client believed itself bound while inbound stanzas were silently

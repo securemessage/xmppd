@@ -147,7 +147,10 @@ Sonya needs hundreds of resources per account. T197 is the exit gate: the
 release is not tagged until the codebase-wide quality sweep has run and its
 findings are triaged.
 
-- [ ] T112 — MUC MAM routing
+- [x] T112 — MUC MAM routing: cross-worker queries now carry the IQ stanza
+      id separately from the MAM queryid, full RSM (max/after/before), and
+      answer no-archive with item-not-found like the local path — merged
+      2026-10-01 (c1f53e9)
 - [x] **T130** — batch presence delivery: session-map batch resolve
       (one lock hold per 32-JID chunk) + one MPSC pipe wake per remote
       worker — merged 2026-10-01 (52d6896)
