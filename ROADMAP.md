@@ -139,11 +139,13 @@ eleven items landed; see CHANGELOG for details:
 Deferred out of the v0.8.0 feature release:
 
 Execution order (agreed 2026-09-30): T177 MUC occupant migration first
-(completes cross-worker resume), then the perf backlog T130/T121/T110/T87,
-T154 opportunistically (its delivery pattern now exists); T32 stays blocked
-on the lib/xmppc delivery, T31 gated on T32 measurements. T197 is the exit
-gate: the release is not tagged until the codebase-wide quality sweep has
-run and its findings are triaged.
+(LANDED 2026-10-01), then the perf backlog T130/T121/T110/T87, T154
+opportunistically (its delivery pattern now exists — Sonya request); T32
+stays blocked on the lib/xmppc delivery, T31 gated on T32 measurements.
+T198 (per-account resource cap + silent bind failure) joins this release —
+Sonya needs hundreds of resources per account. T197 is the exit gate: the
+release is not tagged until the codebase-wide quality sweep has run and its
+findings are triaged.
 
 - [ ] T112 — MUC MAM routing
 - [ ] T130 — batch presence
@@ -173,6 +175,11 @@ run and its findings are triaged.
       2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
 - [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
       measurements showing actual DebugAllocator lock contention
+- [ ] **T198** — per-account resource scale: MAX_RESOURCES is a hard 16 per
+      bare JID and a bind past the cap silently desyncs the client (success
+      IQ precedes session_map registration) — raise/statically-size or make
+      it src/config-configurable, and make bind failure client-visible
+      (stanza error). Needed by Sonya (hundreds of resources per account)
 - [ ] **T197** — codebase-wide quality sweep (EXIT GATE, runs after the
       0.9.0 work above lands): performance (hot-path allocation churn,
       lock contention, event-loop hygiene per project kqueue rules),
