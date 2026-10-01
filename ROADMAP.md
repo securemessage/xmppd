@@ -148,11 +148,29 @@ release is not tagged until the codebase-wide quality sweep has run and its
 findings are triaged.
 
 - [ ] T112 — MUC MAM routing
-- [ ] T130 — batch presence
-- [ ] T121 — auth thread pool
-- [ ] T110 — backpressure
-- [ ] T87 — async archive writer
-- [ ] T154 — cross-worker resource eviction (workers>1)
+- [x] **T130** — batch presence delivery: session-map batch resolve
+      (one lock hold per 32-JID chunk) + one MPSC pipe wake per remote
+      worker — merged 2026-10-01 (52d6896)
+- [x] **T121** — auth crypto pool: PBKDF2 derives run on worker threads
+      off the event loop; `[auth] crypto_threads` (default 4) — merged
+      2026-10-01 (39e7e6d)
+- [x] **T110** — client-side backpressure: EVFILT_READ suppressed when a
+      connection's write buffer crosses 75%, re-enabled at 50% — merged
+      2026-10-01 (8e6fb7c)
+- [x] **T87** — async archive writer: single writer thread + bounded deep-
+      copy queue; event loops never block on storage; archive writes are
+      single-threaded now — merged 2026-10-01 (c0a9223)
+- [x] **T154** — cross-worker resource eviction: session_kick actor
+      round-trip (park bind, holding worker destroys old session per RFC
+      6120 §7.7.3, retry on reply; 3-round cap); evicted clients now get
+      the conflict stream error flushed before disconnect. Same fix on the
+      local eviction path (T152) — merged 2026-10-01 (307a717)
+- [x] **T198** — per-account resource cap raised from hardcoded 16 to a
+      configurable `[core] max_resources_per_account` (default 256) with a
+      heap-backed entry list; bind failures are now client-visible (stanza
+      error resource-constraint; success IQ only after registration) —
+      merged 2026-10-01 (a3babac)
+- [ ] T112 — MUC MAM routing
 - [ ] **T177** — cross-worker SM resume: Option A state handoff landed
       2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
       MPSC request/reply, mutex-guarded handoff store for the unacked queue,

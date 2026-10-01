@@ -19,14 +19,52 @@
   worker's prefix, so repeat resumes now follow per-worker previd → worker
   redirects (chained, bounded hops, expire with the resume window) instead
   of failing `item-not-found` on the second cross-worker hop.
+- T130 batch presence delivery: subscriber resolution resolves a chunk of
+  32 bare JIDs in one session-map lock hold (batched lookup) and each
+  remote worker's MPSC queue gets ONE pipe wake per chunk instead of one
+  per target session; presence probes use the same batching (52d6896).
+- T110 client-side backpressure: when a connection's write buffer crosses
+  75%, its EVFILT_READ is disabled — the server stops consuming stanzas it
+  cannot forward and TCP flow control pushes back on the sender; reading
+  resumes at 50% (8e6fb7c).
+- T121 auth crypto pool: PLAIN credential derivation (PBKDF2) runs on a
+  fixed pool of worker threads (default 4, `[auth] crypto_threads`, 0
+  disables) instead of blocking the auth daemon's event loop; bounded
+  256-job queue answers temporary-auth-failure on overflow. SCRAM is
+  unaffected (server-side verify is cheap HMAC) (39e7e6d).
+- T87 async archive writer: a single writer thread with a bounded
+  deep-copy queue owns all archive stores; event loops never block on
+  storage I/O (compaction stalls no longer freeze sessions), and archive
+  writes became single-threaded (previously N concurrent writers)
+  (c0a9223). MAM/history reads stay inline (eventually consistent).
+- T154 cross-worker resource takeover: a bind conflicting with a resource
+  held by another worker now parks and evicts the holder via a
+  session_kick actor round-trip (RFC 6120 §7.7.3) instead of failing the
+  client with <conflict/> (e2e-resource-takeover 25/25 at workers=4)
+  (307a717).
+- T198: per-account resource cap raised from hardcoded 16 to
+  `[core] max_resources_per_account` (default 256) backed by a heap-grown
+  entry list — multi-resource accounts (agent/bot deployments) no longer
+  hit the wall (a3babac).
 
 ### Fixes
 
+- T198: a bind whose session-map registration failed (e.g. over the
+  resource cap) previously sent the success IQ first and only logged —
+  the client believed itself bound while inbound stanzas were silently
+  unroutable. Registration now precedes the result; over-cap binds get a
+  stanza error (resource-constraint) and may retry with another resource
+  (a3babac). Also rolled back partial full_map/bare_map registration on
+  mid-bind failures (latent inconsistency).
+- T152/T154: evicted sessions got their <conflict/> stream error queued
+  but never flushed before the teardown closed the fd — the client closed
+  with no explanation. Now flushed synchronously before teardown
+  (307a717).
 - SM resume restored the session resource from the transient bind
   accumulator, which is zeroed after a successful bind — resumed sessions
   ended up with an EMPTY resource (`user@host/`). The resource now comes
-  from the detached session's bound JID, and MUC occupant records (keyed by
-  full JID) migrate correctly on same-worker resumes too.
+  from the detached session's bound JID — MUC fan-in and fan-out stay
+  correct after resume (T177 work, 02893d9).
 
 ### Testing
 
@@ -35,6 +73,8 @@
   receiving and sending groupchat without rejoining, detached-era stanzas
   replay, and other occupants never see a rebroadcast join presence.
   Cross-worker handoff is verified via server-log evidence.
+- New `e2e-resource-takeover.py`: repeated same-resource bind takeovers,
+  cross-worker kick evidence via server log.
 
 ## v0.8.11 — 2026-09-30
 
