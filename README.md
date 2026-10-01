@@ -31,7 +31,7 @@ polymorphism for performance at scale.
 |----------|-------------|---------|--------|
 | RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
 | RFC 6121 | XMPP IM (roster, presence, messaging) | Partial¹ | Interop, E2E, Unit |
-| XEP-0012 | Last Activity | Partial⁵ | Unit |
+| XEP-0012 | Last Activity | Partial⁵ | E2E, Unit |
 | XEP-0030 | Service Discovery | Full | Interop |
 | XEP-0045 | Multi-User Chat | Partial² | Interop, E2E, Unit |
 | XEP-0054 | vCard-temp | Full | Interop |
@@ -81,9 +81,13 @@ resume: sessions detach on abnormal disconnect and resume on reconnect without
 re-authentication, replaying unacked stanzas from a bounded queue. Detached sessions
 expire after 300s. Shipped in v0.6.0; hardened in v0.8.6 (T152/T153).
 
-⁵ Last Activity answers only the online-self case (`seconds='0'`); querying another
-user, or an offline user's time-since-logout (§2), is not yet implemented — no
-last-online timestamp is stored. Full implementation is planned for v0.9.0 (T164).
+⁵ Last Activity is server-answered (XEP-0012 §2): domain queries return uptime,
+online accounts answer `seconds='0'`, and offline accounts answer seconds since
+their last session teardown (durable record in the ops DB, consistent across
+workers). Disclosure is gated to presence-sharing contacts (roster from/both);
+everyone else gets `forbidden`, including for nonexistent accounts. Full-JID
+queries to another account get the account-level answer — per-resource idle
+time is not tracked (the remaining gap to "Full"). Shipped in v0.9.0 (T164).
 
 ## Building
 

@@ -4,6 +4,16 @@
 
 ### Features
 
+- T164 XEP-0012 last-activity: the jabber:iq:last handler was a stub that
+  answered seconds='0' to everything (README had already been downgraded
+  to Partial for this). Server-directed queries now answer real domain
+  uptime; other-account queries are server-answered with 0 while online
+  and seconds-since-last-teardown while offline (durable record in the
+  ops DB written when an account's final resource unbinds — consistent
+  across workers with no new actor traffic). Disclosure follows presence
+  visibility (target's roster entry for the requester must be from/both,
+  else forbidden; nonexistent accounts are indistinguishable). Per-
+  resource idle timing is documented as the remaining gap (9d6daff).
 - T177 MUC occupant migration: cross-worker XEP-0198 resume now works for
   sessions that occupy MUC rooms (previously refused, forcing a full
   re-bind + rejoin). The handoff bundle carries the detached session's room

@@ -183,8 +183,9 @@ findings are triaged.
       SM-IDs on repeat hops (chains, bounded, expiring); e2e-muc-resume
       37/37 at workers=4 x4 runs with handoff log evidence. REMAINING:
       unbind→re-bind offline-routing micro-window
-- [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
-      store, offline elapsed seconds, privacy rules)
+- [x] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
+      store, offline elapsed seconds, privacy rules) — merged 2026-10-01
+      (9d6daff)
 - [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
       client-core module (in-repo for now, extract to a canonical repo when
       a second consumer appears), load driver built on it, then benchmarks:
