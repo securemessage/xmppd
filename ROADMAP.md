@@ -42,13 +42,12 @@ tracks the release-level shape.
 
 ### Immediate
 
-- [ ] Tag **v0.8.11** — hardening patch: auth rate limiting was silently
-      inert in every prior release (empty-username checks + 8-slot ring <
-      20-attempt default). Fixed and verified with a live single-IP hammer;
-      SASL failure reasons (policy-violation/account-disabled) now reach the
-      wire. New `[auth] rate_limit = false` switch for benchmark rigs.
-      UPGRADE NOTE: first release where the brute-force policy actually
-      enforces (5/account, 20/IP per 120s, lockout after 10 fails).
+- [x] Tag **v0.8.11** — SHIPPED 2026-09-30: hardening patch: auth rate limiting
+      was silently inert in every prior release (empty-username checks +
+      8-slot ring < 20-attempt default). Fixed and verified with a live
+      single-IP hammer; SASL failure reasons (policy-violation/
+      account-disabled) now reach the wire. New `[auth] rate_limit = false`
+      switch for benchmark rigs.
 - [x] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
       — verified and tagged 2026-08-30 (see Phase 13 Deferred Follow-ups for the
       full test matrix), deployed to the test jail the same day
@@ -155,8 +154,13 @@ run and its findings are triaged.
 - [ ] **T177** — cross-worker SM resume: Option A state handoff landed
       2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
       MPSC request/reply, mutex-guarded handoff store for the unacked queue,
-      ABA epoch guard, e2e-sm-resume passes at workers=4. REMAINING: MUC
-      occupant-record migration (currently falls back to full re-bind) and the
+      ABA epoch guard, e2e-sm-resume passes at workers=4. MUC occupant
+      migration landed 2026-10-01: bundles carry the room list; the resuming
+      worker replays `room_occupant_move` actor messages that retarget each
+      canonical occupant record (worker, session, generation) and sync shadow
+      copies without presence fan-out; redirect breadcrumbs follow relocated
+      SM-IDs on repeat hops (chains, bounded, expiring); e2e-muc-resume
+      37/37 at workers=4 x4 runs with handoff log evidence. REMAINING:
       unbind→re-bind offline-routing micro-window
 - [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
       store, offline elapsed seconds, privacy rules)

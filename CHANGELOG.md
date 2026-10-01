@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased (v0.9.0)
+
+### Features
+
+- T177 MUC occupant migration: cross-worker XEP-0198 resume now works for
+  sessions that occupy MUC rooms (previously refused, forcing a full
+  re-bind + rejoin). The handoff bundle carries the detached session's room
+  list; after the resuming worker re-binds (generation known), it replays
+  one `room_occupant_move` actor message per room's owning worker, which
+  updates the canonical occupant record's (worker, session, generation)
+  triple in place and syncs shadow copies — a move, not a join/part: no
+  presence fan-out, no new-member handling. Ghost-leak safety: if the
+  resumed connection dies before the moves apply, the session_close
+  broadcast still removes the occupant by full JID everywhere. Occupancy
+  over 64 rooms per session falls back to the full re-bind behavior.
+- T177 redirect breadcrumbs: a relocated session's SM-ID keeps the issuing
+  worker's prefix, so repeat resumes now follow per-worker previd → worker
+  redirects (chained, bounded hops, expire with the resume window) instead
+  of failing `item-not-found` on the second cross-worker hop.
+
+### Fixes
+
+- SM resume restored the session resource from the transient bind
+  accumulator, which is zeroed after a successful bind — resumed sessions
+  ended up with an EMPTY resource (`user@host/`). The resource now comes
+  from the detached session's bound JID, and MUC occupant records (keyed by
+  full JID) migrate correctly on same-worker resumes too.
+
+### Testing
+
+- New `e2e-muc-resume.py`: alice joins a room with SM resume enabled and
+  loops abrupt-disconnect + resume; asserts the resumed session keeps
+  receiving and sending groupchat without rejoining, detached-era stanzas
+  replay, and other occupants never see a rebroadcast join presence.
+  Cross-worker handoff is verified via server-log evidence.
+
 ## v0.8.11 — 2026-09-30
 
 Hardening release. **Operationally significant:** the authentication
