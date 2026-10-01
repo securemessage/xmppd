@@ -430,32 +430,47 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     to_fbs.writer().writeAll(bound.resource) catch return;
     const to_str = to_fbs.getWritten();
 
-    // For each subscribed contact, check if local or remote
-    for (contact_jids) |contact_bare| {
-        const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
-        const contact_local = contact_bare[0..at_pos];
-        const contact_domain = contact_bare[at_pos + 1 ..];
+    // For each subscribed contact, check if local or remote. T130: local
+    // contacts resolve in chunks of one lock hold instead of one per JID.
+    const SUBS_PER_CHUNK = 32;
+    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
 
-        // Remote domain? Send a presence probe via S2S.
-        // The remote server will respond with the contact's current presence.
-        if (!std.mem.eql(u8, contact_domain, server.server_host)) {
-            var probe_buf: [512]u8 = undefined;
-            var probe_fbs = std.io.fixedBufferStream(&probe_buf);
-            const pbw = probe_fbs.writer();
-            pbw.writeAll("<presence from='") catch continue;
-            pbw.writeAll(bare_jid) catch continue;
-            pbw.writeAll("' to='") catch continue;
-            pbw.writeAll(contact_bare) catch continue;
-            pbw.writeAll("' type='probe'/>") catch continue;
-            server.sendPresenceViaS2s(bare_jid, contact_bare, probe_fbs.getWritten(), changes);
-            continue;
+    var contact_i: usize = 0;
+    while (contact_i < contact_jids.len) {
+        var parts_buf: [SUBS_PER_CHUNK]session_map_mod.JidParts = undefined;
+        var parts_len: usize = 0;
+        const end = @min(contact_i + SUBS_PER_CHUNK, contact_jids.len);
+
+        for (contact_jids[contact_i..end]) |contact_bare| {
+            const at_pos = std.mem.indexOf(u8, contact_bare, "@") orelse continue;
+            const contact_local = contact_bare[0..at_pos];
+            const contact_domain = contact_bare[at_pos + 1 ..];
+
+            // Remote domain? Send a presence probe via S2S.
+            // The remote server will respond with the contact's current presence.
+            if (!std.mem.eql(u8, contact_domain, server.server_host)) {
+                var probe_buf: [512]u8 = undefined;
+                var probe_fbs = std.io.fixedBufferStream(&probe_buf);
+                const pbw = probe_fbs.writer();
+                pbw.writeAll("<presence from='") catch continue;
+                pbw.writeAll(bare_jid) catch continue;
+                pbw.writeAll("' to='") catch continue;
+                pbw.writeAll(contact_bare) catch continue;
+                pbw.writeAll("' type='probe'/>") catch continue;
+                server.sendPresenceViaS2s(bare_jid, contact_bare, probe_fbs.getWritten(), changes);
+                continue;
+            }
+            parts_buf[parts_len] = .{ .local = contact_local, .domain = contact_domain };
+            parts_len += 1;
         }
 
-        // Local contact — iterate their available sessions
-        var probe_entries: [16]SessionEntry = undefined;
-        const target_count = sm.findAvailableByBareJid(contact_local, contact_domain, &probe_entries);
+        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
+        var jid_idxs: [MAX_CHUNK_ENTRIES]u16 = undefined;
+        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, &jid_idxs);
 
-        for (probe_entries[0..target_count]) |entry| {
+        for (entries[0..target_count], jid_idxs[0..target_count]) |entry, idx| {
+            const contact = parts_buf[idx];
+
             // Retrieve the contact's stored presence inner XML (status/show/priority)
             const contact_inner = if (entry.worker_id == server.worker_id) blk: {
                 const contact_sess = server.sessions[entry.local_session_id] orelse break :blk @as([]const u8, "");
@@ -467,9 +482,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
             const ppw = pres_fbs.writer();
             ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(contact_local) catch continue;
+            ppw.writeAll(contact.local) catch continue;
             ppw.writeByte('@') catch continue;
-            ppw.writeAll(contact_domain) catch continue;
+            ppw.writeAll(contact.domain) catch continue;
             ppw.writeByte('/') catch continue;
             ppw.writeAll(entry.resource()) catch continue;
             ppw.writeAll("' to='") catch continue;
@@ -493,6 +508,8 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
         }
+
+        contact_i = end;
     }
 }
 
@@ -1159,6 +1176,13 @@ pub fn dispatchDirectedPresenceToBareJid(
 
 /// Deliver a presence stanza to all available sessions of subscriber JIDs.
 /// Handles local delivery + cross-thread MPSC + S2S forwarding.
+///
+/// T130 batching: subscribers are processed in fixed-size chunks. Per chunk,
+/// the session-map resolution happens in ONE shared-lock hold
+/// (findAvailableByBareJidBatch) and each remote worker's MPSC queue gets a
+/// single pipe wake regardless of how many target sessions it has
+/// (enqueue + one wakeWorker), instead of a lock per JID and a pipe write
+/// per session. Chunking caps stack usage at 32 subscribers x 16 resources.
 fn deliverPresenceToSubscribers(
     server: *Server,
     subscriber_jids: []const []const u8,
@@ -1167,35 +1191,63 @@ fn deliverPresenceToSubscribers(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    for (subscriber_jids) |sub_bare_jid| {
-        // XEP-0191: Skip subscribers who have blocked us
-        if (server.block_store) |bs| {
-            if (bs.isBlocked(server.allocator, sub_bare_jid, sender_bare) catch false) continue;
+
+    const SUBS_PER_CHUNK = 32;
+    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
+
+    var i: usize = 0;
+    while (i < subscriber_jids.len) {
+        // Pass 1: blocklist filter, S2S split, collect local-domain JIDs.
+        var parts_buf: [SUBS_PER_CHUNK]session_map_mod.JidParts = undefined;
+        var parts_len: usize = 0;
+        const end = @min(i + SUBS_PER_CHUNK, subscriber_jids.len);
+        for (subscriber_jids[i..end]) |sub_bare_jid| {
+            // XEP-0191: Skip subscribers who have blocked us
+            if (server.block_store) |bs| {
+                if (bs.isBlocked(server.allocator, sub_bare_jid, sender_bare) catch false) continue;
+            }
+
+            // Parse the subscriber bare JID to get local/domain
+            const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
+            const sub_local = sub_bare_jid[0..at_pos];
+            const sub_domain = sub_bare_jid[at_pos + 1 ..];
+
+            // Remote domain? Forward via S2S.
+            if (!std.mem.eql(u8, sub_domain, server.server_host)) {
+                server.sendPresenceViaS2s(sender_bare, sub_bare_jid, presence_xml, changes);
+                continue;
+            }
+            parts_buf[parts_len] = .{ .local = sub_local, .domain = sub_domain };
+            parts_len += 1;
         }
 
-        // Parse the subscriber bare JID to get local/domain
-        const at_pos = std.mem.indexOf(u8, sub_bare_jid, "@") orelse continue;
-        const sub_local = sub_bare_jid[0..at_pos];
-        const sub_domain = sub_bare_jid[at_pos + 1 ..];
+        // Resolve the whole chunk under one lock hold.
+        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
+        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, null);
 
-        // Remote domain? Forward via S2S.
-        if (!std.mem.eql(u8, sub_domain, server.server_host)) {
-            server.sendPresenceViaS2s(sender_bare, sub_bare_jid, presence_xml, changes);
-            continue;
+        // Local targets deliver inline.
+        for (entries[0..count]) |entry| {
+            if (entry.worker_id != server.worker_id) continue;
+            const target_session = server.sessions[entry.local_session_id] orelse continue;
+            fanout.deliverToSession(target_session, presence_xml, entry.local_session_id, changes);
         }
 
-        var entries_buf: [16]SessionEntry = undefined;
-        const route_count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries_buf);
-        for (entries_buf[0..route_count]) |entry| {
-            if (entry.worker_id == server.worker_id) {
-                const target_session = server.sessions[entry.local_session_id] orelse continue;
-                fanout.deliverToSession(target_session, presence_xml, entry.local_session_id, changes);
-            } else {
-                if (server.delivery_system) |ds| {
-                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
+        // Remote targets: bucket by worker, wake each worker once.
+        if (server.delivery_system) |ds| {
+            var w: u16 = 0;
+            while (w < ds.worker_count) : (w += 1) {
+                if (w == server.worker_id) continue;
+                var pending = false;
+                for (entries[0..count]) |entry| {
+                    if (entry.worker_id != w) continue;
+                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml) catch continue;
+                    pending = true;
                 }
+                if (pending) ds.wakeWorker(w);
             }
         }
+
+        i = end;
     }
 }
 

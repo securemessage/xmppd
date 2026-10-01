@@ -47,6 +47,12 @@ pub const SessionEntry = struct {
     }
 };
 
+/// A pre-split bare JID for batch resolution (T130).
+pub const JidParts = struct {
+    local: []const u8,
+    domain: []const u8,
+};
+
 /// Bounded list of session entries for a bare JID (multi-resource).
 pub const EntryList = struct {
     buffer: [MAX_RESOURCES]SessionEntry = undefined,
@@ -281,6 +287,37 @@ pub const SessionMap = struct {
             }
         }
         return count;
+    }
+
+    /// Resolve many bare JIDs to their presence-available entries in ONE
+    /// shared-lock hold (T130 presence broadcast batching). If out_jidIdx is
+    /// provided, each appended entry is paired with the index (into jids) of
+    /// the bare JID it came from — needed when per-target payloads differ
+    /// (presence probes address the contact's own JID). Returns entries
+    /// appended (truncated at out.len — callers chunk).
+    pub fn findAvailableByBareJidBatch(
+        self: *SessionMap,
+        jids: []const JidParts,
+        out: []SessionEntry,
+        out_jid_idx: ?[]u16,
+    ) usize {
+        if (self.multi_worker) self.lock.lockShared();
+        defer if (self.multi_worker) self.lock.unlockShared();
+
+        var total: usize = 0;
+        for (jids, 0..) |jid, jid_idx| {
+            var bare_buf: [320]u8 = undefined;
+            const bare_jid = buildBareBuf(&bare_buf, jid.local, jid.domain) orelse continue;
+            const list = self.bare_map.get(bare_jid) orelse continue;
+            for (list.constSlice()) |entry| {
+                if (!entry.presence_available) continue;
+                if (total >= out.len) return total;
+                out[total] = entry;
+                if (out_jid_idx) |idxs| idxs[total] = @intCast(jid_idx);
+                total += 1;
+            }
+        }
+        return total;
     }
 
     /// Check if any session for a bare JID is presence-available.
@@ -531,6 +568,48 @@ test "SessionMap: findAvailableByBareJid" {
     const count = map.findAvailableByBareJid("alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(u32, 1), buf[0].local_session_id);
+}
+
+test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
+    var map = SessionMap.init(std.testing.allocator, false);
+    defer map.deinit();
+
+    _ = try map.bind(0, 1, "alice", "localhost", "mobile");
+    _ = try map.bind(1, 2, "alice", "localhost", "desktop");
+    _ = try map.bind(0, 3, "bob", "localhost", "laptop");
+    _ = try map.bind(2, 4, "carol", "localhost", "web");
+
+    map.setPresenceAvailable("alice", "localhost", "mobile", true);
+    map.setPresenceAvailable("alice", "localhost", "desktop", true);
+    map.setPresenceAvailable("carol", "localhost", "web", true);
+    // bob stays unavailable
+
+    const jids = [_]JidParts{
+        .{ .local = "alice", .domain = "localhost" },
+        .{ .local = "bob", .domain = "localhost" },
+        .{ .local = "carol", .domain = "localhost" },
+        .{ .local = "nobody", .domain = "localhost" },
+    };
+    var buf: [8]SessionEntry = undefined;
+    var idxs: [8]u16 = undefined;
+    const total = map.findAvailableByBareJidBatch(&jids, &buf, &idxs);
+    try std.testing.expectEqual(@as(usize, 3), total);
+    // alice (jid 0) x2 available, carol (jid 2) x1, bob/nobody none
+    try std.testing.expectEqual(@as(u16, 0), idxs[0]);
+    try std.testing.expectEqual(@as(u16, 0), idxs[1]);
+    try std.testing.expectEqual(@as(u16, 2), idxs[2]);
+
+    // Batch must match the per-JID call's results, in order
+    var single: [8]SessionEntry = undefined;
+    var want: usize = 0;
+    for (jids) |jid| {
+        want += map.findAvailableByBareJid(jid.local, jid.domain, &single);
+    }
+    try std.testing.expectEqual(want, total);
+
+    // Truncation: capacity 2 stops early
+    var small: [2]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 2), map.findAvailableByBareJidBatch(&jids, &small, null));
 }
 
 test "SessionMap: duplicate bind fails" {
