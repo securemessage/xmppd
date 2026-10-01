@@ -17,8 +17,10 @@
 //! - **Read buffer**: Fixed 8KB. Data is consumed from the front by the XML
 //!   parser; unconsumed bytes are compacted (shifted to front) after each parse.
 //! - **Write buffer**: Fixed 16KB. Data is appended by the stream handler and
-//!   drained to the socket when writable. If the buffer fills, backpressure
-//!   is applied (stop reading from this connection until writes drain).
+//!   drained to the socket when writable. When it fills beyond WRITE_SUPPRESS_HIGH
+//!   the worker disables EVFILT_READ for the fd (T110): TCP flow control
+//!   pushes back on the sender until the buffer drains below WRITE_SUPPRESS_LOW.
+//!   If it fills completely, queueSend() fails with error.WriteBufferFull.
 //!
 //! ## TLS
 //!
@@ -57,6 +59,16 @@ const READ_BUF_SIZE = 8192;
 /// stanzas before the client has a chance to ACK at the TCP level.
 const WRITE_BUF_SIZE = 16384;
 
+/// T110 backpressure: at/above this buffered-bytes level the server disables
+/// EVFILT_READ for the connection, so TCP-level flow control propagates to
+/// the sender's kernel instead of us reading ever more stanzas we cannot
+/// forward. 75% of the write buffer.
+pub const WRITE_SUPPRESS_HIGH: usize = WRITE_BUF_SIZE * 3 / 4;
+
+/// T110 backpressure: reading resumes once the buffer drained to or below
+/// this level. 50% — hysteresis against flapping at the threshold.
+pub const WRITE_SUPPRESS_LOW: usize = WRITE_BUF_SIZE / 2;
+
 /// Per-client XMPP connection state.
 pub const Connection = struct {
     /// The client socket file descriptor. Set to -1 by `close()` (T155) so a
@@ -90,6 +102,12 @@ pub const Connection = struct {
 
     /// Whether the connection is in a closed/error state.
     closed: bool = false,
+
+    /// T110: EVFILT_READ for this fd is currently disabled because the write
+    /// buffer exceeded WRITE_SUPPRESS_HIGH. Set/cleared by the worker
+    /// (Server.applyReadBackpressure) — Connection itself never touches
+    /// kqueue.
+    read_suppressed: bool = false,
 
     /// Peer address string (e.g., "192.168.1.100"). Stored from accept().
     peer_addr_buf: [64]u8 = undefined,
@@ -235,6 +253,11 @@ pub const Connection = struct {
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {
         return self.write_start < self.write_end;
+    }
+
+    /// Bytes currently buffered for writing (T110 backpressure thresholds).
+    pub fn pendingWriteBytes(self: *const Connection) usize {
+        return self.write_end - self.write_start;
     }
 
     /// Flush the write buffer to the socket.

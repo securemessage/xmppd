@@ -38,6 +38,7 @@ const sasl = @import("sasl");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const Connection = @import("connection.zig").Connection;
+const connection_mod = @import("connection.zig");
 const Listener = @import("listener.zig").Listener;
 const Event = @import("event_loop.zig").Event;
 
@@ -2669,6 +2670,33 @@ pub const Server = struct {
         if (!session.conn.hasPendingWrite()) {
             changes.removeWrite(session.conn.fd) catch {};
         }
+
+        self.applyReadBackpressure(session, changes);
+    }
+
+    /// T110 client-side backpressure: while a connection's write buffer
+    /// holds more than WRITE_SUPPRESS_HIGH bytes, disable its EVFILT_READ so
+    /// we stop consuming stanzas we cannot forward — TCP windows close and
+    /// flow control propagates to whoever is flooding us. Re-enable once the
+    /// buffer drains to WRITE_SUPPRESS_LOW.
+    ///
+    /// Called from handleWritable: every write-buffer growth path arms the
+    /// fd's write watch, and EVFILT_WRITE is level-triggered, so this
+    /// function runs at most one event batch after the buffer crosses the
+    /// threshold, and keeps running until the buffer is fully drained (which
+    /// is below the low-water mark — suppression always lifts).
+    fn applyReadBackpressure(self: *Server, session: *Session, changes: *ChangeList) void {
+        _ = self;
+        const conn = &session.conn;
+        if (conn.closed or conn.fd < 0) return;
+        const pending = conn.pendingWriteBytes();
+        if (!conn.read_suppressed and pending >= connection_mod.WRITE_SUPPRESS_HIGH) {
+            conn.read_suppressed = true;
+            changes.disableRead(conn.fd) catch {};
+        } else if (conn.read_suppressed and pending <= connection_mod.WRITE_SUPPRESS_LOW) {
+            conn.read_suppressed = false;
+            changes.enableRead(conn.fd) catch {};
+        }
     }
 
     // ========================================================================
@@ -4083,6 +4111,54 @@ test "Server: accept and close session" {
     }
     try std.testing.expect(found);
     try std.testing.expect(changes.count() > 0); // Should have addRead in changelist
+}
+
+test "Server: read backpressure toggles EVFILT_READ across write-buffer thresholds (T110)" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Fill the write buffer past the suppression threshold without flushing.
+    var payload: [connection_mod.WRITE_SUPPRESS_HIGH + 128]u8 = @splat('x');
+    try session.conn.queueSend(&payload);
+    try std.testing.expectEqual(connection_mod.WRITE_SUPPRESS_HIGH + 128, session.conn.pendingWriteBytes());
+    try std.testing.expect(!session.conn.read_suppressed);
+
+    server.applyReadBackpressure(session, &changes);
+    try std.testing.expect(session.conn.read_suppressed);
+    // Expect an EV.DISABLE change for the READ filter on this fd
+    var saw_disable = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident == session.conn.fd and ev.filter == std.c.EVFILT.READ and (ev.flags & std.c.EV.DISABLE) != 0) saw_disable = true;
+    }
+    try std.testing.expect(saw_disable);
+
+    // Suppression is sticky in the hysteresis band (between LOW and HIGH)
+    changes.reset();
+    session.conn.write_end = connection_mod.WRITE_SUPPRESS_HIGH - 16;
+    server.applyReadBackpressure(session, &changes);
+    try std.testing.expect(session.conn.read_suppressed);
+    try std.testing.expectEqual(@as(usize, 0), changes.count());
+
+    // Drained at/below low-water: read watch re-enabled
+    changes.reset();
+    session.conn.write_end = connection_mod.WRITE_SUPPRESS_LOW;
+    server.applyReadBackpressure(session, &changes);
+    try std.testing.expect(!session.conn.read_suppressed);
+    var saw_enable = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident == session.conn.fd and ev.filter == std.c.EVFILT.READ and (ev.flags & std.c.EV.ENABLE) != 0) saw_enable = true;
+    }
+    try std.testing.expect(saw_enable);
 }
 
 test "Server: stream open produces response" {
