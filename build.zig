@@ -38,24 +38,64 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    _ = b.createModule(.{
+    const tls_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    _ = b.createModule(.{
+    const ssl_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/ssl.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    ssl_mod.linkSystemLibrary("ssl", .{});
+    ssl_mod.linkSystemLibrary("crypto", .{});
 
-    _ = b.createModule(.{
+    const dns_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+
+    // --- xmppc: client-core library (T32 phase 1) ---
+    // Own API boundary from day one: nothing in lib/xmppc imports src/, and
+    // src/ does not import lib/xmppc. Reuses the shared protocol primitives
+    // (xml, xmpp, sasl, tls, ssl, dns) as named module imports.
+    const xmppc_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xmppc/xmppc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    xmppc_mod.addImport("xml", xml_mod);
+    xmppc_mod.addImport("xmpp", xmpp_mod);
+    xmppc_mod.addImport("sasl", sasl_mod);
+    xmppc_mod.addImport("tls", tls_mod);
+    xmppc_mod.addImport("ssl", ssl_mod);
+    xmppc_mod.addImport("dns", dns_mod);
+
+    // xmppc-smoke: end-to-end smoke client (T-91E96A28 validation). Imports
+    // session.zig as a file, so it needs the same named-import surface.
+    const smoke_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xmppc/smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_mod.addImport("xml", xml_mod);
+    smoke_mod.addImport("xmpp", xmpp_mod);
+    smoke_mod.addImport("sasl", sasl_mod);
+    smoke_mod.addImport("tls", tls_mod);
+    smoke_mod.addImport("ssl", ssl_mod);
+    smoke_mod.addImport("dns", dns_mod);
+    const smoke_exe = b.addExecutable(.{
+        .name = "xmppc-smoke",
+        .root_module = smoke_mod,
+    });
+    b.installArtifact(smoke_exe);
 
     // --- Tests ---
 
@@ -100,6 +140,19 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const xmppc_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xmppc/xmppc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    xmppc_test_mod.addImport("xml", xml_mod);
+    xmppc_test_mod.addImport("xmpp", xmpp_mod);
+    xmppc_test_mod.addImport("sasl", sasl_mod);
+    xmppc_test_mod.addImport("tls", tls_mod);
+    xmppc_test_mod.addImport("ssl", ssl_mod);
+    xmppc_test_mod.addImport("dns", dns_mod);
+
     const xml_tests = b.addTest(.{
         .name = "xml-tests",
         .root_module = xml_test_mod,
@@ -130,12 +183,18 @@ pub fn build(b: *std.Build) void {
         .root_module = dns_test_mod,
     });
 
+    const xmppc_tests = b.addTest(.{
+        .name = "xmppc-tests",
+        .root_module = xmppc_test_mod,
+    });
+
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
     const run_dns_tests = b.addRunArtifact(dns_tests);
+    const run_xmppc_tests = b.addRunArtifact(xmppc_tests);
 
     // --- Core daemon tests ---
 
@@ -1375,6 +1434,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);
     test_step.dependOn(&run_dns_tests.step);
+    test_step.dependOn(&run_xmppc_tests.step);
     test_step.dependOn(&run_event_loop_tests.step);
     test_step.dependOn(&run_connection_tests.step);
     test_step.dependOn(&run_listener_tests.step);

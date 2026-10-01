@@ -133,10 +133,10 @@ pub const SslContext = struct {
         const sid_ctx = "xmppd";
         _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
 
-        // Enable FreeBSD KTLS — offloads symmetric crypto to kernel.
-        // Silently ignored if kernel or OpenSSL lacks KTLS support.
-        // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) = 1 << 3 = 0x8
-        _ = c.SSL_CTX_set_options(ctx, 0x8);
+        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
+        // offload flag, and arming it on this platform desyncs the TLS
+        // record layer (clients fail the first read after STARTTLS with
+        // "decryption failed or bad record mac").
 
         return SslContext{ .ctx = ctx };
     }
@@ -177,10 +177,10 @@ pub const SslContext = struct {
             }
         }
 
-        // Enable FreeBSD KTLS — offloads symmetric crypto to kernel.
-        // Silently ignored if kernel or OpenSSL lacks KTLS support.
-        // SSL_OP_ENABLE_KTLS = SSL_OP_BIT(3) = 1 << 3 = 0x8
-        _ = c.SSL_CTX_set_options(ctx, 0x8);
+        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
+        // offload flag, and arming it on this platform desyncs the TLS
+        // record layer (clients fail the first read after STARTTLS with
+        // "decryption failed or bad record mac").
 
         return SslContext{ .ctx = ctx };
     }
@@ -291,7 +291,17 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             c.SSL_ERROR_ZERO_RETURN => SslError.ConnectionClosed,
-            else => SslError.ReadFailed,
+            else => {
+                // Log the OpenSSL error queue for diagnostics.
+                var err_buf: [256]u8 = undefined;
+                while (true) {
+                    const e = c.ERR_get_error();
+                    if (e == 0) break;
+                    c.ERR_error_string_n(e, &err_buf, err_buf.len);
+                    std.log.scoped(.ssl).err("TLS read error: SSL_get_error={d} detail={s}", .{ err, @as([*:0]const u8, @ptrCast(&err_buf)) });
+                }
+                return SslError.ReadFailed;
+            },
         };
     }
 
