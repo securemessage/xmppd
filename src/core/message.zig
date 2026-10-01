@@ -90,6 +90,24 @@ pub const RoomMessageEvent = struct {
     stanza_id: []const u8,
 };
 
+/// T177 MUC occupant migration: an SM-resumed session moved to another
+/// worker. Routed to the room's owning worker, which updates the canonical
+/// occupant record's (worker, session, generation) triple in place — no
+/// join presence fan-out, no new-member handling. Identity is the full JID.
+pub const RoomOccupantMove = struct {
+    room_jid: []const u8,
+    real_jid: []const u8,
+    /// Worker the occupant record pointed at before the move (for shadow
+    /// cleanup on that worker).
+    old_worker_id: u16,
+    /// Resuming worker.
+    new_worker_id: u16,
+    /// Session slot of the resumed connection on the resuming worker.
+    new_session_id: u32,
+    /// ABA generation from the resuming worker's SessionMap bind.
+    new_generation: u32,
+};
+
 /// MUC disco query (routed to owning worker).
 pub const DiscoRequest = struct {
     room_jid: []const u8,
@@ -172,6 +190,10 @@ pub const SmResumeRequest = struct {
     /// detached session's JID by the owning worker.
     auth_local: []const u8,
     auth_domain: []const u8,
+    /// Redirect hops already taken (T177). The SM-ID prefix names the worker
+    /// that ISSUED the id; a handed-off session lives elsewhere, so requests
+    /// follow redirect breadcrumbs. Bounded — a cycle means stale state.
+    hops: u8 = 0,
 };
 
 /// T177: owning worker → requesting worker. status "ok" means the state
@@ -220,6 +242,10 @@ pub const Tag = enum(u8) {
     room_directory_update = 0x18,
     /// MUC MAM query routed to room's owning worker.
     room_mam_query = 0x19,
+    /// T177 MUC occupant migration: move an occupant's (worker, session,
+    /// generation) triple after a cross-worker SM resume. Runs on the room's
+    /// owning worker; dispatches immediately (not via room mailbox).
+    room_occupant_move = 0x1b,
     /// Subscription-cache invalidation broadcast to all workers (the
     /// sub_cache is per-worker memory; roster/subscription changes on one
     /// worker must invalidate everywhere).
@@ -248,6 +274,7 @@ pub const Message = union(Tag) {
     room_admin: AdminAction,
     room_directory_update: RoomDirectoryUpdate,
     room_mam_query: MamQuery,
+    room_occupant_move: RoomOccupantMove,
     invalidate_subscription: CacheInvalidate,
     pep_published: PepEvent,
     stanza_archived: ArchiveEvent,
@@ -341,6 +368,14 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeU32(w, ev.reply_to_generation) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
         },
+        .room_occupant_move => |ev| {
+            writeStr(w, ev.room_jid) catch return null;
+            writeStr(w, ev.real_jid) catch return null;
+            writeU16(w, ev.old_worker_id) catch return null;
+            writeU16(w, ev.new_worker_id) catch return null;
+            writeU32(w, ev.new_session_id) catch return null;
+            writeU32(w, ev.new_generation) catch return null;
+        },
         .invalidate_subscription => |ev| {
             writeStr(w, ev.bare_jid) catch return null;
         },
@@ -362,6 +397,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeU32(w, ev.req_epoch) catch return null;
             writeStr(w, ev.auth_local) catch return null;
             writeStr(w, ev.auth_domain) catch return null;
+            w.writeByte(ev.hops) catch return null;
         },
         .sm_resume_reply => |ev| {
             writeStr(w, ev.previd) catch return null;
@@ -553,6 +589,22 @@ pub fn decode(data: []const u8) ?Message {
             const bare_jid = readStr(data, &fbs) orelse return null;
             return .{ .invalidate_subscription = .{ .bare_jid = bare_jid } };
         },
+        .room_occupant_move => {
+            const room_jid = readStr(data, &fbs) orelse return null;
+            const real_jid = readStr(data, &fbs) orelse return null;
+            const old_worker_id = readU16(r) orelse return null;
+            const new_worker_id = readU16(r) orelse return null;
+            const new_session_id = readU32(r) orelse return null;
+            const new_generation = readU32(r) orelse return null;
+            return .{ .room_occupant_move = .{
+                .room_jid = room_jid,
+                .real_jid = real_jid,
+                .old_worker_id = old_worker_id,
+                .new_worker_id = new_worker_id,
+                .new_session_id = new_session_id,
+                .new_generation = new_generation,
+            } };
+        },
         .pep_published => {
             const publisher_local = readStr(data, &fbs) orelse return null;
             const publisher_domain = readStr(data, &fbs) orelse return null;
@@ -581,6 +633,7 @@ pub fn decode(data: []const u8) ?Message {
             const req_epoch = readU32(r) orelse return null;
             const auth_local = readStr(data, &fbs) orelse return null;
             const auth_domain = readStr(data, &fbs) orelse return null;
+            const hops = r.readByte() catch return null;
             return .{ .sm_resume_request = .{
                 .previd = previd,
                 .h = h,
@@ -589,6 +642,7 @@ pub fn decode(data: []const u8) ?Message {
                 .req_epoch = req_epoch,
                 .auth_local = auth_local,
                 .auth_domain = auth_domain,
+                .hops = hops,
             } };
         },
         .sm_resume_reply => {
@@ -1062,6 +1116,7 @@ test "encode/decode: sm_resume_request round-trip" {
         .req_epoch = 5,
         .auth_local = "alice",
         .auth_domain = "example.com",
+        .hops = 2,
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1077,6 +1132,7 @@ test "encode/decode: sm_resume_request round-trip" {
             try std.testing.expectEqual(@as(u32, 5), ev.req_epoch);
             try std.testing.expectEqualStrings("alice", ev.auth_local);
             try std.testing.expectEqualStrings("example.com", ev.auth_domain);
+            try std.testing.expectEqual(@as(u8, 2), ev.hops);
         },
         else => return error.WrongTag,
     }
@@ -1099,6 +1155,33 @@ test "encode/decode: sm_resume_reply round-trip" {
             try std.testing.expectEqualStrings("ok", ev.status);
             try std.testing.expectEqual(@as(u32, 9), ev.req_session);
             try std.testing.expectEqual(@as(u32, 2), ev.req_epoch);
+        },
+        else => return error.WrongTag,
+    }
+}
+
+test "encode/decode: room_occupant_move round-trip" {
+    const msg = Message{ .room_occupant_move = .{
+        .room_jid = "dev@conference.example.com",
+        .real_jid = "alice@example.com/phone",
+        .old_worker_id = 0,
+        .new_worker_id = 3,
+        .new_session_id = 271,
+        .new_generation = 41,
+    } };
+
+    var buf: [MAX_ENCODED_SIZE]u8 = undefined;
+    const len = encode(&buf, msg).?;
+    const decoded = decode(buf[0..len]).?;
+
+    switch (decoded) {
+        .room_occupant_move => |ev| {
+            try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("alice@example.com/phone", ev.real_jid);
+            try std.testing.expectEqual(@as(u16, 0), ev.old_worker_id);
+            try std.testing.expectEqual(@as(u16, 3), ev.new_worker_id);
+            try std.testing.expectEqual(@as(u32, 271), ev.new_session_id);
+            try std.testing.expectEqual(@as(u32, 41), ev.new_generation);
         },
         else => return error.WrongTag,
     }

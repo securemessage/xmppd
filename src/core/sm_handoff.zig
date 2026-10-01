@@ -29,6 +29,11 @@ const log = std.log.scoped(.sm_handoff);
 /// stanzas, so this bounds worst-case store memory.
 pub const MAX_BUNDLES: usize = 32;
 
+/// Maximum MUC rooms carried in one bundle. Beyond this the handoff is
+/// refused and the client falls back to a full re-bind + rejoin — the same
+/// behavior as before occupant migration existed.
+pub const MAX_BUNDLE_ROOMS: usize = 64;
+
 /// Deep-copied state of a detached SM session being transferred between
 /// workers. All slices are owned by the bundle (C allocator).
 pub const ResumeBundle = struct {
@@ -47,6 +52,11 @@ pub const ResumeBundle = struct {
     stanzas: std.ArrayListUnmanaged([]u8) = .{},
     /// sm_out_seq value of stanzas[0], i.e. the source queue's base_seq.
     base_seq: u32,
+    /// Room JIDs of every MUC room the detached session occupied at handoff
+    /// (T177 occupant migration). Nicks/roles/affiliations are NOT bundled:
+    /// the canonical occupant record on each room's owning worker is the
+    /// source of truth and is moved in place.
+    rooms: std.ArrayListUnmanaged([]u8) = .{},
     created: i64,
 
     pub fn deinit(self: *ResumeBundle) void {
@@ -55,6 +65,8 @@ pub const ResumeBundle = struct {
         allocator.free(self.last_presence);
         for (self.stanzas.items) |s| allocator.free(s);
         self.stanzas.deinit(allocator);
+        for (self.rooms.items) |r| allocator.free(r);
+        self.rooms.deinit(allocator);
     }
 };
 
@@ -171,6 +183,7 @@ fn testBundle(previd_suffix: u8) !*ResumeBundle {
     };
     try b.stanzas.append(allocator, try allocator.dupe(u8, "<message/>"));
     try b.stanzas.append(allocator, try allocator.dupe(u8, "<presence/>"));
+    try b.rooms.append(allocator, try allocator.dupe(u8, "dev@conference.example.com"));
     return b;
 }
 
@@ -185,6 +198,8 @@ test "handoff store: put and take roundtrip" {
     try std.testing.expectEqual(@as(u32, 3), got.base_seq);
     try std.testing.expectEqualStrings("alice", got.username);
     try std.testing.expectEqual(@as(usize, 2), got.stanzas.items.len);
+    try std.testing.expectEqual(@as(usize, 1), got.rooms.items.len);
+    try std.testing.expectEqualStrings("dev@conference.example.com", got.rooms.items[0]);
     release(got);
     try std.testing.expectEqual(@as(usize, 0), count());
 }

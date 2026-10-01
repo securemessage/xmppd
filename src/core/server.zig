@@ -434,6 +434,20 @@ const SmIdEntry = struct {
     slot: usize = 0,
 };
 
+/// T177: breadcrumb left when a detached session is handed off to another
+/// worker. resolved hop-by-hop because the SM-ID prefix never updates.
+const SmRedirect = struct {
+    worker: u16,
+    moved_at: i64,
+};
+
+/// Bound on redirect entries per worker; a full map evicts the oldest.
+const MAX_SM_REDIRECTS: usize = 256;
+
+/// Bound on redirect hops per request. A cycle means stale state — the
+/// client gets item-not-found and full-rebinds.
+const MAX_SM_REDIRECT_HOPS: u8 = 8;
+
 /// FNV-1a hash of an SM-ID for map indexing (T127).
 fn hashSmId(id: *const [sm_state.SM_ID_HEX_LEN]u8) usize {
     var h: u64 = 0xcbf29ce484222325;
@@ -529,6 +543,15 @@ pub const Server = struct {
     /// SM-ID → session slot index map for O(1) resume lookup (T127).
     /// Open-addressing table with FNV-1a hash. Capacity must exceed max concurrent detached sessions.
     sm_id_map: [64]SmIdEntry = [_]SmIdEntry{SmIdEntry{}} ** 64,
+
+    /// T177: SM-ID → worker redirects for sessions handed off to another
+    /// worker by a cross-worker resume. The SM-ID prefix permanently names
+    /// the worker that ISSUED the id, so a repeat resume of a relocated
+    /// session would otherwise route to a worker that no longer holds it.
+    /// Breadcrumbs form a chain (A→B→C) resolved hop by hop; entries expire
+    /// with the SM resume window. Worker-local memory: only this worker
+    /// touches its own map, always on its own event loop.
+    sm_redirects: std.AutoHashMapUnmanaged([sm_state.SM_ID_HEX_LEN]u8, SmRedirect) = .{},
 
     /// Monotonic counter for generating unique stanza IDs (XEP-0359).
     /// Combined with worker_id to ensure uniqueness across threads.
@@ -726,6 +749,7 @@ pub const Server = struct {
         }
         self.allocator.free(self.sessions);
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
+        self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
         self.loop.deinit();
         if (self.ssl_ctx) |*ctx| ctx.deinit();
@@ -2805,6 +2829,12 @@ pub const Server = struct {
             .shadow_part => |ev| {
                 muc_handler.handleShadowPart(self, ev);
             },
+            .room_occupant_move => |ev| {
+                // T177: immediate dispatch (see handleOccupantMove) — the move
+                // only mutates a delivery triple, so mailbox ordering with
+                // queued join/part/message traffic is not required.
+                muc_handler.handleOccupantMove(self, ev);
+            },
             .session_closed => |ev| {
                 var jid_buf: [256]u8 = undefined;
                 var jid_fbs = std.io.fixedBufferStream(&jid_buf);
@@ -3063,6 +3093,16 @@ pub const Server = struct {
 
         // Find the detached session with matching SM-ID
         const detached_id = self.findDetachedSession(previd) orelse {
+            // T177: prefix routed here but the session was handed off —
+            // follow the redirect breadcrumb instead of failing.
+            if (self.getWorkerCount() > 1) {
+                if (self.smRedirectLookup(previd)) |target| {
+                    if (target != self.worker_id and target < self.getWorkerCount()) {
+                        self.startCrossWorkerResume(session, previd, h_value, target, changes);
+                        return;
+                    }
+                }
+            }
             self.sendSmFailed(session, "item-not-found", changes);
             return;
         };
@@ -3102,6 +3142,29 @@ pub const Server = struct {
             queue.ack(h_value);
         }
 
+        // Snapshot local MUC occupancies (T177): the detached slot is torn
+        // down below, so the room list must be captured now. Slices point
+        // into Room structs, which stay alive across this handler.
+        var move_rooms_buf: [sm_handoff.MAX_BUNDLE_ROOMS][]const u8 = undefined;
+        var move_room_count: usize = 0;
+        if (self.room_registry) |reg| {
+            for (&reg.rooms) |*rslot| {
+                const room = rslot.* orelse continue;
+                if (!room.active) continue;
+                for (&room.occupants) |*occ_slot| {
+                    const occ = occ_slot.* orelse continue;
+                    if (occ.worker_id == self.worker_id and occ.session_id == detached_id) {
+                        if (move_room_count >= move_rooms_buf.len) {
+                            log.warn("SM resume: session occupies more than {d} rooms — remaining occupancies will not migrate", .{sm_handoff.MAX_BUNDLE_ROOMS});
+                            break;
+                        }
+                        move_rooms_buf[move_room_count] = room.getJid();
+                        move_room_count += 1;
+                    }
+                }
+            }
+        }
+
         // Transfer resumed state to the current session
         session.sm_enabled = true;
         session.sm_in_h = detached.sm_in_h;
@@ -3118,8 +3181,12 @@ pub const Server = struct {
         const d_username_len = detached.auth_username_len;
         @memcpy(session.auth_username_buf[0..d_username_len], detached.auth_username_buf[0..d_username_len]);
         session.auth_username_len = d_username_len;
-        const d_resource_len = detached.bind_resource_len;
-        @memcpy(session.bind_resource_buf[0..d_resource_len], detached.bind_resource_buf[0..d_resource_len]);
+        // Resource from the detached bound JID, not the bind accumulator:
+        // bind_resource_len is reset to 0 after a successful bind dispatch
+        // (parser accumulator reuse), but bound_jid.resource keeps pointing at
+        // the buffer's still-intact contents.
+        const d_resource_len = detached_jid.resource.len;
+        @memcpy(session.bind_resource_buf[0..d_resource_len], detached_jid.resource);
         session.bind_resource_len = d_resource_len;
         session.stream.bound_jid = .{
             .local = session.auth_username_buf[0..d_username_len],
@@ -3141,18 +3208,22 @@ pub const Server = struct {
         session.last_presence_inner_len = detached.last_presence_inner_len;
 
         // Re-bind in session map: unbind old slot, bind new slot with same JID
+        var bound_generation: ?u32 = null;
         if (self.session_map) |sm| {
             _ = sm.unbind(detached_jid.local, detached_jid.domain, detached_jid.resource);
-            _ = sm.bind(self.worker_id, @intCast(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource) catch {
-                log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}", .{
-                    detached_jid.local, detached_jid.domain, detached_jid.resource,
+            if (sm.bind(self.worker_id, @intCast(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |gen| {
+                bound_generation = gen;
+            } else |err| {
+                log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}: {}", .{
+                    detached_jid.local, detached_jid.domain, detached_jid.resource, err,
                 });
-            };
+            }
         }
 
         // Clean up detached session bookkeeping before destroying
         if (self.detached_count > 0) self.detached_count -= 1;
         self.smIdMapRemove(detached.sm_id[0..detached.sm_id_len]);
+        self.smRedirectDrop(previd); // session lives here again
 
         // Destroy the detached session (slot freed for reuse)
         detached.sm_resume_enabled = false; // Prevent re-detach
@@ -3164,6 +3235,22 @@ pub const Server = struct {
         if (self.free_count < self.free_ids.len) {
             self.free_ids[self.free_count] = detached_id;
             self.free_count += 1;
+        }
+
+        // T177 occupant migration: replay the room moves before <resumed/> —
+        // the detached slot was just destroyed, so every room record pointing
+        // at it is stale until moved. Doing this before the client learns of
+        // the resume guarantees its post-resume traffic is ordered after the
+        // moves. Same-worker moves apply in place on the owning worker
+        // (possibly remote); roomOwner == self applies synchronously.
+        if (move_room_count > 0) {
+            if (bound_generation) |gen| {
+                self.replayOccupantMoves(session, move_rooms_buf[0..move_room_count], gen, self.worker_id);
+            } else {
+                log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped", .{
+                    session.conn.id, move_room_count,
+                });
+            }
         }
 
         // Send <resumed/> to the client
@@ -3191,10 +3278,11 @@ pub const Server = struct {
             }
         }
 
-        log.info("connection {d} session resumed (id={s}, replayed {d} stanzas)", .{
+        log.info("connection {d} session resumed (id={s}, replayed {d} stanzas, {d} rooms)", .{
             session.conn.id,
             session.sm_id[0..session.sm_id_len],
             if (session.sm_unacked) |q| q.pending() else 0,
+            move_room_count,
         });
     }
 
@@ -3254,8 +3342,25 @@ pub const Server = struct {
             }
         }.send;
 
-        const detached_id = self.findDetachedSession(req.previd) orelse
+        const detached_id = self.findDetachedSession(req.previd) orelse {
+            // T177: this worker handed the session off earlier — follow the
+            // breadcrumb, preserving the original requester addressing.
+            if (req.hops < MAX_SM_REDIRECT_HOPS) {
+                if (self.smRedirectLookup(req.previd)) |target| {
+                    if (target != self.worker_id and target < self.getWorkerCount()) {
+                        log.info("cross-worker SM resume: {s} relocated to worker {d}, forwarding (hop {d})", .{
+                            req.previd, target, req.hops + 1,
+                        });
+                        var fwd = req;
+                        fwd.hops += 1;
+                        self.enqueueSmActor(target, .{ .sm_resume_request = fwd }) catch
+                            return fail(self, req, "item-not-found", "redirect forward failed");
+                        return;
+                    }
+                }
+            }
             return fail(self, req, "item-not-found", "no such detached session");
+        };
         const detached = self.sessions[detached_id] orelse
             return fail(self, req, "item-not-found", "slot empty");
 
@@ -3271,10 +3376,9 @@ pub const Server = struct {
         if (!std.mem.eql(u8, dj.local, req.auth_local) or !std.mem.eql(u8, dj.domain, req.auth_domain))
             return fail(self, req, "not-authorized", "JID mismatch");
 
-        // v1 limitation: MUC occupant records are not migrated — fall back to
-        // full re-bind so the client rejoins rooms cleanly (T177 follow-up).
-        if (self.sessionOccupiesAnyRoom(self.worker_id, detached_id))
-            return fail(self, req, "item-not-found", "MUC occupancy migration not yet supported");
+        // T177 occupant migration: MUC-occupying sessions are now handoff-
+        // eligible — the bundle carries the room list and the requesting
+        // worker replays occupant moves after it re-binds.
 
         if (detached.sm_unacked) |q| q.ack(req.h);
 
@@ -3326,6 +3430,15 @@ pub const Server = struct {
             }
         }
 
+        // Snapshot the detached session's MUC occupancies into the bundle.
+        // Over the cap: refuse the handoff (full re-bind + rejoin fallback,
+        // the pre-migration behavior).
+        if (!self.gatherSessionRooms(self.worker_id, detached_id, bundle)) {
+            bundle.deinit();
+            sm_handoff.allocator.destroy(bundle);
+            return fail(self, req, "item-not-found", "occupancy exceeds migration cap");
+        }
+
         sm_handoff.put(req.previd, bundle) catch {
             bundle.deinit();
             sm_handoff.allocator.destroy(bundle);
@@ -3340,6 +3453,10 @@ pub const Server = struct {
 
         // Dismantle the detached slot: same teardown as a successful local
         // resume (session-map unbind, sm-id map removal, free the slot).
+        // MUC occupant records are deliberately LEFT in place — occupancy is
+        // keyed by the full JID, which survives the move; the requesting
+        // worker replays occupant moves to retarget each record's
+        // (worker, session, generation) triple.
         if (self.session_map) |sm| {
             _ = sm.unbind(dj.local, dj.domain, dj.resource);
         }
@@ -3354,8 +3471,12 @@ pub const Server = struct {
             self.free_count += 1;
         }
 
-        log.info("cross-worker SM resume: handed off {s} to worker {d} ({d} stanzas)", .{
-            req.previd, req.req_worker, bundle.stanzas.items.len,
+        // Breadcrumb: the SM-ID prefix still names THIS worker; a repeat
+        // resume of the relocated session must find worker req.req_worker.
+        self.smRedirectNote(req.previd, req.req_worker);
+
+        log.info("cross-worker SM resume: handed off {s} to worker {d} ({d} stanzas, {d} rooms)", .{
+            req.previd, req.req_worker, bundle.stanzas.items.len, bundle.rooms.items.len,
         });
 
         self.enqueueSmActor(req.req_worker, .{ .sm_resume_reply = .{
@@ -3401,6 +3522,7 @@ pub const Server = struct {
             return;
         };
         defer sm_handoff.release(bundle);
+        self.smRedirectDrop(rep.previd); // session lives here again
 
         // Rebuild the unacked queue on this worker's allocator.
         const queue = self.allocator.create(sm_state.SmUnackedQueue) catch {
@@ -3456,12 +3578,30 @@ pub const Server = struct {
         @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
         session.last_presence_inner_len = bundle.last_presence.len;
 
+        var bound_generation: ?u32 = null;
         if (self.session_map) |sm| {
-            _ = sm.bind(self.worker_id, @intCast(session.conn.id), bundle.username, self.server_host, bundle.resource) catch |err| {
+            if (sm.bind(self.worker_id, @intCast(session.conn.id), bundle.username, self.server_host, bundle.resource)) |gen| {
+                bound_generation = gen;
+            } else |err| {
                 log.err("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
                     bundle.username, self.server_host, bundle.resource, err,
                 });
-            };
+            }
+        }
+
+        // T177 occupant migration: replay room moves before <resumed/> — SM
+        // state applied, SessionMap bind done (generation known); the client
+        // has not been told yet, so its post-resume traffic is ordered after
+        // the moves. Old worker identity comes from the SM-ID prefix.
+        if (bundle.rooms.items.len > 0) {
+            if (bound_generation) |gen| {
+                const old_worker = sm_state.workerIdFromSmId(&bundle.previd) orelse self.worker_id;
+                self.replayOccupantMoves(session, bundle.rooms.items, gen, old_worker);
+            } else {
+                log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped (client should MAM/rejoin)", .{
+                    session.conn.id, bundle.rooms.items.len,
+                });
+            }
         }
 
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
@@ -3487,10 +3627,11 @@ pub const Server = struct {
             }
         }
 
-        log.info("connection {d} cross-worker session resumed (id={s}, replayed {d} stanzas)", .{
+        log.info("connection {d} cross-worker session resumed (id={s}, replayed {d} stanzas, {d} rooms)", .{
             session.conn.id,
             session.sm_id[0..session.sm_id_len],
             replay_count,
+            bundle.rooms.items.len,
         });
     }
 
@@ -3516,20 +3657,77 @@ pub const Server = struct {
         try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_SENTINEL, 0, buf[0..len]);
     }
 
-    /// True if this worker's session occupies any MUC room (authoritative
-    /// occupant records for local sessions live in every worker's registry
-    /// via the shadow-room replication).
-    fn sessionOccupiesAnyRoom(self: *Server, worker_id: u16, session_id: usize) bool {
-        const reg = self.room_registry orelse return false;
+    /// Append the JIDs of every MUC room the given session occupies into the
+    /// bundle (T177 occupant migration). Every worker's registry carries
+    /// occupant records for its own sessions — canonical records for rooms it
+    /// owns, shadow copies for rooms owned elsewhere — so a local scan sees
+    /// all of them. Only the room JID is bundled: the canonical record on the
+    /// room's owning worker keeps the authoritative nick/role/affiliation and
+    /// is updated in place by the occupant move. Returns false on alloc
+    /// failure or when occupancy exceeds sm_handoff.MAX_BUNDLE_ROOMS (the
+    /// caller then falls back to a full re-bind).
+    fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bundle: *sm_handoff.ResumeBundle) bool {
+        const reg = self.room_registry orelse return true;
         for (&reg.rooms) |*slot| {
             const room = slot.* orelse continue;
             if (!room.active) continue;
             for (&room.occupants) |*occ_slot| {
                 const occ = occ_slot.* orelse continue;
-                if (occ.worker_id == worker_id and occ.session_id == session_id) return true;
+                if (occ.worker_id != worker_id or occ.session_id != session_id) continue;
+                if (bundle.rooms.items.len >= sm_handoff.MAX_BUNDLE_ROOMS) return false;
+                const copy = sm_handoff.allocator.dupe(u8, room.getJid()) catch return false;
+                bundle.rooms.append(sm_handoff.allocator, copy) catch {
+                    sm_handoff.allocator.free(copy);
+                    return false;
+                };
             }
         }
-        return false;
+        return true;
+    }
+
+    /// T177: replay occupant moves for a successfully resumed session — one
+    /// per room's owning worker, which updates the canonical record (and
+    /// shadow copies) to the new (worker, session, generation) without any
+    /// presence fan-out.
+    ///
+    /// Ordering: runs after the SessionMap bind (generation known) and before
+    /// <resumed/> reaches the client, so traffic the client sends after the
+    /// resume is always ordered behind the moves. Rooms owned by THIS worker
+    /// are applied synchronously — an async hop would let same-batch room
+    /// traffic (a groupchat from another client read in the same kevent
+    /// batch) see the pre-move triple and drop the stanza on the stale slot.
+    ///
+    /// If the resumed connection dies before or while these apply,
+    /// destroySession's session_closed broadcast removes the occupant by
+    /// full JID everywhere — no ghost occupancy.
+    fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, generation: u32, old_worker: u16) void {
+        const bound = session.stream.bound_jid orelse return;
+        var jid_buf: [320]u8 = undefined;
+        var jid_fbs = std.io.fixedBufferStream(&jid_buf);
+        const jw = jid_fbs.writer();
+        jw.writeAll(bound.local) catch return;
+        jw.writeByte('@') catch return;
+        jw.writeAll(bound.domain) catch return;
+        jw.writeByte('/') catch return;
+        jw.writeAll(bound.resource) catch return;
+        const real_jid = jid_fbs.getWritten();
+
+        for (room_jids) |room_jid| {
+            const move = actor_message.RoomOccupantMove{
+                .room_jid = room_jid,
+                .real_jid = real_jid,
+                .old_worker_id = old_worker,
+                .new_worker_id = self.worker_id,
+                .new_session_id = @intCast(session.conn.id),
+                .new_generation = generation,
+            };
+            const owner = room_registry_mod.roomOwner(room_jid, self.getWorkerCount());
+            if (owner == self.worker_id) {
+                muc_handler.handleOccupantMove(self, move);
+            } else {
+                self.enqueueRoomActorMessage(owner, .{ .room_occupant_move = move });
+            }
+        }
     }
 
     /// Send SM <failed/> with a specific error condition.
@@ -3597,6 +3795,68 @@ pub const Server = struct {
             }
             idx = (idx + 1) % 64;
         }
+    }
+
+    /// T177: record that previd's session moved to `worker` (cross-worker
+    /// handoff on this worker). Breadcrumbs expire with the SM resume window;
+    /// a full map evicts the oldest entry.
+    fn smRedirectNote(self: *Server, previd: []const u8, worker: u16) void {
+        if (previd.len != sm_state.SM_ID_HEX_LEN) return;
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, previd);
+        const now = std.time.timestamp();
+        self.smRedirectsPurgeExpired(now);
+        if (self.sm_redirects.count() >= MAX_SM_REDIRECTS and !self.sm_redirects.contains(key)) {
+            var oldest_key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+            var oldest_ts: i64 = std.math.maxInt(i64);
+            var found = false;
+            var it = self.sm_redirects.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.moved_at < oldest_ts) {
+                    oldest_ts = kv.value_ptr.moved_at;
+                    oldest_key = kv.key_ptr.*;
+                    found = true;
+                }
+            }
+            if (found) _ = self.sm_redirects.remove(oldest_key);
+        }
+        self.sm_redirects.put(self.allocator, key, .{ .worker = worker, .moved_at = now }) catch {};
+    }
+
+    /// Where did previd's session go? null if unknown/expired.
+    fn smRedirectLookup(self: *Server, previd: []const u8) ?u16 {
+        if (previd.len != sm_state.SM_ID_HEX_LEN) return null;
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, previd);
+        const entry = self.sm_redirects.getPtr(key) orelse return null;
+        if (std.time.timestamp() - entry.moved_at > sm_state.DEFAULT_RESUME_TIMEOUT) {
+            _ = self.sm_redirects.remove(key);
+            return null;
+        }
+        return entry.worker;
+    }
+
+    /// Drop a redirect for previd (session resumed or destroyed here).
+    fn smRedirectDrop(self: *Server, previd: []const u8) void {
+        if (previd.len != sm_state.SM_ID_HEX_LEN) return;
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, previd);
+        _ = self.sm_redirects.remove(key);
+    }
+
+    fn smRedirectsPurgeExpired(self: *Server, now: i64) void {
+        var stale: [16][sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        var stale_count: usize = 0;
+        var it = self.sm_redirects.iterator();
+        while (it.next()) |kv| {
+            if (now - kv.value_ptr.moved_at > sm_state.DEFAULT_RESUME_TIMEOUT) {
+                if (stale_count < stale.len) {
+                    stale[stale_count] = kv.key_ptr.*;
+                    stale_count += 1;
+                }
+            }
+        }
+        for (stale[0..stale_count]) |key| _ = self.sm_redirects.remove(key);
     }
 
     /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.

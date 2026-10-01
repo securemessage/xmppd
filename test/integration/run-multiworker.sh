@@ -69,6 +69,10 @@ tmp=$(mktemp -d /tmp/xmppd-mw.XXXXXX)
 # srvpid is set once the server starts; guard for early failures.
 srvpid=
 cleanup() {
+    # Optional: preserve the full server log for post-mortem analysis.
+    if [ -n "${XMPP_LOG_COPY:-}" ] && [ -f "$tmp/server.log" ]; then
+        cp "$tmp/server.log" "$XMPP_LOG_COPY"
+    fi
     if [ -n "$srvpid" ]; then
         kill "$srvpid" 2>/dev/null
         wait "$srvpid" 2>/dev/null
@@ -136,6 +140,10 @@ fi
 
 echo "=== multi-worker lane: workers=$workers port=$PORT ==="
 rc=0
+# XMPP_SERVER_LOG lets suites assert on observed cross-worker behavior
+# (e.g. e2e-muc-resume counts handoffs for T177 occupant migration).
+export XMPP_SERVER_LOG="$tmp/server.log"
+XMPP_WORKERS=$workers; export XMPP_WORKERS
 for suite in $suites; do
     echo "--- $suite (workers=$workers) ---"
     XMPP_PORT=$PORT "$PYTHON" "$here/$suite" || rc=1
