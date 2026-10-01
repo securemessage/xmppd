@@ -479,6 +479,9 @@ pub const Server = struct {
     server_host: []const u8,
     running: bool = true,
 
+    /// Process start time (epoch seconds) — XEP-0012 domain uptime answer.
+    start_time: i64 = 0,
+
     /// Session table — indexed by session ID. Heap-allocated, size configurable.
     sessions: []?*Session = &.{},
     max_sessions: usize = DEFAULT_MAX_SESSIONS,
@@ -640,6 +643,7 @@ pub const Server = struct {
             .free_count = fc,
             .allocator = allocator,
             .server_host = host,
+            .start_time = std.time.timestamp(),
         };
     }
 
@@ -695,6 +699,7 @@ pub const Server = struct {
             .free_count = fc,
             .allocator = allocator,
             .server_host = host,
+            .start_time = std.time.timestamp(),
         };
     }
 

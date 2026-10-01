@@ -4,6 +4,7 @@
 //! - Roster queries (jabber:iq:roster)
 //! - Service Discovery (XEP-0030: disco#info, disco#items)
 //! - XMPP Ping (XEP-0199)
+//! - Last activity (XEP-0012: jabber:iq:last)
 //! - vCard-temp (XEP-0054)
 //! - Software Version (XEP-0092)
 //! - Legacy session establishment
@@ -519,6 +520,12 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 sendIqError(server, session, iq_id, "not-allowed");
                 return;
             }
+            // Last Activity (XEP-0012) about another JID. Server-answered on behalf
+            // of the bare JID; see handleLastActivityFor for the disclosure policy.
+            if (std.mem.eql(u8, child_ns, xml.ns.last) and std.mem.eql(u8, iq_type, "get")) {
+                handleLastActivityFor(server, session, iq_id, to_jid);
+                return;
+            }
             // RFC 6121 §2.1.5: Roster set/get to another user — forbidden.
             if (std.mem.eql(u8, child_ns, xml.ns.roster)) {
                 sendIqErrorWithType(server, session, iq_id, "auth", "forbidden");
@@ -645,16 +652,11 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         return;
     }
 
-    // Last Activity (XEP-0012)
+    // Last Activity (XEP-0012, T164): queries reaching the general flow are
+    // server-directed (uptime) or about the querying account itself (0).
+    // Other-account queries are answered in the foreign-JID branch above.
     if (std.mem.eql(u8, child_ns, xml.ns.last) and std.mem.eql(u8, iq_type, "get")) {
-        var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        // Query own last activity: return 0 (currently online)
-        // TODO: For querying other users, look up stored last_online timestamp
-        w.writeAll("><query xmlns='jabber:iq:last' seconds='0'/>") catch return;
-        w.writeAll("</iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        handleLastActivitySelfOrServer(server, session, iq_id);
         return;
     }
 
@@ -1322,6 +1324,98 @@ pub fn parseTimestamp(text: []const u8) ?u64 {
 
 fn isLeapYear(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
+}
+
+// ============================================================================
+// XEP-0012 Last Activity (T164)
+// ============================================================================
+
+/// Emit a successful jabber:iq:last result IQ.
+fn sendLastActivityResult(server: *Server, session: *Session, iq_id: []const u8, seconds: u64) void {
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "result", iq_id);
+    w.writeAll("><query xmlns='jabber:iq:last' seconds='") catch return;
+    w.print("{d}", .{seconds}) catch return;
+    w.writeAll("'/></iq>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
+}
+
+/// Server-directed queries (uptime, XEP-0012 §2.2) and self queries (the
+/// querying account is online by definition => 0). Queries about other
+/// accounts never reach here — dispatchIq's foreign-JID branch handles them.
+fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []const u8) void {
+    const iq_to = session.iq_to;
+    if (iq_to.len == 0 or std.mem.eql(u8, iq_to, server.server_host)) {
+        const start = if (server.start_time > 0) server.start_time else std.time.timestamp();
+        const uptime: u64 = @intCast(@max(std.time.timestamp() - start, 0));
+        sendLastActivityResult(server, session, iq_id, uptime);
+        return;
+    }
+    if (std.mem.indexOfScalar(u8, iq_to, '@') == null) {
+        // '@'-less address that is not our domain — not ours to answer.
+        sendIqError(server, session, iq_id, "service-unavailable");
+        return;
+    }
+    // '@'-bearing JIDs reaching here are the requester's own.
+    sendLastActivityResult(server, session, iq_id, 0);
+}
+
+/// Query about another local account. Disclosure policy (XEP-0012 §3.7):
+/// the target's roster entry for the requester must carry subscription
+/// "from" or "both" — the same parties that receive the target's presence.
+/// Online targets answer 0; offline targets answer seconds since the last
+/// resource teardown; no record (or no store) is indistinguishable from a
+/// nonexistent account per the vCard anti-harvesting precedent.
+fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, to_jid: @import("xmpp").Jid) void {
+    const bound = session.stream.bound_jid orelse return;
+
+    if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
+        sendIqError(server, session, iq_id, "service-unavailable");
+        return;
+    }
+
+    var target_buf: [320]u8 = undefined;
+    var target_fbs = std.io.fixedBufferStream(&target_buf);
+    target_fbs.writer().writeAll(to_jid.local) catch return;
+    target_fbs.writer().writeByte('@') catch return;
+    target_fbs.writer().writeAll(to_jid.domain) catch return;
+    const target_bare = target_fbs.getWritten();
+
+    var requester_buf: [320]u8 = undefined;
+    var requester_fbs = std.io.fixedBufferStream(&requester_buf);
+    requester_fbs.writer().writeAll(bound.local) catch return;
+    requester_fbs.writer().writeByte('@') catch return;
+    requester_fbs.writer().writeAll(bound.domain) catch return;
+    const requester_bare = requester_fbs.getWritten();
+
+    const roster = server.roster orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+    const allowed = roster.isSubscribedToPresence(server.allocator, target_bare, requester_bare) catch false;
+    if (!allowed) {
+        sendIqErrorWithType(server, session, iq_id, "auth", "forbidden");
+        return;
+    }
+
+    // Online anywhere (bound — SM-detached included) => 0.
+    if (server.session_map) |sm| {
+        var probe: [1]SessionEntry = undefined;
+        if (sm.findByBareJid(to_jid.local, to_jid.domain, &probe) > 0) {
+            sendLastActivityResult(server, session, iq_id, 0);
+            return;
+        }
+    }
+
+    const lastact = @import("last_activity_store");
+    const last = lastact.get(server.allocator, roster.backend, target_bare) catch null orelse {
+        sendIqError(server, session, iq_id, "item-not-found");
+        return;
+    };
+    const now = std.time.timestamp();
+    const elapsed: u64 = @intCast(@max(now - @as(i64, @intCast(last)), 0));
+    sendLastActivityResult(server, session, iq_id, elapsed);
 }
 
 /// Write IQ opening tag with type, from, to (client full JID), and id.

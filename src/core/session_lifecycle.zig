@@ -21,6 +21,7 @@ const sm_state = server_mod.sm_state;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
+const lastact_store = @import("last_activity_store");
 
 const log = std.log.scoped(.lifecycle);
 
@@ -346,6 +347,15 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
                     presence_handler.broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
                 }
             }
+            // T164: when the account's last resource tears down, record when it
+            // went offline (XEP-0012). Written to the shared op DB so any
+            // worker answers last-activity without cross-worker routing.
+            var probe_buf: [1]@import("session_map").SessionEntry = undefined;
+            if (sm.findByBareJid(bound.local, bound.domain, &probe_buf) == 0) {
+                if (server.roster) |roster| {
+                    recordLastOffline(roster, bound);
+                }
+            }
         }
     }
 
@@ -362,6 +372,20 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     // Return ID to free-list (T128)
     server.free_ids[server.free_count] = id;
     server.free_count += 1;
+}
+
+/// T164: write the account's last-offline timestamp after its final resource
+/// unbound (best-effort; on error the next teardown retries).
+fn recordLastOffline(roster: anytype, bound: anytype) void {
+    var bare_buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&bare_buf);
+    fbs.writer().writeAll(bound.local) catch return;
+    fbs.writer().writeByte('@') catch return;
+    fbs.writer().writeAll(bound.domain) catch return;
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    lastact_store.record(roster.backend, fbs.getWritten(), now) catch |err| {
+        log.warn("last-activity record failed for {s}@{s}: {}", .{ bound.local, bound.domain, err });
+    };
 }
 
 /// Reap sessions whose SM unacked queue overflowed (T178). XEP-0198 has no

@@ -311,6 +311,12 @@ pub fn build(b: *std.Build) void {
     });
     server_mam_handler_mod.addImport("backend", server_backend_mod);
     server_mam_handler_mod.addImport("archive_store", server_archive_store_mod);
+    const server_last_activity_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/last_activity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_last_activity_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -328,6 +334,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("archive_backend", server_archive_backend_mod);
     server_test_mod.addImport("mam_handler", server_mam_handler_mod);
     server_test_mod.addImport("vcard_store", server_vcard_store_mod);
+    server_test_mod.addImport("last_activity_store", server_last_activity_mod);
     const server_room_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/room_store.zig"),
         .target = target,
@@ -787,6 +794,22 @@ pub fn build(b: *std.Build) void {
 
     const run_generic_offline_store_tests = b.addRunArtifact(generic_offline_store_tests);
 
+    // --- Last activity store tests (XEP-0012, T164) ---
+
+    const last_activity_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/last_activity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    last_activity_store_test_mod.addImport("backend", backend_test_mod);
+
+    const last_activity_store_tests = b.addTest(.{
+        .name = "last-activity-store-tests",
+        .root_module = last_activity_store_test_mod,
+    });
+
+    const run_last_activity_store_tests = b.addRunArtifact(last_activity_store_tests);
+
     // --- PEP store tests ---
 
     const pep_store_test_mod = b.createModule(.{
@@ -1091,6 +1114,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("archive_backend", server_archive_backend_mod);
     core_mod.addImport("mam_handler", server_mam_handler_mod);
     core_mod.addImport("vcard_store", server_vcard_store_mod);
+    core_mod.addImport("last_activity_store", server_last_activity_mod);
     core_mod.addImport("room_store", server_room_store_mod);
     core_mod.addImport("room_registry", server_room_registry_mod);
     core_mod.addImport("room_mailbox", server_room_mailbox_mod);
@@ -1459,6 +1483,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+    test_step.dependOn(&run_last_activity_store_tests.step);
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);
     test_step.dependOn(&run_invite_store_tests.step);
