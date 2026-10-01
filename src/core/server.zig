@@ -4318,7 +4318,7 @@ test "cross-thread delivery: enqueue and drain" {
     const allocator = std.testing.allocator;
 
     // Set up shared infrastructure
-    var sm = SessionMap.init(allocator, true);
+    var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -4373,7 +4373,7 @@ test "cross-thread delivery: enqueue and drain" {
 test "cross-thread delivery: generation mismatch drops stanza" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true);
+    var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();

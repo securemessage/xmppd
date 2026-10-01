@@ -70,50 +70,95 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
 /// ("the server MAY terminate the old session in favor of the new") rather
 /// than silently leaving the new (already-acknowledged-to-the-client) bind
 /// unregistered in the session map.
+///
+/// T198: the session-map registration happens BEFORE the success IQ is sent.
+/// On failure the client now gets a real answer — stanza error
+/// resource-constraint when the account is over its resource cap (stream
+/// stays open; the client may retry with a different resource), conflict
+/// stream error when a cross-worker eviction is impossible (T154).
 /// Returns `false` if the session was destroyed as part of handling the bind
 /// (e.g. an unrecoverable AlreadyBound conflict) — callers MUST NOT touch
 /// `session` again if this returns false.
 pub fn handleBind(server: *Server, session: *Session, resource: []const u8, changes: *ChangeList) bool {
-    const action = session.stream.handleBind(resource);
-    server.executeAction(session, action);
+    // Only resource-binding happens through this path; anything else keeps
+    // the original stream-state-machine behavior.
+    if (session.stream.state != .features_bind) {
+        const action = session.stream.handleBind(resource);
+        server.executeAction(session, action);
+        return true;
+    }
 
-    if (session.stream.isActive()) {
-        if (session.stream.bound_jid) |bound| {
-            const sm = server.session_map orelse {
-                log.err("connection {d} bind failed: session_map not configured", .{session.conn.id});
-                return true;
-            };
-            _ = sm.bind(server.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err| {
-                if (err == error.AlreadyBound) {
-                    if (evictStaleResource(server, sm, bound.local, bound.domain, bound.resource, changes)) {
-                        _ = sm.bind(server.worker_id, @intCast(session.conn.id), bound.local, bound.domain, bound.resource) catch |err2| {
-                            log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
-                            server.sendStreamError(session, .conflict);
-                            forceCloseSession(server, session.conn.id, changes);
-                            return false;
-                        };
-                        log.info("connection {d} session established (evicted stale resource): {s}@{s}/{s}", .{
-                            session.conn.id, bound.local, bound.domain, bound.resource,
-                        });
-                        return true;
-                    }
-                    // Cross-worker stale entry: no safe local mechanism to evict a
-                    // connection owned by another worker thread yet (see T152 follow-up).
-                    // Fail loud instead of leaving the client believing it's bound.
-                    log.err("connection {d} session_map bind failed: resource held by another worker, cannot evict", .{session.conn.id});
+    const sm = server.session_map orelse {
+        log.err("connection {d} bind failed: session_map not configured", .{session.conn.id});
+        return true;
+    };
+
+    // The stream FSM applies the same defaulting rule; do the sm work first.
+    const eff_resource: []const u8 = if (resource.len > 0) resource else "default";
+    const local = session.stream.authenticated_jid orelse {
+        const action = session.stream.handleBind(resource);
+        server.executeAction(session, action);
+        return true;
+    };
+
+    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource)) |_| {
+        const action = session.stream.handleBind(eff_resource);
+        server.executeAction(session, action);
+        log.info("connection {d} session established: {s}@{s}/{s}", .{
+            session.conn.id, local.local, local.domain, eff_resource,
+        });
+        return true;
+    } else |err| {
+        if (err == error.AlreadyBound) {
+            if (evictStaleResource(server, sm, local.local, local.domain, eff_resource, changes)) {
+                _ = sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource) catch |err2| {
+                    log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
                     server.sendStreamError(session, .conflict);
                     forceCloseSession(server, session.conn.id, changes);
                     return false;
-                }
-                log.err("connection {d} session_map bind failed: {}", .{ session.conn.id, err });
+                };
+                const action = session.stream.handleBind(eff_resource);
+                server.executeAction(session, action);
+                log.info("connection {d} session established (evicted stale resource): {s}@{s}/{s}", .{
+                    session.conn.id, local.local, local.domain, eff_resource,
+                });
                 return true;
-            };
-            log.info("connection {d} session established: {s}@{s}/{s}", .{
-                session.conn.id, bound.local, bound.domain, bound.resource,
-            });
+            }
+            // Cross-worker stale entry: no safe local mechanism to evict a
+            // connection owned by another worker thread yet (see T152 follow-up).
+            // Fail loud instead of leaving the client believing it's bound.
+            log.err("connection {d} session_map bind failed: resource held by another worker, cannot evict", .{session.conn.id});
+            server.sendStreamError(session, .conflict);
+            forceCloseSession(server, session.conn.id, changes);
+            return false;
         }
+
+        // T198: capacity/other registration failure — answer the bind IQ with
+        // a stanza error; do NOT mark the stream active. The client sees the
+        // failure instead of believing it holds an unregistered binding, and
+        // may retry with another resource.
+        log.err("connection {d} bind rejected for {s}@{s}/{s}: {}", .{
+            session.conn.id, local.local, local.domain, eff_resource, err,
+        });
+        sendBindRejected(session);
+        return true;
     }
-    return true;
+}
+
+/// Stanza-level rejection of a resource bind (T198). Stream stays open.
+fn sendBindRejected(session: *Session) void {
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    w.writeAll("<iq type='error'") catch return;
+    if (session.bind_iq_id.len > 0) {
+        w.writeAll(" id='") catch return;
+        w.writeAll(session.bind_iq_id) catch return;
+        w.writeByte('\'') catch return;
+    }
+    w.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
+        "<error type='cancel'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>" ++
+        "</error></iq>") catch return;
+    session.conn.queueSend(fbs.getWritten()) catch return;
 }
 
 /// Evict a stale same-worker session occupying the target full JID so a new
@@ -492,7 +537,7 @@ test "T152: rebind with same resource evicts stale session" {
     var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
-    var sm = SessionMap.init(allocator, false);
+    var sm = SessionMap.init(allocator, false, 0);
     defer sm.deinit();
     server.session_map = &sm;
 

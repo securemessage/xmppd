@@ -78,6 +78,8 @@ pub fn main() !void {
     var listen_fd_str: ?[]const u8 = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
+    // 0 = SessionMap default (256). T198/Sonya: raise for many-resources-per-account deployments.
+    var max_resources_per_account: usize = 0;
     var oidc_import_avatar: bool = false;
 
     // Skip argv[0]
@@ -206,6 +208,9 @@ pub fn main() !void {
         if (c.get("core", "fan_out_batch_size")) |v| {
             fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("fanout.zig").DEFAULT_BATCH_SIZE;
         }
+        if (c.get("core", "max_resources_per_account")) |v| {
+            max_resources_per_account = std.fmt.parseInt(usize, v, 10) catch 0;
+        }
 
         // [oidc] section (core-side options)
         if (c.get("oidc", "import_avatar")) |v| {
@@ -323,7 +328,7 @@ pub fn main() !void {
     };
 
     // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
-    var session_map = SessionMap.init(allocator, worker_count > 1);
+    var session_map = SessionMap.init(allocator, worker_count > 1, max_resources_per_account);
     defer session_map.deinit();
     log.info("session map allocated (multi_worker={s})", .{if (worker_count > 1) "true" else "false"});
 
