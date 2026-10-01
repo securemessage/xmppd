@@ -165,12 +165,10 @@ findings are triaged.
       6120 §7.7.3, retry on reply; 3-round cap); evicted clients now get
       the conflict stream error flushed before disconnect. Same fix on the
       local eviction path (T152) — merged 2026-10-01 (307a717)
-- [x] **T198** — per-account resource cap raised from hardcoded 16 to a
-      configurable `[core] max_resources_per_account` (default 256) with a
-      heap-backed entry list; bind failures are now client-visible (stanza
-      error resource-constraint; success IQ only after registration) —
+- [x] **T198** — per-account resource cap raised to configurable
+      `[core] max_resources_per_account` (default 256); bind failures now
+      client-visible (stanza error, success IQ only after registration) —
       merged 2026-10-01 (a3babac)
-- [ ] T112 — MUC MAM routing
 - [ ] **T177** — cross-worker SM resume: Option A state handoff landed
       2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
       MPSC request/reply, mutex-guarded handoff store for the unacked queue,
@@ -193,11 +191,6 @@ findings are triaged.
       2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
 - [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
       measurements showing actual DebugAllocator lock contention
-- [ ] **T198** — per-account resource scale: MAX_RESOURCES is a hard 16 per
-      bare JID and a bind past the cap silently desyncs the client (success
-      IQ precedes session_map registration) — raise/statically-size or make
-      it src/config-configurable, and make bind failure client-visible
-      (stanza error). Needed by Sonya (hundreds of resources per account)
 - [ ] **T197** — codebase-wide quality sweep (EXIT GATE, runs after the
       0.9.0 work above lands): performance (hot-path allocation churn,
       lock contention, event-loop hygiene per project kqueue rules),
