@@ -384,6 +384,11 @@ pub const Connection = struct {
     // --- Private helpers ---
 
     fn compactWriteBuf(self: *Connection) void {
+        // A TLS write retried after WANT_WRITE must use the same buffer
+        // address; moving it gives "bad write retry" (or corrupt data with
+        // kTLS). TLS writes are all-or-nothing, so write_start is already 0
+        // whenever a retry is pending and this is a no-op by construction.
+        if (self.tls_conn != null) return;
         if (self.write_start == 0) return;
         const remaining = self.write_end - self.write_start;
         if (remaining > 0) {
