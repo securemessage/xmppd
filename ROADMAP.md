@@ -139,6 +139,13 @@ eleven items landed; see CHANGELOG for details:
 
 Deferred out of the v0.8.0 feature release:
 
+Execution order (agreed 2026-09-30): T177 MUC occupant migration first
+(completes cross-worker resume), then the perf backlog T130/T121/T110/T87,
+T154 opportunistically (its delivery pattern now exists); T32 stays blocked
+on the lib/xmppc delivery, T31 gated on T32 measurements. T197 is the exit
+gate: the release is not tagged until the codebase-wide quality sweep has
+run and its findings are triaged.
+
 - [ ] T112 — MUC MAM routing
 - [ ] T130 — batch presence
 - [ ] T121 — auth thread pool
@@ -162,6 +169,13 @@ Deferred out of the v0.8.0 feature release:
       2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
 - [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
       measurements showing actual DebugAllocator lock contention
+- [ ] **T197** — codebase-wide quality sweep (EXIT GATE, runs after the
+      0.9.0 work above lands): performance (hot-path allocation churn,
+      lock contention, event-loop hygiene per project kqueue rules),
+      anti-patterns, readability/maintainability, separation of concerns,
+      Zig-specific idiom/allocator-discipline review. Output: triaged
+      findings report; fix-now items land before tagging, the rest become
+      new tasks
 
 ### v0.10.0 — Feature: Web Transport
 
