@@ -15,6 +15,7 @@ const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const lock_store_mod = @import("lock_store");
+const crypto_pool_mod = @import("crypto_pool");
 
 const log = std.log.scoped(.auth_handler);
 
@@ -44,6 +45,43 @@ pub const InviteValidator = struct {
 pub const RegistrationConfig = struct {
     enabled: bool = false,
     require_invite: bool = true,
+};
+
+/// A PLAIN auth parked while the crypto pool derives its key (T121). Owned
+/// by the handler; all memory comes from the handler's allocator and is only
+/// touched on the event-loop thread.
+const PendingPlain = struct {
+    slot: u32,
+    /// Accept-generation of the IPC client slot at request time — guards
+    /// against a deferred reply landing on a different core connection that
+    /// reused the slot.
+    slot_gen: u32,
+    conn_id: u32,
+    username: []u8,
+    client_ip: []u8,
+};
+
+/// What handleMessage instructs the IPC loop to do next.
+pub const HandleResult = union(enum) {
+    /// Not an auth message — nothing to send.
+    none,
+    /// Send this reply now.
+    reply: protocol.Message,
+    /// Deferred to the crypto pool; the reply arrives via takeCryptoReply().
+    deferred,
+};
+
+/// A completion-side reply rendered in the event loop (T121). On success the
+/// message borrows owned_username — callers queueSend before deinit.
+pub const DeferredReply = struct {
+    slot: u32,
+    slot_gen: u32,
+    msg: protocol.Message,
+    owned_username: ?[]u8 = null,
+
+    pub fn deinit(self: *DeferredReply, allocator: std.mem.Allocator) void {
+        if (self.owned_username) |u| allocator.free(u);
+    }
 };
 
 /// Maximum concurrent SCRAM exchanges (one per XMPP connection doing auth).
@@ -96,6 +134,13 @@ pub fn AuthHandler(comptime Store: type) type {
             .timestamp = 0,
             .occupied = false,
         }} ** CRED_CACHE_SIZE,
+
+        /// T121: optional crypto offload pool. With a pool attached, local-store
+        /// PLAIN derives run on pool threads and the reply is deferred; without
+        /// one the derive runs inline in the loop (OIDC daemon, tests).
+        crypto_pool: ?*crypto_pool_mod.CryptoPool = null,
+        /// Deferred PLAIN auths awaiting pool completion, keyed by job id.
+        pending_plain: std.AutoHashMapUnmanaged(u64, PendingPlain) = .{},
 
         const Self = @This();
 
@@ -156,26 +201,73 @@ pub fn AuthHandler(comptime Store: type) type {
             for (&self.scram_sessions) |*s| {
                 if (s.active) s.deinit();
             }
+            var pend_it = self.pending_plain.iterator();
+            while (pend_it.next()) |kv| {
+                self.allocator.free(kv.value_ptr.username);
+                self.allocator.free(kv.value_ptr.client_ip);
+            }
+            self.pending_plain.deinit(self.allocator);
         }
 
-        /// Process an incoming IPC message and return a response message.
-        pub fn handleMessage(self: *Self, msg: protocol.Message) ?protocol.Message {
-            return switch (msg) {
-                .auth_request => |req| self.handleAuthRequest(req),
-                .sasl_response => |resp| self.handleSaslResponse(resp),
-                .password_change_request => |req| self.handlePasswordChange(req),
-                .account_delete_request => |req| self.handleAccountDelete(req),
-                .register_request => |req| self.handleRegisterRequest(req),
-                else => null,
+        /// Attach a crypto pool (T121). Local-store PLAIN derives start
+        /// deferring after this; the IPC loop must poll takeCryptoReply()
+        /// whenever the pool's wake pipe fires.
+        pub fn enableCryptoPool(self: *Self, pool: *crypto_pool_mod.CryptoPool) void {
+            self.crypto_pool = pool;
+        }
+
+        /// Render the reply for a finished crypto job (T121), or null if the
+        /// job id is unknown (stale/abandoned). Rate-limit bookkeeping runs
+        /// here on the loop thread, same as the inline path.
+        pub fn takeCryptoReply(self: *Self, completion: crypto_pool_mod.Completion) ?DeferredReply {
+            const kv = self.pending_plain.fetchRemove(completion.id) orelse return null;
+            const pend = kv.value;
+            defer self.allocator.free(pend.client_ip);
+
+            if (completion.ok) {
+                log.info("PLAIN auth success: '{s}'", .{pend.username});
+                if (self.rate_limiter) |rl| rl.recordSuccess(pend.username);
+                return .{
+                    .slot = pend.slot,
+                    .slot_gen = pend.slot_gen,
+                    .owned_username = pend.username,
+                    .msg = .{ .auth_success = .{
+                        .conn_id = pend.conn_id,
+                        .username = pend.username,
+                        .server_final = "",
+                    } },
+                };
+            }
+
+            log.info("PLAIN auth failed: wrong password for '{s}'", .{pend.username});
+            if (self.rate_limiter) |rl| rl.recordFailure(pend.username, pend.client_ip);
+            self.allocator.free(pend.username);
+            return .{
+                .slot = pend.slot,
+                .slot_gen = pend.slot_gen,
+                .msg = authFailure(pend.conn_id, "not-authorized"),
             };
         }
 
-        fn handleAuthRequest(self: *Self, req: protocol.AuthRequest) protocol.Message {
+        /// Process an incoming IPC message. slot/slot_gen identify the IPC
+        /// client for deferred (crypto pool) replies.
+        pub fn handleMessage(self: *Self, msg: protocol.Message, slot: u32, slot_gen: u32) HandleResult {
+            return switch (msg) {
+                .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
+                .sasl_response => |resp| .{ .reply = self.handleSaslResponse(resp) },
+                .password_change_request => |req| .{ .reply = self.handlePasswordChange(req) },
+                .account_delete_request => |req| .{ .reply = self.handleAccountDelete(req) },
+                .register_request => |req| .{ .reply = self.handleRegisterRequest(req) },
+                else => .none,
+            };
+        }
+
+        fn handleAuthRequest(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
             // Permanent lock check (if enabled)
             if (self.lock_checker) |checker| {
                 if (req.username.len > 0 and checker.isLocked(req.username)) {
                     log.info("auth rejected: account '{s}' is permanently locked", .{req.username});
-                    return authFailure(req.conn_id, "account-disabled");
+                    return .{ .reply = authFailure(req.conn_id, "account-disabled") };
                 }
             }
 
@@ -185,25 +277,25 @@ pub fn AuthHandler(comptime Store: type) type {
             // username is known.
             if (self.rate_limiter) |rl| {
                 if (rl.checkAllowed("", req.client_ip)) |reason| {
-                    return authFailure(req.conn_id, reason);
+                    return .{ .reply = authFailure(req.conn_id, reason) };
                 }
                 rl.recordAttempt("", req.client_ip);
             }
 
             return switch (req.mechanism) {
-                .plain => self.handlePlainAuth(req),
+                .plain => self.handlePlainAuth(req, slot, slot_gen),
                 .scram_sha_256 => if (comptime @hasDecl(Store, "lookup"))
-                    self.handleScramInit(req)
+                    .{ .reply = self.handleScramInit(req) }
                 else
-                    authFailure(req.conn_id, "mechanism-not-supported"),
+                    .{ .reply = authFailure(req.conn_id, "mechanism-not-supported") },
                 .oauthbearer => if (comptime @hasDecl(Store, "validateToken"))
-                    self.handleOAuthBearerAuth(req)
+                    .{ .reply = self.handleOAuthBearerAuth(req) }
                 else
-                    authFailure(req.conn_id, "mechanism-not-supported"),
+                    .{ .reply = authFailure(req.conn_id, "mechanism-not-supported") },
             };
         }
 
-        fn handlePlainAuth(self: *Self, req: protocol.AuthRequest) protocol.Message {
+        fn handlePlainAuth(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
             // PLAIN payload format: [authzid]\0authcid\0passwd
             // We only use authcid (username) and passwd
             const payload = req.payload;
@@ -222,12 +314,12 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
             }
 
-            const authcid_start = (nul1 orelse return authFailure(req.conn_id, "invalid-encoding")) + 1;
-            const authcid_end = nul2 orelse return authFailure(req.conn_id, "invalid-encoding");
+            const authcid_start = (nul1 orelse return .{ .reply = authFailure(req.conn_id, "invalid-encoding") }) + 1;
+            const authcid_end = nul2 orelse return .{ .reply = authFailure(req.conn_id, "invalid-encoding") };
             const passwd_start = authcid_end + 1;
 
             if (authcid_start >= payload.len or passwd_start >= payload.len) {
-                return authFailure(req.conn_id, "invalid-encoding");
+                return .{ .reply = authFailure(req.conn_id, "invalid-encoding") };
             }
 
             const username = payload[authcid_start..authcid_end];
@@ -236,7 +328,7 @@ pub fn AuthHandler(comptime Store: type) type {
             // Per-account rate limiting (username was "" at auth_request entry)
             if (self.rate_limiter) |rl| {
                 if (rl.checkAllowed(username, "")) |reason| {
-                    return authFailure(req.conn_id, reason);
+                    return .{ .reply = authFailure(req.conn_id, reason) };
                 }
                 rl.recordAttempt(username, "");
             }
@@ -244,52 +336,84 @@ pub fn AuthHandler(comptime Store: type) type {
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
                 const result = self.store.validatePassword(self.allocator, username, password) catch {
-                    return authFailure(req.conn_id, "temporary-auth-failure");
+                    return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
                     log.info("PLAIN auth success (IdP): '{s}'", .{validated_user});
                     if (self.rate_limiter) |rl| rl.recordSuccess(username);
-                    return protocol.Message{ .auth_success = .{
+                    return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
                         .username = validated_user,
                         .server_final = "",
-                    } };
+                    } } };
                 } else {
                     log.info("PLAIN auth failed (IdP): '{s}'", .{username});
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
-                    return authFailure(req.conn_id, "not-authorized");
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
             }
 
             // Traditional credential lookup + SCRAM derive
             if (comptime @hasDecl(Store, "lookup")) {
                 const maybe_creds = self.store.lookup(self.allocator, username) catch {
-                    return authFailure(req.conn_id, "temporary-auth-failure");
+                    return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 const creds = maybe_creds orelse {
                     log.info("PLAIN auth failed: user '{s}' not found", .{username});
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
-                    return authFailure(req.conn_id, "not-authorized");
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
 
-                // Verify by deriving with the same salt and comparing
+                // T121: with a pool attached, the loop returns immediately and
+                // the derive runs on a pool thread; the reply is rendered by
+                // takeCryptoReply when the completion wakes the loop. The pool
+                // deep-copies the password — payload's backing buffer dies
+                // with this dispatch.
+                if (self.crypto_pool) |pool| {
+                    const job_id = pool.put(password, creds.salt, creds.iteration_count, creds.stored_key) catch {
+                        return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
+                    };
+                    const username_owned = self.allocator.dupe(u8, username) catch {
+                        log.err("pending auth alloc failed; job {d} completes orphaned", .{job_id});
+                        return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
+                    };
+                    const ip_owned = self.allocator.dupe(u8, req.client_ip) catch {
+                        self.allocator.free(username_owned);
+                        log.err("pending auth alloc failed; job {d} completes orphaned", .{job_id});
+                        return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
+                    };
+                    self.pending_plain.put(self.allocator, job_id, .{
+                        .slot = slot,
+                        .slot_gen = slot_gen,
+                        .conn_id = req.conn_id,
+                        .username = username_owned,
+                        .client_ip = ip_owned,
+                    }) catch {
+                        self.allocator.free(username_owned);
+                        self.allocator.free(ip_owned);
+                        return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
+                    };
+                    return .deferred;
+                }
+
+                // No pool: verify inline by deriving with the same salt.
                 const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count);
                 if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
                     log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
-                    return authFailure(req.conn_id, "not-authorized");
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
 
                 log.info("PLAIN auth success: '{s}'", .{username});
                 if (self.rate_limiter) |rl| rl.recordSuccess(username);
-                return protocol.Message{ .auth_success = .{
+                return .{ .reply = protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
                     .username = username,
                     .server_final = "",
-                } };
+                } } };
             }
 
-            return authFailure(req.conn_id, "mechanism-not-supported");
+            return .{ .reply = authFailure(req.conn_id, "mechanism-not-supported") };
         }
 
         /// Handle OAUTHBEARER mechanism — delegates to Store.validateToken.
@@ -678,6 +802,15 @@ const user_store_mod = @import("user_store");
 const MemoryBackend = backend_mod.MemoryBackend;
 const TestUserStore = user_store_mod.UserStore(MemoryBackend);
 const TestHandler = AuthHandler(TestUserStore);
+const TestCryptoPool = crypto_pool_mod.CryptoPool;
+
+/// Test helper: drive the synchronous variant of handleMessage.
+fn handleSync(handler: *TestHandler, msg: protocol.Message) ?protocol.Message {
+    return switch (handler.handleMessage(msg, 0, 1)) {
+        .reply => |m| m,
+        .deferred, .none => null,
+    };
+}
 
 test "AuthHandler: PLAIN auth success" {
     const allocator = std.testing.allocator;
@@ -699,7 +832,7 @@ test "AuthHandler: PLAIN auth success" {
     const pass = "secret123";
     @memcpy(plain_payload[2 + user.len .. 2 + user.len + pass.len], pass);
 
-    const result = handler.handleMessage(.{ .auth_request = .{
+    const result = handleSync(&handler, .{ .auth_request = .{
         .conn_id = 1,
         .mechanism = .plain,
         .client_ip = "127.0.0.1",
@@ -730,7 +863,7 @@ test "AuthHandler: PLAIN auth wrong password" {
     plain_payload[4] = 0;
     @memcpy(plain_payload[5..10], "wrong");
 
-    const result = handler.handleMessage(.{ .auth_request = .{
+    const result = handleSync(&handler, .{ .auth_request = .{
         .conn_id = 2,
         .mechanism = .plain,
         .client_ip = "127.0.0.1",
@@ -760,7 +893,7 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     const client_first = try client.clientFirst();
 
     // Step 1: AuthRequest with client-first-message
-    const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
         .conn_id = 5,
         .mechanism = .scram_sha_256,
         .client_ip = "10.0.0.1",
@@ -778,7 +911,7 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     const client_final = try client.handleServerFirst(challenge);
 
     // Step 3: SaslResponse with client-final-message
-    const success_msg = handler.handleMessage(.{ .sasl_response = .{
+    const success_msg = handleSync(&handler, .{ .sasl_response = .{
         .conn_id = 5,
         .payload = client_final,
     } }) orelse return error.NoResponse;
@@ -808,7 +941,7 @@ test "AuthHandler: SCRAM unknown user" {
     defer client.deinit();
     const client_first = try client.clientFirst();
 
-    const result = handler.handleMessage(.{ .auth_request = .{
+    const result = handleSync(&handler, .{ .auth_request = .{
         .conn_id = 10,
         .mechanism = .scram_sha_256,
         .client_ip = "10.0.0.2",
@@ -838,7 +971,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         defer client.deinit();
         const client_first = try client.clientFirst();
 
-        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+        const challenge_msg = handleSync(&handler, .{ .auth_request = .{
             .conn_id = 20,
             .mechanism = .scram_sha_256,
             .client_ip = "10.0.0.5",
@@ -849,7 +982,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
-        const success_msg = handler.handleMessage(.{ .sasl_response = .{
+        const success_msg = handleSync(&handler, .{ .sasl_response = .{
             .conn_id = 20,
             .payload = client_final,
         } }) orelse return error.NoResponse;
@@ -867,7 +1000,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         defer client.deinit();
         const client_first = try client.clientFirst();
 
-        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+        const challenge_msg = handleSync(&handler, .{ .auth_request = .{
             .conn_id = 21,
             .mechanism = .scram_sha_256,
             .client_ip = "10.0.0.5",
@@ -878,7 +1011,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
-        const success_msg = handler.handleMessage(.{ .sasl_response = .{
+        const success_msg = handleSync(&handler, .{ .sasl_response = .{
             .conn_id = 21,
             .payload = client_final,
         } }) orelse return error.NoResponse;
@@ -905,7 +1038,7 @@ test "AuthHandler: credential cache invalidated on password change" {
         defer client.deinit();
         const client_first = try client.clientFirst();
 
-        const challenge_msg = handler.handleMessage(.{ .auth_request = .{
+        const challenge_msg = handleSync(&handler, .{ .auth_request = .{
             .conn_id = 30,
             .mechanism = .scram_sha_256,
             .client_ip = "10.0.0.6",
@@ -916,7 +1049,7 @@ test "AuthHandler: credential cache invalidated on password change" {
         } }) orelse return error.NoResponse;
 
         const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
-        _ = handler.handleMessage(.{ .sasl_response = .{
+        _ = handleSync(&handler, .{ .sasl_response = .{
             .conn_id = 30,
             .payload = client_final,
         } }) orelse return error.NoResponse;
@@ -928,7 +1061,7 @@ test "AuthHandler: credential cache invalidated on password change" {
     try std.testing.expect(handler.cacheLookup(hashUsername("rotate"), std.time.timestamp()) != null);
 
     // Change password — invalidates cache
-    _ = handler.handleMessage(.{ .password_change_request = .{
+    _ = handleSync(&handler, .{ .password_change_request = .{
         .conn_id = 31,
         .username = "rotate",
         .new_password = "newpass",
@@ -962,7 +1095,7 @@ test "AuthHandler: unlimited attempts when rate limiter is not attached" {
     // Far beyond the default per-IP limit (20); every attempt must succeed.
     var i: u32 = 0;
     while (i < 30) : (i += 1) {
-        const result = handler.handleMessage(.{ .auth_request = .{
+        const result = handleSync(&handler, .{ .auth_request = .{
             .conn_id = 100 + i,
             .mechanism = .plain,
             .client_ip = "127.0.0.1",
@@ -996,6 +1129,46 @@ fn plainRequest(conn_id: u32, ip: []const u8, payload: []const u8) protocol.Mess
     } };
 }
 
+test "AuthHandler: PLAIN auth defers to crypto pool and completes (T121)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [16]u8 = undefined;
+    const res = handleSync(&handler, plainRequest(42, "10.0.0.9", plainPayload(&buf, "dave", "pw123")));
+    // With a pool attached the sync helper reports no immediate reply...
+    try std.testing.expect(res == null);
+    // ...because the request went deferred.
+    try std.testing.expectEqual(@as(usize, 1), handler.pending_plain.count());
+
+    var completion: ?crypto_pool_mod.Completion = null;
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (completion == null and std.time.milliTimestamp() < deadline) {
+        completion = pool.popCompletion();
+        if (completion == null) std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(completion != null);
+
+    var reply = handler.takeCryptoReply(completion.?).?;
+    defer reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 0), reply.slot);
+    try std.testing.expectEqual(@as(u32, 1), reply.slot_gen);
+    try std.testing.expectEqualStrings("dave", reply.msg.auth_success.username);
+    try std.testing.expectEqual(@as(u32, 42), reply.msg.auth_success.conn_id);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
+}
+
 test "AuthHandler: PLAIN per-account rate limit engages on parsed username" {
     const allocator = std.testing.allocator;
 
@@ -1019,11 +1192,11 @@ test "AuthHandler: PLAIN per-account rate limit engages on parsed username" {
     const req = plainPayload(&buf, "carol", "pw");
 
     // First two attempts pass the rate check (auth itself succeeds)
-    try std.testing.expectEqualStrings("carol", (handler.handleMessage(plainRequest(1, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
-    try std.testing.expectEqualStrings("carol", (handler.handleMessage(plainRequest(2, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
+    try std.testing.expectEqualStrings("carol", (handleSync(&handler, plainRequest(1, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
+    try std.testing.expectEqualStrings("carol", (handleSync(&handler, plainRequest(2, "10.9.0.1", req)) orelse return error.NoResponse).auth_success.username);
 
     // Third exceeds max_per_account = 2
-    const third = handler.handleMessage(plainRequest(3, "10.9.0.1", req)) orelse return error.NoResponse;
+    const third = handleSync(&handler, plainRequest(3, "10.9.0.1", req)) orelse return error.NoResponse;
     try std.testing.expectEqualStrings("policy-violation", third.auth_failure.reason);
 }
 
@@ -1050,9 +1223,9 @@ test "AuthHandler: PLAIN account lockout engages on parsed username" {
     const wrong = plainPayload(&buf, "dave", "wrongpw");
 
     // Two consecutive failures hit the lockout threshold
-    _ = handler.handleMessage(plainRequest(10, "10.9.0.2", wrong));
-    _ = handler.handleMessage(plainRequest(11, "10.9.0.2", wrong));
+    _ = handleSync(&handler, plainRequest(10, "10.9.0.2", wrong));
+    _ = handleSync(&handler, plainRequest(11, "10.9.0.2", wrong));
 
-    const locked = handler.handleMessage(plainRequest(12, "10.9.0.3", wrong)) orelse return error.NoResponse;
+    const locked = handleSync(&handler, plainRequest(12, "10.9.0.3", wrong)) orelse return error.NoResponse;
     try std.testing.expectEqualStrings("account-disabled", locked.auth_failure.reason);
 }

@@ -38,6 +38,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // T121: crypto offload thread pool (auth daemon, handler tests). Created
+    // early because both binary and test module sections import it.
+    const crypto_pool_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/crypto_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_pool_mod.addImport("sasl", sasl_mod);
+
     _ = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
         .target = target,
@@ -452,6 +461,14 @@ pub fn build(b: *std.Build) void {
     auth_handler_test_mod.addImport("invite_store", invite_store_test_mod);
     auth_handler_test_mod.addImport("user_store", generic_user_store_test_mod);
     auth_handler_test_mod.addImport("backend", backend_test_mod);
+    auth_handler_test_mod.addImport("crypto_pool", crypto_pool_mod);
+
+    // T121 crypto-pool tests live in the module itself
+    const crypto_pool_tests = b.addTest(.{
+        .name = "crypto-pool-tests",
+        .root_module = crypto_pool_mod,
+    });
+    const run_crypto_pool_tests = b.addRunArtifact(crypto_pool_tests);
 
     const auth_handler_tests = b.addTest(.{
         .name = "auth-handler-tests",
@@ -1157,6 +1174,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
+    auth_handler_mod.addImport("crypto_pool", crypto_pool_mod);
 
     const auth_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -1183,6 +1201,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
+    auth_mod.addImport("crypto_pool", crypto_pool_mod);
     auth_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_mod.addImport("lock_store", auth_lock_store_mod);
     auth_mod.addImport("invite_store", auth_invite_store_mod);
@@ -1238,6 +1257,7 @@ pub fn build(b: *std.Build) void {
     oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_handler_mod.addImport("crypto_pool", crypto_pool_mod);
     oidc_handler_mod.addImport("invite_store", auth_invite_store_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
@@ -1438,6 +1458,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
+    test_step.dependOn(&run_crypto_pool_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.
