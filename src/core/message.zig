@@ -159,10 +159,20 @@ pub const RoomDirectoryUpdate = struct {
 /// MUC MAM query routed to owning worker (T112).
 pub const MamQuery = struct {
     room_jid: []const u8,
+    /// The request's IQ stanza id — responses must carry this. Kept separate
+    /// from query_id (the client's MAM queryid); conflating them mis-id's the
+    /// IQ result whenever a client sets a queryid (XEP-0313).
+    iq_id: []const u8,
     query_id: []const u8,
     start: []const u8,
     end_field: []const u8,
     with: []const u8,
+    /// Raw RSM <max/> text; the owning worker parses it (default 50 when
+    /// empty or unparsable, matching the local path).
+    max: []const u8,
+    /// RSM paging anchors (archive ids); empty when absent from the query.
+    after_id: []const u8,
+    before_id: []const u8,
     reply_to_worker: u16,
     reply_to_session: u32,
     /// ABA generation of the querying session, captured on the originating
@@ -387,10 +397,14 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
         },
         .room_mam_query => |ev| {
             writeStr(w, ev.room_jid) catch return null;
+            writeStr(w, ev.iq_id) catch return null;
             writeStr(w, ev.query_id) catch return null;
             writeStr(w, ev.start) catch return null;
             writeStr(w, ev.end_field) catch return null;
             writeStr(w, ev.with) catch return null;
+            writeStr(w, ev.max) catch return null;
+            writeStr(w, ev.after_id) catch return null;
+            writeStr(w, ev.before_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
             writeU32(w, ev.reply_to_session) catch return null;
             writeU32(w, ev.reply_to_generation) catch return null;
@@ -605,20 +619,28 @@ pub fn decode(data: []const u8) ?Message {
         },
         .room_mam_query => {
             const room_jid = readStr(data, &fbs) orelse return null;
+            const iq_id = readStr(data, &fbs) orelse return null;
             const query_id = readStr(data, &fbs) orelse return null;
             const start = readStr(data, &fbs) orelse return null;
             const end_field = readStr(data, &fbs) orelse return null;
             const with = readStr(data, &fbs) orelse return null;
+            const max = readStr(data, &fbs) orelse return null;
+            const after_id = readStr(data, &fbs) orelse return null;
+            const before_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
             const reply_to_session = readU32(r) orelse return null;
             const reply_to_generation = readU32(r) orelse return null;
             const reply_to_jid = readStr(data, &fbs) orelse return null;
             return .{ .room_mam_query = .{
                 .room_jid = room_jid,
+                .iq_id = iq_id,
                 .query_id = query_id,
                 .start = start,
                 .end_field = end_field,
                 .with = with,
+                .max = max,
+                .after_id = after_id,
+                .before_id = before_id,
                 .reply_to_worker = reply_to_worker,
                 .reply_to_session = reply_to_session,
                 .reply_to_generation = reply_to_generation,
@@ -1288,10 +1310,14 @@ test "encode/decode: session_kick round-trips" {
 test "encode/decode: room_mam_query round-trip" {
     const msg = Message{ .room_mam_query = .{
         .room_jid = "dev@conference.example.com",
+        .iq_id = "iq-stanza-7",
         .query_id = "mam-q1",
         .start = "2026-06-01T00:00:00Z",
         .end_field = "",
         .with = "",
+        .max = "25",
+        .after_id = "arc-1234",
+        .before_id = "",
         .reply_to_worker = 1,
         .reply_to_session = 42,
         .reply_to_generation = 9,
@@ -1305,8 +1331,12 @@ test "encode/decode: room_mam_query round-trip" {
     switch (decoded) {
         .room_mam_query => |ev| {
             try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
+            try std.testing.expectEqualStrings("iq-stanza-7", ev.iq_id);
             try std.testing.expectEqualStrings("mam-q1", ev.query_id);
             try std.testing.expectEqualStrings("2026-06-01T00:00:00Z", ev.start);
+            try std.testing.expectEqualStrings("25", ev.max);
+            try std.testing.expectEqualStrings("arc-1234", ev.after_id);
+            try std.testing.expectEqualStrings("", ev.before_id);
             try std.testing.expectEqual(@as(u16, 1), ev.reply_to_worker);
             try std.testing.expectEqual(@as(u32, 42), ev.reply_to_session);
             try std.testing.expectEqual(@as(u32, 9), ev.reply_to_generation);

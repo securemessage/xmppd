@@ -2374,24 +2374,15 @@ pub fn processRemoteMamQuery(
     _ = changes;
     const reg = server.room_registry orelse return;
     if (reg.findByJid(ev.room_jid) == null) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     }
 
     const ds = server.delivery_system orelse return;
     const archive = server.archive orelse {
-        // No archive configured — send empty fin
-        var buf: [512]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const fw = fbs.writer();
-        fw.writeAll("<iq type='result' from='") catch return;
-        fw.writeAll(ev.room_jid) catch return;
-        fw.writeAll("' to='") catch return;
-        fw.writeAll(ev.reply_to_jid) catch return;
-        fw.writeAll("' id='") catch return;
-        fw.writeAll(ev.query_id) catch return;
-        fw.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
-        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
+        // No archive configured — same answer the local path gives
+        // (routing must be invisible to the client).
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     };
 
@@ -2401,21 +2392,27 @@ pub fn processRemoteMamQuery(
     const start_ts = if (ev.start.len > 0) parseTs(ev.start) else null;
     const end_ts = if (ev.end_field.len > 0) parseTs(ev.end_field) else null;
 
+    // RSM params travel with the query (T112); same defaults as the local path.
+    const max: u32 = if (ev.max.len > 0)
+        std.fmt.parseInt(u32, ev.max, 10) catch 50
+    else
+        50;
+
     const query = mam_handler.MamQuery{
-        .iq_id = ev.query_id,
+        .iq_id = ev.iq_id,
         .owner = ev.room_jid,
         .query_id = ev.query_id,
         .with = if (ev.with.len > 0) ev.with else null,
         .start = start_ts,
         .end = end_ts,
-        .after_id = null,
-        .before_id = null,
-        .max = 50,
+        .after_id = if (ev.after_id.len > 0) ev.after_id else null,
+        .before_id = if (ev.before_id.len > 0) ev.before_id else null,
+        .max = max,
     };
 
     const ArchBackend = @import("archive_backend").Backend;
     var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "internal-server-error");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "internal-server-error");
         return;
     };
     defer response.deinit();

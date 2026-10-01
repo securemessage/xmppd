@@ -1207,6 +1207,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     const owner = room_registry_mod.roomOwner(room_jid, server.getWorkerCount());
     if (owner != server.worker_id) {
         // Route to owning worker — they have the archive data
+        log.info("routing MAM query for room {s} to owning worker {d} (from {d})", .{ room_jid, owner, server.worker_id });
         const bound = session.stream.bound_jid orelse return;
         var jid_buf: [256]u8 = undefined;
         var jid_fbs = std.io.fixedBufferStream(&jid_buf);
@@ -1225,10 +1226,14 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
         server.enqueueRoomActorMessage(owner, .{ .room_mam_query = .{
             .room_jid = room_jid,
+            .iq_id = iq_id,
             .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
             .start = session.mam_start,
             .end_field = session.mam_end,
             .with = session.mam_with,
+            .max = session.mam_max,
+            .after_id = session.mam_after,
+            .before_id = session.mam_before,
             .reply_to_worker = server.worker_id,
             .reply_to_session = @intCast(session.conn.id),
             .reply_to_generation = reply_gen,
