@@ -135,9 +135,16 @@ pub const Engine = struct {
 
     /// Install a client TLS context (DANE-first: PKIX verify disabled, so
     /// self-signed / DANE-validated certs both work).
-    pub fn useTls(self: *Engine) !void {
+    ///
+    /// The shared initializers arm KTLS unconditionally (battle-tested server
+    /// behavior), but a client must not offload when its peer might: two
+    /// KTLS-armed endpoints desync across lo0/epair/bridge (FreeBSD PR
+    /// 296498). Offload is therefore disabled here unless `ktls` is true —
+    /// opt in only against non-KTLS peers or real-NIC paths (IFCAP_MEXTPG).
+    pub fn useTls(self: *Engine, ktls: ?bool) !void {
         if (self.tls_ctx) |_| return;
         self.tls_ctx = ssl.SslContext.initClient() catch return error.TlsInit;
+        if (!(ktls orelse false)) self.tls_ctx.?.disableKtls();
     }
 
     pub fn sessionCount(self: *const Engine) usize {
