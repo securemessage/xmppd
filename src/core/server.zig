@@ -700,8 +700,10 @@ pub const Server = struct {
     /// Configure TLS with a certificate and key file.
     /// Must be called before `run()`. Without this, STARTTLS is advertised
     /// but upgrade requests fail.
-    pub fn configureTls(self: *Server, cert_path: [*:0]const u8, key_path: [*:0]const u8) !void {
-        self.ssl_ctx = ssl.SslContext.initServer(cert_path, key_path) catch {
+    ///
+    /// `ktls` enables kernel-TLS offload (default on — see SslContext.initServer).
+    pub fn configureTls(self: *Server, cert_path: [*:0]const u8, key_path: [*:0]const u8, ktls: ?bool) !void {
+        self.ssl_ctx = ssl.SslContext.initServer(cert_path, key_path, ktls) catch {
             return error.TlsConfigFailed;
         };
     }

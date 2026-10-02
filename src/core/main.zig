@@ -77,6 +77,8 @@ pub fn main() !void {
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
     var oidc_import_avatar: bool = false;
+    // Kernel-TLS offload: on by default (first-class FreeBSD feature).
+    var ktls: ?bool = null;
 
     // Skip argv[0]
     _ = args.next();
@@ -145,6 +147,13 @@ pub fn main() !void {
             // Skip TLS requirement — offer SASL without STARTTLS (benchmarks/trusted networks)
             cert_path = null;
             key_path = null;
+        } else if (std.mem.eql(u8, arg, "--ktls")) {
+            // Kernel-TLS offload (default on); explicit opt-in kept for clarity.
+            ktls = true;
+        } else if (std.mem.eql(u8, arg, "--no-ktls")) {
+            // Disable kernel-TLS offload (e.g. same-host rigs where the client
+            // is also KTLS-armed — the kernel has no both-ends offload path).
+            ktls = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -180,7 +189,17 @@ pub fn main() !void {
 
         // [tls] section — cert/key are sentinel-terminated (C API requirement),
         // config values are not null-terminated. TLS is typically set via CLI or
-        // passed by the master supervisor. Skip config for TLS paths.
+        // passed by the master supervisor. Skip config for TLS paths, but ktls
+        // is a plain boolean.
+        if (ktls == null) {
+            if (c.get("tls", "ktls")) |v| {
+                if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "off")) {
+                    ktls = false;
+                } else {
+                    ktls = true;
+                }
+            }
+        }
 
         // [auth] section
         if (auth_socket == null) {
@@ -313,6 +332,7 @@ pub fn main() !void {
         .per_worker_sessions = per_worker_sessions,
         .fan_out_batch_size = fan_out_batch_size,
         .skip_tls = (cert_path == null),
+        .ktls = ktls,
         .roster = if (roster_store != null) &roster_store.? else null,
         .offline = if (offline_store != null) &offline_store.? else null,
         .archive = if (archive_store != null) &archive_store.? else null,
@@ -414,6 +434,7 @@ const WorkerCtx = struct {
     per_worker_sessions: usize,
     fan_out_batch_size: u8,
     skip_tls: bool,
+    ktls: ?bool,
     roster: ?*GenericRosterStore,
     offline: ?*GenericOfflineStore(OpBackendType),
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
@@ -450,7 +471,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
             log.err("--cert requires --key", .{});
             return;
         };
-        server.configureTls(cert, key) catch {
+        server.configureTls(cert, key, ctx.ktls) catch {
             log.err("TLS configuration failed", .{});
             return;
         };

@@ -34,6 +34,11 @@ const c = @cImport({
     @cInclude("openssl/x509.h");
 });
 
+// OpenSSL 3.0.22 defines SSL_OP_ENABLE_KTLS as the variadic macro
+// SSL_OP_BIT(3) ((uint64_t)1 << 3). Zig's cimport lowers that macro to a
+// generic function that fails to instantiate, so define the bit by hand.
+const SSL_OP_ENABLE_KTLS: u64 = 1 << 3;
+
 /// Result of a non-blocking TLS handshake attempt.
 pub const HandshakeResult = enum {
     /// Handshake completed successfully.
@@ -91,15 +96,27 @@ fn alwaysAcceptVerify(_: c_int, _: ?*c.X509_STORE_CTX) callconv(.c) c_int {
 /// all connections. Thread-safe after initialization (OpenSSL 3.x guarantee).
 pub const SslContext = struct {
     ctx: *c.SSL_CTX,
+    /// Whether `SSL_OP_ENABLE_KTLS` was armed on this context (kernel-TLS
+    /// offload). Recorded here for `ktlsEngaged()` reporting and config.
+    ktls: bool,
 
     /// Initialize a server-side TLS context with certificate and private key.
     ///
     /// - `cert_path` — path to PEM-encoded certificate file (may include chain)
     /// - `key_path` — path to PEM-encoded private key file
+    /// - `ktls` — enable kernel-TLS offload (SSL_OP_ENABLE_KTLS). DEFAULT ON.
     ///
     /// Uses `TLS_server_method()` which negotiates the highest TLS version
     /// supported by both sides (TLS 1.2 or 1.3).
-    pub fn initServer(cert_path: [*:0]const u8, key_path: [*:0]const u8) SslError!SslContext {
+    ///
+    /// KTLS is a first-class FreeBSD feature and is the default offload for the
+    /// server side, where it is both valuable (symmetric crypto in-kernel) and
+    /// safe: C2S clients are ordinary non-KTLS peers, so the both-ends kernel
+    /// limitation (see initClientWithCert) is never triggered. Pass `false` to
+    /// disable (e.g. the local same-host smoke rig, whose client is also
+    /// KTLS-armed by default in some builds).
+    pub fn initServer(cert_path: [*:0]const u8, key_path: [*:0]const u8, ktls: ?bool) SslError!SslContext {
+        const enable_ktls = ktls orelse true;
         const method = c.TLS_server_method() orelse return SslError.SslInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
         errdefer c.SSL_CTX_free(ctx);
@@ -133,12 +150,18 @@ pub const SslContext = struct {
         const sid_ctx = "xmppd";
         _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
 
-        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
-        // offload flag, and arming it on this platform desyncs the TLS
-        // record layer (clients fail the first read after STARTTLS with
-        // "decryption failed or bad record mac").
+        // Kernel-TLS offload: first-class on FreeBSD and the default here.
+        // OpenSSL arms the in-kernel ULP lazily after the handshake (verify
+        // with ktlsEngaged()). One-ended kTLS is safe; the only failure mode
+        // is BOTH ends arming across an interface without IFCAP_MEXTPG (lo0,
+        // epair, bridge) — FreeBSD PR 296498, `EBADMSG`/bad record mac. That
+        // is never triggered on C2S because our clients default to offload OFF
+        // (initClientWithCert), so the both-ends case cannot occur.
+        if (enable_ktls) {
+            _ = c.SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+        }
 
-        return SslContext{ .ctx = ctx };
+        return SslContext{ .ctx = ctx, .ktls = enable_ktls };
     }
 
     /// Initialize a client-side TLS context for outbound connections.
@@ -147,14 +170,25 @@ pub const SslContext = struct {
     /// SASL EXTERNAL authentication with DANE). PKIX verification of the remote
     /// peer is disabled because we use DANE verification ourselves.
     pub fn initClient() SslError!SslContext {
-        return initClientWithCert(null, null);
+        return initClientWithCert(null, null, null);
     }
 
     /// Initialize a client-side TLS context with a certificate for mutual TLS.
     ///
-    /// The cert/key are presented to the remote server so it can authenticate us
-    /// (required for XMPP S2S SASL EXTERNAL after DANE verification).
-    pub fn initClientWithCert(cert_path: ?[*:0]const u8, key_path: ?[*:0]const u8) SslError!SslContext {
+    /// - `cert_path` / `key_path` — our certificate/key, presented to the remote
+    ///   server (required for XMPP S2S SASL EXTERNAL after DANE verification).
+    /// - `ktls` — enable kernel-TLS offload. DEFAULT OFF.
+    ///
+    /// KTLS is first-class on FreeBSD, but a client that arms KTLS fails
+    /// (EBADMSG / "bad record mac") when its PEER also arms KTLS and the
+    /// packets cross an interface without IFCAP_MEXTPG (lo0, epair, bridge) —
+    /// FreeBSD PR 296498. A peer that is another xmppd has server-side KTLS
+    /// on by default, so a client talking to it must NOT arm KTLS. One-ended
+    /// offload is safe, which is why the server stays on by default. Opt in
+    /// only against peers known not to arm it themselves (e.g. a `--no-ktls`
+    /// or `ktls=false` server).
+    pub fn initClientWithCert(cert_path: ?[*:0]const u8, key_path: ?[*:0]const u8, ktls: ?bool) SslError!SslContext {
+        const enable_ktls = ktls orelse false;
         const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
         const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
         errdefer c.SSL_CTX_free(ctx);
@@ -177,12 +211,13 @@ pub const SslContext = struct {
             }
         }
 
-        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
-        // offload flag, and arming it on this platform desyncs the TLS
-        // record layer (clients fail the first read after STARTTLS with
-        // "decryption failed or bad record mac").
+        // Kernel-TLS offload is opt-in on the client side (default off): see
+        // the doc above for the both-ends limitation.
+        if (enable_ktls) {
+            _ = c.SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+        }
 
-        return SslContext{ .ctx = ctx };
+        return SslContext{ .ctx = ctx, .ktls = enable_ktls };
     }
 
     /// Release the SSL_CTX. All SslConns created from this context must be
@@ -327,6 +362,25 @@ pub const SslConn = struct {
     pub fn pending(self: *SslConn) usize {
         const ret = c.SSL_pending(self.ssl);
         return if (ret > 0) @intCast(ret) else 0;
+    }
+
+    /// Whether kernel-TLS offload actually engaged on this connection. OpenSSL
+    /// arms the in-kernel ULP lazily after the handshake, so this is false
+    /// until a record has flowed. Useful for logging/verification that a
+    /// KTLS-armed context really offloaded (fallback to userland is silent,
+    /// so this is the only way to tell).
+    ///
+    /// Mirrors the BIO_get_ktls_send/recv macros: send is queried on the
+    /// write BIO, recv on the read BIO. True if either direction is offloaded.
+    pub fn ktlsEngaged(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_SEND = 73, BIO_CTRL_GET_KTLS_RECV = 76.
+        if (c.SSL_get_wbio(self.ssl)) |wbio| {
+            if (c.BIO_ctrl(wbio, 73, 0, null) > 0) return true;
+        }
+        if (c.SSL_get_rbio(self.ssl)) |rbio| {
+            if (c.BIO_ctrl(rbio, 76, 0, null) > 0) return true;
+        }
+        return false;
     }
 
     /// Extract the peer's leaf certificate as DER-encoded bytes.
@@ -489,8 +543,64 @@ pub const SslConn = struct {
 // Tests
 // ============================================================================
 
+// Self-signed test cert/key (CN=localhost) embedded so tests are self-contained.
+const TestCert =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIDCTCCAfGgAwIBAgIUC4bDrk8Y0fI5AoKrFkDHpu/Z/UgwDQYJKoZIhvcNAQEL
+    \\BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMTAyNDEzMloXDTI2MDkw
+    \\MjAyNDEzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+    \\AAOCAQ8AMIIBCgKCAQEA7G3DDoU55u8Ty5T1knHdEojzVKQxjW9fvWLchkffrS3S
+    \\KEyoDCn+3IILv14hKxsILDWf0vYdhiCiFZGJ2iOj3XCgjTsJZbE6d4RETmtHNYvX
+    \\OMVdH0XAFpS2Y1mf9xUwBLXfHgaTKp6t0WEW32njMjsJW1uix1UnstRlCnf0FUNC
+    \\1+13TSAWn4/j4WeAozPsKDLr64VYFEZfkoB/jOz5AnTb3RzAInW1vmzt9Kk3ITdD
+    \\JymJ2AWJ8vz4wOe1yd5TvAtYtnbMg5tuFThKnejsEUnvVCi0Ht+Jcaw4cCLykH+Q
+    \\GwtWFRuh/lqiXZY6XbdrNHxFb2neYRyhR5ua9GUzAwIDAQABo1MwUTAdBgNVHQ4E
+    \\FgQUGL02ZFJ47GBarVFkmh+i6gsJwggwHwYDVR0jBBgwFoAUGL02ZFJ47GBarVFk
+    \\mh+i6gsJwggwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAdC2v
+    \\UXaoH/MtZjtJc6UAedgqDgon8dc9h4kBFAE2LXLm0A+hk9aATXp+tGuQgJm+Zk7v
+    \\lNZRwrI3vTXVWPpowZ/8225QiEtfoPvJrOHU2I1HIMuqTd8KK5W1XH9tF0w/7/Xe
+    \\mPwB/7dNfeV1g2LgLYuP+xg4gZb6bE2cToMcsFcu/8ZsTUrOyW72hkRmMITSPCDD
+    \\uIvLB47FBQn+Tv6P7y+fpf0Md3Ac2p/bCogdX76iaZVTjn7OeOmox7OHu9bNXssF
+    \\NeA/ahqgHF6HIBLs/kirttsQMJT1WCSqT+UE8D4cJse1vDrXIgFK5ud7hTGJHh1e
+    \\yQPImlOe+43+ZCYZfg==
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+const TestKey =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDsbcMOhTnm7xPL
+    \\lPWScd0SiPNUpDGNb1+9YtyGR9+tLdIoTKgMKf7cggu/XiErGwgsNZ/S9h2GIKIV
+    \\kYnaI6PdcKCNOwllsTp3hEROa0c1i9c4xV0fRcAWlLZjWZ/3FTAEtd8eBpMqnq3R
+    \\YRbfaeMyOwlbW6LHVSey1GUKd/QVQ0LX7XdNIBafj+PhZ4CjM+woMuvrhVgURl+S
+    \\gH+M7PkCdNvdHMAidbW+bO30qTchN0MnKYnYBYny/PjA57XJ3lO8C1i2dsyDm24V
+    \\OEqd6OwRSe9UKLQe34lxrDhwIvKQf5AbC1YVG6H+WqJdljpdt2s0fEVvad5hHKFH
+    \\m5r0ZTMDAgMBAAECggEADzt/a8IAVV5hKJ1r5l62petqvfoVTluJPcUzc5wtIYza
+    \\juUfut4KpZtR4yc8vNQDhm0TdaNoHR7Fi7if8bFz/zJFEl/BbJh9LZ/v24lElEw7
+    \\rTAJefPRjVUsd+qZY972Foi/LeZEHXcNk68NKtgm+g5Kqxumy6bFXFuJyrPNC6U+
+    \\YLfkNExhmANADPS56JxajBWk5rjIZEZHNKPgwLoznykNoWld4sDyvgGZ0m73Y0nP
+    \\4nCEyiieZUzP/QnNVBwXsJzv5goiJbRlUUTZ2mi+z9cYN2G5pZTue23uFuzgRBIp
+    \\iwofyElr8Re/4EsPY/8NMEtTRUZbUGpkfkD8jMutAQKBgQD8DwZtWGVGxtmJp434
+    \\g9yRtFCS837eJQLPCSIyHqj+K60KyhIPyMpAxSoVnJ0/+vKR5Lk2UwqpQpu3KJP1
+    \\v2gu1yeWI33AFdLkAzCDFbsJIlq4vmLqnnGCK3t+/zOXXWruSUjOvS96A3PE9cXx
+    \\PKlFc5ZxB0A4KXHMhDNiLwUDAQKBgQDwICvT8fLV/VMjCUKL0DrIaaBL9pf7Bk9q
+    \\INrpWc0tMikTMo1Qkd29pTh6q0cwlKQhXIl7eOhBu01h7aeH9IOXDlBNwVS3yEiS
+    \\CrowDxrDAJeMSVbpPXE5lEhE6T1A9XI930ZEGzK8o4XdGG+a2aH6MRnKKtqkun90
+    \\xOBfDNgqAwKBgQC0j4LYI6FxIRNGc7vU0YjY62Voz3sLYVHww6c2ZhZC9UChYP2t
+    \\RvXzjgnGr4lKAtdvQXyX+MbDV0661xueyD22iDP4bnYverK22b4PuSphsbVxcBjl
+    \\3xiK2eE+qUvo22e1SNQaHRX8fqqY5kKkvAK6GMIlN79+O9okWnOAmxQpAQKBgHsg
+    \\s/iQ9uj9ZdTwWZwhoRLE/roU7yd7u9r6j+XZ81h6gQ9j+4xVz3MANm7IRs/FWEf3
+    \\EFQs0kNqTKqrVx1iptsdLtZADTXT0Ep6j7A2/o0BT7RSouskY1uYClqzkoItmW/a
+    \\fkhL/f82hlyxvACWGfWVmdjNkqGnM9XnYfm7N1iLAoGBAOSHVVaA+RpkZnF5qWs8
+    \\AW/DtZu00mkSpUT/jAZKNj8MOm5VCNeT6CoROhvgn+f/C6kc6PvzAdJtrDImE9lM
+    \\2iPPJ6RMzVun0MZQExGrc6QNJ4jBnvdLLKSl0rq/Can3mf5OIx3ALaVFXnQtrqW6
+    \\3m6PRJeGKuEzJztmizyMZfNS
+    \\-----END PRIVATE KEY-----
+    \\
+;
+
 test "SslContext: initServer fails with bad cert path" {
-    const result = SslContext.initServer("/nonexistent/cert.pem", "/nonexistent/key.pem");
+    const result = SslContext.initServer("/nonexistent/cert.pem", "/nonexistent/key.pem", null);
     try std.testing.expectError(SslError.CertLoadFailed, result);
 }
 
@@ -498,6 +608,57 @@ test "SslContext: initClient succeeds without cert/key" {
     var ctx = try SslContext.initClient();
     defer ctx.deinit();
     // Client context created successfully — no cert/key needed
+    // KTLS is off by default on the client side (both-ends limitation).
+    try std.testing.expect(!ctx.ktls);
+}
+
+test "SslContext: KTLS default is on for server, off for client" {
+    // initServer's happy path needs a cert+key on disk; use a private /tmp
+    // dir (unique per run) so the test is self-contained.
+    const alloc = std.testing.allocator;
+    const tmp = std.fmt.allocPrint(alloc, "/tmp/xmppd-ssl-test-{d}", .{std.time.milliTimestamp()}) catch @panic("alloc");
+    try std.fs.cwd().makePath(tmp);
+    // allocPrintSentinel yields a NUL-terminated [:0]u8 whose .len EXCLUDES the
+    // NUL: .ptr is the [*:0]const u8 the OpenSSL C API wants, and the full slice
+    // (len = content) is a clean []const u8 for Zig's file ops.
+    const cert_c = std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{tmp}, 0) catch @panic("alloc");
+    const key_c = std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{tmp}, 0) catch @panic("alloc");
+    const cert_path = cert_c[0..cert_c.len];
+    const key_path = key_c[0..key_c.len];
+
+    const cert_file = try std.fs.cwd().createFile(cert_path, .{});
+    try cert_file.writeAll(TestCert);
+    cert_file.close();
+    const key_file = try std.fs.cwd().createFile(key_path, .{});
+    try key_file.writeAll(TestKey);
+    key_file.close();
+
+    // Server: KTLS default ON (first-class FreeBSD feature).
+    var srv = try SslContext.initServer(cert_c.ptr, key_c.ptr, null);
+    defer srv.deinit();
+    try std.testing.expect(srv.ktls);
+
+    // Server: explicit opt-out is honored.
+    var srv_off = try SslContext.initServer(cert_c.ptr, key_c.ptr, false);
+    defer srv_off.deinit();
+    try std.testing.expect(!srv_off.ktls);
+
+    // Client: KTLS default OFF (avoids the both-ends kernel limitation).
+    var cli = try SslContext.initClientWithCert(null, null, null);
+    defer cli.deinit();
+    try std.testing.expect(!cli.ktls);
+
+    // Client: explicit opt-in is honored.
+    var cli_on = try SslContext.initClientWithCert(null, null, true);
+    defer cli_on.deinit();
+    try std.testing.expect(cli_on.ktls);
+
+    std.fs.cwd().deleteFile(cert_path) catch {};
+    std.fs.cwd().deleteFile(key_path) catch {};
+    std.fs.cwd().deleteDir(tmp) catch {};
+    alloc.free(tmp);
+    alloc.free(cert_c);
+    alloc.free(key_c);
 }
 
 test "HandshakeResult: enum values" {

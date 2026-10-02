@@ -613,6 +613,10 @@ pub fn main() !void {
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
     var listen_fd: ?posix.fd_t = null;
+    // Kernel-TLS offload for federation. Off by default: a remote peer may arm
+    // KTLS on its own side, and two KTLS-armed endpoints desync (the kernel has
+    // no both-ends offload path). Opt in with --ktls for non-KTLS-only peering.
+    var ktls: ?bool = null;
 
     _ = args.next(); // Skip argv[0]
 
@@ -660,6 +664,12 @@ pub fn main() !void {
                 log.err("invalid fd number: {s}", .{val});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--ktls")) {
+            // Enable kernel-TLS offload on the s2s listener (see --ktls note
+            // at the top: only safe when peers are known not to arm KTLS).
+            ktls = true;
+        } else if (std.mem.eql(u8, arg, "--no-ktls")) {
+            ktls = false;
         } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
             // Consume and ignore — passed by master but not used by S2S
             _ = args.next();
@@ -680,7 +690,7 @@ pub fn main() !void {
     if (cert_path) |cert| {
         if (key_path) |key| {
             log.info("TLS configured: cert={s} key={s}", .{ cert, key });
-            daemon.tls_ctx = SslContext.initServer(cert, key) catch |err| {
+            daemon.tls_ctx = SslContext.initServer(cert, key, ktls) catch |err| {
                 log.err("failed to initialize TLS context: {}", .{err});
                 return error.InvalidArgs;
             };
@@ -693,7 +703,9 @@ pub fn main() !void {
     // Initialize client TLS context for outbound connections (with our cert for SASL EXTERNAL)
     const client_cert: ?[*:0]const u8 = if (cert_path) |p| p.ptr else null;
     const client_key: ?[*:0]const u8 = if (key_path) |p| p.ptr else null;
-    daemon.tls_client_ctx = SslContext.initClientWithCert(client_cert, client_key) catch |err| {
+    // Client side is off by default; --ktls arms it (only safe against peers
+    // that do not arm KTLS themselves).
+    daemon.tls_client_ctx = SslContext.initClientWithCert(client_cert, client_key, ktls) catch |err| {
         log.err("failed to initialize client TLS context: {}", .{err});
         return err;
     };
