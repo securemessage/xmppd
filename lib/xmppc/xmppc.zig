@@ -6,8 +6,10 @@
 //!
 //!   * `ClientStream` (stream.zig) — client-side stream FSM (RFC 6120 + XEP-0198)
 //!   * `SaslClient`   (sasl.zig)   — client SASL mechanism coordinator
+//!   * `Engine`       (engine.zig) — ONE kqueue loop driving N Sessions
 //!   * `Session`      (session.zig) — connect → TCP → STARTTLS → SASL → bind
-//!                                   → SM, driven by ONE kqueue loop for N clients
+//!                                   → SM, one connection lifecycle
+//!   * `Parser`       (parser.zig) — XML reader events → stream.ServerEvent
 //!   * `Sm`           (sm.zig)     — Stream Management r/h ack bookkeeping (phase 2)
 //!
 //! Design invariants (see Continuum board XMPPC/task-brief-91e96a28):
@@ -27,6 +29,8 @@
 pub const stream = @import("stream.zig");
 pub const sasl = @import("sasl.zig");
 pub const session = @import("session.zig");
+pub const engine = @import("engine.zig");
+pub const parser = @import("parser.zig");
 
 pub const ClientStream = stream.ClientStream;
 pub const ClientState = stream.ClientState;
@@ -39,11 +43,13 @@ pub const SmResult = stream.SmResult;
 
 pub const SaslClient = sasl.SaslClient;
 
-pub const Engine = session.Engine;
+pub const Engine = engine.Engine;
 pub const Session = session.Session;
 
 test {
     _ = stream;
     _ = sasl;
     _ = session;
+    _ = engine;
+    _ = parser;
 }
