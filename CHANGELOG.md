@@ -1,5 +1,140 @@
 # Changelog
 
+## Unreleased (v0.9.0)
+
+### Features
+
+- T164 XEP-0012 last-activity: the jabber:iq:last handler was a stub that
+  answered seconds='0' to everything (README had already been downgraded
+  to Partial for this). Server-directed queries now answer real domain
+  uptime; other-account queries are server-answered with 0 while online
+  and seconds-since-last-teardown while offline (durable record in the
+  ops DB written when an account's final resource unbinds — consistent
+  across workers with no new actor traffic). Disclosure follows presence
+  visibility (target's roster entry for the requester must be from/both,
+  else forbidden; nonexistent accounts are indistinguishable). Full-JID
+  queries forward to the addressed resource per RFC 6121 §8.5.3 — the
+  resource's client answers its own idle time (XEP-0012 §2.1), so no
+  server-side idle clock is kept (9d6daff).
+- T177 MUC occupant migration: cross-worker XEP-0198 resume now works for
+  sessions that occupy MUC rooms (previously refused, forcing a full
+  re-bind + rejoin). The handoff bundle carries the detached session's room
+  list; after the resuming worker re-binds (generation known), it replays
+  one `room_occupant_move` actor message per room's owning worker, which
+  updates the canonical occupant record's (worker, session, generation)
+  triple in place and syncs shadow copies — a move, not a join/part: no
+  presence fan-out, no new-member handling. Ghost-leak safety: if the
+  resumed connection dies before the moves apply, the session_close
+  broadcast still removes the occupant by full JID everywhere. Occupancy
+  over 64 rooms per session falls back to the full re-bind behavior.
+- T177 redirect breadcrumbs: a relocated session's SM-ID keeps the issuing
+  worker's prefix, so repeat resumes now follow per-worker previd → worker
+  redirects (chained, bounded hops, expire with the resume window) instead
+  of failing `item-not-found` on the second cross-worker hop.
+- T130 batch presence delivery: subscriber resolution resolves a chunk of
+  32 bare JIDs in one session-map lock hold (batched lookup) and each
+  remote worker's MPSC queue gets ONE pipe wake per chunk instead of one
+  per target session; presence probes use the same batching (52d6896).
+- T110 client-side backpressure: when a connection's write buffer crosses
+  75%, its EVFILT_READ is disabled — the server stops consuming stanzas it
+  cannot forward and TCP flow control pushes back on the sender; reading
+  resumes at 50% (8e6fb7c).
+- T121 auth crypto pool: PLAIN credential derivation (PBKDF2) runs on a
+  fixed pool of worker threads (default 4, `[auth] crypto_threads`, 0
+  disables) instead of blocking the auth daemon's event loop; bounded
+  256-job queue answers temporary-auth-failure on overflow. SCRAM is
+  unaffected (server-side verify is cheap HMAC) (39e7e6d).
+- T87 async archive writer: a single writer thread with a bounded
+  deep-copy queue owns all archive stores; event loops never block on
+  storage I/O (compaction stalls no longer freeze sessions), and archive
+  writes became single-threaded (previously N concurrent writers)
+  (c0a9223). MAM/history reads stay inline (eventually consistent).
+- T154 cross-worker resource takeover: a bind conflicting with a resource
+  held by another worker now parks and evicts the holder via a
+  session_kick actor round-trip (RFC 6120 §7.7.3) instead of failing the
+  client with <conflict/> (e2e-resource-takeover 25/25 at workers=4)
+  (307a717).
+- T198: per-account resource cap raised from hardcoded 16 to
+  `[core] max_resources_per_account` (default 256) backed by a heap-grown
+  entry list — multi-resource accounts (agent/bot deployments) no longer
+  hit the wall (a3babac).
+
+### Fixes
+
+- T112: MUC MAM queries routed to a room's owning worker were degraded at
+  the actor-message boundary: the response IQ id was the client's MAM
+  queryid (XEP-0313 allows queryid != stanza id, breaking IQ matching),
+  RSM <max/> was replaced by a hardcoded 50, <after/>/<before/> paging was
+  dropped, and the no-archive answer diverged from the local path. The
+  room_mam_query actor message now carries iq_id + full RSM text; local
+  and remote answers are identical (e2e-muc-mam-routing 82/82 at
+  workers=4, wired into the CI multiworker lane) (c1f53e9).
+- T198: a bind whose session-map registration failed (e.g. over the
+  resource cap) previously sent the success IQ first and only logged —
+  the client believed itself bound while inbound stanzas were silently
+  unroutable. Registration now precedes the result; over-cap binds get a
+  stanza error (resource-constraint) and may retry with another resource
+  (a3babac). Also rolled back partial full_map/bare_map registration on
+  mid-bind failures (latent inconsistency).
+- T152/T154: evicted sessions got their <conflict/> stream error queued
+  but never flushed before the teardown closed the fd — the client closed
+  with no explanation. Now flushed synchronously before teardown
+  (307a717).
+- SM resume restored the session resource from the transient bind
+  accumulator, which is zeroed after a successful bind — resumed sessions
+  ended up with an EMPTY resource (`user@host/`). The resource now comes
+  from the detached session's bound JID — MUC fan-in and fan-out stay
+  correct after resume (T177 work, 02893d9).
+
+### Testing
+
+- New `e2e-muc-resume.py`: alice joins a room with SM resume enabled and
+  loops abrupt-disconnect + resume; asserts the resumed session keeps
+  receiving and sending groupchat without rejoining, detached-era stanzas
+  replay, and other occupants never see a rebroadcast join presence.
+  Cross-worker handoff is verified via server-log evidence.
+- New `e2e-resource-takeover.py`: repeated same-resource bind takeovers,
+  cross-worker kick evidence via server log.
+
+## v0.8.11 — 2026-09-30
+
+Hardening release. **Operationally significant:** the authentication
+rate limiter was silently inert in all previous releases and now actually
+enforces. Deployments upgrading from ≤ 0.8.10 gain brute-force protection
+for the first time: 5 attempts per account and 20 per IP per 120s window,
+temporary account lockout after 10 consecutive failures. Clients that
+repeatedly fail auth will now see `policy-violation` / `account-disabled`
+instead of unlimited `not-authorized` retries.
+
+### Fixes
+
+- Auth rate limiting was inert on the live path: core sends an empty
+  username in the auth request (the daemon extracts the identity from the
+  SASL payload), so per-account rate checks and lockouts evaluated an
+  empty key and never engaged; and the per-IP attempt ring (8 slots) could
+  never count up to the default per-IP limit (20). Per-IP checks still run
+  at request entry; per-account checks and lockouts now run in the
+  PLAIN/SCRAM handlers once the username is parsed, and the ring holds 32
+  entries so configured maxima up to 32 engage (8a100f4)
+- SASL failure reason is now passed through to the wire: rate-limit denial
+  surfaces as `policy-violation` / `account-disabled` (RFC 6120 §6.5
+  conditions, whitelisted) instead of a generic `not-authorized` (8a100f4)
+
+### Tooling
+
+- New `[auth] rate_limit = false` config switch (and `--no-rate-limit` on
+  xmppd-auth, `[oidc] rate_limit = false` on xmppd-auth-oidc) to disable
+  auth rate limiting for benchmark/load-test rigs; the multi-worker e2e
+  lane enables it since connect-heavy suites now trip the real limits
+  (ee4d113). Logs a prominent warning at startup when disabled. Never use
+  on a reachable deployment.
+
+Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps
+(including new rate-limiter enforcement and SASL-condition tests);
+live 25-attempt single-IP auth hammer: unlimited when disabled, exactly
+5× `not-authorized` then `policy-violation` with defaults; seven e2e
+suites at workers=1, cross-worker subset at workers=4.
+
 ## v0.8.10 — 2026-08-31
 
 Bugfix release: cross-worker delivery, a v0.8.9 regression, and four

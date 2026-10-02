@@ -290,9 +290,30 @@ pub const Stream = struct {
         return .{ .send_sasl_success = server_final };
     }
 
-    /// Called when SASL authentication fails.
-    pub fn saslFailure(self: *Stream) StreamAction {
+    /// SASL failure conditions defined by RFC 6120 §6.5. Anything else
+    /// (e.g. an unexpected daemon reason string) renders as not-authorized.
+    pub const VALID_SASL_FAILURES = [_][]const u8{
+        "aborted",
+        "account-disabled",
+        "credentials-expired",
+        "encryption-required",
+        "incorrect-encoding",
+        "invalid-authzid",
+        "invalid-mechanism",
+        "malformed-request",
+        "mechanism-too-weak",
+        "not-authorized",
+        "policy-violation",
+        "temporary-auth-failure",
+    };
+
+    /// Called when SASL authentication fails. Pass the daemon's failure
+    /// reason; unrecognised values fall back to not-authorized.
+    pub fn saslFailure(self: *Stream, reason: []const u8) StreamAction {
         self.state = .features_sasl;
+        for (VALID_SASL_FAILURES) |r| {
+            if (std.mem.eql(u8, reason, r)) return .{ .send_sasl_failure = r };
+        }
         return .{ .send_sasl_failure = "not-authorized" };
     }
 
@@ -504,10 +525,20 @@ test "Stream: SASL failure allows retry" {
     _ = stream.handleStreamOpen("example.com", "1.0");
     _ = stream.handleSaslAuth("PLAIN");
 
-    const action = stream.saslFailure();
+    const action = stream.saslFailure("policy-violation");
     try std.testing.expect(action == .send_sasl_failure);
+    try std.testing.expectEqualStrings("policy-violation", action.send_sasl_failure);
     // Should return to features_sasl state for retry
     try std.testing.expectEqual(StreamState.features_sasl, stream.state);
+}
+
+test "Stream: SASL failure with unknown reason falls back to not-authorized" {
+    var stream = Stream.init("example.com", true);
+    _ = stream.handleStreamOpen("example.com", "1.0");
+    _ = stream.handleSaslAuth("PLAIN");
+
+    const action = stream.saslFailure("<injected/>xml");
+    try std.testing.expectEqualStrings("not-authorized", action.send_sasl_failure);
 }
 
 test "writeStreamOpen" {

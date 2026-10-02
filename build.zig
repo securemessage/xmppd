@@ -4,7 +4,7 @@ const std = @import("std");
 /// via the "build_options" module; consumed by `xmppd --version` and the
 /// XEP-0092 Software Version answer. Bump at release time (must equal the
 /// git tag without the leading 'v').
-const version = "0.8.10";
+const version = "0.8.11";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -34,6 +34,22 @@ pub fn build(b: *std.Build) void {
 
     const sasl_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // T121: crypto offload thread pool (auth daemon, handler tests). Created
+    // early because both binary and test module sections import it.
+    const crypto_pool_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/crypto_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_pool_mod.addImport("sasl", sasl_mod);
+
+    // T87: async archive write queue — no deps beyond std
+    const archive_queue_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/archive_queue.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -354,6 +370,12 @@ pub fn build(b: *std.Build) void {
     });
     server_mam_handler_mod.addImport("backend", server_backend_mod);
     server_mam_handler_mod.addImport("archive_store", server_archive_store_mod);
+    const server_last_activity_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/last_activity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_last_activity_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -365,11 +387,13 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("delivery_queue", delivery_queue_mod);
     server_test_mod.addImport("generic_offline_store", server_generic_offline_mod);
     server_test_mod.addImport("archive_store", server_archive_store_mod);
+    server_test_mod.addImport("archive_queue", archive_queue_mod);
     server_test_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("op_backend", server_op_backend_mod);
     server_test_mod.addImport("archive_backend", server_archive_backend_mod);
     server_test_mod.addImport("mam_handler", server_mam_handler_mod);
     server_test_mod.addImport("vcard_store", server_vcard_store_mod);
+    server_test_mod.addImport("last_activity_store", server_last_activity_mod);
     const server_room_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/room_store.zig"),
         .target = target,
@@ -511,6 +535,14 @@ pub fn build(b: *std.Build) void {
     auth_handler_test_mod.addImport("invite_store", invite_store_test_mod);
     auth_handler_test_mod.addImport("user_store", generic_user_store_test_mod);
     auth_handler_test_mod.addImport("backend", backend_test_mod);
+    auth_handler_test_mod.addImport("crypto_pool", crypto_pool_mod);
+
+    // T121 crypto-pool tests live in the module itself
+    const crypto_pool_tests = b.addTest(.{
+        .name = "crypto-pool-tests",
+        .root_module = crypto_pool_mod,
+    });
+    const run_crypto_pool_tests = b.addRunArtifact(crypto_pool_tests);
 
     const auth_handler_tests = b.addTest(.{
         .name = "auth-handler-tests",
@@ -596,6 +628,22 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_delivery_queue_tests = b.addRunArtifact(delivery_queue_tests);
+
+    // --- SM handoff store tests ---
+
+    const sm_handoff_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/sm_handoff.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const sm_handoff_tests = b.addTest(.{
+        .name = "sm-handoff-tests",
+        .root_module = sm_handoff_test_mod,
+    });
+
+    const run_sm_handoff_tests = b.addRunArtifact(sm_handoff_tests);
 
     // --- Offline store tests ---
 
@@ -804,6 +852,22 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_generic_offline_store_tests = b.addRunArtifact(generic_offline_store_tests);
+
+    // --- Last activity store tests (XEP-0012, T164) ---
+
+    const last_activity_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/last_activity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    last_activity_store_test_mod.addImport("backend", backend_test_mod);
+
+    const last_activity_store_tests = b.addTest(.{
+        .name = "last-activity-store-tests",
+        .root_module = last_activity_store_test_mod,
+    });
+
+    const run_last_activity_store_tests = b.addRunArtifact(last_activity_store_tests);
 
     // --- PEP store tests ---
 
@@ -1103,11 +1167,13 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
     core_mod.addImport("archive_store", server_archive_store_mod);
+    core_mod.addImport("archive_queue", archive_queue_mod);
     core_mod.addImport("backend", server_backend_mod);
     core_mod.addImport("op_backend", server_op_backend_mod);
     core_mod.addImport("archive_backend", server_archive_backend_mod);
     core_mod.addImport("mam_handler", server_mam_handler_mod);
     core_mod.addImport("vcard_store", server_vcard_store_mod);
+    core_mod.addImport("last_activity_store", server_last_activity_mod);
     core_mod.addImport("room_store", server_room_store_mod);
     core_mod.addImport("room_registry", server_room_registry_mod);
     core_mod.addImport("room_mailbox", server_room_mailbox_mod);
@@ -1200,6 +1266,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
+    auth_handler_mod.addImport("crypto_pool", crypto_pool_mod);
 
     const auth_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -1226,6 +1293,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_mod.addImport("user_store", auth_user_store_mod);
     auth_mod.addImport("handler", auth_handler_mod);
+    auth_mod.addImport("crypto_pool", crypto_pool_mod);
     auth_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_mod.addImport("lock_store", auth_lock_store_mod);
     auth_mod.addImport("invite_store", auth_invite_store_mod);
@@ -1281,6 +1349,7 @@ pub fn build(b: *std.Build) void {
     oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_handler_mod.addImport("crypto_pool", crypto_pool_mod);
     oidc_handler_mod.addImport("invite_store", auth_invite_store_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
@@ -1425,6 +1494,13 @@ pub fn build(b: *std.Build) void {
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
+    // T87: archive write queue tests (module defined next to core_mod)
+    const archive_queue_tests = b.addTest(.{
+        .name = "archive-queue-tests",
+        .root_module = archive_queue_mod,
+    });
+    const run_archive_queue_tests = b.addRunArtifact(archive_queue_tests);
+
     // --- Test step ---
 
     const test_step = b.step("test", "Run all library tests");
@@ -1449,6 +1525,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
+    test_step.dependOn(&run_sm_handoff_tests.step);
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);
@@ -1466,6 +1543,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+    test_step.dependOn(&run_last_activity_store_tests.step);
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);
     test_step.dependOn(&run_invite_store_tests.step);
@@ -1481,6 +1559,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
+    test_step.dependOn(&run_crypto_pool_tests.step);
+    test_step.dependOn(&run_archive_queue_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

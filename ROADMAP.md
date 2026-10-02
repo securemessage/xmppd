@@ -42,6 +42,12 @@ tracks the release-level shape.
 
 ### Immediate
 
+- [x] Tag **v0.8.11** — SHIPPED 2026-09-30: hardening patch: auth rate limiting
+      was silently inert in every prior release (empty-username checks +
+      8-slot ring < 20-attempt default). Fixed and verified with a live
+      single-IP hammer; SASL failure reasons (policy-violation/
+      account-disabled) now reach the wire. New `[auth] rate_limit = false`
+      switch for benchmark rigs.
 - [x] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
       — verified and tagged 2026-08-30 (see Phase 13 Deferred Follow-ups for the
       full test matrix), deployed to the test jail the same day
@@ -132,22 +138,73 @@ eleven items landed; see CHANGELOG for details:
 
 Deferred out of the v0.8.0 feature release:
 
-- [ ] T112 — MUC MAM routing
-- [ ] T130 — batch presence
-- [ ] T121 — auth thread pool
-- [ ] T110 — backpressure
-- [ ] T87 — async archive writer
-- [ ] T154 — cross-worker resource eviction (workers>1)
-- [ ] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
-      store, offline elapsed seconds, privacy rules)
-- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `[auth]`
-      rate-limit disable knob, `lib/xmppc` client-core module (in-repo for
-      now, extract to a canonical repo when a second consumer appears), load
-      driver built on it, then benchmarks: connections/sec at workers=1/N,
-      message throughput, cross-thread delivery latency. Benchmarks double as
-      the measurement gate for T31 (allocator contention premise).
+Execution order (agreed 2026-09-30): T177 MUC occupant migration first
+(LANDED 2026-10-01), then the perf backlog T130/T121/T110/T87, T154
+opportunistically (its delivery pattern now exists — Sonya request); T32
+stays blocked on the lib/xmppc delivery, T31 gated on T32 measurements.
+T198 (per-account resource cap + silent bind failure) joins this release —
+Sonya needs hundreds of resources per account. T197 is the exit gate: the
+release is not tagged until the codebase-wide quality sweep has run and its
+findings are triaged.
+
+- [x] T112 — MUC MAM routing: cross-worker queries now carry the IQ stanza
+      id separately from the MAM queryid, full RSM (max/after/before), and
+      answer no-archive with item-not-found like the local path — merged
+      2026-10-01 (c1f53e9)
+- [x] **T130** — batch presence delivery: session-map batch resolve
+      (one lock hold per 32-JID chunk) + one MPSC pipe wake per remote
+      worker — merged 2026-10-01 (52d6896)
+- [x] **T121** — auth crypto pool: PBKDF2 derives run on worker threads
+      off the event loop; `[auth] crypto_threads` (default 4) — merged
+      2026-10-01 (39e7e6d)
+- [x] **T110** — client-side backpressure: EVFILT_READ suppressed when a
+      connection's write buffer crosses 75%, re-enabled at 50% — merged
+      2026-10-01 (8e6fb7c)
+- [x] **T87** — async archive writer: single writer thread + bounded deep-
+      copy queue; event loops never block on storage; archive writes are
+      single-threaded now — merged 2026-10-01 (c0a9223)
+- [x] **T154** — cross-worker resource eviction: session_kick actor
+      round-trip (park bind, holding worker destroys old session per RFC
+      6120 §7.7.3, retry on reply; 3-round cap); evicted clients now get
+      the conflict stream error flushed before disconnect. Same fix on the
+      local eviction path (T152) — merged 2026-10-01 (307a717)
+- [x] **T198** — per-account resource cap raised to configurable
+      `[core] max_resources_per_account` (default 256); bind failures now
+      client-visible (stanza error, success IQ only after registration) —
+      merged 2026-10-01 (a3babac)
+- [x] **T177** — cross-worker SM resume: Option A state handoff landed
+      2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
+      MPSC request/reply, mutex-guarded handoff store for the unacked queue,
+      ABA epoch guard, e2e-sm-resume passes at workers=4. MUC occupant
+      migration landed 2026-10-01: bundles carry the room list; the resuming
+      worker replays `room_occupant_move` actor messages that retarget each
+      canonical occupant record (worker, session, generation) and sync shadow
+      copies without presence fan-out; redirect breadcrumbs follow relocated
+      SM-IDs on repeat hops (chains, bounded, expiring); e2e-muc-resume
+      37/37 at workers=4 x4 runs with handoff log evidence. Micro-window
+      study done 2026-10-01 (Phorge comment): measured <=1 ms; 1:1 traffic
+      diverts to offline store (delayed, not lost), in-flight + MUC
+      generation-drops are lost client-side inside the window — accepted for
+      0.9.0; atomic-transfer fix specified as T199 (v0.10.0 candidate)
+- [x] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
+      store, offline elapsed seconds, privacy rules) — merged 2026-10-01
+      (9d6daff)
+- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
+      client-core module (in-repo for now, extract to a canonical repo when
+      a second consumer appears), load driver built on it, then benchmarks:
+      connections/sec at workers=1/N, message throughput, cross-thread
+      delivery latency. Benchmarks double as the measurement gate for T31
+      (allocator contention premise). `[auth]` rate-limit knob landed
+      2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
 - [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
       measurements showing actual DebugAllocator lock contention
+- [ ] **T197** — codebase-wide quality sweep (EXIT GATE, runs after the
+      0.9.0 work above lands): performance (hot-path allocation churn,
+      lock contention, event-loop hygiene per project kqueue rules),
+      anti-patterns, readability/maintainability, separation of concerns,
+      Zig-specific idiom/allocator-discipline review. Output: triaged
+      findings report; fix-now items land before tagging, the rest become
+      new tasks
 
 ### v0.10.0 — Feature: Web Transport
 
@@ -162,6 +219,11 @@ Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
       `pubsub/service` disco identity (service identity + node
       create/publish/subscribe beyond the PEP subset; do NOT advertise the
       identity before the implementation exists)
+- [ ] **T199** — atomic cross-worker session transfer: close the T177
+      unbind→re-bind micro-window (study + design 2026-10-01): step-2
+      SessionMap.transfer using requester coordinates, parked-session
+      migration stash riding the replay, earlier MUC occupant moves; the
+      T32 load harness will quantify the before/after window-loss rate
 
 ### Non-code
 

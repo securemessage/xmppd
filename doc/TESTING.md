@@ -33,6 +33,10 @@ zig build
 #   [tls]                # REQUIRED for e2e-sm-resume.py (it does STARTTLS)
 #   cert = /tmp/xmppd-test-cert.pem
 #   key = /tmp/xmppd-test-key.pem
+#   [auth]
+#   rate_limit = false   # e2e suites make many connects per account/IP; the
+#                        # default policy (5/account, 20/IP per 120s) trips
+#                        # mid-suite. Same knob for benchmark/load runs.
 
 # self-signed cert (suites use CERT_NONE contexts):
 openssl req -x509 -newkey rsa:2048 -keyout /tmp/xmppd-test-key.pem \
@@ -51,6 +55,11 @@ openssl req -x509 -newkey rsa:2048 -keyout /tmp/xmppd-test-key.pem \
 ```
 
 `--no-s2s` avoids colliding with any real instance on port 5269.
+
+The `rate_limit = false` line above is load-bearing for e2e and
+load/benchmark runs (the T32 harness needs it). It can equivalently come
+from `--no-rate-limit` on xmppd-auth when running the daemon standalone.
+Never set it on a reachable deployment — it removes brute-force protection.
 
 ### Environment overrides
 
@@ -127,13 +136,17 @@ Notes:
   randomised because a fixed port is NOT enough: xmppd's listener uses
   SO_REUSEPORT, so two concurrently-running lane instances on the same port
   would load-split incoming connections across both servers.
-- `e2e-sm-resume.py` is excluded on purpose: SM resume state is per-worker,
-  and a reconnect lands on a random worker via SO_REUSEPORT, so resume fails
-  with `item-not-found` at workers>1 by design (cross-worker resume is not
-  implemented).
+- `e2e-sm-resume.py` exercises T177 cross-worker resume at workers>1: SM-IDs
+  embed the owning worker id, and a `<resume/>` landing elsewhere triggers
+  the state handoff (`cross-worker SM resume` lines in the server log). It
+  lands randomly via SO_REUSEPORT, so a single run may or may not hit the
+  cross-worker path — run it a few times and grep the server log for
+  `handed off` to confirm both same- and cross-worker resumes were covered.
 
 Known-good at workers=4 (post-T173): muc-test 12/12, e2e-quick-wins 12/12,
-e2e-chat all pass, e2e-mam 7/7, e2e-subscription 29/29.
+e2e-chat all pass, e2e-mam 7/7, e2e-subscription 29/29. Post-T177:
+e2e-sm-resume 29/29 (4 consecutive runs, cross-worker handoffs of 1–5
+stanzas observed in all directions across workers).
 
 ## Interop (SINT)
 

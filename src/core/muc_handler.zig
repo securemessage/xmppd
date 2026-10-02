@@ -224,7 +224,7 @@ pub fn handleMucGroupchat(
     }
 
     // Store in archive for room history replay (T44)
-    if (server.archive) |archive| {
+    if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (id_str.len > 0) id_str else "muc";
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
@@ -242,7 +242,7 @@ pub fn handleMucGroupchat(
         aw.writeByte('>') catch return;
         aw.writeAll(inner_xml) catch return;
         aw.writeAll("</message>") catch return;
-        archive.store(room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+        server.archiveStore(room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten());
     }
 }
 
@@ -1886,7 +1886,7 @@ pub fn processRemoteGroupchat(
     }
 
     // Archive
-    if (server.archive) |archive| {
+    if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
         var arch_buf: [17200]u8 = undefined;
@@ -1903,7 +1903,7 @@ pub fn processRemoteGroupchat(
         aw.writeByte('>') catch return;
         aw.writeAll(ev.inner_xml) catch return;
         aw.writeAll("</message>") catch return;
-        archive.store(ev.room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten()) catch {};
+        server.archiveStore(ev.room_jid, from_str, stanza_id, timestamp, arch_fbs.getWritten());
     }
 }
 
@@ -1993,7 +1993,10 @@ pub fn processRemoteDiscoItems(
 }
 
 /// Handle shadow_join: add a local occupant to the shadow room on this worker.
-/// Called when the owning worker notifies us that one of our sessions joined a room.
+/// Called when the owning worker notifies us that one of our sessions joined a
+/// room — or, on T177 occupant moves, that a local occupant's delivery triple
+/// changed (worker is ours; session slot and generation churn with each SM
+/// resume even on same-worker moves).
 pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     const reg = server.room_registry orelse return;
 
@@ -2004,15 +2007,22 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     }
     const r = room.?;
 
-    // Idempotent: skip if already present (prevents duplicate entries from race conditions)
-    if (r.findByRealJid(ev.real_jid) != null) return;
+    // Idempotent / refresh: if already present, update the delivery triple
+    // (T177 move refresh) without touching identity fields.
+    if (r.findByRealJid(ev.real_jid)) |idx| {
+        const occ = &r.occupants[idx].?;
+        occ.worker_id = ev.worker_id;
+        occ.session_id = ev.session_id;
+        occ.generation = ev.generation;
+        return;
+    }
 
     // Extract bare JID
     const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
     const bare_jid = ev.real_jid[0..slash_pos];
 
     // Add occupant to shadow (ignore errors — shadow is best-effort)
-    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, 0, .participant, .none) catch {};
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, .participant, .none) catch {};
 }
 
 /// Handle shadow_part: remove a local occupant from the shadow room on this worker.
@@ -2026,6 +2036,88 @@ pub fn handleShadowPart(server: *Server, ev: actor_message.RoomEvent) void {
     if (room.occupant_count == 0) {
         _ = reg.destroyRoom(ev.room_jid);
     }
+}
+
+/// T177 MUC occupant migration, owner side. An SM-resumed session moved to a
+/// new worker: update the canonical occupant record's delivery triple in
+/// place (identity — nick/role/affiliation — is untouched), then sync shadow
+/// copies: drop the occupant on the old worker's shadow, mirror it onto the
+/// new worker's shadow. This is a MOVE, not a join/part: there is no
+/// presence fan-out to other occupants and no new-member handling.
+///
+/// Dispatched immediately (not via the room mailbox): the move only mutates
+/// the delivery triple, so ordering against queued join/part/message traffic
+/// is irrelevant — a part queued either side of the move still ends with the
+/// occupant removed, and groupchat queued after the resumed client's next
+/// stanza is guaranteed to arrive after the move (same B→owner MPSC FIFO).
+pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) void {
+    const reg = server.room_registry orelse return;
+
+    const room = reg.findByJid(ev.room_jid) orelse {
+        // Canonical room gone — sweep any stale shadow on the old worker.
+        shadowCleanOldWorker(server, ev);
+        return;
+    };
+
+    const old_worker = room.updateOccupantMove(
+        ev.real_jid,
+        ev.new_worker_id,
+        ev.new_session_id,
+        ev.new_generation,
+    ) orelse {
+        // Occupant ended concurrently with the resume (kick/ban, expiry) —
+        // do not resurrect it; still sweep the old worker's stale shadow.
+        shadowCleanOldWorker(server, ev);
+        return;
+    };
+
+    log.info("occupant {s} in {s} moved: worker {d} -> {d} (session {d}, gen {d})", .{
+        ev.real_jid, ev.room_jid, old_worker, ev.new_worker_id, ev.new_session_id, ev.new_generation,
+    });
+
+    // Cross-worker move: the old worker's shadow copy is stale — remove it.
+    if (old_worker != ev.new_worker_id and old_worker != server.worker_id) {
+        server.enqueueRoomActorMessage(old_worker, .{ .shadow_part = .{
+            .room_jid = ev.room_jid,
+            .real_jid = ev.real_jid,
+            .nick = "",
+            .worker_id = old_worker,
+            .session_id = 0,
+            .generation = 0,
+        } });
+    }
+
+    // Mirror the canonical nick + new delivery triple into the new worker's
+    // shadow so multicast fan-out can reach the resumed session. This also
+    // covers the same-worker case: a resume changes the session slot and
+    // generation even when the worker does not move, and handleShadowJoin
+    // refreshes an existing entry's triple.
+    if (ev.new_worker_id != server.worker_id) {
+        const idx = room.findByRealJid(ev.real_jid).?;
+        const occ = room.occupants[idx].?;
+        server.enqueueRoomActorMessage(ev.new_worker_id, .{ .shadow_join = .{
+            .room_jid = room.getJid(),
+            .real_jid = ev.real_jid,
+            .nick = occ.getNick(),
+            .worker_id = ev.new_worker_id,
+            .session_id = ev.new_session_id,
+            .generation = ev.new_generation,
+        } });
+    }
+}
+
+/// Remove the pre-move shadow entry on the old worker when the canonical
+/// room/occupant no longer exists to update in place.
+fn shadowCleanOldWorker(server: *Server, ev: actor_message.RoomOccupantMove) void {
+    if (ev.old_worker_id == server.worker_id) return; // canonical lives here; nothing to sweep
+    server.enqueueRoomActorMessage(ev.old_worker_id, .{ .shadow_part = .{
+        .room_jid = ev.room_jid,
+        .real_jid = ev.real_jid,
+        .nick = "",
+        .worker_id = ev.old_worker_id,
+        .session_id = 0,
+        .generation = 0,
+    } });
 }
 
 /// Send room history to a remote joiner via MPSC unicast.
@@ -2282,24 +2374,15 @@ pub fn processRemoteMamQuery(
     _ = changes;
     const reg = server.room_registry orelse return;
     if (reg.findByJid(ev.room_jid) == null) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     }
 
     const ds = server.delivery_system orelse return;
     const archive = server.archive orelse {
-        // No archive configured — send empty fin
-        var buf: [512]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const fw = fbs.writer();
-        fw.writeAll("<iq type='result' from='") catch return;
-        fw.writeAll(ev.room_jid) catch return;
-        fw.writeAll("' to='") catch return;
-        fw.writeAll(ev.reply_to_jid) catch return;
-        fw.writeAll("' id='") catch return;
-        fw.writeAll(ev.query_id) catch return;
-        fw.writeAll("'><fin xmlns='urn:xmpp:mam:2' complete='true'><set xmlns='http://jabber.org/protocol/rsm'><count>0</count></set></fin></iq>") catch return;
-        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
+        // No archive configured — same answer the local path gives
+        // (routing must be invisible to the client).
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "item-not-found");
         return;
     };
 
@@ -2309,21 +2392,27 @@ pub fn processRemoteMamQuery(
     const start_ts = if (ev.start.len > 0) parseTs(ev.start) else null;
     const end_ts = if (ev.end_field.len > 0) parseTs(ev.end_field) else null;
 
+    // RSM params travel with the query (T112); same defaults as the local path.
+    const max: u32 = if (ev.max.len > 0)
+        std.fmt.parseInt(u32, ev.max, 10) catch 50
+    else
+        50;
+
     const query = mam_handler.MamQuery{
-        .iq_id = ev.query_id,
+        .iq_id = ev.iq_id,
         .owner = ev.room_jid,
         .query_id = ev.query_id,
         .with = if (ev.with.len > 0) ev.with else null,
         .start = start_ts,
         .end = end_ts,
-        .after_id = null,
-        .before_id = null,
-        .max = 50,
+        .after_id = if (ev.after_id.len > 0) ev.after_id else null,
+        .before_id = if (ev.before_id.len > 0) ev.before_id else null,
+        .max = max,
     };
 
     const ArchBackend = @import("archive_backend").Backend;
     var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
-        sendIqErrorToRemote(server, ev.room_jid, ev.query_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "internal-server-error");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "internal-server-error");
         return;
     };
     defer response.deinit();

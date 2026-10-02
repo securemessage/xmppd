@@ -41,6 +41,11 @@ pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
 /// to the local room shard for processing.
 pub const ROOM_ACTOR_SENTINEL: u32 = 0xFFFFFFFE;
 
+/// Sentinel value for target_session_id indicating an SM resume handoff
+/// message (T177). Payload decodes as a message.zig sm_resume_request (on the
+/// owning worker) or sm_resume_reply (on the requesting worker).
+pub const SM_ACTOR_SENTINEL: u32 = 0xFFFFFFFD;
+
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
 
@@ -266,13 +271,33 @@ pub const DeliverySystem = struct {
         target_generation: u32,
         payload: []const u8,
     ) !void {
-        if (target_worker >= self.worker_count) return error.InvalidWorker;
-
-        try self.queues[target_worker].enqueue(target_session_id, target_generation, payload);
+        try self.enqueue(target_worker, target_session_id, target_generation, payload);
 
         // Always wake the target worker — coalesced signaling is unsafe because
         // the target may finish processing and enter kevent() between our isActive
         // check and the pipe write. The pipe drainPipe() handles duplicate wakes.
+        self.wakeWorker(target_worker);
+    }
+
+    /// Enqueue without waking the target worker (T130 batch delivery).
+    /// The caller MUST call wakeWorker() once after the batch. A stale read
+    /// of the queue by a woken-but-racing target is harmless; skipping the
+    /// trailing wake is not.
+    pub fn enqueue(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+    ) !void {
+        if (target_worker >= self.worker_count) return error.InvalidWorker;
+        try self.queues[target_worker].enqueue(target_session_id, target_generation, payload);
+    }
+
+    /// Wake a worker after one or more enqueue() calls (T130). One pipe
+    /// write for the whole batch instead of one per stanza.
+    pub fn wakeWorker(self: *DeliverySystem, target_worker: u16) void {
+        if (target_worker >= self.worker_count) return;
         self.pipes[target_worker].wake();
     }
 

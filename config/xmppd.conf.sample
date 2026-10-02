@@ -68,6 +68,11 @@ key = /usr/local/etc/xmppd/server.key
 # IPC socket path for core↔auth communication
 socket = /var/run/xmppd/auth.sock
 
+# Disable auth rate limiting entirely (default: true = enabled).
+# Set false ONLY for local benchmark/load-test runs — removes brute-force
+# protection, never use on a reachable deployment.
+# rate_limit = true
+
 # Rate limiting: max authentication attempts per account per window
 # max_per_account = 5
 

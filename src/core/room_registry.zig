@@ -223,6 +223,26 @@ pub const Room = struct {
         const idx = self.findByRealJid(real_jid) orelse return null;
         return self.removeOccupant(idx);
     }
+
+    /// Move an occupant to another (worker, session, generation) — the
+    /// SM-resume migration (T177). The occupant's identity (nick, role,
+    /// affiliation, JIDs) is unchanged; only the delivery triple moves.
+    /// Returns the worker the record pointed at before the move, or null if
+    /// the occupant is not present. Idempotent at the identity level: the
+    /// recorded old worker is authoritative, the caller's hint ignored.
+    pub fn updateOccupantMove(self: *Room, real_jid: []const u8, new_worker: u16, new_session: usize, new_generation: u32) ?u16 {
+        const idx = self.findByRealJid(real_jid) orelse return null;
+        const occ = &self.occupants[idx].?;
+        const old_worker = occ.worker_id;
+        occ.worker_id = new_worker;
+        occ.session_id = new_session;
+        occ.generation = new_generation;
+        self.worker_mask |= @as(u16, 1) << @intCast(new_worker);
+        if (!self.hasOccupantOnWorker(old_worker)) {
+            self.worker_mask &= ~(@as(u16, 1) << @intCast(old_worker));
+        }
+        return old_worker;
+    }
 };
 
 /// Maximum entries in the room directory (for disco#items across all workers).
@@ -484,6 +504,57 @@ test "Room: remove occupant" {
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
     try std.testing.expect(room.findByNick("alice") == null);
     try std.testing.expect(room.findByNick("bob") != null);
+}
+
+test "Room: updateOccupantMove swaps delivery triple and fixes worker_mask" {
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 0, 7, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/d", "bob@localhost", 7, 0, 9, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b1), room.worker_mask);
+
+    // Move alice from (worker 0, slot 5, gen 7) to (worker 2, slot 41, gen 3)
+    const old = room.updateOccupantMove("alice@localhost/m", 2, 41, 3).?;
+    try std.testing.expectEqual(@as(u16, 0), old);
+
+    const idx = room.findByRealJid("alice@localhost/m").?;
+    const occ = room.occupants[idx].?;
+    try std.testing.expectEqual(@as(u16, 2), occ.worker_id);
+    try std.testing.expectEqual(@as(usize, 41), occ.session_id);
+    try std.testing.expectEqual(@as(u32, 3), occ.generation);
+    // Identity fields untouched
+    try std.testing.expectEqualStrings("alice", occ.getNick());
+    try std.testing.expectEqualStrings("alice@localhost", occ.getBareJid());
+    try std.testing.expectEqual(Role.participant, occ.role);
+    try std.testing.expectEqual(Affiliation.none, occ.affiliation);
+
+    // worker_mask: bit 0 stays (bob still there), bit 2 set
+    try std.testing.expectEqual(@as(u16, 0b101), room.worker_mask);
+}
+
+test "Room: updateOccupantMove clears old worker bit when last local occupant leaves" {
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 1, 7, .participant, .none);
+    try std.testing.expectEqual(@as(u16, 0b10), room.worker_mask);
+
+    const old = room.updateOccupantMove("alice@localhost/m", 3, 9, 11).?;
+    try std.testing.expectEqual(@as(u16, 1), old);
+    try std.testing.expectEqual(@as(u16, 0b1000), room.worker_mask);
+
+    // Same-worker move (slot/gen churn on local SM resume) keeps the bit
+    _ = room.updateOccupantMove("alice@localhost/m", 3, 12, 13);
+    try std.testing.expectEqual(@as(u16, 0b1000), room.worker_mask);
+
+    // Unknown occupant: null, mask untouched
+    try std.testing.expect(room.updateOccupantMove("ghost@localhost/x", 0, 1, 1) == null);
+    try std.testing.expectEqual(@as(u16, 0b1000), room.worker_mask);
 }
 
 test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {

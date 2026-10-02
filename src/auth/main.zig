@@ -35,6 +35,7 @@ const ChangeList = event_loop_mod.ChangeList;
 const Event = event_loop_mod.Event;
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
+const crypto_pool_mod = @import("crypto_pool");
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const LockChecker = handler_mod.LockChecker;
@@ -47,6 +48,9 @@ const log = std.log.scoped(.xmppd_auth);
 
 /// Sentinel value for the listener fd in kqueue udata.
 const LISTENER_UDATA: usize = std.math.maxInt(usize);
+
+/// Sentinel value for the crypto pool wake pipe in kqueue udata (T121).
+const POOL_UDATA: usize = std.math.maxInt(usize) - 1;
 
 /// Base udata for IPC client connections.
 const CLIENT_UDATA_BASE: usize = 0x10000;
@@ -63,7 +67,10 @@ pub fn main() !void {
     var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var rate_policy = RatePolicy{};
+    var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
+    // T121: crypto pool size. 0 disables (inline derive in the event loop).
+    var crypto_threads: u32 = 4;
 
     var config_path: ?[]const u8 = null;
 
@@ -110,6 +117,8 @@ pub fn main() !void {
                 log.err("--lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
             });
+        } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
+            rate_limit_enabled = false;
         } else if (std.mem.eql(u8, arg, "--enable-registration")) {
             reg_config.enabled = true;
         } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
@@ -165,6 +174,12 @@ pub fn main() !void {
                 rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch 10);
             }
         }
+        if (c.get("auth", "rate_limit")) |v| {
+            if (std.mem.eql(u8, v, "false")) rate_limit_enabled = false;
+        }
+        if (c.get("auth", "crypto_threads")) |v| {
+            crypto_threads = std.fmt.parseInt(u32, v, 10) catch 4;
+        }
         if (c.get("auth", "registration")) |v| {
             if (std.mem.eql(u8, v, "true")) reg_config.enabled = true;
         }
@@ -183,13 +198,6 @@ pub fn main() !void {
         return error.InvalidArgs;
     };
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
-    log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
-        rate_policy.max_per_account,
-        rate_policy.max_per_ip,
-        rate_policy.window_seconds,
-        rate_policy.lockout_duration,
-        rate_policy.lockout_threshold,
-    });
 
     // Open storage backend
     var backend = try OpBackendType.open(auth_path, .{});
@@ -203,7 +211,18 @@ pub fn main() !void {
 
     // Initialize auth handler
     var handler = AuthHandler.init(allocator, &store);
-    handler.setRateLimiter(&rate_limiter);
+    if (rate_limit_enabled) {
+        handler.setRateLimiter(&rate_limiter);
+        log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
+            rate_policy.max_per_account,
+            rate_policy.max_per_ip,
+            rate_policy.window_seconds,
+            rate_policy.lockout_duration,
+            rate_policy.lockout_threshold,
+        });
+    } else {
+        log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
+    }
     handler.setLockChecker(makeLockChecker(&lock_store, allocator));
     handler.reg_config = reg_config;
     if (reg_config.enabled and reg_config.require_invite) {
@@ -214,6 +233,23 @@ pub fn main() !void {
     if (reg_config.enabled) {
         log.info("registration enabled (require_invite={s})", .{if (reg_config.require_invite) "true" else "false"});
     }
+
+    // T121: crypto offload pool — PBKDF2 derives run off the event loop.
+    // Started before the listener accepts anything; on failure the daemon
+    // continues with inline derivation (the pre-T121 behavior).
+    var crypto_pool = crypto_pool_mod.CryptoPool{ .allocator = allocator };
+    var pool_started = false;
+    if (crypto_threads > 0) {
+        crypto_pool.start(crypto_threads) catch |err| {
+            log.err("crypto pool failed to start ({}): falling back to inline derivation", .{err});
+        };
+        pool_started = crypto_pool.thread_count > 0;
+    }
+    if (pool_started) {
+        handler.enableCryptoPool(&crypto_pool);
+        log.info("crypto pool: {d} worker threads", .{crypto_pool.thread_count});
+    }
+    defer if (pool_started) crypto_pool.stop();
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
     // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
@@ -231,9 +267,15 @@ pub fn main() !void {
 
     // Register listener + signals (signal masking is automatic)
     try loop.addFd(ipc.listen_fd, .read, LISTENER_UDATA);
+    if (pool_started) try loop.addFd(crypto_pool.pipe_rd, .read, POOL_UDATA);
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
     try loop.addSignal(posix.SIG.HUP);
+
+    // ABA guard for deferred crypto replies: bumped on every client accept so
+    // a stale completion can't land on a different core connection that
+    // reused the slot.
+    var ipc_gens = [_]u32{0} ** @import("ipc_server").MAX_IPC_CLIENTS;
 
     // Scratch buffer for batching changes across iterations.
     var scratch: [16]posix.Kevent = undefined;
@@ -262,6 +304,7 @@ pub fn main() !void {
                     if (e.udata == LISTENER_UDATA) {
                         // New IPC client connection
                         if (ipc.accept() catch null) |slot| {
+                            ipc_gens[slot] +%= 1;
                             const conn = ipc.getClient(slot) orelse continue;
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch break;
 
@@ -276,9 +319,15 @@ pub fn main() !void {
                                 batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
                             }
                         }
+                    } else if (e.udata == POOL_UDATA) {
+                        // T121: crypto completions — render and send replies
+                        crypto_pool.drainPipe();
+                        while (crypto_pool.popCompletion()) |c| {
+                            pumpCryptoReply(ipc, &handler, c, &ipc_gens, &batch);
+                        }
                     } else if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        handleIpcClient(ipc, &handler, &batch, slot);
+                        handleIpcClient(ipc, &handler, &batch, slot, &ipc_gens);
                     }
                 },
                 .fd_writable => |e| {
@@ -295,7 +344,7 @@ pub fn main() !void {
     log.info("xmppd-auth shutdown complete", .{});
 }
 
-fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize) void {
+fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, ipc_gens: []const u32) void {
     const conn = ipc.getClient(slot) orelse return;
 
     const n = conn.recv() catch {
@@ -317,24 +366,48 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
 
         if (msg == null) break;
 
-        if (handler.handleMessage(msg.?)) |response| {
-            conn.queueSend(response) catch {
-                ipc.closeClient(slot);
-                return;
-            };
+        switch (handler.handleMessage(msg.?, @intCast(slot), ipc_gens[slot])) {
+            .reply => |response| {
+                conn.queueSend(response) catch {
+                    ipc.closeClient(slot);
+                    return;
+                };
 
-            // Clean up SCRAM session after sending success/failure
-            switch (response) {
-                .auth_success => |s| handler.cleanupSession(s.conn_id),
-                .auth_failure => |f| handler.cleanupSession(f.conn_id),
-                else => {},
-            }
+                // Clean up SCRAM session after sending success/failure
+                switch (response) {
+                    .auth_success => |s| handler.cleanupSession(s.conn_id),
+                    .auth_failure => |f| handler.cleanupSession(f.conn_id),
+                    else => {},
+                }
 
-            // One-shot write notification for pending data
-            if (conn.hasPendingSend()) {
-                batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
-            }
+                // One-shot write notification for pending data
+                if (conn.hasPendingSend()) {
+                    batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+                }
+            },
+            // Crypto pool answers via the completion pipe (T121).
+            .deferred, .none => {},
         }
+    }
+}
+
+/// T121: send a finished crypto job's reply to its IPC client. The slot
+/// generation both validates the client is still the connection that asked
+/// and prevents a stale reply reaching an unrelated (reused) slot.
+fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Completion, ipc_gens: []const u32, batch: *ChangeList) void {
+    var reply = handler.takeCryptoReply(c) orelse return;
+    defer reply.deinit(handler.allocator);
+
+    const slot: usize = reply.slot;
+    if (slot >= ipc_gens.len or ipc_gens[slot] != reply.slot_gen) return;
+
+    const conn = ipc.getClient(slot) orelse return;
+    conn.queueSend(reply.msg) catch {
+        ipc.closeClient(slot);
+        return;
+    };
+    if (conn.hasPendingSend()) {
+        batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
     }
 }
 
@@ -416,6 +489,7 @@ fn printUsage() void {
         \\  --auth-window N            Rate window in seconds (default: 120)
         \\  --lockout-duration N       Temp lockout duration in seconds (default: 300)
         \\  --lockout-threshold N      Consecutive failures before lockout (default: 10)
+        \\  --no-rate-limit            Disable auth rate limiting entirely (testing/benchmarks only)
         \\  --enable-registration      Enable in-band registration (XEP-0077)
         \\  --no-require-invite        Allow registration without invitation code
         \\  --help, -h                 Show this help

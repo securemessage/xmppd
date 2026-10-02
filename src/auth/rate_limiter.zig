@@ -17,7 +17,10 @@ const std = @import("std");
 const log = std.log.scoped(.rate_limiter);
 
 /// Number of recent attempt timestamps to track per entry.
-const RING_SIZE = 8;
+/// Upper bound on the effective per-window max: isRateLimited can never
+/// count more than RING_SIZE attempts, so policies above this are inert.
+/// 32 covers the default max_per_ip (20) with headroom.
+const RING_SIZE = 32;
 
 /// Rate table size (power of 2, open addressing).
 const TABLE_SIZE = 4096;

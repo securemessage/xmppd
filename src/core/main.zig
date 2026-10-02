@@ -32,6 +32,8 @@ const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const generic_offline = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const archive_store_mod = @import("archive_store");
+const archive_queue_mod = @import("archive_queue");
+const ArchiveWriteQueue = archive_queue_mod.ArchiveWriteQueue;
 const vcard_store_mod = @import("vcard_store");
 const OpBackendMod = @import("op_backend");
 const OpBackendType = OpBackendMod.Backend;
@@ -76,6 +78,8 @@ pub fn main() !void {
     var listen_fd_str: ?[]const u8 = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
     var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
+    // 0 = SessionMap default (256). T198/Sonya: raise for many-resources-per-account deployments.
+    var max_resources_per_account: usize = 0;
     var oidc_import_avatar: bool = false;
 
     // Skip argv[0]
@@ -204,6 +208,9 @@ pub fn main() !void {
         if (c.get("core", "fan_out_batch_size")) |v| {
             fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("fanout.zig").DEFAULT_BATCH_SIZE;
         }
+        if (c.get("core", "max_resources_per_account")) |v| {
+            max_resources_per_account = std.fmt.parseInt(usize, v, 10) catch 0;
+        }
 
         // [oidc] section (core-side options)
         if (c.get("oidc", "import_avatar")) |v| {
@@ -280,6 +287,39 @@ pub fn main() !void {
     }
     defer if (archive_backend) |*b| b.close();
 
+    // T87: single archive writer thread — workers enqueue, it alone calls
+    // store(). Compaction stalls no longer freeze an event loop.
+    var archive_queue: ?ArchiveWriteQueue = null;
+    var archive_writer_thread: ?std.Thread = null;
+    if (archive_store != null) {
+        archive_queue = ArchiveWriteQueue.init() catch |err| blk: {
+            log.err("archive write queue init failed: {} — archiving stays inline", .{err});
+            break :blk null;
+        };
+        if (archive_queue) |*q| {
+            archive_writer_thread = std.Thread.spawn(.{}, archiveWriterMain, .{ q, &archive_store.? }) catch |err| blk: {
+                log.err("archive writer thread spawn failed: {} — archiving stays inline", .{err});
+                q.deinit();
+                archive_queue = null;
+                break :blk null;
+            };
+            if (archive_writer_thread != null) {
+                log.info("archive writer thread started (queue cap {d}, batch {d})", .{ ArchiveWriteQueue.MAX_JOBS, ARCHIVE_WRITER_BATCH });
+            }
+        }
+    }
+    // Runs before the backend close deferred above (LIFO): stop, join, free.
+    defer {
+        if (archive_queue) |*q| {
+            if (archive_writer_thread) |t| {
+                q.stopping.store(true, .release);
+                _ = std.posix.write(q.pipe_wr, "\x00") catch {};
+                t.join();
+            }
+            q.deinit();
+        }
+    }
+
     // MUC host resolution — each worker creates its own RoomRegistry in configureServer
     var muc_host_buf: [256]u8 = undefined;
     const effective_muc_host: ?[]const u8 = if (muc_host_arg) |h| h else blk: {
@@ -288,7 +328,7 @@ pub fn main() !void {
     };
 
     // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
-    var session_map = SessionMap.init(allocator, worker_count > 1);
+    var session_map = SessionMap.init(allocator, worker_count > 1, max_resources_per_account);
     defer session_map.deinit();
     log.info("session map allocated (multi_worker={s})", .{if (worker_count > 1) "true" else "false"});
 
@@ -316,6 +356,7 @@ pub fn main() !void {
         .roster = if (roster_store != null) &roster_store.? else null,
         .offline = if (offline_store != null) &offline_store.? else null,
         .archive = if (archive_store != null) &archive_store.? else null,
+        .archive_queue = if (archive_queue != null) &archive_queue.? else null,
         .vcard = if (vcard_store != null) &vcard_store.? else null,
         .muc_enabled = (effective_muc_host != null),
         .room_store = if (rs != null) &rs.? else null,
@@ -417,6 +458,7 @@ const WorkerCtx = struct {
     roster: ?*GenericRosterStore,
     offline: ?*GenericOfflineStore(OpBackendType),
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType),
+    archive_queue: ?*ArchiveWriteQueue,
     vcard: ?*GenericVCardStore,
     muc_enabled: bool,
     room_store: ?*GenericRoomStore,
@@ -435,6 +477,16 @@ const WorkerArgs = struct {
     worker_id: usize,
     ctx: *WorkerCtx,
 };
+
+/// T87 writer-thread batch size per drain iteration.
+const ARCHIVE_WRITER_BATCH: usize = 128;
+
+/// T87: archive writer thread — drains the shared queue into the store.
+fn archiveWriterMain(queue: *ArchiveWriteQueue, store: *archive_store_mod.ArchiveStore(ArchiveBackendType)) void {
+    log.info("archive writer thread starting", .{});
+    queue.writerLoop(store, ARCHIVE_WRITER_BATCH);
+    log.info("archive writer thread exiting", .{});
+}
 
 /// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and session map.
 fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
@@ -474,6 +526,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
     if (ctx.offline != null and ctx.archive != null) {
         server.configureOffline(ctx.offline.?, ctx.archive.?);
     }
+    if (ctx.archive_queue) |q| server.configureArchiveWriter(q);
 
     if (ctx.block_store) |bs| server.configureBlockStore(bs);
     if (ctx.pep_store) |ps| server.configurePepStore(ps);

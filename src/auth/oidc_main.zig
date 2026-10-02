@@ -143,7 +143,12 @@ pub fn main() !void {
 
     // Initialize auth handler (generic over OidcStore)
     var handler = AuthHandler.init(allocator, &oidc_store);
-    handler.setRateLimiter(&rate_limiter);
+    const rate_limit_disabled = if (cfg.get("oidc", "rate_limit")) |v| std.mem.eql(u8, v, "false") else false;
+    if (!rate_limit_disabled) {
+        handler.setRateLimiter(&rate_limiter);
+    } else {
+        log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
+    }
     defer handler.deinit();
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
@@ -247,30 +252,35 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
 
         if (msg == null) break;
 
-        if (handler.handleMessage(msg.?)) |response| {
-            conn.queueSend(response) catch {
-                ipc.closeClient(slot);
-                return;
-            };
-
-            // Clean up session after sending success/failure
-            switch (response) {
-                .auth_success => |s| handler.cleanupSession(s.conn_id),
-                .auth_failure => |f| handler.cleanupSession(f.conn_id),
-                else => {},
-            }
-
-            // Flush IPC response immediately — deferred addWriteOnce was
-            // causing auth responses to be permanently stuck in send buffer.
-            if (conn.hasPendingSend()) {
-                _ = conn.flush() catch {
+        // The OIDC daemon never attaches a crypto pool (T121); .deferred
+        // cannot occur here.
+        switch (handler.handleMessage(msg.?, @intCast(slot), 0)) {
+            .reply => |response| {
+                conn.queueSend(response) catch {
                     ipc.closeClient(slot);
                     return;
                 };
-                if (conn.hasPendingSend()) {
-                    batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+
+                // Clean up session after sending success/failure
+                switch (response) {
+                    .auth_success => |s| handler.cleanupSession(s.conn_id),
+                    .auth_failure => |f| handler.cleanupSession(f.conn_id),
+                    else => {},
                 }
-            }
+
+                // Flush IPC response immediately — deferred addWriteOnce was
+                // causing auth responses to be permanently stuck in send buffer.
+                if (conn.hasPendingSend()) {
+                    _ = conn.flush() catch {
+                        ipc.closeClient(slot);
+                        return;
+                    };
+                    if (conn.hasPendingSend()) {
+                        batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
+                    }
+                }
+            },
+            .deferred, .none => {},
         }
     }
 }
