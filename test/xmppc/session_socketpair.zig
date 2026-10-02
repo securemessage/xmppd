@@ -23,6 +23,7 @@ const ssl_mod = @import("ssl");
 const posix = std.posix;
 const Engine = xmppc.Engine;
 const Session = xmppc.Session;
+const Handle = xmppc.Handle;
 
 // ---------------------------------------------------------------------------
 // In-test self-signed cert (CN=localhost, generated for this suite only; the
@@ -103,9 +104,9 @@ var cur_mutex: std.Thread.Mutex = .{};
 var cur_cond: std.Thread.Condition = .{};
 var cur_outcome: Outcome = .{};
 
-fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
+fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
     _ = engine;
-    _ = index;
+    _ = handle;
     const jid_str: []const u8 = if (session.boundJid()) |j|
         std.fmt.allocPrint(std.heap.page_allocator, "{s}@{s}/{s}", .{ j.local, j.domain, j.resource }) catch ""
     else
@@ -122,9 +123,9 @@ fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
     cur_cond.signal();
 }
 
-fn onClosed(engine: *Engine, index: usize, session: *Session, reason: []const u8) void {
+fn onClosed(engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void {
     _ = engine;
-    _ = index;
+    _ = handle;
     _ = session;
     const dup = std.heap.page_allocator.dupe(u8, reason) catch "";
     cur_mutex.lock();
@@ -227,7 +228,7 @@ const Rig = struct {
     }
 };
 
-fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *Engine } {
+fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *Engine, handle: Handle } {
     cur_mutex.lock();
     cur_outcome = .{};
     cur_mutex.unlock();
@@ -253,7 +254,7 @@ fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *E
     }
 
     try engine.run();
-    return .{ .rig = .{ .fake_fd = fds[1] }, .engine = engine };
+    return .{ .rig = .{ .fake_fd = fds[1] }, .engine = engine, .handle = idx };
 }
 
 fn teardown(alloc: std.mem.Allocator, rig: *Rig, engine: *Engine) void {
@@ -409,7 +410,7 @@ test "socketpair: partial writes under a tiny send buffer all arrive" {
     try std.testing.expect(out.established);
 
     const engine = ctx.engine;
-    if (engine.sessionAt(0)) |s| {
+    if (engine.sessionAt(ctx.handle)) |s| {
         // Tiny sndbuf on the paired fd.
         const small: c_int = 1024;
         try posix.setsockopt(s.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small));

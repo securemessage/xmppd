@@ -23,6 +23,7 @@ const std = @import("std");
 const xmppc = @import("xmppc");
 const Engine = xmppc.Engine;
 const Session = xmppc.Session;
+const Handle = xmppc.Handle;
 const Mutex = std.Thread.Mutex;
 const Condition = std.Thread.Condition;
 
@@ -160,9 +161,9 @@ var g = struct {
 }{};
 
 // --- engine-thread callbacks ---
-fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
+fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
     _ = engine;
-    _ = index;
+    _ = handle;
     const jid_str: []const u8 = if (session.boundJid()) |j| blk: {
         break :blk std.fmt.allocPrint(std.heap.page_allocator, "{s}@{s}/{s}", .{ j.local, j.domain, j.resource }) catch "";
     } else "";
@@ -186,8 +187,8 @@ fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
     g.cond.signal();
 }
 
-fn onClosed(engine: *Engine, index: usize, session: *Session, reason: []const u8) void {
-    _ = index;
+fn onClosed(engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void {
+    _ = handle;
     _ = session;
     g.lock.lock();
     const already = g.outcome.established;
@@ -228,7 +229,7 @@ pub fn main() !void {
 
     // Register N sessions (one per client). N>1 gets per-session resources so
     // the rig sees N distinct bind results on one loop.
-    var idxs = std.ArrayList(usize){};
+    var idxs = std.ArrayList(Handle){};
     defer idxs.deinit(std.heap.page_allocator);
     for (0..o.count) |i| {
         const res: []const u8 = if (o.count == 1) o.resource else blk: {

@@ -47,6 +47,7 @@ pub const SaslClient = sasl.SaslClient;
 pub const Engine = engine.Engine;
 pub const Session = session.Session;
 pub const Transport = transport.Transport;
+pub const Handle = engine.Handle;
 
 test {
     _ = stream;

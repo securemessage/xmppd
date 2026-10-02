@@ -1,13 +1,28 @@
 //! # xmppc Engine — ONE kqueue loop driving N client sessions
 //!
-//! Owns the kqueue, the session table, the cross-thread wake pipe, and the
+//! Owns the kqueue, the session slot map, the cross-thread wake pipe, and the
 //! connect/registration helpers. Session lifecycle and protocol handling
-//! live in session.zig; parser/ stream state in parser.zig / stream.zig.
+//! live in session.zig; protocol parsing in parser.zig; the stream FSM in
+//! stream.zig; I/O in transport.zig.
+//!
+//! ## Slot map (T-80EFEC29)
+//! Sessions live in stable slots behind generational `Handle`s — the public
+//! session id and the kqueue `udata`. A freed slot bumps its generation, so
+//! a stale event or a stale handle is dropped by a cheap check; removal
+//! never moves a live session, never invalidates a `*Session` handed to a
+//! callback, and never touches kqueue.
+//!
+//! ## Changelist (T-65F61479)
+//! kqueue registrations are STAGED into a buffer and applied by the ONE
+//! `kevent()` wait per loop iteration (project kqueue rule: never a kevent
+//! call without an eventlist). The wake pipe's one-time registration is the
+//! single deliberate exception (created lazily on first use).
 
 const std = @import("std");
 const ssl = @import("ssl");
 
 const Session = @import("session.zig").Session;
+const Transport = @import("transport.zig").Transport;
 
 const Kevent = std.posix.Kevent;
 const posix = std.posix;
@@ -15,6 +30,23 @@ const posix = std.posix;
 fn kev(ident: usize, filter: i16, flags: u16, udata: usize) Kevent {
     return .{ .ident = ident, .filter = filter, .flags = flags, .fflags = 0, .data = 0, .udata = udata };
 }
+
+/// A generationally-tagged session slot. Stale handles fail `Engine.get`
+/// and late kqueue events fail the same check — the slot was reused.
+pub const Handle = packed struct {
+    index: u32,
+    generation: u32,
+
+    pub fn encode(h: Handle) usize {
+        return @intCast(@as(u64, @bitCast(h)));
+    }
+    pub fn decode(v: usize) Handle {
+        return @bitCast(@as(u64, v));
+    }
+};
+
+/// One kqueue registration change, staged until the waiting kevent() call.
+const Change = Kevent;
 
 /// Synchronous hostname resolution (the one blocking call in the client).
 fn resolveHost(host: []const u8) !std.c.sockaddr.in {
@@ -41,20 +73,35 @@ fn resolveHost(host: []const u8) !std.c.sockaddr.in {
 // ============================================================================
 
 pub const Engine = struct {
+    const WAKE_UDATA: usize = std.math.maxInt(usize);
+    const Slot = struct {
+        session: Session,
+        generation: u32,
+        live: bool,
+    };
+
     kq: posix.fd_t,
     allocator: std.mem.Allocator,
-    sessions: std.ArrayList(Session),
+    slots: std.ArrayListUnmanaged(Slot),
+    free_slots: std.ArrayListUnmanaged(u32),
+    live_count: usize = 0,
+
     tls_ctx: ?ssl.SslContext = null,
     thread: ?std.Thread = null,
     // Self-pipe for cross-thread wake-up (N-worker shutdown / stopSession
     // from a foreign thread). EVFILT_SIGNAL is unreliable across threads;
     // a real kqueue event on the pipe read-end is not.
     wake_pipe: [2]posix.fd_t = .{ -1, -1 },
-    const WAKE_UDATA: usize = std.math.maxInt(usize);
+
+    /// Staged kqueue registration changes, folded into the next waiting
+    /// kevent() call. Mutex-guarded: attachFromThreadFd callers may stage
+    /// from foreign threads.
+    changes: std.ArrayListUnmanaged(Change) = .{},
+    changes_lock: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
-        return .{ .kq = kq, .allocator = allocator, .sessions = .{} };
+        return .{ .kq = kq, .allocator = allocator, .slots = .{}, .free_slots = .{} };
     }
 
     pub fn deinit(self: *Engine) void {
@@ -63,8 +110,9 @@ pub const Engine = struct {
             self.thread = null;
         }
         self.stopAll();
-        self.sessions.deinit(self.allocator);
-        self.sessions = .{};
+        self.slots.deinit(self.allocator);
+        self.free_slots.deinit(self.allocator);
+        self.changes.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
         if (self.wake_pipe[0] >= 0) posix.close(self.wake_pipe[0]);
         if (self.wake_pipe[1] >= 0) posix.close(self.wake_pipe[1]);
@@ -85,8 +133,11 @@ pub const Engine = struct {
     }
 
     pub fn stopAll(self: *Engine) void {
-        for (self.sessions.items) |*s| s.destroy(self.allocator);
-        self.sessions.items.len = 0;
+        for (self.slots.items) |*slot| {
+            if (slot.live) slot.session.destroy(self.allocator);
+            slot.live = false;
+        }
+        self.live_count = 0;
     }
 
     /// Install a client TLS context (DANE-first: PKIX verify disabled, so
@@ -104,30 +155,31 @@ pub const Engine = struct {
     }
 
     pub fn sessionCount(self: *const Engine) usize {
-        return self.sessions.items.len;
+        return self.live_count;
     }
-    /// Access a live session by its engine index (from startSession).
-    /// Returns null once the session is dead/reaped.
-    pub fn sessionAt(self: *Engine, idx: usize) ?*Session {
-        if (idx >= self.sessions.items.len) return null;
-        const s = &self.sessions.items[idx];
-        if (!s.alive) return null;
-        return s;
+
+    /// Access a live session by its handle (from startSession/attachFd).
+    /// Returns null for dead/reaped sessions and for stale handles.
+    pub fn sessionAt(self: *Engine, h: Handle) ?*Session {
+        if (h.index >= self.slots.items.len) return null;
+        const slot = &self.slots.items[@intCast(h.index)];
+        if (!slot.live or slot.generation != h.generation) return null;
+        if (!slot.session.alive) return null;
+        return &slot.session;
     }
+
     /// Mark a session dead and wake the loop to reap it. Safe from any thread:
-    /// fail() is idempotent and reapDead() runs on the engine thread.
-    pub fn stopSession(self: *Engine, idx: usize, reason: []const u8) void {
-        if (idx < self.sessions.items.len) {
-            self.sessions.items[idx].fail(self.allocator, reason);
-        }
+    /// fail() is idempotent and the reap runs on the engine thread.
+    pub fn stopSession(self: *Engine, h: Handle, reason: []const u8) void {
+        if (self.sessionAt(h)) |s| s.fail(self.allocator, reason);
         self.requestWake();
     }
 
     /// Begin a client session toward host:port. `domain` is the stream's
     /// `to=` JID domain (RFC 6120 §4.2) — distinct from the TCP connect
     /// target `host` (e.g. host "127.0.0.1" but domain "localhost"). Returns
-    /// the session index.
-    pub fn startSession(self: *Engine, host: []const u8, port: u16, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !usize {
+    /// the session handle.
+    pub fn startSession(self: *Engine, host: []const u8, port: u16, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
         s.host = host;
@@ -162,7 +214,7 @@ pub const Engine = struct {
     /// the plaintext cases). The fd must be non-blocking and connected (or a
     /// socketpair/stream fd); the session then runs the same post-connect
     /// path as startSession (stream open on first writability).
-    pub fn attachFd(self: *Engine, fd: posix.fd_t, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !usize {
+    pub fn attachFd(self: *Engine, fd: posix.fd_t, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
         s.host = "";
@@ -174,21 +226,44 @@ pub const Engine = struct {
         return self.attachPrepared(&s, fd);
     }
 
-    fn attachPrepared(self: *Engine, s: *Session, fd: posix.fd_t) !usize {
+    fn attachPrepared(self: *Engine, s: *Session, fd: posix.fd_t) !Handle {
         s.fd = fd;
-        s.tport = @import("transport.zig").Transport.initPlain(fd);
+        s.tport = Transport.initPlain(fd);
         s.phase = .connecting;
 
-        const idx = self.sessions.items.len;
-        self.sessions.append(self.allocator, s.*) catch {
-            posix.close(fd);
-            s.destroy(self.allocator);
-            return error.OutOfMemory;
-        };
-        self.sessions.items[idx].engine_index = idx;
-        self.addRead(fd, idx);
-        self.addWrite(fd, idx);
-        return idx;
+        const h = try self.allocSlot();
+        const slot = &self.slots.items[@intCast(h.index)];
+        slot.session = s.*;
+        slot.session.handle = h;
+        slot.live = true;
+        // Both filters are registered below — keep the session's bookkeeping
+        // in step (disarm/arm are idempotent guards).
+        slot.session.write_registered = true;
+        slot.session.read_registered = true;
+        self.live_count += 1;
+        self.addRead(fd, h);
+        self.addWrite(fd, h);
+        return h;
+    }
+
+    fn allocSlot(self: *Engine) !Handle {
+        if (self.free_slots.items.len > 0) {
+            const idx = self.free_slots.items[self.free_slots.items.len - 1];
+            self.free_slots.items.len -= 1;
+            const slot = &self.slots.items[@intCast(idx)];
+            return .{ .index = idx, .generation = slot.generation };
+        }
+        // Placeholder session is overwritten by the caller before use.
+        try self.slots.append(self.allocator, .{ .session = undefined, .generation = 0, .live = false });
+        return .{ .index = @intCast(self.slots.items.len - 1), .generation = 0 };
+    }
+
+    fn freeSlot(self: *Engine, h: Handle) void {
+        const slot = &self.slots.items[@intCast(h.index)];
+        slot.live = false;
+        slot.generation +%= 1;
+        self.free_slots.append(self.allocator, h.index) catch {};
+        self.live_count -= 1;
     }
 
     /// Run the kqueue loop on a dedicated thread.
@@ -199,10 +274,12 @@ pub const Engine = struct {
 
     /// Run the kqueue loop inline on the caller thread until all sessions die.
     pub fn runSync(self: *Engine) !void {
-        while (self.sessions.items.len > 0) {
+        while (self.live_count > 0) {
             self.loopOnce() catch {
                 // kevent error — fail every session and stop rather than spin.
-                for (self.sessions.items) |*s| s.fail(self.allocator, "kqueue-error");
+                for (self.slots.items) |*slot| {
+                    if (slot.live) slot.session.fail(self.allocator, "kqueue-error");
+                }
                 self.reapDead();
                 break;
             };
@@ -211,7 +288,7 @@ pub const Engine = struct {
     }
 
     fn runLoop(self: *Engine) void {
-        while (self.sessions.items.len > 0) {
+        while (self.live_count > 0) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -226,16 +303,30 @@ pub const Engine = struct {
                 _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
             }
         }
+
+        // Fold everything staged since the last iteration into THIS kevent:
+        // snapshot the buffer, then release the lock — event handlers stage
+        // new changes during dispatch (they'd otherwise self-deadlock).
         var evbuf: [64]Kevent = undefined;
-        const n = posix.kevent(self.kq, &.{}, &evbuf, null) catch |err| {
-            if (err == error.SystemResources or err == error.EventNotFound) return error.SystemResources;
+        var staged: [64]Change = undefined;
+        self.changes_lock.lock();
+        const staged_count = @min(self.changes.items.len, staged.len);
+        @memcpy(staged[0..staged_count], self.changes.items[0..staged_count]);
+        self.changes.items.len -= staged_count;
+        self.changes_lock.unlock();
+
+        const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, null) catch {
             return error.SystemResources;
         };
+        if (std.posix.getenv("XMPPC_EVTRACE") != null) {
+            std.debug.print("[engine] staged={d} returned={d}\n", .{ staged_count, n });
+            for (evbuf[0..n]) |ev| std.debug.print("  ev fd={d} filter={d} flags=0x{x} reg={} wan=\n", .{ ev.ident, ev.filter, ev.flags, ev.udata });
+        }
+
         for (evbuf[0..n]) |ev| {
-            const idx = ev.udata;
-            if (idx >= self.sessions.items.len) continue;
-            const s = &self.sessions.items[idx];
-            if (!s.alive) continue;
+            if (ev.udata == WAKE_UDATA) continue;
+            const h = Handle.decode(ev.udata);
+            const s = self.sessionAt(h) orelse continue;
             switch (ev.filter) {
                 std.c.EVFILT.READ => s.onRead(self) catch s.fail(self.allocator, "read-error"),
                 std.c.EVFILT.WRITE => s.onWritable(self) catch s.fail(self.allocator, "write-error"),
@@ -247,64 +338,46 @@ pub const Engine = struct {
             // EV_EOF — not exposed as std.c.EV.EOF for FreeBSD in this zig
             // std; the value is stable ABI.
             if (ev.flags & 0x8000 != 0) s.fail(self.allocator, "peer-closed");
-            if (ev.flags & std.c.EV.ERROR != 0) s.fail(self.allocator, "socket-error");
-        }
-    }
-
-    /// Destroy + remove dead sessions (swap-with-last). Idempotent.
-    fn reapDead(self: *Engine) void {
-        var i: usize = 0;
-        while (i < self.sessions.items.len) {
-            if (self.sessions.items[i].alive) {
-                i += 1;
-                continue;
+            if (ev.flags & std.c.EV.ERROR != 0) {
+                std.debug.print("[engine] EV_ERROR fd={d} filter={d} data={d}\n", .{ ev.ident, ev.filter, ev.data });
+                s.fail(self.allocator, "socket-error");
             }
-            self.removeSession(i);
-            // index i now holds the swapped-in session (or is past the end);
-            // re-examine it.
         }
     }
 
-    fn removeSession(self: *Engine, idx: usize) void {
-        if (idx >= self.sessions.items.len) return;
-        const n = self.sessions.items.len;
-        const dead = &self.sessions.items[idx];
-        if (dead.alive) return; // already removed / never marked dead
-        dead.destroy(self.allocator);
-        if (idx + 1 == n) {
-            _ = self.sessions.pop();
-            return;
-        }
-        self.sessions.items[idx] = self.sessions.items[n - 1];
-        _ = self.sessions.pop();
-        const moved = &self.sessions.items[idx];
-        moved.engine_index = idx;
-        if (moved.alive and moved.fd >= 0) {
-            self.addRead(moved.fd, idx);
-            if (moved.write_len > 0) self.addWrite(moved.fd, idx);
+    /// Destroy + release dead sessions. Slots stay; generations advance.
+    fn reapDead(self: *Engine) void {
+        for (self.slots.items, 0..) |*slot, i| {
+            if (!slot.live) continue;
+            if (slot.session.alive) continue;
+            slot.session.destroy(self.allocator);
+            self.freeSlot(.{ .index = @intCast(i), .generation = slot.generation });
         }
     }
 
-    // --- kqueue changelist helpers (single-event submit) ---
+    // --- kqueue helpers: stage registration changes (applied at the wait) ---
 
-    pub fn addRead(self: *Engine, fd: posix.fd_t, idx: usize) void {
-        self.submit(kev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, idx));
+    pub fn addRead(self: *Engine, fd: posix.fd_t, h: Handle) void {
+        self.stage(kev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, h.encode()));
     }
-    pub fn addWrite(self: *Engine, fd: posix.fd_t, idx: usize) void {
-        self.submit(kev(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, idx));
+    pub fn addWrite(self: *Engine, fd: posix.fd_t, h: Handle) void {
+        self.stage(kev(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, h.encode()));
     }
     pub fn removeRead(self: *Engine, fd: posix.fd_t) void {
-        self.submit(kev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DELETE, 0));
+        self.stage(kev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DELETE, 0));
     }
     pub fn removeWrite(self: *Engine, fd: posix.fd_t) void {
-        self.submit(kev(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
+        self.stage(kev(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
     }
-    // TODO(phase 2): stage changes in a changelist buffer and fold them into
-    // the ONE kevent() wait call (project kqueue rule) instead of one
-    // kevent() per registration. Fine at smoke scale; required before the
-    // T32 load driver.
-    fn submit(self: *Engine, ev: Kevent) void {
-        var one = [_]Kevent{ev};
-        _ = posix.kevent(self.kq, &one, &.{}, null) catch {};
+
+    /// Stage a registration change for the next loop iteration's kevent(),
+    /// then wake the loop: a kevent() blocked on a drained changelist would
+    /// otherwise not apply the registration until an unrelated fd event.
+    /// Never calls kevent for registration alone (project kqueue rule).
+    fn stage(self: *Engine, ev: Change) void {
+        self.changes_lock.lock();
+        defer self.changes_lock.unlock();
+        self.changes.append(self.allocator, ev) catch {};
+        self.requestWake();
     }
 };

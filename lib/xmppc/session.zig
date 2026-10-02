@@ -27,6 +27,7 @@ const stream = @import("stream.zig");
 const saslmod = @import("sasl.zig");
 
 const Engine = @import("engine.zig").Engine;
+const Handle = @import("engine.zig").Handle;
 const Parser = @import("parser.zig").Parser;
 const Transport = @import("transport.zig").Transport;
 
@@ -50,12 +51,16 @@ fn b64enc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 pub const Session = struct {
     const Phase = enum {
         connecting,
+        /// TCP up + stream open written; FSM-driven establishment pending.
+        connected,
+        /// Full protocol establishment (bind + SM).
         established,
         dead,
     };
 
     engine: *Engine,
-    engine_index: usize = 0,
+    /// This session's slot handle on the engine (public id + kqueue udata).
+    handle: Handle = .{ .index = 0, .generation = 0 },
     alive: bool = true,
     /// Freed exactly once (destroy idempotence). Separate from `alive`:
     /// fail() only marks dead; destroy still has resources to free.
@@ -92,6 +97,9 @@ pub const Session = struct {
     read_len: usize = 0,
     write_buf: []u8,
     write_len: usize = 0,
+    /// Registration bookkeeping: stage writes only on transitions so that a
+    /// duplicate EV_DELETE can't surface as a changelist EV_ERROR (ENOENT).
+    read_registered: bool = false,
     write_registered: bool = false,
     /// Bytes queued while write_buf is pinned by a pending TLS write and
     /// full, in order; moved into write_buf once the pending write completes.
@@ -105,9 +113,9 @@ pub const Session = struct {
     sm_resumed: bool = false,
 
     /// Fired on the engine thread once the stream is active.
-    on_established: ?*const fn (engine: *Engine, index: usize, session: *Session) void = null,
+    on_established: ?*const fn (engine: *Engine, handle: Handle, session: *Session) void = null,
     /// Fired on the engine thread when the stream dies.
-    on_closed: ?*const fn (engine: *Engine, index: usize, session: *Session, reason: []const u8) void = null,
+    on_closed: ?*const fn (engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void = null,
 
     pub fn init(allocator: std.mem.Allocator) !Session {
         const parser = try allocator.create(Parser);
@@ -157,14 +165,14 @@ pub const Session = struct {
         @memcpy(self.fail_reason_buf[0..n], reason[0..n]);
         self.fail_reason_len = n;
         const owned = self.fail_reason_buf[0..n];
-        if (self.on_closed) |cb| cb(self.engine, self.engine_index, self, owned);
+        if (self.on_closed) |cb| cb(self.engine, self.handle, self, owned);
         // The engine's reapDead() destroys + removes this slot.
     }
 
     /// Install the established/closed callbacks. Must be called on the engine
     /// thread (or before runSync) after startSession, before the stream
     /// completes; the engine hands out sessions by index.
-    pub fn setCallbacks(self: *Session, est: ?*const fn (*Engine, usize, *Session) void, closed: ?*const fn (*Engine, usize, *Session, []const u8) void) void {
+    pub fn setCallbacks(self: *Session, est: ?*const fn (*Engine, Handle, *Session) void, closed: ?*const fn (*Engine, Handle, *Session, []const u8) void) void {
         self.on_established = est;
         self.on_closed = closed;
     }
@@ -208,8 +216,7 @@ pub const Session = struct {
             switch (res) {
                 .complete => {
                     self.tls_handshake = false;
-                    engine.removeWrite(self.fd);
-                    self.write_registered = false;
+                    self.disarmWrite(engine);
                     // Guardrail rule 3: right after the handshake, check and
                     // log kernel-TLS offload per direction — fallback to
                     // userland crypto is silent, so this is the only way to
@@ -229,14 +236,16 @@ pub const Session = struct {
                     return;
                 },
                 .want_write => {
-                    if (!self.write_registered) {
-                        engine.addWrite(self.fd, self.engine_index);
-                        self.write_registered = true;
-                    }
+                    self.armWrite(engine);
                     return;
                 },
             }
         }
+
+        // Not connected yet — the (batch-parallel) connect-writable event
+        // hasn't run. Leave bytes unread; the fd stays readable and we'll
+        // be back. Reading now would feed server bytes to an idle FSM.
+        if (self.phase == .connecting) return;
 
         while (true) {
             if (self.read_len >= self.read_buf.len) {
@@ -272,6 +281,17 @@ pub const Session = struct {
             if (tp.tlsConn()) |tc| return .{ .send = tc.ktlsSend(), .recv = tc.ktlsRecv() };
         }
         return .{ .send = false, .recv = false };
+    }
+
+    fn armWrite(self: *Session, engine: *Engine) void {
+        if (self.write_registered) return;
+        engine.addWrite(self.fd, self.handle);
+        self.write_registered = true;
+    }
+    fn disarmWrite(self: *Session, engine: *Engine) void {
+        if (!self.write_registered) return;
+        engine.removeWrite(self.fd);
+        self.write_registered = false;
     }
 
     /// Returns 0 only when the peer is drained for now (would_block).
@@ -317,6 +337,8 @@ pub const Session = struct {
     }
 
     fn handleServerEvent(self: *Session, engine: *Engine, ev: stream.ServerEvent) void {
+        if (std.posix.getenv("XMPPC_EVTRACE") != null)
+            std.debug.print("[fsm {s} ev={s}]\n", .{ @tagName(self.fsm.state), @tagName(ev) });
         if (ev == .sasl_success) {
             if (self.sasl) |sc| {
                 sc.verifyServerFinal(ev.sasl_success) catch {
@@ -347,12 +369,15 @@ pub const Session = struct {
                 self.fail(engine.allocator, "connect-failed");
                 return;
             }
-            // TCP up — open the stream. The connect-writable is consumed; write
-            // interest is re-armed by flushWrites only if bytes are pending.
+            // TCP up — open the stream and leave the connecting phase so a
+            // later write event goes to flushWrites, not back through here
+            // (the old code left phase stuck until .established, which
+            // re-ran this branch and staged duplicate EV_DELETEs — with a
+            // changelist those surface as spurious EV_ERROR events).
+            self.phase = .connected;
             const action = self.fsm.openStream();
             self.handleAction(engine, action);
-            engine.removeWrite(self.fd);
-            self.write_registered = self.write_len > 0;
+            self.disarmWrite(engine);
             return;
         }
         self.flushWrites(engine);
@@ -388,6 +413,7 @@ pub const Session = struct {
     }
 
     fn flushWrites(self: *Session, engine: *Engine) void {
+        const trace = std.posix.getenv("XMPPC_EVTRACE") != null;
         while (self.write_len > 0) {
             // sendSome returns 0 only for would-block / TLS WANT_*; any error
             // is fatal (a swallowed TLS write error would stall the session).
@@ -395,16 +421,18 @@ pub const Session = struct {
                 self.fail(self.engine.allocator, "write-error");
                 return;
             };
-            if (n == 0) return;
+            if (n == 0) {
+                // Stalled on a full send buffer — WRITE interest must be armed.
+                self.armWrite(engine);
+                return;
+            }
+            if (trace) std.debug.print("[flush wrote {d}, left {d}]\n", .{ n, self.write_len - n });
             self.consumeWritten(n) catch {
                 self.fail(self.engine.allocator, "queue-error");
                 return;
             };
         }
-        if (self.write_registered) {
-            engine.removeWrite(self.fd);
-            self.write_registered = false;
-        }
+        self.disarmWrite(engine);
     }
 
     /// Drop `n` written bytes; the pending TLS retry (if any) is credited,
@@ -549,7 +577,7 @@ pub const Session = struct {
                 self.sm_resumed = self.fsm.sm_resumed;
                 self.sm_id = self.fsm.sm_id;
                 self.bound_jid = self.fsm.bound_jid;
-                if (self.on_established) |cb| cb(engine, self.engine_index, self);
+                if (self.on_established) |cb| cb(engine, self.handle, self);
             },
             .close => {
                 // Prefer the protocol reason the FSM already recorded
@@ -574,10 +602,7 @@ pub const Session = struct {
     /// After queueing bytes: flush now, and re-arm write interest if pending.
     fn writeAfter(self: *Session, engine: *Engine) void {
         self.flushWrites(engine);
-        if (self.write_len > 0 and !self.write_registered) {
-            engine.addWrite(self.fd, self.engine_index);
-            self.write_registered = true;
-        }
+        if (self.write_len > 0) self.armWrite(engine);
     }
 };
 // ============================================================================
