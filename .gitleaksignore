@@ -1,0 +1,5 @@
+# Allowlisted gitleaks findings. Each line: <commit>:<path>:<rule>:<line>.
+# 9cccba7: throwaway self-signed keypair used by the in-test PKI of the
+# xmppc socketpair harness (test/xmppc/session_socketpair.zig) — generated
+# strictly for tests, no deployment material.
+9cccba7fef9c736921cfa6078e83fce199906c66:test/xmppc/session_socketpair.zig:private-key:57
