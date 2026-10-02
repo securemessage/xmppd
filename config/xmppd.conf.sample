@@ -74,10 +74,14 @@ socket = /var/run/xmppd/auth.sock
 # rate_limit = true
 
 # Rate limiting: max authentication attempts per account per window
-# max_per_account = 5
+# (relaxed for agent fleets in v0.9.0; the consecutive-failure lockout below
+# remains the brute-force control)
+# max_per_account = 60
 
 # Rate limiting: max authentication attempts per IP per window
-# max_per_ip = 20
+# (covers agent fleets and NAT-shared egress; keep below the internal
+# per-key ring size of 256 or the limit goes inert)
+# max_per_ip = 200
 
 # Rate window in seconds (default: 120)
 # window_seconds = 120

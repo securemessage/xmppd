@@ -19,8 +19,8 @@ const log = std.log.scoped(.rate_limiter);
 /// Number of recent attempt timestamps to track per entry.
 /// Upper bound on the effective per-window max: isRateLimited can never
 /// count more than RING_SIZE attempts, so policies above this are inert.
-/// 32 covers the default max_per_ip (20) with headroom.
-const RING_SIZE = 32;
+/// 256 covers the default max_per_ip (200) with headroom.
+const RING_SIZE = 256;
 
 /// Rate table size (power of 2, open addressing).
 const TABLE_SIZE = 4096;
@@ -45,12 +45,15 @@ const RateEntry = struct {
     }
 };
 
-/// Rate limiting policy (configurable via CLI flags).
+/// Rate limiting policy (configurable via CLI flags / [auth] config).
 pub const RatePolicy = struct {
-    /// Max attempts per account within the window.
-    max_per_account: u32 = 5,
-    /// Max attempts per IP within the window.
-    max_per_ip: u32 = 20,
+    /// Max attempts per account within the window. Relaxed for v0.9.0
+    /// (T196): bots/agents reconnect legitimately; successive-failure
+    /// lockout remains the brute-force control.
+    max_per_account: u32 = 60,
+    /// Max attempts per IP within the window. Covers agent fleets and
+    /// NAT-shared egress; must stay below RING_SIZE to remain effective.
+    max_per_ip: u32 = 200,
     /// Window size in seconds.
     window_seconds: u32 = 120,
     /// Temporary lockout duration in seconds.
@@ -60,13 +63,26 @@ pub const RatePolicy = struct {
 };
 
 /// Rate limiter with two tables: per-account and per-IP.
+/// Tables are heap-allocated (T196): at ring 256 the pair is ~8 MB, past
+/// the default 8 MiB stack the test runner and daemon mains run on.
 pub const RateLimiter = struct {
-    account_table: [TABLE_SIZE]RateEntry = [_]RateEntry{.{}} ** TABLE_SIZE,
-    ip_table: [TABLE_SIZE]RateEntry = [_]RateEntry{.{}} ** TABLE_SIZE,
+    account_table: []RateEntry,
+    ip_table: []RateEntry,
     policy: RatePolicy,
+    allocator: std.mem.Allocator,
 
-    pub fn init(policy: RatePolicy) RateLimiter {
-        return .{ .policy = policy };
+    pub fn init(allocator: std.mem.Allocator, policy: RatePolicy) !RateLimiter {
+        const account = try allocator.alloc(RateEntry, TABLE_SIZE);
+        errdefer allocator.free(account);
+        const ip = try allocator.alloc(RateEntry, TABLE_SIZE);
+        @memset(account, .{});
+        @memset(ip, .{});
+        return .{ .account_table = account, .ip_table = ip, .policy = policy, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *RateLimiter) void {
+        self.allocator.free(self.account_table);
+        self.allocator.free(self.ip_table);
     }
 
     /// Check if an authentication attempt should be allowed.
@@ -76,7 +92,7 @@ pub const RateLimiter = struct {
 
         // Check per-IP rate first (broadest protection)
         if (client_ip.len > 0) {
-            if (self.isRateLimited(&self.ip_table, client_ip, self.policy.max_per_ip, now)) {
+            if (self.isRateLimited(self.ip_table, client_ip, self.policy.max_per_ip, now)) {
                 log.info("rate limited by IP: {s}", .{client_ip});
                 return "policy-violation";
             }
@@ -84,7 +100,7 @@ pub const RateLimiter = struct {
 
         // Check per-account temporary lockout
         if (username.len > 0) {
-            const account_entry = self.findEntry(&self.account_table, username);
+            const account_entry = self.findEntry(self.account_table, username);
             if (account_entry) |entry| {
                 if (entry.locked_until > 0 and now < entry.locked_until) {
                     log.info("account temporarily locked: {s} (until {d})", .{ username, entry.locked_until });
@@ -93,7 +109,7 @@ pub const RateLimiter = struct {
             }
 
             // Check per-account rate
-            if (self.isRateLimited(&self.account_table, username, self.policy.max_per_account, now)) {
+            if (self.isRateLimited(self.account_table, username, self.policy.max_per_account, now)) {
                 log.info("rate limited by account: {s}", .{username});
                 return "policy-violation";
             }
@@ -107,10 +123,10 @@ pub const RateLimiter = struct {
         const now = currentEpoch();
 
         if (client_ip.len > 0) {
-            self.addAttempt(&self.ip_table, client_ip, now);
+            self.addAttempt(self.ip_table, client_ip, now);
         }
         if (username.len > 0) {
-            self.addAttempt(&self.account_table, username, now);
+            self.addAttempt(self.account_table, username, now);
         }
     }
 
@@ -120,13 +136,13 @@ pub const RateLimiter = struct {
         const now = currentEpoch();
 
         if (client_ip.len > 0) {
-            if (self.findOrCreateEntry(&self.ip_table, client_ip)) |entry| {
+            if (self.findOrCreateEntry(self.ip_table, client_ip)) |entry| {
                 entry.failures +|= 1;
             }
         }
 
         if (username.len > 0) {
-            if (self.findOrCreateEntry(&self.account_table, username)) |entry| {
+            if (self.findOrCreateEntry(self.account_table, username)) |entry| {
                 entry.failures +|= 1;
                 if (entry.failures >= self.policy.lockout_threshold) {
                     entry.locked_until = now + self.policy.lockout_duration;
@@ -139,7 +155,7 @@ pub const RateLimiter = struct {
     /// Record an authentication success. Resets the account failure counter.
     pub fn recordSuccess(self: *RateLimiter, username: []const u8) void {
         if (username.len > 0) {
-            if (self.findEntry(&self.account_table, username)) |entry| {
+            if (self.findEntry(self.account_table, username)) |entry| {
                 entry.failures = 0;
                 entry.locked_until = 0;
             }
@@ -148,7 +164,7 @@ pub const RateLimiter = struct {
 
     // --- Internal helpers ---
 
-    fn isRateLimited(self: *const RateLimiter, table: *const [TABLE_SIZE]RateEntry, key: []const u8, max: u32, now: u32) bool {
+    fn isRateLimited(self: *const RateLimiter, table: []const RateEntry, key: []const u8, max: u32, now: u32) bool {
         const entry = self.findEntryConst(table, key) orelse return false;
 
         // Count attempts within the window
@@ -160,14 +176,14 @@ pub const RateLimiter = struct {
         return count >= max;
     }
 
-    fn addAttempt(self: *RateLimiter, table: *[TABLE_SIZE]RateEntry, key: []const u8, now: u32) void {
+    fn addAttempt(self: *RateLimiter, table: []RateEntry, key: []const u8, now: u32) void {
         if (self.findOrCreateEntry(table, key)) |entry| {
             entry.attempts[entry.ring_pos] = now;
             entry.ring_pos = @intCast((@as(u16, entry.ring_pos) + 1) % RING_SIZE);
         }
     }
 
-    fn findEntry(_: *RateLimiter, table: *[TABLE_SIZE]RateEntry, key: []const u8) ?*RateEntry {
+    fn findEntry(_: *RateLimiter, table: []RateEntry, key: []const u8) ?*RateEntry {
         const hash = hashKey(key);
         var idx = @as(usize, @intCast(hash & (TABLE_SIZE - 1)));
         var probes: usize = 0;
@@ -181,7 +197,7 @@ pub const RateLimiter = struct {
         return null;
     }
 
-    fn findEntryConst(_: *const RateLimiter, table: *const [TABLE_SIZE]RateEntry, key: []const u8) ?*const RateEntry {
+    fn findEntryConst(_: *const RateLimiter, table: []const RateEntry, key: []const u8) ?*const RateEntry {
         const hash = hashKey(key);
         var idx = @as(usize, @intCast(hash & (TABLE_SIZE - 1)));
         var probes: usize = 0;
@@ -195,7 +211,7 @@ pub const RateLimiter = struct {
         return null;
     }
 
-    fn findOrCreateEntry(_: *RateLimiter, table: *[TABLE_SIZE]RateEntry, key: []const u8) ?*RateEntry {
+    fn findOrCreateEntry(_: *RateLimiter, table: []RateEntry, key: []const u8) ?*RateEntry {
         const hash = hashKey(key);
         var idx = @as(usize, @intCast(hash & (TABLE_SIZE - 1)));
         var probes: usize = 0;
@@ -239,26 +255,28 @@ pub fn testCurrentEpoch() u32 {
 // ============================================================================
 
 test "RateLimiter: allows initial attempts" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 3,
         .max_per_ip = 10,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 5,
     });
+    defer limiter.deinit();
 
     // First attempt should be allowed
     try std.testing.expect(limiter.checkAllowed("alice", "10.0.0.1") == null);
 }
 
 test "RateLimiter: blocks after max_per_account exceeded" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 3,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
     });
+    defer limiter.deinit();
 
     // Record 3 attempts (fills window)
     limiter.recordAttempt("alice", "10.0.0.1");
@@ -272,13 +290,14 @@ test "RateLimiter: blocks after max_per_account exceeded" {
 }
 
 test "RateLimiter: blocks after max_per_ip exceeded" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,
         .max_per_ip = 2,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
     });
+    defer limiter.deinit();
 
     // Record 2 attempts from same IP
     limiter.recordAttempt("user1", "10.0.0.1");
@@ -291,13 +310,14 @@ test "RateLimiter: blocks after max_per_ip exceeded" {
 }
 
 test "RateLimiter: temporary lockout after failures" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 3,
     });
+    defer limiter.deinit();
 
     // Record 3 failures
     limiter.recordFailure("alice", "10.0.0.1");
@@ -311,13 +331,14 @@ test "RateLimiter: temporary lockout after failures" {
 }
 
 test "RateLimiter: success resets failure counter" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 5,
     });
+    defer limiter.deinit();
 
     // Record some failures
     limiter.recordFailure("bob", "10.0.0.1");
@@ -333,13 +354,14 @@ test "RateLimiter: success resets failure counter" {
 }
 
 test "RateLimiter: different accounts are independent" {
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 2,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
     });
+    defer limiter.deinit();
 
     // Fill alice's window
     limiter.recordAttempt("alice", "10.0.0.1");
@@ -352,8 +374,25 @@ test "RateLimiter: different accounts are independent" {
     try std.testing.expect(limiter.checkAllowed("bob", "10.0.0.3") == null);
 }
 
+test "RateLimiter: default policy engages at its own limits" {
+    // Guards the T196 class of regression: a policy above RING_SIZE is
+    // silently inert because the observed count can never reach it.
+    var limiter = try RateLimiter.init(std.testing.allocator, .{});
+    defer limiter.deinit();
+    const policy = RatePolicy{};
+
+    var i: u32 = 0;
+    while (i < policy.max_per_ip) : (i += 1) limiter.recordAttempt("user", "10.1.2.3");
+    try std.testing.expectEqualStrings("policy-violation", limiter.checkAllowed("user", "10.1.2.3").?);
+
+    i = 0;
+    while (i < policy.max_per_account) : (i += 1) limiter.recordAttempt("user", "10.9.8.7");
+    try std.testing.expectEqualStrings("policy-violation", limiter.checkAllowed("user", "10.9.8.7").?);
+}
+
 test "RateLimiter: empty key is ignored" {
-    var limiter = RateLimiter.init(.{});
+    var limiter = try RateLimiter.init(std.testing.allocator, .{});
+    defer limiter.deinit();
 
     // Empty username or IP should not crash
     try std.testing.expect(limiter.checkAllowed("", "") == null);

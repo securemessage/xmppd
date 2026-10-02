@@ -149,29 +149,33 @@ pub fn main() !void {
         if (std.mem.eql(u8, socket_path, "/var/run/xmppd/auth.sock")) {
             if (c.get("auth", "socket")) |v| socket_path = v;
         }
-        if (rate_policy.max_per_account == 5) {
+        // CLI args outrank config; config applies only at the untouched
+        // default. Compare against the struct default, not a copy-pasted
+        // literal (T196: literals bit-rotted when defaults moved).
+        const rate_defaults = RatePolicy{};
+        if (rate_policy.max_per_account == rate_defaults.max_per_account) {
             if (c.get("auth", "max_per_account")) |v| {
-                rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch 5;
+                rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch rate_defaults.max_per_account;
             }
         }
-        if (rate_policy.max_per_ip == 20) {
+        if (rate_policy.max_per_ip == rate_defaults.max_per_ip) {
             if (c.get("auth", "max_per_ip")) |v| {
-                rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch 20;
+                rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch rate_defaults.max_per_ip;
             }
         }
-        if (rate_policy.window_seconds == 120) {
+        if (rate_policy.window_seconds == rate_defaults.window_seconds) {
             if (c.get("auth", "window_seconds")) |v| {
-                rate_policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch 120;
+                rate_policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch rate_defaults.window_seconds;
             }
         }
-        if (rate_policy.lockout_duration == 300) {
+        if (rate_policy.lockout_duration == rate_defaults.lockout_duration) {
             if (c.get("auth", "lockout_duration")) |v| {
-                rate_policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch 300;
+                rate_policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_duration;
             }
         }
-        if (rate_policy.lockout_threshold == 10) {
+        if (rate_policy.lockout_threshold == rate_defaults.lockout_threshold) {
             if (c.get("auth", "lockout_threshold")) |v| {
-                rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch 10);
+                rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_threshold);
             }
         }
         if (c.get("auth", "rate_limit")) |v| {
@@ -207,7 +211,8 @@ pub fn main() !void {
     var invite_store = InviteStore.init(&backend);
 
     // Initialize rate limiter
-    var rate_limiter = RateLimiter.init(rate_policy);
+    var rate_limiter = try RateLimiter.init(allocator, rate_policy);
+    defer rate_limiter.deinit();
 
     // Initialize auth handler
     var handler = AuthHandler.init(allocator, &store);

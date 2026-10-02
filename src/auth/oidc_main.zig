@@ -134,12 +134,13 @@ pub fn main() !void {
     // Initialize rate limiter
     var rate_policy = RatePolicy{};
     if (cfg.get("oidc", "rate_max_per_account")) |v| {
-        rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch 5;
+        rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch rate_policy.max_per_account;
     }
     if (cfg.get("oidc", "rate_max_per_ip")) |v| {
-        rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch 20;
+        rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch rate_policy.max_per_ip;
     }
-    var rate_limiter = RateLimiter.init(rate_policy);
+    var rate_limiter = try RateLimiter.init(allocator, rate_policy);
+    defer rate_limiter.deinit();
 
     // Initialize auth handler (generic over OidcStore)
     var handler = AuthHandler.init(allocator, &oidc_store);
@@ -317,8 +318,8 @@ fn printUsage() void {
         \\Optional config [oidc] section:
         \\  ca_file           CA bundle path (default: system)
         \\  socket            Override IPC socket path
-        \\  rate_max_per_account  Rate limit per account (default: 5)
-        \\  rate_max_per_ip       Rate limit per IP (default: 20)
+        \\  rate_max_per_account  Rate limit per account (default: 60)
+        \\  rate_max_per_ip       Rate limit per IP (default: 200)
         \\
     ;
     var buf: [0]u8 = .{};

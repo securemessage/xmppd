@@ -37,8 +37,8 @@ in development mode.
 |-----|---------|-------------|
 | `socket` | `/var/run/xmppd/auth.sock` | IPC socket path |
 | `rate_limit` | `true` | Authentication rate limiting master switch; `false` disables it entirely (testing/benchmarks only) |
-| `max_per_account` | `5` | Max auth attempts per account per window |
-| `max_per_ip` | `20` | Max auth attempts per IP per window |
+| `max_per_account` | `60` | Max auth attempts per account per window |
+| `max_per_ip` | `200` | Max auth attempts per IP per window (must stay below the internal ring size of 256) |
 | `window_seconds` | `120` | Rate window size |
 | `lockout_duration` | `300` | Temporary lockout length in seconds |
 | `lockout_threshold` | `10` | Consecutive failures before temporary lockout |
