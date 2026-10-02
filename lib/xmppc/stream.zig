@@ -251,6 +251,14 @@ pub const ClientStream = struct {
     /// The most recent `<stream:features>` block (retained for the bind/session/SM
     /// decisions that follow it).
     feats: Features = .{},
+    /// Refuse to authenticate without TLS. A server (or attacker stripping
+    /// `<starttls/>`) that offers SASL in the clear is rejected. Only a lab rig
+    /// without TLS clears this.
+    tls_required: bool = true,
+    /// Allow SASL PLAIN. Off by default: PLAIN sends the password itself to
+    /// whoever terminates TLS, and the TLS peer is not authenticated yet
+    /// (T-B5D56AD3). SCRAM never reveals the password.
+    allow_plain: bool = false,
 
     /// Begin the connection: transition to awaiting the stream header and emit
     /// the stream-open action. The Session performs the TCP connect before
@@ -315,19 +323,17 @@ pub const ClientStream = struct {
                     return .send_starttls;
                 }
                 if (self.feats.mechanisms.len > 0) {
-                    self.state = .sasl_negotiating;
-                    self.sasl_mechanism = self.feats.mechanisms[0];
-                    return .{ .send_sasl_auth = self.sasl_mechanism };
+                    if (self.tls_required) {
+                        self.fail("tls-required");
+                        return .close;
+                    }
+                    return self.startSasl();
                 }
                 self.fail("no-features");
                 return .close;
             },
             .awaiting_stream_header_tls => {
-                if (self.feats.mechanisms.len > 0) {
-                    self.state = .sasl_negotiating;
-                    self.sasl_mechanism = self.feats.mechanisms[0];
-                    return .{ .send_sasl_auth = self.sasl_mechanism };
-                }
+                if (self.feats.mechanisms.len > 0) return self.startSasl();
                 self.fail("no-mechanisms");
                 return .close;
             },
@@ -537,6 +543,24 @@ pub const ClientStream = struct {
         return .send_sm_enable;
     }
 
+    /// Pick a mechanism by the client's preference, not the server's order, so
+    /// a server listing PLAIN first cannot steer the client onto it.
+    fn startSasl(self: *ClientStream) ClientAction {
+        const prefs = [_][]const u8{ "SCRAM-SHA-256", "PLAIN" };
+        for (prefs) |want| {
+            if (std.mem.eql(u8, want, "PLAIN") and !self.allow_plain) continue;
+            for (self.feats.mechanisms) |m| {
+                if (std.mem.eql(u8, m, want)) {
+                    self.state = .sasl_negotiating;
+                    self.sasl_mechanism = m;
+                    return .{ .send_sasl_auth = m };
+                }
+            }
+        }
+        self.fail("no-supported-mechanism");
+        return .close;
+    }
+
     fn fail(self: *ClientStream, reason: []const u8) void {
         if (self.state != .closed) {
             self.failure_reason = reason;
@@ -621,7 +645,7 @@ test "client stream: full STARTTLS + SCRAM + bind + SM happy path" {
 }
 
 test "client stream: bind only (no SM) goes straight to active" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1", .from = "example.com" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -639,7 +663,7 @@ test "client stream: bind only (no SM) goes straight to active" {
 }
 
 test "client stream: session optional (xmppd default) skips the session IQ" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -657,7 +681,7 @@ test "client stream: session optional (xmppd default) skips the session IQ" {
 }
 
 test "client stream: SM resume when resume_id is set" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     s.resume_id = "prev-session-id";
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
@@ -677,7 +701,7 @@ test "client stream: SM resume when resume_id is set" {
 }
 
 test "client stream: session IQ between bind and SM" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -697,7 +721,7 @@ test "client stream: session IQ between bind and SM" {
 }
 
 test "client stream: SASL failure closes" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -709,7 +733,7 @@ test "client stream: SASL failure closes" {
 }
 
 test "client stream: stream error during handshake closes" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const a = s.feed(.{ .stream_error = .{ .condition = .conflict, .raw = "conflict" } });
@@ -718,7 +742,7 @@ test "client stream: stream error during handshake closes" {
 }
 
 test "client stream: bind IQ error closes" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -732,7 +756,7 @@ test "client stream: bind IQ error closes" {
 }
 
 test "client stream: clean stream close in active state" {
-    var s = ClientStream{};
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
     _ = s.openStream();
     _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
     const mechs = [_][]const u8{ "PLAIN" };
@@ -746,6 +770,43 @@ test "client stream: clean stream close in active state" {
     const a = s.feed(.stream_closed);
     try std.testing.expect(a == .none);
     try std.testing.expect(s.isClosed());
+}
+
+test "client stream: SASL offered without STARTTLS is refused (stripping)" {
+    var s = ClientStream{};
+    _ = s.openStream();
+    _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
+    const mechs = [_][]const u8{ "SCRAM-SHA-256", "PLAIN" };
+    const a = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    try std.testing.expect(a == .close);
+    try std.testing.expectEqualStrings("tls-required", s.failure_reason);
+}
+
+test "client stream: SCRAM preferred even when the server lists PLAIN first" {
+    var s = ClientStream{ .state = .awaiting_stream_header_tls, .allow_plain = true };
+    const mechs = [_][]const u8{ "PLAIN", "SCRAM-SHA-256" };
+    const a = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    try std.testing.expectEqualStrings("SCRAM-SHA-256", a.send_sasl_auth);
+}
+
+test "client stream: PLAIN-only server is refused unless PLAIN is allowed" {
+    const mechs = [_][]const u8{"PLAIN"};
+    var s = ClientStream{ .state = .awaiting_stream_header_tls };
+    const a = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    try std.testing.expect(a == .close);
+    try std.testing.expectEqualStrings("no-supported-mechanism", s.failure_reason);
+
+    var s2 = ClientStream{ .state = .awaiting_stream_header_tls, .allow_plain = true };
+    const b = s2.feed(.{ .features = .{ .mechanisms = &mechs } });
+    try std.testing.expectEqualStrings("PLAIN", b.send_sasl_auth);
+}
+
+test "client stream: unsupported mechanisms only (e.g. SCRAM-SHA-1) closes" {
+    var s = ClientStream{ .state = .awaiting_stream_header_tls };
+    const mechs = [_][]const u8{ "SCRAM-SHA-1", "SCRAM-SHA-1-PLUS" };
+    const a = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    try std.testing.expect(a == .close);
+    try std.testing.expectEqualStrings("no-supported-mechanism", s.failure_reason);
 }
 
 test "StreamError.fromString" {

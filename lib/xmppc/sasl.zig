@@ -62,16 +62,27 @@ pub const SaslClient = struct {
     /// Given the RAW (base64-decoded) server challenge, return the RAW next
     /// client message, or `null` when the mechanism has no further client step.
     /// PLAIN is single-shot (the server answers `<success>` directly). SCRAM
-    /// returns the client-final-message here; the subsequent `<success>` is
-    /// verified via `verifyServerFinal`.
+    /// returns the client-final-message for the first challenge. A server that
+    /// sends server-final as a second challenge (RFC 6120 6.4.6) gets it
+    /// verified here and an empty response; its `<success>` is then empty.
     pub fn handleChallenge(self: *SaslClient, challenge_raw: []const u8) !?[]const u8 {
-        if (self.scram) |*sc| return try sc.handleServerFirst(challenge_raw);
+        if (self.scram) |*sc| {
+            if (sc.awaitingServerFinal()) {
+                try sc.handleServerFinal(challenge_raw);
+                self.complete = true;
+                return "";
+            }
+            return try sc.handleServerFirst(challenge_raw);
+        }
         return null;
     }
 
-    /// Verify the server signature (SCRAM server-final). No-op for PLAIN.
+    /// Verify the SCRAM server signature carried in `<success>`. Fails unless
+    /// the signature checks out, or was already verified from a challenge and
+    /// `<success>` is empty. No-op for PLAIN.
     pub fn verifyServerFinal(self: *SaslClient, final_raw: []const u8) !void {
         if (self.scram) |*sc| {
+            if (self.complete and final_raw.len == 0) return;
             try sc.handleServerFinal(final_raw);
             self.complete = sc.isComplete();
         }
@@ -141,6 +152,44 @@ test "SCRAM wrong password fails at the server" {
     const client_final = (try client.handleChallenge(server_first)).?;
 
     try std.testing.expectError(error.AuthenticationFailed, server.handleClientFinal(client_final));
+}
+
+test "SCRAM: <success> without server-final is rejected" {
+    const alloc = std.testing.allocator;
+    const salt = [_]u8{0xAB} ** 32;
+    const creds = sasl.StoredCredentials.derive("secret", salt, 4096);
+
+    var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "secret");
+    defer client.deinit();
+    var server = sasl.ScramServer.init(alloc);
+    defer server.deinit();
+    _ = try server.handleClientFirst(try client.initial());
+    server.setCredentials(creds);
+    _ = (try client.handleChallenge(try server.serverFirst())).?;
+
+    // An attacker skipping the proof with an empty <success/> must not pass.
+    try std.testing.expectError(error.ServerAuthFailed, client.verifyServerFinal(""));
+    try std.testing.expect(!client.isComplete());
+}
+
+test "SCRAM: server-final delivered as a challenge, then empty <success>" {
+    const alloc = std.testing.allocator;
+    const salt = [_]u8{0xAB} ** 32;
+    const creds = sasl.StoredCredentials.derive("secret", salt, 4096);
+
+    var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "secret");
+    defer client.deinit();
+    var server = sasl.ScramServer.init(alloc);
+    defer server.deinit();
+    _ = try server.handleClientFirst(try client.initial());
+    server.setCredentials(creds);
+    const client_final = (try client.handleChallenge(try server.serverFirst())).?;
+    const server_final = try server.handleClientFinal(client_final);
+
+    const resp = (try client.handleChallenge(server_final)).?;
+    try std.testing.expectEqualStrings("", resp);
+    try client.verifyServerFinal("");
+    try std.testing.expect(client.isComplete());
 }
 
 test "unsupported mechanism errors" {
