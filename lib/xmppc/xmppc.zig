@@ -31,6 +31,7 @@ pub const sasl = @import("sasl.zig");
 pub const session = @import("session.zig");
 pub const engine = @import("engine.zig");
 pub const parser = @import("parser.zig");
+pub const transport = @import("transport.zig");
 
 pub const ClientStream = stream.ClientStream;
 pub const ClientState = stream.ClientState;
@@ -45,6 +46,7 @@ pub const SaslClient = sasl.SaslClient;
 
 pub const Engine = engine.Engine;
 pub const Session = session.Session;
+pub const Transport = transport.Transport;
 
 test {
     _ = stream;
@@ -52,4 +54,5 @@ test {
     _ = session;
     _ = engine;
     _ = parser;
+    _ = transport;
 }

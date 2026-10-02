@@ -214,6 +214,13 @@ pub const SslContext = struct {
 /// Provides non-blocking handshake, read, and write operations.
 pub const SslConn = struct {
     ssl: *c.SSL,
+    /// The socket this connection is bound to (kept for callers that swap
+    /// transports — e.g. lib/xmppc's Transport union — and need the fd back).
+    sock_fd: std.posix.fd_t = -1,
+
+    pub fn sockFd(self: *const SslConn) std.posix.fd_t {
+        return self.sock_fd;
+    }
 
     /// Create a new server-side TLS connection from an SSL_CTX and a socket fd.
     ///
@@ -231,7 +238,7 @@ pub const SslConn = struct {
         // Server mode — we accept connections
         c.SSL_set_accept_state(ssl);
 
-        return SslConn{ .ssl = ssl };
+        return SslConn{ .ssl = ssl, .sock_fd = fd };
     }
 
     /// Create a new client-side TLS connection for outbound use.
@@ -256,7 +263,7 @@ pub const SslConn = struct {
             _ = c.SSL_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(h)));
         }
 
-        return SslConn{ .ssl = ssl };
+        return SslConn{ .ssl = ssl, .sock_fd = fd };
     }
 
     /// Perform (or continue) the TLS handshake.

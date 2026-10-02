@@ -176,6 +176,7 @@ pub const Engine = struct {
 
     fn attachPrepared(self: *Engine, s: *Session, fd: posix.fd_t) !usize {
         s.fd = fd;
+        s.tport = @import("transport.zig").Transport.initPlain(fd);
         s.phase = .connecting;
 
         const idx = self.sessions.items.len;

@@ -28,6 +28,7 @@ const saslmod = @import("sasl.zig");
 
 const Engine = @import("engine.zig").Engine;
 const Parser = @import("parser.zig").Parser;
+const Transport = @import("transport.zig").Transport;
 
 const Jid = xmpp.Jid;
 const Reader = xml.Reader;
@@ -69,7 +70,9 @@ pub const Session = struct {
     fail_reason_len: u8 = 0,
 
     fd: posix.fd_t = -1,
-    tls: ?ssl.SslConn = null,
+    /// The I/O link — plain TCP until STARTTLS upgrades it in place
+    /// (Transport owns the "identical pointer on TLS retry" pin state).
+    tport: ?Transport = null,
     tls_handshake: bool = false,
 
     host: []const u8 = "",
@@ -90,13 +93,8 @@ pub const Session = struct {
     write_buf: []u8,
     write_len: usize = 0,
     write_registered: bool = false,
-    /// Length passed to the last SSL_write that returned WANT_*; 0 when no
-    /// TLS write is pending. OpenSSL requires the retry to use the same
-    /// buffer address with at least this length, so write_buf must not move
-    /// while this is non-zero (ktls-guardrails rule 6).
-    tls_pending: usize = 0,
-    /// Bytes queued while write_buf is pinned and full, in order; moved into
-    /// write_buf once the pending TLS write completes.
+    /// Bytes queued while write_buf is pinned by a pending TLS write and
+    /// full, in order; moved into write_buf once the pending write completes.
     overflow: std.ArrayListUnmanaged(u8) = .{},
 
     /// Bound full JID (set when the bind result is parsed).
@@ -137,9 +135,11 @@ pub const Session = struct {
             sc.deinit();
             allocator.destroy(sc);
         }
-        if (self.tls) |*tc| {
-            tc.shutdown();
-            tc.deinit();
+        if (self.tport) |*tp| {
+            if (tp.tlsConn()) |tc| {
+                tc.shutdown();
+                tc.deinit();
+            }
         }
         if (self.fd >= 0) posix.close(self.fd);
         allocator.free(self.read_buf);
@@ -197,7 +197,10 @@ pub const Session = struct {
     pub fn onRead(self: *Session, engine: *Engine) !void {
         // TLS handshake in flight: drive it, re-arm, and stop.
         if (self.tls_handshake) {
-            var tc = self.tls orelse return self.fail(engine.allocator, "tls-missing");
+            const tc = blk: {
+                const tp = if (self.tport) |*t| t else return self.fail(engine.allocator, "tls-missing");
+                break :blk tp.tlsConn() orelse return self.fail(engine.allocator, "tls-missing");
+            };
             const res = tc.doHandshake() catch {
                 self.fail(engine.allocator, "tls-handshake-failed");
                 return;
@@ -265,32 +268,24 @@ pub const Session = struct {
     /// TLS or when offload was disabled (see Engine.useTls). Meaningful
     /// once the handshake has completed.
     pub fn ktlsState(self: *Session) struct { send: bool, recv: bool } {
-        if (self.tls) |*tc| return .{ .send = tc.ktlsSend(), .recv = tc.ktlsRecv() };
+        if (self.tport) |*tp| {
+            if (tp.tlsConn()) |tc| return .{ .send = tc.ktlsSend(), .recv = tc.ktlsRecv() };
+        }
         return .{ .send = false, .recv = false };
     }
 
-    /// Returns 0 only when the peer is drained for now (WouldBlock /
-    /// TLS WANT_*). A peer close — TCP FIN or TLS close_notify — is
-    /// error.ConnectionClosed: it must never be conflated with "drained",
-    /// because a level-triggered read filter stays readable on a closed
-    /// socket and would busy-loop a session that is never failed.
+    /// Returns 0 only when the peer is drained for now (would_block).
+    /// A peer close — TCP FIN or TLS close_notify — is error.ConnectionClosed:
+    /// it must never be conflated with "drained", because a level-triggered
+    /// read filter stays readable on a closed socket and would busy-loop a
+    /// session that is never failed.
     fn recv(self: *Session, buf: []u8) !usize {
-        if (self.tls) |*tc| {
-            const r = tc.read(buf) catch |e| switch (e) {
-                ssl.SslError.ConnectionClosed => return error.ConnectionClosed,
-                else => return error.TlsRead,
-            };
-            return switch (r) {
-                .ok => |n| n,
-                .want_read, .want_write => 0,
-            };
-        }
-        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
-            error.WouldBlock => return 0,
-            else => return err,
+        const tp = if (self.tport) |*t| t else return error.NoTransport;
+        return switch (try tp.read(buf)) {
+            .data => |n| n,
+            .would_block => 0,
+            .closed => error.ConnectionClosed,
         };
-        if (n == 0) return error.ConnectionClosed;
-        return n;
     }
 
     /// Feed the reader, map events to ServerEvents, drive the FSM, execute
@@ -371,7 +366,7 @@ pub const Session = struct {
         }
         if (self.write_len + data.len > self.write_buf.len) {
             // Growing would move write_buf under a pending TLS retry.
-            if (self.tls_pending > 0) {
+            if (self.tport != null and self.tport.?.hasPendingWrite()) {
                 try self.overflow.appendSlice(self.engine.allocator, data);
                 return;
             }
@@ -412,10 +407,10 @@ pub const Session = struct {
         }
     }
 
-    /// Drop `n` written bytes; the pending TLS retry (if any) is complete, so
-    /// write_buf may move again and overflowed bytes rejoin it.
+    /// Drop `n` written bytes; the pending TLS retry (if any) is credited,
+    /// and overflowed bytes rejoin write_buf when the pin fully releases.
     fn consumeWritten(self: *Session, n: usize) !void {
-        self.tls_pending = 0;
+        if (self.tport) |*tp| tp.writeCompleted(n);
         std.mem.copyForwards(u8, self.write_buf, self.write_buf[n..self.write_len]);
         self.write_len -= n;
         if (self.overflow.items.len > 0) {
@@ -427,21 +422,12 @@ pub const Session = struct {
     }
 
     fn sendSome(self: *Session) !usize {
-        if (self.tls) |*tc| {
-            const r = tc.write(self.write_buf[0..self.write_len]) catch return error.TlsWrite;
-            return switch (r) {
-                .ok => |n| n,
-                .want_read, .want_write => blk: {
-                    self.tls_pending = self.write_len;
-                    break :blk 0;
-                },
-            };
-        }
-        const n = posix.send(self.fd, self.write_buf[0..self.write_len], 0) catch |err| switch (err) {
-            error.WouldBlock => return 0,
-            else => return err,
+        const tp = if (self.tport) |*t| t else return error.NoTransport;
+        return switch (try tp.write(self.write_buf[0..self.write_len])) {
+            .data => |n| n,
+            .would_block => 0,
+            .closed => error.ConnectionClosed,
         };
-        return n;
     }
 
     // ------------------------------------------------------------------
@@ -455,7 +441,8 @@ pub const Session = struct {
             .send_stream_open => {
                 // Restart after TLS or auth: reset parser + reader state (the
                 // server resets its own reader on both).
-                if (self.tls != null or self.fsm.state == .awaiting_stream_header_auth) {
+                const have_tls = self.tport != null and self.tport.?.isTls();
+                if (have_tls or self.fsm.state == .awaiting_stream_header_auth) {
                     self.reader.reset();
                     if (self.parser) |pr| pr.reset();
                 }
@@ -551,8 +538,8 @@ pub const Session = struct {
             },
             .begin_tls => {
                 const ctx = engine.tls_ctx orelse return self.fail(allocator, "tls-not-configured");
-                const tc = ssl.SslConn.initClient(ctx, self.fd, null) catch return self.fail(allocator, "tls-init-failed");
-                self.tls = tc;
+                const tp = if (self.tport) |*t| t else return self.fail(allocator, "tls-missing");
+                tp.upgradeToTls(ctx, null) catch return self.fail(allocator, "tls-init-failed");
                 self.tls_handshake = true;
                 _ = self.onRead(engine) catch return;
             },
@@ -610,7 +597,8 @@ test "write path: write_buf never moves while a TLS write is pending" {
     @memset(filler, 'a');
     try s.queue(filler);
     // As if SSL_write(write_buf, write_len) had returned WANT_WRITE.
-    s.tls_pending = s.write_len;
+    s.tport = Transport.initPlain(-1); // only the pin bookkeeping is used
+    s.tport.?.tls_pending = s.write_len;
     const pinned = s.write_buf.ptr;
 
     try s.queue("0123456789ABCDEF"); // does not fit: overflows
@@ -621,7 +609,7 @@ test "write path: write_buf never moves while a TLS write is pending" {
 
     // The retried write completes in full; overflow rejoins write_buf.
     try s.consumeWritten(s.write_len);
-    try std.testing.expectEqual(@as(usize, 0), s.tls_pending);
+    try std.testing.expect(!s.tport.?.hasPendingWrite());
     try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
     try std.testing.expectEqualStrings("0123456789ABCDEFxy", s.write_buf[0..s.write_len]);
 }
@@ -635,7 +623,8 @@ test "write path: appending in place during a pending TLS write keeps the buffer
     defer s.destroy(a);
 
     try s.queue("<presence/>");
-    s.tls_pending = s.write_len;
+    s.tport = Transport.initPlain(-1); // only the pin bookkeeping is used
+    s.tport.?.tls_pending = s.write_len;
     const pinned = s.write_buf.ptr;
     // Fits: the retry may legally pass a longer length from the same address.
     try s.queue("<message/>");

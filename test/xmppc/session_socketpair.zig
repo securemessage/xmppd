@@ -116,10 +116,9 @@ fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
     cur_outcome.established = true;
     cur_outcome.bound_jid = jid_str;
     cur_outcome.sm_id = sm_id;
-    if (session.tls) |*t| {
-        cur_outcome.ktls_send = t.ktlsSend();
-        cur_outcome.ktls_recv = t.ktlsRecv();
-    }
+    const ks = session.ktlsState();
+    cur_outcome.ktls_send = ks.send;
+    cur_outcome.ktls_recv = ks.recv;
     cur_cond.signal();
 }
 
