@@ -332,22 +332,21 @@ pub const SslConn = struct {
         return if (ret > 0) @intCast(ret) else 0;
     }
 
-    /// Whether kernel-TLS offload actually engaged on this connection. OpenSSL
-    /// arms the in-kernel ULP lazily after the handshake, so this is false
-    /// until a record has flowed. Fallback to userland crypto is silent, so
-    /// this is the only way to tell a KTLS-armed context really offloaded.
-    ///
-    /// Mirrors the BIO_get_ktls_send/recv macros: send is queried on the
-    /// write BIO, recv on the read BIO. True if either direction is offloaded.
-    pub fn ktlsEngaged(self: *SslConn) bool {
-        // BIO_CTRL_GET_KTLS_SEND = 73, BIO_CTRL_GET_KTLS_RECV = 76.
-        if (c.SSL_get_wbio(self.ssl)) |wbio| {
-            if (c.BIO_ctrl(wbio, 73, 0, null) > 0) return true;
-        }
-        if (c.SSL_get_rbio(self.ssl)) |rbio| {
-            if (c.BIO_ctrl(rbio, 76, 0, null) > 0) return true;
-        }
-        return false;
+    /// Whether kernel-TLS offload engaged for the send direction. Mirrors
+    /// BIO_get_ktls_send: queried on the write BIO. Fallback to userland
+    /// crypto is silent, so this is the only way to confirm offload.
+    pub fn ktlsSend(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_SEND = 73.
+        const wbio = c.SSL_get_wbio(self.ssl) orelse return false;
+        return c.BIO_ctrl(wbio, 73, 0, null) > 0;
+    }
+
+    /// Whether kernel-TLS offload engaged for the receive direction. Mirrors
+    /// BIO_get_ktls_recv: queried on the read BIO.
+    pub fn ktlsRecv(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_RECV = 76.
+        const rbio = c.SSL_get_rbio(self.ssl) orelse return false;
+        return c.BIO_ctrl(rbio, 76, 0, null) > 0;
     }
 
     /// Extract the peer's leaf certificate as DER-encoded bytes.

@@ -171,9 +171,10 @@ fn onEstablished(engine: *Engine, index: usize, session: *Session) void {
     g.established += 1;
     g.done += 1;
     if (!g.quiet) {
+        const ks = session.ktlsState();
         std.debug.print(
-            "smoke: established {d}/{d} bound={s} sm_enabled={d} sm_resumed={d} sm_id={s}\n",
-            .{ g.established, g.total, jid_str, @intFromBool(g.outcome.sm_enabled), @intFromBool(g.outcome.sm_resumed), sm_id },
+            "smoke: established {d}/{d} bound={s} sm_enabled={d} sm_resumed={d} ktls_send={d} ktls_recv={d} sm_id={s}\n",
+            .{ g.established, g.total, jid_str, @intFromBool(g.outcome.sm_enabled), @intFromBool(g.outcome.sm_resumed), @intFromBool(ks.send), @intFromBool(ks.recv), sm_id },
         );
     }
     g.cond.signal();
@@ -190,6 +191,9 @@ fn onClosed(engine: *Engine, index: usize, session: *Session, reason: []const u8
         if (!g.quiet) {
             std.debug.print("smoke: failed: {s}\n", .{reason});
         }
+        // Wake the main waiter like onEstablished does; without this a
+        // failed run sleeps out the full max-wait deadline.
+        g.cond.signal();
     }
     g.lock.unlock();
     if (!already) engine.requestWake();

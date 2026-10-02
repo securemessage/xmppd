@@ -28,6 +28,8 @@
 
 const std = @import("std");
 const xml = @import("xml");
+
+const log = std.log.scoped(.xmppc);
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
 const ssl = @import("ssl");
@@ -263,9 +265,12 @@ pub const Engine = struct {
                 std.c.EVFILT.WRITE => s.onWritable(self) catch s.fail(self.allocator, "write-error"),
                 else => {},
             }
-            // sys/event.h NOTE_EOF — not exposed as std.c.NOTE.EOF for FreeBSD
-            // in this zig std; the value is stable ABI.
-            if (ev.fflags & 0x8000 != 0) s.fail(self.allocator, "peer-closed");
+            // EV_EOF lives in ev.flags (not fflags): the peer shut down the
+            // read direction. Checked after dispatch so any last buffered
+            // data is drained before the session is failed. sys/event.h
+            // EV_EOF — not exposed as std.c.EV.EOF for FreeBSD in this zig
+            // std; the value is stable ABI.
+            if (ev.flags & 0x8000 != 0) s.fail(self.allocator, "peer-closed");
             if (ev.flags & std.c.EV.ERROR != 0) s.fail(self.allocator, "socket-error");
         }
     }
@@ -318,6 +323,10 @@ pub const Engine = struct {
     fn removeWrite(self: *Engine, fd: posix.fd_t) void {
         self.submit(kev(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
     }
+    // TODO(phase 2): stage changes in a changelist buffer and fold them into
+    // the ONE kevent() wait call (project kqueue rule) instead of one
+    // kevent() per registration. Fine at smoke scale; required before the
+    // T32 load driver.
     fn submit(self: *Engine, ev: Kevent) void {
         var one = [_]Kevent{ev};
         _ = posix.kevent(self.kq, &one, &.{}, null) catch {};
@@ -466,6 +475,11 @@ pub const Session = struct {
                     self.tls_handshake = false;
                     engine.removeWrite(self.fd);
                     self.write_registered = false;
+                    // Guardrail rule 3: right after the handshake, check and
+                    // log kernel-TLS offload per direction — fallback to
+                    // userland crypto is silent, so this is the only way to
+                    // tell an armed context really offloaded.
+                    log.info("fd={d} tls established ktls_send={} ktls_recv={}", .{ self.fd, tc.ktlsSend(), tc.ktlsRecv() });
                     // Reset the reader, then tell the FSM TLS is up; the FSM
                     // action re-sends <stream:stream> (RFC 6120 §4.6).
                     self.reader.reset();
@@ -515,21 +529,36 @@ pub const Session = struct {
         try self.parseAll(engine);
     }
 
+    /// Kernel-TLS offload state per direction. Both false when not using
+    /// TLS or when offload was disabled (see Engine.useTls). Meaningful
+    /// once the handshake has completed.
+    pub fn ktlsState(self: *Session) struct { send: bool, recv: bool } {
+        if (self.tls) |*tc| return .{ .send = tc.ktlsSend(), .recv = tc.ktlsRecv() };
+        return .{ .send = false, .recv = false };
+    }
+
+    /// Returns 0 only when the peer is drained for now (WouldBlock /
+    /// TLS WANT_*). A peer close — TCP FIN or TLS close_notify — is
+    /// error.ConnectionClosed: it must never be conflated with "drained",
+    /// because a level-triggered read filter stays readable on a closed
+    /// socket and would busy-loop a session that is never failed.
     fn recv(self: *Session, buf: []u8) !usize {
         if (self.tls) |*tc| {
             const r = tc.read(buf) catch |e| switch (e) {
-                ssl.SslError.ConnectionClosed => return 0,
+                ssl.SslError.ConnectionClosed => return error.ConnectionClosed,
                 else => return error.TlsRead,
             };
             return switch (r) {
                 .ok => |n| n,
-                .want_read, .want_write => return 0,
+                .want_read, .want_write => 0,
             };
         }
-        return posix.recv(self.fd, buf, 0) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => err,
+        const n = posix.recv(self.fd, buf, 0) catch |err| switch (err) {
+            error.WouldBlock => return 0,
+            else => return err,
         };
+        if (n == 0) return error.ConnectionClosed;
+        return n;
     }
 
     /// Feed the reader, map events to ServerEvents, drive the FSM, execute

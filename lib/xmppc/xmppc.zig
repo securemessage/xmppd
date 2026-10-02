@@ -18,6 +18,11 @@
 //!
 //! Consumers: the xmppd T32 load driver (phase 2), then Kumiko Chat (M9) via a
 //! thin C-ABI wrapper.
+//!
+//! SECURITY STATUS — lab-only for now: the TLS client context runs with
+//! SSL_VERIFY_NONE and no SNI/hostname check. DANE-first (TLSA) validation
+//! is the house-standard successor and is not wired in yet; until it lands,
+//! do not use this library against untrusted networks.
 
 pub const stream = @import("stream.zig");
 pub const sasl = @import("sasl.zig");
