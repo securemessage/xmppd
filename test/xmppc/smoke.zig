@@ -3,20 +3,26 @@
 //! TCP → STARTTLS → SASL SCRAM-SHA-256 → resource bind → session/SM — on ONE kqueue
 //! loop (N client sessions in one process; the load-driver shape).
 //!
+//! Uses only the public `xmppc` module API, so it also proves that surface is
+//! sufficient for a real client. Not installed: build with
+//! `zig build xmppc-smoke`, binary at zig-out/bin/xmppc-smoke (doc/TESTING.md).
+//!
 //! Usage:
 //!   xmppc-smoke -host H [-domain D] -port P -user U -password W -resource R
-//!               [-n N] [-resume PREV_SMID] [-max-wait S] [-quiet]
+//!               [-n N] [-resume PREV_SMID] [-max-wait S] [-quiet] [-ktls]
 //!
 //! Exit 0 once every session is established (SM enabled or resumed); 1 on
-//! failure. Emits one machine-readable `ESTABLISHED …` / `FAILED …` line.
+//! failure. Emits one machine-readable `ESTABLISHED …` / `FAILED …` line;
+//! `sm_id=` and `reason=` are always present (empty when not applicable).
 //!
 //! Credential/resource strings are stored by reference inside the Session and
 //! must outlive it; this client passes static literals (or heap allocations
 //! that live until process exit).
 
 const std = @import("std");
-const Engine = @import("session.zig").Engine;
-const Session = @import("session.zig").Session;
+const xmppc = @import("xmppc");
+const Engine = xmppc.Engine;
+const Session = xmppc.Session;
 const Mutex = std.Thread.Mutex;
 const Condition = std.Thread.Condition;
 
@@ -274,8 +280,8 @@ pub fn main() !void {
     }
 
     std.debug.print(
-        "smoke: {s} established={d}/{d} bound={s} sm_enabled={d} sm_resumed={d} sm_id={s}\n",
-        .{ if (ok) "ESTABLISHED" else "FAILED", g.established, g.total, bound, @intFromBool(sm_enabled), @intFromBool(sm_resumed), if (ok) sm_id else reason },
+        "smoke: {s} established={d}/{d} bound={s} sm_enabled={d} sm_resumed={d} sm_id={s} reason={s}\n",
+        .{ if (ok) "ESTABLISHED" else "FAILED", g.established, g.total, bound, @intFromBool(sm_enabled), @intFromBool(sm_resumed), sm_id, if (ok) "" else reason },
     );
     std.c._exit(if (ok) 0 else 1);
 }

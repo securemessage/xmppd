@@ -1247,7 +1247,7 @@ const Parser = struct {
 };
 
 // ============================================================================
-// Tests (unit; end-to-end lives in the smoke client + xmppd rig)
+// Tests (unit; end-to-end lives in test/xmppc/smoke.zig + xmppd rig)
 // ============================================================================
 //
 // These drive the real xml.Reader through the same parse loop the Session uses,

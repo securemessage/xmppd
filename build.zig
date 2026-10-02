@@ -93,25 +93,23 @@ pub fn build(b: *std.Build) void {
     xmppc_mod.addImport("ssl", ssl_mod);
     xmppc_mod.addImport("dns", dns_mod);
 
-    // xmppc-smoke: end-to-end smoke client (T-91E96A28 validation). Imports
-    // session.zig as a file, so it needs the same named-import surface.
+    // xmppc-smoke: end-to-end test client for lib/xmppc against a live xmppd
+    // rig (doc/TESTING.md). A consumer of the public xmppc module, not part
+    // of it; built only by its own step and never installed with the server.
     const smoke_mod = b.createModule(.{
-        .root_source_file = b.path("lib/xmppc/smoke.zig"),
+        .root_source_file = b.path("test/xmppc/smoke.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    smoke_mod.addImport("xml", xml_mod);
-    smoke_mod.addImport("xmpp", xmpp_mod);
-    smoke_mod.addImport("sasl", sasl_mod);
-    smoke_mod.addImport("tls", tls_mod);
-    smoke_mod.addImport("ssl", ssl_mod);
-    smoke_mod.addImport("dns", dns_mod);
+    smoke_mod.addImport("xmppc", xmppc_mod);
     const smoke_exe = b.addExecutable(.{
         .name = "xmppc-smoke",
         .root_module = smoke_mod,
     });
-    b.installArtifact(smoke_exe);
+    const smoke_install = b.addInstallArtifact(smoke_exe, .{});
+    const smoke_step = b.step("xmppc-smoke", "Build the xmppc end-to-end smoke client (zig-out/bin/xmppc-smoke)");
+    smoke_step.dependOn(&smoke_install.step);
 
     // --- Tests ---
 
