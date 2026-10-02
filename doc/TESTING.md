@@ -114,6 +114,22 @@ Notes:
   silently leaves `custom_address` unset and the client falls back to DNS SRV,
   connecting to whatever is on port 5222.
 
+### xmppc smoke client
+
+`test/xmppc/smoke.zig` drives lib/xmppc end to end against the throwaway
+instance (TCP, STARTTLS, SCRAM-SHA-256, bind, XEP-0198). It is not built by
+`zig build`; build it on demand:
+
+```sh
+zig build xmppc-smoke
+./zig-out/bin/xmppc-smoke -port 15222 -user alice@localhost -password pass1 -n 3
+# -> smoke: ESTABLISHED established=3/3 ... sm_id=... reason=
+```
+
+Exit 0 when every session is established. The client uses userland TLS by
+default; `-ktls` keeps kTLS armed and is only valid against a non-kTLS peer
+or across a real NIC (both ends kTLS over lo0 fails: FreeBSD PR 296498).
+
 ### Multi-worker lane
 
 `workers = 1` makes every route local — the whole cross-worker surface (room

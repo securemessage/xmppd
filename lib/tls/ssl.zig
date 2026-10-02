@@ -185,6 +185,19 @@ pub const SslContext = struct {
         return SslContext{ .ctx = ctx };
     }
 
+    /// Disarm kernel-TLS offload on this context (clears the
+    /// SSL_OP_ENABLE_KTLS option the initializers above set).
+    ///
+    /// Client-side escape hatch for paths where the peer may also arm KTLS:
+    /// two KTLS-armed endpoints desync across an interface without
+    /// IFCAP_MEXTPG (lo0, epair, bridge) — FreeBSD PR 296498, EBADMSG /
+    /// "bad record mac". Local rigs and same-host tooling cross exactly
+    /// such interfaces, so they must run one end in userland TLS. Safe to
+    /// call before any connection is created from this context.
+    pub fn disableKtls(self: *SslContext) void {
+        _ = c.SSL_CTX_clear_options(self.ctx, 0x8); // SSL_OP_ENABLE_KTLS
+    }
+
     /// Release the SSL_CTX. All SslConns created from this context must be
     /// freed first.
     pub fn deinit(self: *SslContext) void {
@@ -317,6 +330,23 @@ pub const SslConn = struct {
     pub fn pending(self: *SslConn) usize {
         const ret = c.SSL_pending(self.ssl);
         return if (ret > 0) @intCast(ret) else 0;
+    }
+
+    /// Whether kernel-TLS offload engaged for the send direction. Mirrors
+    /// BIO_get_ktls_send: queried on the write BIO. Fallback to userland
+    /// crypto is silent, so this is the only way to confirm offload.
+    pub fn ktlsSend(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_SEND = 73.
+        const wbio = c.SSL_get_wbio(self.ssl) orelse return false;
+        return c.BIO_ctrl(wbio, 73, 0, null) > 0;
+    }
+
+    /// Whether kernel-TLS offload engaged for the receive direction. Mirrors
+    /// BIO_get_ktls_recv: queried on the read BIO.
+    pub fn ktlsRecv(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_RECV = 76.
+        const rbio = c.SSL_get_rbio(self.ssl) orelse return false;
+        return c.BIO_ctrl(rbio, 76, 0, null) > 0;
     }
 
     /// Extract the peer's leaf certificate as DER-encoded bytes.
@@ -488,6 +518,14 @@ test "SslContext: initClient succeeds without cert/key" {
     var ctx = try SslContext.initClient();
     defer ctx.deinit();
     // Client context created successfully — no cert/key needed
+}
+
+test "SslContext: disableKtls is accepted on a fresh context" {
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+    // Clearing the option the initializer set must not disturb the context.
+    ctx.disableKtls();
+    ctx.disableKtls(); // idempotent
 }
 
 test "HandshakeResult: enum values" {

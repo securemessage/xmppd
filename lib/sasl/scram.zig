@@ -320,10 +320,21 @@ pub const ScramServer = struct {
 
 /// SCRAM-SHA-256 client-side implementation (for testing and s2s).
 pub const ScramClient = struct {
+    /// Iteration counts outside this range are refused: below the RFC 7677
+    /// minimum the key derivation is too weak; above the maximum a hostile
+    /// server could stall the client's event loop in PBKDF2.
+    pub const min_iterations: u32 = 4096;
+    pub const max_iterations: u32 = 1_000_000;
+    /// Longest accepted salt (decoded bytes).
+    pub const max_salt_len = 128;
+
     state: State = .initial,
     username: []const u8,
     password: []const u8,
     client_nonce: [24]u8 = undefined,
+    client_nonce_b64: []const u8 = "",
+    /// Expected ServerSignature, computed in handleServerFirst.
+    server_signature: [32]u8 = undefined,
     client_first_bare: []const u8 = "",
     server_first_msg: []const u8 = "",
     combined_nonce: []const u8 = "",
@@ -357,6 +368,7 @@ pub const ScramClient = struct {
     pub fn clientFirst(self: *ScramClient) ![]const u8 {
         const alloc = self.arena.allocator();
         const nonce_b64 = try base64Encode(alloc, &self.client_nonce);
+        self.client_nonce_b64 = nonce_b64;
 
         // client-first-message-bare: n=username,r=nonce
         self.client_first_bare = try std.fmt.allocPrint(alloc, "n={s},r={s}", .{ self.username, nonce_b64 });
@@ -381,6 +393,13 @@ pub const ScramClient = struct {
         const r_field = iter.next() orelse return error.InvalidMessage;
         if (!std.mem.startsWith(u8, r_field, "r=")) return error.InvalidMessage;
         self.combined_nonce = try alloc.dupe(u8, r_field[2..]);
+        // RFC 5802 5.1: the combined nonce must extend our own nonce.
+        if (self.combined_nonce.len <= self.client_nonce_b64.len or
+            !std.mem.startsWith(u8, self.combined_nonce, self.client_nonce_b64))
+        {
+            self.state = .failed;
+            return error.NonceMismatch;
+        }
 
         // s=salt
         const s_field = iter.next() orelse return error.InvalidMessage;
@@ -391,14 +410,21 @@ pub const ScramClient = struct {
         const i_field = iter.next() orelse return error.InvalidMessage;
         if (!std.mem.startsWith(u8, i_field, "i=")) return error.InvalidMessage;
         self.iteration_count = std.fmt.parseInt(u32, i_field[2..], 10) catch return error.InvalidMessage;
+        if (self.iteration_count < min_iterations or self.iteration_count > max_iterations) {
+            self.state = .failed;
+            return error.IterationCountOutOfRange;
+        }
 
-        // Decode salt from base64
-        var salt_bytes: [32]u8 = undefined;
-        try base64Decode(self.salt, &salt_bytes);
+        // Decode salt from base64 (any length the server chose)
+        const decoder = std.base64.standard.Decoder;
+        const salt_len = decoder.calcSizeForSlice(self.salt) catch return error.InvalidBase64;
+        if (salt_len == 0 or salt_len > max_salt_len) return error.InvalidMessage;
+        var salt_buf: [max_salt_len]u8 = undefined;
+        decoder.decode(salt_buf[0..salt_len], self.salt) catch return error.InvalidBase64;
 
         // SaltedPassword := Hi(password, salt, i)
         var salted_password: [32]u8 = undefined;
-        pbkdf2(self.password, &salt_bytes, self.iteration_count, &salted_password);
+        pbkdf2(self.password, salt_buf[0..salt_len], self.iteration_count, &salted_password);
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
@@ -431,6 +457,12 @@ pub const ScramClient = struct {
             r.* = k ^ s;
         }
 
+        // ServerSignature := HMAC(HMAC(SaltedPassword, "Server Key"), AuthMessage),
+        // checked against the server-final-message (mutual authentication).
+        var server_key: [32]u8 = undefined;
+        HmacSha256.create(&server_key, "Server Key", &salted_password);
+        HmacSha256.create(&self.server_signature, auth_message, &server_key);
+
         const proof_b64 = try base64Encode(alloc, &client_proof);
 
         self.state = .awaiting_server_final;
@@ -439,18 +471,30 @@ pub const ScramClient = struct {
         return try std.fmt.allocPrint(alloc, "{s},p={s}", .{ without_proof, proof_b64 });
     }
 
-    /// Verify server-final-message (optional — validates the server).
+    /// Verify the server-final-message `v=ServerSignature` in constant time.
+    /// Anything else (`e=...`, a wrong or malformed signature) fails: a server
+    /// that cannot prove knowledge of the credentials is not trusted.
     pub fn handleServerFinal(self: *ScramClient, message: []const u8) !void {
         if (self.state != .awaiting_server_final) return error.InvalidState;
+        self.state = .failed;
 
-        if (!std.mem.startsWith(u8, message, "v=")) {
-            self.state = .failed;
-            return error.ServerAuthFailed;
-        }
+        // Only the first attribute matters; extensions may follow.
+        const first = message[0 .. std.mem.indexOfScalar(u8, message, ',') orelse message.len];
+        if (!std.mem.startsWith(u8, first, "v=")) return error.ServerAuthFailed;
 
-        // In a full implementation, we'd verify the server signature here.
-        // For MVP, we trust the server if it sends v= (mutual auth deferred).
+        var got: [32]u8 = undefined;
+        const decoder = std.base64.standard.Decoder;
+        const len = decoder.calcSizeForSlice(first[2..]) catch return error.ServerAuthFailed;
+        if (len != got.len) return error.ServerAuthFailed;
+        decoder.decode(&got, first[2..]) catch return error.ServerAuthFailed;
+        if (!std.crypto.timing_safe.eql([32]u8, got, self.server_signature)) return error.ServerAuthFailed;
+
         self.state = .completed;
+    }
+
+    /// True once the client-final-message was sent and server-final is due.
+    pub fn awaitingServerFinal(self: *const ScramClient) bool {
+        return self.state == .awaiting_server_final;
     }
 
     pub fn isComplete(self: *const ScramClient) bool {
@@ -617,6 +661,98 @@ test "SCRAM-SHA-256 wrong password fails" {
     const result = server.handleClientFinal(client_final);
     try std.testing.expectError(error.AuthenticationFailed, result);
     try std.testing.expect(server.hasFailed());
+}
+
+/// Run the client through client-first and server-first against our server,
+/// returning the genuine server-final for tamper tests.
+fn exchangeToServerFinal(client: *ScramClient, server: *ScramServer) ![]const u8 {
+    const salt = [_]u8{0x5A} ** 32;
+    const creds = StoredCredentials.derive("pw", salt, 4096);
+    _ = try server.handleClientFirst(try client.clientFirst());
+    server.setCredentials(creds);
+    const client_final = try client.handleServerFirst(try server.serverFirst());
+    return try server.handleClientFinal(client_final);
+}
+
+test "SCRAM client: RFC 7677 test vector (16-byte salt)" {
+    var client = ScramClient.init(std.testing.allocator, "user", "pencil");
+    defer client.deinit();
+    _ = try client.clientFirst();
+    // Pin the RFC's client nonce.
+    client.client_nonce_b64 = "rOprNGfwEbeRWgbNEkqO";
+    client.client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+
+    const final = try client.handleServerFirst("r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    try std.testing.expectEqualStrings("c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=", final);
+
+    try client.handleServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    try std.testing.expect(client.isComplete());
+}
+
+test "SCRAM client: forged server signature is rejected" {
+    const allocator = std.testing.allocator;
+    var client = ScramClient.init(allocator, "user", "pw");
+    defer client.deinit();
+    var server = ScramServer.init(allocator);
+    defer server.deinit();
+    _ = try exchangeToServerFinal(&client, &server);
+
+    // Correct shape, wrong value.
+    try std.testing.expectError(error.ServerAuthFailed, client.handleServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
+    try std.testing.expect(!client.isComplete());
+}
+
+test "SCRAM client: server error and bare v= are rejected" {
+    const allocator = std.testing.allocator;
+    inline for (.{ "e=invalid-proof", "v=", "v=AAAA", "" }) |msg| {
+        var client = ScramClient.init(allocator, "user", "pw");
+        defer client.deinit();
+        var server = ScramServer.init(allocator);
+        defer server.deinit();
+        _ = try exchangeToServerFinal(&client, &server);
+        try std.testing.expectError(error.ServerAuthFailed, client.handleServerFinal(msg));
+    }
+}
+
+test "SCRAM client: genuine server-final verifies" {
+    const allocator = std.testing.allocator;
+    var client = ScramClient.init(allocator, "user", "pw");
+    defer client.deinit();
+    var server = ScramServer.init(allocator);
+    defer server.deinit();
+    const server_final = try exchangeToServerFinal(&client, &server);
+    try client.handleServerFinal(server_final);
+    try std.testing.expect(client.isComplete());
+}
+
+test "SCRAM client: combined nonce must extend the client nonce" {
+    var client = ScramClient.init(std.testing.allocator, "user", "pencil");
+    defer client.deinit();
+    _ = try client.clientFirst();
+    client.client_nonce_b64 = "rOprNGfwEbeRWgbNEkqO";
+    client.client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+    // Different prefix
+    try std.testing.expectError(error.NonceMismatch, client.handleServerFirst("r=XXprNGfwEbeRWgbNEkqO%hvYD,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
+}
+
+test "SCRAM client: server nonce part must be non-empty" {
+    var client = ScramClient.init(std.testing.allocator, "user", "pencil");
+    defer client.deinit();
+    _ = try client.clientFirst();
+    client.client_nonce_b64 = "rOprNGfwEbeRWgbNEkqO";
+    client.client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+    try std.testing.expectError(error.NonceMismatch, client.handleServerFirst("r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
+}
+
+test "SCRAM client: iteration count bounds" {
+    inline for (.{ "1", "4095", "1000001", "4294967295" }) |i| {
+        var client = ScramClient.init(std.testing.allocator, "user", "pencil");
+        defer client.deinit();
+        _ = try client.clientFirst();
+        client.client_nonce_b64 = "rOprNGfwEbeRWgbNEkqO";
+        client.client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        try std.testing.expectError(error.IterationCountOutOfRange, client.handleServerFirst("r=rOprNGfwEbeRWgbNEkqO%hv,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=" ++ i));
+    }
 }
 
 test "findClientFirstBare" {
