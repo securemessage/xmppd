@@ -34,6 +34,11 @@ const c = @cImport({
     @cInclude("openssl/x509.h");
 });
 
+// OpenSSL 3.0.22 defines SSL_OP_ENABLE_KTLS as the variadic macro
+// SSL_OP_BIT(3) ((uint64_t)1 << 3). Zig's cimport lowers that macro to a
+// generic function that fails to instantiate, so define the bit by hand.
+const SSL_OP_ENABLE_KTLS: u64 = 1 << 3;
+
 /// Result of a non-blocking TLS handshake attempt.
 pub const HandshakeResult = enum {
     /// Handshake completed successfully.
@@ -91,6 +96,9 @@ fn alwaysAcceptVerify(_: c_int, _: ?*c.X509_STORE_CTX) callconv(.c) c_int {
 /// all connections. Thread-safe after initialization (OpenSSL 3.x guarantee).
 pub const SslContext = struct {
     ctx: *c.SSL_CTX,
+    /// Whether `SSL_OP_ENABLE_KTLS` was armed on this context (kernel-TLS
+    /// offload) via `enableKtls()`. Recorded for `ktlsEngaged()` reporting.
+    ktls: bool = false,
 
     /// Initialize a server-side TLS context with certificate and private key.
     ///
@@ -133,11 +141,9 @@ pub const SslContext = struct {
         const sid_ctx = "xmppd";
         _ = c.SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx.len);
 
-        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
-        // offload flag, and arming it on this platform desyncs the TLS
-        // record layer (clients fail the first read after STARTTLS with
-        // "decryption failed or bad record mac").
-
+        // Kernel-TLS offload (SSL_OP_ENABLE_KTLS) is not armed here; callers
+        // opt in via enableKtls(). Server-side KTLS policy is a server
+        // deliverable and out of scope for this client library.
         return SslContext{ .ctx = ctx };
     }
 
@@ -177,12 +183,22 @@ pub const SslContext = struct {
             }
         }
 
-        // Never set SSL_OP_ENABLE_KTLS here: that is the Linux kernel-TLS
-        // offload flag, and arming it on this platform desyncs the TLS
-        // record layer (clients fail the first read after STARTTLS with
-        // "decryption failed or bad record mac").
-
+        // Kernel-TLS offload stays off unless the caller arms it with
+        // enableKtls() — see that function for the both-ends limitation.
         return SslContext{ .ctx = ctx };
+    }
+
+    /// Arm kernel-TLS offload (`SSL_OP_ENABLE_KTLS`) on this context. OpenSSL
+    /// engages the in-kernel ULP lazily after the handshake; verify with
+    /// `SslConn.ktlsEngaged()` — fallback to userland crypto is silent.
+    ///
+    /// Off by default and opt-in: an endpoint that arms KTLS fails (EBADMSG /
+    /// "bad record mac") when its PEER also arms KTLS and the packets cross an
+    /// interface without IFCAP_MEXTPG (lo0, epair, bridge) — FreeBSD PR 296498.
+    /// Arm only against peers known not to arm KTLS themselves.
+    pub fn enableKtls(self: *SslContext) void {
+        _ = c.SSL_CTX_set_options(self.ctx, SSL_OP_ENABLE_KTLS);
+        self.ktls = true;
     }
 
     /// Release the SSL_CTX. All SslConns created from this context must be
@@ -327,6 +343,25 @@ pub const SslConn = struct {
     pub fn pending(self: *SslConn) usize {
         const ret = c.SSL_pending(self.ssl);
         return if (ret > 0) @intCast(ret) else 0;
+    }
+
+    /// Whether kernel-TLS offload actually engaged on this connection. OpenSSL
+    /// arms the in-kernel ULP lazily after the handshake, so this is false
+    /// until a record has flowed. Useful for logging/verification that a
+    /// KTLS-armed context really offloaded (fallback to userland is silent,
+    /// so this is the only way to tell).
+    ///
+    /// Mirrors the BIO_get_ktls_send/recv macros: send is queried on the
+    /// write BIO, recv on the read BIO. True if either direction is offloaded.
+    pub fn ktlsEngaged(self: *SslConn) bool {
+        // BIO_CTRL_GET_KTLS_SEND = 73, BIO_CTRL_GET_KTLS_RECV = 76.
+        if (c.SSL_get_wbio(self.ssl)) |wbio| {
+            if (c.BIO_ctrl(wbio, 73, 0, null) > 0) return true;
+        }
+        if (c.SSL_get_rbio(self.ssl)) |rbio| {
+            if (c.BIO_ctrl(rbio, 76, 0, null) > 0) return true;
+        }
+        return false;
     }
 
     /// Extract the peer's leaf certificate as DER-encoded bytes.
@@ -498,6 +533,16 @@ test "SslContext: initClient succeeds without cert/key" {
     var ctx = try SslContext.initClient();
     defer ctx.deinit();
     // Client context created successfully — no cert/key needed
+    // KTLS is off by default (both-ends limitation, see enableKtls).
+    try std.testing.expect(!ctx.ktls);
+}
+
+test "SslContext: KTLS is opt-in via enableKtls" {
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+    try std.testing.expect(!ctx.ktls);
+    ctx.enableKtls();
+    try std.testing.expect(ctx.ktls);
 }
 
 test "HandshakeResult: enum values" {

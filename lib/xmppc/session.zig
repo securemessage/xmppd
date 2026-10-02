@@ -135,9 +135,13 @@ pub const Engine = struct {
 
     /// Install a client TLS context (DANE-first: PKIX verify disabled, so
     /// self-signed / DANE-validated certs both work).
-    pub fn useTls(self: *Engine) !void {
+    ///
+    /// `ktls` arms kernel-TLS offload on the client side (default off — see
+    /// SslContext.enableKtls for the both-ends limitation).
+    pub fn useTls(self: *Engine, ktls: ?bool) !void {
         if (self.tls_ctx) |_| return;
         self.tls_ctx = ssl.SslContext.initClient() catch return error.TlsInit;
+        if (ktls orelse false) self.tls_ctx.?.enableKtls();
     }
 
     pub fn sessionCount(self: *const Engine) usize {

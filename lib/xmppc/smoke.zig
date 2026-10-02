@@ -39,6 +39,11 @@ const Options = struct {
     resume_id: []const u8 = "",
     max_wait: u64 = 15,
     quiet: bool = false,
+    // Arm KTLS on the smoke client (default off: the local rig's server may be
+    // KTLS-armed, and two KTLS-armed endpoints desync — the kernel has no
+    // both-ends offload path). Use with a `--no-ktls` server to exercise
+    // client-side offload.
+    ktls: bool = false,
 
     fn parse(o: *Options, args: []const [:0]u8) !void {
         var i: usize = 1;
@@ -58,6 +63,10 @@ const Options = struct {
                 o.quiet = true;
                 continue;
             }
+            if (std.mem.eql(u8, key, "ktls")) {
+                o.ktls = true;
+                continue;
+            }
             if (std.mem.eql(u8, key, "help") or std.mem.eql(u8, key, "h")) {
                 std.debug.print(
                     "smoke: xmppc client-core end-to-end smoke\n" ++
@@ -69,7 +78,8 @@ const Options = struct {
                         "  -resource R      (default smoke; -n N uses smoke-0..N-1)\n" ++
                         "  -resume SMID     (session 0 attempts SM resume of a prior session)\n" ++
                         "  -max-wait S      (seconds; default 15)\n" ++
-                        "  -quiet           (suppress the per-event log lines)\n",
+                        "  -quiet           (suppress the per-event log lines)\n" ++
+                        "  -ktls            (arm KTLS on the client; needs a non-KTLS server)\n",
                     .{},
                 );
                 return error.Help;
@@ -201,7 +211,7 @@ pub fn main() !void {
 
     var engine = try Engine.init(std.heap.page_allocator);
     defer engine.deinit();
-    try engine.useTls();
+    try engine.useTls(if (o.ktls) true else null);
 
     g.total = o.count;
     g.quiet = o.quiet;
