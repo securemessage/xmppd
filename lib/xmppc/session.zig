@@ -372,6 +372,14 @@ pub const Session = struct {
     write_buf: []u8,
     write_len: usize = 0,
     write_registered: bool = false,
+    /// Length passed to the last SSL_write that returned WANT_*; 0 when no
+    /// TLS write is pending. OpenSSL requires the retry to use the same
+    /// buffer address with at least this length, so write_buf must not move
+    /// while this is non-zero (ktls-guardrails rule 6).
+    tls_pending: usize = 0,
+    /// Bytes queued while write_buf is pinned and full, in order; moved into
+    /// write_buf once the pending TLS write completes.
+    overflow: std.ArrayListUnmanaged(u8) = .{},
 
     /// Bound full JID (set when the bind result is parsed).
     bound_jid: ?Jid = null,
@@ -417,6 +425,7 @@ pub const Session = struct {
         if (self.fd >= 0) posix.close(self.fd);
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
+        self.overflow.deinit(allocator);
     }
 
     pub fn fail(self: *Session, allocator: std.mem.Allocator, reason: []const u8) void {
@@ -632,10 +641,21 @@ pub const Session = struct {
     }
 
     fn queue(self: *Session, data: []const u8) !void {
+        // Once anything overflowed, later data follows it to keep order.
+        if (self.overflow.items.len > 0) {
+            try self.overflow.appendSlice(self.engine.allocator, data);
+            return;
+        }
         if (self.write_len + data.len > self.write_buf.len) {
-            var need = self.write_len + data.len;
-            while (need > self.write_buf.len) need *= 2;
-            const nb = self.engine.allocator.realloc(self.write_buf, need) catch return error.OutOfMemory;
+            // Growing would move write_buf under a pending TLS retry.
+            if (self.tls_pending > 0) {
+                try self.overflow.appendSlice(self.engine.allocator, data);
+                return;
+            }
+            const need = self.write_len + data.len;
+            var cap = @max(self.write_buf.len, 1);
+            while (cap < need) cap *= 2;
+            const nb = self.engine.allocator.realloc(self.write_buf, cap) catch return error.OutOfMemory;
             self.write_buf = nb;
         }
         std.mem.copyForwards(u8, self.write_buf[self.write_len..], data);
@@ -651,14 +671,17 @@ pub const Session = struct {
 
     fn flushWrites(self: *Session, engine: *Engine) void {
         while (self.write_len > 0) {
-            const n = self.sendSome() catch |err| {
-                if (err == error.WouldBlock or err == error.TlsWrite or err == error.TlsRead) return;
+            // sendSome returns 0 only for would-block / TLS WANT_*; any error
+            // is fatal (a swallowed TLS write error would stall the session).
+            const n = self.sendSome() catch {
                 self.fail(self.engine.allocator, "write-error");
                 return;
             };
             if (n == 0) return;
-            std.mem.copyForwards(u8, self.write_buf, self.write_buf[n..]);
-            self.write_len -= n;
+            self.consumeWritten(n) catch {
+                self.fail(self.engine.allocator, "queue-error");
+                return;
+            };
         }
         if (self.write_registered) {
             engine.removeWrite(self.fd);
@@ -666,15 +689,29 @@ pub const Session = struct {
         }
     }
 
+    /// Drop `n` written bytes; the pending TLS retry (if any) is complete, so
+    /// write_buf may move again and overflowed bytes rejoin it.
+    fn consumeWritten(self: *Session, n: usize) !void {
+        self.tls_pending = 0;
+        std.mem.copyForwards(u8, self.write_buf, self.write_buf[n..self.write_len]);
+        self.write_len -= n;
+        if (self.overflow.items.len > 0) {
+            const pending = self.overflow.items;
+            // Capacity is retained, so `pending` stays valid for the copy.
+            self.overflow.clearRetainingCapacity();
+            try self.queue(pending);
+        }
+    }
+
     fn sendSome(self: *Session) !usize {
         if (self.tls) |*tc| {
-            const r = tc.write(self.write_buf[0..self.write_len]) catch |e| switch (e) {
-                ssl.SslError.ConnectionClosed => return 0,
-                else => return error.TlsWrite,
-            };
+            const r = tc.write(self.write_buf[0..self.write_len]) catch return error.TlsWrite;
             return switch (r) {
                 .ok => |n| n,
-                .want_read, .want_write => return 0,
+                .want_read, .want_write => blk: {
+                    self.tls_pending = self.write_len;
+                    break :blk 0;
+                },
             };
         }
         const n = posix.send(self.fd, self.write_buf[0..self.write_len], 0) catch |err| switch (err) {
@@ -1439,3 +1476,66 @@ test "parser: SM resumed" {
     }
 }
 
+
+test "write path: write_buf never moves while a TLS write is pending" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const filler = try a.alloc(u8, s.write_buf.len - 10);
+    defer a.free(filler);
+    @memset(filler, 'a');
+    try s.queue(filler);
+    // As if SSL_write(write_buf, write_len) had returned WANT_WRITE.
+    s.tls_pending = s.write_len;
+    const pinned = s.write_buf.ptr;
+
+    try s.queue("0123456789ABCDEF"); // does not fit: overflows
+    try s.queue("xy"); // would fit, but must follow the overflow to keep order
+    try std.testing.expect(s.write_buf.ptr == pinned);
+    try std.testing.expectEqual(filler.len, s.write_len);
+    try std.testing.expectEqualStrings("0123456789ABCDEFxy", s.overflow.items);
+
+    // The retried write completes in full; overflow rejoins write_buf.
+    try s.consumeWritten(s.write_len);
+    try std.testing.expectEqual(@as(usize, 0), s.tls_pending);
+    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
+    try std.testing.expectEqualStrings("0123456789ABCDEFxy", s.write_buf[0..s.write_len]);
+}
+
+test "write path: appending in place during a pending TLS write keeps the buffer" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    try s.queue("<presence/>");
+    s.tls_pending = s.write_len;
+    const pinned = s.write_buf.ptr;
+    // Fits: the retry may legally pass a longer length from the same address.
+    try s.queue("<message/>");
+    try std.testing.expect(s.write_buf.ptr == pinned);
+    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
+    try std.testing.expectEqualStrings("<presence/><message/>", s.write_buf[0..s.write_len]);
+}
+
+test "write path: buffer grows normally when no TLS write is pending" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const big = try a.alloc(u8, s.write_buf.len + 1);
+    defer a.free(big);
+    @memset(big, 'b');
+    try s.queue(big);
+    try std.testing.expectEqual(big.len, s.write_len);
+    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
+}
