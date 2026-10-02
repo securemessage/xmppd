@@ -1177,13 +1177,14 @@ test "AuthHandler: PLAIN per-account rate limit engages on parsed username" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "carol", "pw");
 
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 2,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
     });
+    defer limiter.deinit();
     var handler = TestHandler.init(allocator, &store);
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
@@ -1208,13 +1209,14 @@ test "AuthHandler: PLAIN account lockout engages on parsed username" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "dave", "rightpw");
 
-    var limiter = RateLimiter.init(.{
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 2,
     });
+    defer limiter.deinit();
     var handler = TestHandler.init(allocator, &store);
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
