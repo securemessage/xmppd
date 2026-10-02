@@ -202,6 +202,23 @@ pub fn build(b: *std.Build) void {
         .root_module = xmppc_test_mod,
     });
 
+    // xmppc socketpair harness: Engine/Session driven against a scripted fake
+    // server (T-6871B4C7). Needs xmppc public module + the ssl wrapper.
+    const socketpair_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/xmppc/session_socketpair.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    socketpair_test_mod.addImport("xmppc", xmppc_mod);
+    socketpair_test_mod.addImport("ssl", ssl_mod);
+
+    const socketpair_tests = b.addTest(.{
+        .name = "xmppc-socketpair-tests",
+        .root_module = socketpair_test_mod,
+    });
+    const run_socketpair_tests = b.addRunArtifact(socketpair_tests);
+
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
@@ -1509,6 +1526,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ssl_tests.step);
     test_step.dependOn(&run_dns_tests.step);
     test_step.dependOn(&run_xmppc_tests.step);
+    test_step.dependOn(&run_socketpair_tests.step);
     test_step.dependOn(&run_event_loop_tests.step);
     test_step.dependOn(&run_connection_tests.step);
     test_step.dependOn(&run_listener_tests.step);

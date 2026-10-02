@@ -56,8 +56,17 @@ pub const Session = struct {
     engine: *Engine,
     engine_index: usize = 0,
     alive: bool = true,
+    /// Freed exactly once (destroy idempotence). Separate from `alive`:
+    /// fail() only marks dead; destroy still has resources to free.
+    destructed: bool = false,
     phase: Phase = .connecting,
     failed: bool = false,
+
+    /// Copy of the last fail() reason — callbacks and post-mortem readers
+    /// (e.g. smoke's summary line) may outlive the parser buffers the
+    /// original slice borrows from.
+    fail_reason_buf: [128]u8 = undefined,
+    fail_reason_len: u8 = 0,
 
     fd: posix.fd_t = -1,
     tls: ?ssl.SslConn = null,
@@ -115,7 +124,8 @@ pub const Session = struct {
     }
 
     pub fn destroy(self: *Session, allocator: std.mem.Allocator) void {
-        if (!self.alive) return;
+        if (self.destructed) return; // exactly-once free (fail() may precede)
+        self.destructed = true;
         self.alive = false;
         self.reader.deinit();
         if (self.parser) |pr| {
@@ -143,7 +153,11 @@ pub const Session = struct {
         self.failed = true;
         self.alive = false;
         self.phase = .dead;
-        if (self.on_closed) |cb| cb(self.engine, self.engine_index, self, reason);
+        const n: u8 = @intCast(@min(reason.len, self.fail_reason_buf.len));
+        @memcpy(self.fail_reason_buf[0..n], reason[0..n]);
+        self.fail_reason_len = n;
+        const owned = self.fail_reason_buf[0..n];
+        if (self.on_closed) |cb| cb(self.engine, self.engine_index, self, owned);
         // The engine's reapDead() destroys + removes this slot.
     }
 
@@ -551,9 +565,23 @@ pub const Session = struct {
                 if (self.on_established) |cb| cb(engine, self.engine_index, self);
             },
             .close => {
-                self.fail(allocator, "stream-closed");
+                // Prefer the protocol reason the FSM already recorded
+                // (stream error condition, SASL failure) — failing with a
+                // bare "stream-closed" hides the actual error from callers.
+                if (self.fsm.failure_reason.len > 0)
+                    self.fail(allocator, self.fsm.failure_reason)
+                else
+                    self.fail(allocator, "stream-closed");
             },
         }
+    }
+
+    /// Test seam (socketpair harness): queue raw bytes through the same path
+    /// the FSM actions use — respects overflow ordering and the TLS pinned
+    /// buffer, flushes immediately, re-arms write interest when pending.
+    pub fn testQueue(self: *Session, data: []const u8) !void {
+        try self.queue(data);
+        self.writeAfter(self.engine);
     }
 
     /// After queueing bytes: flush now, and re-arm write interest if pending.

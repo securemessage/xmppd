@@ -154,16 +154,37 @@ pub const Engine = struct {
                 return error.ConnectFailed;
             }
         };
+        return self.attachPrepared(&s, fd);
+    }
+
+    /// Attach a pre-connected fd — the test seam for driving a Session over
+    /// socketpair(2) with a scripted fake server (no network, no certs for
+    /// the plaintext cases). The fd must be non-blocking and connected (or a
+    /// socketpair/stream fd); the session then runs the same post-connect
+    /// path as startSession (stream open on first writability).
+    pub fn attachFd(self: *Engine, fd: posix.fd_t, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !usize {
+        var s = try Session.init(self.allocator);
+        s.engine = self;
+        s.host = "";
+        s.domain = domain;
+        s.user = user;
+        s.password = password;
+        s.resource = resource;
+        s.fsm.resume_id = sm_resume_id;
+        return self.attachPrepared(&s, fd);
+    }
+
+    fn attachPrepared(self: *Engine, s: *Session, fd: posix.fd_t) !usize {
         s.fd = fd;
         s.phase = .connecting;
 
         const idx = self.sessions.items.len;
-        self.sessions.append(self.allocator, s) catch {
+        self.sessions.append(self.allocator, s.*) catch {
             posix.close(fd);
             s.destroy(self.allocator);
             return error.OutOfMemory;
         };
-        s.engine_index = idx;
+        self.sessions.items[idx].engine_index = idx;
         self.addRead(fd, idx);
         self.addWrite(fd, idx);
         return idx;

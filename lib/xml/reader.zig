@@ -287,6 +287,35 @@ pub const Reader = struct {
 
 // --- Tests ---
 
+test "reader: stream restart mid-buffer after reset" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // SUCCESS + post-auth stream open in ONE input buffer — what lands on the
+    // wire when a server batches them. The XMPP flow is: success parsed,
+    // reset() called (stream restart), scan continues from the cursor.
+    const input =
+        "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>" ++
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='s2' version='1.0'>" ++
+        "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
+    var pos: usize = 0;
+
+    const e1 = (try reader.next(input, &pos)).?; // <success/>
+    try std.testing.expect(e1 == .element_start);
+    // A reader-level stream was never opened here; reset() models the XMPP
+    // stream-restart the Session performs right after consuming the success.
+    reader.reset();
+    const pos_after_success = pos;
+
+    const e2 = (try reader.next(input, &pos)) orelse return error.LostAfterReset;
+    try std.testing.expect(e2 == .stream_open);
+    try std.testing.expect(pos > pos_after_success);
+
+    const e3 = (try reader.next(input, &pos)) orelse return error.LostFeatures;
+    try std.testing.expect(e3 == .element_start); // <stream:features>
+}
+
 test "reader: parse stream opening" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);

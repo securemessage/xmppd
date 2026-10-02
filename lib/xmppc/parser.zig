@@ -79,6 +79,8 @@ pub const Parser = struct {
         if (self.sasl_success_raw) |raw| self.allocator.free(raw);
         self.in_features = false;
         self.feats = .{};
+        // Each name is individually duped; freeing here mirrors deinit().
+        for (self.mech_names.items) |name| self.allocator.free(name);
         self.mech_names.clearRetainingCapacity();
         self.in_mechanism = false;
         self.sasl_kind = .none;
@@ -126,7 +128,19 @@ pub const Parser = struct {
                 self.pending = .stream_closed;
                 return true;
             },
-            .element_start => |el| return self.onElementStart(el),
+            .element_start => |el| {
+                // The reader emits NO element_end for self-closing elements
+                // (net depth stays at zero) — settle them inline, or a
+                // self-closing <success/>/<failure/> would leave the SASL
+                // collection state dangling until some later closed element
+                // settled it under the wrong name (or never).
+                const ok = self.onElementStart(el);
+                if (!ok) return false;
+                if (el.self_closing and self.sasl_kind != .none) {
+                    return self.onElementEnd(el.local_name);
+                }
+                return true;
+            },
             .element_end => |name| return self.onElementEnd(name),
             .text => |t| return self.onText(t),
         }
@@ -442,7 +456,6 @@ pub const Parser = struct {
         self.feats = .{};
         self.pending = .{ .features = f };
     }
-
 };
 
 // ============================================================================
@@ -611,6 +624,33 @@ test "parser: SM enabled" {
     }
 }
 
+test "parser: self-closing SASL success settles immediately" {
+    // Regression: the reader emits only element_start for <success/> (never
+    // element_end); previously the SASL success event hung until an unrelated
+    // closing tag. Real xmppd sends paired tags, so only self-closing peers
+    // (or batching) ever hit this — found via the socketpair harness.
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s1' from='localhost'>" ++
+        "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var got_success = false;
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch unreachable;
+        if (ev == null) break;
+        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (parser.pending) |sev| {
+            parser.pending = null;
+            if (sev == .sasl_success) got_success = true;
+        }
+    }
+    try std.testing.expect(got_success);
+}
+
 test "parser: SM resumed" {
     const allocator = std.testing.allocator;
     const input =
@@ -637,4 +677,3 @@ test "parser: SM resumed" {
         else => return error.TestFail,
     }
 }
-
