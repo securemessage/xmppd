@@ -61,6 +61,17 @@
 
 ### Fixes
 
+- T196: auth rate-limit defaults relaxed (user decision 2026-09-30):
+  max_per_account 5 → 60, max_per_ip 20 → 200 per 120s window; the
+  consecutive-failure lockout (10 → 300s) is unchanged and remains the
+  brute-force control. The per-key ring grew 32 → 256 so the new per-IP
+  ceiling is actually observable (a policy above the ring was inert), and
+  the limiter tables are heap-allocated (~8 MB pair, no longer on any
+  stack). Config/CLI precedence sentinels (auth + oidc daemons) now
+  compare against the struct defaults instead of copy-pasted literals
+  that would have rotted again. Guard test proves both default caps
+  engage. (e19f17a)
+
 - T112: MUC MAM queries routed to a room's owning worker were degraded at
   the actor-message boundary: the response IQ id was the client's MAM
   queryid (XEP-0313 allows queryid != stanza id, breaking IQ matching),

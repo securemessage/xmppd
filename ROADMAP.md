@@ -172,6 +172,9 @@ findings are triaged.
       `[core] max_resources_per_account` (default 256); bind failures now
       client-visible (stanza error, success IQ only after registration) —
       merged 2026-10-01 (a3babac)
+- [x] **T196** — auth rate-limit defaults relaxed (60/account, 200/IP per
+      120s; lockout unchanged at 10 consecutive failures) — merged
+      2026-10-02 (e19f17a)
 - [x] **T177** — cross-worker SM resume: Option A state handoff landed
       2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
       MPSC request/reply, mutex-guarded handoff store for the unacked queue,
