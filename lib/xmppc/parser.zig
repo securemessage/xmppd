@@ -61,7 +61,10 @@ const ChildBuilder = struct {
 ///
 /// Child `text` is the concatenated text of the child's whole subtree
 /// (e.g. XHTML-IM `<html><body><p>x</p>` appears as `"x"` on `html`).
-/// Capture is one level of elements deep.
+/// Capture is one level of elements deep, EXCEPT inside a MAM result
+/// wrapper: `<message><result xmlns='urn:xmpp:mam:2'><forwarded …><message>`
+/// is unwrapped — the archived stanza surfaces as the Stanza (with
+/// `archive` set), and the result wrapper itself produces nothing.
 pub const Stanza = struct {
     pub const Kind = enum { message, presence, iq };
     kind: Kind,
@@ -74,8 +77,20 @@ pub const Stanza = struct {
     /// when the producer supplied no spans). Nested structure lost by the
     /// flat child capture (e.g. XEP-0313 result>forwarded>message) can be
     /// re-parsed from this. Valid until the NEXT stanza is dispatched,
-    /// same lifetime as children.
+    /// same lifetime as children. (Note: MAM result wrappers are unwrapped
+    /// structurally into `archive` + the inner stanza; `raw` stays the
+    /// escape hatch for anything else.)
     raw: []const u8 = "",
+    /// Non-null when this stanza was delivered from a message archive:
+    /// the <result> id (RSM cursor / dedupe key), echoed queryid, and the
+    /// XEP-0297 <delay> stamp.
+    archive: ?ArchiveMeta = null,
+};
+
+pub const ArchiveMeta = struct {
+    id: []const u8 = "",
+    query: []const u8 = "",
+    stamp: []const u8 = "",
 };
 
 pub const Parser = struct {
@@ -117,6 +132,18 @@ pub const Parser = struct {
     // Application stanza capture (message/presence/iq at top level).
     // build_depth counts open elements below the stream tag.
     build_depth: u32 = 0,
+    /// Depth at which children of the in-progress stanza open (1 for a
+    /// top-level stanza; one deeper per tunnel layer for forwarded ones).
+    st_child_depth: u32 = 1,
+    st_archive: ?ArchiveMeta = null,
+    // MAM/forward tunnel state (XEP-0313 <result> + XEP-0297 <forwarded>):
+    // armed while the wrapper is open so the inner stanza replaces the
+    // outer capture.
+    tun_armed: bool = false,
+    tun_forwarded: bool = false,
+    tun_result_id: []const u8 = "",
+    tun_result_query: []const u8 = "",
+    tun_stamp: []const u8 = "",
     st_kind: Stanza.Kind = .message,
     in_stanza: bool = false,
     st_type: []const u8 = "",
@@ -206,6 +233,13 @@ pub const Parser = struct {
         self.build_depth = 0;
         self.in_stanza = false;
         self.st_child_open = false;
+        self.st_child_depth = 1;
+        self.st_archive = null;
+        self.tun_armed = false;
+        self.tun_forwarded = false;
+        self.tun_result_id = "";
+        self.tun_result_query = "";
+        self.tun_stamp = "";
         self.st_children_b.clearRetainingCapacity();
         self.st_attrs.clearRetainingCapacity();
         self.st_children_out.clearRetainingCapacity();
@@ -349,8 +383,64 @@ pub const Parser = struct {
             }
         }
 
-        // --- Application stanza child (depth 2: inside an open stanza) ---
-        if (self.in_stanza and self.build_depth == 1) {
+        // --- MAM result-wrapper tunnel (XEP-0313 + XEP-0297) -------------
+        // <message><result xmlns='urn:xmpp:mam:2'><forwarded …><message>…
+        // is unwrapped: the archived stanza is captured as if it had
+        // arrived directly, carrying the result's id/queryid and the delay
+        // stamp in Stanza.archive. The wrapper counts once for XEP-0198 and
+        // never surfaces.
+        if (self.in_stanza and self.st_kind == .message and self.st_child_depth == 1 and
+            !self.tun_armed and self.build_depth == 1 and
+            std.mem.eql(u8, name, "result") and std.mem.eql(u8, ns, "urn:xmpp:mam:2"))
+        {
+            self.tun_armed = true;
+            for (el.attributes) |a| {
+                if (std.mem.eql(u8, a.local_name, "id")) {
+                    self.tun_result_id = a.value;
+                } else if (std.mem.eql(u8, a.local_name, "queryid")) {
+                    self.tun_result_query = a.value;
+                }
+            }
+            // The wrapper IS the wire stanza: count it now; its close gets
+            // no finishStanza once the tunnel owns the capture (and an
+            // empty wrapper delivers nothing).
+            self.sm_stanza_count +%= 1;
+            return true;
+        }
+        if (self.tun_armed and !self.tun_forwarded and self.build_depth == 2 and
+            std.mem.eql(u8, name, "forwarded") and std.mem.eql(u8, ns, "urn:xmpp:forward:0"))
+        {
+            self.tun_forwarded = true;
+            if (closed) self.tun_forwarded = false;
+            return true;
+        }
+        if (self.tun_armed and self.tun_forwarded and self.build_depth == 3) {
+            if (std.mem.eql(u8, name, "delay")) {
+                for (el.attributes) |a| {
+                    if (std.mem.eql(u8, a.local_name, "stamp")) self.tun_stamp = a.value;
+                }
+                return true;
+            }
+            // Note: no namespace gate here. The archived stanza is spliced
+            // verbatim, and <forwarded> redeclares the default namespace to
+            // urn:xmpp:forward:0 — peer messages are not required to carry
+            // their own xmlns, so position (inside <forwarded>) + name is
+            // the accept rule.
+            if (std.mem.eql(u8, name, "message") or std.mem.eql(u8, name, "presence") or std.mem.eql(u8, name, "iq")) {
+                self.beginStanza(name, el);
+                self.st_archive = .{
+                    .id = self.tun_result_id,
+                    .query = self.tun_result_query,
+                    .stamp = self.tun_stamp,
+                };
+                if (closed) self.finishStanza();
+                return true;
+            }
+            return true;
+        }
+
+        // --- Application stanza child: one level below the open stanza ---
+        if (self.in_stanza and self.build_depth == self.st_child_depth) {
             self.beginStanzaChild(el);
             if (closed) self.endStanzaChild();
             return true;
@@ -514,13 +604,13 @@ pub const Parser = struct {
     fn onElementEnd(self: *Parser, name: []const u8) bool {
         const local = localOf(name);
         // Application stanza child close.
-        if (self.in_stanza and self.build_depth == 2) {
+        if (self.in_stanza and self.build_depth == self.st_child_depth + 1) {
             self.endStanzaChild();
             return true;
         }
         // Application stanza close. finishStanza routes protocol-shaped IQ
         // results (bind/session) to the FSM and surfaces everything else.
-        if (self.in_stanza and self.build_depth == 1) {
+        if (self.in_stanza and self.build_depth == self.st_child_depth) {
             self.finishStanza();
             return true;
         }
@@ -655,6 +745,10 @@ pub const Parser = struct {
             if (s.len > 0 and s[0] != '<') self.st_raw.append(self.allocator, '<') catch {};
             self.st_raw.appendSlice(self.allocator, s) catch {};
         }
+        // Children open one level below the element passed in (top-level
+        // stanza: depth 1; forwarded inner stanza: wherever the tunnel
+        // was entered).
+        self.st_child_depth = self.build_depth + 1;
     }
 
     fn beginStanzaChild(self: *Parser, el: xml.Element) void {
@@ -688,6 +782,16 @@ pub const Parser = struct {
     /// iq type='result' case, e.g. sess1 without a <session/> payload).
     fn finishStanza(self: *Parser) void {
         if (self.st_child_open) self.endStanzaChild();
+        // Tunnel bookkeeping: a wrapper was armed but no inner stanza ever
+        // opened -> deliver nothing (its wire count already happened at arm
+        // time). A completed inner stanza must not count again.
+        const tunneled = self.st_archive != null;
+        const empty_wrapper = self.tun_armed and !tunneled;
+        self.tun_armed = false;
+        self.tun_forwarded = false;
+        self.tun_result_id = "";
+        self.tun_result_query = "";
+        self.tun_stamp = "";
         const is_result = std.mem.eql(u8, self.st_type, "result");
         // bind/session establishment results are FSM traffic; after the
         // stream is active the ids bind1/sess1 have no special meaning and
@@ -696,40 +800,45 @@ pub const Parser = struct {
             (self.iq_is_bind or self.iq_is_session or
                 std.mem.eql(u8, self.st_id, "bind1") or std.mem.eql(u8, self.st_id, "sess1"));
         // Every completed top-level stanza counts for XEP-0198 'h'.
-        self.sm_stanza_count +%= 1;
-        if (self.st_kind == .iq and is_result and shaped) {
-            var res = stream.IqResult{ .id = self.st_id };
-            res.is_error = self.iq_is_error;
-            if (self.iq_is_bind and !self.iq_is_error) {
-                const jt = std.mem.trim(u8, self.jid_text.items, " \t\r\n");
-                res.bound_jid = Jid.parse(jt) catch null;
+        if (!tunneled and !empty_wrapper) self.sm_stanza_count +%= 1;
+        if (!empty_wrapper) {
+            if (self.st_kind == .iq and is_result and shaped) {
+                var res = stream.IqResult{ .id = self.st_id };
+                res.is_error = self.iq_is_error;
+                if (self.iq_is_bind and !self.iq_is_error) {
+                    const jt = std.mem.trim(u8, self.jid_text.items, " \t\r\n");
+                    res.bound_jid = Jid.parse(jt) catch null;
+                }
+                self.pending = .{ .iq_result = res };
+            } else {
+                // Materialize public children: backing lists are final now,
+                // so building slices here cannot dangle.
+                self.st_children_out.clearRetainingCapacity();
+                for (self.st_children_b.items) |b| {
+                    self.st_children_out.append(self.allocator, .{
+                        .name = b.name,
+                        .local_name = b.local_name,
+                        .ns = b.ns,
+                        .attrs = self.st_attrs.items[b.attrs_start .. b.attrs_start + b.attrs_len],
+                        .text = self.st_text.items[b.text_start .. b.text_start + b.text_len],
+                    }) catch continue;
+                }
+                self.pending_stanza = .{
+                    .kind = self.st_kind,
+                    .type = self.st_type,
+                    .id = self.st_id,
+                    .from = self.st_from,
+                    .to = self.st_to,
+                    .children = self.st_children_out.items,
+                    .raw = self.st_raw.items,
+                    .archive = self.st_archive,
+                };
             }
-            self.pending = .{ .iq_result = res };
-        } else {
-            // Materialize public children: backing lists are final now,
-            // so building slices here cannot dangle.
-            self.st_children_out.clearRetainingCapacity();
-            for (self.st_children_b.items) |b| {
-                self.st_children_out.append(self.allocator, .{
-                    .name = b.name,
-                    .local_name = b.local_name,
-                    .ns = b.ns,
-                    .attrs = self.st_attrs.items[b.attrs_start .. b.attrs_start + b.attrs_len],
-                    .text = self.st_text.items[b.text_start .. b.text_start + b.text_len],
-                }) catch continue;
-            }
-            self.pending_stanza = .{
-                .kind = self.st_kind,
-                .type = self.st_type,
-                .id = self.st_id,
-                .from = self.st_from,
-                .to = self.st_to,
-                .children = self.st_children_out.items,
-                .raw = self.st_raw.items,
-            };
         }
         self.in_stanza = false;
         self.st_child_open = false;
+        self.st_child_depth = 1;
+        self.st_archive = null;
         // Legacy bind/session tracking state
         self.in_iq = false;
         self.iq_is_bind = false;
@@ -969,7 +1078,6 @@ test "parser: SM resumed" {
     }
 }
 
-
 test "parser: SM ack captured in pending_sm_a (T-9BC4D065)" {
     const allocator = std.testing.allocator;
     const input =
@@ -1185,15 +1293,18 @@ test "parser: application iq result surfaces; protocol iq stays with the FSM" {
 
 test "parser: stanza raw wire bytes captured" {
     const allocator = std.testing.allocator;
-    // MAM-shaped result: nested structure the flat child capture loses;
-    // raw must reproduce the exact wire bytes for re-parsing.
+    // MAM wrapper: the tunnel surfaces the ARCHIVED stanza once, whose raw
+    // is the inner stanza's exact wire bytes (the wrapper's metadata
+    // surfaces via Stanza.archive instead).
+    const stanza1_raw =
+        "<message from='dev@conference.localhost/alice' type='groupchat'>" ++
+        "<body>backlog &lt;3</body></message>";
     const stanza1 =
         "<message from='dev@conference.localhost' to='bob@localhost/kumiko'>" ++
         "<result xmlns='urn:xmpp:mam:2' queryid='q1' id='u-42'>" ++
         "<forwarded xmlns='urn:xmpp:forward:0'>" ++
         "<delay xmlns='urn:xmpp:delay' stamp='2026-09-30T18:22:10Z'/>" ++
-        "<message from='dev@conference.localhost/alice' type='groupchat'>" ++
-        "<body>backlog &lt;3</body></message>" ++
+        stanza1_raw ++
         "</forwarded></result></message>";
     const stanza2 = "<presence from='dev@conference.localhost/alice'/>";
     const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s9' from='localhost'>" ++
@@ -1210,11 +1321,118 @@ test "parser: stanza raw wire bytes captured" {
             parser.pending_stanza = null;
             raws += 1;
             if (raws == 1) {
-                try std.testing.expectEqualStrings(stanza1, st.raw);
+                try std.testing.expectEqualStrings(stanza1_raw, st.raw);
+                try std.testing.expect(st.archive != null);
+                try std.testing.expectEqualStrings("u-42", st.archive.?.id);
             } else {
                 try std.testing.expectEqualStrings(stanza2, st.raw);
             }
         }
     }
     try std.testing.expectEqual(@as(usize, 2), raws);
+}
+
+test "parser: MAM result wrapper unwraps to the archived stanza" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s20' from='localhost'>" ++
+        "<message from='alice@localhost' to='alice@localhost'>" ++
+        "<result xmlns='urn:xmpp:mam:2' queryid='bridge-catchup' id='arc-42'>" ++
+        "<forwarded xmlns='urn:xmpp:forward:0'>" ++
+        "<delay xmlns='urn:xmpp:delay' stamp='2026-10-03T06:00:00Z'/>" ++
+        "<message from='bob@localhost/x' to='alice@localhost' type='chat' id='m99'>" ++
+        "<body>from the archive</body>" ++
+        "<sonya xmlns='urn:sonya:message:0' kind='notice'/>" ++
+        "<thread>t-7</thread>" ++
+        "</message>" ++
+        "</forwarded>" ++
+        "</result>" ++
+        "</message>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var stanzas_text: [3][]const u8 = .{ "", "", "" };
+    var got: usize = 0;
+    var arc_id: []const u8 = "";
+    var arc_query: []const u8 = "";
+    var arc_stamp: []const u8 = "";
+    var got_id: []const u8 = "";
+    var got_from: []const u8 = "";
+    var got_type: []const u8 = "";
+    var got_sonya_ns: []const u8 = "";
+    var got_kind_attr: []const u8 = "";
+    var pos: usize = 0;
+    while (true) {
+        if (!drive(&parser, &reader, input, &pos)) break;
+        if (parser.pending_stanza) |st| {
+            // Snapshot: slices die at the next stanza.
+            parser.pending_stanza = null;
+            got += 1;
+            got_type = std.heap.page_allocator.dupe(u8, st.type) catch return;
+            got_from = std.heap.page_allocator.dupe(u8, st.from) catch return;
+            got_id = std.heap.page_allocator.dupe(u8, st.id) catch return;
+            try std.testing.expect(st.archive != null);
+            arc_id = std.heap.page_allocator.dupe(u8, st.archive.?.id) catch return;
+            arc_query = std.heap.page_allocator.dupe(u8, st.archive.?.query) catch return;
+            arc_stamp = std.heap.page_allocator.dupe(u8, st.archive.?.stamp) catch return;
+            try std.testing.expectEqual(@as(usize, 3), st.children.len);
+            try std.testing.expectEqualStrings("body", st.children[0].local_name);
+            stanzas_text[0] = std.heap.page_allocator.dupe(u8, st.children[0].text) catch return;
+            got_sonya_ns = std.heap.page_allocator.dupe(u8, st.children[1].ns) catch return;
+            got_kind_attr = std.heap.page_allocator.dupe(u8, st.children[1].attrs[0].value) catch return;
+            stanzas_text[2] = std.heap.page_allocator.dupe(u8, st.children[2].text) catch return;
+        }
+        // The wrapper carries no bind/session shape; nothing FSM-side.
+        try std.testing.expect(parser.pending == null or parser.pending.? == .stream_header);
+    }
+    try std.testing.expectEqual(@as(usize, 1), got);
+    try std.testing.expectEqualStrings("from the archive", stanzas_text[0]);
+    try std.testing.expectEqualStrings("urn:sonya:message:0", got_sonya_ns);
+    try std.testing.expectEqualStrings("notice", got_kind_attr);
+    try std.testing.expectEqualStrings("t-7", stanzas_text[2]);
+    try std.testing.expectEqualStrings("arc-42", arc_id);
+    try std.testing.expectEqualStrings("bridge-catchup", arc_query);
+    try std.testing.expectEqualStrings("2026-10-03T06:00:00Z", arc_stamp);
+    try std.testing.expectEqualStrings("chat", got_type);
+    try std.testing.expectEqualStrings("bob@localhost/x", got_from);
+    try std.testing.expectEqualStrings("m99", got_id);
+}
+
+test "parser: MAM wrappers and wire stanzas interleave without loss" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s21' from='localhost'>" ++
+        "<message from='a@x/1' id='w1'><body>live one</body></message>" ++
+        "<message><result xmlns='urn:xmpp:mam:2' id='arc-1'><forwarded xmlns='urn:xmpp:forward:0'>" ++
+        "<message from='b@x' id='a1'><body>archived one</body></message>" ++
+        "</forwarded></result></message>" ++
+        "<message from='a@x/2' id='w2'><body>live two</body></message>" ++
+        "<message><result xmlns='urn:xmpp:mam:2' id='arc-2'/></message>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var ids: [4][]u8 = undefined;
+    var archived: [4]bool = undefined;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        if (!drive(&parser, &reader, input, &pos)) break;
+        if (parser.pending_stanza) |st| {
+            parser.pending_stanza = null;
+            ids[n] = std.heap.page_allocator.dupe(u8, st.id) catch return;
+            archived[n] = st.archive != null;
+            n += 1;
+        }
+        try std.testing.expect(parser.pending == null or parser.pending.? == .stream_header);
+    }
+    // Live 1, archived 1, live 2; the empty result wrapper delivers nothing.
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("w1", ids[0]);
+    try std.testing.expect(!archived[0]);
+    try std.testing.expectEqualStrings("a1", ids[1]); // inner stanza's own id wins
+    try std.testing.expect(archived[1]);
+    try std.testing.expectEqualStrings("w2", ids[2]);
+    try std.testing.expect(!archived[2]);
 }
