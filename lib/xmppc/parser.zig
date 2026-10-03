@@ -70,6 +70,12 @@ pub const Stanza = struct {
     from: []const u8 = "",
     to: []const u8 = "",
     children: []const StanzaChild = &.{},
+    /// Exact wire bytes of the stanza, open tag through close tag (empty
+    /// when the producer supplied no spans). Nested structure lost by the
+    /// flat child capture (e.g. XEP-0313 result>forwarded>message) can be
+    /// re-parsed from this. Valid until the NEXT stanza is dispatched,
+    /// same lifetime as children.
+    raw: []const u8 = "",
 };
 
 pub const Parser = struct {
@@ -126,6 +132,10 @@ pub const Parser = struct {
     st_children_out: std.ArrayListUnmanaged(StanzaChild) = .{},
     st_child_open: bool = false,
     st_text: std.ArrayListUnmanaged(u8) = .{},
+    // Raw wire bytes of the open stanza, accumulated from the per-event
+    // spans onReaderEvent is given; empty when spans are not supplied.
+    st_raw: std.ArrayListUnmanaged(u8) = .{},
+    cur_span: ?[]const u8 = null,
 
     /// Set by the Session when the stream becomes active; bind1/sess1
     /// iq-result routing to the FSM applies only during establishment.
@@ -166,6 +176,7 @@ pub const Parser = struct {
         self.st_attrs.deinit(self.allocator);
         self.st_children_out.deinit(self.allocator);
         self.st_text.deinit(self.allocator);
+        self.st_raw.deinit(self.allocator);
     }
 
     pub fn reset(self: *Parser) void {
@@ -199,10 +210,22 @@ pub const Parser = struct {
         self.st_attrs.clearRetainingCapacity();
         self.st_children_out.clearRetainingCapacity();
         self.st_text.clearRetainingCapacity();
+        self.st_raw.clearRetainingCapacity();
         self.pending_stanza = null;
     }
 
-    pub fn onReaderEvent(self: *Parser, ev: xml.Event) bool {
+    pub fn onReaderEvent(self: *Parser, ev: xml.Event, span: ?[]const u8) bool {
+        self.cur_span = span;
+        // Raw capture: any event arriving while a stanza is open is part of
+        // its wire bytes. The opener is appended by beginStanza instead, so
+        // its span lands after the clear.
+        if (span) |s| {
+            // In-stanza text spans may end with the '<' of the next tag
+            // (scanner lookahead); appending them verbatim keeps the byte
+            // chain whole. Between stanzas the reader swallows whitespace,
+            // so beginStanza restores the opener's '<' itself.
+            if (self.in_stanza) self.st_raw.appendSlice(self.allocator, s) catch {};
+        }
         switch (ev) {
             .xml_declaration => return true,
             .stream_open => |el| {
@@ -624,6 +647,14 @@ pub const Parser = struct {
         self.st_children_out.clearRetainingCapacity();
         self.st_text.clearRetainingCapacity();
         self.st_child_open = false;
+        self.st_raw.clearRetainingCapacity();
+        // The span includes the opening '<' only when the scanner chained
+        // from the previous tag in one read; after (possibly swallowed)
+        // whitespace it starts at the tag name and the '<' is restored here.
+        if (self.cur_span) |s| {
+            if (s.len > 0 and s[0] != '<') self.st_raw.append(self.allocator, '<') catch {};
+            self.st_raw.appendSlice(self.allocator, s) catch {};
+        }
     }
 
     fn beginStanzaChild(self: *Parser, el: xml.Element) void {
@@ -694,6 +725,7 @@ pub const Parser = struct {
                 .from = self.st_from,
                 .to = self.st_to,
                 .children = self.st_children_out.items,
+                .raw = self.st_raw.items,
             };
         }
         self.in_stanza = false;
@@ -726,6 +758,16 @@ pub const Parser = struct {
 // Session's parse loop produces (stream_open, element_start, text,
 // element_end) rather than hand-constructed Elements.
 
+/// Feed one reader event to the parser with its exact byte span, the same
+/// contract the Session's parse loop fulfills for raw stanza capture.
+fn drive(parser: *Parser, reader: *Reader, input: []const u8, pos: *usize) bool {
+    const start = pos.*;
+    const ev = reader.next(input, pos) catch unreachable;
+    if (ev == null) return false;
+    if (!parser.onReaderEvent(ev.?, input[start..pos.*])) unreachable;
+    return true;
+}
+
 test "parser: pre-TLS features → starttls" {
     const allocator = std.testing.allocator;
     const input =
@@ -742,9 +784,7 @@ test "parser: pre-TLS features → starttls" {
     var got_feats: ?stream.Features = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             switch (sev) {
@@ -777,9 +817,7 @@ test "parser: post-auth features (bind+session-optional+sm)" {
     var got_feats: ?stream.Features = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .features) got_feats = sev.features;
@@ -810,9 +848,7 @@ test "parser: mechanisms list accumulates" {
     var got_feats: ?stream.Features = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .features) got_feats = sev.features;
@@ -841,9 +877,7 @@ test "parser: bind result IQ → bound_jid" {
     var got: ?stream.IqResult = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .iq_result) got = sev.iq_result;
@@ -869,9 +903,7 @@ test "parser: SM enabled" {
     var got: ?stream.SmResult = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .sm_result) got = sev.sm_result;
@@ -900,9 +932,7 @@ test "parser: self-closing SASL success settles immediately" {
     var got_success = false;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .sasl_success) got_success = true;
@@ -923,9 +953,7 @@ test "parser: SM resumed" {
     var got: ?stream.SmResult = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending) |sev| {
             parser.pending = null;
             if (sev == .sm_result) got = sev.sm_result;
@@ -953,9 +981,7 @@ test "parser: SM ack captured in pending_sm_a (T-9BC4D065)" {
     defer parser.deinit(allocator);
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
     }
     try std.testing.expectEqual(@as(?u32, 7), parser.pending_sm_a);
 }
@@ -977,9 +1003,7 @@ test "parser: message stanza captured with children" {
     var got: ?Stanza = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             stanzas += 1;
@@ -1022,9 +1046,7 @@ test "parser: self-closing presence captured empty; protocol iq not surfaced as 
     var iqs: usize = 0;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             stanzas += 1;
@@ -1059,9 +1081,7 @@ test "parser: two stanzas in one buffer both captured" {
     var n: usize = 0;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             kinds[n] = st.kind;
@@ -1085,9 +1105,7 @@ test "parser: child attrs survive later siblings (reader attr-list reuse)" {
     var got: ?Stanza = null;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             got = st;
@@ -1112,9 +1130,7 @@ test "parser: child text survives rolling-buffer growth" {
     defer parser.deinit(allocator);
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             // st_text grew past its initial capacity between the two
@@ -1146,9 +1162,7 @@ test "parser: application iq result surfaces; protocol iq stays with the FSM" {
     var id_len: usize = 0;
     var pos: usize = 0;
     while (true) {
-        const ev = reader.next(input, &pos) catch unreachable;
-        if (ev == null) break;
-        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (!drive(&parser, &reader, input, &pos)) break;
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             stanzas += 1;
@@ -1167,4 +1181,40 @@ test "parser: application iq result surfaces; protocol iq stays with the FSM" {
     try std.testing.expectEqual(@as(usize, 1), iq_results);
     try std.testing.expect(got_kind.? == .iq);
     try std.testing.expectEqualStrings("disco1", id_buf[0..id_len]);
+}
+
+test "parser: stanza raw wire bytes captured" {
+    const allocator = std.testing.allocator;
+    // MAM-shaped result: nested structure the flat child capture loses;
+    // raw must reproduce the exact wire bytes for re-parsing.
+    const stanza1 =
+        "<message from='dev@conference.localhost' to='bob@localhost/kumiko'>" ++
+        "<result xmlns='urn:xmpp:mam:2' queryid='q1' id='u-42'>" ++
+        "<forwarded xmlns='urn:xmpp:forward:0'>" ++
+        "<delay xmlns='urn:xmpp:delay' stamp='2026-09-30T18:22:10Z'/>" ++
+        "<message from='dev@conference.localhost/alice' type='groupchat'>" ++
+        "<body>backlog &lt;3</body></message>" ++
+        "</forwarded></result></message>";
+    const stanza2 = "<presence from='dev@conference.localhost/alice'/>";
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s9' from='localhost'>" ++
+        stanza1 ++ " \r\n" ++ stanza2;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var raws: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        if (!drive(&parser, &reader, input, &pos)) break;
+        if (parser.pending_stanza) |st| {
+            parser.pending_stanza = null;
+            raws += 1;
+            if (raws == 1) {
+                try std.testing.expectEqualStrings(stanza1, st.raw);
+            } else {
+                try std.testing.expectEqualStrings(stanza2, st.raw);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), raws);
 }

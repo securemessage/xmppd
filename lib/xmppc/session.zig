@@ -581,12 +581,13 @@ pub const Session = struct {
         const parser = self.parser orelse return;
         var pos: usize = 0;
         while (true) {
+            const ev_start = pos;
             const ev = self.reader.next(self.read_buf[0..self.read_len], &pos) catch {
                 self.fail(allocator, "xml-parse-error");
                 return;
             };
             if (ev == null) break;
-            if (!parser.onReaderEvent(ev.?)) {
+            if (!parser.onReaderEvent(ev.?, self.read_buf[ev_start..pos])) {
                 self.fail(allocator, "protocol-error");
                 return;
             }
