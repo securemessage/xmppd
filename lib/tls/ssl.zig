@@ -150,6 +150,22 @@ pub const SslContext = struct {
         return initClientWithCert(null, null);
     }
 
+    /// Initialize a client-side TLS context with standard PKIX verification:
+    /// the system CA trust store, chain validation, and per-connection
+    /// hostname checking (SslConn.setHostname). This is the fallback path
+    /// when no DANE TLSA records exist for the target.
+    pub fn initClientVerified() SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            return SslError.SslInitFailed;
+        }
+        return .{ .ctx = ctx };
+    }
+
     /// Initialize a client-side TLS context with a certificate for mutual TLS.
     ///
     /// The cert/key are presented to the remote server so it can authenticate us
@@ -266,6 +282,16 @@ pub const SslConn = struct {
         return SslConn{ .ssl = ssl, .sock_fd = fd };
     }
 
+    /// Require the peer certificate to match `hostname` (PKIX path only;
+    /// DANE mode authenticates via TLSA instead). Uses the connection's
+    /// X509_VERIFY_PARAM — call after initClient, before the handshake.
+    pub fn setHostname(self: *SslConn, hostname: [*:0]const u8) SslError!void {
+        const param = c.SSL_get0_param(self.ssl) orelse return SslError.SslInitFailed;
+        if (c.X509_VERIFY_PARAM_set1_host(param, hostname, 0) != 1) {
+            return SslError.SslInitFailed;
+        }
+    }
+
     /// Perform (or continue) the TLS handshake.
     ///
     /// For non-blocking sockets, this may return `want_read` or `want_write`.
@@ -282,14 +308,17 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             else => {
-                // Log the OpenSSL error queue for diagnostics
+                // Log the OpenSSL error queue for diagnostics. warn, not
+                // err: handshake failures are client-caused routine noise
+                // (bad certs, port scans, aborted probes), not daemon
+                // errors, and the caller reports the failure itself.
                 var err_buf: [256]u8 = undefined;
                 while (true) {
                     const e = c.ERR_get_error();
                     if (e == 0) break;
                     c.ERR_error_string_n(e, &err_buf, err_buf.len);
                     const log = std.log.scoped(.ssl);
-                    log.err("TLS handshake error: SSL_get_error={d} detail={s}", .{ err, @as([*:0]const u8, @ptrCast(&err_buf)) });
+                    log.warn("TLS handshake error: SSL_get_error={d} detail={s}", .{ err, @as([*:0]const u8, @ptrCast(&err_buf)) });
                 }
                 return SslError.HandshakeFailed;
             },

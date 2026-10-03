@@ -48,6 +48,10 @@ const Options = struct {
     // and two KTLS-armed endpoints desync across lo0 — FreeBSD PR 296498).
     // Only useful against non-KTLS peers or over a real NIC (IFCAP_MEXTPG).
     ktls: bool = false,
+    // Server authentication (T202): smoke targets lab rigs with self-signed
+    // certs, so verification defaults off. Use dane|pkix against rigs with
+    // TLSA records or real CA certs.
+    tls_policy: []const u8 = "none",
 
     fn parse(o: *Options, args: []const [:0]u8) !void {
         var i: usize = 1;
@@ -83,6 +87,8 @@ const Options = struct {
                         "  -resume SMID     (session 0 attempts SM resume of a prior session)\n" ++
                         "  -max-wait S      (seconds; default 15)\n" ++
                         "  -quiet           (suppress the per-event log lines)\n" ++
+                        "  -tls-policy P    (server auth: none|dane_first|pkix_only;\n" ++
+                        "                    default none — lab rigs are self-signed)\n" ++
                         "  -ktls            (keep KTLS armed on the client; only safe vs\n" ++
                         "                    non-KTLS peers or over a real NIC)\n",
                     .{},
@@ -118,6 +124,8 @@ const Options = struct {
                 o.resume_id = val;
             } else if (eqKey(key, "max-wait")) {
                 o.max_wait = parseOpt(u64, val);
+            } else if (eqKey(key, "tls-policy")) {
+                o.tls_policy = val;
             } else {
                 std.debug.print("smoke: unknown option -{s}\n", .{key});
                 return error.BadOption;
@@ -232,6 +240,10 @@ pub fn main() !void {
     var engine = try Engine.init(std.heap.page_allocator);
     defer engine.deinit();
     try engine.useTls(if (o.ktls) true else null);
+    engine.default_tls_policy = std.meta.stringToEnum(@TypeOf(engine.default_tls_policy), o.tls_policy) orelse {
+        std.debug.print("smoke: bad -tls-policy {s} (none|dane_first|pkix_only)\n", .{o.tls_policy});
+        std.c._exit(2);
+    };
 
     g.total = o.count;
     g.quiet = o.quiet;

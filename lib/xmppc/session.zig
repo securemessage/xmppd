@@ -29,6 +29,8 @@ const xml = @import("xml");
 const log = std.log.scoped(.xmppc);
 const xmpp = @import("xmpp");
 const ssl = @import("ssl");
+const tls = @import("tls");
+const dns = @import("dns");
 const stream = @import("stream.zig");
 const saslmod = @import("sasl.zig");
 
@@ -145,6 +147,18 @@ pub const Session = struct {
     /// (Transport owns the "identical pointer on TLS retry" pin state).
     tport: ?Transport = null,
     tls_handshake: bool = false,
+
+    /// Server-authentication policy for the TLS handshake (T202). Seeded
+    /// from Engine.default_tls_policy: dane_first matches the peer chain
+    /// against the resolution's TLSA records and falls back to PKIX
+    /// (system CA + hostname) only when none exist; none is lab-only.
+    tls_policy: tls.VerifyMode = .dane_first,
+    /// TLSA records to authenticate with when no resolution is attached
+    /// (test seam; hostname sessions get records per target from DNS).
+    dane_records: []const dns.TlsaRecord = &.{},
+    /// True while the handshake runs in DANE mode (VERIFY_NONE context):
+    /// the TLSA match runs on this thread the moment it completes.
+    pending_dane: bool = false,
 
     /// Requested TCP port for direct connects (kept for target iteration).
     port: u16 = 0,
@@ -317,6 +331,12 @@ pub const Session = struct {
                     // userland crypto is silent, so this is the only way to
                     // tell an armed context really offloaded.
                     log.info("fd={d} tls established ktls_send={} ktls_recv={}", .{ self.fd, tc.ktlsSend(), tc.ktlsRecv() });
+                    // DANE mode authenticated nothing yet: match the peer
+                    // chain against the TLSA records now, fail closed.
+                    if (self.pending_dane) {
+                        self.pending_dane = false;
+                        self.verifyDane(engine, tc) orelse return;
+                    }
                     // Reset the reader, then tell the FSM TLS is up; the FSM
                     // action re-sends <stream:stream> (RFC 6120 §4.6).
                     self.reader.reset();
@@ -441,6 +461,73 @@ pub const Session = struct {
         if (self.write_registered) return;
         engine.addWrite(self.fd, self.handle);
         self.write_registered = true;
+    }
+
+    /// TLSA records authenticating the current connection target: the test
+    /// seam's override first, then the resolution's per-target set.
+    fn currentTlsa(self: *const Session) []const dns.TlsaRecord {
+        if (self.dane_records.len > 0) return self.dane_records;
+        if (self.resolution) |*r| {
+            if (self.target_index < r.targets.len) return r.targets[self.target_index].tlsa;
+        }
+        return &.{};
+    }
+
+    /// Zero-terminated copy of the stream domain for SNI / hostname checks.
+    fn domainZ(buf: []u8, domain: []const u8) ?[*:0]const u8 {
+        if (domain.len == 0 or domain.len >= buf.len) return null;
+        @memcpy(buf[0..domain.len], domain);
+        buf[domain.len] = 0;
+        return buf[0..domain.len :0].ptr;
+    }
+
+    /// DANE match of the just-presented peer chain against the TLSA records
+    /// (engine thread, at handshake completion). Fails the session and
+    /// returns null on mismatch; logs which path validated (T202).
+    fn verifyDane(self: *Session, engine: *Engine, tc: *ssl.SslConn) ?void {
+        const allocator = engine.allocator;
+        const leaf = (tc.getPeerCertDer(allocator) catch null) orelse {
+            log.warn("fd={d} tls: no peer certificate for DANE match", .{self.fd});
+            self.fail(allocator, "tls-dane-mismatch");
+            return null;
+        };
+        defer allocator.free(leaf);
+        const chain = tc.getPeerChainDer(allocator) catch &.{};
+        defer {
+            for (chain) |cert| allocator.free(cert);
+            if (chain.len > 0) allocator.free(chain);
+        }
+
+        // Convert lib/dns records to lib/tls records, dropping any with
+        // out-of-range fields (their bytes never authenticate anything).
+        var converted: [16]tls.TlsaRecord = undefined;
+        var n: usize = 0;
+        for (self.currentTlsa()) |r| {
+            if (n == converted.len) break;
+            converted[n] = .{
+                .usage = std.enums.fromInt(tls.TlsaCertUsage, r.usage) orelse continue,
+                .selector = std.enums.fromInt(tls.TlsaSelector, r.selector) orelse continue,
+                .matching_type = std.enums.fromInt(tls.TlsaMatchingType, r.matching_type) orelse continue,
+                .association_data = r.association_data,
+            };
+            n += 1;
+        }
+        if (n == 0) {
+            log.warn("fd={d} tls: TLSA present for {s} but none usable — refusing", .{ self.fd, self.domain });
+            self.fail(allocator, "tls-dane-mismatch");
+            return null;
+        }
+
+        switch (tls.validateDane(leaf, chain, converted[0..n])) {
+            .dane_ee_match => log.info("fd={d} tls: DANE-EE match for {s}", .{ self.fd, self.domain }),
+            .dane_ta_match => log.info("fd={d} tls: DANE-TA match for {s}", .{ self.fd, self.domain }),
+            .no_tlsa_records => unreachable, // n > 0 above
+            .dane_failed => {
+                log.warn("fd={d} tls: DANE mismatch for {s} — refusing connection", .{ self.fd, self.domain });
+                self.fail(allocator, "tls-dane-mismatch");
+                return null;
+            },
+        }
     }
     fn disarmWrite(self: *Session, engine: *Engine) void {
         if (!self.write_registered) return;
@@ -683,6 +770,7 @@ pub const Session = struct {
         TlsMissing,
         TlsInitFailed,
         TlsDriveFailed,
+        TlsDomainTooLong,
     };
 
     fn actionFailReason(err: ActionError) []const u8 {
@@ -700,6 +788,7 @@ pub const Session = struct {
             error.TlsMissing => "tls-missing",
             error.TlsInitFailed => "tls-init-failed",
             error.TlsDriveFailed => "tls-handshake-failed",
+            error.TlsDomainTooLong => "tls-domain-too-long",
         };
     }
 
@@ -797,9 +886,29 @@ pub const Session = struct {
                 self.writeAfter(engine);
             },
             .begin_tls => {
-                const ctx = engine.tls_ctx orelse return error.TlsNotConfigured;
                 const tp = if (self.tport) |*t| t else return error.TlsMissing;
-                tp.upgradeToTls(ctx, null) catch return error.TlsInitFailed;
+                // T202 verification decision (before the handshake, since
+                // the PKIX path must verify during it):
+                //   dane_first + TLSA records  -> VERIFY_NONE ctx, manual
+                //     TLSA match at completion (fail closed on mismatch);
+                //   dane_first, no records   -> PKIX ctx (system CA) +
+                //     hostname check on the stream domain;
+                //   none                     -> lab path, no verification.
+                const records = self.currentTlsa();
+                const use_dane = self.tls_policy == .dane_first and records.len > 0;
+                var sni_buf: [256]u8 = undefined;
+                const sni = domainZ(&sni_buf, self.domain);
+                const ctx = if (use_dane or self.tls_policy == .none)
+                    engine.tls_ctx orelse return error.TlsNotConfigured
+                else
+                    engine.clientCaTlsContext() catch return error.TlsNotConfigured;
+                tp.upgradeToTls(ctx, sni) catch return error.TlsInitFailed;
+                if (!use_dane and self.tls_policy != .none) {
+                    const tc = tp.tlsConn() orelse return error.TlsMissing;
+                    const host = sni orelse return error.TlsDomainTooLong;
+                    tc.setHostname(host) catch return error.TlsInitFailed;
+                }
+                self.pending_dane = use_dane;
                 self.tls_handshake = true;
                 _ = self.onRead(engine) catch return error.TlsDriveFailed;
             },

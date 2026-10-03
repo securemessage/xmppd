@@ -27,10 +27,14 @@
 //! Consumers: the xmppd T32 load driver (phase 2), then Kumiko Chat (M9) via a
 //! thin C-ABI wrapper.
 //!
-//! SECURITY STATUS — lab-only for now: the TLS client context runs with
-//! SSL_VERIFY_NONE and no SNI/hostname check. DANE-first (TLSA) validation
-//! is the house-standard successor and is not wired in yet; until it lands,
-//! do not use this library against untrusted networks.
+//! SECURITY (T202/T-B5D56AD3): server authentication is DANE-first.
+//! `Session.tls_policy` (seeded from `Engine.default_tls_policy`) selects:
+//!   * dane_first (default) — the resolution's TLSA records authenticate the
+//!     peer chain (DANE-EE or DANE-TA; fail closed on mismatch); only when no
+//!     TLSA exists does it fall back to PKIX (system CA store + hostname
+//!     check against the stream domain, which is also the SNI).
+//!   * none — lab rigs only: SSL_VERIFY_NONE, no hostname check. Never use
+//!     against untrusted networks.
 
 pub const stream = @import("stream.zig");
 pub const sasl = @import("sasl.zig");

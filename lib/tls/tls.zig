@@ -21,35 +21,65 @@ pub const VerifyMode = enum {
 
 /// Certificate fingerprint for DANE matching.
 pub const CertFingerprint = struct {
+    /// Raw DER of the certificate (matching type 0, selector 0).
+    der: []const u8 = "",
+    /// Raw DER of the SubjectPublicKeyInfo (matching type 0, selector 1).
+    spki_der: []const u8 = "",
     /// SHA-256 hash of the full DER-encoded certificate
     full: [32]u8 = undefined,
     /// SHA-256 hash of the SubjectPublicKeyInfo (SPKI)
     spki: [32]u8 = undefined,
+    /// SHA-512 hash of the full certificate / SPKI
+    full512: [64]u8 = undefined,
+    spki512: [64]u8 = undefined,
 
     /// Compute fingerprints from a DER-encoded certificate.
+    /// The returned struct borrows `der` — it must outlive the fingerprint.
     pub fn fromDer(der: []const u8) CertFingerprint {
         var fp = CertFingerprint{};
-        // Full certificate hash
+        fp.der = der;
         std.crypto.hash.sha2.Sha256.hash(der, &fp.full, .{});
-        // SPKI hash requires parsing the certificate to extract the public key info
-        // For MVP, we extract SPKI using a simplified ASN.1 parser
+        std.crypto.hash.sha2.Sha512.hash(der, &fp.full512, .{});
         if (extractSpki(der)) |spki_bytes| {
+            fp.spki_der = spki_bytes;
             std.crypto.hash.sha2.Sha256.hash(spki_bytes, &fp.spki, .{});
+            std.crypto.hash.sha2.Sha512.hash(spki_bytes, &fp.spki512, .{});
         } else {
-            // Fallback: use full cert hash for SPKI too
+            // Unparseable cert: SPKI selectors can never exact-match, and
+            // their hashes fall back to the full-cert hashes.
             fp.spki = fp.full;
+            fp.spki512 = fp.full512;
         }
         return fp;
     }
 
-    /// Compare fingerprint against a DANE TLSA association data.
-    pub fn matches(self: *const CertFingerprint, selector: TlsaSelector, association_data: []const u8) bool {
-        if (association_data.len != 32) return false;
-        const hash = switch (selector) {
-            .full_certificate => &self.full,
-            .subject_public_key_info => &self.spki,
-        };
-        return std.mem.eql(u8, hash, association_data);
+    /// Compare fingerprint against a TLSA association per its matching type.
+    pub fn matches(self: *const CertFingerprint, selector: TlsaSelector, matching_type: TlsaMatchingType, association_data: []const u8) bool {
+        switch (matching_type) {
+            .exact => {
+                const raw: []const u8 = switch (selector) {
+                    .full_certificate => self.der,
+                    .subject_public_key_info => self.spki_der,
+                };
+                return raw.len > 0 and std.mem.eql(u8, raw, association_data);
+            },
+            .sha256 => {
+                if (association_data.len != 32) return false;
+                const hash = switch (selector) {
+                    .full_certificate => &self.full,
+                    .subject_public_key_info => &self.spki,
+                };
+                return std.mem.eql(u8, hash, association_data);
+            },
+            .sha512 => {
+                if (association_data.len != 64) return false;
+                const hash = switch (selector) {
+                    .full_certificate => &self.full512,
+                    .subject_public_key_info => &self.spki512,
+                };
+                return std.mem.eql(u8, hash, association_data);
+            },
+        }
     }
 };
 
@@ -90,8 +120,7 @@ pub const TlsaRecord = struct {
 
     /// Check if this TLSA record matches a certificate fingerprint.
     pub fn matchesCert(self: *const TlsaRecord, fingerprint: *const CertFingerprint) bool {
-        if (self.matching_type != .sha256) return false; // We only support SHA-256 for now
-        return fingerprint.matches(self.selector, self.association_data);
+        return fingerprint.matches(self.selector, self.matching_type, self.association_data);
     }
 };
 
@@ -305,6 +334,47 @@ test "TLSA record matching" {
     };
 
     try std.testing.expect(record.matchesCert(&fp));
+}
+
+test "TLSA record matching: exact and SHA-512" {
+    const fake_cert = "certificate bytes for exact and sha512 matching";
+    const fp = CertFingerprint.fromDer(fake_cert);
+
+    // Exact (matching type 0): full raw bytes, full-cert selector.
+    const exact = TlsaRecord{
+        .usage = .dane_ee,
+        .selector = .full_certificate,
+        .matching_type = .exact,
+        .association_data = fake_cert,
+    };
+    try std.testing.expect(exact.matchesCert(&fp));
+
+    // SHA-512 (matching type 2): 64-byte hash.
+    const sha512_rec = TlsaRecord{
+        .usage = .dane_ee,
+        .selector = .full_certificate,
+        .matching_type = .sha512,
+        .association_data = &fp.full512,
+    };
+    try std.testing.expect(sha512_rec.matchesCert(&fp));
+
+    // SPKI selector falls back to full-cert hashes for unparseable certs.
+    const spki_sha256 = TlsaRecord{
+        .usage = .dane_ee,
+        .selector = .subject_public_key_info,
+        .matching_type = .sha256,
+        .association_data = &fp.spki,
+    };
+    try std.testing.expect(spki_sha256.matchesCert(&fp));
+
+    // Wrong length association data never matches.
+    const short = TlsaRecord{
+        .usage = .dane_ee,
+        .selector = .full_certificate,
+        .matching_type = .sha256,
+        .association_data = fake_cert[0..16],
+    };
+    try std.testing.expect(!short.matchesCert(&fp));
 }
 
 test "TLSA record non-matching" {

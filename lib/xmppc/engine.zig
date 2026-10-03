@@ -27,6 +27,7 @@
 const std = @import("std");
 const ssl = @import("ssl");
 const sasl = @import("sasl");
+const tls = @import("tls");
 
 const Session = @import("session.zig").Session;
 const SessionConfig = @import("session.zig").SessionConfig;
@@ -137,6 +138,12 @@ pub const Engine = struct {
     resolver_tick_armed: bool = false,
 
     tls_ctx: ?ssl.SslContext = null,
+    /// PKIX-verifying client context (lazy): system CA store, per-connection
+    /// hostname check. Fallback when DANE brought no TLSA records (T202).
+    tls_ctx_ca: ?ssl.SslContext = null,
+    /// Server-authentication policy seeded into each new session
+    /// (dane_first default; lab rigs set .none — see xmppc.zig).
+    default_tls_policy: tls.VerifyMode = .dane_first,
     thread: ?std.Thread = null,
 
     /// The single event sink for all sessions (T-25A16875 c): established,
@@ -228,6 +235,7 @@ pub const Engine = struct {
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
+        if (self.tls_ctx_ca) |*c| c.deinit();
         // Leftover posted-but-never-applied commands.
         for (self.cmd_active.items) |*c| self.allocator.free(cmdPayload(c));
         for (self.cmd_spare.items) |*c| self.allocator.free(cmdPayload(c));
@@ -375,6 +383,16 @@ pub const Engine = struct {
         if (!(ktls orelse false)) self.tls_ctx.?.disableKtls();
     }
 
+    /// PKIX-verifying client context (lazy init): system CA trust store.
+    /// Sessions use it when their policy requires verification but the
+    /// resolution brought no TLSA records (T202 fallback order).
+    pub fn clientCaTlsContext(self: *Engine) !ssl.SslContext {
+        if (self.tls_ctx_ca == null) {
+            self.tls_ctx_ca = ssl.SslContext.initClientVerified() catch return error.TlsInit;
+        }
+        return self.tls_ctx_ca.?;
+    }
+
     pub fn sessionCount(self: *const Engine) usize {
         return self.live_count;
     }
@@ -497,6 +515,7 @@ pub const Engine = struct {
             return error.OutOfMemory;
         };
         s.port = config.port;
+        s.tls_policy = self.default_tls_policy;
 
         // Literal IP: skip DNS entirely (lab rigs, explicit endpoints).
         if (std.net.Address.parseIp(config.host, 0)) |_| {
@@ -589,6 +608,7 @@ pub const Engine = struct {
             s.destroy(self.allocator);
             return error.OutOfMemory;
         };
+        s.tls_policy = self.default_tls_policy;
         return self.attachPrepared(&s, fd);
     }
 

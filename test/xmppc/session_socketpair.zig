@@ -19,10 +19,13 @@
 const std = @import("std");
 const xmppc = @import("xmppc");
 const ssl_mod = @import("ssl");
+const tls_mod = @import("tls");
+const dns_mod = @import("dns");
 const sasl_mod = @import("sasl");
 
 const posix = std.posix;
 const Engine = xmppc.Engine;
+
 const Session = xmppc.Session;
 const SessionConfig = xmppc.SessionConfig;
 const Event = xmppc.Event;
@@ -295,7 +298,16 @@ const Rig = struct {
     }
 };
 
-fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *Engine, handle: Handle } {
+const SetupCtx = struct { rig: Rig, engine: *Engine, handle: Handle };
+
+fn setup(alloc: std.mem.Allocator, use_tls: bool) !SetupCtx {
+    return setupPolicy(alloc, use_tls, .none, &.{});
+}
+
+/// setup with an explicit server-authentication policy (T202): lab tests
+/// pass .none, the DANE/PKIX tests pass .dane_first with (or without)
+/// TLSA records injected through the session's test seam.
+fn setupPolicy(alloc: std.mem.Allocator, use_tls: bool, tls_policy: tls_mod.VerifyMode, dane_records: []const dns_mod.TlsaRecord) !SetupCtx {
     cur_mutex.lock();
     cur_outcome = .{};
     cur_stanzas.clearRetainingCapacity();
@@ -324,6 +336,11 @@ fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *E
         // covered live by the smoke client).
         s.fsm.tls_required = false;
         s.fsm.allow_plain = true;
+        // Lab policy: the in-test cert is self-signed and there is no DNS
+        // here, so PKIX/DANE verification stays off unless the test asked
+        // for it (T202).
+        s.tls_policy = tls_policy;
+        s.dane_records = dane_records;
     }
 
     try engine.run();
@@ -481,6 +498,7 @@ test "socketpair: two SCRAM logins on one engine derive once (SaltedPassword cac
         const s = engine.sessionAt(h).?;
         s.fsm.tls_required = false;
         s.fsm.allow_plain = true;
+        s.tls_policy = .none; // lab rig, see setup()
     }
 
     var rig_a = Rig{ .fake_fd = fds_a[1] };
@@ -823,12 +841,25 @@ test "socketpair: partial writes under a tiny send buffer all arrive" {
     try std.testing.expectEqual(big.len, got);
 }
 
-test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
-    const alloc = std.testing.allocator;
+// ---------------------------------------------------------------------------
+// TLS test scaffolding (in-test PKI + scripted STARTTLS upgrade)
+// ---------------------------------------------------------------------------
 
-    // In-test PKI: write the embedded throwaway cert where SslContext can read it.
+const TlsServer = struct {
+    tmp: std.testing.TmpDir,
+    server_ctx: ssl_mod.SslContext,
+
+    fn deinit(self: *TlsServer) void {
+        self.server_ctx.deinit();
+        self.tmp.cleanup();
+    }
+};
+
+/// In-test PKI: write the embedded throwaway cert where SslContext can read
+/// it and build the fake server's TLS context.
+fn makeTlsServer(alloc: std.mem.Allocator) !TlsServer {
     var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    errdefer tmp.cleanup();
     {
         const cf = try tmp.dir.createFile("cert.pem", .{});
         defer cf.close();
@@ -839,11 +870,6 @@ test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
         defer kf.close();
         try kf.writeAll(TEST_PEM_KEY);
     }
-
-    const ctx_use_tls = true;
-    var ctx = try setup(alloc, ctx_use_tls);
-    defer teardown(alloc, &ctx.rig, ctx.engine);
-
     const cert_pre = try tmp.dir.realpathAlloc(alloc, "cert.pem");
     defer alloc.free(cert_pre);
     const key_pre = try tmp.dir.realpathAlloc(alloc, "key.pem");
@@ -852,38 +878,79 @@ test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
     defer alloc.free(cert_path);
     const key_path = try alloc.dupeZ(u8, key_pre);
     defer alloc.free(key_path);
-    var server_ctx = try ssl_mod.SslContext.initServer(cert_path, key_path);
-    defer server_ctx.deinit();
+    return .{ .tmp = tmp, .server_ctx = try ssl_mod.SslContext.initServer(cert_path, key_path) };
+}
 
+/// Base64-decode the embedded throwaway cert's DER (association data for
+/// the DANE tests' TLSA records).
+fn testCertDer(buf: []u8) ![]const u8 {
+    const hdr = "-----BEGIN CERTIFICATE-----";
+    const ftr = "-----END CERTIFICATE-----";
+    const s = std.mem.indexOf(u8, TEST_PEM_CERT, hdr).? + hdr.len;
+    const e = std.mem.indexOf(u8, TEST_PEM_CERT, ftr).?;
+    var b64: [4096]u8 = undefined;
+    var n: usize = 0;
+    for (TEST_PEM_CERT[s..e]) |ch| {
+        if (ch == '\n' or ch == '\r') continue;
+        b64[n] = ch;
+        n += 1;
+    }
+    const dec = std.base64.standard.Decoder;
+    const out_len = try dec.calcSizeForSlice(b64[0..n]);
+    try dec.decode(buf[0..out_len], b64[0..n]);
+    return buf[0..out_len];
+}
+
+/// Script the STARTTLS negotiation and drive the server side of the
+/// handshake (the client side runs on the engine's kqueue concurrently).
+/// `tolerate_abort` is for the PKIX-fallback test, where the client is
+/// expected to kill the handshake on seeing the self-signed cert.
+fn driveTlsUpgrade(server: *TlsServer, rig: *Rig, tolerate_abort: bool) !void {
     // Pre-TLS features advertise STARTTLS as required (mirrors xmppd).
-    try ctx.rig.send("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-t1' version='1.0'>" ++
+    try rig.send("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-t1' version='1.0'>" ++
         "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>");
-    try ctx.rig.expect("<starttls", 2000);
-    try ctx.rig.send("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    try rig.expect("<starttls", 2000);
+    try rig.send("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
 
-    // Arm the server side and drive the handshake until complete (the client
-    // side is driven by the engine's kqueue loop concurrently).
-    ctx.rig.tls_conn = try ssl_mod.SslConn.init(server_ctx, ctx.rig.fake_fd);
-    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    rig.tls_conn = try ssl_mod.SslConn.init(server.server_ctx, rig.fake_fd);
     var done = false;
     const hs_deadline = std.time.milliTimestamp() + 5000;
     while (!done and std.time.milliTimestamp() < hs_deadline) {
-        const res = try ctx.rig.tls_conn.?.doHandshake();
+        const res = rig.tls_conn.?.doHandshake() catch |err| {
+            if (tolerate_abort) return; // client aborted, as expected
+            return err;
+        };
         done = res == .complete;
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    if (!done) return error.TlsHandshakeTimeout;
+    if (!done and !tolerate_abort) return error.TlsHandshakeTimeout;
+}
 
-    // Post-TLS script: same happy path over the secure channel.
-    try ctx.rig.send(pre_tls_features); // mechanisms over TLS now
-    try ctx.rig.expect("<auth", 3000);
-    try ctx.rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
-    try ctx.rig.expect("<stream:stream", 3000);
-    try sendPostAuthFeatures(&ctx.rig);
-    try ctx.rig.expect("<bind", 3000);
-    try ctx.rig.send("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/smoke</jid></bind></iq>");
-    try ctx.rig.expect("<enable", 3000);
-    try ctx.rig.send("<enabled xmlns='urn:xmpp:sm:3' id='sm-tls' resume='true'/>");
+/// Post-TLS happy path: PLAIN auth, bind, SM enable (id 'sm-tls').
+fn drivePostAuthPlain(rig: *Rig) !void {
+    try rig.send(pre_tls_features); // mechanisms over TLS now
+    try rig.expect("<auth", 3000);
+    try rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+    try rig.expect("<stream:stream", 3000);
+    try sendPostAuthFeatures(rig);
+    try rig.expect("<bind", 3000);
+    try rig.send("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/smoke</jid></bind></iq>");
+    try rig.expect("<enable", 3000);
+    try rig.send("<enabled xmlns='urn:xmpp:sm:3' id='sm-tls' resume='true'/>");
+}
+
+test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    const ctx_use_tls = true;
+    var ctx = try setup(alloc, ctx_use_tls);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
 
     const out = waitTerminal(5000);
     try std.testing.expect(out.established);
@@ -893,4 +960,75 @@ test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
     // flags were actually observed (guardrails rule 3), both directions.
     try std.testing.expect(!out.ktls_send);
     try std.testing.expect(!out.ktls_recv);
+}
+
+test "socketpair: DANE-EE TLSA match authenticates the TLS peer" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    // TLSA 3 0 1: DANE-EE, full cert, SHA-256 of the throwaway cert's DER.
+    var der_buf: [4096]u8 = undefined;
+    const der = try testCertDer(&der_buf);
+    const fp = tls_mod.CertFingerprint.fromDer(der);
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = &fp.full },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
+
+    const out = waitTerminal(5000);
+    if (!out.established) std.debug.print("dane-ee not established: failed={} reason='{s}'\n", .{ out.failed, out.reason });
+    try std.testing.expect(out.established);
+    try std.testing.expectEqualStrings("alice@localhost/smoke", out.bound_jid);
+    try std.testing.expectEqualStrings("sm-tls", out.sm_id);
+}
+
+test "socketpair: DANE mismatch fails closed" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    // Same shape as the matching test, but the hash belongs to no cert.
+    var wrong_hash: [32]u8 = [_]u8{0xAB} ** 32;
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = &wrong_hash },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    // The client must refuse the moment the handshake completes — before
+    // any post-TLS traffic.
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
+}
+
+test "socketpair: no TLSA falls back to PKIX and rejects the self-signed rig cert" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    // dane_first with no records: PKIX path (system CA + hostname). The
+    // in-test cert is self-signed, so the handshake must die.
+    var ctx = try setupPolicy(alloc, true, .dane_first, &.{});
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true); // client aborts mid-handshake
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-handshake-failed", out.reason);
 }
