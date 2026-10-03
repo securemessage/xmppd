@@ -15,12 +15,15 @@ const stream = @import("stream.zig");
 const Jid = xmpp.Jid;
 const Reader = xml.Reader;
 
-fn b64dec(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+const SASL_RAW_MAX = 1024; // comfortably covers any legal SCRAM/PLAIN message
+
+/// Decode base64 into a caller-owned fixed buffer (no heap on the hot path).
+fn b64decInto(out: []u8, input: []const u8) ![]const u8 {
     const dec = std.base64.standard.Decoder;
     const len = try dec.calcSizeForSlice(input);
-    const buf = try allocator.alloc(u8, len);
-    try dec.decode(buf, input);
-    return buf[0..len];
+    if (len > out.len) return error.SaslMessageTooLong;
+    try dec.decode(out[0..len], input);
+    return out[0..len];
 }
 
 pub const Parser = struct {
@@ -36,8 +39,10 @@ pub const Parser = struct {
     sasl_kind: enum { none, auth, challenge, success, failure } = .none,
     sasl_text: std.ArrayListUnmanaged(u8) = .{},
     sasl_cond: []const u8 = "",
-    sasl_challenge_raw: ?[]const u8 = null,
-    sasl_success_raw: ?[]const u8 = null,
+    sasl_challenge_buf: [SASL_RAW_MAX]u8 = undefined,
+    sasl_challenge_len: usize = 0,
+    sasl_success_buf: [SASL_RAW_MAX]u8 = undefined,
+    sasl_success_len: usize = 0,
 
     // IQ stanza (bind/session result)
     in_iq: bool = false,
@@ -65,9 +70,16 @@ pub const Parser = struct {
         return .{ .allocator = allocator };
     }
 
+    pub fn saslChallengeRaw(self: *const Parser) ?[]const u8 {
+        if (self.sasl_challenge_len == 0) return null;
+        return self.sasl_challenge_buf[0..self.sasl_challenge_len];
+    }
+    pub fn saslSuccessRaw(self: *const Parser) ?[]const u8 {
+        if (self.sasl_success_len == 0) return null;
+        return self.sasl_success_buf[0..self.sasl_success_len];
+    }
+
     pub fn deinit(self: *Parser, allocator: std.mem.Allocator) void {
-        if (self.sasl_challenge_raw) |raw| allocator.free(raw);
-        if (self.sasl_success_raw) |raw| allocator.free(raw);
         for (self.mech_names.items) |name| allocator.free(name);
         self.mech_names.deinit(self.allocator);
         self.sasl_text.deinit(self.allocator);
@@ -75,8 +87,6 @@ pub const Parser = struct {
     }
 
     pub fn reset(self: *Parser) void {
-        if (self.sasl_challenge_raw) |raw| self.allocator.free(raw);
-        if (self.sasl_success_raw) |raw| self.allocator.free(raw);
         self.in_features = false;
         self.feats = .{};
         // Each name is individually duped; freeing here mirrors deinit().
@@ -86,8 +96,8 @@ pub const Parser = struct {
         self.sasl_kind = .none;
         self.sasl_text.clearRetainingCapacity();
         self.sasl_cond = "";
-        self.sasl_challenge_raw = null;
-        self.sasl_success_raw = null;
+        self.sasl_challenge_len = 0;
+        self.sasl_success_len = 0;
         self.pending = null;
         self.in_iq = false;
         self.iq_type = "";
@@ -343,18 +353,16 @@ pub const Parser = struct {
             .auth => self.sasl_kind = .none,
             .challenge => {
                 const b64 = std.mem.trim(u8, self.sasl_text.items, " \t\r\n");
-                const raw = b64dec(self.allocator, b64) catch return false;
-                if (self.sasl_challenge_raw) |old| self.allocator.free(old);
-                self.sasl_challenge_raw = raw;
+                const raw = b64decInto(&self.sasl_challenge_buf, b64) catch return false;
+                self.sasl_challenge_len = raw.len;
                 self.pending = .{ .sasl_challenge = raw };
                 self.sasl_kind = .none;
             },
             .success => {
                 // base64 server-final; the Session verifies via SaslClient.
                 const b64 = std.mem.trim(u8, self.sasl_text.items, " \t\r\n");
-                const raw = b64dec(self.allocator, b64) catch return false;
-                if (self.sasl_success_raw) |old| self.allocator.free(old);
-                self.sasl_success_raw = raw;
+                const raw = b64decInto(&self.sasl_success_buf, b64) catch return false;
+                self.sasl_success_len = raw.len;
                 self.pending = .{ .sasl_success = raw };
                 self.sasl_kind = .none;
             },

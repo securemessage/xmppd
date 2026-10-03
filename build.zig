@@ -111,6 +111,22 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("xmppc-smoke", "Build the xmppc end-to-end smoke client (zig-out/bin/xmppc-smoke)");
     smoke_step.dependOn(&smoke_install.step);
 
+    // xmppc-memprobe: per-session allocation shape A/B (T-09BD8909).
+    const memprobe_mod = b.createModule(.{
+        .root_source_file = b.path("test/xmppc/memprobe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    memprobe_mod.addImport("xmppc", xmppc_mod);
+    const memprobe_exe = b.addExecutable(.{
+        .name = "xmppc-memprobe",
+        .root_module = memprobe_mod,
+    });
+    const memprobe_install = b.addInstallArtifact(memprobe_exe, .{});
+    const memprobe_step = b.step("xmppc-memprobe", "Build the xmppc per-session memory probe");
+    memprobe_step.dependOn(&memprobe_install.step);
+
     // --- Tests ---
 
     const xml_test_mod = b.createModule(.{

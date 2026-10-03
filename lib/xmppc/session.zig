@@ -37,12 +37,28 @@ const posix = std.posix;
 
 const READ_BUF_SIZE = 1 << 16;
 
-fn b64enc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+/// Buffers start small and grow on demand; shrink back when fully drained.
+/// (T-09BD8909: a session must not cost 128 KiB at rest.)
+const BUF_INITIAL_SIZE = 1 << 12; // 4 KiB
+/// Hard cap on a single incoming element's buffered bytes; a larger element
+/// fails the session with policy-violation (an unlimited growth was a DoS
+/// vector). Sized far above any legal stanza (~10 KiB is typical).
+const MAX_READ_BUF_SIZE = 1 << 20; // 1 MiB
+
+/// Max wire footprint of one SASL strophe after base64 (~1.34× the raw cap).
+const SASL_ENC_MAX = 2048;
+
+/// Encode base64 into a caller-owned fixed buffer (no heap on the hot path).
+fn b64encInto(out: []u8, input: []const u8) ![]const u8 {
     const enc = std.base64.standard.Encoder;
-    const buf = try allocator.alloc(u8, enc.calcSize(input.len));
-    _ = enc.encode(buf, input);
-    return buf;
+    const len = enc.calcSize(input.len);
+    if (len > out.len) return error.SaslMessageTooLong;
+    _ = enc.encode(out[0..len], input);
+    return out[0..len];
 }
+
+/// Decode is the parser's job (parser.zig owns its own fixed scratch).
+/// session.zig encodes into SASL_ENC_MAX-sized stack buffers.
 
 // ============================================================================
 // Session
@@ -97,6 +113,9 @@ pub const Session = struct {
     read_len: usize = 0,
     write_buf: []u8,
     write_len: usize = 0,
+    /// Write start offset: sends consume [write_start..write_len]; the
+    /// consumed prefix compacts lazily (never while a TLS write is pinned).
+    write_start: usize = 0,
     /// Registration bookkeeping: stage writes only on transitions so that a
     /// duplicate EV_DELETE can't surface as a changelist EV_ERROR (ENOENT).
     read_registered: bool = false,
@@ -124,8 +143,8 @@ pub const Session = struct {
             .engine = undefined, // set by Engine.startSession
             .reader = Reader.init(allocator),
             .parser = parser,
-            .read_buf = try allocator.alloc(u8, READ_BUF_SIZE),
-            .write_buf = try allocator.alloc(u8, READ_BUF_SIZE),
+            .read_buf = try allocator.alloc(u8, BUF_INITIAL_SIZE),
+            .write_buf = try allocator.alloc(u8, BUF_INITIAL_SIZE),
         };
     }
 
@@ -249,7 +268,13 @@ pub const Session = struct {
 
         while (true) {
             if (self.read_len >= self.read_buf.len) {
-                const nb = engine.allocator.realloc(self.read_buf, self.read_buf.len * 2) catch return error.OutOfMemory;
+                // A session sock the parser refuses to finish could otherwise
+                // grow without bound (craft a huge element): cap it.
+                if (self.read_buf.len >= MAX_READ_BUF_SIZE) {
+                    self.fail(engine.allocator, "policy-violation");
+                    return;
+                }
+                const nb = engine.allocator.realloc(self.read_buf, @min(self.read_buf.len * 2, MAX_READ_BUF_SIZE)) catch return error.OutOfMemory;
                 self.read_buf = nb;
             }
             const space = self.read_buf.len - self.read_len;
@@ -271,6 +296,10 @@ pub const Session = struct {
         // (e.g. an `<enabled>` closed) that hasn't been fed to the FSM, and
         // OpenSSL may have decrypted bytes buffered across a WANT_READ boundary.
         try self.parseAll(engine);
+        // Shrink back to the idle footprint once the buffer fully drained.
+        if (self.read_len == 0 and self.read_buf.len > BUF_INITIAL_SIZE) {
+            self.read_buf = engine.allocator.realloc(self.read_buf, BUF_INITIAL_SIZE) catch self.read_buf;
+        }
     }
 
     /// Kernel-TLS offload state per direction. Both false when not using
@@ -391,15 +420,24 @@ pub const Session = struct {
         }
         if (self.write_len + data.len > self.write_buf.len) {
             // Growing would move write_buf under a pending TLS retry.
-            if (self.tport != null and self.tport.?.hasPendingWrite()) {
+            const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
+            if (tls_pinned) {
                 try self.overflow.appendSlice(self.engine.allocator, data);
                 return;
             }
-            const need = self.write_len + data.len;
-            var cap = @max(self.write_buf.len, 1);
-            while (cap < need) cap *= 2;
-            const nb = self.engine.allocator.realloc(self.write_buf, cap) catch return error.OutOfMemory;
-            self.write_buf = nb;
+            // Compact the consumed prefix first — growth is the last resort.
+            if (self.write_start > 0) {
+                std.mem.copyForwards(u8, self.write_buf, self.write_buf[self.write_start..self.write_len]);
+                self.write_len -= self.write_start;
+                self.write_start = 0;
+            }
+            if (self.write_len + data.len > self.write_buf.len) {
+                const need = self.write_len + data.len;
+                var cap = @max(self.write_buf.len, 1);
+                while (cap < need) cap *= 2;
+                const nb = self.engine.allocator.realloc(self.write_buf, cap) catch return error.OutOfMemory;
+                self.write_buf = nb;
+            }
         }
         std.mem.copyForwards(u8, self.write_buf[self.write_len..], data);
         self.write_len += data.len;
@@ -414,7 +452,7 @@ pub const Session = struct {
 
     fn flushWrites(self: *Session, engine: *Engine) void {
         const trace = std.posix.getenv("XMPPC_EVTRACE") != null;
-        while (self.write_len > 0) {
+        while (self.write_start < self.write_len) {
             // sendSome returns 0 only for would-block / TLS WANT_*; any error
             // is fatal (a swallowed TLS write error would stall the session).
             const n = self.sendSome() catch {
@@ -426,7 +464,7 @@ pub const Session = struct {
                 self.armWrite(engine);
                 return;
             }
-            if (trace) std.debug.print("[flush wrote {d}, left {d}]\n", .{ n, self.write_len - n });
+            if (trace) std.debug.print("[flush wrote {d}, left {d}]\n", .{ n, self.write_len - self.write_start - n });
             self.consumeWritten(n) catch {
                 self.fail(self.engine.allocator, "queue-error");
                 return;
@@ -437,10 +475,20 @@ pub const Session = struct {
 
     /// Drop `n` written bytes; the pending TLS retry (if any) is credited,
     /// and overflowed bytes rejoin write_buf when the pin fully releases.
+    /// The consumed prefix is tracked by offset — write_buf is only
+    /// compacted/shrunk lazily, never under a pending TLS write.
     fn consumeWritten(self: *Session, n: usize) !void {
         if (self.tport) |*tp| tp.writeCompleted(n);
-        std.mem.copyForwards(u8, self.write_buf, self.write_buf[n..self.write_len]);
-        self.write_len -= n;
+        self.write_start += n;
+        if (self.write_start == self.write_len) {
+            self.write_start = 0;
+            self.write_len = 0;
+            // Back to the idle footprint when the pipe drained fully.
+            if (self.overflow.items.len == 0 and self.write_buf.len > BUF_INITIAL_SIZE) {
+                const t = self.engine.allocator.realloc(self.write_buf, BUF_INITIAL_SIZE);
+                if (t) |nb| self.write_buf = nb else |_| {}
+            }
+        }
         if (self.overflow.items.len > 0) {
             const pending = self.overflow.items;
             // Capacity is retained, so `pending` stays valid for the copy.
@@ -451,7 +499,7 @@ pub const Session = struct {
 
     fn sendSome(self: *Session) !usize {
         const tp = if (self.tport) |*t| t else return error.NoTransport;
-        return switch (try tp.write(self.write_buf[0..self.write_len])) {
+        return switch (try tp.write(self.write_buf[self.write_start..self.write_len])) {
             .data => |n| n,
             .would_block => 0,
             .closed => error.ConnectionClosed,
@@ -506,11 +554,12 @@ pub const Session = struct {
                     self.fail(allocator, "sasl-init-failed");
                     return;
                 };
-                const b64 = b64enc(allocator, raw) catch {
+                // Stack-scratch encoding (T-09BD8909: no heap per step).
+                var enc_buf: [SASL_ENC_MAX]u8 = undefined;
+                const b64 = b64encInto(&enc_buf, raw) catch {
                     self.fail(allocator, "b64-error");
                     return;
                 };
-                defer allocator.free(b64);
                 self.queuef("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='{s}'>{s}</auth>", .{ mech, b64 }) catch {
                     self.fail(allocator, "queue-error");
                     return;
@@ -519,16 +568,17 @@ pub const Session = struct {
             },
             .send_sasl_response => {
                 const sc = self.sasl orelse return self.fail(allocator, "sasl-not-active");
-                const raw = self.parser.?.sasl_challenge_raw orelse return self.fail(allocator, "sasl-no-challenge");
+                const pr = self.parser orelse return self.fail(allocator, "sasl-no-parser");
+                const raw = pr.saslChallengeRaw() orelse return self.fail(allocator, "sasl-no-challenge");
                 const next = sc.handleChallenge(raw) catch {
                     self.fail(allocator, "sasl-challenge-error");
                     return;
                 } orelse return; // client-final already sent; await <success>
-                const b64 = b64enc(allocator, next) catch {
+                var enc_buf: [SASL_ENC_MAX]u8 = undefined;
+                const b64 = b64encInto(&enc_buf, next) catch {
                     self.fail(allocator, "b64-error");
                     return;
                 };
-                defer allocator.free(b64);
                 self.queuef("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</response>", .{b64}) catch {
                     self.fail(allocator, "queue-error");
                     return;
