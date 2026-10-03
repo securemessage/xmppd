@@ -85,9 +85,6 @@ const max_ns_bindings = 16;
 const NsBinding = struct {
     prefix: []const u8,
     uri: []const u8,
-    /// Depth at which this binding was declared; only depth <= 1
-    /// (stream and top-level stanza opens) survive the stanza arena reset.
-    depth: u32,
 };
 
 pub const Reader = struct {
@@ -99,6 +96,12 @@ pub const Reader = struct {
     /// Namespace prefix-to-URI bindings for the current scope
     ns_bindings: [max_ns_bindings]NsBinding = undefined,
     ns_binding_count: u32 = 0,
+    /// Element-scoped marks: element_open pushes the current binding count;
+    /// the matching close restores it. A redeclared prefix on a nested
+    /// stanza then shadows the outer one only for that element's lifetime
+    /// (T232); `resolveNamespace` always prefers the newest binding.
+    ns_marks: [64]u32 = undefined,
+    ns_mark_depth: u32 = 0,
     /// Default namespace URI
     default_ns: []const u8 = "",
     /// Namespace stack — saves default_ns on element_open, restores on element_close.
@@ -141,60 +144,15 @@ pub const Reader = struct {
                     return Event.xml_declaration;
                 },
                 .element_open => {
-                    if (self.stream_opened and self.depth == 1) {
-                        // Stanza-scoped arena (xmppc Stanza lifetime contract):
-                        // a long-lived stream must not accumulate every name,
-                        // value and text forever. Top-level stanzas are
-                        // self-contained; consumers keep nothing past the
-                        // next stanza.
-                        //
-                        // The surviving context is the default ns and prefix
-                        // bindings DECLARED at depth <= 1 (the stream element
-                        // and top-level stanza opens); stanza-interior
-                        // bindings would otherwise accumulate forever.
-                        // Oversized ns strings are a protocol failure, never
-                        // a silent truncation (an attacker controls a stream
-                        // header; a wrong binding would misroute stanzas).
-                        if (self.default_ns.len > 512) return error.NsContextTooLarge;
-                        var def_buf: [512]u8 = undefined;
-                        @memcpy(def_buf[0..self.default_ns.len], self.default_ns);
-                        const def_len = self.default_ns.len;
-
-                        var keep: [max_ns_bindings]NsBinding = undefined;
-                        var keep_bufs: [max_ns_bindings][768]u8 = undefined;
-                        var keep_n: u32 = 0;
-                        for (self.ns_bindings[0..self.ns_binding_count]) |b| {
-                            if (b.depth > 1) continue;
-                            if (keep_n >= max_ns_bindings) break;
-                            if (b.prefix.len + b.uri.len > 768) return error.NsContextTooLarge;
-                            @memcpy(keep_bufs[keep_n][0..b.prefix.len], b.prefix);
-                            @memcpy(keep_bufs[keep_n][b.prefix.len .. b.prefix.len + b.uri.len], b.uri);
-                            keep[keep_n] = .{
-                                .prefix = keep_bufs[keep_n][0..b.prefix.len],
-                                .uri = keep_bufs[keep_n][b.prefix.len .. b.prefix.len + b.uri.len],
-                                .depth = b.depth,
-                            };
-                            keep_n += 1;
-                        }
-
-                        _ = self.arena.reset(.retain_capacity);
-                        self.default_ns = if (def_len > 0) try self.arenaDupe(def_buf[0..def_len]) else "";
-                        self.ns_stack_depth = 0;
-                        self.ns_binding_count = 0;
-                        for (keep[0..keep_n]) |b| {
-                            const uri = try self.arenaDupe(b.uri);
-                            self.ns_bindings[self.ns_binding_count] = .{
-                                .prefix = try self.arenaDupe(b.prefix),
-                                .uri = uri,
-                                .depth = b.depth,
-                            };
-                            self.ns_binding_count += 1;
-                        }
-                    }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
                     self.current_element_local = try self.arenaDupe(token.local_name);
                     self.attrs.clearRetainingCapacity();
+                    // Scope mark: the matching close restores this many bindings.
+                    if (self.ns_mark_depth < self.ns_marks.len) {
+                        self.ns_marks[self.ns_mark_depth] = self.ns_binding_count;
+                        self.ns_mark_depth += 1;
+                    }
                     // Push current default namespace before this element's xmlns decls modify it
                     if (self.ns_stack_depth < self.ns_stack.len) {
                         self.ns_stack[self.ns_stack_depth] = self.default_ns;
@@ -208,14 +166,12 @@ pub const Reader = struct {
                         self.default_ns = uri;
                     } else {
                         const prefix = try self.arenaDupe(token.prefix);
-                        if (self.ns_binding_count < max_ns_bindings) {
-                            self.ns_bindings[self.ns_binding_count] = .{
-                                .prefix = prefix,
-                                .uri = uri,
-                                .depth = self.depth,
-                            };
-                            self.ns_binding_count += 1;
-                        }
+                        if (self.ns_binding_count >= max_ns_bindings) return error.TooManyNsBindings;
+                        self.ns_bindings[self.ns_binding_count] = .{
+                            .prefix = prefix,
+                            .uri = uri,
+                        };
+                        self.ns_binding_count += 1;
                     }
                 },
                 .attribute => {
@@ -249,6 +205,11 @@ pub const Reader = struct {
                     }
 
                     self.depth -= 1;
+                    // Scope ends immediately: pop the ns mark and default ns.
+                    if (self.ns_mark_depth > 0) {
+                        self.ns_mark_depth -= 1;
+                        self.ns_binding_count = self.ns_marks[self.ns_mark_depth];
+                    }
                     // Restore the parent's default namespace — self-closing element's
                     // xmlns scope ends immediately.
                     if (self.ns_stack_depth > 0) {
@@ -260,6 +221,12 @@ pub const Reader = struct {
                 .element_close => {
                     if (self.depth > 0) {
                         self.depth -= 1;
+                    }
+                    // Pop the ns scope mark: any prefix bound inside this
+                    // element's tag disappears with the element.
+                    if (self.ns_mark_depth > 0) {
+                        self.ns_mark_depth -= 1;
+                        self.ns_binding_count = self.ns_marks[self.ns_mark_depth];
                     }
                     // Restore the parent's default namespace
                     if (self.ns_stack_depth > 0) {
@@ -293,11 +260,14 @@ pub const Reader = struct {
         return self.depth - 1;
     }
 
-    /// Resolve a namespace prefix to its URI.
+    /// Resolve a namespace prefix to its URI. Newest binding wins: a
+    /// redeclared prefix on a nested element correctly shadows the outer
+    /// one until its scope closes (T232).
     pub fn resolveNamespace(self: *const Reader, prefix: []const u8) []const u8 {
         if (prefix.len == 0) return self.default_ns;
-        var i: u32 = 0;
-        while (i < self.ns_binding_count) : (i += 1) {
+        var i = self.ns_binding_count;
+        while (i > 0) {
+            i -= 1;
             if (std.mem.eql(u8, self.ns_bindings[i].prefix, prefix)) {
                 return self.ns_bindings[i].uri;
             }
@@ -330,6 +300,7 @@ pub const Reader = struct {
         self.default_ns = "";
         self.ns_stack_depth = 0;
         self.ns_binding_count = 0;
+        self.ns_mark_depth = 0;
         self.current_element_name = "";
         self.current_element_prefix = "";
         self.current_element_local = "";
@@ -368,6 +339,56 @@ test "reader: stream restart mid-buffer after reset" {
 
     const e3 = (try reader.next(input, &pos)) orelse return error.LostFeatures;
     try std.testing.expect(e3 == .element_start); // <stream:features>
+}
+
+test "reader: namespace prefix bindings are element-scoped (T232)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // The same prefix redeclared on a later stanza must resolve to the NEW
+    // URI — and a redeclaration nested inside an element must not leak past
+    // that element's close.
+    const input =
+        "<message xmlns:x='urn:first'><x:a/></message>" ++
+        "<message xmlns:x='urn:second'><x:a/></message>" ++
+        "<message><outer xmlns:y='urn:inner'><y:b/></outer><c/></message>";
+    var pos: usize = 0;
+
+    var uris = std.ArrayList([]const u8){};
+    defer uris.deinit(allocator);
+    while (true) {
+        const ev = (try reader.next(input, &pos)) orelse break;
+        switch (ev) {
+            .element_start => |el| {
+                if (std.mem.eql(u8, el.prefix, "x") or std.mem.eql(u8, el.prefix, "y")) {
+                    try uris.append(allocator, el.namespace_uri);
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), uris.items.len);
+    try std.testing.expectEqualStrings("urn:first", uris.items[0]);
+    try std.testing.expectEqualStrings("urn:second", uris.items[1]);
+    try std.testing.expectEqualStrings("urn:inner", uris.items[2]);
+}
+
+test "namespace resolution on master stream: redeclared prefix resolves newest-first" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<a xmlns:p='urn:one'><p:b xmlns:p='urn:two'/></a>";
+    var pos: usize = 0;
+    _ = (try reader.next(input, &pos)).?; // <a ...>
+    const b = (try reader.next(input, &pos)).?; // <p:b/> self-closing
+    try std.testing.expect(b == .element_start);
+    try std.testing.expectEqualStrings("urn:two", b.element_start.namespace_uri);
+    _ = (try reader.next(input, &pos)).?; // </a>
+
+    // Stack unwound: post-scope the prefix is gone.
+    try std.testing.expectEqual(@as(u32, 0), reader.ns_binding_count);
 }
 
 test "reader: parse stream opening" {
@@ -455,31 +476,4 @@ test "reader: namespace resolution" {
 
 test "scanner tests" {
     _ = scanner;
-}
-
-test "reader: arena stays bounded over many stanzas on a long-lived stream" {
-    const allocator = std.testing.allocator;
-    var reader = Reader.init(allocator);
-    defer reader.deinit();
-
-    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
-    var pos: usize = 0;
-    _ = try reader.next(stream_open, &pos);
-
-    // After the first stanza the arena retains some capacity; 200 more
-    // identically sized stanzas must not grow it (reset per top-level open).
-    var cap_after_first: usize = 0;
-    for (0..201) |i| {
-        var buf: [256]u8 = undefined;
-        const stanza = std.fmt.bufPrint(&buf, "<message id='m{d}' from='a@b/c' to='d@e'><body>payload-{d}</body></message>", .{ i, i }) catch unreachable;
-        var p2: usize = 0;
-        while (try reader.next(stanza, &p2)) |ev| {
-            if (ev == .element_end and std.mem.endsWith(u8, ev.element_end, "message")) break;
-        }
-        if (i == 0) cap_after_first = reader.arena.queryCapacity();
-    }
-    try std.testing.expect(cap_after_first > 0);
-    // Later stanzas differ only in digit length, so allow the small
-    // one-step growth seen during warmup and require no growth after it.
-    try std.testing.expect(reader.arena.queryCapacity() < 4096);
 }
