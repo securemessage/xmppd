@@ -179,6 +179,9 @@ var g = struct {
     stanzas_posted: u64 = 0,
     post_drops: u64 = 0,
     quiet: bool = false,
+    /// Set by main right before the stopSession teardown: closes after this
+    /// are our own, not load-phase failures.
+    draining: bool = false,
 }{};
 
 fn slotEnsure(comptime T: type, list: *std.ArrayListUnmanaged(T), idx: usize, fill: T) !*T {
@@ -223,7 +226,7 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             defer g.lock.unlock();
             const was = idx < g.was_established.items.len and g.was_established.items[idx];
             if (was) {
-                g.post_closes += 1;
+                if (!g.draining) g.post_closes += 1;
             } else {
                 g.failed += 1;
                 g.settled += 1;
@@ -366,6 +369,9 @@ pub fn main() !void {
     const rss_end = maxRssKiB();
 
     // Teardown: stop everything, wait for the engine to reap, join threads.
+    g.lock.lock();
+    g.draining = true;
+    g.lock.unlock();
     for (handles.items) |h| engine.stopSession(h, "load-done");
     var tries: u32 = 0;
     while (engine.sessionCount() > 0 and tries < 1000) : (tries += 1)

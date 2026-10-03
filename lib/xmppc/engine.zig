@@ -299,6 +299,12 @@ pub const Engine = struct {
     /// thread through the note*() helpers; read via statsSnapshot().
     stats: Stats = .{},
 
+    /// Set by Session.fail() (engine thread). Sessions failed during the
+    /// drain phase must be reaped BEFORE this iteration's kevent(): once
+    /// every session is dead nothing remains armed on the kqueue, so the
+    /// wait would never return to reach the runLoop's reap.
+    reap_pending: bool = false,
+
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
         return .{ .kq = kq, .allocator = allocator, .slots = .{}, .free_slots = .{} };
@@ -799,7 +805,12 @@ pub const Engine = struct {
         // Resume sessions whose off-loop SaltedPassword derivation finished.
         self.drainCryptoDone();
 
-        // Fold everything staged since the last iteration into THIS kevent:
+        // Sessions killed by the drains above (stopSession commands, dead
+        // resumes) are reaped now, not after the wait: with no live session
+        // left armed, kevent() would block forever and runLoop's own reap
+        // never runs. No-op when nothing died.
+        if (self.reap_pending) self.reapDead();
+        if (self.live_count == 0) return; // nothing armed: never wait        // Fold everything staged since the last iteration into THIS kevent:
         // snapshot the buffer, then release the lock — event handlers stage
         // new changes during dispatch (they'd otherwise self-deadlock).
         var evbuf: [64]Kevent = undefined;
@@ -857,6 +868,7 @@ pub const Engine = struct {
 
     /// Destroy + release dead sessions. Slots stay; generations advance.
     fn reapDead(self: *Engine) void {
+        self.reap_pending = false;
         for (self.slots.items, 0..) |*slot, i| {
             if (!slot.live) continue;
             if (slot.session.alive) continue;
