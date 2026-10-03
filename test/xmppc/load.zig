@@ -7,10 +7,11 @@
 //! xmppc-smoke). Build with `zig build xmppc-load` → zig-out/bin/xmppc-load.
 //!
 //! Phases:
-//!   1. ramp   — register all N sessions, run the engine, wait until every
-//!               session settled (established or login-phase close) or the
-//!               deadline. Connects are issued in one burst; the server and
-//!               kernel pace the actual ramp.
+//!   1. ramp   — run the engine FIRST, then startSession at -connect-rate
+//!               pacing (startSession is thread-safe; T237), waiting until
+//!               every session settled (established or login-phase close) or
+//!               the deadline. Pacing therefore spaces real protocol
+//!               progress, not just connect issuance.
 //!   2. hold   — keep everything up for -hold seconds while the driver
 //!               thread posts -msg-rate aggregate stanzas/sec, each session
 //!               messaging its own bound JID (server routes it right back,
@@ -248,6 +249,7 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             g.stanzas_rx += 1;
             g.lock.unlock();
         },
+        .sm_failed => {},
     }
 }
 
@@ -275,8 +277,11 @@ pub fn main() !void {
 
     engine.setEventHandler(onEvent, null);
 
-    // Register all N sessions BEFORE engine.run(): startSession mutates the
-    // slot map, and the loop thread must not iterate it concurrently.
+    // Sessions are started at the paced rate WHILE the engine runs
+    // (startSession is thread-safe, T237): the loop launches each one as
+    // posted, so pacing spaces real protocol progress. Previously all N
+    // were registered before engine.run(), and the "paced" ramp released
+    // as a herd once the loop started.
     var handles = try std.ArrayList(Handle).initCapacity(std.heap.c_allocator, o.count);
     defer handles.deinit(std.heap.c_allocator);
     const pace_start = std.time.nanoTimestamp();
@@ -302,12 +307,14 @@ pub fn main() !void {
             std.c._exit(1);
         };
         handles.appendAssumeCapacity(h);
+        // run() exits when the live-session count reaches zero: spin it up
+        // once the first session exists.
+        if (i == 0) try engine.run();
     }
 
     // End-to-end ramp clock starts when the FIRST connect is issued — paced
     // ramps include their issuance time in logins/sec-wall by design.
     const t_start = pace_start;
-    try engine.run();
 
     // Ramp wait: every session settled, or the deadline expired.
     const deadline = t_start + @as(i128, o.deadline) * std.time.ns_per_s;
@@ -393,8 +400,15 @@ pub fn main() !void {
     g.lock.unlock();
     for (handles.items) |h| engine.stopSession(h, "load-done");
     var tries: u32 = 0;
-    while (engine.sessionCount() > 0 and tries < 1000) : (tries += 1)
+    while (engine.sessionCount() > 0 and tries < 1000) : (tries += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
+        // Teardown forensics: once per second while sessions linger, show
+        // the fail/reap/drop counters (T237/T244 hang diagnostics).
+        if (tries % 100 == 99) {
+            const st = engine.statsSnapshot();
+            std.debug.print("load: teardown live={d} fails={d} reaped={d} stop_drops={d} posted={d} drained={d} wk_wr={d} wk_rd={d} wk_pend={}\n", .{ engine.sessionCount(), st.sessions_failed, st.sessions_reaped, st.stops_dropped, st.cmds_posted, st.cmds_drained, st.wakes_written, st.wakes_read, st.wake_pending });
+        }
+    }
     engine.deinit();
 
     g.lock.lock();

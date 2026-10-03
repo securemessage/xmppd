@@ -286,6 +286,7 @@ pub const Session = struct {
         self.alive = false;
         self.phase = .dead;
         self.engine.reap_pending = true;
+        self.engine.noteFail();
         const n: u8 = @intCast(@min(reason.len, self.fail_reason_buf.len));
         @memcpy(self.fail_reason_buf[0..n], reason[0..n]);
         self.fail_reason_len = n;

@@ -15,8 +15,10 @@
 //! ## Thread ownership
 //! The kqueue loop owns every Session: callbacks (setEventHandler) run on
 //! the engine thread and may touch session state directly (e.g. sendStanza
-//! via sessionAt). Foreign threads interact ONLY through the command
-//! mailbox — postStanza and stopSession — never through *Session itself.
+//! via sessionAt). Foreign threads interact ONLY through the engine's
+//! thread-safe entry points — startSession (slots the session, the loop
+//! launches it), postStanza and stopSession — never through *Session
+//! itself.
 //!
 //! ## Changelist (T-65F61479)
 //! kqueue registrations are STAGED into a buffer and applied by the ONE
@@ -92,9 +94,11 @@ pub const Engine = struct {
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
     const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
 
-    /// One queued command for a session. `stanza` is application payload
+    /// One queued command for a session. `start` launches a session slotted
+    /// by a foreign-thread startSession; `stanza` is application payload
     /// bytes; `stop` carries the failure reason.
     pub const Command = union(enum) {
+        start,
         stanza: []u8,
         stop: []u8,
     };
@@ -135,6 +139,19 @@ pub const Engine = struct {
         last_connect_ns: std.atomic.Value(u64) = .init(0),
         first_established_ns: std.atomic.Value(u64) = .init(0),
         last_established_ns: std.atomic.Value(u64) = .init(0),
+        /// Session.fail() calls and reapDead() destroys (teardown forensics,
+        /// T237/T244). A stop command for a session the slot map no longer
+        /// owns is counted separately — that is a lost teardown signal.
+        sessions_failed: std.atomic.Value(u64) = .init(0),
+        sessions_reaped: std.atomic.Value(u64) = .init(0),
+        stops_dropped: std.atomic.Value(u64) = .init(0),
+        /// Mailbox/wake-pipe forensics: commands appended by ANY thread,
+        /// commands actually dispatched, wake bytes written, and pipe bytes
+        /// drained (teardown-hang instrumentation, T237).
+        cmds_posted: std.atomic.Value(u64) = .init(0),
+        cmds_drained: std.atomic.Value(u64) = .init(0),
+        wakes_written: std.atomic.Value(u64) = .init(0),
+        wakes_read: std.atomic.Value(u64) = .init(0),
     };
 
     /// Plain (non-atomic) copy returned by statsSnapshot().
@@ -148,6 +165,14 @@ pub const Engine = struct {
         last_connect_ns: u64 = 0,
         first_established_ns: u64 = 0,
         last_established_ns: u64 = 0,
+        sessions_failed: u64 = 0,
+        sessions_reaped: u64 = 0,
+        stops_dropped: u64 = 0,
+        cmds_posted: u64 = 0,
+        cmds_drained: u64 = 0,
+        wakes_written: u64 = 0,
+        wakes_read: u64 = 0,
+        wake_pending: bool = false,
     };
 
     pub fn statsSnapshot(self: *Engine) StatsFlat {
@@ -161,6 +186,14 @@ pub const Engine = struct {
             .last_connect_ns = self.stats.last_connect_ns.load(.monotonic),
             .first_established_ns = self.stats.first_established_ns.load(.monotonic),
             .last_established_ns = self.stats.last_established_ns.load(.monotonic),
+            .sessions_failed = self.stats.sessions_failed.load(.monotonic),
+            .sessions_reaped = self.stats.sessions_reaped.load(.monotonic),
+            .stops_dropped = self.stats.stops_dropped.load(.monotonic),
+            .cmds_posted = self.stats.cmds_posted.load(.monotonic),
+            .cmds_drained = self.stats.cmds_drained.load(.monotonic),
+            .wakes_written = self.stats.wakes_written.load(.monotonic),
+            .wakes_read = self.stats.wakes_read.load(.monotonic),
+            .wake_pending = self.wake_pending.load(.acquire),
         };
     }
 
@@ -174,6 +207,23 @@ pub const Engine = struct {
         self.stats.last_connect_ns.store(0, .monotonic);
         self.stats.first_established_ns.store(0, .monotonic);
         self.stats.last_established_ns.store(0, .monotonic);
+        self.stats.sessions_failed.store(0, .monotonic);
+        self.stats.sessions_reaped.store(0, .monotonic);
+        self.stats.stops_dropped.store(0, .monotonic);
+        self.stats.cmds_posted.store(0, .monotonic);
+        self.stats.cmds_drained.store(0, .monotonic);
+        self.stats.wakes_written.store(0, .monotonic);
+        self.stats.wakes_read.store(0, .monotonic);
+    }
+
+    pub fn noteFail(self: *Engine) void {
+        _ = self.stats.sessions_failed.fetchAdd(1, .monotonic);
+    }
+    pub fn noteReap(self: *Engine) void {
+        _ = self.stats.sessions_reaped.fetchAdd(1, .monotonic);
+    }
+    fn noteStopDropped(self: *Engine) void {
+        _ = self.stats.stops_dropped.fetchAdd(1, .monotonic);
     }
 
     fn nowNs() u64 {
@@ -229,14 +279,30 @@ pub const Engine = struct {
     /// engine allocator is not required to be thread-safe.
     const DONE_CAP = 64;
 
+    // --- generational session slots (T-80EFEC29), foreign-thread safe (T237) ---
+    // Slots live in fixed CHUNK-entry chunks: a published chunk pointer never
+    // changes until deinit, so an engine-thread reader (sessionAt, event
+    // dispatch) never chases a realloc while a foreign-thread startSession
+    // reserves a slot. Only allocSlot/freeSlot mutate the free list and the
+    // watermark, under slots_lock.
+    pub const CHUNK = 1024;
+    /// 64 chunks = 65536 sessions — at/above the process fd limit anyway.
+    pub const MAX_CHUNKS = 64;
+    const Chunk = [CHUNK]Slot;
+
+    chunks: [MAX_CHUNKS]std.atomic.Value(?*Chunk) = @splat(.init(null)),
+    /// Next never-issued slot index. Read lock-free for the early-out in
+    /// sessionAt; written only under slots_lock.
+    hi: std.atomic.Value(usize) = .init(0),
+    slots_lock: std.Thread.Mutex = .{},
+    free_slots: std.ArrayListUnmanaged(u32) = .{},
+    live_count: std.atomic.Value(usize) = .init(0),
+
     kq: posix.fd_t,
     allocator: std.mem.Allocator,
     /// XMPPC_EVTRACE snapshot taken at init — getenv() walks the whole
     /// environment, far too expensive per event/flush on the engine thread.
     trace: bool,
-    slots: std.ArrayListUnmanaged(Slot),
-    free_slots: std.ArrayListUnmanaged(u32),
-    live_count: usize = 0,
     /// Async DNS engine (lazy-open on first resolve).
     resolver: ?Resolver = null,
     /// One-second housekeeping tick (resolver retransmits/timeouts). The
@@ -267,11 +333,22 @@ pub const Engine = struct {
     // Self-pipe for cross-thread wake-up (N-worker shutdown / stopSession
     // from a foreign thread). EVFILT_SIGNAL is unreliable across threads;
     // a real kqueue event on the pipe read-end is not.
+    //
+    // Wake discipline (T236/T237): BOTH ends are O_NONBLOCK and writers post
+    // one byte UNCONDITIONALLY (the canonical self-pipe pattern). A full
+    // pipe turns a write into EAGAIN — which is safe by construction: full
+    // implies nonempty, which arms the level-triggered READ and wakes the
+    // loop, whose drain empties it. The T236 coalescing FLAG was removed:
+    // clearing it before the drain let a swap(true) win and write a byte
+    // that was then drained while the flag stayed set, suppressing every
+    // later wake (live-locked teardown, observed 2026-10-03).
     wake_pipe: [2]posix.fd_t = .{ -1, -1 },
-    /// Coalesces wake bytes: only the false->true transition writes to the
-    /// pipe; loopOnce clears this before draining. Without it, one write per
-    /// staged change floods the 16 KiB pipe (T236: blocking write end
-    /// deadlocked at ~8192 sessions staged before engine.run()).
+    /// Serializes only the one-time lazy pipe creation (two foreign callers
+    /// racing the create would leak/clobber an fd pair); the steady-state
+    /// wake path takes no lock.
+    wake_create_lock: std.Thread.Mutex = .{},
+    /// Kept only as observability (read by statsSnapshot().wake_pending):
+    /// true while the loop has not yet drained the pipe this iteration.
     wake_pending: std.atomic.Value(bool) = .init(false),
     /// Kernel tid of the thread executing the loop (0 = not running). The
     /// engine thread must never write to the wake pipe: its staged changes
@@ -427,8 +504,6 @@ pub const Engine = struct {
         return .{
             .kq = kq,
             .allocator = allocator,
-            .slots = .{},
-            .free_slots = .{},
             .trace = std.posix.getenv("XMPPC_EVTRACE") != null,
         };
     }
@@ -471,14 +546,16 @@ pub const Engine = struct {
             self.allocator.free(kv.key_ptr.*);
         }
         self.sm_queues.deinit(self.allocator);
-        self.slots.deinit(self.allocator);
+        for (&self.chunks) |*c| {
+            if (c.load(.acquire)) |chunk| self.allocator.destroy(chunk);
+        }
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
         if (self.tls_ctx_ca) |*c| c.deinit();
         // Leftover posted-but-never-applied commands.
-        for (self.cmd_active.items) |*c| self.allocator.free(cmdPayload(c));
-        for (self.cmd_spare.items) |*c| self.allocator.free(cmdPayload(c));
+        for (self.cmd_active.items) |*c| self.cmdFree(c);
+        for (self.cmd_spare.items) |*c| self.cmdFree(c);
         self.cmd_active.deinit(self.allocator);
         self.cmd_spare.deinit(self.allocator);
         if (self.wake_pipe[0] >= 0) posix.close(self.wake_pipe[0]);
@@ -594,44 +671,45 @@ pub const Engine = struct {
     /// about to call.
     pub fn requestWake(self: *Engine) void {
         if (self.loop_tid.load(.acquire) == std.Thread.getCurrentId()) return;
-        // Coalesce writers: one pending byte is enough to re-examine.
-        // Whoever flips the flag owns the write (and the one-time pipe
-        // create), giving that path a single-threaded section.
-        if (self.wake_pending.swap(true, .acq_rel)) return;
+        self.wake_pending.store(true, .release);
         if (self.wake_pipe[1] < 0) {
-            const rollback = struct {
-                fn f(e: *Engine) void {
-                    e.wake_pending.store(false, .release);
-                }
-            }.f;
-            self.wake_pipe = posix.pipe() catch {
-                rollback(self);
-                return;
-            };
-            // Both ends non-blocking: the read drain never stalls, and a
-            // full pipe turns into EAGAIN ("a wake is already pending")
-            // instead of blocking the caller (T236 deadlock).
-            const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
-            _ = std.c.fcntl(self.wake_pipe[0], std.c.F.SETFL, nb);
-            _ = std.c.fcntl(self.wake_pipe[1], std.c.F.SETFL, nb);
-            const ev = kev(@intCast(self.wake_pipe[0]), std.c.EVFILT.READ, std.c.EV.ADD, WAKE_UDATA);
-            _ = posix.kevent(self.kq, &.{ev}, &.{}, null) catch {
-                posix.close(self.wake_pipe[0]);
-                posix.close(self.wake_pipe[1]);
-                self.wake_pipe = .{ -1, -1 };
-                rollback(self);
-                return;
-            };
+            // One-time lazy create. Creation races between two foreign
+            // callers finalize through wake_create_lock; AFTER creation the
+            // fds never change, so the steady-state write path is lock-free.
+            self.wake_create_lock.lock();
+            defer self.wake_create_lock.unlock();
+            if (self.wake_pipe[1] < 0) {
+                self.wake_pipe = posix.pipe() catch return;
+                // Both ends non-blocking: the read drain never stalls, and
+                // a full pipe turns into EAGAIN ("a wake is already
+                // pending") instead of blocking the caller (T236 deadlock).
+                const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+                _ = std.c.fcntl(self.wake_pipe[0], std.c.F.SETFL, nb);
+                _ = std.c.fcntl(self.wake_pipe[1], std.c.F.SETFL, nb);
+                const ev = kev(@intCast(self.wake_pipe[0]), std.c.EVFILT.READ, std.c.EV.ADD, WAKE_UDATA);
+                _ = posix.kevent(self.kq, &.{ev}, &.{}, null) catch {
+                    posix.close(self.wake_pipe[0]);
+                    posix.close(self.wake_pipe[1]);
+                    self.wake_pipe = .{ -1, -1 };
+                    return;
+                };
+            }
         }
-        _ = posix.write(self.wake_pipe[1], &.{1}) catch {};
+        // Unconditional nonblocking byte: full? then a wake is pending by
+        // definition (the level-triggered READ on a nonempty pipe always
+        // re-fires the wait). The drain side empties the pipe fully.
+        const n = posix.write(self.wake_pipe[1], &.{1}) catch 0;
+        if (n == 1) _ = self.stats.wakes_written.fetchAdd(1, .monotonic);
     }
 
     pub fn stopAll(self: *Engine) void {
-        for (self.slots.items) |*slot| {
+        var i: usize = 0;
+        while (i < self.hi.load(.monotonic)) : (i += 1) {
+            const slot = self.slotAt(@intCast(i)) orelse continue;
             if (slot.live) slot.session.destroy(self.allocator);
             slot.live = false;
         }
-        self.live_count = 0;
+        self.live_count.store(0, .monotonic);
     }
 
     /// Install a client TLS context (DANE-first: PKIX verify disabled, so
@@ -659,14 +737,24 @@ pub const Engine = struct {
     }
 
     pub fn sessionCount(self: *const Engine) usize {
-        return self.live_count;
+        return self.live_count.load(.monotonic);
+    }
+
+    /// Slot storage for a handle index, or null when the index is past the
+    /// watermark (guard against fabricated handles aliasing the undefined
+    /// tail of the newest chunk). Lock-free: chunk pointers are append-only
+    /// until deinit.
+    fn slotAt(self: *Engine, index: u32) ?*Slot {
+        const i: usize = @intCast(index);
+        if (i >= self.hi.load(.acquire)) return null;
+        const chunk = self.chunks[i / CHUNK].load(.acquire) orelse return null;
+        return &chunk[i % CHUNK];
     }
 
     /// Access a live session by its handle (from startSession/attachFd).
     /// Returns null for dead/reaped sessions and for stale handles.
     pub fn sessionAt(self: *Engine, h: Handle) ?*Session {
-        if (h.index >= self.slots.items.len) return null;
-        const slot = &self.slots.items[@intCast(h.index)];
+        const slot = self.slotAt(h.index) orelse return null;
         if (!slot.live or slot.generation != h.generation) return null;
         if (!slot.session.alive) return null;
         return &slot.session;
@@ -689,6 +777,7 @@ pub const Engine = struct {
             log.err("out of memory posting stop command for a session", .{});
             return;
         }
+        _ = self.stats.cmds_posted.fetchAdd(1, .monotonic);
         self.requestWake();
     }
 
@@ -707,26 +796,34 @@ pub const Engine = struct {
         {
             self.cmd_lock.lock();
             defer self.cmd_lock.unlock();
-            if (self.cmd_active.items.len >= CMD_QUEUE_MAX) return error.CommandQueueFull;
+            // .start/.stop are exempt from the mailbox bound: both are
+            // bounded by the session count itself, and dropping one would
+            // leak the reservation / the teardown signal respectively.
+            if (cmd == .stanza and self.cmd_active.items.len >= CMD_QUEUE_MAX)
+                return error.CommandQueueFull;
             self.cmd_active.append(self.allocator, .{ .handle = h, .cmd = cmd }) catch return error.OutOfMemory;
         }
+        _ = self.stats.cmds_posted.fetchAdd(1, .monotonic);
         self.requestWake();
     }
 
-    /// Engine-thread: apply every posted command. Stanzas route through
-    /// Session.sendStanza (established guard lives there); stops fail
-    /// the session. Drops are logged, never silent.
+    /// Engine-thread: apply every posted command. Starts launch a slotted
+    /// session's connect/DNS phase; stanzas route through Session.sendStanza
+    /// (established guard lives there); stops fail the session. Drops are
+    /// logged, never silent.
     fn drainCommands(self: *Engine) void {
         self.cmd_lock.lock();
         std.mem.swap(@TypeOf(self.cmd_active), &self.cmd_active, &self.cmd_spare);
         self.cmd_lock.unlock();
         var pending = &self.cmd_spare;
         defer {
-            for (pending.items) |*c| self.allocator.free(cmdPayload(c));
+            for (pending.items) |*c| self.cmdFree(c);
             pending.clearRetainingCapacity();
         }
         for (pending.items) |cmd| {
+            _ = self.stats.cmds_drained.fetchAdd(1, .monotonic);
             switch (cmd.cmd) {
+                .start => self.launchSession(cmd.handle),
                 .stanza => |bytes| {
                     const s = self.sessionAt(cmd.handle) orelse {
                         log.debug("posted stanza dropped: dead session", .{});
@@ -738,17 +835,21 @@ pub const Engine = struct {
                     };
                 },
                 .stop => |reason| {
-                    if (self.sessionAt(cmd.handle)) |s| s.fail(self.allocator, reason);
+                    if (self.sessionAt(cmd.handle)) |s|
+                        s.fail(self.allocator, reason)
+                    else
+                        self.noteStopDropped();
                 },
             }
         }
     }
 
-    fn cmdPayload(c: anytype) []u8 {
-        return switch (c.cmd) {
-            .stanza => |b| b,
-            .stop => |r| r,
-        };
+    fn cmdFree(self: *Engine, c: *QueuedCmd) void {
+        switch (c.cmd) {
+            .stanza => |b| self.allocator.free(b),
+            .stop => |r| self.allocator.free(r),
+            .start => {},
+        }
     }
 
     /// Install the single event handler receiving every session Event
@@ -764,15 +865,39 @@ pub const Engine = struct {
         if (self.on_event) |cb| cb(self.on_event_ctx, self, handle, ev);
     }
 
-    /// Begin a client session. All config fields are arena-copied into the
-    /// Session, so the caller's storage may be reused or freed immediately.
-    /// Returns the session handle.
+    /// Begin a client session — callable from ANY thread (T237). All config
+    /// fields are arena-copied into the Session, so the caller's storage may
+    /// be reused or freed immediately. Returns the session handle.
     ///
-    /// `host` as a literal IP connects immediately; otherwise DNS resolution
-    /// runs asynchronously (SRV chain -> A/AAAA -> TLSA) on this loop and the
-    /// session continues when the answer lands. Connect failure walks the
-    /// target list.
+    /// The session is slotted (prepareSession) on the CALLER's thread. On
+    /// the engine thread the launch runs inline (startSession before
+    /// engine.run() keeps its old behavior); from any other thread the
+    /// launch is posted to the command mailbox and executed by the loop —
+    /// this is what lets consumers add sessions to a running engine, and
+    /// what lets the load driver pace a ramp instead of herding.
+    ///
+    /// Connect/DNS failures surface as `.closed` events for the returned
+    /// handle (a foreign-thread caller has no synchronous failure path).
+    /// Hard errors (OOM, mailbox full, session-cap reached) are returned.
     pub fn startSession(self: *Engine, config: SessionConfig) !Handle {
+        const h = try self.prepareSession(config);
+        if (self.loop_tid.load(.acquire) == std.Thread.getCurrentId()) {
+            self.launchSession(h);
+            return h;
+        }
+        self.postCommand(h, .start) catch |err| {
+            // Never reached the loop: nothing else knows the slot, reclaim it.
+            if (self.sessionAt(h)) |s| s.destroy(self.allocator);
+            self.freeSlot(h);
+            return err;
+        };
+        return h;
+    }
+
+    /// Caller-thread prologue of startSession: build the Session, arena-copy
+    /// the config, slot it live. The returned handle becomes observable to
+    /// the engine through the command mailbox's lock ordering.
+    fn prepareSession(self: *Engine, config: SessionConfig) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
         s.setConfig(config) catch {
@@ -782,9 +907,28 @@ pub const Engine = struct {
         s.port = config.port;
         s.tls_policy = self.default_tls_policy;
 
+        const h = try self.allocSlot();
+        const slot = self.slotAt(h.index).?;
+        slot.session = s;
+        slot.session.handle = h;
+        slot.live = true;
+        _ = self.live_count.fetchAdd(1, .monotonic);
+        return h;
+    }
+
+    /// Engine-thread continuation of startSession (inline, or the `.start`
+    /// mailbox command). `host` as a literal IP connects immediately;
+    /// otherwise DNS resolution runs asynchronously (SRV chain -> A/AAAA ->
+    /// TLSA) on this loop and the session continues when the answer lands.
+    fn launchSession(self: *Engine, h: Handle) void {
+        const s = self.sessionAt(h) orelse return; // stopped before launch
+
         // Literal IP: skip DNS entirely (lab rigs, explicit endpoints).
-        if (std.net.Address.parseIp(config.host, 0)) |_| {
-            return self.connectDirect(&s, config.host, config.port);
+        if (std.net.Address.parseIp(s.host, 0)) |_| {
+            self.connectPrepared(s) catch {
+                s.fail(self.allocator, "connect-failed");
+            };
+            return;
         } else |_| {}
 
         // Hostname: park the session in .resolving and hand the lookup to
@@ -793,46 +937,48 @@ pub const Engine = struct {
             self.resolver = Resolver.init(self.allocator);
             self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         }
-        // Register the session slot first so the resolution completes to a
-        // live handle.
-        const h = try self.allocSlot();
-        const slot = &self.slots.items[@intCast(h.index)];
-        slot.session = s;
-        slot.session.handle = h;
-        slot.live = true;
-        slot.session.phase = .resolving;
-        self.live_count += 1;
-        self.resolver.?.resolve(config.host, config.port, h.encode()) catch |err| {
-            slot.session.destroy(self.allocator);
-            self.freeSlot(h);
-            return err;
+        s.phase = .resolving;
+        self.resolver.?.resolve(s.host, s.port, h.encode()) catch {
+            s.fail(self.allocator, "resolve-error");
+            return;
         };
         self.armResolverTick();
-        return h;
     }
 
-    /// Direct connect without DNS (literal IP or the socketpair test seam's
-    /// pre-connected fd).
-    pub fn connectDirect(self: *Engine, s: *Session, host: []const u8, port: u16) !Handle {
-        const addr_v4 = resolveHost(host) catch {
+    /// Wire a connected fd into an already-slotted session (engine thread):
+    /// plain transport, both filters staged, bookkeeping in step
+    /// (disarm/arm are idempotent guards).
+    fn wireFd(self: *Engine, h: Handle, fd: posix.fd_t) void {
+        const s = self.sessionAt(h).?;
+        s.fd = fd;
+        s.tport = Transport.initPlain(fd);
+        s.phase = .connecting;
+        s.write_registered = true;
+        s.read_registered = true;
+        self.addRead(fd, h);
+        self.addWrite(fd, h);
+    }
+
+    /// Direct connect without DNS for a slotted session (literal IP).
+    /// Engine thread only.
+    fn connectPrepared(self: *Engine, s: *Session) !void {
+        const addr_v4 = resolveHost(s.host) catch {
             return error.NameResolutionFailed;
         };
         var addr = addr_v4;
-        addr.port = std.mem.nativeToBig(u16, port);
+        addr.port = std.mem.nativeToBig(u16, s.port);
         const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch |serr| {
             log.warn("socket() failed: {}", .{serr});
-            s.destroy(self.allocator);
             return error.SocketCreate;
         };
         posix.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
             if (err != error.WouldBlock) {
-                log.warn("connect() to {s}:{d} failed immediately: {}", .{ host, port, err });
+                log.warn("connect() to {s}:{d} failed immediately: {}", .{ s.host, s.port, err });
                 posix.close(fd);
-                s.destroy(self.allocator);
                 return error.ConnectFailed;
             }
         };
-        return self.attachPrepared(s, fd);
+        self.wireFd(s.handle, fd);
     }
 
     // ---- DNS completion ---------------------------------------------------
@@ -869,54 +1015,42 @@ pub const Engine = struct {
     /// path as startSession (stream open on first writability). config.host
     /// and config.port are unused here.
     pub fn attachFd(self: *Engine, fd: posix.fd_t, config: SessionConfig) !Handle {
-        var s = try Session.init(self.allocator);
-        s.engine = self;
-        s.setConfig(config) catch {
-            s.destroy(self.allocator);
-            return error.OutOfMemory;
-        };
-        s.tls_policy = self.default_tls_policy;
-        return self.attachPrepared(&s, fd);
-    }
-
-    fn attachPrepared(self: *Engine, s: *Session, fd: posix.fd_t) !Handle {
-        s.fd = fd;
-        s.tport = Transport.initPlain(fd);
-        s.phase = .connecting;
-
-        const h = try self.allocSlot();
-        const slot = &self.slots.items[@intCast(h.index)];
-        slot.session = s.*;
-        slot.session.handle = h;
-        slot.live = true;
-        // Both filters are registered below — keep the session's bookkeeping
-        // in step (disarm/arm are idempotent guards).
-        slot.session.write_registered = true;
-        slot.session.read_registered = true;
-        self.live_count += 1;
-        self.addRead(fd, h);
-        self.addWrite(fd, h);
+        const h = try self.prepareSession(config);
+        self.wireFd(h, fd);
         return h;
     }
 
     fn allocSlot(self: *Engine) !Handle {
+        self.slots_lock.lock();
+        defer self.slots_lock.unlock();
         if (self.free_slots.items.len > 0) {
             const idx = self.free_slots.items[self.free_slots.items.len - 1];
             self.free_slots.items.len -= 1;
-            const slot = &self.slots.items[@intCast(idx)];
+            const slot = &self.chunks[@intCast(idx / CHUNK)].load(.acquire).?[@intCast(idx % CHUNK)];
             return .{ .index = idx, .generation = slot.generation };
         }
-        // Placeholder session is overwritten by the caller before use.
-        try self.slots.append(self.allocator, .{ .session = undefined, .generation = 0, .live = false });
-        return .{ .index = @intCast(self.slots.items.len - 1), .generation = 0 };
+        const hi = self.hi.load(.monotonic);
+        if (hi >= CHUNK * MAX_CHUNKS) return error.TooManySessions;
+        const c = hi / CHUNK;
+        if (self.chunks[c].load(.acquire) == null) {
+            const chunk = try self.allocator.create(Chunk);
+            // Slots beyond the watermark stay live=false; publish the chunk
+            // before the watermark moves.
+            chunk.* = @splat(.{ .session = undefined, .generation = 0, .live = false });
+            self.chunks[c].store(chunk, .release);
+        }
+        self.hi.store(hi + 1, .release);
+        return .{ .index = @intCast(hi), .generation = 0 };
     }
 
     fn freeSlot(self: *Engine, h: Handle) void {
-        const slot = &self.slots.items[@intCast(h.index)];
+        self.slots_lock.lock();
+        defer self.slots_lock.unlock();
+        const slot = self.slotAt(h.index) orelse return;
         slot.live = false;
         slot.generation +%= 1;
         self.free_slots.append(self.allocator, h.index) catch {};
-        self.live_count -= 1;
+        _ = self.live_count.fetchSub(1, .monotonic);
     }
 
     /// Join the loop thread without respawning it: the deterministic "loop
@@ -931,7 +1065,10 @@ pub const Engine = struct {
         }
     }
 
-    /// Run the kqueue loop on a dedicated thread.
+    /// Run the kqueue loop on a dedicated thread. The loop exits when the
+    /// live-session count reaches zero — consumers adding sessions from
+    /// other threads (thread-safe startSession) must have at least one
+    /// session started before calling run().
     pub fn run(self: *Engine) !void {
         self.run_gen +%= 1;
         self.waitLoopExit();
@@ -943,10 +1080,12 @@ pub const Engine = struct {
     pub fn runSync(self: *Engine) !void {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count > 0) {
+        while (self.live_count.load(.monotonic) > 0) {
             self.loopOnce() catch {
                 // kevent error — fail every session and stop rather than spin.
-                for (self.slots.items) |*slot| {
+                var i: usize = 0;
+                while (i < self.hi.load(.monotonic)) : (i += 1) {
+                    const slot = self.slotAt(@intCast(i)) orelse continue;
                     if (slot.live) slot.session.fail(self.allocator, "kqueue-error");
                 }
                 self.reapDead();
@@ -960,7 +1099,7 @@ pub const Engine = struct {
         const gen = self.run_gen;
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count > 0 and self.run_gen == gen) {
+        while (self.live_count.load(.monotonic) > 0 and self.run_gen == gen) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -977,7 +1116,8 @@ pub const Engine = struct {
             self.wake_pending.store(false, .release);
             var wbuf: [128]u8 = undefined;
             while (true) {
-                _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
+                const r = posix.read(self.wake_pipe[0], &wbuf) catch break;
+                _ = self.stats.wakes_read.fetchAdd(@intCast(r), .monotonic);
             }
         }
         self.drainCommands();
@@ -990,7 +1130,9 @@ pub const Engine = struct {
         // left armed, kevent() would block forever and runLoop's own reap
         // never runs. No-op when nothing died.
         if (self.reap_pending) self.reapDead();
-        if (self.live_count == 0) return; // nothing armed: never wait        // Fold everything staged since the last iteration into THIS kevent:
+        // Nothing armed: never wait.
+        if (self.live_count.load(.monotonic) == 0) return;
+        // Fold everything staged since the last iteration into THIS kevent:
         // snapshot the buffer, then release the lock — event handlers stage
         // new changes during dispatch (they'd otherwise self-deadlock).
         var evbuf: [64]Kevent = undefined;
@@ -1055,10 +1197,13 @@ pub const Engine = struct {
     /// Destroy + release dead sessions. Slots stay; generations advance.
     fn reapDead(self: *Engine) void {
         self.reap_pending = false;
-        for (self.slots.items, 0..) |*slot, i| {
+        var i: usize = 0;
+        while (i < self.hi.load(.monotonic)) : (i += 1) {
+            const slot = self.slotAt(@intCast(i)) orelse continue;
             if (!slot.live) continue;
             if (slot.session.alive) continue;
             slot.session.destroy(self.allocator);
+            self.noteReap();
             self.freeSlot(.{ .index = @intCast(i), .generation = slot.generation });
         }
     }
@@ -1123,6 +1268,38 @@ test "engine: SM unacked queue track/ack/drop incl. sequence wrap (T-9BC4D065)" 
     try std.testing.expect(engine.sm_queues.getPtr("s1") == null);
 }
 
+test "engine: startSession from a foreign thread launches via the mailbox (T237)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    const Probe = struct {
+        closes: std.atomic.Value(u32) = .init(0),
+        fn onEvent(ctx: ?*anyopaque, _: *Engine, _: Handle, ev: Event) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (ev == .closed) _ = p.closes.fetchAdd(1, .monotonic);
+        }
+    };
+    var probe = Probe{};
+    eng.setEventHandler(Probe.onEvent, &probe);
+
+    // Started from the main thread while the loop is not ours: the session
+    // must be slotted synchronously but launched by the loop thread.
+    const h = try eng.startSession(.{
+        .host = "127.0.0.1", // nothing listens here: the launch fails fast
+        .port = 1,
+        .domain = "localhost",
+        .user = "u",
+        .password = "p",
+        .resource = "r",
+    });
+    try std.testing.expect(eng.slotAt(h.index) != null);
+
+    try eng.run();
+    eng.waitLoopExit(); // joins once the refused session has been reaped
+    try std.testing.expectEqual(@as(u32, 1), probe.closes.load(.monotonic));
+}
+
 test "engine: wake pipe never blocks on un-read staged changes (T236)" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
@@ -1130,22 +1307,29 @@ test "engine: wake pipe never blocks on un-read staged changes (T236)" {
 
     // No loop is running: with a blocking write end the 16 KiB pipe fills
     // after ~8192 of these and the caller hangs forever (pre-fix behavior).
+    // Nonblocking unconditional writes may fill the pipe — that is safe by
+    // construction (a nonempty pipe keeps READ armed; EAGAIN is a no-op).
     const h = Handle{ .index = 0, .generation = 0 };
     var i: usize = 0;
     while (i < 20000) : (i += 1) eng.addRead(999_999, h);
 
-    // Wakes coalesce to a single byte.
-    try std.testing.expect(eng.wake_pending.load(.acquire));
     var wbuf: [128]u8 = undefined;
+    try std.testing.expect((try posix.read(eng.wake_pipe[0], &wbuf)) > 0);
+    eng.requestWake();
+    // Drain to empty; a post-drain wake must leave exactly one byte.
+    var drained: usize = 0;
+    while (posix.read(eng.wake_pipe[0], &wbuf)) |r| {
+        drained += r;
+        if (drained >= 1 << 20) break;
+    } else |_| {}
+    const before = eng.stats.wakes_written.load(.monotonic);
+    eng.requestWake();
+    try std.testing.expect(eng.stats.wakes_written.load(.monotonic) > before);
     try std.testing.expectEqual(@as(usize, 1), try posix.read(eng.wake_pipe[0], &wbuf));
-    try std.testing.expectError(error.WouldBlock, posix.read(eng.wake_pipe[0], &wbuf));
 
-    // Simulate the loop having drained: flag cleared. requestWake from the
-    // thread the loop runs on must not write nor raise the flag.
-    eng.wake_pending.store(false, .release);
+    // requestWake from the thread the loop runs on must not write.
     eng.loop_tid.store(std.Thread.getCurrentId(), .release);
     defer eng.loop_tid.store(0, .release);
     eng.requestWake();
-    try std.testing.expect(!eng.wake_pending.load(.acquire));
     try std.testing.expectError(error.WouldBlock, posix.read(eng.wake_pipe[0], &wbuf));
 }
