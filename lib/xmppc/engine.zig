@@ -93,6 +93,12 @@ pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
     const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
+    /// Consumer-timer udata range base: token N rides as TIMER_UDATA - N.
+    /// The range sits below the reserved sentinels and far above any Handle
+    /// encode (slot index | generation are both u32), so an event arriving
+    /// after its timer was cancelled decodes to a dead Handle and is skipped.
+    const TIMER_UDATA: usize = std.math.maxInt(usize) - 3;
+    const TIMER_MAX = 65536;
 
     /// One queued command for a session. `start` launches a session slotted
     /// by a foreign-thread startSession; `stanza` is application payload
@@ -102,6 +108,11 @@ pub const Engine = struct {
         stanza: []u8,
         stop: []u8,
     };
+
+    /// One-shot timer callback; runs on the engine thread like session
+    /// events (it may startSession/postStanza/stopSession inline).
+    pub const TimerFn = *const fn (ctx: ?*anyopaque, engine: *Engine) void;
+    const Timer = struct { cb: TimerFn, ctx: ?*anyopaque };
 
     const QueuedCmd = struct { handle: Handle, cmd: Command };
 
@@ -322,6 +333,14 @@ pub const Engine = struct {
     /// closed, stanza. Always delivered on the engine thread.
     on_event: ?@import("session.zig").EventHandler = null,
     on_event_ctx: ?*anyopaque = null,
+
+    /// One-shot consumer timers (engine thread only): reconnect backoff and
+    /// other delayed actions a consumer drives from its event callbacks.
+    /// The kqueue timer (EV_ONESHOT) is the single source of a firing; the
+    /// map entry is consumed when it dispatches. The loop keeps running
+    /// while timers are pending even with no live sessions.
+    timers: std.AutoHashMapUnmanaged(usize, Timer) = .{},
+    next_timer: usize = 0,
 
     /// Cross-thread command mailbox (postStanza / stopSession): the ONLY
     /// way foreign threads touch a session. Copied here under the lock,
@@ -551,6 +570,7 @@ pub const Engine = struct {
         }
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
+        self.timers.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
         if (self.tls_ctx_ca) |*c| c.deinit();
         // Leftover posted-but-never-applied commands.
@@ -779,6 +799,46 @@ pub const Engine = struct {
         }
         _ = self.stats.cmds_posted.fetchAdd(1, .monotonic);
         self.requestWake();
+    }
+
+    // ---- consumer timers (engine thread only) ---------------------------
+
+    /// Run `cb(ctx, engine)` once after `delay_ms`. Returns a cancel token.
+    /// Engine thread only (event callbacks); also safe before run() starts.
+    /// The callback may touch engine state directly — it IS the loop. If the
+    /// timer is cancelled after kqueue already delivered the event, the
+    /// dispatch is skipped and the stale token is inert.
+    pub fn schedule(self: *Engine, delay_ms: i64, cb: TimerFn, ctx: ?*anyopaque) !usize {
+        // Tokens wrap through the TIMER window; a pending-timer collision scans
+        // forward to the next free token (TIMER_MAX bounds concurrency, not
+        // lifetime count — cumulative scheduling never exhausts).
+        var tries: usize = 0;
+        while (tries < TIMER_MAX) : (tries += 1) {
+            const token = TIMER_UDATA - self.next_timer;
+            self.next_timer = @mod(self.next_timer + 1, TIMER_MAX);
+            if (self.timers.contains(token)) continue;
+            try self.timers.put(self.allocator, token, .{ .cb = cb, .ctx = ctx });
+            var tev = kev(token, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, token);
+            tev.data = delay_ms; // EVFILT_TIMER expiry sits in data (ms)
+            self.stage(tev);
+            return token;
+        }
+        return error.TimerLimit;
+    }
+
+    /// Cancel a pending timer. Engine thread only. No-op for a fired or
+    /// unknown token; a race with dispatch is a lost cancel, matching
+    /// classic EV_ONESHOT semantics.
+    pub fn cancelTimer(self: *Engine, token: usize) void {
+        if (self.timers.remove(token)) {
+            self.stage(kev(token, std.c.EVFILT.TIMER, std.c.EV.DELETE, token));
+        }
+    }
+
+    /// Pending consumer timers (keep-alive for the loop when every session
+    /// is dead; e.g. reconnect backoff).
+    pub fn timersPending(self: *const Engine) usize {
+        return self.timers.count();
     }
 
     /// Send one application stanza from ANY thread: the bytes are copied
@@ -1065,10 +1125,11 @@ pub const Engine = struct {
         }
     }
 
-    /// Run the kqueue loop on a dedicated thread. The loop exits when the
-    /// live-session count reaches zero — consumers adding sessions from
-    /// other threads (thread-safe startSession) must have at least one
-    /// session started before calling run().
+    /// Run the kqueue loop on a dedicated thread. The loop lives while any
+    /// session is live or any consumer timer is pending, so backoff timers
+    /// keep the engine up after its last session dies. Consumers adding
+    /// sessions from other threads (thread-safe startSession) must have a
+    /// session or timer pending before calling run().
     pub fn run(self: *Engine) !void {
         self.run_gen +%= 1;
         self.waitLoopExit();
@@ -1080,7 +1141,7 @@ pub const Engine = struct {
     pub fn runSync(self: *Engine) !void {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count.load(.monotonic) > 0) {
+        while (self.live_count.load(.monotonic) > 0 or self.timers.count() > 0) {
             self.loopOnce() catch {
                 // kevent error — fail every session and stop rather than spin.
                 var i: usize = 0;
@@ -1099,7 +1160,7 @@ pub const Engine = struct {
         const gen = self.run_gen;
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count.load(.monotonic) > 0 and self.run_gen == gen) {
+        while ((self.live_count.load(.monotonic) > 0 or self.timers.count() > 0) and self.run_gen == gen) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -1131,7 +1192,7 @@ pub const Engine = struct {
         // never runs. No-op when nothing died.
         if (self.reap_pending) self.reapDead();
         // Nothing armed: never wait.
-        if (self.live_count.load(.monotonic) == 0) return;
+        if (self.live_count.load(.monotonic) == 0 and self.timers.count() == 0) return;
         // Fold everything staged since the last iteration into THIS kevent:
         // snapshot the buffer, then release the lock — event handlers stage
         // new changes during dispatch (they'd otherwise self-deadlock).
@@ -1167,6 +1228,15 @@ pub const Engine = struct {
             }
             if (ev.udata == TICK_UDATA) {
                 if (self.resolver) |*r| r.tick();
+                continue;
+            }
+            // Consumer timer window: dispatch the callback and consume the
+            // map entry (EV_ONESHOT already dropped the registration). A
+            // cancelled timer whose event raced the DELETE finds no entry.
+            if (ev.udata <= TIMER_UDATA and ev.udata > TIMER_UDATA - TIMER_MAX) {
+                if (ev.filter == std.c.EVFILT.TIMER) {
+                    if (self.timers.fetchRemove(ev.udata)) |kv| kv.value.cb(kv.value.ctx, self);
+                }
                 continue;
             }
             const h = Handle.decode(ev.udata);

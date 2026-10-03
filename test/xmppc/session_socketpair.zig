@@ -1227,3 +1227,83 @@ test "socketpair: no TLSA falls back to PKIX and rejects the self-signed rig cer
     try std.testing.expect(out.failed);
     try std.testing.expectEqualStrings("tls-handshake-failed", out.reason);
 }
+
+// ---------------------------------------------------------------------------
+// Engine consumer timers (T-A9AE7D9C): one-shot EVFILT_TIMER on the engine
+// loop so consumers can drive reconnect backoff without std.Thread.sleep.
+// ---------------------------------------------------------------------------
+
+const TimerProbe = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    fired: usize = 0,
+    long_token: usize = 0,
+    canceled_fired: bool = false,
+};
+
+fn timerCb(ctx: ?*anyopaque, engine: *Engine) void {
+    _ = engine;
+    const probe: *TimerProbe = @ptrCast(@alignCast(ctx orelse return));
+    probe.mutex.lock();
+    probe.fired += 1;
+    probe.cond.signal();
+    probe.mutex.unlock();
+}
+
+fn canceledTimerCb(ctx: ?*anyopaque, engine: *Engine) void {
+    _ = engine;
+    const probe: *TimerProbe = @ptrCast(@alignCast(ctx orelse return));
+    probe.mutex.lock();
+    probe.canceled_fired = true;
+    probe.cond.signal();
+    probe.mutex.unlock();
+}
+
+fn cancelingTimerCb(ctx: ?*anyopaque, engine: *Engine) void {
+    const probe: *TimerProbe = @ptrCast(@alignCast(ctx orelse return));
+    engine.cancelTimer(probe.long_token);
+    timerCb(ctx, engine);
+}
+
+fn timerProbeWait(probe: *TimerProbe, want: usize, timeout_ms: u64) void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    probe.mutex.lock();
+    defer probe.mutex.unlock();
+    while (probe.fired < want) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) break;
+        probe.cond.timedWait(&probe.mutex, @intCast((deadline - now) * std.time.ns_per_ms)) catch break;
+    }
+}
+
+test "engine: consumer timer fires with no sessions and the loop exits" {
+    const alloc = std.testing.allocator;
+    var probe: TimerProbe = .{};
+    const engine = try alloc.create(Engine);
+    engine.* = try Engine.init(alloc);
+    // Scheduling before run(): the map entry must keep the loop alive.
+    _ = try engine.schedule(25, timerCb, &probe);
+    try engine.run();
+    timerProbeWait(&probe, 1, 2000);
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+    // No sessions and no pending timers: the loop thread exits by itself
+    // (deinit joins it; a stuck loop would hang the suite here).
+    engine.deinit();
+    alloc.destroy(engine);
+}
+
+test "engine: cancelTimer drops a pending timer" {
+    const alloc = std.testing.allocator;
+    var probe: TimerProbe = .{};
+    const engine = try alloc.create(Engine);
+    engine.* = try Engine.init(alloc);
+    probe.long_token = try engine.schedule(10_000, canceledTimerCb, &probe);
+    _ = try engine.schedule(10, cancelingTimerCb, &probe);
+    try engine.run();
+    timerProbeWait(&probe, 1, 2000);
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+    try std.testing.expectEqual(@as(usize, 0), engine.timersPending());
+    engine.deinit();
+    alloc.destroy(engine);
+    try std.testing.expect(!probe.canceled_fired);
+}
