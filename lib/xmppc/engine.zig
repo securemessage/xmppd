@@ -105,6 +105,8 @@ pub const Engine = struct {
     const CMD_QUEUE_MAX = 4096;
 
     const Slot = struct {
+        session: Session,
+        generation: u32,
         live: bool,
     };
 
@@ -525,6 +527,14 @@ pub const Engine = struct {
         return h;
     }
 
+    /// Direct connect without DNS (literal IP or the socketpair test seam's
+    /// pre-connected fd).
+    pub fn connectDirect(self: *Engine, s: *Session, host: []const u8, port: u16) !Handle {
+        const addr_v4 = resolveHost(host) catch {
+            return error.NameResolutionFailed;
+        };
+        var addr = addr_v4;
+        addr.port = std.mem.nativeToBig(u16, port);
         const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
             s.destroy(self.allocator);
             return error.SocketCreate;

@@ -473,11 +473,12 @@ test "socketpair: two SCRAM logins on one engine derive once (SaltedPassword cac
 
     // Both sessions attach before the loop starts (attachFd is not
     // thread-safe); each runs the same lab controls as setup().
-    const ha = try engine.attachFd(fds_a[0], "localhost", "alice", "pass1", "smoke", "");
-    const hb = try engine.attachFd(fds_b[0], "localhost", "alice", "pass1", "smoke", "");
+    engine.setEventHandler(onEvent, null);
+    const cfg: SessionConfig = .{ .user = "alice", .password = "pass1", .domain = "localhost", .resource = "smoke" };
+    const ha = try engine.attachFd(fds_a[0], cfg);
+    const hb = try engine.attachFd(fds_b[0], cfg);
     for ([_]Handle{ ha, hb }) |h| {
         const s = engine.sessionAt(h).?;
-        s.setCallbacks(onEstablished, onClosed);
         s.fsm.tls_required = false;
         s.fsm.allow_plain = true;
     }

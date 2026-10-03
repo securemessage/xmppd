@@ -710,14 +710,26 @@ pub const Session = struct {
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
                 // per-stanza arena reset later frees; consumers hold these
-                // across the session, so copy them (PR #4 review A).
+                // across the session, so copy them (PR #4 review A). OOM
+                // here fails the session (T233): a silently empty sm_id
+                // would make the next resume replay everything.
                 self.sm_enabled = self.fsm.sm_enabled;
                 self.sm_resumed = self.fsm.sm_resumed;
-                self.sm_id = a.dupe(u8, self.fsm.sm_id) catch "";
-                self.bound_jid = if (self.fsm.bound_jid) |bj| Jid{
-                    .local = a.dupe(u8, bj.local) catch "",
-                    .domain = a.dupe(u8, bj.domain) catch "",
-                    .resource = a.dupe(u8, bj.resource) catch "",
+                self.sm_id = a.dupe(u8, self.fsm.sm_id) catch {
+                    self.fail(engine.allocator, "alloc-failed");
+                    return;
+                };
+                self.bound_jid = if (self.fsm.bound_jid) |bj| blk: {
+                    const j = Jid{
+                        .local = a.dupe(u8, bj.local) catch break :blk null,
+                        .domain = a.dupe(u8, bj.domain) catch break :blk null,
+                        .resource = a.dupe(u8, bj.resource) catch break :blk null,
+                    };
+                    if (j.local.len == 0 or j.domain.len == 0 or j.resource.len == 0) {
+                        self.fail(engine.allocator, "alloc-failed");
+                        return;
+                    }
+                    break :blk j;
                 } else null;
                 // 'h' counts stanzas handled since SM enablement. A resume
                 // keeps counting from where the previous session left it
@@ -960,4 +972,26 @@ test "write path: buffer grows normally when no TLS write is pending" {
     try s.queue(big);
     try std.testing.expectEqual(big.len, s.write_len);
     try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
+}
+
+test "establishment: allocator failure fails the session (T233)" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    s.fsm.sm_enabled = true;
+    s.fsm.sm_id = "sm-under-oom";
+    s.fsm.sm_resumed = false;
+    // The arena's copy of sm_id/bound_jid must fail the session, never
+    // produce a silently empty identity (a resume keyed on "" replays
+    // everything).
+    s.arena_state.child_allocator = std.testing.failing_allocator;
+    s.handleAction(&engine, .established);
+
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("alloc-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+    try std.testing.expect(s.phase == .dead);
 }
