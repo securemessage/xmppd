@@ -85,7 +85,15 @@ pub const DeferredReply = struct {
 };
 
 /// Maximum concurrent SCRAM exchanges (one per XMPP connection doing auth).
-const MAX_SCRAM_SESSIONS = 256;
+/// Must cover a full-worker login burst — xmppd-core defaults to 4096
+/// sessions per worker, and every one of them can be mid-SASL at once.
+const MAX_SCRAM_SESSIONS = 8192;
+
+/// A slot whose owner connection vanished mid-exchange (core only reports
+/// auth outcomes for live connections) is reclaimed lazily on the probe
+/// path once it has been stale this long. Event-driven: no sweep timer, and
+/// idle daemons (no new auths) pay nothing.
+const SCRAM_SLOT_STALE_SECONDS: i64 = 60;
 
 /// Number of credential cache entries (power of 2 for fast modulo).
 const CRED_CACHE_SIZE = 64;
@@ -106,10 +114,14 @@ const ScramSession = struct {
     conn_id: u32,
     server: sasl.ScramServer,
     active: bool = false,
+    /// Last activity (unix seconds); drives lazy reclamation of slots whose
+    /// XMPP connection died mid-exchange (see SCRAM_SLOT_STALE_SECONDS).
+    touched_at: i64 = 0,
 
     fn deinit(self: *ScramSession) void {
         self.server.deinit();
         self.active = false;
+        self.touched_at = 0;
     }
 };
 
@@ -485,6 +497,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 session.server = sasl.ScramServer.init(self.allocator);
                 session.conn_id = req.conn_id;
                 session.active = true;
+                session.touched_at = std.time.timestamp();
 
                 // Set channel binding data from TLS session
                 session.server.setChannelBinding(req.cb_type, req.cb_data);
@@ -545,6 +558,7 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             var session = &self.scram_sessions[slot];
+            session.touched_at = std.time.timestamp();
 
             // Process client-final-message
             const server_final = session.server.handleClientFinal(resp.payload) catch {
@@ -767,11 +781,19 @@ pub fn AuthHandler(comptime Store: type) type {
         /// null now means the table is genuinely full.
         fn findOrCreateScramSlot(self: *Self, conn_id: u32) ?usize {
             if (self.findScramSlot(conn_id)) |slot| return slot;
+            const now = std.time.timestamp();
             const start = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
             var i: usize = 0;
             while (i < MAX_SCRAM_SESSIONS) : (i += 1) {
                 const slot = (start + i) % MAX_SCRAM_SESSIONS;
-                if (!self.scram_sessions[slot].active) return slot;
+                const s = &self.scram_sessions[slot];
+                if (!s.active) return slot;
+                // Reclaim slots abandoned by connections that died before a
+                // final auth response — otherwise they leak until restart.
+                if (now - s.touched_at > SCRAM_SLOT_STALE_SECONDS) {
+                    s.deinit();
+                    return slot;
+                }
             }
             return null;
         }
@@ -910,6 +932,47 @@ test "AuthHandler: SCRAM slot table full means null, not aliasing" {
 
     cid = 1;
     while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(cid);
+}
+
+test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // Simulate a connection that died mid-exchange: its slot stays active.
+    const dead_conn: u32 = 42;
+    const dead_slot = handler.findOrCreateScramSlot(dead_conn).?;
+    handler.scram_sessions[dead_slot] = .{
+        .conn_id = dead_conn,
+        .server = sasl.ScramServer.init(allocator),
+        .active = true,
+        .touched_at = std.time.timestamp() - 2 * SCRAM_SLOT_STALE_SECONDS,
+    };
+
+    // A fresh login aliasing the same home slot (same low 16 bits = same
+    // session slot, newer generation) must reclaim it, not fail.
+    const fresh_conn: u32 = 42 + (1 << 16);
+    const got = handler.findOrCreateScramSlot(fresh_conn).?;
+    try std.testing.expectEqual(dead_slot, got);
+    try std.testing.expect(!handler.scram_sessions[got].active); // reclaimed, caller activates
+
+    // A still-fresh slot on the probe path is NOT reclaimed.
+    handler.scram_sessions[got] = .{
+        .conn_id = fresh_conn,
+        .server = sasl.ScramServer.init(allocator),
+        .active = true,
+        .touched_at = std.time.timestamp(),
+    };
+    const blocked_conn: u32 = 43 + (1 << 16); // aliases neighbor slot 43
+    const alt = handler.findOrCreateScramSlot(blocked_conn).?;
+    try std.testing.expect(alt != dead_slot);
+    handler.scram_sessions[dead_slot].deinit();
+    handler.scram_sessions[alt].deinit();
 }
 
 test "AuthHandler: PLAIN auth success" {
