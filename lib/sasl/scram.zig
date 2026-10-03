@@ -857,6 +857,22 @@ test "SCRAM client: RFC 7677 test vector (16-byte salt)" {
     try std.testing.expect(client.isComplete());
 }
 
+test "SCRAM-SHA-1 client: RFC 5802 test vector" {
+    var client = ScramClientSha1.init(std.testing.allocator, "user", "pencil");
+    defer client.deinit();
+    _ = try client.clientFirst();
+    // Pin the RFC's client nonce.
+    client.client_nonce_b64 = "fyko+d2lbbFgONRv9qkxdawL";
+    client.client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
+
+    const final = try client.handleServerFirst("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096");
+    try std.testing.expectEqualStrings("c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=", final);
+
+    try client.handleServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+    try std.testing.expect(client.isComplete());
+}
+
+
 test "SCRAM client: forged server signature is rejected" {
     const allocator = std.testing.allocator;
     var client = ScramClient.init(allocator, "user", "pw");
