@@ -53,7 +53,7 @@ pub fn UserStore(comptime Backend: type) type {
                 return error.UserExists;
             }
 
-            const creds = sasl.StoredCredentials.generate(password, 4096);
+            const creds = try sasl.StoredCredentials.generate(password, 4096);
             const value = serializeCredentials(creds);
             try self.backend.put(NAMESPACE, username, &value);
             log.info("added user: {s}", .{username});
@@ -79,7 +79,7 @@ pub fn UserStore(comptime Backend: type) type {
             } else {
                 return error.UserNotFound;
             }
-            const creds = sasl.StoredCredentials.generate(password, 4096);
+            const creds = try sasl.StoredCredentials.generate(password, 4096);
             const value = serializeCredentials(creds);
             try self.backend.put(NAMESPACE, username, &value);
             log.info("changed password for: {s}", .{username});
@@ -213,13 +213,13 @@ test "UserStore: credentials verify with SCRAM" {
     const creds = (try store.lookup(std.testing.allocator, "testuser")).?;
 
     // Re-derive with same salt — keys should match
-    const rederived = sasl.StoredCredentials.derive("testpassword", creds.salt, 4096);
+    const rederived = try sasl.StoredCredentials.derive("testpassword", creds.salt, 4096);
     try std.testing.expectEqualSlices(u8, &creds.stored_key, &rederived.stored_key);
     try std.testing.expectEqualSlices(u8, &creds.server_key, &rederived.server_key);
 }
 
 test "serializeCredentials roundtrip" {
-    const creds = sasl.StoredCredentials.generate("test", 4096);
+    const creds = try sasl.StoredCredentials.generate("test", 4096);
     const buf = serializeCredentials(creds);
     const back = deserializeCredentials(&buf).?;
     try std.testing.expectEqualSlices(u8, &creds.salt, &back.salt);

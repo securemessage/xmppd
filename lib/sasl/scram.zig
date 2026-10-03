@@ -1,6 +1,72 @@
 const std = @import("std");
+const stringprep = @import("stringprep.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// SCRAM hash functions (mechanism family selector).
+pub const Hash = enum {
+    sha256,
+    sha1,
+
+    pub fn len(self: Hash) usize {
+        return switch (self) {
+            .sha256 => 32,
+            .sha1 => 20,
+        };
+    }
+};
+
+/// A Hi() output with its hash family tagged; SHA-1 fills bytes[0..20].
+/// The engine crypto worker and the SaltedPassword cache pass this around so
+/// a SHA-1 derivation can never be fed to a SHA-256 exchange (or vice versa).
+pub const SaltedPassword = struct {
+    hash: Hash,
+    bytes: [32]u8,
+
+    pub fn slice(self: *const SaltedPassword) []const u8 {
+        return self.bytes[0..self.hash.len()];
+    }
+};
+
+/// Derive Hi(password, salt, i) for the given hash family.
+pub fn deriveSalted(hash: Hash, password: []const u8, salt: []const u8, iterations: u32) SaltedPassword {
+    var out = SaltedPassword{ .hash = hash, .bytes = undefined };
+    switch (hash) {
+        .sha256 => pbkdf2(password, salt, iterations, &out.bytes),
+        .sha1 => {
+            var short: [20]u8 = undefined;
+            pbkdf2Sha1(password, salt, iterations, &short);
+            @memcpy(out.bytes[0..20], &short);
+        },
+    }
+    return out;
+}
+
+/// Channel binding mode the client advertises in the gs2 header (RFC 5802 §6).
+pub const CbMode = enum {
+    /// gs2 'n': client does not support channel binding.
+    none,
+    /// gs2 'y': client supports CB but the server did not advertise -PLUS.
+    unsupported_by_server,
+    /// gs2 'p=tls-exporter' (RFC 9266).
+    tls_exporter,
+    /// gs2 'p=tls-server-end-point' (RFC 5929).
+    tls_server_end_point,
+
+    /// The gs2 header up to and including the second comma.
+    pub fn gs2Header(self: CbMode) []const u8 {
+        return switch (self) {
+            .none => "n,,",
+            .unsupported_by_server => "y,,",
+            .tls_exporter => "p=tls-exporter,,",
+            .tls_server_end_point => "p=tls-server-end-point,,",
+        };
+    }
+
+    pub fn isPlus(self: CbMode) bool {
+        return self == .tls_exporter or self == .tls_server_end_point;
+    }
+};
 
 /// SCRAM-SHA-256 server-side implementation per RFC 5802 and RFC 7677.
 ///
@@ -19,10 +85,18 @@ pub const StoredCredentials = struct {
 
     /// Derive stored credentials from a plaintext password.
     /// This should be called once at user creation/password change time.
-    pub fn derive(password: []const u8, salt: [32]u8, iteration_count: u32) StoredCredentials {
+    /// The password is prepped (RFC 8265 OpaqueString) internally so every
+    /// credential-creation path (user store, xmppctl, tests) is identical;
+    /// the client applies the same prep before Hi().
+    pub fn derive(password: []const u8, salt: [32]u8, iteration_count: u32) stringprep.PrepError!StoredCredentials {
         // SaltedPassword := Hi(Normalize(password), salt, i)
+        var prep_buf: [2048]u8 = undefined;
+        var prep_cps: [3072]u21 = undefined;
+        var prep_cccs: [3072]u8 = undefined;
+        if (password.len > prep_buf.len / 2) return error.NoSpaceLeft;
+        const prepped = try stringprep.prepareOpaqueString(password, &prep_buf, &prep_cps, &prep_cccs);
         var salted_password: [32]u8 = undefined;
-        pbkdf2(password, &salt, iteration_count, &salted_password);
+        pbkdf2(prepped, &salt, iteration_count, &salted_password);
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
@@ -45,7 +119,7 @@ pub const StoredCredentials = struct {
     }
 
     /// Generate random salt and derive credentials.
-    pub fn generate(password: []const u8, iteration_count: u32) StoredCredentials {
+    pub fn generate(password: []const u8, iteration_count: u32) stringprep.PrepError!StoredCredentials {
         var salt: [32]u8 = undefined;
         std.crypto.random.bytes(&salt);
         return derive(password, salt, iteration_count);
@@ -118,11 +192,14 @@ pub const ScramServer = struct {
 
         self.client_first_bare = try alloc.dupe(u8, bare);
 
-        // Parse n=username
+        // Parse n=username (wire form carries RFC 5802 §5.1 escaping;
+        // client_first_bare above keeps the raw bytes for AuthMessage).
         if (!std.mem.startsWith(u8, bare, "n=")) return error.InvalidMessage;
         const after_n = bare[2..];
         const comma_pos = std.mem.indexOfScalar(u8, after_n, ',') orelse return error.InvalidMessage;
-        self.username = try alloc.dupe(u8, after_n[0..comma_pos]);
+        const raw_name = after_n[0..comma_pos];
+        const name_buf = try alloc.alloc(u8, raw_name.len);
+        self.username = stringprep.unescapeScramName(raw_name, name_buf) catch return error.InvalidMessage;
 
         // Parse r=client-nonce
         const after_comma = after_n[comma_pos + 1 ..];
@@ -318,211 +395,236 @@ pub const ScramServer = struct {
     }
 };
 
-/// SCRAM-SHA-256 client-side implementation (for testing and s2s).
-pub const ScramClient = struct {
-    /// Iteration counts outside this range are refused: below the RFC 7677
-    /// minimum the key derivation is too weak; above the maximum a hostile
-    /// server could stall the client's event loop in PBKDF2.
-    pub const min_iterations: u32 = 4096;
-    pub const max_iterations: u32 = 1_000_000;
-    /// Longest accepted salt (decoded bytes).
-    pub const max_salt_len = 128;
+/// SCRAM client-side implementation, comptime-parameterized over the hash
+/// family (SCRAM-SHA-256 per RFC 7677, SCRAM-SHA-1 per RFC 5802).
+/// Used by xmppc and s2s; `ScramClient` below is the SHA-256 instantiation.
+pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
+    return struct {
+        const Self = @This();
+        const mac_len = Hmac.mac_length;
+        /// Iteration counts outside this range are refused: below the RFC 7677
+        /// minimum the key derivation is too weak; above the maximum a hostile
+        /// server could stall the client's event loop in PBKDF2.
+        pub const min_iterations: u32 = 4096;
+        pub const max_iterations: u32 = 1_000_000;
+        /// Longest accepted salt (decoded bytes).
+        pub const max_salt_len = 128;
 
-    state: State = .initial,
-    username: []const u8,
-    password: []const u8,
-    client_nonce: [24]u8 = undefined,
-    client_nonce_b64: []const u8 = "",
-    /// Expected ServerSignature, computed in handleServerFirst.
-    server_signature: [32]u8 = undefined,
-    client_first_bare: []const u8 = "",
-    server_first_msg: []const u8 = "",
-    combined_nonce: []const u8 = "",
-    /// Decoded salt from server-first (raw bytes, any length the server
-    /// chose); exposed so the SaltedPassword can be derived off the caller's
-    /// thread (parse is cheap, Hi() is not — xmppc T-7AD30E73).
-    salt_raw: [max_salt_len]u8 = undefined,
-    salt_raw_len: usize = 0,
-    iteration_count: u32 = 0,
-    server_first_parsed: bool = false,
-    arena: std.heap.ArenaAllocator,
+        state: State = .initial,
+        username: []const u8,
+        password: []const u8,
+        client_nonce: [24]u8 = undefined,
+        client_nonce_b64: []const u8 = "",
+        /// Expected ServerSignature, computed in handleServerFirst.
+        server_signature: [mac_len]u8 = undefined,
+        /// Channel binding mode + data (gs2 'p'/'y'/'n' per RFC 5802 §6).
+        /// cb_data must outlive the exchange; set before clientFirst().
+        cb_mode: CbMode = .none,
+        cb_data: []const u8 = "",
+        client_first_bare: []const u8 = "",
+        server_first_msg: []const u8 = "",
+        combined_nonce: []const u8 = "",
+        /// Decoded salt from server-first (raw bytes, any length the server
+        /// chose); exposed so the SaltedPassword can be derived off the caller's
+        /// thread (parse is cheap, Hi() is not — xmppc T-7AD30E73).
+        salt_raw: [max_salt_len]u8 = undefined,
+        salt_raw_len: usize = 0,
+        iteration_count: u32 = 0,
+        server_first_parsed: bool = false,
+        arena: std.heap.ArenaAllocator,
 
-    const State = enum {
-        initial,
-        awaiting_server_first,
-        awaiting_server_final,
-        completed,
-        failed,
-    };
-
-    pub fn init(allocator: std.mem.Allocator, username: []const u8, password: []const u8) ScramClient {
-        var client = ScramClient{
-            .username = username,
-            .password = password,
-            .arena = std.heap.ArenaAllocator.init(allocator),
+        const State = enum {
+            initial,
+            awaiting_server_first,
+            awaiting_server_final,
+            completed,
+            failed,
         };
-        std.crypto.random.bytes(&client.client_nonce);
-        return client;
-    }
 
-    pub fn deinit(self: *ScramClient) void {
-        self.arena.deinit();
-    }
+        pub fn init(allocator: std.mem.Allocator, username: []const u8, password: []const u8) Self {
+            var client = Self{
+                .username = username,
+                .password = password,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+            };
+            std.crypto.random.bytes(&client.client_nonce);
+            return client;
+        }
 
-    /// Generate client-first-message.
-    pub fn clientFirst(self: *ScramClient) ![]const u8 {
-        const alloc = self.arena.allocator();
-        const nonce_b64 = try base64Encode(alloc, &self.client_nonce);
-        self.client_nonce_b64 = nonce_b64;
+        pub fn deinit(self: *Self) void {
+            self.arena.deinit();
+        }
 
-        // client-first-message-bare: n=username,r=nonce
-        self.client_first_bare = try std.fmt.allocPrint(alloc, "n={s},r={s}", .{ self.username, nonce_b64 });
+        /// Generate client-first-message. The username is expected prepped
+        /// by the caller; RFC 5802 §5.1 escaping of '=' and ',' is applied.
+        pub fn clientFirst(self: *Self) ![]const u8 {
+            const alloc = self.arena.allocator();
+            // Test/caller seam: a preset nonce (RFC vector tests) is used as-is.
+            if (self.client_nonce_b64.len == 0) {
+                self.client_nonce_b64 = try base64Encode(alloc, &self.client_nonce);
+            }
 
-        self.state = .awaiting_server_first;
+            // client-first-message-bare: n=username,r=nonce
+            const name_buf = try alloc.alloc(u8, self.username.len * 3);
+            const name = try stringprep.escapeScramName(self.username, name_buf);
+            self.client_first_bare = try std.fmt.allocPrint(alloc, "n={s},r={s}", .{ name, self.client_nonce_b64 });
 
-        // Full message with gs2-header: n,,n=username,r=nonce
-        return try std.fmt.allocPrint(alloc, "n,,{s}", .{self.client_first_bare});
-    }
+            self.state = .awaiting_server_first;
 
-    /// Process server-first-message and generate client-final-message.
-    /// Derives the SaltedPassword inline; callers that must not block
-    /// (event loops) use parseServerFirst + pbkdf2 off-thread + clientFinal.
-    pub fn handleServerFirst(self: *ScramClient, message: []const u8) ![]const u8 {
-        try self.parseServerFirst(message);
-        var salted_password: [32]u8 = undefined;
-        pbkdf2(self.password, self.salt_raw[0..self.salt_raw_len], self.iteration_count, &salted_password);
-        return self.clientFinal(salted_password);
-    }
+            // gs2 header from the channel binding mode (RFC 5802 §6)
+            return try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.cb_mode.gs2Header(), self.client_first_bare });
+        }
 
-    /// Parse and validate server-first-message (cheap: no PBKDF2). On
-    /// success salt_raw/iteration_count are set and the exchange parks until
-    /// clientFinal is called with the SaltedPassword.
-    pub fn parseServerFirst(self: *ScramClient, message: []const u8) !void {
-        if (self.state != .awaiting_server_first) return error.InvalidState;
+        /// Process server-first-message and generate client-final-message.
+        /// Derives the SaltedPassword inline; callers that must not block
+        /// (event loops) use parseServerFirst + pbkdf2 off-thread + clientFinal.
+        pub fn handleServerFirst(self: *Self, message: []const u8) ![]const u8 {
+            try self.parseServerFirst(message);
+            var salted_password: [mac_len]u8 = undefined;
+            pbkdf2With(Hmac, self.password, self.salt_raw[0..self.salt_raw_len], self.iteration_count, &salted_password);
+            return self.clientFinal(salted_password);
+        }
 
-        const alloc = self.arena.allocator();
-        self.server_first_msg = try alloc.dupe(u8, message);
+        /// Parse and validate server-first-message (cheap: no PBKDF2). On
+        /// success salt_raw/iteration_count are set and the exchange parks until
+        /// clientFinal is called with the SaltedPassword.
+        pub fn parseServerFirst(self: *Self, message: []const u8) !void {
+            if (self.state != .awaiting_server_first) return error.InvalidState;
 
-        // Parse r=combined_nonce,s=salt,i=iteration_count
-        var iter = std.mem.splitScalar(u8, message, ',');
+            const alloc = self.arena.allocator();
+            self.server_first_msg = try alloc.dupe(u8, message);
 
-        // r=nonce
-        const r_field = iter.next() orelse return error.InvalidMessage;
-        if (!std.mem.startsWith(u8, r_field, "r=")) return error.InvalidMessage;
-        self.combined_nonce = try alloc.dupe(u8, r_field[2..]);
-        // RFC 5802 5.1: the combined nonce must extend our own nonce.
-        if (self.combined_nonce.len <= self.client_nonce_b64.len or
-            !std.mem.startsWith(u8, self.combined_nonce, self.client_nonce_b64))
-        {
+            // Parse r=combined_nonce,s=salt,i=iteration_count
+            var iter = std.mem.splitScalar(u8, message, ',');
+
+            // r=nonce
+            const r_field = iter.next() orelse return error.InvalidMessage;
+            if (!std.mem.startsWith(u8, r_field, "r=")) return error.InvalidMessage;
+            self.combined_nonce = try alloc.dupe(u8, r_field[2..]);
+            // RFC 5802 5.1: the combined nonce must extend our own nonce.
+            if (self.combined_nonce.len <= self.client_nonce_b64.len or
+                !std.mem.startsWith(u8, self.combined_nonce, self.client_nonce_b64))
+            {
+                self.state = .failed;
+                return error.NonceMismatch;
+            }
+
+            // s=salt
+            const s_field = iter.next() orelse return error.InvalidMessage;
+            if (!std.mem.startsWith(u8, s_field, "s=")) return error.InvalidMessage;
+            const salt_b64 = s_field[2..];
+
+            // i=iteration_count
+            const i_field = iter.next() orelse return error.InvalidMessage;
+            if (!std.mem.startsWith(u8, i_field, "i=")) return error.InvalidMessage;
+            self.iteration_count = std.fmt.parseInt(u32, i_field[2..], 10) catch return error.InvalidMessage;
+            if (self.iteration_count < min_iterations or self.iteration_count > max_iterations) {
+                self.state = .failed;
+                return error.IterationCountOutOfRange;
+            }
+
+            // Decode salt from base64 (any length the server chose)
+            const decoder = std.base64.standard.Decoder;
+            const salt_len = decoder.calcSizeForSlice(salt_b64) catch return error.InvalidBase64;
+            if (salt_len == 0 or salt_len > max_salt_len) return error.InvalidMessage;
+            decoder.decode(self.salt_raw[0..salt_len], salt_b64) catch return error.InvalidBase64;
+            self.salt_raw_len = salt_len;
+            self.server_first_parsed = true;
+        }
+
+        /// Generate client-final-message from a pre-derived SaltedPassword
+        /// (Hi(password, salt, i)). Requires parseServerFirst to have run.
+        pub fn clientFinal(self: *Self, salted_password: [mac_len]u8) ![]const u8 {
+            if (self.state != .awaiting_server_first or !self.server_first_parsed) return error.InvalidState;
+
+            const alloc = self.arena.allocator();
+
+            // ClientKey := HMAC(SaltedPassword, "Client Key")
+            var client_key: [mac_len]u8 = undefined;
+            Hmac.create(&client_key, "Client Key", &salted_password);
+
+            // StoredKey := H(ClientKey)
+            var stored_key: [mac_len]u8 = undefined;
+            HashFn.hash(&client_key, &stored_key, .{});
+
+            // c= is base64(gs2-header [+ channel-binding-data]) (RFC 5802 §7)
+            const gs2 = self.cb_mode.gs2Header();
+            const cb_raw = if (self.cb_mode.isPlus())
+                try std.mem.concat(alloc, u8, &.{ gs2, self.cb_data })
+            else
+                gs2;
+            const channel_binding = try base64Encode(alloc, cb_raw);
+
+            // client-final-message-without-proof
+            const without_proof = try std.fmt.allocPrint(alloc, "c={s},r={s}", .{ channel_binding, self.combined_nonce });
+
+            // AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
+            const auth_message = try std.fmt.allocPrint(alloc, "{s},{s},{s}", .{
+                self.client_first_bare,
+                self.server_first_msg,
+                without_proof,
+            });
+
+            // ClientSignature := HMAC(StoredKey, AuthMessage)
+            var client_signature: [mac_len]u8 = undefined;
+            Hmac.create(&client_signature, auth_message, &stored_key);
+
+            // ClientProof := ClientKey XOR ClientSignature
+            var client_proof: [mac_len]u8 = undefined;
+            for (&client_proof, client_key, client_signature) |*r, k, s| {
+                r.* = k ^ s;
+            }
+
+            // ServerSignature := HMAC(HMAC(SaltedPassword, "Server Key"), AuthMessage),
+            // checked against the server-final-message (mutual authentication).
+            var server_key: [mac_len]u8 = undefined;
+            Hmac.create(&server_key, "Server Key", &salted_password);
+            Hmac.create(&self.server_signature, auth_message, &server_key);
+
+            const proof_b64 = try base64Encode(alloc, &client_proof);
+
+            self.state = .awaiting_server_final;
+
+            // client-final-message: c=biws,r=nonce,p=proof
+            return try std.fmt.allocPrint(alloc, "{s},p={s}", .{ without_proof, proof_b64 });
+        }
+
+        /// Verify the server-final-message `v=ServerSignature` in constant time.
+        /// Anything else (`e=...`, a wrong or malformed signature) fails: a server
+        /// that cannot prove knowledge of the credentials is not trusted.
+        pub fn handleServerFinal(self: *Self, message: []const u8) !void {
+            if (self.state != .awaiting_server_final) return error.InvalidState;
             self.state = .failed;
-            return error.NonceMismatch;
+
+            // Only the first attribute matters; extensions may follow.
+            const first = message[0 .. std.mem.indexOfScalar(u8, message, ',') orelse message.len];
+            if (!std.mem.startsWith(u8, first, "v=")) return error.ServerAuthFailed;
+
+            var got: [mac_len]u8 = undefined;
+            const decoder = std.base64.standard.Decoder;
+            const len = decoder.calcSizeForSlice(first[2..]) catch return error.ServerAuthFailed;
+            if (len != got.len) return error.ServerAuthFailed;
+            decoder.decode(&got, first[2..]) catch return error.ServerAuthFailed;
+            if (!std.crypto.timing_safe.eql([mac_len]u8, got, self.server_signature)) return error.ServerAuthFailed;
+
+            self.state = .completed;
         }
 
-        // s=salt
-        const s_field = iter.next() orelse return error.InvalidMessage;
-        if (!std.mem.startsWith(u8, s_field, "s=")) return error.InvalidMessage;
-        const salt_b64 = s_field[2..];
-
-        // i=iteration_count
-        const i_field = iter.next() orelse return error.InvalidMessage;
-        if (!std.mem.startsWith(u8, i_field, "i=")) return error.InvalidMessage;
-        self.iteration_count = std.fmt.parseInt(u32, i_field[2..], 10) catch return error.InvalidMessage;
-        if (self.iteration_count < min_iterations or self.iteration_count > max_iterations) {
-            self.state = .failed;
-            return error.IterationCountOutOfRange;
+        /// True once the client-final-message was sent and server-final is due.
+        pub fn awaitingServerFinal(self: *const Self) bool {
+            return self.state == .awaiting_server_final;
         }
 
-        // Decode salt from base64 (any length the server chose)
-        const decoder = std.base64.standard.Decoder;
-        const salt_len = decoder.calcSizeForSlice(salt_b64) catch return error.InvalidBase64;
-        if (salt_len == 0 or salt_len > max_salt_len) return error.InvalidMessage;
-        decoder.decode(self.salt_raw[0..salt_len], salt_b64) catch return error.InvalidBase64;
-        self.salt_raw_len = salt_len;
-        self.server_first_parsed = true;
-    }
-
-    /// Generate client-final-message from a pre-derived SaltedPassword
-    /// (Hi(password, salt, i)). Requires parseServerFirst to have run.
-    pub fn clientFinal(self: *ScramClient, salted_password: [32]u8) ![]const u8 {
-        if (self.state != .awaiting_server_first or !self.server_first_parsed) return error.InvalidState;
-
-        const alloc = self.arena.allocator();
-
-        // ClientKey := HMAC(SaltedPassword, "Client Key")
-        var client_key: [32]u8 = undefined;
-        HmacSha256.create(&client_key, "Client Key", &salted_password);
-
-        // StoredKey := H(ClientKey)
-        var stored_key: [32]u8 = undefined;
-        Sha256.hash(&client_key, &stored_key, .{});
-
-        // channel binding: c=biws (base64 of "n,,")
-        const channel_binding = "biws"; // base64("n,,")
-
-        // client-final-message-without-proof
-        const without_proof = try std.fmt.allocPrint(alloc, "c={s},r={s}", .{ channel_binding, self.combined_nonce });
-
-        // AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
-        const auth_message = try std.fmt.allocPrint(alloc, "{s},{s},{s}", .{
-            self.client_first_bare,
-            self.server_first_msg,
-            without_proof,
-        });
-
-        // ClientSignature := HMAC(StoredKey, AuthMessage)
-        var client_signature: [32]u8 = undefined;
-        HmacSha256.create(&client_signature, auth_message, &stored_key);
-
-        // ClientProof := ClientKey XOR ClientSignature
-        var client_proof: [32]u8 = undefined;
-        for (&client_proof, client_key, client_signature) |*r, k, s| {
-            r.* = k ^ s;
+        pub fn isComplete(self: *const Self) bool {
+            return self.state == .completed;
         }
+    };
+}
 
-        // ServerSignature := HMAC(HMAC(SaltedPassword, "Server Key"), AuthMessage),
-        // checked against the server-final-message (mutual authentication).
-        var server_key: [32]u8 = undefined;
-        HmacSha256.create(&server_key, "Server Key", &salted_password);
-        HmacSha256.create(&self.server_signature, auth_message, &server_key);
-
-        const proof_b64 = try base64Encode(alloc, &client_proof);
-
-        self.state = .awaiting_server_final;
-
-        // client-final-message: c=biws,r=nonce,p=proof
-        return try std.fmt.allocPrint(alloc, "{s},p={s}", .{ without_proof, proof_b64 });
-    }
-
-    /// Verify the server-final-message `v=ServerSignature` in constant time.
-    /// Anything else (`e=...`, a wrong or malformed signature) fails: a server
-    /// that cannot prove knowledge of the credentials is not trusted.
-    pub fn handleServerFinal(self: *ScramClient, message: []const u8) !void {
-        if (self.state != .awaiting_server_final) return error.InvalidState;
-        self.state = .failed;
-
-        // Only the first attribute matters; extensions may follow.
-        const first = message[0 .. std.mem.indexOfScalar(u8, message, ',') orelse message.len];
-        if (!std.mem.startsWith(u8, first, "v=")) return error.ServerAuthFailed;
-
-        var got: [32]u8 = undefined;
-        const decoder = std.base64.standard.Decoder;
-        const len = decoder.calcSizeForSlice(first[2..]) catch return error.ServerAuthFailed;
-        if (len != got.len) return error.ServerAuthFailed;
-        decoder.decode(&got, first[2..]) catch return error.ServerAuthFailed;
-        if (!std.crypto.timing_safe.eql([32]u8, got, self.server_signature)) return error.ServerAuthFailed;
-
-        self.state = .completed;
-    }
-
-    /// True once the client-final-message was sent and server-final is due.
-    pub fn awaitingServerFinal(self: *const ScramClient) bool {
-        return self.state == .awaiting_server_final;
-    }
-
-    pub fn isComplete(self: *const ScramClient) bool {
-        return self.state == .completed;
-    }
-};
+/// SCRAM-SHA-256 client (RFC 7677) — the default mechanism.
+pub const ScramClient = ScramClientWith(HmacSha256, Sha256);
+/// SCRAM-SHA-1 client (RFC 5802; RFC 6120 §13.8.3 mandatory-to-implement).
+pub const ScramClientSha1 = ScramClientWith(std.crypto.auth.hmac.HmacSha1, std.crypto.hash.Sha1);
 
 // --- Helpers ---
 
@@ -556,24 +658,22 @@ fn findClientFirstBare(message: []const u8) ?usize {
     return i;
 }
 
-/// PBKDF2-HMAC-SHA-256. Public so event-loop callers (xmppc Engine) can run
-/// the derivation on a worker thread between parseServerFirst and clientFinal.
-pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
-    // PBKDF2 with SHA-256, dkLen = 32 (one block)
+/// PBKDF2 over a comptime HMAC, dkLen = mac_length (one block).
+pub fn pbkdf2With(comptime Hmac: type, password: []const u8, salt: []const u8, iterations: u32, output: *[Hmac.mac_length]u8) void {
     // U1 = HMAC(password, salt || INT(1)) — streamed, any salt length.
-    var h = HmacSha256.init(password);
+    var h = Hmac.init(password);
     h.update(salt);
     h.update(&[_]u8{ 0, 0, 0, 1 });
-    var u: [32]u8 = undefined;
+    var u: [Hmac.mac_length]u8 = undefined;
     h.final(&u);
 
-    var result: [32]u8 = u;
+    var result: [Hmac.mac_length]u8 = u;
 
     // U2..Ui
     var i: u32 = 1;
     while (i < iterations) : (i += 1) {
-        var next_u: [32]u8 = undefined;
-        HmacSha256.create(&next_u, &u, password);
+        var next_u: [Hmac.mac_length]u8 = undefined;
+        Hmac.create(&next_u, &u, password);
         u = next_u;
         for (&result, u) |*r, x| {
             r.* ^= x;
@@ -581,6 +681,17 @@ pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *
     }
 
     output.* = result;
+}
+
+/// PBKDF2-HMAC-SHA-256. Public so event-loop callers (xmppc Engine) can run
+/// the derivation on a worker thread between parseServerFirst and clientFinal.
+pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
+    pbkdf2With(HmacSha256, password, salt, iterations, output);
+}
+
+/// PBKDF2-HMAC-SHA-1 (SCRAM-SHA-1, RFC 5802).
+pub fn pbkdf2Sha1(password: []const u8, salt: []const u8, iterations: u32, output: *[20]u8) void {
+    pbkdf2With(std.crypto.auth.hmac.HmacSha1, password, salt, iterations, output);
 }
 
 /// Base64 encode a byte slice using the standard alphabet.
@@ -603,8 +714,8 @@ fn base64Decode(input: []const u8, output: []u8) !void {
 
 test "StoredCredentials derivation is deterministic" {
     const salt = [_]u8{0x01} ** 32;
-    const creds1 = StoredCredentials.derive("password123", salt, 4096);
-    const creds2 = StoredCredentials.derive("password123", salt, 4096);
+    const creds1 = try StoredCredentials.derive("password123", salt, 4096);
+    const creds2 = try StoredCredentials.derive("password123", salt, 4096);
 
     try std.testing.expectEqualSlices(u8, &creds1.stored_key, &creds2.stored_key);
     try std.testing.expectEqualSlices(u8, &creds1.server_key, &creds2.server_key);
@@ -612,10 +723,49 @@ test "StoredCredentials derivation is deterministic" {
 
 test "StoredCredentials different passwords produce different keys" {
     const salt = [_]u8{0x42} ** 32;
-    const creds1 = StoredCredentials.derive("password1", salt, 4096);
-    const creds2 = StoredCredentials.derive("password2", salt, 4096);
+    const creds1 = try StoredCredentials.derive("password1", salt, 4096);
+    const creds2 = try StoredCredentials.derive("password2", salt, 4096);
 
     try std.testing.expect(!std.mem.eql(u8, &creds1.stored_key, &creds2.stored_key));
+}
+
+test "StoredCredentials: NFC and NFD forms of one password derive identically (T-12C2E0C6)" {
+    const salt = [_]u8{0x07} ** 32;
+    // "päss" precomposed (NFC) vs decomposed "pa" + U+0308 (NFD).
+    const creds_nfc = try StoredCredentials.derive("p\xC3\xA4ss", salt, 4096);
+    const creds_nfd = try StoredCredentials.derive("pa\xCC\x88ss", salt, 4096);
+    try std.testing.expectEqualSlices(u8, &creds_nfc.stored_key, &creds_nfd.stored_key);
+    try std.testing.expectEqualSlices(u8, &creds_nfc.server_key, &creds_nfd.server_key);
+}
+
+test "StoredCredentials: non-ASCII space in password maps to U+0020 (T-12C2E0C6)" {
+    const salt = [_]u8{0x08} ** 32;
+    const creds_nbsp = try StoredCredentials.derive("pass\xC2\xA0word", salt, 4096); // U+00A0
+    const creds_sp = try StoredCredentials.derive("pass word", salt, 4096);
+    try std.testing.expectEqualSlices(u8, &creds_nbsp.stored_key, &creds_sp.stored_key);
+}
+
+test "StoredCredentials: prohibited password is rejected (T-12C2E0C6)" {
+    const salt = [_]u8{0x09} ** 32;
+    try std.testing.expectError(error.ProhibitedCharacter, StoredCredentials.derive("pa\xEE\x80\x80ss", salt, 4096)); // U+E000
+    try std.testing.expectError(error.ProhibitedCharacter, StoredCredentials.derive("pa\x00ss", salt, 4096)); // NUL
+}
+
+test "SCRAM client escapes '=' and ',' in n= (RFC 5802 5.1)" {
+    const allocator = std.testing.allocator;
+    var client = ScramClient.init(allocator, "us,er=na", "pencil");
+    defer client.deinit();
+    const first = try client.clientFirst();
+    try std.testing.expect(std.mem.startsWith(u8, first, "n,,n=us=2Cer=3Dna,r="));
+}
+
+test "SCRAM server unescapes n= but keeps wire bytes in AuthMessage" {
+    const allocator = std.testing.allocator;
+    var server = ScramServer.init(allocator);
+    defer server.deinit();
+    const username = try server.handleClientFirst("n,,n=us=2Cer=3Dna,r=clientnonce0001");
+    try std.testing.expectEqualStrings("us,er=na", username);
+    try std.testing.expectEqualStrings("n=us=2Cer=3Dna,r=clientnonce0001", server.client_first_bare);
 }
 
 test "SCRAM-SHA-256 full exchange" {
@@ -623,7 +773,7 @@ test "SCRAM-SHA-256 full exchange" {
 
     // Server has stored credentials for "testuser"
     const salt = [_]u8{0xAB} ** 32;
-    const creds = StoredCredentials.derive("testpassword", salt, 4096);
+    const creds = try StoredCredentials.derive("testpassword", salt, 4096);
 
     // Client initiates
     var client = ScramClient.init(allocator, "testuser", "testpassword");
@@ -658,7 +808,7 @@ test "SCRAM-SHA-256 wrong password fails" {
     const allocator = std.testing.allocator;
 
     const salt = [_]u8{0xCD} ** 32;
-    const creds = StoredCredentials.derive("correct_password", salt, 4096);
+    const creds = try StoredCredentials.derive("correct_password", salt, 4096);
 
     // Client uses wrong password
     var client = ScramClient.init(allocator, "user", "wrong_password");
@@ -685,7 +835,7 @@ test "SCRAM-SHA-256 wrong password fails" {
 /// returning the genuine server-final for tamper tests.
 fn exchangeToServerFinal(client: *ScramClient, server: *ScramServer) ![]const u8 {
     const salt = [_]u8{0x5A} ** 32;
-    const creds = StoredCredentials.derive("pw", salt, 4096);
+    const creds = try StoredCredentials.derive("pw", salt, 4096);
     _ = try server.handleClientFirst(try client.clientFirst());
     server.setCredentials(creds);
     const client_final = try client.handleServerFirst(try server.serverFirst());
@@ -706,6 +856,22 @@ test "SCRAM client: RFC 7677 test vector (16-byte salt)" {
     try client.handleServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
     try std.testing.expect(client.isComplete());
 }
+
+test "SCRAM-SHA-1 client: RFC 5802 test vector" {
+    var client = ScramClientSha1.init(std.testing.allocator, "user", "pencil");
+    defer client.deinit();
+    _ = try client.clientFirst();
+    // Pin the RFC's client nonce.
+    client.client_nonce_b64 = "fyko+d2lbbFgONRv9qkxdawL";
+    client.client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
+
+    const final = try client.handleServerFirst("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096");
+    try std.testing.expectEqualStrings("c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=", final);
+
+    try client.handleServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+    try std.testing.expect(client.isComplete());
+}
+
 
 test "SCRAM client: forged server signature is rejected" {
     const allocator = std.testing.allocator;
@@ -824,11 +990,68 @@ test "StoredCredentials.derive is standard PBKDF2-HMAC-SHA-256 (RFC 5802)" {
     // the RFC 5802 ClientKey/StoredKey/ServerKey chain, salt = 0x00..0x1f.
     var salt: [32]u8 = undefined;
     for (&salt, 0..) |*b, i| b.* = @intCast(i);
-    const creds = StoredCredentials.derive("correct horse battery staple", salt, 4096);
+    const creds = try StoredCredentials.derive("correct horse battery staple", salt, 4096);
     const expected_stored = [_]u8{ 0x4d, 0x67, 0xd5, 0xaf, 0xef, 0xa4, 0xbb, 0x81, 0x14, 0x34, 0x80, 0xc0, 0x8a, 0xdb, 0x72, 0xa2, 0x14, 0xb8, 0x6c, 0xbb, 0x6d, 0xe0, 0xae, 0x28, 0x84, 0x13, 0x70, 0x25, 0xf0, 0x7b, 0xf3, 0xc0 };
     const expected_server = [_]u8{ 0x0b, 0x1d, 0xf9, 0x1b, 0xf0, 0xa5, 0x4d, 0xa6, 0x44, 0xca, 0xc0, 0x11, 0x8b, 0x44, 0xbb, 0x34, 0xac, 0xdc, 0x3e, 0x84, 0xbc, 0x32, 0x80, 0xa0, 0xa9, 0x97, 0xa5, 0xc3, 0xb6, 0x2f, 0x8c, 0x53 };
     try std.testing.expectEqualSlices(u8, &expected_stored, &creds.stored_key);
     try std.testing.expectEqualSlices(u8, &expected_server, &creds.server_key);
     try std.testing.expectEqualSlices(u8, &salt, &creds.salt);
     try std.testing.expectEqual(@as(u32, 4096), creds.iteration_count);
+}
+
+test "SCRAM-SHA-1 client matches the RFC 5802 example exchange" {
+    const alloc = std.testing.allocator;
+    var client = ScramClientSha1.init(alloc, "user", "pencil");
+    defer client.deinit();
+    client.client_nonce_b64 = "fyko+d2lbbFgONRv9qkxdawL";
+
+    const client_first = try client.clientFirst();
+    try std.testing.expectEqualStrings("n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL", client_first);
+
+    const client_final = try client.handleServerFirst("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096");
+    try std.testing.expectEqualStrings(
+        "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=",
+        client_final,
+    );
+
+    try client.handleServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+    try std.testing.expect(client.isComplete());
+}
+
+test "gs2 'y' when the server does not advertise -PLUS" {
+    const alloc = std.testing.allocator;
+    var client = ScramClient.init(alloc, "alice", "secret");
+    defer client.deinit();
+    client.cb_mode = .unsupported_by_server;
+    client.client_nonce_b64 = "clientnonce";
+
+    const client_first = try client.clientFirst();
+    try std.testing.expectEqualStrings("y,,n=alice,r=clientnonce", client_first);
+
+    const client_final = try client.handleServerFirst("r=clientnonceservernonce,s=QSXCR+Q6sek8bf92,i=4096");
+    // c= must be base64("y,,") = eSws
+    try std.testing.expect(std.mem.startsWith(u8, client_final, "c=eSws,r=clientnonceservernonce,p="));
+}
+
+test "gs2 'p=tls-exporter' binds the c= payload" {
+    const alloc = std.testing.allocator;
+    var cb: [32]u8 = undefined;
+    for (&cb, 0..) |*b, i| b.* = @intCast(i);
+
+    var client = ScramClient.init(alloc, "alice", "secret");
+    defer client.deinit();
+    client.cb_mode = .tls_exporter;
+    client.cb_data = &cb;
+    client.client_nonce_b64 = "clientnonce";
+
+    const client_first = try client.clientFirst();
+    try std.testing.expectEqualStrings("p=tls-exporter,,n=alice,r=clientnonce", client_first);
+
+    const client_final = try client.handleServerFirst("r=clientnonceservernonce,s=QSXCR+Q6sek8bf92,i=4096");
+    // c= = base64("p=tls-exporter,," || exporter bytes), from hashlib
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        client_final,
+        "c=cD10bHMtZXhwb3J0ZXIsLAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f,r=clientnonceservernonce,p=",
+    ));
 }

@@ -220,8 +220,11 @@ pub const Engine = struct {
         password: []u8,
         salt: []u8,
         iterations: u32,
+        /// SCRAM hash family (SHA-256 or SHA-1); the worker derives with it
+        /// and the completion carries it back so the session can verify.
+        hash: sasl.scram.Hash,
     };
-    const DeriveDone = struct { job: DeriveJob, salted: [32]u8 };
+    const DeriveDone = struct { job: DeriveJob, salted: sasl.scram.SaltedPassword };
     /// Fixed-capacity completion ring: the worker never allocates, so the
     /// engine allocator is not required to be thread-safe.
     const DONE_CAP = 64;
@@ -285,7 +288,7 @@ pub const Engine = struct {
     /// Cache hits served without touching the worker.
     scram_cache_hits: usize = 0,
 
-    scram_cache: std.StringHashMapUnmanaged([32]u8) = .{},
+    scram_cache: std.StringHashMapUnmanaged(sasl.scram.SaltedPassword) = .{},
 
     crypto_mutex: std.Thread.Mutex = .{},
     /// Signaled on: job queued, done-ring room freed, stop requested.
@@ -298,6 +301,8 @@ pub const Engine = struct {
     crypto_thread: ?std.Thread = null,
     crypto_stop: bool = false,
 
+    sm_queues: std.StringHashMapUnmanaged(SmQueue) = .{},
+
     /// Driver-facing cumulative counters (T32). Written only on the engine
     /// thread through the note*() helpers; read via statsSnapshot().
     stats: Stats = .{},
@@ -307,6 +312,104 @@ pub const Engine = struct {
     /// every session is dead nothing remains armed on the kqueue, so the
     /// wait would never return to reach the runLoop's reap.
     reap_pending: bool = false,
+
+    /// Bumped on every run(): a previous loop that is still unwinding (its
+    /// last session died while a foreign thread already attached the next
+    /// one, reviving live_count) sees its generation go stale and exits
+    /// before the replacement thread spawns.
+    run_gen: u32 = 0,
+
+    // --- XEP-0198 outbound unacked queues (T-9BC4D065) ---
+    // Keyed by SM id; a queue outlives the Session that produced it because
+    // resume spins up a NEW Session (SessionConfig.sm_resume_id) that must
+    // find the old queue to drop acked entries and replay the rest.
+    // Engine-thread only: every entry point is the read loop, sendStanza,
+    // or the established action.
+
+    pub const SmEntry = struct {
+        /// Owned copy of the raw stanza bytes.
+        bytes: []u8,
+        /// Wire sequence of the most recent send (1-based to match 'h').
+        seq: u32,
+    };
+    pub const SmQueue = struct {
+        entries: std.ArrayListUnmanaged(SmEntry) = .{},
+        next_seq: u32 = 1,
+    };
+    /// Backpressure bound: a server that never acks stops the send path
+    // with error.SmBacklog instead of growing memory without limit.
+    pub const SM_UNACKED_MAX = 512;
+
+    /// Wrap-aware a <= b in XEP-0198 sequence space (u32, wraps at 2^32).
+    fn smSeqLte(a: u32, b: u32) bool {
+        return (b -% a) < (@as(u32, 1) << 31);
+    }
+
+    /// Fresh `<enabled id=...>`: start (or reset) the queue for `sm_id`.
+    pub fn smRegisterFresh(self: *Engine, sm_id: []const u8) !void {
+        if (self.sm_queues.getPtr(sm_id)) |q| {
+            self.smQueueClear(q);
+            q.next_seq = 1;
+            return;
+        }
+        _ = try self.smQueueCreate(sm_id);
+    }
+
+    fn smQueueCreate(self: *Engine, sm_id: []const u8) !*SmQueue {
+        const key = try self.allocator.dupe(u8, sm_id);
+        errdefer self.allocator.free(key);
+        try self.sm_queues.put(self.allocator, key, .{});
+        return self.sm_queues.getPtr(key).?;
+    }
+
+    fn smQueueClear(self: *Engine, q: *SmQueue) void {
+        for (q.entries.items) |e| self.allocator.free(e.bytes);
+        q.entries.clearRetainingCapacity();
+    }
+
+    /// Track one outbound stanza while SM is active. Returns the unacked
+    /// depth (the Session uses it to pace `<r/>` ack requests).
+    pub fn smTrackSend(self: *Engine, sm_id: []const u8, stanza: []const u8) !usize {
+        const q = self.sm_queues.getPtr(sm_id) orelse try self.smQueueCreate(sm_id);
+        if (q.entries.items.len >= SM_UNACKED_MAX) return error.SmBacklog;
+        const bytes = try self.allocator.dupe(u8, stanza);
+        errdefer self.allocator.free(bytes);
+        try q.entries.append(self.allocator, .{ .bytes = bytes, .seq = q.next_seq });
+        q.next_seq +%= 1;
+        return q.entries.items.len;
+    }
+
+    /// Server `<a h=.../>`: drop everything up to and including seq h.
+    pub fn smAck(self: *Engine, sm_id: []const u8, h: u32) void {
+        const q = self.sm_queues.getPtr(sm_id) orelse return;
+        var n: usize = 0;
+        while (n < q.entries.items.len and smSeqLte(q.entries.items[n].seq, h)) : (n += 1)
+            self.allocator.free(q.entries.items[n].bytes);
+        if (n > 0) std.mem.copyForwards(SmEntry, q.entries.items[0 .. q.entries.items.len - n], q.entries.items[n..]);
+        q.entries.shrinkRetainingCapacity(q.entries.items.len - n);
+    }
+
+    /// Drop the queue for `sm_id` (resume `<failed/>`, consumer giving up on
+    /// resume). Returns how many unacked stanzas were discarded.
+    pub fn smDrop(self: *Engine, sm_id: []const u8) u32 {
+        const kv = self.sm_queues.fetchRemove(sm_id) orelse return 0;
+        const count: u32 = @intCast(kv.value.entries.items.len);
+        var q = kv.value;
+        self.smQueueClear(&q);
+        q.entries.deinit(self.allocator);
+        self.allocator.free(kv.key);
+        return count;
+    }
+
+    /// Replay on `<resumed h=.../>`: drop acked entries, hand the queue back
+    /// for the Session to re-queue remaining bytes in order (each gets a
+    /// fresh wire sequence). Null when there is nothing to replay.
+    pub fn smReplayQueue(self: *Engine, sm_id: []const u8, h: u32) ?*SmQueue {
+        self.smAck(sm_id, h);
+        const q = self.sm_queues.getPtr(sm_id) orelse return null;
+        if (q.entries.items.len == 0) return null;
+        return q;
+    }
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
@@ -350,6 +453,13 @@ pub const Engine = struct {
         }
         self.scramCacheClear();
         self.scram_cache.deinit(self.allocator);
+        var sm_it = self.sm_queues.iterator();
+        while (sm_it.next()) |kv| {
+            self.smQueueClear(kv.value_ptr);
+            kv.value_ptr.entries.deinit(self.allocator);
+            self.allocator.free(kv.key_ptr.*);
+        }
+        self.sm_queues.deinit(self.allocator);
         self.slots.deinit(self.allocator);
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
@@ -367,16 +477,16 @@ pub const Engine = struct {
 
     /// Look up a cached SaltedPassword for (password, salt, iterations).
     /// Engine thread only (cache is unsynchronized by design).
-    pub fn scramCached(self: *Engine, password: []const u8, salt: []const u8, iterations: u32) ?[32]u8 {
+    pub fn scramCached(self: *Engine, password: []const u8, salt: []const u8, iterations: u32, hash: sasl.scram.Hash) ?sasl.scram.SaltedPassword {
         var kbuf: [1024]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "{s}\x00{s}\x00{d}", .{ password, salt, iterations }) catch return null;
+        const key = std.fmt.bufPrint(&kbuf, "{d}\x00{s}\x00{s}\x00{d}", .{ @intFromEnum(hash), password, salt, iterations }) catch return null;
         return self.scram_cache.get(key);
     }
 
     /// Queue a SaltedPassword derivation for the crypto worker; the session
     /// parks until onSaslDerived fires from the loopOnce drain. Engine
     /// thread only.
-    pub fn queueDerive(self: *Engine, h: Handle, password: []const u8, salt: []const u8, iterations: u32) !void {
+    pub fn queueDerive(self: *Engine, h: Handle, password: []const u8, salt: []const u8, iterations: u32, hash: sasl.scram.Hash) !void {
         const pw_copy = try self.allocator.dupe(u8, password);
         errdefer self.allocator.free(pw_copy);
         const salt_copy = try self.allocator.dupe(u8, salt);
@@ -393,6 +503,7 @@ pub const Engine = struct {
             .password = pw_copy,
             .salt = salt_copy,
             .iterations = iterations,
+            .hash = hash,
         });
         self.crypto_cond.signal();
     }
@@ -400,7 +511,7 @@ pub const Engine = struct {
     fn scramCacheClear(self: *Engine) void {
         var it = self.scram_cache.iterator();
         while (it.next()) |e| {
-            std.crypto.secureZero(u8, e.value_ptr[0..]);
+            std.crypto.secureZero(u8, std.mem.asBytes(e.value_ptr));
             self.allocator.free(e.key_ptr.*);
         }
         self.scram_cache.clearRetainingCapacity();
@@ -420,8 +531,7 @@ pub const Engine = struct {
             const job = self.crypto_jobs.orderedRemove(0);
             self.crypto_mutex.unlock();
 
-            var salted: [32]u8 = undefined;
-            sasl.scram.pbkdf2(job.password, job.salt, job.iterations, &salted);
+            const salted = sasl.scram.deriveSalted(job.hash, job.password, job.salt, job.iterations);
 
             self.crypto_mutex.lock();
             self.crypto_done[self.crypto_done_head] = .{ .job = job, .salted = salted };
@@ -454,7 +564,7 @@ pub const Engine = struct {
             defer self.allocator.free(done.job.salt);
             self.scram_derives += 1;
 
-            const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ done.job.password, done.job.salt, done.job.iterations }) catch null;
+            const key = std.fmt.allocPrint(self.allocator, "{d}\x00{s}\x00{s}\x00{d}", .{ @intFromEnum(done.job.hash), done.job.password, done.job.salt, done.job.iterations }) catch null;
             if (key) |k| {
                 if (self.scram_cache.contains(k)) {
                     self.allocator.free(k);
@@ -773,8 +883,22 @@ pub const Engine = struct {
         self.live_count -= 1;
     }
 
+    /// Join the loop thread without respawning it: the deterministic "loop
+    /// fully stopped" point a consumer needs before re-attaching a session
+    /// from its control thread (attachFd only stages; a still-running old
+    /// loop would otherwise drive the fresh session concurrently).
+    pub fn waitLoopExit(self: *Engine) void {
+        if (self.thread) |*t| {
+            self.requestWake();
+            t.join();
+            self.thread = null;
+        }
+    }
+
     /// Run the kqueue loop on a dedicated thread.
     pub fn run(self: *Engine) !void {
+        self.run_gen +%= 1;
+        self.waitLoopExit();
         const t = std.Thread.spawn(.{}, Engine.runLoop, .{self}) catch return error.ThreadSpawn;
         self.thread = t;
     }
@@ -795,7 +919,8 @@ pub const Engine = struct {
     }
 
     fn runLoop(self: *Engine) void {
-        while (self.live_count > 0) {
+        const gen = self.run_gen;
+        while (self.live_count > 0 and self.run_gen == gen) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -920,3 +1045,36 @@ pub const Engine = struct {
         self.requestWake();
     }
 };
+
+test "engine: SM unacked queue track/ack/drop incl. sequence wrap (T-9BC4D065)" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc);
+    defer engine.deinit();
+
+    try engine.smRegisterFresh("s1");
+    _ = try engine.smTrackSend("s1", "<m1/>");
+    _ = try engine.smTrackSend("s1", "<m2/>");
+    _ = try engine.smTrackSend("s1", "<m3/>");
+    engine.smAck("s1", 2);
+    const q = engine.sm_queues.getPtr("s1").?;
+    try std.testing.expectEqual(@as(usize, 1), q.entries.items.len);
+    try std.testing.expectEqualStrings("<m3/>", q.entries.items[0].bytes);
+
+    // Wrap: with only near-wrap entries in flight (the realistic case —
+    // h advances as the peer handles our stanzas), acks across the 2^32
+    // boundary must drop the right prefix.
+    engine.smAck("s1", 3);
+    try std.testing.expectEqual(@as(usize, 0), q.entries.items.len);
+    q.next_seq = 0xFFFF_FFFE;
+    _ = try engine.smTrackSend("s1", "<m4/>"); // seq FFFE
+    _ = try engine.smTrackSend("s1", "<m5/>"); // seq FFFF
+    _ = try engine.smTrackSend("s1", "<m6/>"); // seq 0 (wrapped)
+    engine.smAck("s1", 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(usize, 1), q.entries.items.len);
+    try std.testing.expectEqualStrings("<m6/>", q.entries.items[0].bytes);
+    engine.smAck("s1", 0); // wrapped h acks the m6 entry too
+    try std.testing.expectEqual(@as(usize, 0), q.entries.items.len);
+
+    try std.testing.expectEqual(@as(u32, 0), engine.smDrop("s1"));
+    try std.testing.expect(engine.sm_queues.getPtr("s1") == null);
+}

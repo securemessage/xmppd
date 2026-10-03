@@ -159,7 +159,14 @@ pub const CryptoPool = struct {
             } orelse return;
 
             defer std.heap.c_allocator.free(job.password);
-            const test_creds = sasl.StoredCredentials.derive(job.password, job.salt, job.iteration_count);
+            // Prep failure means the presented password can never match a
+            // prepped stored credential: report as a mismatch.
+            const test_creds = sasl.StoredCredentials.derive(job.password, job.salt, job.iteration_count) catch {
+                self.completion_mutex.lock();
+                defer self.completion_mutex.unlock();
+                self.completions.append(self.allocator, .{ .id = job.id, .ok = false }) catch {};
+                continue;
+            };
             const ok = std.mem.eql(u8, &test_creds.stored_key, &job.expected_stored_key);
 
             {
@@ -186,7 +193,7 @@ test "CryptoPool: derive matches inline computation" {
     try pool.start(2);
     defer pool.stop();
 
-    const creds = sasl.StoredCredentials.derive("hunter2", @splat(1), 4096);
+    const creds = try sasl.StoredCredentials.derive("hunter2", @splat(1), 4096);
 
     const id1 = try pool.put("hunter2", @splat(1), 4096, creds.stored_key);
     const id2 = try pool.put("wrong", @splat(1), 4096, creds.stored_key);
@@ -223,7 +230,7 @@ test "CryptoPool: queue is bounded" {
         pool.completions.deinit(std.testing.allocator);
     }
 
-    const creds = sasl.StoredCredentials.derive("x", @splat(2), 4096);
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 4096);
     var accepted: usize = 0;
     for (0..MAX_JOBS + 8) |_| {
         _ = pool.put("x", @splat(2), 4096, creds.stored_key) catch |err| switch (err) {

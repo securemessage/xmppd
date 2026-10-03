@@ -33,6 +33,7 @@ const tls = @import("tls");
 const dns = @import("dns");
 const stream = @import("stream.zig");
 const saslmod = @import("sasl.zig");
+const sasl = @import("sasl");
 
 const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
@@ -92,6 +93,10 @@ pub const Event = union(enum) {
     closed: []const u8,
     /// Inbound application stanza (see Stanza for payload lifetime).
     stanza: Stanza,
+    /// SM resume was rejected (`<failed/>`): the server discarded these
+    /// many of our unacked outbound stanzas (T-9BC4D065). Delivered just
+    /// before .established (the stream continues without SM).
+    sm_failed: u32,
 };
 
 /// Signature of the Engine event sink. Runs on the engine thread (see the
@@ -177,6 +182,15 @@ pub const Session = struct {
     /// Heap pointers: the FSM mutates these in place; copying them (a
     /// `|x|` / `orelse` on a value) would silently drop state.
     sasl: ?*saslmod.SaslClient = null,
+    /// TLS channel binding state captured at handshake completion
+    /// (T-D61734DE): cb_mode mirrors the SslConn binding type, cb_data_buf
+    /// owns the 32 binding bytes for the SASL exchange's lifetime.
+    cb_mode: sasl.scram.CbMode = .none,
+    cb_data_buf: [32]u8 = undefined,
+    /// OpaqueString-prepped credentials (T-12C2E0C6): SaslClient borrows
+    /// these slices, so they must live on the Session.
+    prep_authcid_buf: [2048]u8 = undefined,
+    prep_password_buf: [2048]u8 = undefined,
     /// True while a SaltedPassword derivation runs on the engine's crypto
     /// worker; the SASL exchange resumes in onSaslDerived.
     sasl_deriving: bool = false,
@@ -332,6 +346,17 @@ pub const Session = struct {
                     // userland crypto is silent, so this is the only way to
                     // tell an armed context really offloaded.
                     log.info("fd={d} tls established ktls_send={} ktls_recv={}", .{ self.fd, tc.ktlsSend(), tc.ktlsRecv() });
+                    // Channel binding for SCRAM -PLUS / gs2 'y' (T-D61734DE):
+                    // tls-exporter on TLS 1.3, tls-server-end-point on 1.2.
+                    if (tc.getChannelBinding()) |cb| {
+                        self.cb_data_buf = cb.data;
+                        self.cb_mode = switch (cb.cb_type) {
+                            .tls_exporter => .tls_exporter,
+                            .tls_server_end_point => .tls_server_end_point,
+                            .none => .none,
+                        };
+                        self.fsm.cb_available = self.cb_mode.isPlus();
+                    }
                     // DANE mode authenticated nothing yet: match the peer
                     // chain against the TLSA records now, fail closed.
                     if (self.pending_dane) {
@@ -558,12 +583,13 @@ pub const Session = struct {
         const parser = self.parser orelse return;
         var pos: usize = 0;
         while (true) {
+            const ev_start = pos;
             const ev = self.reader.next(self.read_buf[0..self.read_len], &pos) catch {
                 self.fail(allocator, "xml-parse-error");
                 return;
             };
             if (ev == null) break;
-            if (!parser.onReaderEvent(ev.?)) {
+            if (!parser.onReaderEvent(ev.?, self.read_buf[ev_start..pos])) {
                 self.fail(allocator, "protocol-error");
                 return;
             }
@@ -589,6 +615,10 @@ pub const Session = struct {
                     };
                     self.writeAfter(engine);
                 }
+            }
+            if (parser.pending_sm_a) |h| {
+                parser.pending_sm_a = null;
+                if (self.sm_enabled) engine.smAck(self.sm_id, h);
             }
             if (parser.pending) |sev| {
                 parser.pending = null;
@@ -834,6 +864,39 @@ pub const Session = struct {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;
                 }
+                // Outbound side (T-9BC4D065). Fresh enable: start an empty
+                // unacked queue. Resume: drop the stanzas the server acked
+                // via <resumed h=.../> and replay the rest before the
+                // consumer sees .established, preserving order against any
+                // stanza it sends next. Rejected resume (<failed/>): the
+                // server discarded its side, so drop ours and say how many.
+                if (self.sm_enabled) {
+                    if (self.fsm.sm_resumed) {
+                        if (engine.smReplayQueue(self.sm_id, self.fsm.sm_resumed_h)) |q| {
+                            for (q.entries.items) |*e| {
+                                self.queue(e.bytes) catch {
+                                    self.fail(engine.allocator, "queue-error");
+                                    return;
+                                };
+                                e.seq = q.next_seq;
+                                q.next_seq +%= 1;
+                            }
+                            self.queue("<r xmlns='urn:xmpp:sm:3'/>") catch {
+                                self.fail(engine.allocator, "queue-error");
+                                return;
+                            };
+                            self.writeAfter(engine);
+                        }
+                    } else {
+                        engine.smRegisterFresh(self.sm_id) catch {
+                            self.fail(engine.allocator, "alloc-failed");
+                            return;
+                        };
+                    }
+                } else if (self.fsm.resume_id.len > 0) {
+                    const dropped = engine.smDrop(self.fsm.resume_id);
+                    if (dropped > 0) engine.dispatchEvent(self.handle, .{ .sm_failed = dropped });
+                }
                 engine.dispatchEvent(self.handle, .established);
             },
             .close => {
@@ -927,7 +990,36 @@ pub const Session = struct {
         // prepends its own domain); the full JID is only used after bind.
         const at = std.mem.indexOfScalar(u8, self.user, '@');
         const authcid = if (at) |i| self.user[0..i] else self.user;
-        sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password) catch {
+        // gs2 flag (RFC 5802 §6): 'p' for a -PLUS mechanism (the FSM only
+        // selects one when channel binding data exists), 'y' when the client
+        // supports CB but the server advertised no -PLUS variant, else 'n'.
+        var opts: saslmod.SaslClient.Options = .{};
+        if (saslmod.SaslClient.isPlusMech(mech)) {
+            if (!self.cb_mode.isPlus()) return error.SaslInitFailed;
+            opts.cb_mode = self.cb_mode;
+            opts.cb_data = &self.cb_data_buf;
+        } else if (saslmod.SaslClient.hashOf(mech) != null and self.cb_mode.isPlus()) {
+            opts.cb_mode = .unsupported_by_server;
+        }
+        // RFC 8265 OpaqueString prep (T-12C2E0C6): identical to the prep
+        // StoredCredentials.derive applies at credential creation, so NFC /
+        // space-mapped forms of the same password verify. Prep failure
+        // (prohibited input) fails before anything is sent.
+        var prep_cps: [3072]u21 = undefined;
+        var prep_cccs: [3072]u8 = undefined;
+        const prepped_cid = sasl.stringprep.prepareOpaqueString(authcid, &self.prep_authcid_buf, &prep_cps, &prep_cccs) catch {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        };
+        if (self.password.len > self.prep_password_buf.len / 2) {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        }
+        const prepped_pw = sasl.stringprep.prepareOpaqueString(self.password, &self.prep_password_buf, &prep_cps, &prep_cccs) catch {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        };
+        sc.* = saslmod.SaslClient.init(allocator, mech, prepped_cid, prepped_pw, opts) catch {
             allocator.destroy(sc);
             return error.SaslInitFailed;
         };
@@ -952,14 +1044,14 @@ pub const Session = struct {
             .message => |msg| try self.queueSaslResponse(engine, msg),
             .derive => |d| {
                 const pw = sc.derivePassword() orelse return error.SaslNoPassword;
-                if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations)) |salted| {
+                if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations, d.hash)) |salted| {
                     engine.scram_cache_hits += 1;
                     try self.finishSaslDerive(engine, salted);
                 } else {
                     // Hi() runs on the engine's crypto worker; the
                     // exchange parks until onSaslDerived resumes it.
                     self.sasl_deriving = true;
-                    engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations) catch {
+                    engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations, d.hash) catch {
                         self.sasl_deriving = false;
                         return error.SaslDeriveQueue;
                     };
@@ -973,11 +1065,18 @@ pub const Session = struct {
     /// protocol FSM's own writes, flush immediately, and re-arm kqueue write
     /// interest when the kernel send buffer is full.
     ///
-    /// Not yet SM-counted for later retransmission on <resumed/>: an
-    /// application needing at-least-once over reconnects must watch for the
-    /// .established event after a resume and replay what it cares about.
+    /// With SM enabled the stanza is tracked in the engine's unacked queue
+    /// (T-9BC4D065): acked entries drop on the server's <a h=.../>, the rest
+    /// replays automatically after a successful <resumed/>. error.SmBacklog
+    /// when the server has stopped acking (SM_UNACKED_MAX deep).
     pub fn sendStanza(self: *Session, stanza: []const u8) !void {
         if (self.phase != .established) return error.NotEstablished;
+        if (self.sm_enabled) {
+            const depth = try self.engine.smTrackSend(self.sm_id, stanza);
+            // Nudge the server for an ack every 16 unacked stanzas so the
+            // queue can't grow silently on a quiet peer.
+            if (depth % 16 == 0) try self.queue("<r xmlns='urn:xmpp:sm:3'/>");
+        }
         try self.queue(stanza);
         self.writeAfter(self.engine);
     }
@@ -1004,7 +1103,7 @@ pub const Session = struct {
         self.writeAfter(engine);
     }
 
-    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: [32]u8) ActionError!void {
+    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: sasl.scram.SaltedPassword) ActionError!void {
         const sc = self.sasl orelse return error.SaslNotActive;
         const msg = sc.finishChallenge(salted_password) catch return error.SaslChallengeFailed;
         try self.queueSaslResponse(engine, msg);
@@ -1012,7 +1111,7 @@ pub const Session = struct {
 
     /// Engine-thread callback from drainCryptoDone: the crypto worker
     /// finished this session's parked SaltedPassword derivation.
-    pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: [32]u8) void {
+    pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: sasl.scram.SaltedPassword) void {
         if (!self.sasl_deriving) return; // stale completion (re-derive raced)
         self.sasl_deriving = false;
         self.finishSaslDerive(engine, salted_password) catch |err|

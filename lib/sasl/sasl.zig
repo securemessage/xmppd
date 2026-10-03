@@ -1,9 +1,11 @@
 const std = @import("std");
 pub const scram = @import("scram.zig");
 pub const plain = @import("plain.zig");
+pub const stringprep = @import("stringprep.zig");
 
 pub const ScramServer = scram.ScramServer;
 pub const ScramClient = scram.ScramClient;
+pub const ScramClientSha1 = scram.ScramClientSha1;
 pub const StoredCredentials = scram.StoredCredentials;
 pub const PlainCredentials = plain.PlainCredentials;
 

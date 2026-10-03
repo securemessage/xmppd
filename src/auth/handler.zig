@@ -416,7 +416,13 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
 
                 // No pool: verify inline by deriving with the same salt.
-                const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count);
+                // A password that fails OpaqueString prep cannot match a
+                // prepped stored credential: treat as a failed auth.
+                const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count) catch {
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
+                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
                 if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
                     log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);

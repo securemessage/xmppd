@@ -181,6 +181,11 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             if (!al) engine.requestWake();
         },
         .stanza => {},
+        .sm_failed => |n| {
+            g.lock.lock();
+            defer g.lock.unlock();
+            if (!g.quiet) std.debug.print("[sm] resume rejected, {d} unacked stanza(s) discarded\n", .{n});
+        },
     }
 }
 
