@@ -30,6 +30,8 @@ const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
 const Parser = @import("parser.zig").Parser;
 const Transport = @import("transport.zig").Transport;
+const resolver_mod = @import("resolver.zig");
+const Resolution = resolver_mod.Resolution;
 
 const Jid = xmpp.Jid;
 const Reader = xml.Reader;
@@ -67,6 +69,8 @@ fn b64encInto(out: []u8, input: []const u8) ![]const u8 {
 pub const Session = struct {
     const Phase = enum {
         connecting,
+        /// DNS in flight for a hostname (T-16C82690/T201).
+        resolving,
         /// TCP up + stream open written; FSM-driven establishment pending.
         connected,
         /// Full protocol establishment (bind + SM).
@@ -95,6 +99,13 @@ pub const Session = struct {
     /// (Transport owns the "identical pointer on TLS retry" pin state).
     tport: ?Transport = null,
     tls_handshake: bool = false,
+
+    /// Requested TCP port for direct connects (kept for target iteration).
+    port: u16 = 0,
+    /// DNS resolution result (owned; TLSA records included per target).
+    /// Freed in destroy.
+    resolution: ?Resolution = null,
+    target_index: usize = 0,
 
     host: []const u8 = "",
     domain: []const u8 = "",
@@ -168,6 +179,7 @@ pub const Session = struct {
                 tc.deinit();
             }
         }
+        if (self.resolution) |*r| r.deinitOn(allocator);
         if (self.fd >= 0) posix.close(self.fd);
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
@@ -312,6 +324,55 @@ pub const Session = struct {
         return .{ .send = false, .recv = false };
     }
 
+    /// DNS completion callback from the engine's resolver (engine thread).
+    /// Takes ownership of the Resolution (targets + TLSA per target).
+    pub fn onResolution(self: *Session, res: ?Resolution, status: resolver_mod.Status) void {
+        switch (status) {
+            .resolved => {
+                const r = res orelse return self.fail(self.engine.allocator, "resolve-failed");
+                if (r.targets.len == 0) return self.fail(self.engine.allocator, "resolve-failed");
+                self.resolution = r;
+                self.target_index = 0;
+                self.connectNextTarget(true);
+            },
+            .nxdomain, .failed => self.fail(self.engine.allocator, "resolve-failed"),
+        }
+    }
+
+    /// Connect to targets[target_index], advancing past failures.
+    /// `first` means there is no prior fd to drop.
+    fn connectNextTarget(self: *Session, first: bool) void {
+        const engine = self.engine;
+        const res = &(self.resolution.?);
+        while (self.target_index < res.targets.len) {
+            const t = res.targets[self.target_index];
+            if (!first and self.fd >= 0) posix.close(self.fd);
+
+            self.fd = posix.socket(t.addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
+                self.target_index += 1;
+                continue;
+            };
+            self.tport = Transport.initPlain(self.fd);
+            self.read_registered = false;
+            self.write_registered = false;
+
+            const conn_result = posix.connect(self.fd, &t.addr.any, t.addr.getOsSockLen());
+            if (conn_result) {} else |err| {
+                if (err != error.WouldBlock) {
+                    self.target_index += 1;
+                    continue;
+                }
+            }
+            self.phase = .connecting;
+            engine.addRead(self.fd, self.handle);
+            engine.addWrite(self.fd, self.handle);
+            self.read_registered = true;
+            self.write_registered = true;
+            return;
+        }
+        self.fail(engine.allocator, "connect-failed");
+    }
+
     fn armWrite(self: *Session, engine: *Engine) void {
         if (self.write_registered) return;
         engine.addWrite(self.fd, self.handle);
@@ -395,7 +456,14 @@ pub const Session = struct {
             var optlen: posix.socklen_t = @sizeOf(c_int);
             const rc = std.c.getsockopt(self.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &optlen);
             if (rc != 0 or err_opt != 0) {
-                self.fail(engine.allocator, "connect-failed");
+                // Connect failed — walk the target list when we have one
+                // (DNS-given alternatives), otherwise fail.
+                if (self.resolution != null) {
+                    self.target_index += 1;
+                    self.connectNextTarget(false);
+                } else {
+                    self.fail(engine.allocator, "connect-failed");
+                }
                 return;
             }
             // TCP up — open the stream and leave the connecting phase so a

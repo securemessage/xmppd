@@ -76,6 +76,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const wire_mod = b.createModule(.{
+        .root_source_file = b.path("lib/dns/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wire_mod.addImport("dns", dns_mod);
+    dns_mod.addImport("wire", wire_mod);
+
     // --- xmppc: client-core library (T32 phase 1) ---
     // Own API boundary from day one: nothing in lib/xmppc imports src/, and
     // src/ does not import lib/xmppc. Reuses the shared protocol primitives
@@ -92,6 +100,7 @@ pub fn build(b: *std.Build) void {
     xmppc_mod.addImport("tls", tls_mod);
     xmppc_mod.addImport("ssl", ssl_mod);
     xmppc_mod.addImport("dns", dns_mod);
+    xmppc_mod.addImport("wire", wire_mod);
 
     // xmppc-smoke: end-to-end test client for lib/xmppc against a live xmppd
     // rig (doc/TESTING.md). A consumer of the public xmppc module, not part
@@ -182,6 +191,7 @@ pub fn build(b: *std.Build) void {
     xmppc_test_mod.addImport("tls", tls_mod);
     xmppc_test_mod.addImport("ssl", ssl_mod);
     xmppc_test_mod.addImport("dns", dns_mod);
+    xmppc_test_mod.addImport("wire", wire_mod);
 
     const xml_tests = b.addTest(.{
         .name = "xml-tests",

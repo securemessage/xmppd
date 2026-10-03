@@ -23,6 +23,9 @@ const ssl = @import("ssl");
 
 const Session = @import("session.zig").Session;
 const Transport = @import("transport.zig").Transport;
+const Resolver = @import("resolver.zig").Resolver;
+const Resolution = @import("resolver.zig").Resolution;
+const DnsStatus = @import("resolver.zig").Status;
 
 const Kevent = std.posix.Kevent;
 const posix = std.posix;
@@ -74,6 +77,8 @@ fn resolveHost(host: []const u8) !std.c.sockaddr.in {
 
 pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
+    const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
+    const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
     const Slot = struct {
         session: Session,
         generation: u32,
@@ -85,6 +90,11 @@ pub const Engine = struct {
     slots: std.ArrayListUnmanaged(Slot),
     free_slots: std.ArrayListUnmanaged(u32),
     live_count: usize = 0,
+    /// Async DNS engine (lazy-open on first resolve).
+    resolver: ?Resolver = null,
+    /// One-second housekeeping tick (resolver retransmits/timeouts). The
+    /// single allowed periodic timer on this loop.
+    resolver_tick_armed: bool = false,
 
     tls_ctx: ?ssl.SslContext = null,
     thread: ?std.Thread = null,
@@ -110,6 +120,7 @@ pub const Engine = struct {
             self.thread = null;
         }
         self.stopAll();
+        if (self.resolver) |*r| r.deinit();
         self.slots.deinit(self.allocator);
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
@@ -179,6 +190,11 @@ pub const Engine = struct {
     /// `to=` JID domain (RFC 6120 §4.2) — distinct from the TCP connect
     /// target `host` (e.g. host "127.0.0.1" but domain "localhost"). Returns
     /// the session handle.
+    ///
+    /// `host` as a literal IP connects immediately; otherwise DNS resolution
+    /// runs asynchronously (SRV chain -> A/AAAA -> TLSA) on this loop and the
+    /// session continues when the answer lands. Connect failure walks the
+    /// target list.
     pub fn startSession(self: *Engine, host: []const u8, port: u16, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
@@ -188,11 +204,44 @@ pub const Engine = struct {
         s.password = password;
         s.resource = resource;
         s.fsm.resume_id = sm_resume_id;
+        s.port = port;
 
-        var addr = resolveHost(host) catch {
-            s.destroy(self.allocator);
+        // Literal IP: skip DNS entirely (lab rigs, explicit endpoints).
+        if (std.net.Address.parseIp(host, 0)) |_| {
+            return self.connectDirect(&s, host, port);
+        } else |_| {}
+
+        // Hostname: park the session in .resolving and hand the lookup to
+        // the async resolver on THIS engine. Nothing blocks.
+        if (self.resolver == null) {
+            self.resolver = Resolver.init(self.allocator);
+            self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
+        }
+        // Register the session slot first so the resolution completes to a
+        // live handle.
+        const h = try self.allocSlot();
+        const slot = &self.slots.items[@intCast(h.index)];
+        slot.session = s;
+        slot.session.handle = h;
+        slot.live = true;
+        slot.session.phase = .resolving;
+        self.live_count += 1;
+        self.resolver.?.resolve(host, port, h.encode()) catch |err| {
+            slot.session.destroy(self.allocator);
+            self.freeSlot(h);
+            return err;
+        };
+        self.armResolverTick();
+        return h;
+    }
+
+    /// Direct connect without DNS (literal IP or the socketpair test seam's
+    /// pre-connected fd). Retains the pre-resolver code path.
+    pub fn connectDirect(self: *Engine, s: *Session, host: []const u8, port: u16) !Handle {
+        const addr_v4 = resolveHost(host) catch {
             return error.NameResolutionFailed;
         };
+        var addr = addr_v4;
         addr.port = std.mem.nativeToBig(u16, port);
 
         const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
@@ -206,7 +255,34 @@ pub const Engine = struct {
                 return error.ConnectFailed;
             }
         };
-        return self.attachPrepared(&s, fd);
+        return self.attachPrepared(s, fd);
+    }
+
+    // ---- DNS completion ---------------------------------------------------
+
+    fn armResolverTick(self: *Engine) void {
+        if (self.resolver == null or self.resolver_tick_armed) return;
+        self.resolver_tick_armed = true;
+        // Register the resolver socket + a 1 s housekeeping tick.
+        const dns_fd = self.resolver.?.sockFd();
+        if (dns_fd >= 0) {
+            const dev = kev(@intCast(dns_fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, DNS_UDATA);
+            self.stage(dev);
+        }
+        const tick = kev(1, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ENABLE, TICK_UDATA);
+        // NOTE: kev() here carries data=0; EVFILT_TIMER's interval must go in
+        // `data` (ms). kev() doesn't expose it — write the record directly.
+        var tev = tick;
+        tev.data = 1000;
+        self.stage(tev);
+    }
+
+    /// Completion callback for the resolver (engine thread). static per Cb.
+    fn onDnsResult(ctx: ?*anyopaque, session_key: usize, status: DnsStatus, res: ?Resolution) void {
+        const self: *Engine = @ptrCast(@alignCast(ctx orelse return));
+        const h = Handle.decode(session_key);
+        const s = self.sessionAt(h) orelse return;
+        s.onResolution(res, status);
     }
 
     /// Attach a pre-connected fd — the test seam for driving a Session over
@@ -325,6 +401,14 @@ pub const Engine = struct {
 
         for (evbuf[0..n]) |ev| {
             if (ev.udata == WAKE_UDATA) continue;
+            if (ev.udata == DNS_UDATA) {
+                if (self.resolver) |*r| r.onReadable();
+                continue;
+            }
+            if (ev.udata == TICK_UDATA) {
+                if (self.resolver) |*r| r.tick();
+                continue;
+            }
             const h = Handle.decode(ev.udata);
             const s = self.sessionAt(h) orelse continue;
             switch (ev.filter) {
