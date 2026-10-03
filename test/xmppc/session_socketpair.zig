@@ -119,7 +119,16 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
         .established => if (engine.sessionAt(handle)) |session| onEstablished(session),
         .closed => |reason| onClosed(reason),
         .stanza => |st| onStanza(st),
+        .sm_failed => |n| onSmFailed(n),
     }
+}
+
+var last_sm_failed: ?u32 = null;
+
+fn onSmFailed(n: u32) void {
+    // Recorded only: the .established that follows in the same drain does
+    // the waiting-test wakeup.
+    last_sm_failed = n;
 }
 
 fn onEstablished(session: *Session) void {
@@ -714,6 +723,164 @@ test "socketpair: SM resume sends the carried h and keeps counting" {
     const out2 = waitTerminal(5000);
     try std.testing.expect(out2.established);
 }
+
+test "socketpair: outbound stanzas tracked; server <a> drops acked (T-9BC4D065)" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='o1'><body>one</body></message>");
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='o2'><body>two</body></message>");
+    try ctx.rig.expect("id='o1'", 2000);
+    try ctx.rig.expect("id='o2'", 2000);
+
+    // Both unacked, then the server acks the first.
+    try std.testing.expectEqual(@as(usize, 2), ctx.engine.sm_queues.getPtr("sm-test-42").?.entries.items.len);
+    try ctx.rig.send("<a xmlns='urn:xmpp:sm:3' h='1'/>");
+    {
+        const deadline = std.time.milliTimestamp() + 2000;
+        while (true) {
+            if (ctx.engine.sm_queues.getPtr("sm-test-42")) |q| {
+                if (q.entries.items.len == 1) break;
+            }
+            if (std.time.milliTimestamp() >= deadline) return error.AckTimeout;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    const q = ctx.engine.sm_queues.getPtr("sm-test-42").?;
+    try std.testing.expectEqualStrings("<message to='bob@localhost' id='o2'><body>two</body></message>", q.entries.items[0].bytes);
+}
+
+test "socketpair: resumed session replays unacked stanzas in order (T-9BC4D065)" {
+    const alloc = std.testing.allocator;
+
+    // Leg 1: establish, send two stanzas, server acks only the first.
+    var ctx = try setup(alloc, false);
+    try scriptPlainHappy(&ctx.rig);
+    const out1 = waitTerminal(5000);
+    try std.testing.expect(out1.established);
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='o1'><body>one</body></message>");
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='o2'><body>two</body></message>");
+    try ctx.rig.expect("id='o2'", 2000);
+    try ctx.rig.send("<a xmlns='urn:xmpp:sm:3' h='1'/>");
+    std.Thread.sleep(50 * std.time.ns_per_ms); // let the read loop drain the ack
+    ctx.engine.stopSession(ctx.handle, "teardown-for-resume");
+    var tries: u32 = 0;
+    while (ctx.engine.sessionCount() > 0 and tries < 200) : (tries += 1)
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    posix.close(ctx.rig.fake_fd);
+    ctx.rig.fake_fd = -1;
+    // Loop fully stopped before leg 2 mutates engine/session state from this
+    // thread (attachFd/reframe race a still-unwinding old loop otherwise).
+    ctx.engine.waitLoopExit();
+
+    // Leg 2 on the SAME engine: resume; the rig must see only o2 replayed,
+    // then an <r/> ack request, before any new consumer stanza.
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.Socketpair;
+    ctx.rig = .{ .fake_fd = fds[1] };
+    ctx.handle = try ctx.engine.attachFd(fds[0], .{
+        .domain = "localhost",
+        .user = "alice",
+        .password = "pass1",
+        .resource = "smoke",
+    });
+    // The engine thread exited when leg 1's session count hit zero; leg 2
+    // needs it running again (same pattern a real consumer's reconnect uses).
+    try ctx.engine.run();
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+    if (ctx.engine.sessionAt(ctx.handle)) |s| {
+        s.fsm.tls_required = false;
+        s.fsm.allow_plain = true;
+        s.tls_policy = .none;
+    }
+    reframeForResume(ctx.engine, ctx.handle, "sm-test-42", 0);
+
+    try ctx.rig.send(pre_tls_features);
+    try ctx.rig.expect("<auth", 2000);
+    try ctx.rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+    try ctx.rig.expect("<stream:stream", 2000);
+    try sendPostAuthFeatures(&ctx.rig);
+    try ctx.rig.expect("sm-test-42", 2000);
+    // Server handled only the first of our two (already acked anyway): h='1'.
+    cur_mutex.lock();
+    cur_outcome = .{};
+    cur_mutex.unlock();
+    try ctx.rig.send("<resumed xmlns='urn:xmpp:sm:3' previd='sm-test-42' h='1'/>");
+    // Replay: o2 re-sent (o1 must NOT appear again), then <r/>.
+    try ctx.rig.expect("id='o2'", 2000);
+    try ctx.rig.expect("<r xmlns='urn:xmpp:sm:3'/>", 2000);
+    const out2 = waitTerminal(5000);
+    try std.testing.expect(out2.established);
+    try std.testing.expect(ctx.rig.read_buf[0..ctx.rig.read_len].len == 0 or
+        std.mem.indexOf(u8, ctx.rig.read_buf[0..ctx.rig.read_len], "id='o1'") == null);
+}
+
+test "socketpair: rejected resume surfaces sm_failed and drops the queue (T-9BC4D065)" {
+    const alloc = std.testing.allocator;
+
+    // Leg 1: one unacked stanza left behind.
+    var ctx = try setup(alloc, false);
+    try scriptPlainHappy(&ctx.rig);
+    const out1 = waitTerminal(5000);
+    try std.testing.expect(out1.established);
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='o1'><body>one</body></message>");
+    try ctx.rig.expect("id='o1'", 2000);
+    ctx.engine.stopSession(ctx.handle, "teardown-for-resume");
+    var tries: u32 = 0;
+    while (ctx.engine.sessionCount() > 0 and tries < 200) : (tries += 1)
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    posix.close(ctx.rig.fake_fd);
+    ctx.rig.fake_fd = -1;
+    // Loop fully stopped before leg 2 mutates engine/session state from this
+    // thread (attachFd/reframe race a still-unwinding old loop otherwise).
+    ctx.engine.waitLoopExit();
+
+    // Leg 2: server answers <failed/>; consumer gets sm_failed(1) and the
+    // stream proceeds without SM.
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.Socketpair;
+    ctx.rig = .{ .fake_fd = fds[1] };
+    ctx.handle = try ctx.engine.attachFd(fds[0], .{
+        .domain = "localhost",
+        .user = "alice",
+        .password = "pass1",
+        .resource = "smoke",
+    });
+    // The engine thread exited when leg 1's session count hit zero; leg 2
+    // needs it running again (same pattern a real consumer's reconnect uses).
+    try ctx.engine.run();
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+    if (ctx.engine.sessionAt(ctx.handle)) |s| {
+        s.fsm.tls_required = false;
+        s.fsm.allow_plain = true;
+        s.tls_policy = .none;
+    }
+    reframeForResume(ctx.engine, ctx.handle, "sm-test-42", 0);
+
+    last_sm_failed = null;
+    try ctx.rig.send(pre_tls_features);
+    try ctx.rig.expect("<auth", 2000);
+    try ctx.rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+    try ctx.rig.expect("<stream:stream", 2000);
+    try sendPostAuthFeatures(&ctx.rig);
+    try ctx.rig.expect("sm-test-42", 2000);
+    cur_mutex.lock();
+    cur_outcome = .{};
+    cur_mutex.unlock();
+    try ctx.rig.send("<failed xmlns='urn:xmpp:sm:3'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>");
+    const out2 = waitTerminal(5000);
+    try std.testing.expect(out2.established);
+    try std.testing.expectEqual(@as(?u32, 1), last_sm_failed);
+    try std.testing.expect(ctx.engine.sm_queues.getPtr("sm-test-42") == null);
+}
+
 
 /// Flip the attached session into its resume configuration (test seam:
 /// the real consumer restarts with SessionConfig.sm_resume_*; attachFd

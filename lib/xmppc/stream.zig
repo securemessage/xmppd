@@ -105,8 +105,10 @@ pub const SmResult = union(enum) {
     /// `<enabled>` — SM activated. `id` is the SM session id when the server
     /// granted resumption (empty otherwise).
     enabled: []const u8,
-    /// `<resumed>` — a prior session was resumed; `id` is its SM id.
-    resumed: []const u8,
+    /// `<resumed>` — a prior session was resumed; `id` is its SM id and
+    /// `h` the count of OUR stanzas the server handled before the
+    /// disconnect (T-9BC4D065: drives the unacked-queue drop + replay).
+    resumed: struct { id: []const u8, h: u32 },
     /// `<failed>` — SM could not be enabled/resumed; `condition` is the raw
     /// XEP-0198 condition (e.g. "item-not-found").
     failed: []const u8,
@@ -243,6 +245,9 @@ pub const ClientStream = struct {
     sm_enabled: bool = false,
     /// True if the active SM session was resumed (vs. a fresh enable).
     sm_resumed: bool = false,
+    /// h from `<resumed/>`: stanzas of OURS the server handled before the
+    /// disconnect (T-9BC4D065 replay drop count).
+    sm_resumed_h: u32 = 0,
     /// The server's SM session id (h) for the active session.
     sm_id: []const u8 = "",
     /// The SM session id to attempt to resume ("" = no resume, fresh enable).
@@ -478,10 +483,11 @@ pub const ClientStream = struct {
                     self.state = .active;
                     return .established;
                 },
-                .resumed => |id| {
+                .resumed => |res| {
                     self.sm_enabled = true;
                     self.sm_resumed = true;
-                    self.sm_id = id;
+                    self.sm_id = res.id;
+                    self.sm_resumed_h = res.h;
                     self.state = .active;
                     return .established;
                 },
@@ -703,7 +709,7 @@ test "client stream: SM resume when resume_id is set" {
     const a = s.feed(.{ .features = .{ .bind = true, .stream_mgmt = true } });
     try std.testing.expect(a == .send_sm_resume);
     try std.testing.expectEqual(ClientState.sm_negotiating, s.state);
-    const b = s.feed(.{ .sm_result = .{ .resumed = "prev-session-id" } });
+    const b = s.feed(.{ .sm_result = .{ .resumed = .{ .id = "prev-session-id", .h = 0 } } });
     try std.testing.expect(b == .established);
     try std.testing.expect(s.sm_resumed);
     try std.testing.expectEqualStrings("prev-session-id", s.sm_id);

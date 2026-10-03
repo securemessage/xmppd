@@ -93,6 +93,10 @@ pub const Event = union(enum) {
     closed: []const u8,
     /// Inbound application stanza (see Stanza for payload lifetime).
     stanza: Stanza,
+    /// SM resume was rejected (`<failed/>`): the server discarded these
+    /// many of our unacked outbound stanzas (T-9BC4D065). Delivered just
+    /// before .established (the stream continues without SM).
+    sm_failed: u32,
 };
 
 /// Signature of the Engine event sink. Runs on the engine thread (see the
@@ -609,6 +613,10 @@ pub const Session = struct {
                     self.writeAfter(engine);
                 }
             }
+            if (parser.pending_sm_a) |h| {
+                parser.pending_sm_a = null;
+                if (self.sm_enabled) engine.smAck(self.sm_id, h);
+            }
             if (parser.pending) |sev| {
                 parser.pending = null;
                 self.handleServerEvent(engine, sev);
@@ -850,6 +858,39 @@ pub const Session = struct {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;
                 }
+                // Outbound side (T-9BC4D065). Fresh enable: start an empty
+                // unacked queue. Resume: drop the stanzas the server acked
+                // via <resumed h=.../> and replay the rest before the
+                // consumer sees .established, preserving order against any
+                // stanza it sends next. Rejected resume (<failed/>): the
+                // server discarded its side, so drop ours and say how many.
+                if (self.sm_enabled) {
+                    if (self.fsm.sm_resumed) {
+                        if (engine.smReplayQueue(self.sm_id, self.fsm.sm_resumed_h)) |q| {
+                            for (q.entries.items) |*e| {
+                                self.queue(e.bytes) catch {
+                                    self.fail(engine.allocator, "queue-error");
+                                    return;
+                                };
+                                e.seq = q.next_seq;
+                                q.next_seq +%= 1;
+                            }
+                            self.queue("<r xmlns='urn:xmpp:sm:3'/>") catch {
+                                self.fail(engine.allocator, "queue-error");
+                                return;
+                            };
+                            self.writeAfter(engine);
+                        }
+                    } else {
+                        engine.smRegisterFresh(self.sm_id) catch {
+                            self.fail(engine.allocator, "alloc-failed");
+                            return;
+                        };
+                    }
+                } else if (self.fsm.resume_id.len > 0) {
+                    const dropped = engine.smDrop(self.fsm.resume_id);
+                    if (dropped > 0) engine.dispatchEvent(self.handle, .{ .sm_failed = dropped });
+                }
                 engine.dispatchEvent(self.handle, .established);
             },
             .close => {
@@ -1018,11 +1059,18 @@ pub const Session = struct {
     /// protocol FSM's own writes, flush immediately, and re-arm kqueue write
     /// interest when the kernel send buffer is full.
     ///
-    /// Not yet SM-counted for later retransmission on <resumed/>: an
-    /// application needing at-least-once over reconnects must watch for the
-    /// .established event after a resume and replay what it cares about.
+    /// With SM enabled the stanza is tracked in the engine's unacked queue
+    /// (T-9BC4D065): acked entries drop on the server's <a h=.../>, the rest
+    /// replays automatically after a successful <resumed/>. error.SmBacklog
+    /// when the server has stopped acking (SM_UNACKED_MAX deep).
     pub fn sendStanza(self: *Session, stanza: []const u8) !void {
         if (self.phase != .established) return error.NotEstablished;
+        if (self.sm_enabled) {
+            const depth = try self.engine.smTrackSend(self.sm_id, stanza);
+            // Nudge the server for an ack every 16 unacked stanzas so the
+            // queue can't grow silently on a quiet peer.
+            if (depth % 16 == 0) try self.queue("<r xmlns='urn:xmpp:sm:3'/>");
+        }
         try self.queue(stanza);
         self.writeAfter(self.engine);
     }

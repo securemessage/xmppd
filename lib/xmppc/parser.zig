@@ -101,6 +101,7 @@ pub const Parser = struct {
     // SM bare stanzas
     sm_kind: enum { none, enabled, resumed, failed } = .none,
     sm_id: []const u8 = "",
+    sm_resumed_h: u32 = 0,
     sm_failed_cond: []const u8 = "",
 
     // Stream error
@@ -134,6 +135,9 @@ pub const Parser = struct {
     /// (wrapping u32 'h'); and a queued ack request to answer with <a/>.
     sm_stanza_count: u32 = 0,
     pending_sm_r: bool = false,
+    /// Inbound `<a h='N'/>` (ack of OUR outbound stanzas), drained by the
+    /// Session into the engine's unacked queue (T-9BC4D065).
+    pending_sm_a: ?u32 = null,
 
     /// The next ServerEvent to feed the FSM (one at a time).
     pending: ?stream.ServerEvent = null,
@@ -363,14 +367,21 @@ pub const Parser = struct {
                 return true;
             }
             if (std.mem.eql(u8, name, "resumed")) {
+                var h: u32 = 0;
                 for (el.attributes) |a| {
                     if (std.mem.eql(u8, a.local_name, "previd")) self.sm_id = a.value;
+                    // h = count of OUR stanzas the server handled before the
+                    // disconnect; the engine drops that many from the unacked
+                    // queue before replay (T-9BC4D065).
+                    if (std.mem.eql(u8, a.local_name, "h")) h = std.fmt.parseInt(u32, a.value, 10) catch 0;
                 }
                 self.sm_kind = .resumed;
                 if (closed) {
-                    self.pending = .{ .sm_result = .{ .resumed = self.sm_id } };
+                    self.pending = .{ .sm_result = .{ .resumed = .{ .id = self.sm_id, .h = h } } };
                     self.sm_id = "";
                     self.sm_kind = .none;
+                } else {
+                    self.sm_resumed_h = h;
                 }
                 return true;
             }
@@ -387,6 +398,17 @@ pub const Parser = struct {
             // Ack request: answer with <a h=.../> (Session drains this).
             if (std.mem.eql(u8, name, "r")) {
                 self.pending_sm_r = true;
+                return true;
+            }
+            // Ack of OUR outbound stanzas (T-9BC4D065): the Session drains
+            // this into the engine's unacked queue. Both the self-closing
+            // and explicit-close forms are settled here since 'h' rides on
+            // the open tag.
+            if (std.mem.eql(u8, name, "a")) {
+                for (el.attributes) |a| {
+                    if (std.mem.eql(u8, a.local_name, "h"))
+                        self.pending_sm_a = std.fmt.parseInt(u32, a.value, 10) catch null;
+                }
                 return true;
             }
             // A self-closing condition child of <failed> (e.g. <item-not-found/>).
@@ -527,7 +549,7 @@ pub const Parser = struct {
             },
             .resumed => {
                 if (std.mem.eql(u8, local, "resumed")) {
-                    self.pending = .{ .sm_result = .{ .resumed = self.sm_id } };
+                    self.pending = .{ .sm_result = .{ .resumed = .{ .id = self.sm_id, .h = self.sm_resumed_h } } };
                     self.sm_id = "";
                     self.sm_kind = .none;
                 }
@@ -911,9 +933,31 @@ test "parser: SM resumed" {
     }
     try std.testing.expect(got != null);
     switch (got.?) {
-        .resumed => |id| try std.testing.expectEqualStrings("prev-id", id),
+        .resumed => |r| {
+            try std.testing.expectEqualStrings("prev-id", r.id);
+            try std.testing.expectEqual(@as(u32, 0), r.h);
+        },
         else => return error.TestFail,
     }
+}
+
+
+test "parser: SM ack captured in pending_sm_a (T-9BC4D065)" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s7' from='localhost'>" ++
+        "<a xmlns='urn:xmpp:sm:3' h='7'/>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch unreachable;
+        if (ev == null) break;
+        if (!parser.onReaderEvent(ev.?)) unreachable;
+    }
+    try std.testing.expectEqual(@as(?u32, 7), parser.pending_sm_a);
 }
 
 test "parser: message stanza captured with children" {
