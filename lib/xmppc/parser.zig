@@ -126,6 +126,10 @@ pub const Parser = struct {
     st_child_open: bool = false,
     st_text: std.ArrayListUnmanaged(u8) = .{},
 
+    /// Set by the Session when the stream becomes active; bind1/sess1
+    /// iq-result routing to the FSM applies only during establishment.
+    after_establishment: bool = false,
+
     /// XEP-0198 bookkeeping: completed top-level stanzas since reset
     /// (wrapping u32 'h'); and a queued ack request to answer with <a/>.
     sm_stanza_count: u32 = 0,
@@ -632,8 +636,12 @@ pub const Parser = struct {
     fn finishStanza(self: *Parser) void {
         if (self.st_child_open) self.endStanzaChild();
         const is_result = std.mem.eql(u8, self.st_type, "result");
-        const shaped = self.iq_is_bind or self.iq_is_session or
-            std.mem.eql(u8, self.st_id, "bind1") or std.mem.eql(u8, self.st_id, "sess1");
+        // bind/session establishment results are FSM traffic; after the
+        // stream is active the ids bind1/sess1 have no special meaning and
+        // every iq result surfaces to the application.
+        const shaped = !self.after_establishment and
+            (self.iq_is_bind or self.iq_is_session or
+                std.mem.eql(u8, self.st_id, "bind1") or std.mem.eql(u8, self.st_id, "sess1"));
         // Every completed top-level stanza counts for XEP-0198 'h'.
         self.sm_stanza_count +%= 1;
         if (self.st_kind == .iq and is_result and shaped) {

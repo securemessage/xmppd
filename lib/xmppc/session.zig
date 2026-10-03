@@ -69,6 +69,11 @@ pub const SessionConfig = struct {
     resource: []const u8 = "",
     /// XEP-0198 resume id when reattaching to a detached stream.
     sm_resume_id: []const u8 = "",
+    /// The OLD session's inbound stanza count ('h'), paired with
+    /// sm_resume_id. The server uses h to know which queued stanzas the
+    /// client already handled; sending h='0' when the client DID ack some
+    /// wraps the server's unacked queue into discardAll (silent loss).
+    sm_resume_h: u32 = 0,
 };
 
 /// One application-level stanza (post-establishment message/presence/iq).
@@ -185,6 +190,8 @@ pub const Session = struct {
     sm_id: []const u8 = "",
     sm_enabled: bool = false,
     sm_resumed: bool = false,
+    /// h carried into <resume>; from SessionConfig.sm_resume_h.
+    resume_h: u32 = 0,
 
     /// Per-session arena owning the SessionConfig copies (setConfig); the
     /// caller's config storage is never retained (T-25A16875).
@@ -213,6 +220,7 @@ pub const Session = struct {
         self.password = try a.dupe(u8, config.password);
         self.resource = try a.dupe(u8, config.resource);
         self.fsm.resume_id = try a.dupe(u8, config.sm_resume_id);
+        self.resume_h = config.sm_resume_h;
     }
 
     pub fn destroy(self: *Session, allocator: std.mem.Allocator) void {
@@ -276,6 +284,13 @@ pub const Session = struct {
     }
     pub fn smResumed(self: *const Session) bool {
         return self.sm_resumed;
+    }
+    /// Current inbound stanza count h — with smId(), this is what the
+    /// consumer carries into the NEXT session's SessionConfig for a
+    /// resumption that does not lose in-flight stanzas.
+    pub fn smH(self: *const Session) u32 {
+        const pr = self.parser orelse return 0;
+        return pr.sm_stanza_count;
     }
 
     // ------------------------------------------------------------------
@@ -692,13 +707,27 @@ pub const Session = struct {
         switch (action) {
             .established => {
                 self.phase = .established;
+                const a = self.arena_state.allocator();
+                // The FSM's sm_id/bound_jid borrow parser buffers that the
+                // per-stanza arena reset later frees; consumers hold these
+                // across the session, so copy them (PR #4 review A).
                 self.sm_enabled = self.fsm.sm_enabled;
                 self.sm_resumed = self.fsm.sm_resumed;
-                self.sm_id = self.fsm.sm_id;
-                self.bound_jid = self.fsm.bound_jid;
-                // 'h' counts stanzas handled since SM enablement; the
-                // bind/session establishment traffic must not count.
-                if (self.parser) |pr| pr.sm_stanza_count = 0;
+                self.sm_id = a.dupe(u8, self.fsm.sm_id) catch "";
+                self.bound_jid = if (self.fsm.bound_jid) |bj| Jid{
+                    .local = a.dupe(u8, bj.local) catch "",
+                    .domain = a.dupe(u8, bj.domain) catch "",
+                    .resource = a.dupe(u8, bj.resource) catch "",
+                } else null;
+                // 'h' counts stanzas handled since SM enablement. A resume
+                // keeps counting from where the previous session left it
+                // (resume_h); only a fresh .enabled starts at zero
+                // (PR #4 review B: resetting h on resume wraps xmppd's
+                // unacked queue into discardAll and silently loses mail).
+                if (self.parser) |pr| {
+                    pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
+                    pr.after_establishment = true;
+                }
                 engine.dispatchEvent(self.handle, .established);
             },
             .close => {
@@ -752,7 +781,7 @@ pub const Session = struct {
                 self.writeAfter(engine);
             },
             .send_sm_resume => {
-                self.queuef("<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{self.fsm.resume_id}) catch return error.QueueFailed;
+                self.queuef("<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='{d}'/>", .{ self.fsm.resume_id, self.resume_h }) catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .begin_tls => {

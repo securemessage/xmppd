@@ -85,6 +85,9 @@ const max_ns_bindings = 16;
 const NsBinding = struct {
     prefix: []const u8,
     uri: []const u8,
+    /// Depth at which this binding was declared; only depth <= 1
+    /// (stream and top-level stanza opens) survive the stanza arena reset.
+    depth: u32,
 };
 
 pub const Reader = struct {
@@ -138,40 +141,55 @@ pub const Reader = struct {
                     return Event.xml_declaration;
                 },
                 .element_open => {
-                    // Stanza-scoped arena (xmppc Stanza lifetime contract):
-                    // a long-lived stream must not accumulate every name,
-                    // value and text forever. Top-level stanzas are
-                    // self-contained; consumers keep nothing past the next
-                    // stanza. Stream-level xmlns context (default ns +
-                    // prefix bindings such as xmlns:stream) survives: the
-                    // live bindings are copied to stack scratch and
-                    // re-duped into the fresh arena.
                     if (self.stream_opened and self.depth == 1) {
-                        var def_buf: [256]u8 = undefined;
-                        const def_len = @min(self.default_ns.len, def_buf.len);
-                        @memcpy(def_buf[0..def_len], self.default_ns[0..def_len]);
-                        var pfx_buf: [max_ns_bindings][64]u8 = undefined;
-                        var uri_buf: [max_ns_bindings][256]u8 = undefined;
-                        var pfx_len: [max_ns_bindings]u8 = undefined;
-                        var uri_len: [max_ns_bindings]u16 = undefined;
-                        const nbind = self.ns_binding_count;
-                        for (self.ns_bindings[0..nbind], 0..) |b, bi| {
-                            pfx_len[bi] = @intCast(@min(b.prefix.len, 64));
-                            uri_len[bi] = @intCast(@min(b.uri.len, 256));
-                            @memcpy(pfx_buf[bi][0..pfx_len[bi]], b.prefix[0..pfx_len[bi]]);
-                            @memcpy(uri_buf[bi][0..uri_len[bi]], b.uri[0..uri_len[bi]]);
+                        // Stanza-scoped arena (xmppc Stanza lifetime contract):
+                        // a long-lived stream must not accumulate every name,
+                        // value and text forever. Top-level stanzas are
+                        // self-contained; consumers keep nothing past the
+                        // next stanza.
+                        //
+                        // The surviving context is the default ns and prefix
+                        // bindings DECLARED at depth <= 1 (the stream element
+                        // and top-level stanza opens); stanza-interior
+                        // bindings would otherwise accumulate forever.
+                        // Oversized ns strings are a protocol failure, never
+                        // a silent truncation (an attacker controls a stream
+                        // header; a wrong binding would misroute stanzas).
+                        if (self.default_ns.len > 512) return error.NsContextTooLarge;
+                        var def_buf: [512]u8 = undefined;
+                        @memcpy(def_buf[0..self.default_ns.len], self.default_ns);
+                        const def_len = self.default_ns.len;
+
+                        var keep: [max_ns_bindings]NsBinding = undefined;
+                        var keep_bufs: [max_ns_bindings][768]u8 = undefined;
+                        var keep_n: u32 = 0;
+                        for (self.ns_bindings[0..self.ns_binding_count]) |b| {
+                            if (b.depth > 1) continue;
+                            if (keep_n >= max_ns_bindings) break;
+                            if (b.prefix.len + b.uri.len > 768) return error.NsContextTooLarge;
+                            @memcpy(keep_bufs[keep_n][0..b.prefix.len], b.prefix);
+                            @memcpy(keep_bufs[keep_n][b.prefix.len .. b.prefix.len + b.uri.len], b.uri);
+                            keep[keep_n] = .{
+                                .prefix = keep_bufs[keep_n][0..b.prefix.len],
+                                .uri = keep_bufs[keep_n][b.prefix.len .. b.prefix.len + b.uri.len],
+                                .depth = b.depth,
+                            };
+                            keep_n += 1;
                         }
+
                         _ = self.arena.reset(.retain_capacity);
                         self.default_ns = if (def_len > 0) try self.arenaDupe(def_buf[0..def_len]) else "";
                         self.ns_stack_depth = 0;
                         self.ns_binding_count = 0;
-                        for (0..nbind) |bi| {
-                            self.ns_bindings[bi] = .{
-                                .prefix = try self.arenaDupe(pfx_buf[bi][0..pfx_len[bi]]),
-                                .uri = try self.arenaDupe(uri_buf[bi][0..uri_len[bi]]),
+                        for (keep[0..keep_n]) |b| {
+                            const uri = try self.arenaDupe(b.uri);
+                            self.ns_bindings[self.ns_binding_count] = .{
+                                .prefix = try self.arenaDupe(b.prefix),
+                                .uri = uri,
+                                .depth = b.depth,
                             };
+                            self.ns_binding_count += 1;
                         }
-                        self.ns_binding_count = nbind;
                     }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
@@ -194,6 +212,7 @@ pub const Reader = struct {
                             self.ns_bindings[self.ns_binding_count] = .{
                                 .prefix = prefix,
                                 .uri = uri,
+                                .depth = self.depth,
                             };
                             self.ns_binding_count += 1;
                         }

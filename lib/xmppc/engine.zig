@@ -388,14 +388,23 @@ pub const Engine = struct {
     }
 
     /// Stop a session. Safe from ANY thread: the stop is posted to the
-    /// command mailbox and executed on the engine thread.
+    /// command mailbox and executed on the engine thread. Stops are exempt
+    /// from the mailbox bound (a dropped stop would leak the teardown
+    /// signal); they are bounded by the number of live sessions.
     pub fn stopSession(self: *Engine, h: Handle, reason: []const u8) void {
         const copy = self.allocator.dupe(u8, reason) catch return;
-        self.postCommand(h, .{ .stop = copy }) catch {
-            self.allocator.free(copy);
-            log.warn("command queue full; stop for session not posted", .{});
-            return;
+        const ok = blk: {
+            self.cmd_lock.lock();
+            defer self.cmd_lock.unlock();
+            self.cmd_active.append(self.allocator, .{ .handle = h, .cmd = .{ .stop = copy } }) catch break :blk false;
+            break :blk true;
         };
+        if (!ok) {
+            self.allocator.free(copy);
+            log.err("out of memory posting stop command for a session", .{});
+            return;
+        }
+        self.requestWake();
     }
 
     /// Send one application stanza from ANY thread: the bytes are copied

@@ -630,6 +630,96 @@ test "socketpair: inbound stanza captured with attributes, self-closing forms co
     try std.testing.expectEqualStrings("lunch", p2.children[1].text);
 }
 
+test "socketpair: sm_id stays valid after later stanzas (arena reset)" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // A later stanza used to invalidate Session.smId(): the FSM stored the
+    // parser's slice, and the per-stanza reader arena reset freed it.
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='z1'><body>later</body></message>");
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (true) {
+        cur_mutex.lock();
+        const n = cur_stanzas.items.len;
+        cur_mutex.unlock();
+        if (n > 0) break;
+        if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    // A later stanza used to invalidate Session.smId(): the FSM stored the
+    // parser's slice, and the per-stanza reader arena reset freed it. Read
+    // the value AFTER the stanza was fully processed (the stanza event has
+    // drained, so no engine mutation is in flight).
+    try std.testing.expectEqualStrings("sm-test-42", ctx.engine.sessionAt(ctx.handle).?.smId());
+}
+
+test "socketpair: SM resume sends the carried h and keeps counting" {
+    const alloc = std.testing.allocator;
+
+    // Leg 1: establish with SM enabled, receive one stanza.
+    var ctx = try setup(alloc, false);
+    try scriptPlainHappy(&ctx.rig);
+    const out1 = waitTerminal(5000);
+    try std.testing.expect(out1.established);
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='r1'><body>one</body></message>");
+    {
+        const deadline = std.time.milliTimestamp() + 2000;
+        while (true) {
+            cur_mutex.lock();
+            const n = cur_stanzas.items.len;
+            cur_mutex.unlock();
+            if (n > 0) break;
+            if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    // Tear the connection down at the transport level.
+    ctx.engine.stopSession(ctx.handle, "teardown-for-resume");
+    var tries: u32 = 0;
+    while (ctx.engine.sessionCount() > 0 and tries < 200) : (tries += 1)
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    teardown(alloc, &ctx.rig, ctx.engine);
+
+    // Leg 2: resume with the carried id and h=1. The rig must see h='1',
+    // and must NOT see h='0' (the old code always sent 0 and xmppd's
+    // unacked queue wraps to discardAll).
+    var ctx2 = try setup(alloc, false);
+    defer teardown(alloc, &ctx2.rig, ctx2.engine);
+    reframeForResume(ctx2.engine, ctx2.handle, "sm-test-42", 1);
+    try scriptResume(&ctx2.rig, "sm-test-42");
+    const out2 = waitTerminal(5000);
+    try std.testing.expect(out2.established);
+}
+
+/// Flip the attached session into its resume configuration (test seam:
+/// the real consumer restarts with SessionConfig.sm_resume_*; attachFd
+/// already stored a config, so re-set it through the public surface).
+fn reframeForResume(engine: *Engine, handle: Handle, sm_id: []const u8, h: u32) void {
+    const s = engine.sessionAt(handle).?;
+    s.fsm.resume_id = std.heap.page_allocator.dupe(u8, sm_id) catch "";
+    s.resume_h = h;
+}
+
+/// Minimal script for a resumed stream: pre-TLS features without SM enable,
+/// the client sends <resume ..> which must carry the given h.
+fn scriptResume(rig: *Rig, previd: []const u8) !void {
+    try rig.send(pre_tls_features);
+    try rig.expect("<auth", 2000);
+    try rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+    try rig.expect("<stream:stream", 2000);
+    try sendPostAuthFeatures(rig);
+    // Client sends <resume .../> once bind is skipped? The FSM resumes
+    // INSTEAD of bind when it has a resume id and features advertise SM.
+    try rig.expect(previd, 2000);
+    try rig.expect("h='1'", 2000); // review B: carried count, not hard-coded 0
+    try rig.send("<resumed xmlns='urn:xmpp:sm:3' previd='sm-test-42' h='0'/>");
+}
+
 test "socketpair: SM ack request gets an <a> with the stanza count" {
     const alloc = std.testing.allocator;
     var ctx = try setup(alloc, false);
