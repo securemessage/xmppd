@@ -4,6 +4,7 @@ pub const plain = @import("plain.zig");
 
 pub const ScramServer = scram.ScramServer;
 pub const ScramClient = scram.ScramClient;
+pub const ScramClientSha1 = scram.ScramClientSha1;
 pub const StoredCredentials = scram.StoredCredentials;
 pub const PlainCredentials = plain.PlainCredentials;
 

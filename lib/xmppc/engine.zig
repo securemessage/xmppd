@@ -120,8 +120,11 @@ pub const Engine = struct {
         password: []u8,
         salt: []u8,
         iterations: u32,
+        /// SCRAM hash family (SHA-256 or SHA-1); the worker derives with it
+        /// and the completion carries it back so the session can verify.
+        hash: sasl.scram.Hash,
     };
-    const DeriveDone = struct { job: DeriveJob, salted: [32]u8 };
+    const DeriveDone = struct { job: DeriveJob, salted: sasl.scram.SaltedPassword };
     /// Fixed-capacity completion ring: the worker never allocates, so the
     /// engine allocator is not required to be thread-safe.
     const DONE_CAP = 64;
@@ -182,7 +185,7 @@ pub const Engine = struct {
     /// Cache hits served without touching the worker.
     scram_cache_hits: usize = 0,
 
-    scram_cache: std.StringHashMapUnmanaged([32]u8) = .{},
+    scram_cache: std.StringHashMapUnmanaged(sasl.scram.SaltedPassword) = .{},
 
     crypto_mutex: std.Thread.Mutex = .{},
     /// Signaled on: job queued, done-ring room freed, stop requested.
@@ -248,16 +251,16 @@ pub const Engine = struct {
 
     /// Look up a cached SaltedPassword for (password, salt, iterations).
     /// Engine thread only (cache is unsynchronized by design).
-    pub fn scramCached(self: *Engine, password: []const u8, salt: []const u8, iterations: u32) ?[32]u8 {
+    pub fn scramCached(self: *Engine, password: []const u8, salt: []const u8, iterations: u32, hash: sasl.scram.Hash) ?sasl.scram.SaltedPassword {
         var kbuf: [1024]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "{s}\x00{s}\x00{d}", .{ password, salt, iterations }) catch return null;
+        const key = std.fmt.bufPrint(&kbuf, "{d}\x00{s}\x00{s}\x00{d}", .{ @intFromEnum(hash), password, salt, iterations }) catch return null;
         return self.scram_cache.get(key);
     }
 
     /// Queue a SaltedPassword derivation for the crypto worker; the session
     /// parks until onSaslDerived fires from the loopOnce drain. Engine
     /// thread only.
-    pub fn queueDerive(self: *Engine, h: Handle, password: []const u8, salt: []const u8, iterations: u32) !void {
+    pub fn queueDerive(self: *Engine, h: Handle, password: []const u8, salt: []const u8, iterations: u32, hash: sasl.scram.Hash) !void {
         const pw_copy = try self.allocator.dupe(u8, password);
         errdefer self.allocator.free(pw_copy);
         const salt_copy = try self.allocator.dupe(u8, salt);
@@ -274,6 +277,7 @@ pub const Engine = struct {
             .password = pw_copy,
             .salt = salt_copy,
             .iterations = iterations,
+            .hash = hash,
         });
         self.crypto_cond.signal();
     }
@@ -281,7 +285,7 @@ pub const Engine = struct {
     fn scramCacheClear(self: *Engine) void {
         var it = self.scram_cache.iterator();
         while (it.next()) |e| {
-            std.crypto.secureZero(u8, e.value_ptr[0..]);
+            std.crypto.secureZero(u8, std.mem.asBytes(e.value_ptr));
             self.allocator.free(e.key_ptr.*);
         }
         self.scram_cache.clearRetainingCapacity();
@@ -301,8 +305,7 @@ pub const Engine = struct {
             const job = self.crypto_jobs.orderedRemove(0);
             self.crypto_mutex.unlock();
 
-            var salted: [32]u8 = undefined;
-            sasl.scram.pbkdf2(job.password, job.salt, job.iterations, &salted);
+            const salted = sasl.scram.deriveSalted(job.hash, job.password, job.salt, job.iterations);
 
             self.crypto_mutex.lock();
             self.crypto_done[self.crypto_done_head] = .{ .job = job, .salted = salted };
@@ -335,7 +338,7 @@ pub const Engine = struct {
             defer self.allocator.free(done.job.salt);
             self.scram_derives += 1;
 
-            const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ done.job.password, done.job.salt, done.job.iterations }) catch null;
+            const key = std.fmt.allocPrint(self.allocator, "{d}\x00{s}\x00{s}\x00{d}", .{ @intFromEnum(done.job.hash), done.job.password, done.job.salt, done.job.iterations }) catch null;
             if (key) |k| {
                 if (self.scram_cache.contains(k)) {
                     self.allocator.free(k);

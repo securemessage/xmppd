@@ -33,6 +33,7 @@ const tls = @import("tls");
 const dns = @import("dns");
 const stream = @import("stream.zig");
 const saslmod = @import("sasl.zig");
+const sasl = @import("sasl");
 
 const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
@@ -177,6 +178,11 @@ pub const Session = struct {
     /// Heap pointers: the FSM mutates these in place; copying them (a
     /// `|x|` / `orelse` on a value) would silently drop state.
     sasl: ?*saslmod.SaslClient = null,
+    /// TLS channel binding state captured at handshake completion
+    /// (T-D61734DE): cb_mode mirrors the SslConn binding type, cb_data_buf
+    /// owns the 32 binding bytes for the SASL exchange's lifetime.
+    cb_mode: sasl.scram.CbMode = .none,
+    cb_data_buf: [32]u8 = undefined,
     /// True while a SaltedPassword derivation runs on the engine's crypto
     /// worker; the SASL exchange resumes in onSaslDerived.
     sasl_deriving: bool = false,
@@ -331,6 +337,17 @@ pub const Session = struct {
                     // userland crypto is silent, so this is the only way to
                     // tell an armed context really offloaded.
                     log.info("fd={d} tls established ktls_send={} ktls_recv={}", .{ self.fd, tc.ktlsSend(), tc.ktlsRecv() });
+                    // Channel binding for SCRAM -PLUS / gs2 'y' (T-D61734DE):
+                    // tls-exporter on TLS 1.3, tls-server-end-point on 1.2.
+                    if (tc.getChannelBinding()) |cb| {
+                        self.cb_data_buf = cb.data;
+                        self.cb_mode = switch (cb.cb_type) {
+                            .tls_exporter => .tls_exporter,
+                            .tls_server_end_point => .tls_server_end_point,
+                            .none => .none,
+                        };
+                        self.fsm.cb_available = self.cb_mode.isPlus();
+                    }
                     // DANE mode authenticated nothing yet: match the peer
                     // chain against the TLSA records now, fail closed.
                     if (self.pending_dane) {
@@ -922,7 +939,18 @@ pub const Session = struct {
         // prepends its own domain); the full JID is only used after bind.
         const at = std.mem.indexOfScalar(u8, self.user, '@');
         const authcid = if (at) |i| self.user[0..i] else self.user;
-        sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password) catch {
+        // gs2 flag (RFC 5802 §6): 'p' for a -PLUS mechanism (the FSM only
+        // selects one when channel binding data exists), 'y' when the client
+        // supports CB but the server advertised no -PLUS variant, else 'n'.
+        var opts: saslmod.SaslClient.Options = .{};
+        if (saslmod.SaslClient.isPlusMech(mech)) {
+            if (!self.cb_mode.isPlus()) return error.SaslInitFailed;
+            opts.cb_mode = self.cb_mode;
+            opts.cb_data = &self.cb_data_buf;
+        } else if (saslmod.SaslClient.hashOf(mech) != null and self.cb_mode.isPlus()) {
+            opts.cb_mode = .unsupported_by_server;
+        }
+        sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password, opts) catch {
             allocator.destroy(sc);
             return error.SaslInitFailed;
         };
@@ -947,14 +975,14 @@ pub const Session = struct {
             .message => |msg| try self.queueSaslResponse(engine, msg),
             .derive => |d| {
                 const pw = sc.derivePassword() orelse return error.SaslNoPassword;
-                if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations)) |salted| {
+                if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations, d.hash)) |salted| {
                     engine.scram_cache_hits += 1;
                     try self.finishSaslDerive(engine, salted);
                 } else {
                     // Hi() runs on the engine's crypto worker; the
                     // exchange parks until onSaslDerived resumes it.
                     self.sasl_deriving = true;
-                    engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations) catch {
+                    engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations, d.hash) catch {
                         self.sasl_deriving = false;
                         return error.SaslDeriveQueue;
                     };
@@ -999,7 +1027,7 @@ pub const Session = struct {
         self.writeAfter(engine);
     }
 
-    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: [32]u8) ActionError!void {
+    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: sasl.scram.SaltedPassword) ActionError!void {
         const sc = self.sasl orelse return error.SaslNotActive;
         const msg = sc.finishChallenge(salted_password) catch return error.SaslChallengeFailed;
         try self.queueSaslResponse(engine, msg);
@@ -1007,7 +1035,7 @@ pub const Session = struct {
 
     /// Engine-thread callback from drainCryptoDone: the crypto worker
     /// finished this session's parked SaltedPassword derivation.
-    pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: [32]u8) void {
+    pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: sasl.scram.SaltedPassword) void {
         if (!self.sasl_deriving) return; // stale completion (re-derive raced)
         self.sasl_deriving = false;
         self.finishSaslDerive(engine, salted_password) catch |err|
