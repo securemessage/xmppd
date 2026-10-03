@@ -304,12 +304,25 @@ pub const Resolver = struct {
     }
 
     fn complete(self: *Resolver, job: *Job) void {
+        // Detach from the list FIRST — the job is freed below and deinit's
+        // sweep would double-free it otherwise (test allocator catches).
+        for (self.jobs.items, 0..) |j, i| {
+            if (j == job) {
+                _ = self.jobs.orderedRemove(i);
+                break;
+            }
+        }
         const key = job.session_key;
         const targets = self.alloc.alloc(Target, job.targets.items.len) catch {
-            self.failNow(job);
+            self.freeJob(job);
+            self.cb.fun(self.cb.ctx, key, .failed, null);
             return;
         };
         @memcpy(targets, job.targets.items);
+        // Ownership of the list moves to `targets`; leave a clean empty
+        // list behind so freeJob's sweep is a no-op (deinit leaves the
+        // struct undefined in Debug — reading .items.len after that
+        // caught us with a SIGBUS).
         job.targets.deinit(self.alloc);
         job.targets = .{};
         self.cb.fun(self.cb.ctx, key, .resolved, .{ .targets = targets });
@@ -483,11 +496,15 @@ fn addrFromRdata(rr: wire.Rr, port: u16) !net.Address {
     switch (rr.rtype) {
         KIND_A => {
             if (rr.rdata.len < 4) return error.InvalidRdata;
-            return net.Address.parseIp4(rr.rdata[0..4], port);
+            var octets: [4]u8 = undefined;
+            @memcpy(&octets, rr.rdata[0..4]);
+            return net.Address.initIp4(octets, port);
         },
         KIND_AAAA => {
             if (rr.rdata.len < 16) return error.InvalidRdata;
-            return net.Address.parseIp6(rr.rdata[0..16], port);
+            var octets: [16]u8 = undefined;
+            @memcpy(&octets, rr.rdata[0..16]);
+            return net.Address.initIp6(octets, port, 0, 0);
         },
         else => return error.InvalidRdata,
     }
@@ -510,4 +527,214 @@ pub fn readResolvConf() !net.Address {
         if (net.Address.parseIp(rest, 53)) |a| return a else |_| continue;
     }
     return error.NoResolver;
+}
+// ============================================================================
+// Tests — fake DNS responder driving the scripted chain end to end
+// ============================================================================
+
+const test_alloc = std.testing.allocator;
+
+fn extractQname(msg: []const u8, alloc: std.mem.Allocator) ![]const u8 {
+    return (try wire.decompressName(msg, 12, alloc)).name;
+}
+
+/// Craft one answer RR with a 0xC00C name pointer (the question name).
+fn answerRR(buf: []u8, rtype: u16, ttl: u32, rdata: []const u8) usize {
+    var pos: usize = 0;
+    buf[pos] = 0xC0;
+    buf[pos + 1] = 0x0C;
+    pos += 2;
+    std.mem.writeInt(u16, buf[pos..][0..2], rtype, .big);
+    std.mem.writeInt(u16, buf[pos..][2..4], wire.CLASS_IN, .big);
+    std.mem.writeInt(u32, buf[pos..][4..8], ttl, .big);
+    std.mem.writeInt(u16, buf[pos..][8..10], @intCast(rdata.len), .big);
+    pos += 10;
+    @memcpy(buf[pos .. pos + rdata.len], rdata);
+    return pos + rdata.len;
+}
+
+/// srv rdata: priority, weight, port, target (uncompressed labels)
+fn srvRdata(buf: []u8, port: u16, target: []const u8) usize {
+    std.mem.writeInt(u16, buf[0..2], 10, .big);
+    std.mem.writeInt(u16, buf[2..4], 0, .big);
+    std.mem.writeInt(u16, buf[4..6], port, .big);
+    var pos: usize = 6;
+    var it = std.mem.splitScalar(u8, target, '.');
+    while (it.next()) |label| {
+        buf[pos] = @intCast(label.len);
+        @memcpy(buf[pos + 1 .. pos + 1 + label.len], label);
+        pos += 1 + label.len;
+    }
+    buf[pos] = 0;
+    return pos + 1;
+}
+
+const FakeDns = struct {
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    sock: posix.fd_t = -1,
+};
+
+fn fakeResponder(state: *FakeDns) void {
+    var query: [1024]u8 = undefined;
+    while (!state.stop.load(.acquire)) {
+        var src: posix.sockaddr = undefined;
+        var src_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const n = posix.recvfrom(state.sock, &query, 0, &src, &src_len) catch return;
+        if (n < 12) continue;
+
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const qname = extractQname(query[0..n], arena.allocator()) catch continue;
+
+        // Walk the question name to find QTYPE — qname in wire form may end
+        // in a pointer or a zero-length label.
+        var qend: usize = 12;
+        while (query[qend] != 0) {
+            if (query[qend] & 0xC0 == 0xC0) {
+                qend += 2;
+                break;
+            }
+            qend += 1 + @as(usize, query[qend]);
+        }
+        if (query[qend] == 0) qend += 1;
+        if (qend + 4 > n) continue;
+        const qtype = std.mem.readInt(u16, query[qend..][0..2], .big);
+
+        var out: [1024]u8 = undefined;
+        var olen: usize = qend + 4;
+        @memcpy(out[0..olen], query[0..olen]);
+        std.mem.writeInt(u16, out[6..8], 0, .big); // ANCOUNT = 0 default
+
+        // Scripted answers keyed by (qtype, qname-substring).
+        if (qtype == wire.TYPE_SRV) {
+            if (std.mem.indexOf(u8, qname, "_xmpps-client._tcp") != null) {
+                std.mem.writeInt(u16, out[2..4], 0x8183, .big); // NXDOMAIN
+            } else if (std.mem.indexOf(u8, qname, "_xmpp-client._tcp") != null) {
+                var rdata: [128]u8 = undefined;
+                const rdlen = srvRdata(&rdata, 5222, "host.example.test");
+                var ans: [256]u8 = undefined;
+                const alen = answerRR(&ans, wire.TYPE_SRV, 60, rdata[0..rdlen]);
+                @memcpy(out[olen .. olen + alen], ans[0..alen]);
+                olen += alen;
+                std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+                std.mem.writeInt(u16, out[6..8], 1, .big);
+            } else {
+                std.mem.writeInt(u16, out[2..4], 0x8183, .big);
+            }
+        } else if (qtype == wire.TYPE_A and std.mem.eql(u8, qname, "host.example.test")) {
+            var ans: [32]u8 = undefined;
+            const alen = answerRR(&ans, wire.TYPE_A, 60, &[_]u8{ 127, 0, 0, 4 });
+            @memcpy(out[olen .. olen + alen], ans[0..alen]);
+            olen += alen;
+            std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+            std.mem.writeInt(u16, out[6..8], 1, .big);
+        } else {
+            // TLSA and anything else: NXDOMAIN (no DANE for the test target).
+            std.mem.writeInt(u16, out[2..4], 0x8183, .big);
+        }
+
+        _ = posix.sendto(state.sock, out[0..olen], 0, &src, src_len) catch return;
+    }
+}
+
+const TestResult = struct {
+    status: ?Status = null,
+    targets_host: []const u8 = "",
+    targets_port: u16 = 0,
+    targets_direct_tls: bool = false,
+    targets_tlsa_len: usize = 0,
+    fired: bool = false,
+};
+
+var last_result: TestResult = .{};
+
+fn testCb(_: ?*anyopaque, session_key: usize, status: Status, res: ?Resolution) void {
+    _ = session_key;
+    last_result.status = status;
+    if (res) |r| {
+        if (r.targets.len > 0) {
+            last_result.targets_host = test_alloc.dupe(u8, r.targets[0].host) catch unreachable;
+            last_result.targets_port = r.targets[0].addr.getPort();
+            last_result.targets_direct_tls = r.targets[0].is_direct_tls;
+            last_result.targets_tlsa_len = r.targets[0].tlsa.len;
+        }
+        var rr = r;
+        rr.deinitOn(test_alloc);
+    }
+    last_result.fired = true;
+}
+
+test "resolver: XEP-0368 chain with fake DNS (SRV -> A -> TLSA NXDOMAIN)" {
+    // Fake responder on an ephemeral loopback UDP port.
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch unreachable;
+    var sa = std.mem.zeroes(posix.sockaddr.in);
+    sa.family = posix.AF.INET;
+    sa.port = 0;
+    sa.addr = std.mem.nativeToBig(u32, 0x7F000001);
+    posix.bind(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    var sa_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    posix.getsockname(fd, @ptrCast(&sa), &sa_len) catch unreachable;
+
+    var state = FakeDns{ .sock = fd };
+    const th = try std.Thread.spawn(.{}, fakeResponder, .{&state});
+
+    defer {
+        state.stop.store(true, .release);
+        _ = posix.sendto(fd, &[_]u8{0}, 0, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch {};
+        th.join();
+        posix.close(fd);
+    }
+
+    last_result = .{};
+    var r = Resolver.init(test_alloc);
+    defer r.deinit();
+    r.setCallback(.{ .ctx = null, .fun = testCb });
+    r.setServer(net.Address.initIp4(.{ 127, 0, 0, 1 }, std.mem.bigToNative(u16, sa.port)));
+
+    try r.resolve("example.test", 5222, 99);
+
+    // Drive the loop with the same kevent shape the engine uses.
+    const kq = posix.kqueue() catch unreachable;
+    defer posix.close(kq);
+    const rev = std.posix.Kevent{
+        .ident = @intCast(r.sockFd()),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 1,
+    };
+    const changes = [_]std.posix.Kevent{rev};
+    var evbuf: [8]std.posix.Kevent = undefined;
+
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (std.time.milliTimestamp() < deadline and !last_result.fired) {
+        _ = posix.kevent(kq, &changes, &evbuf, null) catch break;
+        r.onReadable();
+        r.tick();
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(last_result.fired);
+    try std.testing.expectEqual(Status.resolved, last_result.status.?);
+    try std.testing.expectEqualStrings("host.example.test", last_result.targets_host);
+    try std.testing.expectEqual(@as(u16, 5222), last_result.targets_port);
+    try std.testing.expect(!last_result.targets_direct_tls);
+    try std.testing.expectEqual(@as(usize, 0), last_result.targets_tlsa_len);
+
+    if (last_result.targets_host.len > 0) test_alloc.free(last_result.targets_host);
+}
+
+test "resolver: literal IP short-circuits synchronously" {
+    last_result = .{};
+    var r = Resolver.init(test_alloc);
+    defer r.deinit();
+    r.setCallback(.{ .ctx = null, .fun = testCb });
+
+    try r.resolve("192.168.7.1", 5222, 7);
+    try std.testing.expect(last_result.fired);
+    try std.testing.expectEqual(Status.resolved, last_result.status.?);
+    try std.testing.expectEqual(@as(u16, 5222), last_result.targets_port);
+    try std.testing.expectEqualStrings("192.168.7.1", last_result.targets_host);
+    if (last_result.targets_host.len > 0) test_alloc.free(last_result.targets_host);
 }
