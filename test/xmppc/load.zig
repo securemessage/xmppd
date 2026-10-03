@@ -43,6 +43,10 @@ const Options = struct {
     password: []const u8 = "pass1",
     resource: []const u8 = "load",
     count: usize = 1000,
+    /// 0 = burst (all connects issued back to back). Otherwise sessions/sec:
+    /// paces the startSession loop so a 1000+ SYN storm doesn't overflow the
+    /// server's listen backlog before its accept loop drains it.
+    connect_rate: u64 = 0,
     hold: u64 = 5,
     msg_rate: u64 = 0, // aggregate client-tx stanzas/sec during the hold
     msg_size: usize = 128, // <body> payload bytes
@@ -73,6 +77,7 @@ const Options = struct {
                         "                        differentiate: <PREFIX>-0..N-1)\n" ++
                         "  -resource PREFIX     (default load)\n" ++
                         "  -n N                 (sessions; default 1000)\n" ++
+                        "  -connect-rate R      (sessions/sec ramp pace; 0=burst default)\n" ++
                         "  -hold S              (seconds after all settled; default 5)\n" ++
                         "  -msg-rate R          (aggregate stanzas/sec during hold; 0=off)\n" ++
                         "  -msg-size B          (body payload bytes; default 128)\n" ++
@@ -107,6 +112,8 @@ const Options = struct {
                 o.resource = val;
             } else if (std.mem.eql(u8, key, "n")) {
                 o.count = try std.fmt.parseUnsigned(usize, val, 10);
+            } else if (std.mem.eql(u8, key, "connect-rate")) {
+                o.connect_rate = try std.fmt.parseUnsigned(u64, val, 10);
             } else if (std.mem.eql(u8, key, "hold")) {
                 o.hold = try std.fmt.parseUnsigned(u64, val, 10);
             } else if (std.mem.eql(u8, key, "msg-rate")) {
@@ -270,7 +277,15 @@ pub fn main() !void {
     // slot map, and the loop thread must not iterate it concurrently.
     var handles = try std.ArrayList(Handle).initCapacity(std.heap.c_allocator, o.count);
     defer handles.deinit(std.heap.c_allocator);
+    const pace_start = std.time.nanoTimestamp();
     for (0..o.count) |i| {
+        if (o.connect_rate > 0) {
+            // Fixed-quantum pacing: sleep until the schedule slot for i+1.
+            const due_ns = @divTrunc(@as(i128, @intCast(i + 1)) * std.time.ns_per_s, @as(i128, o.connect_rate));
+            const target = pace_start + due_ns;
+            const now = std.time.nanoTimestamp();
+            if (target > now) std.Thread.sleep(@intCast(target - now));
+        }
         const res = try std.fmt.allocPrint(std.heap.c_allocator, "{s}-{d}", .{ o.resource, i });
         defer std.heap.c_allocator.free(res);
         const h = engine.startSession(.{
@@ -287,7 +302,9 @@ pub fn main() !void {
         handles.appendAssumeCapacity(h);
     }
 
-    const t_start = std.time.nanoTimestamp();
+    // End-to-end ramp clock starts when the FIRST connect is issued — paced
+    // ramps include their issuance time in logins/sec-wall by design.
+    const t_start = pace_start;
     try engine.run();
 
     // Ramp wait: every session settled, or the deadline expired.
