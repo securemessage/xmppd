@@ -268,6 +268,17 @@ pub const Engine = struct {
     // from a foreign thread). EVFILT_SIGNAL is unreliable across threads;
     // a real kqueue event on the pipe read-end is not.
     wake_pipe: [2]posix.fd_t = .{ -1, -1 },
+    /// Coalesces wake bytes: only the false->true transition writes to the
+    /// pipe; loopOnce clears this before draining. Without it, one write per
+    /// staged change floods the 16 KiB pipe (T236: blocking write end
+    /// deadlocked at ~8192 sessions staged before engine.run()).
+    wake_pending: std.atomic.Value(bool) = .init(false),
+    /// Kernel tid of the thread executing the loop (0 = not running). The
+    /// engine thread must never write to the wake pipe: its staged changes
+    /// fold into the kevent() it is about to call, and a blocking pipe
+    /// write would self-deadlock. FreeBSD tids start at 100000, so 0 never
+    /// aliases a live thread.
+    loop_tid: std.atomic.Value(std.Thread.Id) = .init(0),
 
     /// Staged kqueue registration changes, folded into the next waiting
     /// kevent() call. Mutex-guarded: attachFromThreadFd callers may stage
@@ -577,15 +588,40 @@ pub const Engine = struct {
         }
     }
 
-    /// Wake the kqueue loop from any thread (no-op if the loop is not
-    /// blocked, e.g. between run() iterations).
+    /// Wake the kqueue loop from any foreign thread (no-op if the loop is
+    /// not blocked, e.g. between run() iterations). The engine thread never
+    /// needs a wake: everything it staged folds into the kevent() it is
+    /// about to call.
     pub fn requestWake(self: *Engine) void {
+        if (self.loop_tid.load(.acquire) == std.Thread.getCurrentId()) return;
+        // Coalesce writers: one pending byte is enough to re-examine.
+        // Whoever flips the flag owns the write (and the one-time pipe
+        // create), giving that path a single-threaded section.
+        if (self.wake_pending.swap(true, .acq_rel)) return;
         if (self.wake_pipe[1] < 0) {
-            self.wake_pipe = posix.pipe() catch return;
-            // Non-blocking read end so the drain loop in loopOnce() never stalls.
-            _ = std.c.fcntl(self.wake_pipe[0], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+            const rollback = struct {
+                fn f(e: *Engine) void {
+                    e.wake_pending.store(false, .release);
+                }
+            }.f;
+            self.wake_pipe = posix.pipe() catch {
+                rollback(self);
+                return;
+            };
+            // Both ends non-blocking: the read drain never stalls, and a
+            // full pipe turns into EAGAIN ("a wake is already pending")
+            // instead of blocking the caller (T236 deadlock).
+            const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+            _ = std.c.fcntl(self.wake_pipe[0], std.c.F.SETFL, nb);
+            _ = std.c.fcntl(self.wake_pipe[1], std.c.F.SETFL, nb);
             const ev = kev(@intCast(self.wake_pipe[0]), std.c.EVFILT.READ, std.c.EV.ADD, WAKE_UDATA);
-            _ = posix.kevent(self.kq, &.{ev}, &.{}, null) catch return;
+            _ = posix.kevent(self.kq, &.{ev}, &.{}, null) catch {
+                posix.close(self.wake_pipe[0]);
+                posix.close(self.wake_pipe[1]);
+                self.wake_pipe = .{ -1, -1 };
+                rollback(self);
+                return;
+            };
         }
         _ = posix.write(self.wake_pipe[1], &.{1}) catch {};
     }
@@ -905,6 +941,8 @@ pub const Engine = struct {
 
     /// Run the kqueue loop inline on the caller thread until all sessions die.
     pub fn runSync(self: *Engine) !void {
+        self.loop_tid.store(std.Thread.getCurrentId(), .release);
+        defer self.loop_tid.store(0, .release);
         while (self.live_count > 0) {
             self.loopOnce() catch {
                 // kevent error — fail every session and stop rather than spin.
@@ -920,6 +958,8 @@ pub const Engine = struct {
 
     fn runLoop(self: *Engine) void {
         const gen = self.run_gen;
+        self.loop_tid.store(std.Thread.getCurrentId(), .release);
+        defer self.loop_tid.store(0, .release);
         while (self.live_count > 0 and self.run_gen == gen) {
             self.loopOnce() catch break;
             self.reapDead();
@@ -929,8 +969,12 @@ pub const Engine = struct {
     fn loopOnce(self: *Engine) !void {
         const t_iter_start = std.time.nanoTimestamp();
         // Drain the self-pipe first: a wake is a "re-examine" request, not
-        // data. The read end is non-blocking, so this terminates on EAGAIN.
+        // data. Clear the coalescing flag BEFORE reading so a concurrent
+        // writer's false->true transition always lands its byte
+        // (post-write the level-triggered READ re-fires the wait anyway).
+        // The read end is non-blocking, so the drain terminates on EAGAIN.
         if (self.wake_pipe[0] >= 0) {
+            self.wake_pending.store(false, .release);
             var wbuf: [128]u8 = undefined;
             while (true) {
                 _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
@@ -1077,4 +1121,31 @@ test "engine: SM unacked queue track/ack/drop incl. sequence wrap (T-9BC4D065)" 
 
     try std.testing.expectEqual(@as(u32, 0), engine.smDrop("s1"));
     try std.testing.expect(engine.sm_queues.getPtr("s1") == null);
+}
+
+test "engine: wake pipe never blocks on un-read staged changes (T236)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    // No loop is running: with a blocking write end the 16 KiB pipe fills
+    // after ~8192 of these and the caller hangs forever (pre-fix behavior).
+    const h = Handle{ .index = 0, .generation = 0 };
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) eng.addRead(999_999, h);
+
+    // Wakes coalesce to a single byte.
+    try std.testing.expect(eng.wake_pending.load(.acquire));
+    var wbuf: [128]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(eng.wake_pipe[0], &wbuf));
+    try std.testing.expectError(error.WouldBlock, posix.read(eng.wake_pipe[0], &wbuf));
+
+    // Simulate the loop having drained: flag cleared. requestWake from the
+    // thread the loop runs on must not write nor raise the flag.
+    eng.wake_pending.store(false, .release);
+    eng.loop_tid.store(std.Thread.getCurrentId(), .release);
+    defer eng.loop_tid.store(0, .release);
+    eng.requestWake();
+    try std.testing.expect(!eng.wake_pending.load(.acquire));
+    try std.testing.expectError(error.WouldBlock, posix.read(eng.wake_pipe[0], &wbuf));
 }
