@@ -259,7 +259,7 @@ pub fn main() !void {
     // Start IPC server (heap-allocated: the struct is ~2 MB since
     // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
     const ipc = try allocator.create(IpcServer);
-    ipc.* = .{};
+    ipc.* = IpcServer.init(allocator);
     defer {
         ipc.deinit();
         allocator.destroy(ipc);
@@ -281,6 +281,11 @@ pub fn main() !void {
     // a stale completion can't land on a different core connection that
     // reused the slot.
     var ipc_gens = [_]u32{0} ** @import("ipc_server").MAX_IPC_CLIENTS;
+
+    // Intake throttle: when a core's response backlog passes the high-water
+    // mark, stop reading NEW requests from that client (EV_DISABLE its read
+    // filter) until the backlog drains. Purely event-driven — no timers.
+    var read_paused = [_]bool{false} ** @import("ipc_server").MAX_IPC_CLIENTS;
 
     // Scratch buffer for batching changes across iterations.
     var scratch: [16]posix.Kevent = undefined;
@@ -310,6 +315,7 @@ pub fn main() !void {
                         // New IPC client connection
                         if (ipc.accept() catch null) |slot| {
                             ipc_gens[slot] +%= 1;
+                            read_paused[slot] = false;
                             const conn = ipc.getClient(slot) orelse continue;
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch break;
 
@@ -328,17 +334,21 @@ pub fn main() !void {
                         // T121: crypto completions — render and send replies
                         crypto_pool.drainPipe();
                         while (crypto_pool.popCompletion()) |c| {
-                            pumpCryptoReply(ipc, &handler, c, &ipc_gens, &batch);
+                            pumpCryptoReply(ipc, &handler, c, &ipc_gens, &batch, &read_paused);
                         }
                     } else if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        handleIpcClient(ipc, &handler, &batch, slot, &ipc_gens);
+                        // Belts-and-braces: a paused client's read filter is
+                        // disabled, so no event should arrive — but one may
+                        // already be queued from before the disable landed.
+                        if (!read_paused[slot])
+                            handleIpcClient(ipc, &handler, &batch, slot, &ipc_gens, &read_paused);
                     }
                 },
                 .fd_writable => |e| {
                     if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        flushIpcClient(ipc, &batch, slot);
+                        flushIpcClient(ipc, &batch, slot, &read_paused);
                     }
                 },
                 else => {},
@@ -349,7 +359,29 @@ pub fn main() !void {
     log.info("xmppd-auth shutdown complete", .{});
 }
 
-fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, ipc_gens: []const u32) void {
+/// Backpressure watermarks for IPC client intake. Sized against the SCRAM
+/// frame reality: a challenge+result pair is ~300 bytes, so 256 KiB of
+/// backlog is ~850 in-flight exchanges — deep but bounded.
+const RX_PAUSE_AT: usize = 768 << 10;
+const RX_RESUME_AT: usize = 256 << 10;
+
+fn updateReadBackpressure(ipc: *IpcServer, batch: *ChangeList, slot: usize, read_paused: []bool) void {
+    const conn = ipc.getClient(slot) orelse return;
+    if (conn.fd < 0) return;
+    const pend = conn.pendingSendBytes();
+    if (!read_paused[slot] and pend > RX_PAUSE_AT) {
+        read_paused[slot] = true;
+        batch.disableRead(conn.fd) catch {};
+        log.warn("IPC client {d}: {d}B outbound backlog > {d}B — pausing intake until drained", .{ slot, pend, RX_PAUSE_AT });
+    } else if (read_paused[slot] and pend < RX_RESUME_AT) {
+        read_paused[slot] = false;
+        batch.enableRead(conn.fd) catch {};
+        log.info("IPC client {d}: backlog drained to {d}B — resuming intake", .{ slot, pend });
+    }
+}
+
+fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, ipc_gens: []const u32, read_paused: []bool) void {
+    defer updateReadBackpressure(ipc, batch, slot, read_paused);
     const conn = ipc.getClient(slot) orelse return;
 
     const n = conn.recv() catch {
@@ -399,7 +431,7 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
 /// T121: send a finished crypto job's reply to its IPC client. The slot
 /// generation both validates the client is still the connection that asked
 /// and prevents a stale reply reaching an unrelated (reused) slot.
-fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Completion, ipc_gens: []const u32, batch: *ChangeList) void {
+fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Completion, ipc_gens: []const u32, batch: *ChangeList, read_paused: []bool) void {
     var reply = handler.takeCryptoReply(c) orelse return;
     defer reply.deinit(handler.allocator);
 
@@ -409,18 +441,21 @@ fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Co
     const conn = ipc.getClient(slot) orelse return;
     conn.queueSend(reply.msg) catch {
         ipc.closeClient(slot);
+        read_paused[slot] = false;
         return;
     };
     if (conn.hasPendingSend()) {
         batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
     }
+    updateReadBackpressure(ipc, batch, slot, read_paused);
 }
 
-fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize) void {
+fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize, read_paused: []bool) void {
     const conn = ipc.getClient(slot) orelse return;
 
     _ = conn.flush() catch {
         ipc.closeClient(slot);
+        read_paused[slot] = false;
         return;
     };
 
@@ -428,6 +463,7 @@ fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize) void {
     if (conn.hasPendingSend()) {
         batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {};
     }
+    updateReadBackpressure(ipc, batch, slot, read_paused);
 }
 
 /// Context for the invite validator callback.

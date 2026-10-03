@@ -652,6 +652,12 @@ pub const EventLoop = struct {
         const timeout_ptr: ?*const posix.timespec = if (timeout) |*t| t else null;
 
         const count = posix.kevent(self.kq, changelist, self.event_buf, timeout_ptr) catch |err| {
+            // T32: crash-context log — which errno, how many changes staged.
+            std.log.scoped(.xmppd).err("submitAndPoll kevent failed: err={} staged={d}", .{ err, changelist.len });
+            if (changelist.len > 0) {
+                const e = changelist[changelist.len - 1];
+                std.log.scoped(.xmppd).err("last change: ident={d} filter={d} flags=0x{x} udata={d}", .{ e.ident, e.filter, e.flags, e.udata });
+            }
             return switch (err) {
                 error.EventNotFound => error.SystemResources,
                 error.AccessDenied => error.SystemResources,

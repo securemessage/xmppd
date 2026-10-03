@@ -25,8 +25,14 @@ pub const MAX_IPC_CLIENTS = 80;
 /// Per-IPC-client receive buffer size.
 const CLIENT_BUF_SIZE = 8192;
 
-/// Per-IPC-client send buffer size.
-const CLIENT_SEND_BUF_SIZE = 16384;
+/// Hard cap on a client's unsent response backlog. Login storms against
+/// xmppd-auth queue one SCRAM challenge plus one result per in-flight SASL
+/// exchange; the old fixed 16 KiB buffer overflowed after ~118 in-flight
+/// requests and the caller closed the core link, wedging auth until restart.
+/// The buffer now GROWS on demand (heap), and intake backpressure (EV_READ
+/// disable at the auth daemon's high-water mark) keeps reality far below
+/// this cap.
+const CLIENT_SEND_CAP: usize = 4 << 20;
 
 /// A connected IPC client (one xmppd-core process).
 pub const IpcConn = struct {
@@ -35,9 +41,12 @@ pub const IpcConn = struct {
     recv_len: usize = 0,
     /// Bytes consumed by the last nextMessage() — compacted on the next call.
     recv_consumed: usize = 0,
-    send_buf: [CLIENT_SEND_BUF_SIZE]u8 = undefined,
+    /// Growable (heap) response backlog: [0..send_start] consumed,
+    /// [send_start..len) unsent. Allocated lazily from `alloc`.
+    send_list: std.ArrayListUnmanaged(u8) = .{},
     send_start: usize = 0,
-    send_end: usize = 0,
+    /// Set when the slot is activated (IpcServer.accept) or by tests.
+    alloc: ?std.mem.Allocator = null,
     active: bool = false,
 
     /// Read data from the socket. Returns 0 on EOF.
@@ -87,27 +96,30 @@ pub const IpcConn = struct {
         self.recv_consumed = 0;
     }
 
-    /// Queue a response message for sending.
+    /// Queue a response message for sending. Grows the backlog buffer on
+    /// demand; returns SendBufferFull only past CLIENT_SEND_CAP.
     pub fn queueSend(self: *IpcConn, msg: protocol.Message) !void {
         var frame_buf: [4096]u8 = undefined;
         const frame_len = try protocol.encode(msg, &frame_buf);
 
-        const space = CLIENT_SEND_BUF_SIZE - self.send_end;
-        if (frame_len > space) {
-            self.compactSendBuf();
-            const space2 = CLIENT_SEND_BUF_SIZE - self.send_end;
-            if (frame_len > space2) return error.SendBufferFull;
+        const alloc = self.alloc orelse return error.NoAllocator;
+        const unsent = self.send_list.items.len - self.send_start;
+        if (unsent + frame_len > CLIENT_SEND_CAP) return error.SendBufferFull;
+        // Reclaim the consumed prefix before growing.
+        if (self.send_start >= unsent or self.send_start >= 4096) {
+            std.mem.copyForwards(u8, self.send_list.items, self.send_list.items[self.send_start..]);
+            self.send_list.items.len = unsent;
+            self.send_start = 0;
         }
-        @memcpy(self.send_buf[self.send_end .. self.send_end + frame_len], frame_buf[0..frame_len]);
-        self.send_end += frame_len;
+        try self.send_list.appendSlice(alloc, frame_buf[0..frame_len]);
     }
 
     /// Flush the send buffer. Returns bytes written.
     pub fn flush(self: *IpcConn) !usize {
-        if (self.send_start >= self.send_end) return 0;
+        const items = self.send_list.items;
+        if (self.send_start >= items.len) return 0;
 
-        const data = self.send_buf[self.send_start..self.send_end];
-        const n = posix.write(self.fd, data) catch |err| {
+        const n = posix.write(self.fd, items[self.send_start..]) catch |err| {
             return switch (err) {
                 error.WouldBlock => @as(usize, 0),
                 else => error.WriteFailed,
@@ -115,16 +127,21 @@ pub const IpcConn = struct {
         };
 
         self.send_start += n;
-        if (self.send_start == self.send_end) {
+        if (self.send_start == self.send_list.items.len) {
             self.send_start = 0;
-            self.send_end = 0;
+            self.send_list.clearRetainingCapacity();
         }
         return n;
     }
 
     /// Returns true if there is unsent data.
     pub fn hasPendingSend(self: *const IpcConn) bool {
-        return self.send_start < self.send_end;
+        return self.send_start < self.send_list.items.len;
+    }
+
+    /// Unflushed bytes — the intake throttle keys on this.
+    pub fn pendingSendBytes(self: *const IpcConn) usize {
+        return self.send_list.items.len - self.send_start;
     }
 
     pub fn close(self: *IpcConn) void {
@@ -132,19 +149,12 @@ pub const IpcConn = struct {
             posix.close(self.fd);
             self.fd = -1;
         }
+        if (self.alloc) |a| {
+            self.send_list.deinit(a);
+            self.alloc = null;
+        }
         self.active = false;
         self.recv_len = 0;
-        self.send_start = 0;
-        self.send_end = 0;
-    }
-
-    fn compactSendBuf(self: *IpcConn) void {
-        if (self.send_start == 0) return;
-        const remaining = self.send_end - self.send_start;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.send_buf[0..remaining], self.send_buf[self.send_start..self.send_end]);
-        }
-        self.send_end = remaining;
         self.send_start = 0;
     }
 };
@@ -156,9 +166,16 @@ pub const IpcServer = struct {
     /// Connected IPC clients.
     clients: [MAX_IPC_CLIENTS]IpcConn = [_]IpcConn{IpcConn{}} ** MAX_IPC_CLIENTS,
 
+    /// Backs per-client growable send backlogs (must outlive the server).
+    allocator: std.mem.Allocator,
+
     /// Path to the socket file (for cleanup).
     socket_path: [108]u8 = std.mem.zeroes([108]u8),
     path_len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) IpcServer {
+        return .{ .allocator = allocator };
+    }
 
     /// Bind and listen on a Unix domain socket.
     pub fn listen(self: *IpcServer, path: []const u8) !void {
@@ -198,6 +215,7 @@ pub const IpcServer = struct {
             if (!slot.active) {
                 slot.* = IpcConn{};
                 slot.fd = client_fd;
+                slot.alloc = self.allocator;
                 slot.active = true;
                 log.info("IPC client connected, slot={d} fd={d}", .{ i, client_fd });
                 return i;
@@ -253,7 +271,7 @@ test "IpcServer: listen, accept, send/receive" {
     // Clean up in case of previous test failure
     std.fs.cwd().deleteFile(path) catch {};
 
-    var server = IpcServer{};
+    var server = IpcServer.init(std.testing.allocator);
     defer server.deinit();
     try server.listen(path);
 
@@ -304,11 +322,34 @@ test "IpcServer: listen, accept, send/receive" {
     try std.testing.expectEqualStrings("bob", msg.auth_request.username);
 }
 
+test "IpcConn: queueSend buffers past the old 16KiB cap without dropping the client" {
+    // Regression: a SCRAM challenge burst overflowed the 16 KiB per-client
+    // send buffer and the caller closed the IPC link, wedging auth for the
+    // whole server. The buffer must absorb a login storm (thousands of
+    // pending frames) — intake backpressure handles the rest upstream.
+    var conn = IpcConn{};
+    conn.fd = -1; // buffer-only; never flushed
+    conn.alloc = std.testing.allocator;
+    conn.active = true;
+    defer if (conn.alloc) |a| conn.send_list.deinit(a);
+
+    var queued: usize = 0;
+    while (queued < 2000) : (queued += 1) {
+        try conn.queueSend(.{ .auth_success = .{
+            .conn_id = 10,
+            .username = "alice",
+            .server_final = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        } });
+    }
+    try std.testing.expect(conn.pendingSendBytes() > 16384);
+    try std.testing.expect(conn.hasPendingSend());
+}
+
 test "IpcServer: deinit cleans up socket file" {
     const path = "/tmp/xmppd-test-ipc-cleanup.sock";
     std.fs.cwd().deleteFile(path) catch {};
 
-    var server = IpcServer{};
+    var server = IpcServer.init(std.testing.allocator);
     try server.listen(path);
 
     // Verify socket exists
@@ -331,6 +372,7 @@ test "IpcConn: queueSend and flush" {
 
     var conn = IpcConn{};
     conn.fd = fds[0];
+    conn.alloc = std.testing.allocator;
     conn.active = true;
     defer conn.close();
 

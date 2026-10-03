@@ -155,7 +155,7 @@ pub fn main() !void {
     // Start IPC server (heap-allocated: the struct is ~2 MB since
     // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
     const ipc = try allocator.create(IpcServer);
-    ipc.* = .{};
+    ipc.* = IpcServer.init(allocator);
     defer {
         ipc.deinit();
         allocator.destroy(ipc);

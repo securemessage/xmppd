@@ -118,7 +118,7 @@ pub const S2sDaemon = struct {
 
     pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) !S2sDaemon {
         const ipc = try allocator.create(IpcServer);
-        ipc.* = .{};
+        ipc.* = IpcServer.init(allocator);
         var d = S2sDaemon{
             .allocator = allocator,
             .local_domain = local_domain,

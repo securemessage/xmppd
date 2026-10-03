@@ -204,10 +204,12 @@ fn bumpReason(reason: []const u8) void {
     };
     if (gop.found_existing) {
         std.heap.c_allocator.free(copy); // getOrPut retained the old key
-    } else if (g.first_fail.len == 0) {
-        g.first_fail = copy;
+        gop.value_ptr.* += 1;
+    } else {
+        // getOrPut leaves the value UNINITIALIZED on insertion.
+        gop.value_ptr.* = 1;
+        if (g.first_fail.len == 0) g.first_fail = copy;
     }
-    gop.value_ptr.* += 1;
 }
 
 fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {

@@ -673,12 +673,14 @@ pub const Engine = struct {
         };
         var addr = addr_v4;
         addr.port = std.mem.nativeToBig(u16, port);
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch |serr| {
+            log.warn("socket() failed: {}", .{serr});
             s.destroy(self.allocator);
             return error.SocketCreate;
         };
         posix.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
             if (err != error.WouldBlock) {
+                log.warn("connect() to {s}:{d} failed immediately: {}", .{ host, port, err });
                 posix.close(fd);
                 s.destroy(self.allocator);
                 return error.ConnectFailed;
