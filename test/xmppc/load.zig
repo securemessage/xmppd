@@ -187,6 +187,17 @@ var g = struct {
     stanzas_posted: u64 = 0,
     post_drops: u64 = 0,
     quiet: bool = false,
+    /// Hold-phase accounting (T239): every posted message carries
+    /// id="l<seq>-<send_ns>". Received seqs mark a bitset (true loss is
+    /// posted-minus-seen after the drain window); latencies are sampled for
+    /// p50/p99/max. Sized up-front from -msg-rate x -hold; overflow seqs
+    /// count received-but-untracked.
+    seen: std.DynamicBitSetUnmanaged = .{},
+    seen_bits: usize = 0,
+    rx_distinct: u64 = 0, // seqs seen exactly once, by bitset
+    rx_untracked: u64 = 0, // seqs past the bitset
+    rx_dupes: u64 = 0,
+    lat_ns: std.ArrayListUnmanaged(u64) = .{},
     /// Set by main right before the stopSession teardown: closes after this
     /// are our own, not load-phase failures.
     draining: bool = false,
@@ -244,10 +255,30 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             }
             g.cond.signal();
         },
-        .stanza => {
+        .stanza => |st| {
             g.lock.lock();
+            defer g.lock.unlock();
             g.stanzas_rx += 1;
-            g.lock.unlock();
+            // Driver load messages carry id="l<seq>-<send_ns>" (T239).
+            const id = st.id;
+            if (st.kind == .message and id.len > 1 and id[0] == 'l') {
+                if (std.mem.indexOfScalar(u8, id, '-')) |dash| {
+                    const seq = std.fmt.parseUnsigned(u64, id[1..dash], 10) catch return;
+                    const sent_ns = std.fmt.parseUnsigned(u64, id[dash + 1 ..], 10) catch return;
+                    const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
+                    if (seq < g.seen_bits) {
+                        if (g.seen.isSet(@intCast(seq))) {
+                            g.rx_dupes += 1;
+                        } else {
+                            g.seen.set(@intCast(seq));
+                            g.rx_distinct += 1;
+                        }
+                    } else {
+                        g.rx_untracked += 1;
+                    }
+                    if (now > sent_ns) g.lat_ns.append(std.heap.c_allocator, now - sent_ns) catch {};
+                }
+            }
         },
         .sm_failed => {},
     }
@@ -346,6 +377,15 @@ pub fn main() !void {
     const body_pad = try std.heap.c_allocator.alloc(u8, o.msg_size);
     defer std.heap.c_allocator.free(body_pad);
     @memset(body_pad, 'x');
+    // T239: message ids carry their send sequence and timestamp so true
+    // loss (posted minus seen) separates from mere late delivery.
+    {
+        const bits: usize = @intCast(o.msg_rate * o.hold * 2 + 4096);
+        g.seen = try std.DynamicBitSetUnmanaged.initEmpty(std.heap.c_allocator, bits);
+        g.seen_bits = bits;
+    }
+    defer g.seen.deinit(std.heap.c_allocator);
+    defer g.lat_ns.deinit(std.heap.c_allocator);
     var stanza_seq: u64 = 0;
     var posted_total: u64 = 0;
     var rr: usize = 0;
@@ -366,7 +406,8 @@ pub fn main() !void {
                     break :blk if (h.index < g.jids.items.len) g.jids.items[@intCast(h.index)] else null;
                 };
                 const jid = target orelse continue;
-                const stanza = std.fmt.allocPrint(std.heap.c_allocator, "<message id='l{d}' to='{s}'><body>{s}</body></message>", .{ stanza_seq, jid, body_pad }) catch continue;
+                const send_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
+                const stanza = std.fmt.allocPrint(std.heap.c_allocator, "<message id='l{d}-{d}' to='{s}'><body>{s}</body></message>", .{ stanza_seq, send_ns, jid, body_pad }) catch continue;
                 defer std.heap.c_allocator.free(stanza);
                 engine.postStanza(h, stanza) catch {
                     g.lock.lock();
@@ -390,6 +431,11 @@ pub fn main() !void {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     const hold_wall_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - hold_start)) / std.time.ns_per_s;
+
+    // Post-hold drain window (T239): late deliveries land here. Anything
+    // still unseen after this is reported as true loss, not latency.
+    const drain_end = std.time.nanoTimestamp() + 3 * std.time.ns_per_s;
+    while (std.time.nanoTimestamp() < drain_end) std.Thread.sleep(10 * std.time.ns_per_ms);
 
     const snap_end = engine.statsSnapshot();
     const rss_end = maxRssKiB();
@@ -419,7 +465,25 @@ pub fn main() !void {
     const stanzas_posted = g.stanzas_posted;
     const stanzas_rx = g.stanzas_rx;
     const first_fail = g.first_fail;
+    const rx_distinct = g.rx_distinct + g.rx_untracked;
+    const rx_dupes = g.rx_dupes;
+    const hold_lost = if (stanzas_posted > rx_distinct) stanzas_posted - rx_distinct else 0;
     g.lock.unlock();
+
+    var lat_p50_us: u64 = 0;
+    var lat_p99_us: u64 = 0;
+    var lat_max_us: u64 = 0;
+    {
+        g.lock.lock();
+        defer g.lock.unlock();
+        const n = g.lat_ns.items.len;
+        if (n > 0) {
+            std.mem.sort(u64, g.lat_ns.items, {}, std.sort.asc(u64));
+            lat_p50_us = g.lat_ns.items[n / 2] / 1000;
+            lat_p99_us = g.lat_ns.items[@min(n - 1, (n * 99) / 100)] / 1000;
+            lat_max_us = g.lat_ns.items[n - 1] / 1000;
+        }
+    }
 
     const n_est: u64 = @max(1, est);
     const ramp_bytes = snap_ramp.bytes_rx + snap_ramp.bytes_tx;
@@ -430,8 +494,8 @@ pub fn main() !void {
         -1;
 
     std.debug.print(
-        "load: LOAD n={d} established={d} failed={d} post_closes={d} ramp_s={d:.2} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} ramp_bytes_per_session={d} hold_s={d:.1} hold_posted={d} hold_rx={d} hold_drops={d} hold_bytes_per_session={d} stall_max_us={d} scram_derives={d} cache_hits={d} mem_bytes_per_session_est={d} first_fail={s}\n",
-        .{ o.count, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, post_drops, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, engine.scram_derives, engine.scram_cache_hits, mem_est_bytes, first_fail },
+        "load: LOAD n={d} established={d} failed={d} post_closes={d} ramp_s={d:.2} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} ramp_bytes_per_session={d} hold_s={d:.1} hold_posted={d} hold_rx={d} hold_rx_distinct={d} hold_dupes={d} hold_lost={d} hold_drops={d} lat_p50_us={d} lat_p99_us={d} lat_max_us={d} hold_bytes_per_session={d} stall_max_us={d} scram_derives={d} cache_hits={d} mem_bytes_per_session_est={d} first_fail={s}\n",
+        .{ o.count, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, rx_distinct, rx_dupes, hold_lost, post_drops, lat_p50_us, lat_p99_us, lat_max_us, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, engine.scram_derives, engine.scram_cache_hits, mem_est_bytes, first_fail },
     );
 
     var it = g.fail_reasons.iterator();
