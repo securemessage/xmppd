@@ -559,17 +559,21 @@ test "socketpair: established session exchanges application stanzas" {
 
     // Inbound: a chat message with a <body> and a flat payload child.
     try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' type='chat' id='m9'><body>reply</body><sonya xmlns='urn:sonya:message:0' kind='directive' session='sess-1'/><thread>m1</thread></message>");
+    var st: Stanza = undefined;
     const deadline = std.time.milliTimestamp() + 2000;
     while (true) {
         {
             cur_mutex.lock();
             defer cur_mutex.unlock();
-            if (cur_stanzas.items.len > 0) break;
+            // Copy under the lock: the engine thread may append mid-assert.
+            if (cur_stanzas.items.len > 0) {
+                st = cur_stanzas.items[0];
+                break;
+            }
         }
         if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
-    const st = cur_stanzas.items[0];
     try std.testing.expect(st.kind == .message);
     try std.testing.expectEqualStrings("chat", st.type);
     try std.testing.expectEqualStrings("bob@localhost/x", st.from);
@@ -600,26 +604,45 @@ test "socketpair: inbound stanza captured with attributes, self-closing forms co
     try ctx.rig.send("<presence from='bob@localhost/x' type='unavailable'/>");
     // Then a normal presence with show/status children.
     try ctx.rig.send("<presence from='bob@localhost/y'><show>away</show><status>lunch</status></presence>");
+    var p1: Stanza = undefined;
+    var p2: Stanza = undefined;
     const deadline = std.time.milliTimestamp() + 2000;
     while (true) {
         {
             cur_mutex.lock();
             defer cur_mutex.unlock();
-            if (cur_stanzas.items.len >= 2) break;
+            if (cur_stanzas.items.len >= 2) {
+                p1 = cur_stanzas.items[0];
+                p2 = cur_stanzas.items[1];
+                break;
+            }
         }
         if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
-    const p1 = cur_stanzas.items[0];
     try std.testing.expect(p1.kind == .presence);
     try std.testing.expectEqualStrings("unavailable", p1.type);
     try std.testing.expectEqual(@as(usize, 0), p1.children.len);
-    const p2 = cur_stanzas.items[1];
     try std.testing.expectEqual(@as(usize, 2), p2.children.len);
     try std.testing.expectEqualStrings("show", p2.children[0].local_name);
     try std.testing.expectEqualStrings("away", p2.children[0].text);
     try std.testing.expectEqualStrings("status", p2.children[1].local_name);
     try std.testing.expectEqualStrings("lunch", p2.children[1].text);
+}
+
+test "socketpair: SM ack request gets an <a> with the stanza count" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // One application stanza inbound, then the server's ack request.
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='m1'><body>hi</body></message>");
+    try ctx.rig.send("<r xmlns='urn:xmpp:sm:3'/>");
+    try ctx.rig.expect("<a xmlns='urn:xmpp:sm:3' h='1'/>", 2000);
 }
 
 test "socketpair: peer close mid-stream fails the session as peer-closed" {

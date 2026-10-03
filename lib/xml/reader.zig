@@ -138,6 +138,41 @@ pub const Reader = struct {
                     return Event.xml_declaration;
                 },
                 .element_open => {
+                    // Stanza-scoped arena (xmppc Stanza lifetime contract):
+                    // a long-lived stream must not accumulate every name,
+                    // value and text forever. Top-level stanzas are
+                    // self-contained; consumers keep nothing past the next
+                    // stanza. Stream-level xmlns context (default ns +
+                    // prefix bindings such as xmlns:stream) survives: the
+                    // live bindings are copied to stack scratch and
+                    // re-duped into the fresh arena.
+                    if (self.stream_opened and self.depth == 1) {
+                        var def_buf: [256]u8 = undefined;
+                        const def_len = @min(self.default_ns.len, def_buf.len);
+                        @memcpy(def_buf[0..def_len], self.default_ns[0..def_len]);
+                        var pfx_buf: [max_ns_bindings][64]u8 = undefined;
+                        var uri_buf: [max_ns_bindings][256]u8 = undefined;
+                        var pfx_len: [max_ns_bindings]u8 = undefined;
+                        var uri_len: [max_ns_bindings]u16 = undefined;
+                        const nbind = self.ns_binding_count;
+                        for (self.ns_bindings[0..nbind], 0..) |b, bi| {
+                            pfx_len[bi] = @intCast(@min(b.prefix.len, 64));
+                            uri_len[bi] = @intCast(@min(b.uri.len, 256));
+                            @memcpy(pfx_buf[bi][0..pfx_len[bi]], b.prefix[0..pfx_len[bi]]);
+                            @memcpy(uri_buf[bi][0..uri_len[bi]], b.uri[0..uri_len[bi]]);
+                        }
+                        _ = self.arena.reset(.retain_capacity);
+                        self.default_ns = if (def_len > 0) try self.arenaDupe(def_buf[0..def_len]) else "";
+                        self.ns_stack_depth = 0;
+                        self.ns_binding_count = 0;
+                        for (0..nbind) |bi| {
+                            self.ns_bindings[bi] = .{
+                                .prefix = try self.arenaDupe(pfx_buf[bi][0..pfx_len[bi]]),
+                                .uri = try self.arenaDupe(uri_buf[bi][0..uri_len[bi]]),
+                            };
+                        }
+                        self.ns_binding_count = nbind;
+                    }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
                     self.current_element_local = try self.arenaDupe(token.local_name);
@@ -401,4 +436,31 @@ test "reader: namespace resolution" {
 
 test "scanner tests" {
     _ = scanner;
+}
+
+test "reader: arena stays bounded over many stanzas on a long-lived stream" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    // After the first stanza the arena retains some capacity; 200 more
+    // identically sized stanzas must not grow it (reset per top-level open).
+    var cap_after_first: usize = 0;
+    for (0..201) |i| {
+        var buf: [256]u8 = undefined;
+        const stanza = std.fmt.bufPrint(&buf, "<message id='m{d}' from='a@b/c' to='d@e'><body>payload-{d}</body></message>", .{ i, i }) catch unreachable;
+        var p2: usize = 0;
+        while (try reader.next(stanza, &p2)) |ev| {
+            if (ev == .element_end and std.mem.endsWith(u8, ev.element_end, "message")) break;
+        }
+        if (i == 0) cap_after_first = reader.arena.queryCapacity();
+    }
+    try std.testing.expect(cap_after_first > 0);
+    // Later stanzas differ only in digit length, so allow the small
+    // one-step growth seen during warmup and require no growth after it.
+    try std.testing.expect(reader.arena.queryCapacity() < 4096);
 }

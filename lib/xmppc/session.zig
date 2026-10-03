@@ -12,13 +12,10 @@
 //! * Event-driven only: kqueue, no thread per connection, no polling.
 //!
 //! ## Thread ownership
-//! All Session state is touched only on the engine thread. Foreign threads
-//! never call into a Session directly; they post commands through Engine
-//! entry points that end in requestWake() (stopSession today). Event
-//! handlers (Engine.setEventHandler) run on the engine thread, EXCEPT a
-//! `.closed` event caused by a foreign-thread stopSession(), which fires on
-//! the caller's thread before the loop wakes; consumers that need strict
-//! engine-thread delivery marshal through their own ctx.
+//! All Session state is touched ONLY on the engine thread. Foreign threads
+//! never call into a Session directly; they post commands to the Engine
+//! (postStanza and stopSession are both outbox commands + wake pipe).
+//! Every Event is delivered on the engine thread.
 //!
 //! ## Stream restarts (RFC 6120 4.7)
 //! The client opens a FRESH <stream:stream> after STARTTLS and after SASL
@@ -474,6 +471,19 @@ pub const Session = struct {
                 if (self.phase == .established) {
                     engine.dispatchEvent(self.handle, .{ .stanza = st });
                     if (self.failed) return;
+                } else {
+                    log.debug("dropping stanza received before establishment ({s})", .{@tagName(st.kind)});
+                }
+            }
+            if (parser.pending_sm_r) {
+                parser.pending_sm_r = false;
+                if (self.sm_enabled) {
+                    // Answer the server's ack request with the running 'h'.
+                    self.queuef("<a xmlns='urn:xmpp:sm:3' h='{d}'/>", .{parser.sm_stanza_count}) catch {
+                        self.fail(allocator, "queue-error");
+                        return;
+                    };
+                    self.writeAfter(engine);
                 }
             }
             if (parser.pending) |sev| {
@@ -542,7 +552,7 @@ pub const Session = struct {
         self.flushWrites(engine);
     }
 
-    pub fn queue(self: *Session, data: []const u8) !void {
+    fn queue(self: *Session, data: []const u8) !void {
         // Once anything overflowed, later data follows it to keep order.
         if (self.overflow.items.len > 0) {
             try self.overflow.appendSlice(self.engine.allocator, data);
@@ -686,6 +696,9 @@ pub const Session = struct {
                 self.sm_resumed = self.fsm.sm_resumed;
                 self.sm_id = self.fsm.sm_id;
                 self.bound_jid = self.fsm.bound_jid;
+                // 'h' counts stanzas handled since SM enablement; the
+                // bind/session establishment traffic must not count.
+                if (self.parser) |pr| pr.sm_stanza_count = 0;
                 engine.dispatchEvent(self.handle, .established);
             },
             .close => {
@@ -823,7 +836,7 @@ pub const Session = struct {
     }
 
     /// After queueing bytes: flush now, and re-arm write interest if pending.
-    pub fn writeAfter(self: *Session, engine: *Engine) void {
+    fn writeAfter(self: *Session, engine: *Engine) void {
         self.flushWrites(engine);
         if (self.write_len > 0) self.armWrite(engine);
     }

@@ -15,8 +15,8 @@
 //! ## Thread ownership
 //! The kqueue loop owns every Session: callbacks (setEventHandler) run on
 //! the engine thread and may touch session state directly (e.g. sendStanza
-//! via sessionAt). Foreign threads interact ONLY through methods ending in
-//! a wake-pipe nudge — today: stopSession — never through *Session itself.
+//! via sessionAt). Foreign threads interact ONLY through the command
+//! mailbox — postStanza and stopSession — never through *Session itself.
 //!
 //! ## Changelist (T-65F61479)
 //! kqueue registrations are STAGED into a buffer and applied by the ONE
@@ -35,6 +35,8 @@ const Transport = @import("transport.zig").Transport;
 const Resolver = @import("resolver.zig").Resolver;
 const Resolution = @import("resolver.zig").Resolution;
 const DnsStatus = @import("resolver.zig").Status;
+
+const log = std.log.scoped(.xmppc);
 
 const Kevent = std.posix.Kevent;
 const posix = std.posix;
@@ -88,9 +90,21 @@ pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
     const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
+
+    /// One queued command for a session. `stanza` is application payload
+    /// bytes; `stop` carries the failure reason.
+    pub const Command = union(enum) {
+        stanza: []u8,
+        stop: []u8,
+    };
+
+    const QueuedCmd = struct { handle: Handle, cmd: Command };
+
+    /// Drop bound for the command mailbox; a flooded consumer gets drops,
+    /// not unbounded memory.
+    const CMD_QUEUE_MAX = 4096;
+
     const Slot = struct {
-        session: Session,
-        generation: u32,
         live: bool,
     };
 
@@ -124,16 +138,17 @@ pub const Engine = struct {
     thread: ?std.Thread = null,
 
     /// The single event sink for all sessions (T-25A16875 c): established,
-    /// closed, stanza. Runs on the engine thread except where Session's
-    /// thread-ownership doc says otherwise.
+    /// closed, stanza. Always delivered on the engine thread.
     on_event: ?@import("session.zig").EventHandler = null,
     on_event_ctx: ?*anyopaque = null,
 
-    /// Application stanzas posted from ANY thread (postStanza); copied,
-    /// queued here under the lock, flushed on the engine thread by
-    /// drainOutbox. Direct Session.sendStanza is engine-thread only.
-    outbox: std.ArrayListUnmanaged(struct { handle: Handle, bytes: []u8 }) = .{},
-    outbox_lock: std.Thread.Mutex = .{},
+    /// Cross-thread command mailbox (postStanza / stopSession): the ONLY
+    /// way foreign threads touch a session. Copied here under the lock,
+    /// drained on the engine thread by drainCommands. Two lists swapped
+    /// each drain so capacity is retained.
+    cmd_active: std.ArrayListUnmanaged(QueuedCmd) = .{},
+    cmd_spare: std.ArrayListUnmanaged(QueuedCmd) = .{},
+    cmd_lock: std.Thread.Mutex = .{},
     // Self-pipe for cross-thread wake-up (N-worker shutdown / stopSession
     // from a foreign thread). EVFILT_SIGNAL is unreliable across threads;
     // a real kqueue event on the pipe read-end is not.
@@ -211,9 +226,11 @@ pub const Engine = struct {
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
-        // Leftover posted-but-never-flushed stanzas.
-        for (self.outbox.items) |ob| self.allocator.free(ob.bytes);
-        self.outbox.deinit(self.allocator);
+        // Leftover posted-but-never-applied commands.
+        for (self.cmd_active.items) |*c| self.allocator.free(cmdPayload(c));
+        for (self.cmd_spare.items) |*c| self.allocator.free(cmdPayload(c));
+        self.cmd_active.deinit(self.allocator);
+        self.cmd_spare.deinit(self.allocator);
         if (self.wake_pipe[0] >= 0) posix.close(self.wake_pipe[0]);
         if (self.wake_pipe[1] >= 0) posix.close(self.wake_pipe[1]);
         posix.close(self.kq);
@@ -370,45 +387,74 @@ pub const Engine = struct {
         return &slot.session;
     }
 
-    /// Mark a session dead and wake the loop to reap it. Safe from any thread:
-    /// fail() is idempotent and the reap runs on the engine thread.
+    /// Stop a session. Safe from ANY thread: the stop is posted to the
+    /// command mailbox and executed on the engine thread.
     pub fn stopSession(self: *Engine, h: Handle, reason: []const u8) void {
-        if (self.sessionAt(h)) |s| s.fail(self.allocator, reason);
-        self.requestWake();
+        const copy = self.allocator.dupe(u8, reason) catch return;
+        self.postCommand(h, .{ .stop = copy }) catch {
+            self.allocator.free(copy);
+            log.warn("command queue full; stop for session not posted", .{});
+            return;
+        };
     }
 
     /// Send one application stanza from ANY thread: the bytes are copied
-    /// into the outbox and queued on the engine thread (foreign threads
-    /// must not touch Session state directly). No delivery guarantee back
-    /// to the poster; watch session state via the event handler.
+    /// and queued on the engine thread (foreign threads must not touch
+    /// Session state directly).
     pub fn postStanza(self: *Engine, h: Handle, stanza: []const u8) !void {
         const copy = try self.allocator.dupe(u8, stanza);
-        self.outbox_lock.lock();
-        self.outbox.append(self.allocator, .{ .handle = h, .bytes = copy }) catch {
-            self.outbox_lock.unlock();
+        self.postCommand(h, .{ .stanza = copy }) catch |err| {
             self.allocator.free(copy);
-            return error.OutOfMemory;
+            return err;
         };
-        self.outbox_lock.unlock();
+    }
+
+    fn postCommand(self: *Engine, h: Handle, cmd: Command) !void {
+        {
+            self.cmd_lock.lock();
+            defer self.cmd_lock.unlock();
+            if (self.cmd_active.items.len >= CMD_QUEUE_MAX) return error.CommandQueueFull;
+            self.cmd_active.append(self.allocator, .{ .handle = h, .cmd = cmd }) catch return error.OutOfMemory;
+        }
         self.requestWake();
     }
 
-    /// Engine-thread: queue every posted stanza into its session. Stanzas
-    /// for dead or unestablished sessions are dropped (the poster owns
-    /// the liveness contract).
-    fn drainOutbox(self: *Engine) void {
-        self.outbox_lock.lock();
-        var pending = self.outbox;
-        self.outbox = .{}; // fresh list; posted bytes flushed below
-        self.outbox_lock.unlock();
-        defer pending.deinit(self.allocator);
-        for (pending.items) |ob| {
-            defer self.allocator.free(ob.bytes);
-            const s = self.sessionAt(ob.handle) orelse continue;
-            if (!s.isEstablished()) continue;
-            s.queue(ob.bytes) catch continue; // allocation failure: drop
-            s.writeAfter(self);
+    /// Engine-thread: apply every posted command. Stanzas route through
+    /// Session.sendStanza (established guard lives there); stops fail
+    /// the session. Drops are logged, never silent.
+    fn drainCommands(self: *Engine) void {
+        self.cmd_lock.lock();
+        std.mem.swap(@TypeOf(self.cmd_active), &self.cmd_active, &self.cmd_spare);
+        self.cmd_lock.unlock();
+        var pending = &self.cmd_spare;
+        defer {
+            for (pending.items) |*c| self.allocator.free(cmdPayload(c));
+            pending.clearRetainingCapacity();
         }
+        for (pending.items) |cmd| {
+            switch (cmd.cmd) {
+                .stanza => |bytes| {
+                    const s = self.sessionAt(cmd.handle) orelse {
+                        log.debug("posted stanza dropped: dead session", .{});
+                        continue;
+                    };
+                    _ = s.sendStanza(bytes) catch |err| {
+                        log.debug("posted stanza dropped: {}", .{err});
+                        continue;
+                    };
+                },
+                .stop => |reason| {
+                    if (self.sessionAt(cmd.handle)) |s| s.fail(self.allocator, reason);
+                },
+            }
+        }
+    }
+
+    fn cmdPayload(c: anytype) []u8 {
+        return switch (c.cmd) {
+            .stanza => |b| b,
+            .stop => |r| r,
+        };
     }
 
     /// Install the single event handler receiving every session Event
@@ -604,7 +650,7 @@ pub const Engine = struct {
                 _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
             }
         }
-        self.drainOutbox();
+        self.drainCommands();
 
         // Resume sessions whose off-loop SaltedPassword derivation finished.
         self.drainCryptoDone();

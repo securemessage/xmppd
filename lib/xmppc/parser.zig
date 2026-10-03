@@ -33,21 +33,35 @@ pub const StanzaChild = struct {
     name: []const u8,
     local_name: []const u8,
     ns: []const u8,
-    attrs: []const xml.Attribute,
-    /// Concatenated direct text of the child ("" when none). Valid until
+    /// Copied per stanza; NOT aliased to the reader's reused attr list.
+    attrs: []const Attribute,
+    /// Concatenated subtree text of the child ("" when none). Valid until
     /// the parser processes the NEXT stanza after dispatch.
     text: []const u8,
 };
 
+/// Private build-time record: offsets instead of slices so that backing
+/// lists may still grow while the stanza is being captured.
+const ChildBuilder = struct {
+    name: []const u8,
+    local_name: []const u8,
+    ns: []const u8,
+    attrs_start: usize,
+    attrs_len: usize,
+    text_start: usize,
+    text_len: usize,
+};
+
 /// A captured application stanza (message/presence/iq at stream-top level).
 ///
-/// Lifetime: all slices borrow the xml Reader arena (attributes, names) or
-/// the parser's rolling text buffer (child text). They are valid from the
-/// stanza's close until the next stanza close is processed — in practice:
-/// for the duration of the consumer's Event callback. Copy what you keep.
+/// Lifetime: attrs/names borrow the xml Reader arena (reset when the NEXT
+/// top-level stanza begins); child text borrows the parser's rolling
+/// buffer (cleared at the same point). So: copy what you keep before
+/// returning from the Event callback.
 ///
-/// Capture is one level deep: elements nested below a direct child are not
-/// recorded (the consumers driving this API carry flat payloads).
+/// Child `text` is the concatenated text of the child's whole subtree
+/// (e.g. XHTML-IM `<html><body><p>x</p>` appears as `"x"` on `html`).
+/// Capture is one level of elements deep.
 pub const Stanza = struct {
     pub const Kind = enum { message, presence, iq };
     kind: Kind,
@@ -78,8 +92,6 @@ pub const Parser = struct {
 
     // IQ stanza (bind/session result)
     in_iq: bool = false,
-    iq_type: []const u8 = "",
-    iq_id: []const u8 = "",
     iq_is_bind: bool = false,
     iq_is_session: bool = false,
     iq_is_error: bool = false,
@@ -104,10 +116,20 @@ pub const Parser = struct {
     st_id: []const u8 = "",
     st_from: []const u8 = "",
     st_to: []const u8 = "",
-    st_children: std.ArrayListUnmanaged(StanzaChild) = .{},
+    // Builders, private: offsets into st_attrs / st_text are resolved into
+    // public StanzaChild slices only in finishStanza, once both backing
+    // lists are final for the stanza (no realloc can move data under an
+    // already-handed-out slice).
+    st_children_b: std.ArrayListUnmanaged(ChildBuilder) = .{},
+    st_attrs: std.ArrayListUnmanaged(Attribute) = .{},
+    st_children_out: std.ArrayListUnmanaged(StanzaChild) = .{},
     st_child_open: bool = false,
-    st_child_text_start: usize = 0,
     st_text: std.ArrayListUnmanaged(u8) = .{},
+
+    /// XEP-0198 bookkeeping: completed top-level stanzas since reset
+    /// (wrapping u32 'h'); and a queued ack request to answer with <a/>.
+    sm_stanza_count: u32 = 0,
+    pending_sm_r: bool = false,
 
     /// The next ServerEvent to feed the FSM (one at a time).
     pending: ?stream.ServerEvent = null,
@@ -132,7 +154,9 @@ pub const Parser = struct {
         self.mech_names.deinit(self.allocator);
         self.sasl_text.deinit(self.allocator);
         self.jid_text.deinit(self.allocator);
-        self.st_children.deinit(self.allocator);
+        self.st_children_b.deinit(self.allocator);
+        self.st_attrs.deinit(self.allocator);
+        self.st_children_out.deinit(self.allocator);
         self.st_text.deinit(self.allocator);
     }
 
@@ -150,8 +174,6 @@ pub const Parser = struct {
         self.sasl_success_len = 0;
         self.pending = null;
         self.in_iq = false;
-        self.iq_type = "";
-        self.iq_id = "";
         self.iq_is_bind = false;
         self.iq_is_session = false;
         self.iq_is_error = false;
@@ -165,7 +187,9 @@ pub const Parser = struct {
         self.build_depth = 0;
         self.in_stanza = false;
         self.st_child_open = false;
-        self.st_children.clearRetainingCapacity();
+        self.st_children_b.clearRetainingCapacity();
+        self.st_attrs.clearRetainingCapacity();
+        self.st_children_out.clearRetainingCapacity();
         self.st_text.clearRetainingCapacity();
         self.pending_stanza = null;
     }
@@ -356,6 +380,11 @@ pub const Parser = struct {
                 }
                 return true;
             }
+            // Ack request: answer with <a h=.../> (Session drains this).
+            if (std.mem.eql(u8, name, "r")) {
+                self.pending_sm_r = true;
+                return true;
+            }
             // A self-closing condition child of <failed> (e.g. <item-not-found/>).
             if (self.sm_kind == .failed and closed) {
                 self.sm_failed_cond = name;
@@ -373,16 +402,14 @@ pub const Parser = struct {
         }
 
         // --- IQ stanza opener ---
+        // Kind/attrs/id are collected by beginStanza already; this block only
+        // arms the legacy bind/session child flag tracking.
         if (std.mem.eql(u8, name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
             self.in_iq = true;
             self.iq_is_bind = false;
             self.iq_is_session = false;
             self.iq_is_error = false;
             self.in_jid = false;
-            for (el.attributes) |a| {
-                if (std.mem.eql(u8, a.local_name, "type")) self.iq_type = a.value;
-                if (std.mem.eql(u8, a.local_name, "id")) self.iq_id = a.value;
-            }
             return true;
         }
 
@@ -442,21 +469,9 @@ pub const Parser = struct {
             self.endStanzaChild();
             return true;
         }
-        // Application stanza close. A protocol IQ that produced an FSM event
-        // (bind/session result) is consumed by that channel and NOT also
-        // dispatched as a stanza.
+        // Application stanza close. finishStanza routes protocol-shaped IQ
+        // results (bind/session) to the FSM and surfaces everything else.
         if (self.in_stanza and self.build_depth == 1) {
-            if (self.in_iq) {
-                if (std.mem.eql(u8, self.iq_type, "result")) {
-                    var res = stream.IqResult{ .id = self.iq_id };
-                    res.is_error = self.iq_is_error;
-                    if (self.iq_is_bind and !self.iq_is_error) {
-                        const jt = std.mem.trim(u8, self.jid_text.items, " \t\r\n");
-                        res.bound_jid = Jid.parse(jt) catch null;
-                    }
-                    self.pending = .{ .iq_result = res };
-                }
-            }
             self.finishStanza();
             return true;
         }
@@ -578,45 +593,77 @@ pub const Parser = struct {
                 self.st_to = a.value;
             }
         }
-        self.st_children.clearRetainingCapacity();
+        self.st_children_b.clearRetainingCapacity();
+        self.st_attrs.clearRetainingCapacity();
+        self.st_children_out.clearRetainingCapacity();
         self.st_text.clearRetainingCapacity();
         self.st_child_open = false;
     }
 
     fn beginStanzaChild(self: *Parser, el: xml.Element) void {
-        // On allocation failure the child is dropped, not the stanza: a
-        // partial capture is better than a parse failure.
-        self.st_children.append(self.allocator, .{
+        // Attr copies stop the aliasing of Reader.attrs (reused for every
+        // element); the strings they point at are reader-arena stable.
+        const attrs_start = self.st_attrs.items.len;
+        self.st_attrs.appendSlice(self.allocator, el.attributes) catch return;
+        self.st_children_b.append(self.allocator, .{
             .name = el.name,
             .local_name = el.local_name,
             .ns = el.namespace_uri,
-            .attrs = el.attributes,
-            .text = "",
+            .attrs_start = attrs_start,
+            .attrs_len = self.st_attrs.items.len - attrs_start,
+            .text_start = self.st_text.items.len,
+            .text_len = 0,
         }) catch return;
-        self.st_child_text_start = self.st_text.items.len;
         self.st_child_open = !el.self_closing;
     }
 
     fn endStanzaChild(self: *Parser) void {
-        if (self.st_children.items.len == 0) return;
-        const child = &self.st_children.items[self.st_children.items.len - 1];
-        child.text = self.st_text.items[self.st_child_text_start..];
+        if (self.st_children_b.items.len == 0) return;
+        const child = &self.st_children_b.items[self.st_children_b.items.len - 1];
+        child.text_len = self.st_text.items.len - child.text_start;
         self.st_child_open = false;
     }
 
-    /// Close the stanza collector. Protocol IQs that produced an FSM event
-    /// (bind/session results) are NOT also surfaced as stanzas.
+    /// Close the stanza collector. A protocol-shaped IQ result
+    /// (bind/session) goes to the FSM and nothing else; every other stanza
+    /// surfaces to the application. Both close paths (end tag and
+    /// self-closing) come through here (fixes the self-closing
+    /// iq type='result' case, e.g. sess1 without a <session/> payload).
     fn finishStanza(self: *Parser) void {
-        const consumed_by_fsm = self.st_kind == .iq and self.pending != null;
-        if (!consumed_by_fsm) {
-            if (self.st_child_open) self.endStanzaChild();
+        if (self.st_child_open) self.endStanzaChild();
+        const is_result = std.mem.eql(u8, self.st_type, "result");
+        const shaped = self.iq_is_bind or self.iq_is_session or
+            std.mem.eql(u8, self.st_id, "bind1") or std.mem.eql(u8, self.st_id, "sess1");
+        // Every completed top-level stanza counts for XEP-0198 'h'.
+        self.sm_stanza_count +%= 1;
+        if (self.st_kind == .iq and is_result and shaped) {
+            var res = stream.IqResult{ .id = self.st_id };
+            res.is_error = self.iq_is_error;
+            if (self.iq_is_bind and !self.iq_is_error) {
+                const jt = std.mem.trim(u8, self.jid_text.items, " \t\r\n");
+                res.bound_jid = Jid.parse(jt) catch null;
+            }
+            self.pending = .{ .iq_result = res };
+        } else {
+            // Materialize public children: backing lists are final now,
+            // so building slices here cannot dangle.
+            self.st_children_out.clearRetainingCapacity();
+            for (self.st_children_b.items) |b| {
+                self.st_children_out.append(self.allocator, .{
+                    .name = b.name,
+                    .local_name = b.local_name,
+                    .ns = b.ns,
+                    .attrs = self.st_attrs.items[b.attrs_start .. b.attrs_start + b.attrs_len],
+                    .text = self.st_text.items[b.text_start .. b.text_start + b.text_len],
+                }) catch continue;
+            }
             self.pending_stanza = .{
                 .kind = self.st_kind,
                 .type = self.st_type,
                 .id = self.st_id,
                 .from = self.st_from,
                 .to = self.st_to,
-                .children = self.st_children.items,
+                .children = self.st_children_out.items,
             };
         }
         self.in_stanza = false;
@@ -916,7 +963,10 @@ test "parser: self-closing presence captured empty; protocol iq not surfaced as 
     var parser = Parser.init(allocator);
     defer parser.deinit(allocator);
     var stanzas: usize = 0;
-    var got: ?Stanza = null;
+    var got_kind: ?Stanza.Kind = null;
+    var got_children: usize = 0;
+    var typ_buf: [32]u8 = undefined;
+    var typ_len: usize = 0;
     var iqs: usize = 0;
     var pos: usize = 0;
     while (true) {
@@ -926,7 +976,10 @@ test "parser: self-closing presence captured empty; protocol iq not surfaced as 
         if (parser.pending_stanza) |st| {
             parser.pending_stanza = null;
             stanzas += 1;
-            got = st;
+            got_kind = st.kind;
+            got_children = st.children.len;
+            @memcpy(typ_buf[0..st.type.len], st.type);
+            typ_len = st.type.len;
         }
         if (parser.pending) |sev| {
             parser.pending = null;
@@ -935,10 +988,9 @@ test "parser: self-closing presence captured empty; protocol iq not surfaced as 
     }
     try std.testing.expectEqual(@as(usize, 1), stanzas);
     try std.testing.expectEqual(@as(usize, 1), iqs); // protocol iq stays on the FSM channel
-    const st = got.?;
-    try std.testing.expect(st.kind == .presence);
-    try std.testing.expectEqualStrings("unavailable", st.type);
-    try std.testing.expectEqual(@as(usize, 0), st.children.len);
+    try std.testing.expect(got_kind.? == .presence);
+    try std.testing.expectEqualStrings("unavailable", typ_buf[0..typ_len]);
+    try std.testing.expectEqual(@as(usize, 0), got_children);
 }
 
 test "parser: two stanzas in one buffer both captured" {
@@ -967,4 +1019,100 @@ test "parser: two stanzas in one buffer both captured" {
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expect(kinds[0] == .presence);
     try std.testing.expect(kinds[1] == .message);
+}
+
+test "parser: child attrs survive later siblings (reader attr-list reuse)" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s10' from='localhost'>" ++
+        "<message id='m1'><first xmlns='urn:x' k='FIRST'/><second xmlns='urn:x' k='SECOND'/></message>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var got: ?Stanza = null;
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch unreachable;
+        if (ev == null) break;
+        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (parser.pending_stanza) |st| {
+            parser.pending_stanza = null;
+            got = st;
+            // What a consumer snapshot would see DURING the dispatch:
+            try std.testing.expectEqualStrings("FIRST", st.children[0].attrs[0].value);
+            try std.testing.expectEqualStrings("SECOND", st.children[1].attrs[0].value);
+        }
+    }
+    try std.testing.expect(got != null);
+}
+
+test "parser: child text survives rolling-buffer growth" {
+    const allocator = std.testing.allocator;
+    const body = "B" ** 60;
+    const thread = "T" ** 200;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s11' from='localhost'>" ++
+        "<message id='m1'><body>" ++ body ++ "</body><thread>" ++ thread ++ "</thread></message>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch unreachable;
+        if (ev == null) break;
+        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (parser.pending_stanza) |st| {
+            parser.pending_stanza = null;
+            // st_text grew past its initial capacity between the two
+            // children; offsets (not slices) must have carried across.
+            try std.testing.expectEqualStrings(body, st.children[0].text);
+            try std.testing.expectEqualStrings(thread, st.children[1].text);
+        }
+    }
+}
+
+test "parser: application iq result surfaces; protocol iq stays with the FSM" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s12' from='localhost'>" ++
+        // application result (disco answer) — must become a stanza
+        "<iq type='result' id='disco1' from='localhost'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server'/></query></iq>" ++
+        // self-closing protocol result (server answered sess1 with nothing) — must feed the FSM
+        "<iq type='result' id='sess1'/>";
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit(allocator);
+    var stanzas: usize = 0;
+    var iq_results: usize = 0;
+    // Snapshot during dispatch: payload slices die on the next stanza
+    // (reader arena reset / parser buffer reuse), per the Stanza contract.
+    var got_kind: ?Stanza.Kind = null;
+    var id_buf: [64]u8 = undefined;
+    var id_len: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch unreachable;
+        if (ev == null) break;
+        if (!parser.onReaderEvent(ev.?)) unreachable;
+        if (parser.pending_stanza) |st| {
+            parser.pending_stanza = null;
+            stanzas += 1;
+            got_kind = st.kind;
+            @memcpy(id_buf[0..st.id.len], st.id);
+            id_len = st.id.len;
+            try std.testing.expectEqualStrings("query", st.children[0].local_name);
+            try std.testing.expectEqualStrings("http://jabber.org/protocol/disco#info", st.children[0].ns);
+        }
+        if (parser.pending) |sev| {
+            parser.pending = null;
+            if (sev == .iq_result) iq_results += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), stanzas);
+    try std.testing.expectEqual(@as(usize, 1), iq_results);
+    try std.testing.expect(got_kind.? == .iq);
+    try std.testing.expectEqualStrings("disco1", id_buf[0..id_len]);
 }
