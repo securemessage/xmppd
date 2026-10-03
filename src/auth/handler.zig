@@ -760,17 +760,28 @@ pub fn AuthHandler(comptime Store: type) type {
             }
         }
 
+        /// conn_id packs generation<<16|session_slot, so a burst of >256
+        /// concurrent logins on one worker aliases mod MAX_SCRAM_SESSIONS
+        /// by construction. The table must probe instead of failing on the
+        /// first occupied home slot (birthday collisions are guaranteed);
+        /// null now means the table is genuinely full.
         fn findOrCreateScramSlot(self: *Self, conn_id: u32) ?usize {
-            const slot = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
-            const s = &self.scram_sessions[slot];
-            if (s.active and s.conn_id != conn_id) return null; // Collision
-            return slot;
+            if (self.findScramSlot(conn_id)) |slot| return slot;
+            const start = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
+            var i: usize = 0;
+            while (i < MAX_SCRAM_SESSIONS) : (i += 1) {
+                const slot = (start + i) % MAX_SCRAM_SESSIONS;
+                if (!self.scram_sessions[slot].active) return slot;
+            }
+            return null;
         }
 
         fn findScramSlot(self: *Self, conn_id: u32) ?usize {
-            const slot = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
-            const s = &self.scram_sessions[slot];
-            if (s.active and s.conn_id == conn_id) return slot;
+            // Probing leaves holes on cleanup; a full scan over 256 entries
+            // is cheaper than tombstone bookkeeping.
+            for (&self.scram_sessions, 0..) |*s, slot| {
+                if (s.active and s.conn_id == conn_id) return slot;
+            }
             return null;
         }
     };
@@ -810,6 +821,95 @@ fn handleSync(handler: *TestHandler, msg: protocol.Message) ?protocol.Message {
         .reply => |m| m,
         .deferred, .none => null,
     };
+}
+
+test "AuthHandler: SCRAM slot table probes past conn_id home-slot collisions" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "burst", "pass123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // conn_id packs generation<<16|session_slot; a login burst on one worker
+    // hands out sequential slots, so conn_ids 1, 257, 513, ... all collide on
+    // the same home slot mod MAX_SCRAM_SESSIONS. Every one must still get a
+    // challenge (probing), not a collision rejection.
+    var client = sasl.ScramClient.init(allocator, "burst", "pass123");
+    defer client.deinit();
+    const conn_ids = [_]u32{ 1, 257, 513, 769 };
+    for (conn_ids) |cid| {
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = cid,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.9",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "burst",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        switch (reply) {
+            .auth_challenge => {},
+            .auth_failure => |f| {
+                std.debug.print("conn_id {d} wrongly failed: {s}\n", .{ cid, f.reason });
+                return error.UnexpectedAuthFailure;
+            },
+            else => return error.UnexpectedReply,
+        }
+    }
+    for (conn_ids) |cid| handler.cleanupSession(cid);
+}
+
+test "AuthHandler: SCRAM slot table full means null, not aliasing" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "fullhouse", "pass123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var client = sasl.ScramClient.init(allocator, "fullhouse", "pass123");
+    defer client.deinit();
+    const client_first = try client.clientFirst();
+
+    // Fill all MAX_SCRAM_SESSIONS slots with genuinely concurrent exchanges.
+    var cid: u32 = 1;
+    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) {
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = cid,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.10",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "fullhouse",
+            .payload = client_first,
+        } }) orelse return error.NoResponse;
+        try std.testing.expect(reply == .auth_challenge);
+    }
+
+    // One more: the table is uniquely exhausted — temporary-auth-failure.
+    const overflow = handleSync(&handler, .{
+        .auth_request = .{
+            .conn_id = 65537, // generation 1, slot 1
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.10",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "fullhouse",
+            .payload = client_first,
+        },
+    }) orelse return error.NoResponse;
+    try std.testing.expect(overflow == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", overflow.auth_failure.reason);
+
+    cid = 1;
+    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(cid);
 }
 
 test "AuthHandler: PLAIN auth success" {
