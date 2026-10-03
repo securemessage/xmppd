@@ -51,6 +51,10 @@ pub const Tag = enum(u8) {
     // Mechanism handshake (0x0C)
     mechanism_list = 0x0C,
 
+    // Auth lifecycle (0x0D)
+    /// Core→Auth: the connection died mid-exchange; drop any state.
+    auth_abort = 0x0D,
+
     // S2S IPC (0x10–0x12)
     s2s_deliver = 0x10,
     s2s_inbound = 0x11,
@@ -107,6 +111,11 @@ pub const Message = union(enum) {
 
     /// Auth→Core: supported SASL mechanisms (sent once on IPC connect).
     mechanism_list: MechanismList,
+    /// Core→Auth: connection died mid-exchange — drop its SCRAM slot now.
+    /// Without it, connections that vanish before a final response leaked
+    /// daemon state and their conn_id aliases poisoned the NEXT session on
+    /// the recycled slot (T32 load-driver finding).
+    auth_abort: AuthAbort,
 
     /// Core→S2S: deliver a stanza to a remote domain.
     s2s_deliver: S2sDeliver,
@@ -154,6 +163,10 @@ pub const AuthFailure = struct {
 pub const SaslResponse = struct {
     conn_id: u32,
     payload: []const u8,
+};
+
+pub const AuthAbort = struct {
+    conn_id: u32,
 };
 
 // ============================================================================
@@ -399,6 +412,12 @@ pub fn encode(msg: Message, buf: []u8) !usize {
                 pos += 1;
             }
         },
+        .auth_abort => |a| {
+            buf[pos] = @intFromEnum(Tag.auth_abort);
+            pos += 1;
+            std.mem.writeInt(u32, buf[pos..][0..4], a.conn_id, .little);
+            pos += 4;
+        },
         .s2s_deliver => |d| {
             buf[pos] = @intFromEnum(Tag.s2s_deliver);
             pos += 1;
@@ -596,6 +615,10 @@ pub fn decode(payload: []const u8) !Message {
             }
             break :blk Message{ .mechanism_list = ml };
         },
+        @intFromEnum(Tag.auth_abort) => blk: {
+            if (data.len < 4) break :blk error.MessageTooShort;
+            break :blk Message{ .auth_abort = .{ .conn_id = std.mem.readInt(u32, data[0..4], .little) } };
+        },
         @intFromEnum(Tag.s2s_deliver) => blk: {
             var pos: usize = 0;
             const from_jid = try readField(data, &pos);
@@ -778,6 +801,15 @@ test "SaslResponse encode/decode roundtrip" {
     const r = decoded.sasl_response;
     try std.testing.expectEqual(@as(u32, 42), r.conn_id);
     try std.testing.expectEqualStrings("c=biws,r=combined,p=dHzmhGToJJFZ2v8wR0n/TN1Y0g==", r.payload);
+}
+
+test "AuthAbort encode/decode roundtrip" {
+    var buf: [64]u8 = undefined;
+
+    const written = try encode(.{ .auth_abort = .{ .conn_id = 0xABCD1234 } }, &buf);
+    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const decoded = try decode(frame.payload);
+    try std.testing.expectEqual(@as(u32, 0xABCD1234), decoded.auth_abort.conn_id);
 }
 
 test "readFrame with partial data returns null" {

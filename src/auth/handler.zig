@@ -267,6 +267,13 @@ pub fn AuthHandler(comptime Store: type) type {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
                 .sasl_response => |resp| .{ .reply = self.handleSaslResponse(resp) },
+                .auth_abort => |a| blk: {
+                    // The XMPP connection vanished mid-exchange; release its
+                    // SCRAM slot immediately instead of waiting for the stale
+                    // sweep — the core may already be reusing the conn.id.
+                    self.cleanupSession(a.conn_id);
+                    break :blk .none;
+                },
                 .password_change_request => |req| .{ .reply = self.handlePasswordChange(req) },
                 .account_delete_request => |req| .{ .reply = self.handleAccountDelete(req) },
                 .register_request => |req| .{ .reply = self.handleRegisterRequest(req) },

@@ -49,6 +49,10 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
             break;
         };
         session.* = Session.init(conn.fd, id, server.server_host, server.listener.direct_tls, server.allocator);
+        // Random seed decorrelates the auth-IPC generation from session slot
+        // reuse: a recycled conn.id previously restarted at gen 0, aliasing
+        // any aborted zombie exchange the auth daemon still held (T32).
+        session.auth_ipc_gen = std.crypto.random.int(u16);
         session.conn = conn;
         server.sessions[id] = session;
 
@@ -287,10 +291,12 @@ pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
 
     // Detach for SM resume if eligible (resume enabled, not already detached, not closing gracefully)
     if (session.sm_resume_enabled and !session.sm_detached and session.stream.isActive()) {
+        abortAuthIfInFlight(server, session, changes);
         detachSession(server, id, session, changes);
         return;
     }
 
+    abortAuthIfInFlight(server, session, changes);
     destroySession(server, id, session, changes);
 }
 
@@ -298,8 +304,23 @@ pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
 /// Used for intentional closes (stream close, protocol errors) where detach is inappropriate.
 pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void {
     const session = server.sessions[id] orelse return;
+    abortAuthIfInFlight(server, session, changes);
     session.sm_resume_enabled = false; // Prevent detach
     destroySession(server, id, session, changes);
+}
+
+/// Release the auth daemon's per-connection state when a session dies
+/// mid-exchange. Without this the SCRAM slot lingers until the stale sweep,
+/// and a conn.id reused inside that window aliases the zombie exchange —
+/// observed as not-authorized storms under churn (T32).
+fn abortAuthIfInFlight(server: *Server, session: *Session, changes: *ChangeList) void {
+    if (session.auth_state == .none) return;
+    session.auth_state = .none;
+    if (!server.ipc.connected) return;
+    server.ipc.send(.{ .auth_abort = .{ .conn_id = session.ipcConnId() } }) catch return;
+    if (server.ipc.hasPendingSend()) {
+        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
+    }
 }
 
 /// Detach a session for SM resume: free connection resources, preserve session state.
