@@ -12,6 +12,12 @@
 //! never moves a live session, never invalidates a `*Session` handed to a
 //! callback, and never touches kqueue.
 //!
+//! ## Thread ownership
+//! The kqueue loop owns every Session: callbacks (setEventHandler) run on
+//! the engine thread and may touch session state directly (e.g. sendStanza
+//! via sessionAt). Foreign threads interact ONLY through methods ending in
+//! a wake-pipe nudge — today: stopSession — never through *Session itself.
+//!
 //! ## Changelist (T-65F61479)
 //! kqueue registrations are STAGED into a buffer and applied by the ONE
 //! `kevent()` wait per loop iteration (project kqueue rule: never a kevent
@@ -23,6 +29,8 @@ const ssl = @import("ssl");
 const sasl = @import("sasl");
 
 const Session = @import("session.zig").Session;
+const SessionConfig = @import("session.zig").SessionConfig;
+const Event = @import("session.zig").Event;
 const Transport = @import("transport.zig").Transport;
 const Resolver = @import("resolver.zig").Resolver;
 const Resolution = @import("resolver.zig").Resolution;
@@ -114,6 +122,18 @@ pub const Engine = struct {
 
     tls_ctx: ?ssl.SslContext = null,
     thread: ?std.Thread = null,
+
+    /// The single event sink for all sessions (T-25A16875 c): established,
+    /// closed, stanza. Runs on the engine thread except where Session's
+    /// thread-ownership doc says otherwise.
+    on_event: ?@import("session.zig").EventHandler = null,
+    on_event_ctx: ?*anyopaque = null,
+
+    /// Application stanzas posted from ANY thread (postStanza); copied,
+    /// queued here under the lock, flushed on the engine thread by
+    /// drainOutbox. Direct Session.sendStanza is engine-thread only.
+    outbox: std.ArrayListUnmanaged(struct { handle: Handle, bytes: []u8 }) = .{},
+    outbox_lock: std.Thread.Mutex = .{},
     // Self-pipe for cross-thread wake-up (N-worker shutdown / stopSession
     // from a foreign thread). EVFILT_SIGNAL is unreliable across threads;
     // a real kqueue event on the pipe read-end is not.
@@ -191,6 +211,9 @@ pub const Engine = struct {
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
+        // Leftover posted-but-never-flushed stanzas.
+        for (self.outbox.items) |ob| self.allocator.free(ob.bytes);
+        self.outbox.deinit(self.allocator);
         if (self.wake_pipe[0] >= 0) posix.close(self.wake_pipe[0]);
         if (self.wake_pipe[1] >= 0) posix.close(self.wake_pipe[1]);
         posix.close(self.kq);
@@ -354,29 +377,73 @@ pub const Engine = struct {
         self.requestWake();
     }
 
-    /// Begin a client session toward host:port. `domain` is the stream's
-    /// `to=` JID domain (RFC 6120 §4.2) — distinct from the TCP connect
-    /// target `host` (e.g. host "127.0.0.1" but domain "localhost"). Returns
-    /// the session handle.
+    /// Send one application stanza from ANY thread: the bytes are copied
+    /// into the outbox and queued on the engine thread (foreign threads
+    /// must not touch Session state directly). No delivery guarantee back
+    /// to the poster; watch session state via the event handler.
+    pub fn postStanza(self: *Engine, h: Handle, stanza: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, stanza);
+        self.outbox_lock.lock();
+        self.outbox.append(self.allocator, .{ .handle = h, .bytes = copy }) catch {
+            self.outbox_lock.unlock();
+            self.allocator.free(copy);
+            return error.OutOfMemory;
+        };
+        self.outbox_lock.unlock();
+        self.requestWake();
+    }
+
+    /// Engine-thread: queue every posted stanza into its session. Stanzas
+    /// for dead or unestablished sessions are dropped (the poster owns
+    /// the liveness contract).
+    fn drainOutbox(self: *Engine) void {
+        self.outbox_lock.lock();
+        var pending = self.outbox;
+        self.outbox = .{}; // fresh list; posted bytes flushed below
+        self.outbox_lock.unlock();
+        defer pending.deinit(self.allocator);
+        for (pending.items) |ob| {
+            defer self.allocator.free(ob.bytes);
+            const s = self.sessionAt(ob.handle) orelse continue;
+            if (!s.isEstablished()) continue;
+            s.queue(ob.bytes) catch continue; // allocation failure: drop
+            s.writeAfter(self);
+        }
+    }
+
+    /// Install the single event handler receiving every session Event
+    /// (established / closed / stanza). Null clears it.
+    pub fn setEventHandler(self: *Engine, cb: ?@import("session.zig").EventHandler, ctx: ?*anyopaque) void {
+        self.on_event = cb;
+        self.on_event_ctx = ctx;
+    }
+
+    /// Fire an Event at the consumer. Called by Session internals on the
+    /// engine thread; safe to call with no handler (event drops silently).
+    pub fn dispatchEvent(self: *Engine, handle: Handle, ev: Event) void {
+        if (self.on_event) |cb| cb(self.on_event_ctx, self, handle, ev);
+    }
+
+    /// Begin a client session. All config fields are arena-copied into the
+    /// Session, so the caller's storage may be reused or freed immediately.
+    /// Returns the session handle.
     ///
     /// `host` as a literal IP connects immediately; otherwise DNS resolution
     /// runs asynchronously (SRV chain -> A/AAAA -> TLSA) on this loop and the
     /// session continues when the answer lands. Connect failure walks the
     /// target list.
-    pub fn startSession(self: *Engine, host: []const u8, port: u16, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !Handle {
+    pub fn startSession(self: *Engine, config: SessionConfig) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
-        s.host = host;
-        s.domain = domain;
-        s.user = user;
-        s.password = password;
-        s.resource = resource;
-        s.fsm.resume_id = sm_resume_id;
-        s.port = port;
+        s.setConfig(config) catch {
+            s.destroy(self.allocator);
+            return error.OutOfMemory;
+        };
+        s.port = config.port;
 
         // Literal IP: skip DNS entirely (lab rigs, explicit endpoints).
-        if (std.net.Address.parseIp(host, 0)) |_| {
-            return self.connectDirect(&s, host, port);
+        if (std.net.Address.parseIp(config.host, 0)) |_| {
+            return self.connectDirect(&s, config.host, config.port);
         } else |_| {}
 
         // Hostname: park the session in .resolving and hand the lookup to
@@ -394,7 +461,7 @@ pub const Engine = struct {
         slot.live = true;
         slot.session.phase = .resolving;
         self.live_count += 1;
-        self.resolver.?.resolve(host, port, h.encode()) catch |err| {
+        self.resolver.?.resolve(config.host, config.port, h.encode()) catch |err| {
             slot.session.destroy(self.allocator);
             self.freeSlot(h);
             return err;
@@ -402,15 +469,6 @@ pub const Engine = struct {
         self.armResolverTick();
         return h;
     }
-
-    /// Direct connect without DNS (literal IP or the socketpair test seam's
-    /// pre-connected fd). Retains the pre-resolver code path.
-    pub fn connectDirect(self: *Engine, s: *Session, host: []const u8, port: u16) !Handle {
-        const addr_v4 = resolveHost(host) catch {
-            return error.NameResolutionFailed;
-        };
-        var addr = addr_v4;
-        addr.port = std.mem.nativeToBig(u16, port);
 
         const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
             s.destroy(self.allocator);
@@ -457,16 +515,15 @@ pub const Engine = struct {
     /// socketpair(2) with a scripted fake server (no network, no certs for
     /// the plaintext cases). The fd must be non-blocking and connected (or a
     /// socketpair/stream fd); the session then runs the same post-connect
-    /// path as startSession (stream open on first writability).
-    pub fn attachFd(self: *Engine, fd: posix.fd_t, domain: []const u8, user: []const u8, password: []const u8, resource: []const u8, sm_resume_id: []const u8) !Handle {
+    /// path as startSession (stream open on first writability). config.host
+    /// and config.port are unused here.
+    pub fn attachFd(self: *Engine, fd: posix.fd_t, config: SessionConfig) !Handle {
         var s = try Session.init(self.allocator);
         s.engine = self;
-        s.host = "";
-        s.domain = domain;
-        s.user = user;
-        s.password = password;
-        s.resource = resource;
-        s.fsm.resume_id = sm_resume_id;
+        s.setConfig(config) catch {
+            s.destroy(self.allocator);
+            return error.OutOfMemory;
+        };
         return self.attachPrepared(&s, fd);
     }
 
@@ -547,6 +604,7 @@ pub const Engine = struct {
                 _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
             }
         }
+        self.drainOutbox();
 
         // Resume sessions whose off-loop SaltedPassword derivation finished.
         self.drainCryptoDone();

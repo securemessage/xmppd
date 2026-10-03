@@ -9,8 +9,14 @@
 //!   * `Engine`       (engine.zig) — ONE kqueue loop driving N Sessions
 //!   * `Session`      (session.zig) — connect → TCP → STARTTLS → SASL → bind
 //!                                   → SM, one connection lifecycle
-//!   * `Parser`       (parser.zig) — XML reader events → stream.ServerEvent
+//!   * `Parser`       (parser.zig) — XML reader events → stream.ServerEvent,
+//!                                   plus application stanza capture
 //!   * `Sm`           (sm.zig)     — Stream Management r/h ack bookkeeping (phase 2)
+//!
+//! Consumers receive everything through ONE tagged-union event handler
+//! (`Engine.setEventHandler` with `Event`: established / closed / stanza —
+//! a C-ABI wrapper maps 1:1) and write stanzas with `Session.sendStanza`
+//! (established streams only).
 //!
 //! Design invariants (see Continuum board XMPPC/task-brief-91e96a28):
 //!   * Own API boundary from day one — nothing here imports src/; src/ does not
@@ -46,6 +52,11 @@ pub const SaslClient = sasl.SaslClient;
 
 pub const Engine = engine.Engine;
 pub const Session = session.Session;
+pub const SessionConfig = session.SessionConfig;
+pub const Event = session.Event;
+pub const EventHandler = session.EventHandler;
+pub const Stanza = session.Stanza;
+pub const StanzaChild = parser.StanzaChild;
 pub const Transport = transport.Transport;
 pub const Handle = engine.Handle;
 

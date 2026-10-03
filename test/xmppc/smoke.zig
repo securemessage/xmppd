@@ -14,15 +14,13 @@
 //! Exit 0 once every session is established (SM enabled or resumed); 1 on
 //! failure. Emits one machine-readable `ESTABLISHED …` / `FAILED …` line;
 //! `sm_id=` and `reason=` are always present (empty when not applicable).
-//!
-//! Credential/resource strings are stored by reference inside the Session and
-//! must outlive it; this client passes static literals (or heap allocations
-//! that live until process exit).
 
 const std = @import("std");
 const xmppc = @import("xmppc");
 const Engine = xmppc.Engine;
 const Session = xmppc.Session;
+const SessionConfig = xmppc.SessionConfig;
+const Event = xmppc.Event;
 const Handle = xmppc.Handle;
 const Mutex = std.Thread.Mutex;
 const Condition = std.Thread.Condition;
@@ -160,10 +158,26 @@ var g = struct {
     quiet: bool = false,
 }{};
 
+// --- engine-thread event sink (T-25A16875 funnel) ---
+fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
+    _ = ctx;
+    switch (ev) {
+        .established => if (engine.sessionAt(handle)) |session| onEstablished(session),
+        .closed => |reason| {
+            const al = blk: {
+                g.lock.lock();
+                defer g.lock.unlock();
+                break :blk g.outcome.established;
+            };
+            onClosed(reason);
+            if (!al) engine.requestWake();
+        },
+        .stanza => {},
+    }
+}
+
 // --- engine-thread callbacks ---
-fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
-    _ = engine;
-    _ = handle;
+fn onEstablished(session: *Session) void {
     const jid_str: []const u8 = if (session.boundJid()) |j| blk: {
         break :blk std.fmt.allocPrint(std.heap.page_allocator, "{s}@{s}/{s}", .{ j.local, j.domain, j.resource }) catch "";
     } else "";
@@ -187,23 +201,18 @@ fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
     g.cond.signal();
 }
 
-fn onClosed(engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void {
-    _ = handle;
-    _ = session;
+fn onClosed(reason: []const u8) void {
     g.lock.lock();
-    const already = g.outcome.established;
-    if (!already) {
-        g.outcome.reason = reason;
-        g.done += 1;
-        if (!g.quiet) {
-            std.debug.print("smoke: failed: {s}\n", .{reason});
-        }
-        // Wake the main waiter like onEstablished does; without this a
-        // failed run sleeps out the full max-wait deadline.
-        g.cond.signal();
+    defer g.lock.unlock();
+    if (g.outcome.established) return;
+    g.outcome.reason = reason;
+    g.done += 1;
+    if (!g.quiet) {
+        std.debug.print("smoke: failed: {s}\n", .{reason});
     }
-    g.lock.unlock();
-    if (!already) engine.requestWake();
+    // Wake the main waiter like onEstablished does; without this a
+    // failed run sleeps out the full max-wait deadline.
+    g.cond.signal();
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +238,7 @@ pub fn main() !void {
 
     // Register N sessions (one per client). N>1 gets per-session resources so
     // the rig sees N distinct bind results on one loop.
+    engine.setEventHandler(onEvent, null);
     var idxs = std.ArrayList(Handle){};
     defer idxs.deinit(std.heap.page_allocator);
     for (0..o.count) |i| {
@@ -240,14 +250,19 @@ pub fn main() !void {
             );
         };
         const resume_id: []const u8 = if (o.resume_id.len > 0 and i == 0) o.resume_id else "";
-        const id = engine.startSession(o.host, o.port, o.domain, o.user, o.password, res, resume_id) catch |err| {
+        const id = engine.startSession(.{
+            .host = o.host,
+            .port = o.port,
+            .domain = o.domain,
+            .user = o.user,
+            .password = o.password,
+            .resource = res,
+            .sm_resume_id = resume_id,
+        }) catch |err| {
             std.debug.print("smoke: startSession: {any}\n", .{err});
             std.c._exit(1);
         };
         try idxs.append(std.heap.page_allocator, id);
-    }
-    for (idxs.items) |id| {
-        if (engine.sessionAt(id)) |s| s.setCallbacks(onEstablished, onClosed);
     }
 
     engine.run() catch {
