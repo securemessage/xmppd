@@ -55,6 +55,10 @@ pub const StreamHeader = stream.StreamHeader;
 pub const StreamError = stream.StreamError;
 pub const SmResult = stream.SmResult;
 
+/// Re-exported so consumers can set Engine.default_tls_policy without a
+/// direct import of the internals.
+pub const TlsPolicy = @import("tls").VerifyMode;
+
 pub const SaslClient = sasl.SaslClient;
 
 pub const Engine = engine.Engine;
