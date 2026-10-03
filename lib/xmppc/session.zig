@@ -11,6 +11,12 @@
 //! * Own API boundary: imports only std + the shared protocol modules. No src/.
 //! * Event-driven only: kqueue, no thread per connection, no polling.
 //!
+//! ## Thread ownership
+//! All Session state is touched ONLY on the engine thread. Foreign threads
+//! never call into a Session directly; they post commands to the Engine
+//! (postStanza and stopSession are both outbox commands + wake pipe).
+//! Every Event is delivered on the engine thread.
+//!
 //! ## Stream restarts (RFC 6120 4.7)
 //! The client opens a FRESH <stream:stream> after STARTTLS and after SASL
 //! success. The server resets its XML reader on both, so the client does the
@@ -37,8 +43,6 @@ const Jid = xmpp.Jid;
 const Reader = xml.Reader;
 const posix = std.posix;
 
-const READ_BUF_SIZE = 1 << 16;
-
 /// Buffers start small and grow on demand; shrink back when fully drained.
 /// (T-09BD8909: a session must not cost 128 KiB at rest.)
 const BUF_INITIAL_SIZE = 1 << 12; // 4 KiB
@@ -49,6 +53,48 @@ const MAX_READ_BUF_SIZE = 1 << 20; // 1 MiB
 
 /// Max wire footprint of one SASL strophe after base64 (~1.34× the raw cap).
 const SASL_ENC_MAX = 2048;
+
+/// Connection and identity for one session. Every field is borrowed on the
+/// call and arena-copied into the Session, so the caller's storage may die
+/// the moment startSession/attachFd returns (T-25A16875).
+pub const SessionConfig = struct {
+    /// TCP connect target. Empty for attachFd (the fd is already connected).
+    host: []const u8 = "",
+    port: u16 = 5222,
+    /// Stream `to=` domain (RFC 6120 4.2); distinct from `host` (e.g. host
+    /// "127.0.0.1" but domain "localhost").
+    domain: []const u8,
+    user: []const u8,
+    password: []const u8,
+    resource: []const u8 = "",
+    /// XEP-0198 resume id when reattaching to a detached stream.
+    sm_resume_id: []const u8 = "",
+    /// The OLD session's inbound stanza count ('h'), paired with
+    /// sm_resume_id. The server uses h to know which queued stanzas the
+    /// client already handled; sending h='0' when the client DID ack some
+    /// wraps the server's unacked queue into discardAll (silent loss).
+    sm_resume_h: u32 = 0,
+};
+
+/// One application-level stanza (post-establishment message/presence/iq).
+/// Payload slices borrow parser/reader buffers: they are valid only while
+/// the Event callback runs; copy what the consumer keeps.
+pub const Stanza = @import("parser.zig").Stanza;
+
+/// Everything a consumer can observe. Delivered through the ONE Engine-level
+/// event handler (T-25A16875 c); a C-ABI wrapper maps 1:1 onto this union.
+pub const Event = union(enum) {
+    /// Stream active (bind + SM done); stanza traffic may flow.
+    established,
+    /// Stream died. The reason slice is valid for the callback only.
+    closed: []const u8,
+    /// Inbound application stanza (see Stanza for payload lifetime).
+    stanza: Stanza,
+};
+
+/// Signature of the Engine event sink. Runs on the engine thread (see the
+/// thread-ownership note above for the stopSession exception).
+pub const EventHandler = *const fn (ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void;
 
 /// Encode base64 into a caller-owned fixed buffer (no heap on the hot path).
 fn b64encInto(out: []u8, input: []const u8) ![]const u8 {
@@ -144,11 +190,12 @@ pub const Session = struct {
     sm_id: []const u8 = "",
     sm_enabled: bool = false,
     sm_resumed: bool = false,
+    /// h carried into <resume>; from SessionConfig.sm_resume_h.
+    resume_h: u32 = 0,
 
-    /// Fired on the engine thread once the stream is active.
-    on_established: ?*const fn (engine: *Engine, handle: Handle, session: *Session) void = null,
-    /// Fired on the engine thread when the stream dies.
-    on_closed: ?*const fn (engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void = null,
+    /// Per-session arena owning the SessionConfig copies (setConfig); the
+    /// caller's config storage is never retained (T-25A16875).
+    arena_state: std.heap.ArenaAllocator,
 
     pub fn init(allocator: std.mem.Allocator) !Session {
         const parser = try allocator.create(Parser);
@@ -159,7 +206,21 @@ pub const Session = struct {
             .parser = parser,
             .read_buf = try allocator.alloc(u8, BUF_INITIAL_SIZE),
             .write_buf = try allocator.alloc(u8, BUF_INITIAL_SIZE),
+            .arena_state = std.heap.ArenaAllocator.init(allocator),
         };
+    }
+
+    /// Copy the config into the session arena and bind the FSM resume id.
+    /// Called by the Engine before the session is slotted.
+    pub fn setConfig(self: *Session, config: SessionConfig) !void {
+        const a = self.arena_state.allocator();
+        self.host = try a.dupe(u8, config.host);
+        self.domain = try a.dupe(u8, config.domain);
+        self.user = try a.dupe(u8, config.user);
+        self.password = try a.dupe(u8, config.password);
+        self.resource = try a.dupe(u8, config.resource);
+        self.fsm.resume_id = try a.dupe(u8, config.sm_resume_id);
+        self.resume_h = config.sm_resume_h;
     }
 
     pub fn destroy(self: *Session, allocator: std.mem.Allocator) void {
@@ -187,6 +248,7 @@ pub const Session = struct {
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
         self.overflow.deinit(allocator);
+        self.arena_state.deinit();
     }
 
     pub fn fail(self: *Session, allocator: std.mem.Allocator, reason: []const u8) void {
@@ -199,16 +261,8 @@ pub const Session = struct {
         @memcpy(self.fail_reason_buf[0..n], reason[0..n]);
         self.fail_reason_len = n;
         const owned = self.fail_reason_buf[0..n];
-        if (self.on_closed) |cb| cb(self.engine, self.handle, self, owned);
+        self.engine.dispatchEvent(self.handle, .{ .closed = owned });
         // The engine's reapDead() destroys + removes this slot.
-    }
-
-    /// Install the established/closed callbacks. Must be called on the engine
-    /// thread (or before runSync) after startSession, before the stream
-    /// completes; the engine hands out sessions by index.
-    pub fn setCallbacks(self: *Session, est: ?*const fn (*Engine, Handle, *Session) void, closed: ?*const fn (*Engine, Handle, *Session, []const u8) void) void {
-        self.on_established = est;
-        self.on_closed = closed;
     }
 
     pub fn isEstablished(self: *const Session) bool {
@@ -230,6 +284,13 @@ pub const Session = struct {
     }
     pub fn smResumed(self: *const Session) bool {
         return self.sm_resumed;
+    }
+    /// Current inbound stanza count h — with smId(), this is what the
+    /// consumer carries into the NEXT session's SessionConfig for a
+    /// resumption that does not lose in-flight stanzas.
+    pub fn smH(self: *const Session) u32 {
+        const pr = self.parser orelse return 0;
+        return pr.sm_stanza_count;
     }
 
     // ------------------------------------------------------------------
@@ -417,6 +478,29 @@ pub const Session = struct {
                 self.fail(allocator, "protocol-error");
                 return;
             }
+            if (parser.pending_stanza) |st| {
+                parser.pending_stanza = null;
+                // Stanzas are application traffic: only delivered once the
+                // stream is active (bind/session IQs during establishment
+                // stay with the FSM even when the parser captures them).
+                if (self.phase == .established) {
+                    engine.dispatchEvent(self.handle, .{ .stanza = st });
+                    if (self.failed) return;
+                } else {
+                    log.debug("dropping stanza received before establishment ({s})", .{@tagName(st.kind)});
+                }
+            }
+            if (parser.pending_sm_r) {
+                parser.pending_sm_r = false;
+                if (self.sm_enabled) {
+                    // Answer the server's ack request with the running 'h'.
+                    self.queuef("<a xmlns='urn:xmpp:sm:3' h='{d}'/>", .{parser.sm_stanza_count}) catch {
+                        self.fail(allocator, "queue-error");
+                        return;
+                    };
+                    self.writeAfter(engine);
+                }
+            }
             if (parser.pending) |sev| {
                 parser.pending = null;
                 self.handleServerEvent(engine, sev);
@@ -579,12 +663,102 @@ pub const Session = struct {
 
     // ------------------------------------------------------------------
     // Action execution — turn FSM actions into I/O
+    //
+    // Error funnel (T-25A16875): each handler returns and the ONE catch
+    // here maps error -> failure reason; handlers never call fail() for
+    // their own I/O errors.
     // ------------------------------------------------------------------
 
+    const ActionError = error{
+        QueueFailed,
+        SaslInitFailed,
+        SaslNotActive,
+        SaslNoParser,
+        SaslNoPassword,
+        SaslNoChallenge,
+        SaslChallengeFailed,
+        SaslDeriveQueue,
+        Base64Failed,
+        TlsNotConfigured,
+        TlsMissing,
+        TlsInitFailed,
+        TlsDriveFailed,
+    };
+
+    fn actionFailReason(err: ActionError) []const u8 {
+        return switch (err) {
+            error.QueueFailed => "queue-error",
+            error.SaslInitFailed => "sasl-init-failed",
+            error.SaslNotActive => "sasl-not-active",
+            error.SaslNoParser => "sasl-no-parser",
+            error.SaslNoPassword => "sasl-no-password",
+            error.SaslNoChallenge => "sasl-no-challenge",
+            error.SaslChallengeFailed => "sasl-challenge-error",
+            error.SaslDeriveQueue => "sasl-derive-queue",
+            error.Base64Failed => "b64-error",
+            error.TlsNotConfigured => "tls-not-configured",
+            error.TlsMissing => "tls-missing",
+            error.TlsInitFailed => "tls-init-failed",
+            error.TlsDriveFailed => "tls-handshake-failed",
+        };
+    }
+
     fn handleAction(self: *Session, engine: *Engine, action: stream.ClientAction) void {
-        const allocator = engine.allocator;
         switch (action) {
-            .none => {},
+            .established => {
+                self.phase = .established;
+                const a = self.arena_state.allocator();
+                // The FSM's sm_id/bound_jid borrow parser buffers that the
+                // per-stanza arena reset later frees; consumers hold these
+                // across the session, so copy them (PR #4 review A). OOM
+                // here fails the session (T233): a silently empty sm_id
+                // would make the next resume replay everything.
+                self.sm_enabled = self.fsm.sm_enabled;
+                self.sm_resumed = self.fsm.sm_resumed;
+                self.sm_id = a.dupe(u8, self.fsm.sm_id) catch {
+                    self.fail(engine.allocator, "alloc-failed");
+                    return;
+                };
+                self.bound_jid = if (self.fsm.bound_jid) |bj| blk: {
+                    const j = Jid{
+                        .local = a.dupe(u8, bj.local) catch break :blk null,
+                        .domain = a.dupe(u8, bj.domain) catch break :blk null,
+                        .resource = a.dupe(u8, bj.resource) catch break :blk null,
+                    };
+                    if (j.local.len == 0 or j.domain.len == 0 or j.resource.len == 0) {
+                        self.fail(engine.allocator, "alloc-failed");
+                        return;
+                    }
+                    break :blk j;
+                } else null;
+                // 'h' counts stanzas handled since SM enablement. A resume
+                // keeps counting from where the previous session left it
+                // (resume_h); only a fresh .enabled starts at zero
+                // (PR #4 review B: resetting h on resume wraps xmppd's
+                // unacked queue into discardAll and silently loses mail).
+                if (self.parser) |pr| {
+                    pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
+                    pr.after_establishment = true;
+                }
+                engine.dispatchEvent(self.handle, .established);
+            },
+            .close => {
+                // Prefer the protocol reason the FSM already recorded
+                // (stream error condition, SASL failure) — failing with a
+                // bare "stream-closed" hides the actual error from callers.
+                if (self.fsm.failure_reason.len > 0)
+                    self.fail(engine.allocator, self.fsm.failure_reason)
+                else
+                    self.fail(engine.allocator, "stream-closed");
+            },
+            else => self.executeAction(engine, action) catch |err|
+                self.fail(engine.allocator, actionFailReason(err)),
+        }
+    }
+
+    fn executeAction(self: *Session, engine: *Engine, action: stream.ClientAction) ActionError!void {
+        switch (action) {
+            .none, .established, .close => {}, // handled in handleAction
             .send_stream_open => {
                 // Restart after TLS or auth: reset parser + reader state (the
                 // server resets its own reader on both).
@@ -593,132 +767,105 @@ pub const Session = struct {
                     self.reader.reset();
                     if (self.parser) |pr| pr.reset();
                 }
-                self.queuef("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='{s}' version='1.0'>", .{self.domain}) catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queuef("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='{s}' version='1.0'>", .{self.domain}) catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .send_starttls => {
-                self.queue("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queue("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .send_sasl_auth => |mech| {
-                const sc = allocator.create(saslmod.SaslClient) catch {
-                    self.fail(allocator, "sasl-init-failed");
-                    return;
-                };
-                // SASL authcid is the bare localpart (RFC 6120 §6.2: the server
-                // prepends its own domain); the full JID is only used after bind.
-                const at = std.mem.indexOfScalar(u8, self.user, '@');
-                const authcid = if (at) |i| self.user[0..i] else self.user;
-                sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password) catch {
-                    allocator.destroy(sc);
-                    self.fail(allocator, "sasl-init-failed");
-                    return;
-                };
-                self.sasl = sc;
-                const raw = sc.initial() catch {
-                    self.fail(allocator, "sasl-init-failed");
-                    return;
-                };
-                // Stack-scratch encoding (T-09BD8909: no heap per step).
-                var enc_buf: [SASL_ENC_MAX]u8 = undefined;
-                const b64 = b64encInto(&enc_buf, raw) catch {
-                    self.fail(allocator, "b64-error");
-                    return;
-                };
-                self.queuef("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='{s}'>{s}</auth>", .{ mech, b64 }) catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                try self.doSaslAuth(engine, mech);
                 self.writeAfter(engine);
             },
-            .send_sasl_response => {
-                const sc = self.sasl orelse return self.fail(allocator, "sasl-not-active");
-                const pr = self.parser orelse return self.fail(allocator, "sasl-no-parser");
-                const raw = pr.saslChallengeRaw() orelse return self.fail(allocator, "sasl-no-challenge");
-                const step = sc.handleChallenge(raw) catch {
-                    self.fail(allocator, "sasl-challenge-error");
-                    return;
-                };
-                switch (step) {
-                    .none => return, // client-final already sent; await <success>
-                    .message => |msg| self.queueSaslResponse(engine, msg, allocator),
-                    .derive => |d| {
-                        const pw = sc.derivePassword() orelse return self.fail(allocator, "sasl-no-password");
-                        if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations)) |salted| {
-                            engine.scram_cache_hits += 1;
-                            self.finishSaslDerive(engine, salted, allocator);
-                        } else {
-                            // Hi() runs on the engine's crypto worker; the
-                            // exchange parks until onSaslDerived resumes it.
-                            self.sasl_deriving = true;
-                            engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations) catch {
-                                self.sasl_deriving = false;
-                                self.fail(allocator, "sasl-derive-queue");
-                            };
-                        }
-                    },
-                }
-            },
+            .send_sasl_response => try self.doSaslResponse(engine),
             .send_bind => {
-                self.queuef("<iq type='set' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{s}</resource></bind></iq>", .{self.resource}) catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queuef("<iq type='set' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{s}</resource></bind></iq>", .{self.resource}) catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .send_session => {
-                self.queue("<iq type='set' id='sess1'><session xmlns='urn:ietf:params:xml:ns:xmpp-session'/></iq>") catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queue("<iq type='set' id='sess1'><session xmlns='urn:ietf:params:xml:ns:xmpp-session'/></iq>") catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .send_sm_enable => {
                 // resume='true' so the server returns an SM id for reconnect.
-                self.queue("<enable xmlns='urn:xmpp:sm:3' resume='true'/>") catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queue("<enable xmlns='urn:xmpp:sm:3' resume='true'/>") catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .send_sm_resume => {
-                self.queuef("<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{self.fsm.resume_id}) catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
+                self.queuef("<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='{d}'/>", .{ self.fsm.resume_id, self.resume_h }) catch return error.QueueFailed;
                 self.writeAfter(engine);
             },
             .begin_tls => {
-                const ctx = engine.tls_ctx orelse return self.fail(allocator, "tls-not-configured");
-                const tp = if (self.tport) |*t| t else return self.fail(allocator, "tls-missing");
-                tp.upgradeToTls(ctx, null) catch return self.fail(allocator, "tls-init-failed");
+                const ctx = engine.tls_ctx orelse return error.TlsNotConfigured;
+                const tp = if (self.tport) |*t| t else return error.TlsMissing;
+                tp.upgradeToTls(ctx, null) catch return error.TlsInitFailed;
                 self.tls_handshake = true;
-                _ = self.onRead(engine) catch return;
-            },
-            .established => {
-                self.phase = .established;
-                self.sm_enabled = self.fsm.sm_enabled;
-                self.sm_resumed = self.fsm.sm_resumed;
-                self.sm_id = self.fsm.sm_id;
-                self.bound_jid = self.fsm.bound_jid;
-                if (self.on_established) |cb| cb(engine, self.handle, self);
-            },
-            .close => {
-                // Prefer the protocol reason the FSM already recorded
-                // (stream error condition, SASL failure) — failing with a
-                // bare "stream-closed" hides the actual error from callers.
-                if (self.fsm.failure_reason.len > 0)
-                    self.fail(allocator, self.fsm.failure_reason)
-                else
-                    self.fail(allocator, "stream-closed");
+                _ = self.onRead(engine) catch return error.TlsDriveFailed;
             },
         }
+    }
+
+    fn doSaslAuth(self: *Session, engine: *Engine, mech: []const u8) ActionError!void {
+        const allocator = engine.allocator;
+        const sc = allocator.create(saslmod.SaslClient) catch return error.SaslInitFailed;
+        // SASL authcid is the bare localpart (RFC 6120 §6.2: the server
+        // prepends its own domain); the full JID is only used after bind.
+        const at = std.mem.indexOfScalar(u8, self.user, '@');
+        const authcid = if (at) |i| self.user[0..i] else self.user;
+        sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password) catch {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        };
+        self.sasl = sc;
+        const raw = sc.initial() catch return error.SaslInitFailed;
+        // Stack-scratch encoding (T-09BD8909: no heap per step).
+        var enc_buf: [SASL_ENC_MAX]u8 = undefined;
+        const b64 = b64encInto(&enc_buf, raw) catch return error.Base64Failed;
+        self.queuef("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='{s}'>{s}</auth>", .{ mech, b64 }) catch return error.QueueFailed;
+    }
+
+    /// Drive one SASL <challenge/> answer. `.none` parks until <success>;
+    /// a `.derive` step runs PBKDF2 on the engine's crypto worker (or its
+    /// cache) and resumes in onSaslDerived.
+    fn doSaslResponse(self: *Session, engine: *Engine) ActionError!void {
+        const sc = self.sasl orelse return error.SaslNotActive;
+        const pr = self.parser orelse return error.SaslNoParser;
+        const raw = pr.saslChallengeRaw() orelse return error.SaslNoChallenge;
+        const step = sc.handleChallenge(raw) catch return error.SaslChallengeFailed;
+        switch (step) {
+            .none => {},
+            .message => |msg| try self.queueSaslResponse(engine, msg),
+            .derive => |d| {
+                const pw = sc.derivePassword() orelse return error.SaslNoPassword;
+                if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations)) |salted| {
+                    engine.scram_cache_hits += 1;
+                    try self.finishSaslDerive(engine, salted);
+                } else {
+                    // Hi() runs on the engine's crypto worker; the
+                    // exchange parks until onSaslDerived resumes it.
+                    self.sasl_deriving = true;
+                    engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations) catch {
+                        self.sasl_deriving = false;
+                        return error.SaslDeriveQueue;
+                    };
+                }
+            },
+        }
+    }
+
+    /// Queue one application stanza for delivery. Established streams only;
+    /// stanzas queue through the same pinned-buffer/overflow path as the
+    /// protocol FSM's own writes, flush immediately, and re-arm kqueue write
+    /// interest when the kernel send buffer is full.
+    ///
+    /// Not yet SM-counted for later retransmission on <resumed/>: an
+    /// application needing at-least-once over reconnects must watch for the
+    /// .established event after a resume and replay what it cares about.
+    pub fn sendStanza(self: *Session, stanza: []const u8) !void {
+        if (self.phase != .established) return error.NotEstablished;
+        try self.queue(stanza);
+        self.writeAfter(self.engine);
     }
 
     /// Test seam (socketpair harness): queue raw bytes through the same path
@@ -736,26 +883,17 @@ pub const Session = struct {
     }
 
     /// Base64 + queue + flush one SASL <response> message.
-    fn queueSaslResponse(self: *Session, engine: *Engine, msg: []const u8, allocator: std.mem.Allocator) void {
+    fn queueSaslResponse(self: *Session, engine: *Engine, msg: []const u8) ActionError!void {
         var enc_buf: [SASL_ENC_MAX]u8 = undefined;
-        const b64 = b64encInto(&enc_buf, msg) catch {
-            self.fail(allocator, "b64-error");
-            return;
-        };
-        self.queuef("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</response>", .{b64}) catch {
-            self.fail(allocator, "queue-error");
-            return;
-        };
+        const b64 = b64encInto(&enc_buf, msg) catch return error.Base64Failed;
+        self.queuef("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</response>", .{b64}) catch return error.QueueFailed;
         self.writeAfter(engine);
     }
 
-    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: [32]u8, allocator: std.mem.Allocator) void {
-        const sc = self.sasl orelse return self.fail(allocator, "sasl-not-active");
-        const msg = sc.finishChallenge(salted_password) catch {
-            self.fail(allocator, "sasl-challenge-error");
-            return;
-        };
-        self.queueSaslResponse(engine, msg, allocator);
+    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: [32]u8) ActionError!void {
+        const sc = self.sasl orelse return error.SaslNotActive;
+        const msg = sc.finishChallenge(salted_password) catch return error.SaslChallengeFailed;
+        try self.queueSaslResponse(engine, msg);
     }
 
     /// Engine-thread callback from drainCryptoDone: the crypto worker
@@ -763,7 +901,8 @@ pub const Session = struct {
     pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: [32]u8) void {
         if (!self.sasl_deriving) return; // stale completion (re-derive raced)
         self.sasl_deriving = false;
-        self.finishSaslDerive(engine, salted_password, engine.allocator);
+        self.finishSaslDerive(engine, salted_password) catch |err|
+            self.fail(engine.allocator, actionFailReason(err));
     }
 };
 // ============================================================================
@@ -833,4 +972,26 @@ test "write path: buffer grows normally when no TLS write is pending" {
     try s.queue(big);
     try std.testing.expectEqual(big.len, s.write_len);
     try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
+}
+
+test "establishment: allocator failure fails the session (T233)" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    s.fsm.sm_enabled = true;
+    s.fsm.sm_id = "sm-under-oom";
+    s.fsm.sm_resumed = false;
+    // The arena's copy of sm_id/bound_jid must fail the session, never
+    // produce a silently empty identity (a resume keyed on "" replays
+    // everything).
+    s.arena_state.child_allocator = std.testing.failing_allocator;
+    s.handleAction(&engine, .established);
+
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("alloc-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+    try std.testing.expect(s.phase == .dead);
 }

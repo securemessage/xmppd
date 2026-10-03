@@ -24,7 +24,12 @@ const sasl_mod = @import("sasl");
 const posix = std.posix;
 const Engine = xmppc.Engine;
 const Session = xmppc.Session;
+const SessionConfig = xmppc.SessionConfig;
+const Event = xmppc.Event;
+const Stanza = xmppc.Stanza;
+const StanzaChild = xmppc.StanzaChild;
 const Handle = xmppc.Handle;
+const xml_Attribute = xmppc.parser.Attribute;
 
 // ---------------------------------------------------------------------------
 // In-test self-signed cert (CN=localhost, generated for this suite only; the
@@ -105,9 +110,16 @@ var cur_mutex: std.Thread.Mutex = .{};
 var cur_cond: std.Thread.Condition = .{};
 var cur_outcome: Outcome = .{};
 
-fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
-    _ = engine;
-    _ = handle;
+fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
+    _ = ctx;
+    switch (ev) {
+        .established => if (engine.sessionAt(handle)) |session| onEstablished(session),
+        .closed => |reason| onClosed(reason),
+        .stanza => |st| onStanza(st),
+    }
+}
+
+fn onEstablished(session: *Session) void {
     const jid_str: []const u8 = if (session.boundJid()) |j|
         std.fmt.allocPrint(std.heap.page_allocator, "{s}@{s}/{s}", .{ j.local, j.domain, j.resource }) catch ""
     else
@@ -124,10 +136,7 @@ fn onEstablished(engine: *Engine, handle: Handle, session: *Session) void {
     cur_cond.signal();
 }
 
-fn onClosed(engine: *Engine, handle: Handle, session: *Session, reason: []const u8) void {
-    _ = engine;
-    _ = handle;
-    _ = session;
+fn onClosed(reason: []const u8) void {
     const dup = std.heap.page_allocator.dupe(u8, reason) catch "";
     cur_mutex.lock();
     defer cur_mutex.unlock();
@@ -136,6 +145,44 @@ fn onClosed(engine: *Engine, handle: Handle, session: *Session, reason: []const 
         cur_outcome.reason = dup;
     }
     cur_cond.signal();
+}
+
+/// Inbound application stanzas land here; copies survive the callback.
+var cur_stanzas: std.ArrayListUnmanaged(Stanza) = .{};
+fn onStanza(st: Stanza) void {
+    cur_mutex.lock();
+    defer cur_mutex.unlock();
+    // Defensive copy: payload slices are parser-buffer borrows.
+    const copy = Stanza{
+        .kind = st.kind,
+        .type = std.heap.page_allocator.dupe(u8, st.type) catch return,
+        .id = std.heap.page_allocator.dupe(u8, st.id) catch return,
+        .from = std.heap.page_allocator.dupe(u8, st.from) catch return,
+        .to = std.heap.page_allocator.dupe(u8, st.to) catch return,
+        .children = blk: {
+            const kids = std.heap.page_allocator.alloc(StanzaChild, st.children.len) catch break :blk &.{};
+            for (st.children, 0..) |child, i| {
+                const attrs = std.heap.page_allocator.alloc(xml_Attribute, child.attrs.len) catch return;
+                for (child.attrs, 0..) |a, j| {
+                    attrs[j] = .{
+                        .name = std.heap.page_allocator.dupe(u8, a.name) catch return,
+                        .value = std.heap.page_allocator.dupe(u8, a.value) catch return,
+                        .prefix = std.heap.page_allocator.dupe(u8, a.prefix) catch return,
+                        .local_name = std.heap.page_allocator.dupe(u8, a.local_name) catch return,
+                    };
+                }
+                kids[i] = .{
+                    .name = std.heap.page_allocator.dupe(u8, child.name) catch return,
+                    .local_name = std.heap.page_allocator.dupe(u8, child.local_name) catch return,
+                    .ns = std.heap.page_allocator.dupe(u8, child.ns) catch return,
+                    .attrs = attrs,
+                    .text = std.heap.page_allocator.dupe(u8, child.text) catch return,
+                };
+            }
+            break :blk kids;
+        },
+    };
+    cur_stanzas.append(std.heap.page_allocator, copy) catch {};
 }
 
 fn waitTerminal(timeout_ms: u64) Outcome {
@@ -251,10 +298,12 @@ const Rig = struct {
 fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *Engine, handle: Handle } {
     cur_mutex.lock();
     cur_outcome = .{};
+    cur_stanzas.clearRetainingCapacity();
     cur_mutex.unlock();
 
     const engine = try alloc.create(Engine);
     engine.* = try Engine.init(alloc);
+    engine.setEventHandler(onEvent, null);
     if (use_tls) try engine.useTls(null);
 
     var fds: [2]posix.fd_t = undefined;
@@ -262,9 +311,13 @@ fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *E
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
         return error.Socketpair;
 
-    const idx = try engine.attachFd(fds[0], "localhost", "alice", "pass1", "smoke", "");
+    const idx = try engine.attachFd(fds[0], .{
+        .domain = "localhost",
+        .user = "alice",
+        .password = "pass1",
+        .resource = "smoke",
+    });
     if (engine.sessionAt(idx)) |s| {
-        s.setCallbacks(onEstablished, onClosed);
         // Lab rig controls (xmppc.zig documents them): the fake server either
         // has no TLS at all (plaintext scripts) or only answers PLAIN (this
         // harness does not run a fake SCRAM verifier; the real-thing SCRAM is
@@ -420,11 +473,12 @@ test "socketpair: two SCRAM logins on one engine derive once (SaltedPassword cac
 
     // Both sessions attach before the loop starts (attachFd is not
     // thread-safe); each runs the same lab controls as setup().
-    const ha = try engine.attachFd(fds_a[0], "localhost", "alice", "pass1", "smoke", "");
-    const hb = try engine.attachFd(fds_b[0], "localhost", "alice", "pass1", "smoke", "");
+    engine.setEventHandler(onEvent, null);
+    const cfg: SessionConfig = .{ .user = "alice", .password = "pass1", .domain = "localhost", .resource = "smoke" };
+    const ha = try engine.attachFd(fds_a[0], cfg);
+    const hb = try engine.attachFd(fds_b[0], cfg);
     for ([_]Handle{ ha, hb }) |h| {
         const s = engine.sessionAt(h).?;
-        s.setCallbacks(onEstablished, onClosed);
         s.fsm.tls_required = false;
         s.fsm.allow_plain = true;
     }
@@ -487,6 +541,199 @@ test "socketpair: diced stream still reaches bind and established" {
     const out = waitTerminal(5000);
     try std.testing.expect(out.established);
     try std.testing.expectEqualStrings("sm-split", out.sm_id);
+}
+
+test "socketpair: established session exchanges application stanzas" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // Outbound via the any-thread outbox (the test thread is foreign to the
+    // engine thread).
+    try ctx.engine.postStanza(ctx.handle, "<message to='bob@localhost' id='m1' type='chat'><body>hi bob</body><sonya xmlns='urn:sonya:message:0' kind='notice'/></message>");
+    try ctx.rig.expect("<body>hi bob</body>", 2000);
+    try ctx.rig.expect("<sonya xmlns='urn:sonya:message:0' kind='notice'/>", 2000);
+
+    // Inbound: a chat message with a <body> and a flat payload child.
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' type='chat' id='m9'><body>reply</body><sonya xmlns='urn:sonya:message:0' kind='directive' session='sess-1'/><thread>m1</thread></message>");
+    var st: Stanza = undefined;
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (true) {
+        {
+            cur_mutex.lock();
+            defer cur_mutex.unlock();
+            // Copy under the lock: the engine thread may append mid-assert.
+            if (cur_stanzas.items.len > 0) {
+                st = cur_stanzas.items[0];
+                break;
+            }
+        }
+        if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(st.kind == .message);
+    try std.testing.expectEqualStrings("chat", st.type);
+    try std.testing.expectEqualStrings("bob@localhost/x", st.from);
+    try std.testing.expectEqualStrings("m9", st.id);
+    try std.testing.expectEqual(@as(usize, 3), st.children.len);
+    try std.testing.expectEqualStrings("body", st.children[0].local_name);
+    try std.testing.expectEqualStrings("reply", st.children[0].text);
+    try std.testing.expectEqualStrings("urn:sonya:message:0", st.children[1].ns);
+    try std.testing.expectEqual(@as(usize, 2), st.children[1].attrs.len);
+    try std.testing.expectEqualStrings("kind", st.children[1].attrs[0].local_name);
+    try std.testing.expectEqualStrings("directive", st.children[1].attrs[0].value);
+    try std.testing.expectEqualStrings("session", st.children[1].attrs[1].local_name);
+    try std.testing.expectEqualStrings("sess-1", st.children[1].attrs[1].value);
+    try std.testing.expectEqualStrings("thread", st.children[2].local_name);
+    try std.testing.expectEqualStrings("m1", st.children[2].text);
+}
+
+test "socketpair: inbound stanza captured with attributes, self-closing forms covered" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // Self-closing stanza (no children at all).
+    try ctx.rig.send("<presence from='bob@localhost/x' type='unavailable'/>");
+    // Then a normal presence with show/status children.
+    try ctx.rig.send("<presence from='bob@localhost/y'><show>away</show><status>lunch</status></presence>");
+    var p1: Stanza = undefined;
+    var p2: Stanza = undefined;
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (true) {
+        {
+            cur_mutex.lock();
+            defer cur_mutex.unlock();
+            if (cur_stanzas.items.len >= 2) {
+                p1 = cur_stanzas.items[0];
+                p2 = cur_stanzas.items[1];
+                break;
+            }
+        }
+        if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(p1.kind == .presence);
+    try std.testing.expectEqualStrings("unavailable", p1.type);
+    try std.testing.expectEqual(@as(usize, 0), p1.children.len);
+    try std.testing.expectEqual(@as(usize, 2), p2.children.len);
+    try std.testing.expectEqualStrings("show", p2.children[0].local_name);
+    try std.testing.expectEqualStrings("away", p2.children[0].text);
+    try std.testing.expectEqualStrings("status", p2.children[1].local_name);
+    try std.testing.expectEqualStrings("lunch", p2.children[1].text);
+}
+
+test "socketpair: sm_id stays valid after later stanzas (arena reset)" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // A later stanza used to invalidate Session.smId(): the FSM stored the
+    // parser's slice, and the per-stanza reader arena reset freed it.
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='z1'><body>later</body></message>");
+    const deadline = std.time.milliTimestamp() + 2000;
+    while (true) {
+        cur_mutex.lock();
+        const n = cur_stanzas.items.len;
+        cur_mutex.unlock();
+        if (n > 0) break;
+        if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    // A later stanza used to invalidate Session.smId(): the FSM stored the
+    // parser's slice, and the per-stanza reader arena reset freed it. Read
+    // the value AFTER the stanza was fully processed (the stanza event has
+    // drained, so no engine mutation is in flight).
+    try std.testing.expectEqualStrings("sm-test-42", ctx.engine.sessionAt(ctx.handle).?.smId());
+}
+
+test "socketpair: SM resume sends the carried h and keeps counting" {
+    const alloc = std.testing.allocator;
+
+    // Leg 1: establish with SM enabled, receive one stanza.
+    var ctx = try setup(alloc, false);
+    try scriptPlainHappy(&ctx.rig);
+    const out1 = waitTerminal(5000);
+    try std.testing.expect(out1.established);
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='r1'><body>one</body></message>");
+    {
+        const deadline = std.time.milliTimestamp() + 2000;
+        while (true) {
+            cur_mutex.lock();
+            const n = cur_stanzas.items.len;
+            cur_mutex.unlock();
+            if (n > 0) break;
+            if (std.time.milliTimestamp() >= deadline) return error.StanzaTimeout;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    // Tear the connection down at the transport level.
+    ctx.engine.stopSession(ctx.handle, "teardown-for-resume");
+    var tries: u32 = 0;
+    while (ctx.engine.sessionCount() > 0 and tries < 200) : (tries += 1)
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    teardown(alloc, &ctx.rig, ctx.engine);
+
+    // Leg 2: resume with the carried id and h=1. The rig must see h='1',
+    // and must NOT see h='0' (the old code always sent 0 and xmppd's
+    // unacked queue wraps to discardAll).
+    var ctx2 = try setup(alloc, false);
+    defer teardown(alloc, &ctx2.rig, ctx2.engine);
+    reframeForResume(ctx2.engine, ctx2.handle, "sm-test-42", 1);
+    try scriptResume(&ctx2.rig, "sm-test-42");
+    const out2 = waitTerminal(5000);
+    try std.testing.expect(out2.established);
+}
+
+/// Flip the attached session into its resume configuration (test seam:
+/// the real consumer restarts with SessionConfig.sm_resume_*; attachFd
+/// already stored a config, so re-set it through the public surface).
+fn reframeForResume(engine: *Engine, handle: Handle, sm_id: []const u8, h: u32) void {
+    const s = engine.sessionAt(handle).?;
+    s.fsm.resume_id = std.heap.page_allocator.dupe(u8, sm_id) catch "";
+    s.resume_h = h;
+}
+
+/// Minimal script for a resumed stream: pre-TLS features without SM enable,
+/// the client sends <resume ..> which must carry the given h.
+fn scriptResume(rig: *Rig, previd: []const u8) !void {
+    try rig.send(pre_tls_features);
+    try rig.expect("<auth", 2000);
+    try rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>");
+    try rig.expect("<stream:stream", 2000);
+    try sendPostAuthFeatures(rig);
+    // Client sends <resume .../> once bind is skipped? The FSM resumes
+    // INSTEAD of bind when it has a resume id and features advertise SM.
+    try rig.expect(previd, 2000);
+    try rig.expect("h='1'", 2000); // review B: carried count, not hard-coded 0
+    try rig.send("<resumed xmlns='urn:xmpp:sm:3' previd='sm-test-42' h='0'/>");
+}
+
+test "socketpair: SM ack request gets an <a> with the stanza count" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try scriptPlainHappy(&ctx.rig);
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+
+    // One application stanza inbound, then the server's ack request.
+    try ctx.rig.send("<message from='bob@localhost/x' to='alice@localhost' id='m1'><body>hi</body></message>");
+    try ctx.rig.send("<r xmlns='urn:xmpp:sm:3'/>");
+    try ctx.rig.expect("<a xmlns='urn:xmpp:sm:3' h='1'/>", 2000);
 }
 
 test "socketpair: peer close mid-stream fails the session as peer-closed" {

@@ -88,7 +88,7 @@ pub fn build(b: *std.Build) void {
     // Own API boundary from day one: nothing in lib/xmppc imports src/, and
     // src/ does not import lib/xmppc. Reuses the shared protocol primitives
     // (xml, xmpp, sasl, tls, ssl, dns) as named module imports.
-    const xmppc_mod = b.createModule(.{
+    const xmppc_mod = b.addModule("xmppc", .{
         .root_source_file = b.path("lib/xmppc/xmppc.zig"),
         .target = target,
         .optimize = optimize,
