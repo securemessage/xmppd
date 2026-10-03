@@ -179,6 +179,11 @@ pub const FdRegistration = struct {
 pub const ChangeList = struct {
     buf: []posix.Kevent,
     len: usize = 0,
+    /// fds purged via purgeFd() in this flush cycle (closed or about to be).
+    /// A subsequent addRead/addWrite for the same number clears the mark —
+    /// that is the fd number legitimately reused by a fresh connection.
+    purged: [64]posix.fd_t = undefined,
+    purged_len: usize = 0,
 
     /// Initialize a changelist backed by the given scratch buffer.
     /// The buffer determines the maximum number of changes per batch.
@@ -189,6 +194,7 @@ pub const ChangeList = struct {
     /// Reset the changelist for reuse (zero-cost — just resets the length).
     pub fn reset(self: *ChangeList) void {
         self.len = 0;
+        self.purged_len = 0;
     }
 
     /// Returns the accumulated changes as a slice for `submitAndPoll()`.
@@ -203,11 +209,13 @@ pub const ChangeList = struct {
 
     /// Add an fd for read monitoring.
     pub fn addRead(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        self.untrackPurged(fd); // fd number legitimately reused by a new owner
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
     /// Add an fd for write monitoring.
     pub fn addWrite(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
@@ -223,6 +231,7 @@ pub const ChangeList = struct {
 
     /// Add a one-shot read monitor (fires once when readable, then auto-removes).
     pub fn addReadOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
 
@@ -230,6 +239,7 @@ pub const ChangeList = struct {
     /// Idiomatic for flush-on-demand: register when data is queued, fires once
     /// kernel send buffer has space.
     pub fn addWriteOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
 
@@ -271,6 +281,62 @@ pub const ChangeList = struct {
         if (self.len >= self.buf.len) return error.ChangeListFull;
         self.buf[self.len] = ev;
         self.len += 1;
+    }
+
+    /// Remove EVERY staged entry for `fd`, and remember the fd as purged.
+    ///
+    /// Call this when a connection closes mid-iteration instead of staging
+    /// EV_DELETEs: close(2) drops the fd's knotes in the kernel, so a staged
+    /// DELETE only risks hitting a DIFFERENT connection — the fd number is
+    /// recycled by a same-iteration accept and the delete would silently
+    /// disarm the new session (T238; the 7145-EBADF churn class at w4/N=5000
+    /// was the visible tip).
+    pub fn purgeFd(self: *ChangeList, fd: posix.fd_t) void {
+        const target: usize = @intCast(fd);
+        var i: usize = 0;
+        while (i < self.len) {
+            if (self.buf[i].ident == target) {
+                self.len -= 1;
+                self.buf[i] = self.buf[self.len]; // swap-remove; order is per-fd irrelevant
+            } else {
+                i += 1;
+            }
+        }
+        if (self.purged_len < self.purged.len) {
+            self.purged[self.purged_len] = fd;
+            self.purged_len += 1;
+        }
+    }
+
+    /// Clear `fd` from the purged list — an add* on a purged number means a
+    /// same-iteration accept reused it for a new connection, legal by design.
+    fn untrackPurged(self: *ChangeList, fd: posix.fd_t) void {
+        var i: usize = 0;
+        while (i < self.purged_len) {
+            if (self.purged[i] == fd) {
+                self.purged_len -= 1;
+                self.purged[i] = self.purged[self.purged_len];
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Safe builds only: prove no staged entry references a purged fd.
+    /// Consumers call this right before submitAndPoll(). (Reuse after an
+    /// add* is untracked, so surviving hits are genuinely stale.)
+    pub fn assertNoPurgedEntries(self: *const ChangeList) void {
+        if (!std.debug.runtime_safety) return;
+        for (self.buf[0..self.len]) |ev| {
+            for (self.purged[0..self.purged_len]) |fd| {
+                if (ev.ident == @as(usize, @intCast(fd))) {
+                    std.debug.panic(
+                        "staged kevent entry for closed fd {d} (filter={d} flags=0x{x}) — fd-reuse corruption risk",
+                        .{ fd, ev.filter, ev.flags },
+                    );
+                }
+            }
+        }
     }
 };
 
@@ -669,20 +735,24 @@ pub const EventLoop = struct {
     // Private helpers
     // ========================================================================
 
-    /// kevent() with mass-churn hardening (T32). Zig's posix.kevent treats
-    /// EBADF/ENOENT-style per-changentry failures as `unreachable` — but
-    /// under a close storm, entries for just-closed fds are exactly what a
-    /// batched changelist legitimately contains (closing an fd drops its
-    /// knotes; a stale EV_ADD/EV_DELETE referencing it then hard-fails the
-    /// WHOLE call, crashing the worker). Isolate instead: on failure, walk
-    /// the changelist entry-by-entry so one stale entry cannot poison the
-    /// batch, then re-poll for events.
+    /// kevent() with mass-churn hardening (T32 rates, root-caused in T238).
+    ///
+    /// The kernel reports per-changentry failures as EV_ERROR *receipt*
+    /// events whenever the eventlist has room; only a no-room situation
+    /// fails the whole call. Receipts are dropped here when they match a
+    /// changelist entry (the failure belongs to a change we submitted, not
+    /// to a live knote) — callers only see real events. When the batch does
+    /// fail, it is re-issued once without a timeout; if it still fails, the
+    /// remaining stale entries are isolated one by one (deep fallback;
+    /// ChangeList.purgeFd should make it unreachable).
     fn keventHardened(
         self: *EventLoop,
         changes: []const posix.Kevent,
         timeout_ptr: ?*const posix.timespec,
     ) !usize {
         var changelist = changes;
+        var tmo = timeout_ptr;
+        var reissued = false;
         while (true) {
             const rc = std.c.kevent(
                 self.kq,
@@ -690,16 +760,44 @@ pub const EventLoop = struct {
                 @intCast(changelist.len),
                 self.event_buf.ptr,
                 @intCast(self.event_buf.len),
-                timeout_ptr,
+                tmo,
             );
             switch (posix.errno(rc)) {
-                .SUCCESS => return @intCast(rc),
+                .SUCCESS => {
+                    // Drop changelist-failure receipts, compacting real events
+                    // down; every other event passes through untouched.
+                    const n: usize = @intCast(rc);
+                    var out: usize = 0;
+                    var receipts: usize = 0;
+                    for (self.event_buf[0..n]) |ev| {
+                        if (ev.flags & std.c.EV.ERROR != 0 and matchChangeEntry(changelist, ev)) {
+                            receipts += 1;
+                            continue;
+                        }
+                        self.event_buf[out] = ev;
+                        out += 1;
+                    }
+                    if (receipts > 0) {
+                        std.log.scoped(.xmppd).warn(
+                            "kevent changelist: dropped {d}/{d} churn-failure receipts (stale fd entries)",
+                            .{ receipts, changelist.len },
+                        );
+                    }
+                    return out;
+                },
                 .INTR => continue,
                 .NOMEM => return error.SystemResources,
                 .BADF, .NOENT, .INVAL => {
-                    // Stale-entry class: replay entries one by one so only
-                    // the dead-fd operations are dropped.
-                    logChangeFailure("batch", null, rc);
+                    if (!reissued) {
+                        // No room for receipts: re-issue once, no timeout,
+                        // so every failed change comes back as an EV_ERROR
+                        // receipt (handled above) instead of erring the call.
+                        logChangeFailure("batch", null, rc);
+                        reissued = true;
+                        tmo = null;
+                        continue;
+                    }
+                    // Isolate: one bad entry must not poison the batch.
                     var isolated: usize = 0;
                     var none_ptr: [0]posix.Kevent = undefined;
                     for (changelist) |ch| {
@@ -723,6 +821,16 @@ pub const EventLoop = struct {
                 else => return error.SystemResources,
             }
         }
+    }
+
+    /// A submission receipt (EV_ERROR for a changelist entry) matches one of
+    /// this call's changes by (ident, filter). Genuine asynchronous knote
+    /// errors for an ident not being changed this call pass as .fd_error.
+    fn matchChangeEntry(changelist: []const posix.Kevent, ev: posix.Kevent) bool {
+        for (changelist) |ch| {
+            if (ch.ident == ev.ident and ch.filter == ev.filter) return true;
+        }
+        return false;
     }
 
     fn logChangeFailure(kind: []const u8, ch: ?posix.Kevent, rc: isize) void {
@@ -1020,6 +1128,58 @@ test "EventLoop: poll timeout returns empty" {
     // Poll with 10ms timeout, nothing registered — should return empty
     const events = try loop.poll(10);
     try std.testing.expectEqual(@as(usize, 0), events.len);
+}
+
+test "ChangeList: purgeFd drops staged entries; re-add untracks (T238)" {
+    var buf: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&buf);
+    try cl.addRead(7, 0xA);
+    try cl.addWrite(7, 0xA);
+    try cl.addRead(9, 0xB);
+    cl.purgeFd(7);
+    try std.testing.expectEqual(@as(usize, 1), cl.count());
+    try std.testing.expectEqual(@as(usize, 9), cl.slice()[0].ident);
+
+    // Same-iteration reuse: fd 7 re-registered by a new connection; the
+    // safety assert accepts it (untracked) and reset clears the marks.
+    try cl.addRead(7, 0xC);
+    try std.testing.expectEqual(@as(usize, 2), cl.count());
+    cl.assertNoPurgedEntries();
+    cl.reset();
+    try std.testing.expectEqual(@as(usize, 0), cl.purged_len);
+}
+
+test "EventLoop: purge + fd-number reuse within one flush (T238)" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const a = try posix.pipe(); // the OLD connection
+    const b = try posix.pipe(); // the NEW connection
+    defer posix.close(a[1]);
+    defer posix.close(b[1]);
+    defer posix.close(b[0]);
+
+    const conn_fd = a[0];
+    try loop.addFd(conn_fd, .read, 0xAAAA_AAAA);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try cl.addWrite(conn_fd, 0xBBBB_BBBB); // stale write-arm for the OLD conn
+    cl.purgeFd(conn_fd); // OLD conn dies mid-iteration
+    posix.close(conn_fd);
+    try posix.dup2(b[0], conn_fd); // NEW conn takes over the same number
+    try cl.addRead(conn_fd, 0xCCCC_CCCC);
+    cl.assertNoPurgedEntries();
+
+    _ = try loop.submitAndPoll(cl.slice(), 100);
+    _ = try posix.write(b[1], "x");
+    const events = try loop.poll(100);
+    // Without the purge, the staged addWrite would have armed WRITE on the
+    // NEW pipe and the poll would surface the stale 0xBBBB… udata.
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0] == .fd_readable);
+    try std.testing.expectEqual(@as(usize, 0xCCCC_CCCC), events[0].fd_readable.udata);
+    posix.close(conn_fd);
 }
 
 test "EventLoop: addFds bulk registration" {

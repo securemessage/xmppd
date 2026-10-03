@@ -34,6 +34,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         };
 
         var conn = server.listener.accept(id) catch |err| {
+            releaseId(server, id);
             switch (err) {
                 error.WouldBlock => break,
                 else => {
@@ -46,6 +47,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         const session = server.allocator.create(Session) catch {
             log.err("out of memory for session", .{});
             conn.close();
+            releaseId(server, id);
             break;
         };
         session.* = Session.init(conn.fd, id, server.server_host, server.listener.direct_tls, server.allocator);
@@ -61,6 +63,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
             session.deinit();
             server.allocator.destroy(session);
             server.sessions[id] = null;
+            releaseId(server, id);
             break;
         };
 
@@ -331,9 +334,11 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
     server.smIdMapInsert(session.sm_id[0..session.sm_id_len], id);
     session.sm_detach_time = std.time.timestamp();
 
-    // Remove from kqueue and close the fd
-    changes.removeRead(session.conn.fd) catch {};
-    changes.removeWrite(session.conn.fd) catch {};
+    // Remove from kqueue and close the fd. Purge instead of staging deletes:
+    // close(2) drops the knotes, and a staged delete/add for this number
+    // could otherwise land on a connection that reuses the fd this same
+    // iteration (T238).
+    changes.purgeFd(session.conn.fd);
     session.conn.close();
 
     log.info("session {d} detached for SM resume (id={s}, timeout={d}s)", .{
@@ -385,11 +390,10 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         }
     }
 
-    // Remove from kqueue (closing fd does this implicitly, but be explicit)
-    if (!session.conn.isClosed()) {
-        changes.removeRead(session.conn.fd) catch {};
-        changes.removeWrite(session.conn.fd) catch {};
-    }
+    // Drop any staged kqueue entries for this fd even when already closed:
+    // close(2) drops the kernel-side knotes; the staged ones would hit
+    // whichever connection reuses the fd number in this iteration (T238).
+    changes.purgeFd(session.conn.fd);
 
     session.deinit();
     server.allocator.destroy(session);
@@ -507,6 +511,16 @@ fn allocateId(server: *Server) ?usize {
     if (server.free_count == 0) return null;
     server.free_count -= 1;
     return server.free_ids[server.free_count];
+}
+
+/// Return a session ID allocated by acceptConnections that never became a
+/// session (accept WouldBlock/errors, OOM, changelist-full). Without this
+/// every false wakeup of the level-triggered listener leaked one slot —
+/// under connect bursts the per-worker pool drained in seconds and the
+/// worker stopped accepting entirely ("connection limit reached" flood).
+fn releaseId(server: *Server, id: usize) void {
+    server.free_ids[server.free_count] = id;
+    server.free_count += 1;
 }
 
 // ============================================================================

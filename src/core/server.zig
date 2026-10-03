@@ -854,6 +854,9 @@ pub const Server = struct {
                 ds.getState(self.worker_id).setActive();
             }
 
+            // T238 proof obligation (safe builds): nothing staged may
+            // reference an fd purged by a same-iteration close.
+            changes.assertNoPurgedEntries();
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
 
