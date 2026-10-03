@@ -592,6 +592,13 @@ pub const Server = struct {
     /// Backing storage for mechanism name strings.
     auth_mechanism_name_buf: [256]u8 = undefined,
 
+    /// Wire the backlog allocators once the Server exists (allocator field
+    /// is set during init{,FromFd}).
+    fn bindIpcAllocators(self: *Server) void {
+        self.ipc.alloc = self.allocator;
+        self.s2s_ipc.alloc = self.allocator;
+    }
+
     /// Initialize the server.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
@@ -643,7 +650,7 @@ pub const Server = struct {
         // kern.ipc.soacceptqueue either way.
         const listener = try Listener.init(address, port, false, 4096);
 
-        return Server{
+        var server = Server{
             .loop = loop,
             .listener = listener,
             .sessions = sessions,
@@ -654,6 +661,8 @@ pub const Server = struct {
             .server_host = host,
             .start_time = std.time.timestamp(),
         };
+        server.bindIpcAllocators();
+        return server;
     }
 
     /// Initialize with a pre-bound listener fd (received from master via fd inheritance).
@@ -699,7 +708,7 @@ pub const Server = struct {
 
         const listener = Listener.initFromFd(fd, skip_tls);
 
-        return Server{
+        var server = Server{
             .loop = loop,
             .listener = listener,
             .sessions = sessions,
@@ -710,6 +719,8 @@ pub const Server = struct {
             .server_host = host,
             .start_time = std.time.timestamp(),
         };
+        server.bindIpcAllocators();
+        return server;
     }
 
     /// Connect to the auth daemon IPC socket.
@@ -807,6 +818,8 @@ pub const Server = struct {
         if (self.ssl_ctx) |*ctx| ctx.deinit();
         if (self.ipc.connected) self.ipc.close();
         if (self.s2s_ipc.connected) self.s2s_ipc.close();
+        self.ipc.deinit();
+        self.s2s_ipc.deinit();
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -1789,7 +1802,7 @@ pub const Server = struct {
             },
         }) catch {
             log.err("connection {d} failed to send auth request via IPC", .{session.conn.id});
-            const fail_action = session.stream.saslFailure("not-authorized");
+            const fail_action = session.stream.saslFailure("temporary-auth-failure");
             self.executeAction(session, fail_action);
             return;
         };
@@ -1828,7 +1841,7 @@ pub const Server = struct {
             .payload = decoded,
         } }) catch {
             log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
-            const fail_action = session.stream.saslFailure("not-authorized");
+            const fail_action = session.stream.saslFailure("temporary-auth-failure");
             self.executeAction(session, fail_action);
             return;
         };

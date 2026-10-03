@@ -20,8 +20,10 @@ const log = std.log.scoped(.ipc_client);
 /// IPC receive buffer size — 32KB should handle many concurrent auth exchanges.
 const RECV_BUF_SIZE = 32768;
 
-/// IPC send buffer size — 16KB.
-const SEND_BUF_SIZE = 16384;
+/// Hard cap on unsent frames to the daemon (heap-grown past the old 16 KiB
+/// fixed buffer, which died in bursts: T32 measured ~50 in-flight auth
+/// requests overflowing it and lying "not-authorized" to clients).
+const SEND_CAP: usize = 4 << 20;
 
 pub const IpcClient = struct {
     /// The Unix socket file descriptor (-1 if not connected).
@@ -36,10 +38,11 @@ pub const IpcClient = struct {
     /// borrowed slices remain valid until the caller processes them.
     recv_consumed: usize = 0,
 
-    /// Send buffer.
-    send_buf: [SEND_BUF_SIZE]u8 = undefined,
+    /// Growable send backlog: [0..send_start) consumed, rest unsent.
+    send_list: std.ArrayListUnmanaged(u8) = .{},
     send_start: usize = 0,
-    send_end: usize = 0,
+    /// Backs send_list; set once at construction by the owner (Server).
+    alloc: ?std.mem.Allocator = null,
 
     /// Whether the connection is established.
     connected: bool = false,
@@ -70,7 +73,7 @@ pub const IpcClient = struct {
         self.recv_len = 0;
         self.recv_consumed = 0;
         self.send_start = 0;
-        self.send_end = 0;
+        self.send_list.clearRetainingCapacity();
     }
 
     /// Close the IPC connection.
@@ -83,27 +86,33 @@ pub const IpcClient = struct {
         self.recv_len = 0;
         self.recv_consumed = 0;
         self.send_start = 0;
-        self.send_end = 0;
+        self.send_list.clearRetainingCapacity();
+    }
+
+    /// Free the growable backlog (owner's lifetime ends).
+    pub fn deinit(self: *IpcClient) void {
+        if (self.alloc) |a| self.send_list.deinit(a);
     }
 
     /// Send a message to the auth daemon.
-    /// Encodes the message into the send buffer and attempts to flush.
+    /// Encodes the message into the backlog and attempts to flush.
     pub fn send(self: *IpcClient, msg: protocol.Message) !void {
         if (!self.connected) return error.NotConnected;
+        const alloc = self.alloc orelse return error.NoAllocator;
 
         // Encode into a temporary buffer
         var frame_buf: [4096]u8 = undefined;
         const frame_len = try protocol.encode(msg, &frame_buf);
 
-        // Append to send buffer
-        const space = SEND_BUF_SIZE - self.send_end;
-        if (frame_len > space) {
-            self.compactSendBuf();
-            const space2 = SEND_BUF_SIZE - self.send_end;
-            if (frame_len > space2) return error.SendBufferFull;
+        const unsent = self.send_list.items.len - self.send_start;
+        if (unsent + frame_len > SEND_CAP) return error.SendBufferFull;
+        // Reclaim the consumed prefix before growing.
+        if (self.send_start >= unsent or self.send_start >= 4096) {
+            std.mem.copyForwards(u8, self.send_list.items, self.send_list.items[self.send_start..]);
+            self.send_list.items.len = unsent;
+            self.send_start = 0;
         }
-        @memcpy(self.send_buf[self.send_end .. self.send_end + frame_len], frame_buf[0..frame_len]);
-        self.send_end += frame_len;
+        try self.send_list.appendSlice(alloc, frame_buf[0..frame_len]);
 
         // Try to flush immediately
         _ = self.flush() catch {};
@@ -111,10 +120,10 @@ pub const IpcClient = struct {
 
     /// Flush the send buffer to the socket. Returns bytes written.
     pub fn flush(self: *IpcClient) !usize {
-        if (self.send_start >= self.send_end) return 0;
+        if (self.send_start >= self.send_list.items.len) return 0;
         if (self.fd < 0) return error.NotConnected;
 
-        const data = self.send_buf[self.send_start..self.send_end];
+        const data = self.send_list.items[self.send_start..];
         const n = posix.write(self.fd, data) catch |err| {
             return switch (err) {
                 error.WouldBlock => @as(usize, 0),
@@ -130,16 +139,16 @@ pub const IpcClient = struct {
         };
 
         self.send_start += n;
-        if (self.send_start == self.send_end) {
+        if (self.send_start == self.send_list.items.len) {
             self.send_start = 0;
-            self.send_end = 0;
+            self.send_list.clearRetainingCapacity();
         }
         return n;
     }
 
     /// Returns true if there is unsent data in the send buffer.
     pub fn hasPendingSend(self: *const IpcClient) bool {
-        return self.send_start < self.send_end;
+        return self.send_start < self.send_list.items.len;
     }
 
     /// Read available data from the socket and extract complete messages.
@@ -214,15 +223,6 @@ pub const IpcClient = struct {
         self.recv_consumed = 0;
     }
 
-    fn compactSendBuf(self: *IpcClient) void {
-        if (self.send_start == 0) return;
-        const remaining = self.send_end - self.send_start;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.send_buf[0..remaining], self.send_buf[self.send_start..self.send_end]);
-        }
-        self.send_end = remaining;
-        self.send_start = 0;
-    }
 };
 
 // ============================================================================
@@ -244,6 +244,8 @@ test "IpcClient: send and receive over socketpair" {
     var client = IpcClient{};
     client.fd = fds[0];
     client.connected = true;
+    client.alloc = std.testing.allocator;
+    defer client.deinit();
     defer client.close();
 
     // Send an auth request
@@ -276,6 +278,8 @@ test "IpcClient: receive message from peer" {
     var client = IpcClient{};
     client.fd = fds[0];
     client.connected = true;
+    client.alloc = std.testing.allocator;
+    defer client.deinit();
     defer client.close();
 
     // Peer sends an auth success
@@ -302,6 +306,8 @@ test "IpcClient: nextMessage returns null with partial frame" {
     var client = IpcClient{};
     client.fd = fds[0];
     client.connected = true;
+    client.alloc = std.testing.allocator;
+    defer client.deinit();
     defer client.close();
 
     // Send only a partial frame (just the length header, no payload)

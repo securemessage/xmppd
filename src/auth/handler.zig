@@ -561,6 +561,9 @@ pub fn AuthHandler(comptime Store: type) type {
         fn handleSaslResponse(self: *Self, resp: protocol.SaslResponse) protocol.Message {
             // Find the SCRAM session for this conn_id
             const slot = self.findScramSlot(resp.conn_id) orelse {
+                // No exchange for this conn: aborted, swept as stale, or the
+                // auth_request never arrived. Was completely silent.
+                log.warn("SCRAM final for conn={d} has no exchange (aborted/swept/lost)", .{resp.conn_id});
                 return authFailure(resp.conn_id, "not-authorized");
             };
 
