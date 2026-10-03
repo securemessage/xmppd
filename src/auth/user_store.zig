@@ -101,7 +101,7 @@ pub const UserStore = struct {
         }
 
         const alloc = self.arena.allocator();
-        const creds = sasl.StoredCredentials.generate(password, 4096);
+        const creds = try sasl.StoredCredentials.generate(password, 4096);
 
         try self.entries.append(self.allocator, .{
             .username = try alloc.dupe(u8, username),
@@ -129,7 +129,7 @@ pub const UserStore = struct {
     pub fn changePassword(self: *UserStore, username: []const u8, password: []const u8) !void {
         for (self.entries.items) |*entry| {
             if (std.mem.eql(u8, entry.username, username)) {
-                entry.credentials = sasl.StoredCredentials.generate(password, 4096);
+                entry.credentials = try sasl.StoredCredentials.generate(password, 4096);
                 try self.save();
                 log.info("changed password for: {s}", .{username});
                 return;
@@ -315,7 +315,7 @@ test "UserStore: save and reload" {
         // We can't reverse the hash, but we can derive new creds with the same
         // salt and verify they match
         const salt = creds.salt;
-        const rederived = sasl.StoredCredentials.derive("testpassword", salt, 4096);
+        const rederived = try sasl.StoredCredentials.derive("testpassword", salt, 4096);
         try std.testing.expectEqualSlices(u8, &creds.stored_key, &rederived.stored_key);
         try std.testing.expectEqualSlices(u8, &creds.server_key, &rederived.server_key);
     }

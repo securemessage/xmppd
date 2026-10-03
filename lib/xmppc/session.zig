@@ -183,6 +183,10 @@ pub const Session = struct {
     /// owns the 32 binding bytes for the SASL exchange's lifetime.
     cb_mode: sasl.scram.CbMode = .none,
     cb_data_buf: [32]u8 = undefined,
+    /// OpaqueString-prepped credentials (T-12C2E0C6): SaslClient borrows
+    /// these slices, so they must live on the Session.
+    prep_authcid_buf: [2048]u8 = undefined,
+    prep_password_buf: [2048]u8 = undefined,
     /// True while a SaltedPassword derivation runs on the engine's crypto
     /// worker; the SASL exchange resumes in onSaslDerived.
     sasl_deriving: bool = false,
@@ -950,7 +954,25 @@ pub const Session = struct {
         } else if (saslmod.SaslClient.hashOf(mech) != null and self.cb_mode.isPlus()) {
             opts.cb_mode = .unsupported_by_server;
         }
-        sc.* = saslmod.SaslClient.init(allocator, mech, authcid, self.password, opts) catch {
+        // RFC 8265 OpaqueString prep (T-12C2E0C6): identical to the prep
+        // StoredCredentials.derive applies at credential creation, so NFC /
+        // space-mapped forms of the same password verify. Prep failure
+        // (prohibited input) fails before anything is sent.
+        var prep_cps: [3072]u21 = undefined;
+        var prep_cccs: [3072]u8 = undefined;
+        const prepped_cid = sasl.stringprep.prepareOpaqueString(authcid, &self.prep_authcid_buf, &prep_cps, &prep_cccs) catch {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        };
+        if (self.password.len > self.prep_password_buf.len / 2) {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        }
+        const prepped_pw = sasl.stringprep.prepareOpaqueString(self.password, &self.prep_password_buf, &prep_cps, &prep_cccs) catch {
+            allocator.destroy(sc);
+            return error.SaslInitFailed;
+        };
+        sc.* = saslmod.SaslClient.init(allocator, mech, prepped_cid, prepped_pw, opts) catch {
             allocator.destroy(sc);
             return error.SaslInitFailed;
         };

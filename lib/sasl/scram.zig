@@ -1,4 +1,5 @@
 const std = @import("std");
+const stringprep = @import("stringprep.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -84,10 +85,18 @@ pub const StoredCredentials = struct {
 
     /// Derive stored credentials from a plaintext password.
     /// This should be called once at user creation/password change time.
-    pub fn derive(password: []const u8, salt: [32]u8, iteration_count: u32) StoredCredentials {
+    /// The password is prepped (RFC 8265 OpaqueString) internally so every
+    /// credential-creation path (user store, xmppctl, tests) is identical;
+    /// the client applies the same prep before Hi().
+    pub fn derive(password: []const u8, salt: [32]u8, iteration_count: u32) stringprep.PrepError!StoredCredentials {
         // SaltedPassword := Hi(Normalize(password), salt, i)
+        var prep_buf: [2048]u8 = undefined;
+        var prep_cps: [3072]u21 = undefined;
+        var prep_cccs: [3072]u8 = undefined;
+        if (password.len > prep_buf.len / 2) return error.NoSpaceLeft;
+        const prepped = try stringprep.prepareOpaqueString(password, &prep_buf, &prep_cps, &prep_cccs);
         var salted_password: [32]u8 = undefined;
-        pbkdf2(password, &salt, iteration_count, &salted_password);
+        pbkdf2(prepped, &salt, iteration_count, &salted_password);
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
@@ -110,7 +119,7 @@ pub const StoredCredentials = struct {
     }
 
     /// Generate random salt and derive credentials.
-    pub fn generate(password: []const u8, iteration_count: u32) StoredCredentials {
+    pub fn generate(password: []const u8, iteration_count: u32) stringprep.PrepError!StoredCredentials {
         var salt: [32]u8 = undefined;
         std.crypto.random.bytes(&salt);
         return derive(password, salt, iteration_count);
@@ -183,11 +192,14 @@ pub const ScramServer = struct {
 
         self.client_first_bare = try alloc.dupe(u8, bare);
 
-        // Parse n=username
+        // Parse n=username (wire form carries RFC 5802 §5.1 escaping;
+        // client_first_bare above keeps the raw bytes for AuthMessage).
         if (!std.mem.startsWith(u8, bare, "n=")) return error.InvalidMessage;
         const after_n = bare[2..];
         const comma_pos = std.mem.indexOfScalar(u8, after_n, ',') orelse return error.InvalidMessage;
-        self.username = try alloc.dupe(u8, after_n[0..comma_pos]);
+        const raw_name = after_n[0..comma_pos];
+        const name_buf = try alloc.alloc(u8, raw_name.len);
+        self.username = stringprep.unescapeScramName(raw_name, name_buf) catch return error.InvalidMessage;
 
         // Parse r=client-nonce
         const after_comma = after_n[comma_pos + 1 ..];
@@ -443,7 +455,8 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             self.arena.deinit();
         }
 
-        /// Generate client-first-message.
+        /// Generate client-first-message. The username is expected prepped
+        /// by the caller; RFC 5802 §5.1 escaping of '=' and ',' is applied.
         pub fn clientFirst(self: *Self) ![]const u8 {
             const alloc = self.arena.allocator();
             // Test/caller seam: a preset nonce (RFC vector tests) is used as-is.
@@ -452,7 +465,9 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             }
 
             // client-first-message-bare: n=username,r=nonce
-            self.client_first_bare = try std.fmt.allocPrint(alloc, "n={s},r={s}", .{ self.username, self.client_nonce_b64 });
+            const name_buf = try alloc.alloc(u8, self.username.len * 3);
+            const name = try stringprep.escapeScramName(self.username, name_buf);
+            self.client_first_bare = try std.fmt.allocPrint(alloc, "n={s},r={s}", .{ name, self.client_nonce_b64 });
 
             self.state = .awaiting_server_first;
 
@@ -699,8 +714,8 @@ fn base64Decode(input: []const u8, output: []u8) !void {
 
 test "StoredCredentials derivation is deterministic" {
     const salt = [_]u8{0x01} ** 32;
-    const creds1 = StoredCredentials.derive("password123", salt, 4096);
-    const creds2 = StoredCredentials.derive("password123", salt, 4096);
+    const creds1 = try StoredCredentials.derive("password123", salt, 4096);
+    const creds2 = try StoredCredentials.derive("password123", salt, 4096);
 
     try std.testing.expectEqualSlices(u8, &creds1.stored_key, &creds2.stored_key);
     try std.testing.expectEqualSlices(u8, &creds1.server_key, &creds2.server_key);
@@ -708,10 +723,49 @@ test "StoredCredentials derivation is deterministic" {
 
 test "StoredCredentials different passwords produce different keys" {
     const salt = [_]u8{0x42} ** 32;
-    const creds1 = StoredCredentials.derive("password1", salt, 4096);
-    const creds2 = StoredCredentials.derive("password2", salt, 4096);
+    const creds1 = try StoredCredentials.derive("password1", salt, 4096);
+    const creds2 = try StoredCredentials.derive("password2", salt, 4096);
 
     try std.testing.expect(!std.mem.eql(u8, &creds1.stored_key, &creds2.stored_key));
+}
+
+test "StoredCredentials: NFC and NFD forms of one password derive identically (T-12C2E0C6)" {
+    const salt = [_]u8{0x07} ** 32;
+    // "päss" precomposed (NFC) vs decomposed "pa" + U+0308 (NFD).
+    const creds_nfc = try StoredCredentials.derive("p\xC3\xA4ss", salt, 4096);
+    const creds_nfd = try StoredCredentials.derive("pa\xCC\x88ss", salt, 4096);
+    try std.testing.expectEqualSlices(u8, &creds_nfc.stored_key, &creds_nfd.stored_key);
+    try std.testing.expectEqualSlices(u8, &creds_nfc.server_key, &creds_nfd.server_key);
+}
+
+test "StoredCredentials: non-ASCII space in password maps to U+0020 (T-12C2E0C6)" {
+    const salt = [_]u8{0x08} ** 32;
+    const creds_nbsp = try StoredCredentials.derive("pass\xC2\xA0word", salt, 4096); // U+00A0
+    const creds_sp = try StoredCredentials.derive("pass word", salt, 4096);
+    try std.testing.expectEqualSlices(u8, &creds_nbsp.stored_key, &creds_sp.stored_key);
+}
+
+test "StoredCredentials: prohibited password is rejected (T-12C2E0C6)" {
+    const salt = [_]u8{0x09} ** 32;
+    try std.testing.expectError(error.ProhibitedCharacter, StoredCredentials.derive("pa\xEE\x80\x80ss", salt, 4096)); // U+E000
+    try std.testing.expectError(error.ProhibitedCharacter, StoredCredentials.derive("pa\x00ss", salt, 4096)); // NUL
+}
+
+test "SCRAM client escapes '=' and ',' in n= (RFC 5802 5.1)" {
+    const allocator = std.testing.allocator;
+    var client = ScramClient.init(allocator, "us,er=na", "pencil");
+    defer client.deinit();
+    const first = try client.clientFirst();
+    try std.testing.expect(std.mem.startsWith(u8, first, "n,,n=us=2Cer=3Dna,r="));
+}
+
+test "SCRAM server unescapes n= but keeps wire bytes in AuthMessage" {
+    const allocator = std.testing.allocator;
+    var server = ScramServer.init(allocator);
+    defer server.deinit();
+    const username = try server.handleClientFirst("n,,n=us=2Cer=3Dna,r=clientnonce0001");
+    try std.testing.expectEqualStrings("us,er=na", username);
+    try std.testing.expectEqualStrings("n=us=2Cer=3Dna,r=clientnonce0001", server.client_first_bare);
 }
 
 test "SCRAM-SHA-256 full exchange" {
@@ -719,7 +773,7 @@ test "SCRAM-SHA-256 full exchange" {
 
     // Server has stored credentials for "testuser"
     const salt = [_]u8{0xAB} ** 32;
-    const creds = StoredCredentials.derive("testpassword", salt, 4096);
+    const creds = try StoredCredentials.derive("testpassword", salt, 4096);
 
     // Client initiates
     var client = ScramClient.init(allocator, "testuser", "testpassword");
@@ -754,7 +808,7 @@ test "SCRAM-SHA-256 wrong password fails" {
     const allocator = std.testing.allocator;
 
     const salt = [_]u8{0xCD} ** 32;
-    const creds = StoredCredentials.derive("correct_password", salt, 4096);
+    const creds = try StoredCredentials.derive("correct_password", salt, 4096);
 
     // Client uses wrong password
     var client = ScramClient.init(allocator, "user", "wrong_password");
@@ -781,7 +835,7 @@ test "SCRAM-SHA-256 wrong password fails" {
 /// returning the genuine server-final for tamper tests.
 fn exchangeToServerFinal(client: *ScramClient, server: *ScramServer) ![]const u8 {
     const salt = [_]u8{0x5A} ** 32;
-    const creds = StoredCredentials.derive("pw", salt, 4096);
+    const creds = try StoredCredentials.derive("pw", salt, 4096);
     _ = try server.handleClientFirst(try client.clientFirst());
     server.setCredentials(creds);
     const client_final = try client.handleServerFirst(try server.serverFirst());
@@ -920,7 +974,7 @@ test "StoredCredentials.derive is standard PBKDF2-HMAC-SHA-256 (RFC 5802)" {
     // the RFC 5802 ClientKey/StoredKey/ServerKey chain, salt = 0x00..0x1f.
     var salt: [32]u8 = undefined;
     for (&salt, 0..) |*b, i| b.* = @intCast(i);
-    const creds = StoredCredentials.derive("correct horse battery staple", salt, 4096);
+    const creds = try StoredCredentials.derive("correct horse battery staple", salt, 4096);
     const expected_stored = [_]u8{ 0x4d, 0x67, 0xd5, 0xaf, 0xef, 0xa4, 0xbb, 0x81, 0x14, 0x34, 0x80, 0xc0, 0x8a, 0xdb, 0x72, 0xa2, 0x14, 0xb8, 0x6c, 0xbb, 0x6d, 0xe0, 0xae, 0x28, 0x84, 0x13, 0x70, 0x25, 0xf0, 0x7b, 0xf3, 0xc0 };
     const expected_server = [_]u8{ 0x0b, 0x1d, 0xf9, 0x1b, 0xf0, 0xa5, 0x4d, 0xa6, 0x44, 0xca, 0xc0, 0x11, 0x8b, 0x44, 0xbb, 0x34, 0xac, 0xdc, 0x3e, 0x84, 0xbc, 0x32, 0x80, 0xa0, 0xa9, 0x97, 0xa5, 0xc3, 0xb6, 0x2f, 0x8c, 0x53 };
     try std.testing.expectEqualSlices(u8, &expected_stored, &creds.stored_key);

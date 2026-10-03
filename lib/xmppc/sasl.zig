@@ -240,7 +240,7 @@ test "SCRAM client initial is well-formed" {
 test "SCRAM full exchange against the server verifies" {
     const alloc = std.testing.allocator;
     const salt = [_]u8{0xAB} ** 32;
-    const creds = sasl.StoredCredentials.derive("secret", salt, 4096);
+    const creds = try sasl.StoredCredentials.derive("secret", salt, 4096);
 
     var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "secret", .{});
     defer client.deinit();
@@ -264,7 +264,7 @@ test "SCRAM full exchange against the server verifies" {
 test "SCRAM wrong password fails at the server" {
     const alloc = std.testing.allocator;
     const salt = [_]u8{0xCD} ** 32;
-    const creds = sasl.StoredCredentials.derive("correct", salt, 4096);
+    const creds = try sasl.StoredCredentials.derive("correct", salt, 4096);
 
     var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "wrong", .{});
     defer client.deinit();
@@ -283,7 +283,7 @@ test "SCRAM wrong password fails at the server" {
 test "SCRAM: <success> without server-final is rejected" {
     const alloc = std.testing.allocator;
     const salt = [_]u8{0xAB} ** 32;
-    const creds = sasl.StoredCredentials.derive("secret", salt, 4096);
+    const creds = try sasl.StoredCredentials.derive("secret", salt, 4096);
 
     var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "secret", .{});
     defer client.deinit();
@@ -301,7 +301,7 @@ test "SCRAM: <success> without server-final is rejected" {
 test "SCRAM: server-final delivered as a challenge, then empty <success>" {
     const alloc = std.testing.allocator;
     const salt = [_]u8{0xAB} ** 32;
-    const creds = sasl.StoredCredentials.derive("secret", salt, 4096);
+    const creds = try sasl.StoredCredentials.derive("secret", salt, 4096);
 
     var client = try SaslClient.init(alloc, "SCRAM-SHA-256", "alice", "secret", .{});
     defer client.deinit();

@@ -419,7 +419,7 @@ fn scriptScramHappy(rig: *Rig, server: *sasl_mod.ScramServer) !void {
     try rig.send(scram_features);
     const cf_raw = try b64DecodeAlloc(try rig.takeElementBody("auth", 3000));
     _ = try server.handleClientFirst(cf_raw);
-    server.setCredentials(sasl_mod.StoredCredentials.derive("pass1", SCRAM_TEST_SALT, 4096));
+    server.setCredentials(try sasl_mod.StoredCredentials.derive("pass1", SCRAM_TEST_SALT, 4096));
     const sf_b64 = try b64EncodeAlloc(try server.serverFirst());
     try rig.send(try std.fmt.allocPrint(std.heap.page_allocator, "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</challenge>", .{sf_b64}));
     // The client derives Hi() off the kqueue thread here.

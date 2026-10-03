@@ -1,6 +1,7 @@
 const std = @import("std");
 pub const scram = @import("scram.zig");
 pub const plain = @import("plain.zig");
+pub const stringprep = @import("stringprep.zig");
 
 pub const ScramServer = scram.ScramServer;
 pub const ScramClient = scram.ScramClient;
