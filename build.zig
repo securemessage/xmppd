@@ -136,6 +136,24 @@ pub fn build(b: *std.Build) void {
     const memprobe_step = b.step("xmppc-memprobe", "Build the xmppc per-session memory probe");
     memprobe_step.dependOn(&memprobe_install.step);
 
+    // xmppc-load: T32 load driver — N sessions on one engine loop against a
+    // live rig, reporting the T222/T-BC27B154 gate metrics (conn/s, login/s,
+    // bytes/session, max loop-iteration stall, RSS/session).
+    const load_mod = b.createModule(.{
+        .root_source_file = b.path("test/xmppc/load.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    load_mod.addImport("xmppc", xmppc_mod);
+    const load_exe = b.addExecutable(.{
+        .name = "xmppc-load",
+        .root_module = load_mod,
+    });
+    const load_install = b.addInstallArtifact(load_exe, .{});
+    const load_step = b.step("xmppc-load", "Build the xmppc load driver (zig-out/bin/xmppc-load)");
+    load_step.dependOn(&load_install.step);
+
     // --- Tests ---
 
     const xml_test_mod = b.createModule(.{

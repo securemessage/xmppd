@@ -112,6 +112,106 @@ pub const Engine = struct {
     };
 
     const SCRAM_CACHE_MAX = 128;
+
+    /// Driver-facing cumulative counters (T32 load-driver). Written ONLY on
+    /// the engine thread; atomic so a consumer thread may statsSnapshot()
+    /// mid-run without a lock.
+    pub const Stats = struct {
+        /// TCP connect()s that completed with SO_ERROR == 0.
+        connects_completed: std.atomic.Value(u64) = .init(0),
+        /// Sessions that reached .established (bind + SM done, or resumed).
+        sessions_established: std.atomic.Value(u64) = .init(0),
+        /// Transport bytes read/written (application path; the TLS
+        /// handshake's own wire bytes are not included).
+        bytes_rx: std.atomic.Value(u64) = .init(0),
+        bytes_tx: std.atomic.Value(u64) = .init(0),
+        /// Longest single loopOnce processing time in µs — everything the
+        /// iteration does (drains + event dispatch) excluding the kevent
+        /// wait itself. The event-loop stall metric.
+        max_iter_us: std.atomic.Value(u64) = .init(0),
+        /// ns epoch of the first/last completed connect / establishment
+        /// (0 = none yet) for driver-side rate computation.
+        first_connect_ns: std.atomic.Value(u64) = .init(0),
+        last_connect_ns: std.atomic.Value(u64) = .init(0),
+        first_established_ns: std.atomic.Value(u64) = .init(0),
+        last_established_ns: std.atomic.Value(u64) = .init(0),
+    };
+
+    /// Plain (non-atomic) copy returned by statsSnapshot().
+    pub const StatsFlat = struct {
+        connects_completed: u64 = 0,
+        sessions_established: u64 = 0,
+        bytes_rx: u64 = 0,
+        bytes_tx: u64 = 0,
+        max_iter_us: u64 = 0,
+        first_connect_ns: u64 = 0,
+        last_connect_ns: u64 = 0,
+        first_established_ns: u64 = 0,
+        last_established_ns: u64 = 0,
+    };
+
+    pub fn statsSnapshot(self: *Engine) StatsFlat {
+        return .{
+            .connects_completed = self.stats.connects_completed.load(.monotonic),
+            .sessions_established = self.stats.sessions_established.load(.monotonic),
+            .bytes_rx = self.stats.bytes_rx.load(.monotonic),
+            .bytes_tx = self.stats.bytes_tx.load(.monotonic),
+            .max_iter_us = self.stats.max_iter_us.load(.monotonic),
+            .first_connect_ns = self.stats.first_connect_ns.load(.monotonic),
+            .last_connect_ns = self.stats.last_connect_ns.load(.monotonic),
+            .first_established_ns = self.stats.first_established_ns.load(.monotonic),
+            .last_established_ns = self.stats.last_established_ns.load(.monotonic),
+        };
+    }
+
+    pub fn statsReset(self: *Engine) void {
+        self.stats.connects_completed.store(0, .monotonic);
+        self.stats.sessions_established.store(0, .monotonic);
+        self.stats.bytes_rx.store(0, .monotonic);
+        self.stats.bytes_tx.store(0, .monotonic);
+        self.stats.max_iter_us.store(0, .monotonic);
+        self.stats.first_connect_ns.store(0, .monotonic);
+        self.stats.last_connect_ns.store(0, .monotonic);
+        self.stats.first_established_ns.store(0, .monotonic);
+        self.stats.last_established_ns.store(0, .monotonic);
+    }
+
+    fn nowNs() u64 {
+        return @intCast(@max(0, std.time.nanoTimestamp()));
+    }
+
+    // --- engine-thread hooks (Sessions call these) ---
+
+    pub fn noteConnect(self: *Engine) void {
+        const now = nowNs();
+        _ = self.stats.connects_completed.fetchAdd(1, .monotonic);
+        if (self.stats.first_connect_ns.load(.monotonic) == 0)
+            self.stats.first_connect_ns.store(now, .monotonic);
+        self.stats.last_connect_ns.store(now, .monotonic);
+    }
+
+    pub fn noteEstablished(self: *Engine) void {
+        const now = nowNs();
+        _ = self.stats.sessions_established.fetchAdd(1, .monotonic);
+        if (self.stats.first_established_ns.load(.monotonic) == 0)
+            self.stats.first_established_ns.store(now, .monotonic);
+        self.stats.last_established_ns.store(now, .monotonic);
+    }
+
+    pub fn noteRx(self: *Engine, n: usize) void {
+        _ = self.stats.bytes_rx.fetchAdd(@intCast(n), .monotonic);
+    }
+
+    pub fn noteTx(self: *Engine, n: usize) void {
+        _ = self.stats.bytes_tx.fetchAdd(@intCast(n), .monotonic);
+    }
+
+    fn noteIterUs(self: *Engine, us: u64) void {
+        // Single writer (engine thread): read-modify-write is race-free here.
+        if (us > self.stats.max_iter_us.load(.monotonic))
+            self.stats.max_iter_us.store(us, .monotonic);
+    }
+
     const DeriveJob = struct {
         handle: Handle,
         /// Owned copies: the session (and its caller-owned strings) may die
@@ -194,6 +294,10 @@ pub const Engine = struct {
     crypto_done_len: usize = 0,
     crypto_thread: ?std.Thread = null,
     crypto_stop: bool = false,
+
+    /// Driver-facing cumulative counters (T32). Written only on the engine
+    /// thread through the note*() helpers; read via statsSnapshot().
+    stats: Stats = .{},
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
@@ -681,6 +785,7 @@ pub const Engine = struct {
     }
 
     fn loopOnce(self: *Engine) !void {
+        const t_iter_start = std.time.nanoTimestamp();
         // Drain the self-pipe first: a wake is a "re-examine" request, not
         // data. The read end is non-blocking, so this terminates on EAGAIN.
         if (self.wake_pipe[0] >= 0) {
@@ -705,9 +810,11 @@ pub const Engine = struct {
         self.changes.items.len -= staged_count;
         self.changes_lock.unlock();
 
+        const t_wait_start = std.time.nanoTimestamp();
         const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, null) catch {
             return error.SystemResources;
         };
+        const t_wait_end = std.time.nanoTimestamp();
         if (std.posix.getenv("XMPPC_EVTRACE") != null) {
             std.debug.print("[engine] staged={d} returned={d}\n", .{ staged_count, n });
             for (evbuf[0..n]) |ev| std.debug.print("  ev fd={d} filter={d} flags=0x{x} reg={} wan=\n", .{ ev.ident, ev.filter, ev.flags, ev.udata });
@@ -741,6 +848,11 @@ pub const Engine = struct {
                 s.fail(self.allocator, "socket-error");
             }
         }
+        // Stall bookkeeping: everything EXCEPT the kevent wait counts —
+        // drains at the top plus event dispatch below it.
+        const t_done = std.time.nanoTimestamp();
+        const work_ns = (t_wait_start - t_iter_start) + (t_done - t_wait_end);
+        self.noteIterUs(@intCast(@max(0, @divTrunc(work_ns, 1000))));
     }
 
     /// Destroy + release dead sessions. Slots stay; generations advance.

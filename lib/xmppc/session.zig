@@ -385,6 +385,7 @@ pub const Session = struct {
             };
             if (n == 0) break;
             self.read_len += n;
+            engine.noteRx(n);
             // Drain whatever is immediately available, then parse.
             if (space - n == 0) continue; // buffer full; loop grows it
         }
@@ -646,6 +647,7 @@ pub const Session = struct {
             // re-ran this branch and staged duplicate EV_DELETEs — with a
             // changelist those surface as spurious EV_ERROR events).
             self.phase = .connected;
+            engine.noteConnect();
             const action = self.fsm.openStream();
             self.handleAction(engine, action);
             self.disarmWrite(engine);
@@ -722,6 +724,7 @@ pub const Session = struct {
     fn consumeWritten(self: *Session, n: usize) !void {
         if (self.tport) |*tp| tp.writeCompleted(n);
         self.write_start += n;
+        self.engine.noteTx(n);
         if (self.write_start == self.write_len) {
             self.write_start = 0;
             self.write_len = 0;
@@ -796,6 +799,7 @@ pub const Session = struct {
         switch (action) {
             .established => {
                 self.phase = .established;
+                engine.noteEstablished();
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
                 // per-stanza arena reset later frees; consumers hold these
