@@ -123,7 +123,11 @@ pub const S2sStream = struct {
     role: Role,
     state: S2sStreamState = .awaiting_stream_open,
     local_domain: []const u8,
-    remote_domain: []const u8 = "",
+    /// Remote domain — COPIED on assignment: the incoming slice lives in the
+    /// reader arena and dies at every reader.reset() (stream restart after
+    /// TLS/SASL). The restart reply's to= reads this buffer (T221).
+    remote_domain_buf: [256]u8 = undefined,
+    remote_domain_len: u16 = 0,
     stream_id: []const u8 = "",
 
     /// Whether DANE verification succeeded on the TLS connection.
@@ -149,16 +153,16 @@ pub const S2sStream = struct {
             .awaiting_stream_open => {
                 if (self.role == .receiving) {
                     // Inbound connection — remote tells us who they are
-                    self.remote_domain = from;
+                    self.setRemoteDomain(from);
                     self.state = .features_tls;
                     return .{ .send_stream_open = .{
                         .from = self.local_domain,
-                        .to = from,
+                        .to = self.remoteDomain(),
                         .id = "s2s-placeholder-id",
                     } };
                 } else {
                     // Outbound — we receive the remote's stream open reply
-                    self.remote_domain = from;
+                    self.setRemoteDomain(from);
                     // Wait for features
                     return .none;
                 }
@@ -174,7 +178,7 @@ pub const S2sStream = struct {
                     }
                     return .{ .send_stream_open = .{
                         .from = self.local_domain,
-                        .to = self.remote_domain,
+                        .to = self.remoteDomain(),
                         .id = "s2s-placeholder-id",
                     } };
                 } else {
@@ -253,6 +257,18 @@ pub const S2sStream = struct {
     }
 
     /// Whether the stream is in established state (ready for stanzas).
+    /// Get the remote domain (copied on assignment from the stream-open
+    /// `from`; safe across reader resets).
+    pub fn remoteDomain(self: *const S2sStream) []const u8 {
+        return self.remote_domain_buf[0..self.remote_domain_len];
+    }
+
+    fn setRemoteDomain(self: *S2sStream, domain: []const u8) void {
+        const n = @min(domain.len, self.remote_domain_buf.len);
+        @memcpy(self.remote_domain_buf[0..n], domain[0..n]);
+        self.remote_domain_len = @intCast(n);
+    }
+
     pub fn isEstablished(self: *const S2sStream) bool {
         return self.state == .established;
     }
@@ -281,7 +297,7 @@ test "S2sStream: receiving role — full lifecycle" {
         else => return error.UnexpectedAction,
     }
     try std.testing.expectEqual(S2sStreamState.features_tls, s.state);
-    try std.testing.expectEqualStrings("b.example", s.remote_domain);
+    try std.testing.expectEqualStrings("b.example", s.remoteDomain());
 
     // Features should require TLS
     const features = s.getFeatures() orelse return error.NoFeatures;
