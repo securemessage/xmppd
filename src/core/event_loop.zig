@@ -651,19 +651,9 @@ pub const EventLoop = struct {
 
         const timeout_ptr: ?*const posix.timespec = if (timeout) |*t| t else null;
 
-        const count = posix.kevent(self.kq, changelist, self.event_buf, timeout_ptr) catch |err| {
-            // T32: crash-context log — which errno, how many changes staged.
-            std.log.scoped(.xmppd).err("submitAndPoll kevent failed: err={} staged={d}", .{ err, changelist.len });
-            if (changelist.len > 0) {
-                const e = changelist[changelist.len - 1];
-                std.log.scoped(.xmppd).err("last change: ident={d} filter={d} flags=0x{x} udata={d}", .{ e.ident, e.filter, e.flags, e.udata });
-            }
+        const count = self.keventHardened(changelist, timeout_ptr) catch |err| {
             return switch (err) {
-                error.EventNotFound => error.SystemResources,
-                error.AccessDenied => error.SystemResources,
-                error.ProcessNotFound => error.SystemResources,
                 error.SystemResources => error.SystemResources,
-                error.Overflow => error.SystemResources,
             };
         };
 
@@ -678,6 +668,78 @@ pub const EventLoop = struct {
     // ========================================================================
     // Private helpers
     // ========================================================================
+
+    /// kevent() with mass-churn hardening (T32). Zig's posix.kevent treats
+    /// EBADF/ENOENT-style per-changentry failures as `unreachable` — but
+    /// under a close storm, entries for just-closed fds are exactly what a
+    /// batched changelist legitimately contains (closing an fd drops its
+    /// knotes; a stale EV_ADD/EV_DELETE referencing it then hard-fails the
+    /// WHOLE call, crashing the worker). Isolate instead: on failure, walk
+    /// the changelist entry-by-entry so one stale entry cannot poison the
+    /// batch, then re-poll for events.
+    fn keventHardened(
+        self: *EventLoop,
+        changes: []const posix.Kevent,
+        timeout_ptr: ?*const posix.timespec,
+    ) !usize {
+        var changelist = changes;
+        while (true) {
+            const rc = std.c.kevent(
+                self.kq,
+                changelist.ptr,
+                @intCast(changelist.len),
+                self.event_buf.ptr,
+                @intCast(self.event_buf.len),
+                timeout_ptr,
+            );
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .NOMEM => return error.SystemResources,
+                .BADF, .NOENT, .INVAL => {
+                    // Stale-entry class: replay entries one by one so only
+                    // the dead-fd operations are dropped.
+                    logChangeFailure("batch", null, rc);
+                    var isolated: usize = 0;
+                    var none_ptr: [0]posix.Kevent = undefined;
+                    for (changelist) |ch| {
+                        const one = [_]posix.Kevent{ch};
+                        const r1 = std.c.kevent(self.kq, &one, 1, &none_ptr, 0, null);
+                        if (posix.errno(r1) != .SUCCESS) {
+                            isolated += 1;
+                            logChangeFailure("isolated", ch, r1);
+                        }
+                    }
+                    if (isolated > 0) {
+                        std.log.scoped(.xmppd).warn(
+                            "kevent changelist: dropped {d}/{d} stale entries (fd already closed)",
+                            .{ isolated, changelist.len },
+                        );
+                    }
+                    // Re-poll with an empty changelist for the actual events.
+                    changelist = &.{};
+                    continue;
+                },
+                else => return error.SystemResources,
+            }
+        }
+    }
+
+    fn logChangeFailure(kind: []const u8, ch: ?posix.Kevent, rc: isize) void {
+        if (ch) |c| {
+            std.log.scoped(.xmppd).warn(
+                "kevent change failed ({s}): ident={d} filter={d} flags=0x{x} errno={d}",
+                .{ kind, c.ident, c.filter, c.flags, rerrno(rc) },
+            );
+        } else {
+            std.log.scoped(.xmppd).warn("kevent changelist failed ({s}): errno={d}", .{ kind, rerrno(rc) });
+        }
+    }
+
+    fn rerrno(rc: isize) i32 {
+        const e = posix.errno(rc);
+        return @intFromEnum(e);
+    }
 
     fn translateKevent(kev: posix.Kevent) Event {
         // Check for errors first
@@ -781,6 +843,33 @@ test "EventLoop: init and deinit" {
 
     // kqueue fd should be valid
     try std.testing.expect(loop.kq >= 0);
+}
+
+test "EventLoop: submitAndPoll isolates stale-fd changelist entries (T32 churn)" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Poison the batch: one valid registration + one EV_DELETE on an fd that
+    // is not (and never was) registered. FreeBSD reports the stale entry in
+    // the EVENTLIST as EV_ERROR; if the whole call errors, keventHardened
+    // replays entries individually and drops only the culprit. Either way
+    // the valid registration must survive and the call must not fail.
+    var changes: [2]posix.Kevent = .{
+        .{ .ident = @intCast(pipe_fds[0]), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0xBEEF },
+        .{ .ident = 999999, .filter = std.c.EVFILT.READ, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
+    };
+    _ = try loop.submitAndPoll(&changes, null);
+
+    _ = try posix.write(pipe_fds[1], "x");
+    const events = try loop.poll(500);
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expect(events[0] == .fd_readable);
+    try std.testing.expectEqual(pipe_fds[0], events[0].fd_readable.fd);
+    try std.testing.expectEqual(@as(usize, 0xBEEF), events[0].fd_readable.udata);
 }
 
 test "EventLoop: fd_readable fires on pipe write" {

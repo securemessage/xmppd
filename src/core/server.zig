@@ -637,7 +637,11 @@ pub const Server = struct {
             l.deinit();
         }
 
-        const listener = try Listener.init(address, port, false, 128);
+        // Backlog sized for connect bursts (T32 load driver): 128 overflowed
+        // the syncache at a few hundred connects/sec while the worker loop is
+        // busy in serial TLS handshakes. listen(2) clamps to
+        // kern.ipc.soacceptqueue either way.
+        const listener = try Listener.init(address, port, false, 4096);
 
         return Server{
             .loop = loop,
@@ -1841,16 +1845,16 @@ pub const Server = struct {
     // ========================================================================
 
     fn handleIpcReadable(self: *Server, changes: *ChangeList) void {
-        _ = self.ipc.recv() catch {
-            log.err("auth daemon IPC recv error", .{});
+        _ = self.ipc.recv() catch |err| {
+            log.err("auth daemon IPC recv error: {}", .{err});
             self.ipc.close();
             return;
         };
 
         // Process all complete messages
         while (true) {
-            const msg = self.ipc.nextMessage() catch {
-                log.err("auth daemon IPC decode error", .{});
+            const msg = self.ipc.nextMessage() catch |err| {
+                log.err("auth daemon IPC decode error: {} len={d} consumed={d}", .{ err, self.ipc.recv_len, self.ipc.recv_consumed });
                 break;
             };
             if (msg == null) break;

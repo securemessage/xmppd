@@ -770,7 +770,10 @@ fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !pos
         };
     };
 
-    posix.listen(fd, 128) catch return error.SystemResources;
+    // Backlog sized for connect bursts (T32): 128 overflowed the box's
+    // syncache at only a few hundred connects/sec while workers churn
+    // handshakes. Clamped by kern.ipc.soacceptqueue.
+    posix.listen(fd, 4096) catch return error.SystemResources;
     return fd;
 }
 

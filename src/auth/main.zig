@@ -384,8 +384,10 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
     defer updateReadBackpressure(ipc, batch, slot, read_paused);
     const conn = ipc.getClient(slot) orelse return;
 
-    const n = conn.recv() catch {
+    const n = conn.recv() catch |err| {
+        log.err("IPC client {d} recv error: {} — closing", .{ slot, err });
         ipc.closeClient(slot);
+        read_paused[slot] = false;
         return;
     };
 
