@@ -228,6 +228,9 @@ pub const Engine = struct {
 
     kq: posix.fd_t,
     allocator: std.mem.Allocator,
+    /// XMPPC_EVTRACE snapshot taken at init — getenv() walks the whole
+    /// environment, far too expensive per event/flush on the engine thread.
+    trace: bool,
     slots: std.ArrayListUnmanaged(Slot),
     free_slots: std.ArrayListUnmanaged(u32),
     live_count: usize = 0,
@@ -307,7 +310,13 @@ pub const Engine = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
-        return .{ .kq = kq, .allocator = allocator, .slots = .{}, .free_slots = .{} };
+        return .{
+            .kq = kq,
+            .allocator = allocator,
+            .slots = .{},
+            .free_slots = .{},
+            .trace = std.posix.getenv("XMPPC_EVTRACE") != null,
+        };
     }
 
     pub fn deinit(self: *Engine) void {
@@ -818,6 +827,12 @@ pub const Engine = struct {
         self.changes_lock.lock();
         const staged_count = @min(self.changes.items.len, staged.len);
         @memcpy(staged[0..staged_count], self.changes.items[0..staged_count]);
+        // Compact the tail: `len -= n` alone discards everything past slot
+        // 64 (the leftover entries sit at HIGHER indices; the shortened
+        // array then exposes the already-consumed head as valid and the
+        // tail is dropped — observed under burst load as lost EV_DELETEs
+        // and a level-triggered WRITE livelock at ~32 sessions).
+        std.mem.copyForwards(Change, self.changes.items, self.changes.items[staged_count..]);
         self.changes.items.len -= staged_count;
         self.changes_lock.unlock();
 
@@ -826,7 +841,7 @@ pub const Engine = struct {
             return error.SystemResources;
         };
         const t_wait_end = std.time.nanoTimestamp();
-        if (std.posix.getenv("XMPPC_EVTRACE") != null) {
+        if (self.trace) {
             std.debug.print("[engine] staged={d} returned={d}\n", .{ staged_count, n });
             for (evbuf[0..n]) |ev| std.debug.print("  ev fd={d} filter={d} flags=0x{x} reg={} wan=\n", .{ ev.ident, ev.filter, ev.flags, ev.udata });
         }

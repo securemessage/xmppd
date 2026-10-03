@@ -603,7 +603,7 @@ pub const Session = struct {
     }
 
     fn handleServerEvent(self: *Session, engine: *Engine, ev: stream.ServerEvent) void {
-        if (std.posix.getenv("XMPPC_EVTRACE") != null)
+        if (engine.trace)
             std.debug.print("[fsm {s} ev={s}]\n", .{ @tagName(self.fsm.state), @tagName(ev) });
         if (ev == .sasl_success) {
             if (self.sasl) |sc| {
@@ -696,7 +696,7 @@ pub const Session = struct {
     }
 
     fn flushWrites(self: *Session, engine: *Engine) void {
-        const trace = std.posix.getenv("XMPPC_EVTRACE") != null;
+        const trace = engine.trace;
         while (self.write_start < self.write_len) {
             // sendSome returns 0 only for would-block / TLS WANT_*; any error
             // is fatal (a swallowed TLS write error would stall the session).
