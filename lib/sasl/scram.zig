@@ -560,17 +560,12 @@ fn findClientFirstBare(message: []const u8) ?usize {
 /// the derivation on a worker thread between parseServerFirst and clientFinal.
 pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
     // PBKDF2 with SHA-256, dkLen = 32 (one block)
-    // U1 = HMAC(password, salt || INT(1))
-    var salt_with_block: [256]u8 = undefined;
-    const slen = @min(salt.len, 252);
-    @memcpy(salt_with_block[0..slen], salt[0..slen]);
-    salt_with_block[slen] = 0;
-    salt_with_block[slen + 1] = 0;
-    salt_with_block[slen + 2] = 0;
-    salt_with_block[slen + 3] = 1;
-
+    // U1 = HMAC(password, salt || INT(1)) — streamed, any salt length.
+    var h = HmacSha256.init(password);
+    h.update(salt);
+    h.update(&[_]u8{ 0, 0, 0, 1 });
     var u: [32]u8 = undefined;
-    HmacSha256.create(&u, salt_with_block[0 .. slen + 4], password);
+    h.final(&u);
 
     var result: [32]u8 = u;
 
@@ -802,4 +797,38 @@ test "PBKDF2 produces non-zero output" {
         }
     }
     try std.testing.expect(!all_zero);
+}
+
+test "pbkdf2 matches RFC 7677 SaltedPassword vector" {
+    const salt_b64 = "W22ZaJ0SNY7soEsUEjb6gQ==";
+    var salt: [16]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&salt, salt_b64);
+    var output: [32]u8 = undefined;
+    pbkdf2("pencil", &salt, 4096, &output);
+    const expected = [_]u8{ 0xc4, 0xa4, 0x95, 0x10, 0x32, 0x3a, 0xb4, 0xf9, 0x52, 0xca, 0xc1, 0xfa, 0x99, 0x44, 0x19, 0x39, 0xe7, 0x8e, 0xa7, 0x4d, 0x6b, 0xe8, 0x1d, 0xdf, 0x70, 0x96, 0xe8, 0x75, 0x13, 0xdc, 0x61, 0x5d };
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "pbkdf2 does not truncate long salts" {
+    // 300-byte salt; expected from hashlib.pbkdf2_hmac (salt=(i*7)%256).
+    var salt: [300]u8 = undefined;
+    for (&salt, 0..) |*b, i| b.* = @intCast((i * 7) % 256);
+    var output: [32]u8 = undefined;
+    pbkdf2("longsalt", &salt, 100, &output);
+    const expected = [_]u8{ 0x99, 0xa9, 0xb4, 0x82, 0x10, 0x52, 0xfa, 0x17, 0xdd, 0xde, 0xd2, 0x25, 0x38, 0x9f, 0x99, 0x04, 0xfc, 0x5d, 0xfa, 0x5d, 0x24, 0x32, 0x28, 0x12, 0x85, 0xb4, 0x80, 0x90, 0xa0, 0x67, 0x99, 0x62 };
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+}
+
+test "StoredCredentials.derive is standard PBKDF2-HMAC-SHA-256 (RFC 5802)" {
+    // Expected values computed with hashlib.pbkdf2_hmac('sha256', ...) +
+    // the RFC 5802 ClientKey/StoredKey/ServerKey chain, salt = 0x00..0x1f.
+    var salt: [32]u8 = undefined;
+    for (&salt, 0..) |*b, i| b.* = @intCast(i);
+    const creds = StoredCredentials.derive("correct horse battery staple", salt, 4096);
+    const expected_stored = [_]u8{ 0x4d, 0x67, 0xd5, 0xaf, 0xef, 0xa4, 0xbb, 0x81, 0x14, 0x34, 0x80, 0xc0, 0x8a, 0xdb, 0x72, 0xa2, 0x14, 0xb8, 0x6c, 0xbb, 0x6d, 0xe0, 0xae, 0x28, 0x84, 0x13, 0x70, 0x25, 0xf0, 0x7b, 0xf3, 0xc0 };
+    const expected_server = [_]u8{ 0x0b, 0x1d, 0xf9, 0x1b, 0xf0, 0xa5, 0x4d, 0xa6, 0x44, 0xca, 0xc0, 0x11, 0x8b, 0x44, 0xbb, 0x34, 0xac, 0xdc, 0x3e, 0x84, 0xbc, 0x32, 0x80, 0xa0, 0xa9, 0x97, 0xa5, 0xc3, 0xb6, 0x2f, 0x8c, 0x53 };
+    try std.testing.expectEqualSlices(u8, &expected_stored, &creds.stored_key);
+    try std.testing.expectEqualSlices(u8, &expected_server, &creds.server_key);
+    try std.testing.expectEqualSlices(u8, &salt, &creds.salt);
+    try std.testing.expectEqual(@as(u32, 4096), creds.iteration_count);
 }
