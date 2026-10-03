@@ -198,6 +198,9 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
                     changes_.addWrite(sess.conn.fd, sess.conn.id) catch {};
                 }
             }
+            // Answered — the id's job is done.
+            sess.bind_iq_id = "";
+            sess.bind_iq_id_len = 0;
         }
     }.run;
 
@@ -210,7 +213,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
                 if (entry.worker_id != server.worker_id and
                     server.startSessionKick(session, local.local, local.domain, resource, entry.worker_id, changes))
                 {
-                    return; // parked again
+                    return; // parked again — id intentionally survives
                 }
                 if (entry.worker_id == server.worker_id and evictStaleResource(server, sm, local.local, local.domain, resource, changes)) {
                     if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, resource)) |_| {
@@ -227,6 +230,8 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
             return;
         }
         sendBindRejected(session);
+        session.bind_iq_id = "";
+        session.bind_iq_id_len = 0;
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }

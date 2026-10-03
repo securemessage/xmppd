@@ -196,6 +196,11 @@ pub const Session = struct {
 
     /// Bind IQ accumulation — deferred until </iq> so <resource> text is parsed.
     bind_iq_id: []const u8 = "",
+    /// Session-owned copy of the bind IQ id (T220): the reader slice dies at
+    /// the next top-level element and the parked cross-worker kick path needs
+    /// the id intact when completeBindAfterKick finally answers.
+    bind_iq_id_buf: [256]u8 = undefined,
+    bind_iq_id_len: usize = 0,
     bind_resource_buf: [256]u8 = undefined,
     bind_resource_len: usize = 0,
     bind_collecting_resource: bool = false,
@@ -1350,6 +1355,13 @@ pub const Server = struct {
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "id")) {
                         session.bind_iq_id = attr.value;
+                        // Keep a session-owned copy and swap the pointer onto
+                        // it: the reader slice is gone by the next stanza and
+                        // the cross-worker kick path answers later (T220).
+                        const n = @min(attr.value.len, session.bind_iq_id_buf.len);
+                        @memcpy(session.bind_iq_id_buf[0..n], attr.value[0..n]);
+                        session.bind_iq_id_len = n;
+                        session.bind_iq_id = session.bind_iq_id_buf[0..n];
                         break;
                     }
                 }
@@ -1586,7 +1598,13 @@ pub const Server = struct {
                 }
                 session.bind_pending = false;
                 session.bind_resource_len = 0;
-                session.bind_iq_id = "";
+                // T220: if the bind is parked on a cross-worker kick, the IQ id
+                // must survive until completeBindAfterKick emits the final
+                // result. session_lifecycle clears it on final answer.
+                if (!session.bind_kick_pending) {
+                    session.bind_iq_id = "";
+                    session.bind_iq_id_len = 0;
+                }
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, session.conn.id) catch {};
                 }
@@ -1601,6 +1619,7 @@ pub const Server = struct {
         if (session.stream.state == .features_bind and session.reader.depth == 1 and session.bind_iq_id.len > 0) {
             iq_handler.sendIqErrorWithType(self, session, session.bind_iq_id, "auth", "not-authorized");
             session.bind_iq_id = "";
+            session.bind_iq_id_len = 0;
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }

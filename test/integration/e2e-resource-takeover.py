@@ -97,6 +97,9 @@ if __name__ == '__main__':
         elapsed = time.time() - start
         ok = f'alice@{DOMAIN}/shared' in new[1]
         check(f'round {rnd}: taker bound (evicting incumbent)', ok, new[1][:200])
+        # T220: the result must carry the client's original IQ id — a lost
+        # id stalls strict clients at bind entirely.
+        check(f'round {rnd}: taker bind result carries IQ id', "id='b1'" in new[1], new[1][:200])
         check(f'round {rnd}: takeover completed quickly', elapsed < 5, f'{elapsed:.1f}s')
 
         # Incumbent must see a conflict stream error and get closed
