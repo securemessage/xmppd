@@ -338,8 +338,13 @@ pub const ScramClient = struct {
     client_first_bare: []const u8 = "",
     server_first_msg: []const u8 = "",
     combined_nonce: []const u8 = "",
-    salt: []const u8 = "",
+    /// Decoded salt from server-first (raw bytes, any length the server
+    /// chose); exposed so the SaltedPassword can be derived off the caller's
+    /// thread (parse is cheap, Hi() is not — xmppc T-7AD30E73).
+    salt_raw: [max_salt_len]u8 = undefined,
+    salt_raw_len: usize = 0,
     iteration_count: u32 = 0,
+    server_first_parsed: bool = false,
     arena: std.heap.ArenaAllocator,
 
     const State = enum {
@@ -380,7 +385,19 @@ pub const ScramClient = struct {
     }
 
     /// Process server-first-message and generate client-final-message.
+    /// Derives the SaltedPassword inline; callers that must not block
+    /// (event loops) use parseServerFirst + pbkdf2 off-thread + clientFinal.
     pub fn handleServerFirst(self: *ScramClient, message: []const u8) ![]const u8 {
+        try self.parseServerFirst(message);
+        var salted_password: [32]u8 = undefined;
+        pbkdf2(self.password, self.salt_raw[0..self.salt_raw_len], self.iteration_count, &salted_password);
+        return self.clientFinal(salted_password);
+    }
+
+    /// Parse and validate server-first-message (cheap: no PBKDF2). On
+    /// success salt_raw/iteration_count are set and the exchange parks until
+    /// clientFinal is called with the SaltedPassword.
+    pub fn parseServerFirst(self: *ScramClient, message: []const u8) !void {
         if (self.state != .awaiting_server_first) return error.InvalidState;
 
         const alloc = self.arena.allocator();
@@ -404,7 +421,7 @@ pub const ScramClient = struct {
         // s=salt
         const s_field = iter.next() orelse return error.InvalidMessage;
         if (!std.mem.startsWith(u8, s_field, "s=")) return error.InvalidMessage;
-        self.salt = try alloc.dupe(u8, s_field[2..]);
+        const salt_b64 = s_field[2..];
 
         // i=iteration_count
         const i_field = iter.next() orelse return error.InvalidMessage;
@@ -417,14 +434,19 @@ pub const ScramClient = struct {
 
         // Decode salt from base64 (any length the server chose)
         const decoder = std.base64.standard.Decoder;
-        const salt_len = decoder.calcSizeForSlice(self.salt) catch return error.InvalidBase64;
+        const salt_len = decoder.calcSizeForSlice(salt_b64) catch return error.InvalidBase64;
         if (salt_len == 0 or salt_len > max_salt_len) return error.InvalidMessage;
-        var salt_buf: [max_salt_len]u8 = undefined;
-        decoder.decode(salt_buf[0..salt_len], self.salt) catch return error.InvalidBase64;
+        decoder.decode(self.salt_raw[0..salt_len], salt_b64) catch return error.InvalidBase64;
+        self.salt_raw_len = salt_len;
+        self.server_first_parsed = true;
+    }
 
-        // SaltedPassword := Hi(password, salt, i)
-        var salted_password: [32]u8 = undefined;
-        pbkdf2(self.password, salt_buf[0..salt_len], self.iteration_count, &salted_password);
+    /// Generate client-final-message from a pre-derived SaltedPassword
+    /// (Hi(password, salt, i)). Requires parseServerFirst to have run.
+    pub fn clientFinal(self: *ScramClient, salted_password: [32]u8) ![]const u8 {
+        if (self.state != .awaiting_server_first or !self.server_first_parsed) return error.InvalidState;
+
+        const alloc = self.arena.allocator();
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
@@ -534,8 +556,9 @@ fn findClientFirstBare(message: []const u8) ?usize {
     return i;
 }
 
-/// PBKDF2-HMAC-SHA-256
-fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
+/// PBKDF2-HMAC-SHA-256. Public so event-loop callers (xmppc Engine) can run
+/// the derivation on a worker thread between parseServerFirst and clientFinal.
+pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
     // PBKDF2 with SHA-256, dkLen = 32 (one block)
     // U1 = HMAC(password, salt || INT(1))
     var salt_with_block: [256]u8 = undefined;

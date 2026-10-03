@@ -117,6 +117,9 @@ pub const Session = struct {
     /// Heap pointers: the FSM mutates these in place; copying them (a
     /// `|x|` / `orelse` on a value) would silently drop state.
     sasl: ?*saslmod.SaslClient = null,
+    /// True while a SaltedPassword derivation runs on the engine's crypto
+    /// worker; the SASL exchange resumes in onSaslDerived.
+    sasl_deriving: bool = false,
     reader: Reader,
     parser: ?*Parser = null,
 
@@ -638,20 +641,29 @@ pub const Session = struct {
                 const sc = self.sasl orelse return self.fail(allocator, "sasl-not-active");
                 const pr = self.parser orelse return self.fail(allocator, "sasl-no-parser");
                 const raw = pr.saslChallengeRaw() orelse return self.fail(allocator, "sasl-no-challenge");
-                const next = sc.handleChallenge(raw) catch {
+                const step = sc.handleChallenge(raw) catch {
                     self.fail(allocator, "sasl-challenge-error");
                     return;
-                } orelse return; // client-final already sent; await <success>
-                var enc_buf: [SASL_ENC_MAX]u8 = undefined;
-                const b64 = b64encInto(&enc_buf, next) catch {
-                    self.fail(allocator, "b64-error");
-                    return;
                 };
-                self.queuef("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</response>", .{b64}) catch {
-                    self.fail(allocator, "queue-error");
-                    return;
-                };
-                self.writeAfter(engine);
+                switch (step) {
+                    .none => return, // client-final already sent; await <success>
+                    .message => |msg| self.queueSaslResponse(engine, msg, allocator),
+                    .derive => |d| {
+                        const pw = sc.derivePassword() orelse return self.fail(allocator, "sasl-no-password");
+                        if (engine.scramCached(pw, d.salt[0..d.salt_len], d.iterations)) |salted| {
+                            engine.scram_cache_hits += 1;
+                            self.finishSaslDerive(engine, salted, allocator);
+                        } else {
+                            // Hi() runs on the engine's crypto worker; the
+                            // exchange parks until onSaslDerived resumes it.
+                            self.sasl_deriving = true;
+                            engine.queueDerive(self.handle, pw, d.salt[0..d.salt_len], d.iterations) catch {
+                                self.sasl_deriving = false;
+                                self.fail(allocator, "sasl-derive-queue");
+                            };
+                        }
+                    },
+                }
             },
             .send_bind => {
                 self.queuef("<iq type='set' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{s}</resource></bind></iq>", .{self.resource}) catch {
@@ -721,6 +733,37 @@ pub const Session = struct {
     fn writeAfter(self: *Session, engine: *Engine) void {
         self.flushWrites(engine);
         if (self.write_len > 0) self.armWrite(engine);
+    }
+
+    /// Base64 + queue + flush one SASL <response> message.
+    fn queueSaslResponse(self: *Session, engine: *Engine, msg: []const u8, allocator: std.mem.Allocator) void {
+        var enc_buf: [SASL_ENC_MAX]u8 = undefined;
+        const b64 = b64encInto(&enc_buf, msg) catch {
+            self.fail(allocator, "b64-error");
+            return;
+        };
+        self.queuef("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</response>", .{b64}) catch {
+            self.fail(allocator, "queue-error");
+            return;
+        };
+        self.writeAfter(engine);
+    }
+
+    fn finishSaslDerive(self: *Session, engine: *Engine, salted_password: [32]u8, allocator: std.mem.Allocator) void {
+        const sc = self.sasl orelse return self.fail(allocator, "sasl-not-active");
+        const msg = sc.finishChallenge(salted_password) catch {
+            self.fail(allocator, "sasl-challenge-error");
+            return;
+        };
+        self.queueSaslResponse(engine, msg, allocator);
+    }
+
+    /// Engine-thread callback from drainCryptoDone: the crypto worker
+    /// finished this session's parked SaltedPassword derivation.
+    pub fn onSaslDerived(self: *Session, engine: *Engine, salted_password: [32]u8) void {
+        if (!self.sasl_deriving) return; // stale completion (re-derive raced)
+        self.sasl_deriving = false;
+        self.finishSaslDerive(engine, salted_password, engine.allocator);
     }
 };
 // ============================================================================

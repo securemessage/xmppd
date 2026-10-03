@@ -59,21 +59,59 @@ pub const SaslClient = struct {
         return self.plain_msg;
     }
 
-    /// Given the RAW (base64-decoded) server challenge, return the RAW next
-    /// client message, or `null` when the mechanism has no further client step.
-    /// PLAIN is single-shot (the server answers `<success>` directly). SCRAM
-    /// returns the client-final-message for the first challenge. A server that
-    /// sends server-final as a second challenge (RFC 6120 6.4.6) gets it
-    /// verified here and an empty response; its `<success>` is then empty.
-    pub fn handleChallenge(self: *SaslClient, challenge_raw: []const u8) !?[]const u8 {
+    /// What handleChallenge needs next.
+    pub const Challenge = union(enum) {
+        /// Send this as the next client message ("" = empty <response/>).
+        message: []const u8,
+        /// Nothing to send; await <success> (PLAIN, or client-final sent).
+        none,
+        /// SCRAM: Hi() is expensive — derive the SaltedPassword off the
+        /// event loop (Engine.queueDerive) and resume with finishChallenge.
+        derive: Derive,
+    };
+
+    /// Parameters for one SaltedPassword derivation (Hi(password, salt, i)).
+    pub const Derive = struct {
+        salt: [sasl.ScramClient.max_salt_len]u8,
+        salt_len: usize,
+        iterations: u32,
+    };
+
+    /// Given the RAW (base64-decoded) server challenge, return what happens
+    /// next. PLAIN is single-shot (.none; the server answers <success>
+    /// directly). SCRAM returns .derive for the first challenge (the client
+    /// parks until finishChallenge). A server that sends server-final as a
+    /// second challenge (RFC 6120 6.4.6) gets it verified here and an empty
+    /// response; its <success> is then empty.
+    pub fn handleChallenge(self: *SaslClient, challenge_raw: []const u8) !Challenge {
         if (self.scram) |*sc| {
             if (sc.awaitingServerFinal()) {
                 try sc.handleServerFinal(challenge_raw);
                 self.complete = true;
-                return "";
+                return .{ .message = "" };
             }
-            return try sc.handleServerFirst(challenge_raw);
+            try sc.parseServerFirst(challenge_raw);
+            var d = Derive{
+                .salt = undefined,
+                .salt_len = sc.salt_raw_len,
+                .iterations = sc.iteration_count,
+            };
+            @memcpy(d.salt[0..d.salt_len], sc.salt_raw[0..d.salt_len]);
+            return .{ .derive = d };
         }
+        return .none;
+    }
+
+    /// Finish a parked SCRAM step once the SaltedPassword is available;
+    /// returns the RAW client-final-message.
+    pub fn finishChallenge(self: *SaslClient, salted_password: [32]u8) ![]const u8 {
+        const sc = if (self.scram) |*sc| sc else return error.InvalidState;
+        return sc.clientFinal(salted_password);
+    }
+
+    /// The password a pending Derive applies to (SCRAM only, else null).
+    pub fn derivePassword(self: *const SaslClient) ?[]const u8 {
+        if (self.scram) |*sc| return sc.password;
         return null;
     }
 
@@ -94,6 +132,20 @@ pub const SaslClient = struct {
 };
 
 // --- Tests ---
+
+/// Drive one SCRAM challenge synchronously (parse + inline derive + final),
+/// the way a non-event-loop caller would.
+fn driveScram(client: *SaslClient, password: []const u8, server_first: []const u8) ![]const u8 {
+    return switch (try client.handleChallenge(server_first)) {
+        .derive => |d| blk: {
+            var salted: [32]u8 = undefined;
+            sasl.scram.pbkdf2(password, d.salt[0..d.salt_len], d.iterations, &salted);
+            break :blk try client.finishChallenge(salted);
+        },
+        .message => |m| m,
+        .none => error.UnexpectedNone,
+    };
+}
 
 test "PLAIN initial decodes to authcid/pass" {
     const alloc = std.testing.allocator;
@@ -127,7 +179,7 @@ test "SCRAM full exchange against the server verifies" {
     server.setCredentials(creds);
     const server_first = try server.serverFirst();
 
-    const client_final = (try client.handleChallenge(server_first)).?;
+    const client_final = try driveScram(&client, "secret", server_first);
     const server_final = try server.handleClientFinal(client_final);
     try std.testing.expect(server.isComplete());
 
@@ -149,7 +201,7 @@ test "SCRAM wrong password fails at the server" {
     _ = try server.handleClientFirst(client_first);
     server.setCredentials(creds);
     const server_first = try server.serverFirst();
-    const client_final = (try client.handleChallenge(server_first)).?;
+    const client_final = try driveScram(&client, "wrong", server_first);
 
     try std.testing.expectError(error.AuthenticationFailed, server.handleClientFinal(client_final));
 }
@@ -165,7 +217,7 @@ test "SCRAM: <success> without server-final is rejected" {
     defer server.deinit();
     _ = try server.handleClientFirst(try client.initial());
     server.setCredentials(creds);
-    _ = (try client.handleChallenge(try server.serverFirst())).?;
+    _ = try driveScram(&client, "secret", try server.serverFirst());
 
     // An attacker skipping the proof with an empty <success/> must not pass.
     try std.testing.expectError(error.ServerAuthFailed, client.verifyServerFinal(""));
@@ -183,10 +235,13 @@ test "SCRAM: server-final delivered as a challenge, then empty <success>" {
     defer server.deinit();
     _ = try server.handleClientFirst(try client.initial());
     server.setCredentials(creds);
-    const client_final = (try client.handleChallenge(try server.serverFirst())).?;
+    const client_final = try driveScram(&client, "secret", try server.serverFirst());
     const server_final = try server.handleClientFinal(client_final);
 
-    const resp = (try client.handleChallenge(server_final)).?;
+    const resp = switch (try client.handleChallenge(server_final)) {
+        .message => |m| m,
+        else => return error.UnexpectedDerive,
+    };
     try std.testing.expectEqualStrings("", resp);
     try client.verifyServerFinal("");
     try std.testing.expect(client.isComplete());

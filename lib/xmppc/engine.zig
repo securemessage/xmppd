@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const ssl = @import("ssl");
+const sasl = @import("sasl");
 
 const Session = @import("session.zig").Session;
 const Transport = @import("transport.zig").Transport;
@@ -85,6 +86,21 @@ pub const Engine = struct {
         live: bool,
     };
 
+    const SCRAM_CACHE_MAX = 128;
+    const DeriveJob = struct {
+        handle: Handle,
+        /// Owned copies: the session (and its caller-owned strings) may die
+        /// while the worker runs. Allocated AND freed on the engine thread —
+        /// the worker never touches the allocator.
+        password: []u8,
+        salt: []u8,
+        iterations: u32,
+    };
+    const DeriveDone = struct { job: DeriveJob, salted: [32]u8 };
+    /// Fixed-capacity completion ring: the worker never allocates, so the
+    /// engine allocator is not required to be thread-safe.
+    const DONE_CAP = 64;
+
     kq: posix.fd_t,
     allocator: std.mem.Allocator,
     slots: std.ArrayListUnmanaged(Slot),
@@ -109,6 +125,32 @@ pub const Engine = struct {
     changes: std.ArrayListUnmanaged(Change) = .{},
     changes_lock: std.Thread.Mutex = .{},
 
+    // --- SCRAM SaltedPassword cache + off-loop derivation (T-7AD30E73) ---
+    // Hi() (4096..1M PBKDF2 iterations) must not run on the kqueue thread:
+    // it stalls every session of the Engine during each login. Cache lookups
+    // and inserts happen ONLY on the engine thread (no lock); the worker
+    // touches just the two queues. SaltedPassword is password-equivalent
+    // material: kept in memory only, zeroed on eviction/deinit.
+
+    /// Worker derivations run (cache misses). Tests and the load driver
+    /// assert N sessions of one account derive once.
+    scram_derives: usize = 0,
+    /// Cache hits served without touching the worker.
+    scram_cache_hits: usize = 0,
+
+    scram_cache: std.StringHashMapUnmanaged([32]u8) = .{},
+
+    crypto_mutex: std.Thread.Mutex = .{},
+    /// Signaled on: job queued, done-ring room freed, stop requested.
+    crypto_cond: std.Thread.Condition = .{},
+    crypto_jobs: std.ArrayListUnmanaged(DeriveJob) = .{},
+    crypto_done: [DONE_CAP]?DeriveDone = @splat(null),
+    crypto_done_head: usize = 0, // worker writes
+    crypto_done_tail: usize = 0, // engine reads
+    crypto_done_len: usize = 0,
+    crypto_thread: ?std.Thread = null,
+    crypto_stop: bool = false,
+
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
         return .{ .kq = kq, .allocator = allocator, .slots = .{}, .free_slots = .{} };
@@ -121,6 +163,30 @@ pub const Engine = struct {
         }
         self.stopAll();
         if (self.resolver) |*r| r.deinit();
+        // Stop the crypto worker, then reclaim its buffers (all on this
+        // thread: the worker is joined before any free happens).
+        self.crypto_mutex.lock();
+        self.crypto_stop = true;
+        self.crypto_cond.signal();
+        self.crypto_mutex.unlock();
+        if (self.crypto_thread) |t| {
+            t.join();
+            self.crypto_thread = null;
+        }
+        for (self.crypto_jobs.items) |job| {
+            self.allocator.free(job.password);
+            self.allocator.free(job.salt);
+        }
+        self.crypto_jobs.deinit(self.allocator);
+        for (&self.crypto_done) |*slot| {
+            if (slot.*) |d| {
+                self.allocator.free(d.job.password);
+                self.allocator.free(d.job.salt);
+                slot.* = null;
+            }
+        }
+        self.scramCacheClear();
+        self.scram_cache.deinit(self.allocator);
         self.slots.deinit(self.allocator);
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
@@ -128,6 +194,108 @@ pub const Engine = struct {
         if (self.wake_pipe[0] >= 0) posix.close(self.wake_pipe[0]);
         if (self.wake_pipe[1] >= 0) posix.close(self.wake_pipe[1]);
         posix.close(self.kq);
+    }
+
+    /// Look up a cached SaltedPassword for (password, salt, iterations).
+    /// Engine thread only (cache is unsynchronized by design).
+    pub fn scramCached(self: *Engine, password: []const u8, salt: []const u8, iterations: u32) ?[32]u8 {
+        var kbuf: [1024]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "{s}\x00{s}\x00{d}", .{ password, salt, iterations }) catch return null;
+        return self.scram_cache.get(key);
+    }
+
+    /// Queue a SaltedPassword derivation for the crypto worker; the session
+    /// parks until onSaslDerived fires from the loopOnce drain. Engine
+    /// thread only.
+    pub fn queueDerive(self: *Engine, h: Handle, password: []const u8, salt: []const u8, iterations: u32) !void {
+        const pw_copy = try self.allocator.dupe(u8, password);
+        errdefer self.allocator.free(pw_copy);
+        const salt_copy = try self.allocator.dupe(u8, salt);
+        errdefer self.allocator.free(salt_copy);
+
+        self.crypto_mutex.lock();
+        defer self.crypto_mutex.unlock();
+        if (self.crypto_thread == null) {
+            self.crypto_thread = std.Thread.spawn(.{}, Engine.cryptoWorkerMain, .{self}) catch null;
+            if (self.crypto_thread == null) return error.WorkerSpawn;
+        }
+        try self.crypto_jobs.append(self.allocator, .{
+            .handle = h,
+            .password = pw_copy,
+            .salt = salt_copy,
+            .iterations = iterations,
+        });
+        self.crypto_cond.signal();
+    }
+
+    fn scramCacheClear(self: *Engine) void {
+        var it = self.scram_cache.iterator();
+        while (it.next()) |e| {
+            std.crypto.secureZero(u8, e.value_ptr[0..]);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.scram_cache.clearRetainingCapacity();
+    }
+
+    fn cryptoWorkerMain(self: *Engine) void {
+        while (true) {
+            self.crypto_mutex.lock();
+            // Pop only when completion is guaranteed: ring room was checked,
+            // and the worker is the ring's sole producer.
+            while ((self.crypto_jobs.items.len == 0 or self.crypto_done_len == DONE_CAP) and !self.crypto_stop)
+                self.crypto_cond.wait(&self.crypto_mutex);
+            if (self.crypto_stop) {
+                self.crypto_mutex.unlock();
+                return; // queued jobs are reclaimed by deinit
+            }
+            const job = self.crypto_jobs.orderedRemove(0);
+            self.crypto_mutex.unlock();
+
+            var salted: [32]u8 = undefined;
+            sasl.scram.pbkdf2(job.password, job.salt, job.iterations, &salted);
+
+            self.crypto_mutex.lock();
+            self.crypto_done[self.crypto_done_head] = .{ .job = job, .salted = salted };
+            self.crypto_done_head = (self.crypto_done_head + 1) % DONE_CAP;
+            self.crypto_done_len += 1;
+            self.crypto_mutex.unlock();
+            self.requestWake();
+        }
+    }
+
+    /// Engine-thread drain of completed derivations (top of loopOnce):
+    /// adopt each result into the cache, free the job's copies, resume the
+    /// parked session (generation-checked; dead sessions are skipped).
+    fn drainCryptoDone(self: *Engine) void {
+        while (true) {
+            self.crypto_mutex.lock();
+            if (self.crypto_done_len == 0) {
+                self.crypto_mutex.unlock();
+                return;
+            }
+            const done = self.crypto_done[self.crypto_done_tail].?;
+            self.crypto_done[self.crypto_done_tail] = null;
+            self.crypto_done_tail = (self.crypto_done_tail + 1) % DONE_CAP;
+            self.crypto_done_len -= 1;
+            self.crypto_mutex.unlock();
+            // Ring room freed: wake a worker blocked on DONE_CAP.
+            self.crypto_cond.signal();
+
+            defer self.allocator.free(done.job.password);
+            defer self.allocator.free(done.job.salt);
+            self.scram_derives += 1;
+
+            const key = std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ done.job.password, done.job.salt, done.job.iterations }) catch null;
+            if (key) |k| {
+                if (self.scram_cache.contains(k)) {
+                    self.allocator.free(k);
+                } else {
+                    if (self.scram_cache.count() >= SCRAM_CACHE_MAX) self.scramCacheClear();
+                    self.scram_cache.put(self.allocator, k, done.salted) catch self.allocator.free(k);
+                }
+            }
+            if (self.sessionAt(done.job.handle)) |s| s.onSaslDerived(self, done.salted);
+        }
     }
 
     /// Wake the kqueue loop from any thread (no-op if the loop is not
@@ -379,6 +547,9 @@ pub const Engine = struct {
                 _ = posix.read(self.wake_pipe[0], &wbuf) catch break;
             }
         }
+
+        // Resume sessions whose off-loop SaltedPassword derivation finished.
+        self.drainCryptoDone();
 
         // Fold everything staged since the last iteration into THIS kevent:
         // snapshot the buffer, then release the lock — event handlers stage

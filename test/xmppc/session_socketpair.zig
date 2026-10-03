@@ -19,6 +19,7 @@
 const std = @import("std");
 const xmppc = @import("xmppc");
 const ssl_mod = @import("ssl");
+const sasl_mod = @import("sasl");
 
 const posix = std.posix;
 const Engine = xmppc.Engine;
@@ -226,6 +227,25 @@ const Rig = struct {
             std.Thread.sleep(2 * std.time.ns_per_ms);
         }
     }
+
+    /// Wait for a complete <tag ...>body</tag> from the client, consume
+    /// everything through its close, and return the body text.
+    fn takeElementBody(self: *Rig, tag: []const u8, timeout_ms: u64) ![]u8 {
+        var close_buf: [64]u8 = undefined;
+        const close = try std.fmt.bufPrint(&close_buf, "</{s}>", .{tag});
+        try self.expect(close, timeout_ms);
+        const buf = self.read_buf[0..self.read_len];
+        var open_buf: [64]u8 = undefined;
+        const open = try std.fmt.bufPrint(&open_buf, "<{s}", .{tag});
+        const s = std.mem.indexOf(u8, buf, open) orelse return error.RigTimeout;
+        const gt = std.mem.indexOfScalarPos(u8, buf, s, '>') orelse return error.RigTimeout;
+        const e = std.mem.indexOfPos(u8, buf, gt, close) orelse return error.RigTimeout;
+        const body = try std.heap.page_allocator.dupe(u8, buf[gt + 1 .. e]);
+        const consume = e + close.len;
+        std.mem.copyForwards(u8, self.read_buf[0..], self.read_buf[consume..self.read_len]);
+        self.read_len -= consume;
+        return body;
+    }
 };
 
 fn setup(alloc: std.mem.Allocator, use_tls: bool) !struct { rig: Rig, engine: *Engine, handle: Handle } {
@@ -297,6 +317,55 @@ fn scriptPlainHappy(rig: *Rig) !void {
 }
 
 // ---------------------------------------------------------------------------
+// SCRAM happy path (T-7AD30E73): real lib/sasl ScramServer as the fake — the
+// client's SaltedPassword derivation runs on the engine's crypto worker, so
+// the exchange below is the off-loop path end to end.
+// ---------------------------------------------------------------------------
+
+const scram_features =
+    "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-1' version='1.0'>" ++
+    "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>" ++
+    "<mechanism>SCRAM-SHA-256</mechanism><mechanism>PLAIN</mechanism></mechanisms></stream:features>";
+
+/// Fixed salt so two logins share (password, salt, iterations) — the cache
+/// test's second login must hit, not re-derive.
+const SCRAM_TEST_SALT = [_]u8{0x5A} ** 32;
+
+fn b64DecodeAlloc(b64: []const u8) ![]u8 {
+    const d = std.base64.standard.Decoder;
+    const out = try std.heap.page_allocator.alloc(u8, try d.calcSizeForSlice(b64));
+    try d.decode(out, b64);
+    return out;
+}
+
+fn b64EncodeAlloc(raw: []const u8) ![]u8 {
+    const e = std.base64.standard.Encoder;
+    const out = try std.heap.page_allocator.alloc(u8, e.calcSize(raw.len));
+    _ = e.encode(out, raw);
+    return out;
+}
+
+fn scriptScramHappy(rig: *Rig, server: *sasl_mod.ScramServer) !void {
+    try rig.send(scram_features);
+    const cf_raw = try b64DecodeAlloc(try rig.takeElementBody("auth", 3000));
+    _ = try server.handleClientFirst(cf_raw);
+    server.setCredentials(sasl_mod.StoredCredentials.derive("pass1", SCRAM_TEST_SALT, 4096));
+    const sf_b64 = try b64EncodeAlloc(try server.serverFirst());
+    try rig.send(try std.fmt.allocPrint(std.heap.page_allocator, "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</challenge>", .{sf_b64}));
+    // The client derives Hi() off the kqueue thread here.
+    const rf_raw = try b64DecodeAlloc(try rig.takeElementBody("response", 15000));
+    const sfinal_b64 = try b64EncodeAlloc(try server.handleClientFinal(rf_raw));
+    if (!server.isComplete()) return error.ScramRejected;
+    try rig.send(try std.fmt.allocPrint(std.heap.page_allocator, "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{s}</success>", .{sfinal_b64}));
+    try rig.expect("<stream:stream", 3000); // post-auth re-open
+    try sendPostAuthFeatures(rig);
+    try rig.expect("<bind", 3000);
+    try rig.send("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/smoke</jid></bind></iq>");
+    try rig.expect("<enable", 3000);
+    try rig.send("<enabled xmlns='urn:xmpp:sm:3' id='sm-scram-1' resume='true'/>");
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -311,6 +380,80 @@ test "socketpair: plain happy path establishes with bound JID and SM id" {
     try std.testing.expect(out.established);
     try std.testing.expectEqualStrings("alice@localhost/smoke", out.bound_jid);
     try std.testing.expectEqualStrings("sm-test-42", out.sm_id);
+}
+
+test "socketpair: SCRAM-SHA-256 login derives off the kqueue thread" {
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    var server = sasl_mod.ScramServer.init(alloc);
+    defer server.deinit();
+    try scriptScramHappy(&ctx.rig, &server);
+    const out = waitTerminal(8000);
+    if (!out.established) std.debug.print("scram not established: failed={} reason='{s}'\n", .{ out.failed, out.reason });
+    try std.testing.expect(out.established);
+    // First login: one worker derivation, nothing cached yet.
+    try std.testing.expectEqual(@as(usize, 1), ctx.engine.scram_derives);
+    try std.testing.expectEqual(@as(usize, 0), ctx.engine.scram_cache_hits);
+}
+
+test "socketpair: two SCRAM logins on one engine derive once (SaltedPassword cache)" {
+    const alloc = std.testing.allocator;
+    cur_mutex.lock();
+    cur_outcome = .{};
+    cur_mutex.unlock();
+
+    const engine = try alloc.create(Engine);
+    engine.* = try Engine.init(alloc);
+    defer {
+        engine.deinit();
+        alloc.destroy(engine);
+    }
+
+    var fds_a: [2]posix.fd_t = undefined;
+    var fds_b: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds_a) != 0) return error.Socketpair;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds_b) != 0) return error.Socketpair;
+    defer posix.close(fds_a[1]);
+    defer posix.close(fds_b[1]);
+
+    // Both sessions attach before the loop starts (attachFd is not
+    // thread-safe); each runs the same lab controls as setup().
+    const ha = try engine.attachFd(fds_a[0], "localhost", "alice", "pass1", "smoke", "");
+    const hb = try engine.attachFd(fds_b[0], "localhost", "alice", "pass1", "smoke", "");
+    for ([_]Handle{ ha, hb }) |h| {
+        const s = engine.sessionAt(h).?;
+        s.setCallbacks(onEstablished, onClosed);
+        s.fsm.tls_required = false;
+        s.fsm.allow_plain = true;
+    }
+
+    var rig_a = Rig{ .fake_fd = fds_a[1] };
+    var rig_b = Rig{ .fake_fd = fds_b[1] };
+    try engine.run();
+
+    var srv_a = sasl_mod.ScramServer.init(alloc);
+    defer srv_a.deinit();
+    try scriptScramHappy(&rig_a, &srv_a);
+    const out_a = waitTerminal(8000);
+    if (!out_a.established) std.debug.print("login A not established: failed={} reason='{s}'\n", .{ out_a.failed, out_a.reason });
+    try std.testing.expect(out_a.established);
+
+    // Same (password, salt, iterations): the second login must hit the
+    // SaltedPassword cache instead of queueing a worker derivation.
+    cur_mutex.lock();
+    cur_outcome = .{};
+    cur_mutex.unlock();
+    var srv_b = sasl_mod.ScramServer.init(alloc);
+    defer srv_b.deinit();
+    try scriptScramHappy(&rig_b, &srv_b);
+    const out_b = waitTerminal(8000);
+    if (!out_b.established) std.debug.print("login B not established: failed={} reason='{s}'\n", .{ out_b.failed, out_b.reason });
+    try std.testing.expect(out_b.established);
+
+    try std.testing.expectEqual(@as(usize, 1), engine.scram_derives);
+    try std.testing.expectEqual(@as(usize, 1), engine.scram_cache_hits);
 }
 
 test "socketpair: reads split across element boundaries parse identically" {

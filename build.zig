@@ -238,6 +238,7 @@ pub fn build(b: *std.Build) void {
     });
     socketpair_test_mod.addImport("xmppc", xmppc_mod);
     socketpair_test_mod.addImport("ssl", ssl_mod);
+    socketpair_test_mod.addImport("sasl", sasl_mod);
 
     const socketpair_tests = b.addTest(.{
         .name = "xmppc-socketpair-tests",
