@@ -17,7 +17,9 @@
 //!
 //! ```zig
 //! const http = @import("http");
-//! var response = try http.get(allocator, "https://auth.example.com/.well-known/openid-configuration", null);
+//! var client = try http.Client.init(null); // or a CA bundle path
+//! defer client.deinit();
+//! var response = try client.get(allocator, "https://auth.example.com/.well-known/openid-configuration");
 //! defer allocator.free(response.body);
 //! ```
 
@@ -29,6 +31,7 @@ const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
     @cInclude("openssl/x509.h");
+    @cInclude("openssl/x509_vfy.h");
     @cInclude("netdb.h");
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
@@ -60,48 +63,68 @@ pub const Response = struct {
 /// Maximum response body size (256KB).
 const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
-/// Perform an HTTPS GET request. Caller owns the returned Response.body.
-pub fn get(allocator: Allocator, url: []const u8, ca_file: ?[]const u8) HttpError!Response {
-    return request(allocator, "GET", url, null, null, ca_file);
-}
+/// Persistent HTTPS client: one SSL_CTX per daemon, parsing the CA bundle
+/// once instead of per request (T357/S8). Not thread-safe; the OIDC daemon
+/// drives it from one thread.
+pub const Client = struct {
+    ssl_ctx: *c.SSL_CTX,
 
-/// Perform an HTTPS POST with form-urlencoded body. Caller owns the returned Response.body.
-pub fn post(allocator: Allocator, url: []const u8, body: []const u8, ca_file: ?[]const u8) HttpError!Response {
-    return request(allocator, "POST", url, body, "application/x-www-form-urlencoded", ca_file);
-}
+    pub fn init(ca_file: ?[]const u8) HttpError!Client {
+        const ctx = initTlsClient(ca_file) orelse return HttpError.TlsInitFailed;
+        return .{ .ssl_ctx = ctx };
+    }
+
+    pub fn deinit(self: *Client) void {
+        c.SSL_CTX_free(self.ssl_ctx);
+    }
+
+    /// Perform an HTTPS GET request. Caller owns the returned Response.body.
+    pub fn get(self: *const Client, allocator: Allocator, url: []const u8) HttpError!Response {
+        return request(self.ssl_ctx, allocator, "GET", url, null, null);
+    }
+
+    /// Perform an HTTPS POST with form-urlencoded body. Caller owns the returned Response.body.
+    pub fn post(self: *const Client, allocator: Allocator, url: []const u8, body: []const u8) HttpError!Response {
+        return request(self.ssl_ctx, allocator, "POST", url, body, "application/x-www-form-urlencoded");
+    }
+};
 
 /// Core HTTP request implementation.
 fn request(
+    ssl_ctx: *c.SSL_CTX,
     allocator: Allocator,
     method: []const u8,
     url: []const u8,
     body: ?[]const u8,
     content_type: ?[]const u8,
-    ca_file: ?[]const u8,
 ) HttpError!Response {
     // Parse URL: https://host[:port]/path
     const parsed = parseUrl(url) orelse return HttpError.InvalidUrl;
+
+    // Zero-terminated host for SNI and the certificate identity check.
+    var host_buf: [256]u8 = undefined;
+    if (parsed.host.len >= host_buf.len) return HttpError.InvalidUrl;
+    @memcpy(host_buf[0..parsed.host.len], parsed.host);
+    host_buf[parsed.host.len] = 0;
+    const host_z: [*:0]const u8 = @ptrCast(&host_buf);
 
     // DNS resolution
     const fd = tcpConnect(parsed.host, parsed.port) orelse return HttpError.ConnectionFailed;
     defer posix.close(fd);
 
-    // TLS setup
-    const ssl_ctx = initTlsClient(ca_file) orelse return HttpError.TlsInitFailed;
-    defer c.SSL_CTX_free(ssl_ctx);
-
     const ssl_ptr = c.SSL_new(ssl_ctx) orelse return HttpError.TlsInitFailed;
     defer c.SSL_free(ssl_ptr);
 
     _ = c.SSL_set_fd(ssl_ptr, @intCast(fd));
+    _ = c.SSL_set_tlsext_host_name(ssl_ptr, host_z);
 
-    // Set SNI hostname
-    var host_buf: [256]u8 = undefined;
-    if (parsed.host.len < host_buf.len) {
-        @memcpy(host_buf[0..parsed.host.len], parsed.host);
-        host_buf[parsed.host.len] = 0;
-        _ = c.SSL_set_tlsext_host_name(ssl_ptr, &host_buf);
-    }
+    // Pin the certificate identity to the URL host (T357/S8): VERIFY_PEER
+    // alone (chain to a CA) accepts any publicly trusted certificate for
+    // any name, so the IdP token/introspection/JWKS endpoints could be
+    // answered by the wrong server without this.
+    const verify_param = c.SSL_get0_param(ssl_ptr) orelse return HttpError.TlsInitFailed;
+    if (c.X509_VERIFY_PARAM_set1_host(verify_param, host_z, 0) != 1)
+        return HttpError.TlsInitFailed;
 
     // TLS handshake (blocking)
     if (c.SSL_connect(ssl_ptr) != 1) return HttpError.TlsHandshakeFailed;
@@ -355,4 +378,112 @@ test "parseStatusLine: invalid" {
     try std.testing.expect(parseStatusLine("") == null);
     try std.testing.expect(parseStatusLine("GARBAGE") == null);
     try std.testing.expect(parseStatusLine("HTTP/1.1") == null);
+}
+
+// --- Hostname verification (T357/S8): in-process TLS server with a     ---
+// --- self-signed cert generated at test time (no key material in-tree). ---
+
+/// Write a fresh self-signed cert+key for "localhost" into `dir` via the
+/// system OpenSSL CLI. Returns error.SkipZigTest when the tool is missing.
+fn genTestCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .cwd_dir = dir,
+        .max_output_bytes = 4096,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            // Older OpenSSL lacks -addext; retry through the config-less
+            // openssl x509 path only if the first form failed.
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Serve exactly `n` tiny HTTP replies on a loopback TLS listener, then
+/// close. Runs on its own thread; a deadline keeps the test from hanging
+/// when the client never connects (or aborts mid-handshake, the point of
+/// the mismatch case).
+fn serveTlsResponses(cert_path: [*:0]const u8, key_path: [*:0]const u8, n: *std.atomic.Value(usize)) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    n.store(std.mem.nativeToBig(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 10000;
+    var served: usize = 0;
+    while (served < 2 and std.time.milliTimestamp() < deadline) : (served += 1) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn);
+        const ssl_ptr = c.SSL_new(ctx) orelse continue;
+        defer c.SSL_free(ssl_ptr);
+        _ = c.SSL_set_fd(ssl_ptr, conn);
+        if (c.SSL_accept(ssl_ptr) != 1) continue; // mismatch case dies here
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+            if (r <= 0) break;
+            total += @intCast(r);
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+        }
+        const resp = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok\r\n";
+        _ = c.SSL_write(ssl_ptr, resp.ptr, resp.len);
+    }
+}
+
+test "TLS: hostname check pins the certificate identity to the URL host (T357/S8)" {
+    // Throwaway cert/key generated at test time so no key material ever
+    // sits in the tree.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(.{}, serveTlsResponses, .{ cert_path.ptr, key_path.ptr, &port });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const good_url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{p});
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, good_url);
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // Same endpoint by IP literal: certificate is for 'localhost', so the
+    // handshake must fail before S8 would have silently accepted it.
+    const bad_url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{p});
+    try std.testing.expectError(HttpError.TlsHandshakeFailed, client.get(std.testing.allocator, bad_url));
 }

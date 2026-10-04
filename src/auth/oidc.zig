@@ -66,6 +66,11 @@ pub const OidcStore = struct {
     config: OidcConfig,
     allocator: Allocator,
 
+    /// One shared HTTPS client for the daemon (T357/S8): the SSL_CTX and its
+    /// parsed CA bundle cost is paid once, not per token/introspection/JWKS
+    /// request. Lazily created on first use; OidcStore.init stays infallible.
+    http_client: ?http.Client = null,
+
     /// Cached JWKS keys.
     keys: [MAX_JWKS_KEYS]JwkKey = undefined,
     key_count: usize = 0,
@@ -94,11 +99,22 @@ pub const OidcStore = struct {
     }
 
     pub fn deinit(self: *OidcStore) void {
+        if (self.http_client) |*cl| cl.deinit();
         if (self.jwks_body) |body| {
             self.allocator.free(body);
             self.jwks_body = null;
         }
         self.key_count = 0;
+    }
+
+    /// The daemon's shared HTTPS client (T357/S8).
+    fn httpClient(self: *OidcStore) ?*http.Client {
+        if (self.http_client) |*cl| return cl;
+        self.http_client = http.Client.init(self.config.ca_file) catch |err| {
+            log.err("OIDC HTTPS client init failed: {}", .{err});
+            return null;
+        };
+        return &self.http_client.?;
     }
 
     /// Validate an OAUTHBEARER token. Returns the extracted username on success.
@@ -207,7 +223,8 @@ pub const OidcStore = struct {
 
         const body = fbs.getWritten();
 
-        var response = http.post(allocator, self.config.token_endpoint, body, self.config.ca_file) catch |err| {
+        const client = self.httpClient() orelse return null;
+        var response = client.post(allocator, self.config.token_endpoint, body) catch |err| {
             log.err("ROPC: HTTP request failed: {}", .{err});
             return null;
         };
@@ -245,7 +262,8 @@ pub const OidcStore = struct {
 
         const body = fbs.getWritten();
 
-        var response = http.post(allocator, endpoint, body, self.config.ca_file) catch |err| {
+        const client = self.httpClient() orelse return null;
+        var response = client.post(allocator, endpoint, body) catch |err| {
             log.err("introspection: HTTP request failed: {}", .{err});
             return null;
         };
@@ -329,7 +347,8 @@ pub const OidcStore = struct {
     fn refreshJwks(self: *OidcStore) !void {
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
-        var response = http.get(self.allocator, self.config.jwks_uri, self.config.ca_file) catch |err| {
+        const client = self.httpClient() orelse return error.TlsInitFailed;
+        var response = client.get(self.allocator, self.config.jwks_uri) catch |err| {
             log.err("JWKS fetch failed: {}", .{err});
             return error.OutOfMemory;
         };
