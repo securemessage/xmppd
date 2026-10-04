@@ -148,6 +148,7 @@ is still done first so the fix ships even if that ADR is rejected.
 | S21 | correctness, low | **Numeric character references parse as `u8`.** `&#233;` becomes a lone 0xE9 byte (invalid UTF-8); control characters are accepted; values >= 256 are rejected. The first-pass T302 text ("&#233; rejected") is wrong. | `lib/xml/scanner.zig:424-433` [V] | Parse as `u21`, check the XML Char production, `std.unicode.utf8Encode`. |
 | S22 | stall, high | **Auth loop drops kqueue registrations.** 16-entry changelist, one `addWriteOnce` per reply, `catch {}`. With several worker lanes at overload, replies strand until unrelated activity; prime suspect for the T242 login knee [S]. The OIDC loop already hit this once (`oidc_main.zig:272-273`). | `auth/main.zig:291, 423-424` [V] | Per-lane dirty flag; flush once per iteration; buffer `2*MAX_IPC_CLIENTS+8`; never swallow `ChangeListFull`. Re-measure (M5). |
 | S23 | kTLS rule, high | **TLS write retry length can grow.** After WANT_WRITE, `queueSend` keeps appending at `write_end` and `flushSend` retries with `write_buf[write_start..write_end]`: same pointer, longer length. `compactWriteBuf` only pins the pointer. Violates the AGENTS.md identical pointer-and-length rule; core analog of T253. Same in s2s session/connector [S]. | `core/connection.zig:233-249, 271-291, 409-414` [V] | Track the pending TLS length and retry exactly that slice; new bytes go behind it. Structural: F3/C2 Outbox pin. |
+| S24 | data loss, high | **SM ack on a backwards `h` wipes the replay queue** (Phorge T217). `acked_count = h -% (base_seq -% 1)` wraps above `count` when a client reports a lower `h` than before (for example `<resume h='0'>` after `<a h='5'/>`), and `discardAll()` drops every unacked stanza. | `sm_state.zig:130-137` [V] | Track the last acked `h`; a backwards `h` never discards (log and ignore, or fail the stream with `undefined-condition`). Fix the `<a/>`, local resume and cross-worker resume call sites. Tests: push 10, ack 5, ack 0 keeps 5; u32 wrap. Structural: C11. |
 
 ### 3.2 First-pass P1s that stay in Phase 0
 
@@ -194,8 +195,17 @@ and then fixed in the workstream named.
 
 Each ADR needs an operator decision: **approve**, **modify** or **reject**.
 Continuum has one decision task per ADR; dependent work is blocked on it.
-Recommendation is given for each. Costs: S (about a day), M (several days),
-L (one to two weeks of focused work).
+Costs: S (about a day), M (several days), L (one to two weeks of focused
+work).
+
+**Decisions (2026-10-04).**
+
+| ADR | Decision |
+|-----|----------|
+| ADR-1 | Approved, modified: no shim; one cutover per consumer (see Risk) |
+| ADR-2, 3, 4, 6, 7, 8, 9, 10, 12 | Approved as written |
+| ADR-5 | Approved; durability stays at full sync (no `MDB_NOMETASYNC`) |
+| ADR-11 | Open: the handshake-on-loop exception is under discussion |
 
 ### ADR-1: Stanza-at-a-time XML processing (removes D1)
 
@@ -225,11 +235,22 @@ L (one to two weeks of focused work).
 - **Alternatives.** (a) Keep SAX, add a per-stanza arena and escaping: smaller,
   keeps the 70-field state machine and its bug rate. (b) Heap DOM: simpler API,
   one allocation per node.
-- **Risk.** The c2s reader swap is a flag day for c2s. Mitigation: a shim
-  replays the old element/text callbacks from the tree, so handlers migrate one
-  at a time and the shim is deleted last. Fuzz plus split-feed tests at every
-  byte boundary gate the swap.
-- **Cost.** L. **Recommendation: approve.**
+- **Migration (no temporary dual paths).** Each consumer of the SAX `Reader`
+  switches in one cutover: core c2s (C5), s2s (X1), `lib/xmppc` (WS8). There
+  is no compatibility shim. The SAX `Reader` is deleted when the last consumer
+  moves, before the v0.9.1 tag. C5 lands after C7 (move-only split), F4
+  (`StanzaWriter`) and C1 (serializers), so the cutover only replaces input
+  handling. Gate: fuzz, split-feed at every byte boundary, the full
+  integration lanes and SINT, all on the cutover branch before merge.
+- **S11 first.** S11 restores the per-stanza arena reset in Phase 0 because it
+  fixes the shipped v0.9.0 leak. Its borrower copies (pending IQ ids, s2s
+  remote domain) are what the lifetime rule above requires, so C5 keeps them.
+- **Measured** (ReleaseFast, 322 B message fed in 8 KiB windows, current
+  reader): v0.9.0 3.6-4.3 us per stanza and 718 B retained per stanza; with a
+  per-stanza reset 2.5-3.2 us per stanza and flat memory. Parsing is not the
+  bottleneck at current loads; the gains are memory, copies, removed state and
+  the escaping bug class. SIMD gains are unproven until M3.
+- **Cost.** L. **Decision: approved (no shim).**
 
 ### ADR-2: Outbox and end-of-iteration flush (removes D2)
 
@@ -317,10 +338,10 @@ L (one to two weeks of focused work).
     errors and keep the full prefix; a backend test matrix (Memory, LMDB,
     RocksDB, SQLite); a direct `lmdb.h` binding replacing the zig-lmdb wrapper
     (it has no txn reset/renew and no put flags) [S].
-- **Durability decision (operator).** Keep two syncs per commit (default), or
-  `MDB_NOMETASYNC` (one sync per batch; a crash can lose the last batch).
+- **Durability (decided).** Two syncs per commit, which group commit turns
+  into two syncs per batch. `MDB_NOMETASYNC` is not used.
 - **Subsumes.** S9, T269, T270, T271, T323, T326, V1-V3, V17.
-- **Cost.** L. **Recommendation: approve with default durability.**
+- **Cost.** L. **Decision: approved, full sync.**
 
 ### ADR-6: Auth pipeline, protocol v2 (one-round-trip SCRAM)
 
@@ -458,7 +479,7 @@ src/core/
 
 ```mermaid
 graph TD
-    P0[Phase 0: blockers S1-S23, first-pass P1s] --> R[Phase 4: release gate]
+    P0[Phase 0: blockers S1-S24, first-pass P1s] --> R[Phase 4: release gate]
     M[Phase 0: measurement M1-M5] --> Q[Phase 1: quick wins Q1-Q11]
     M --> F[Phase 1: foundations F1-F7]
     ADR[ADR decisions] --> C[Phase 2: core data path C1-C11]
@@ -543,7 +564,7 @@ Exit: M5 scenarios re-run; deltas recorded; no regression in R1-R3.
 | C2 | `Outbox` in core (ADR-2): first with today's semantics plus drop counters, then spill + fail-closed, SM count on every stanza, end-of-iteration flush, interest reconciliation, TLS pin, `startTls` rule | F2, F3, ADR-2 | L | S13, S15, S23, T313, T215, T250 |
 | C3 | Tokens in `udata` and cross-worker addressing; worker-owned generations (Q3 generalized); T316 guard | F2, ADR-4 | M | T316, V13 |
 | C4 | Envelope ring + blobs + delivery classes + QueueFull policy; room mailbox deque + pending list; comptime actor codec | C3, ADR-3 | L | S14, S16, T287, V14 |
-| C5 | Stanza reader adoption (ADR-1): `StreamReader` + `Stanza` in `lib/xml`; c2s swap with shim; handler-by-handler migration; delete the reassembly state from `Session` | F4, ADR-1 | L | S11/S12 structural, T249, T301-T304, T306, V9 |
+| C5 | Stanza reader adoption (ADR-1): `StreamReader` + `Stanza` in `lib/xml`; c2s input switches in one cutover (no shim); delete the reassembly state from `Session` | C7, F4, C1, ADR-1 | L | S11/S12 structural, T249, T301-T304, T306, V9 |
 | C6 | `SessionMap` v2: normalized `Jid`, precomputed hashes, sharded locks, single entry store, visitor API, cached JID strings | ADR-4 | M | S18, T305, T268, T254 structural |
 | C8 | MUC: room hash index, `ShadowRoom`, per-room local occupant list, bitset mask, fan-out through Outbox gather writes, server-generated stanza-id, batched remote join | C2, C4 | M | T320, T321, T256, V7, V18 |
 | C9 | Presence: probe replies through Outbox, last presence as a shared blob for remote workers, caps decision (verify + filter PEP by `+notify`, or remove querying), subscription cache keyed by owned JID | C2, C4 | M | V11, V12 |
@@ -893,6 +914,7 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | S17 .. S20 | T-EB8DFB0D, T-A6B6B3A0, T-9BC8ADC0, T-950E45AE | T365-T368 |
 | S21 | T-10C123F7 | T302 |
 | S22, S23 | T-FF8442D6, T-FA72FC5D | T369, T370 |
+| S24 | T-19EB034C | T217 |
 | First-pass P1 batch (3.2) | T-96F6A8B5 | T211, T215, T250-T254, T256-T261, T263, T275, T277, T279 |
 | V1 .. V19 verify-then-fix | T-3FE08568 | T371 |
 | M1 .. M5 | T-2B49596E, T-E7096DCE, T-61BC40BB, T-4D163119, T-9213A076 | T372-T376 |
