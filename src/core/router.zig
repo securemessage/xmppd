@@ -129,6 +129,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var target_count: usize = 0;
 
     var remote_delivered: bool = false;
+    var cross_worker_failed: bool = false;
 
     const route_count = if (to_jid.resource.len > 0) blk: {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
@@ -240,7 +241,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 target_count += 1;
             }
         } else {
-            enqueueCrossThreadStanza(
+            if (enqueueCrossThreadStanza(
                 server,
                 entry,
                 from_str,
@@ -249,8 +250,15 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 id_str,
                 delivery_inner_xml,
                 session.stanza_kind,
-            );
-            remote_delivered = true;
+            )) {
+                remote_delivered = true;
+            } else {
+                // S14: stanza did not fit a delivery slot (or the queue
+                // failed). Never pretend it was delivered — fall through to
+                // the same offline-store/bounce path as an unavailable
+                // resource below.
+                cross_worker_failed = true;
+            }
         }
     }
 
@@ -309,7 +317,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    if (target_count == 0 and !remote_delivered) {
+    if ((target_count == 0 and !remote_delivered) or cross_worker_failed) {
         // RFC 6121 §8.5.2.1a: Presence stanzas to non-existent users are silently ignored.
         if (session.stanza_kind == .presence) return;
 
@@ -573,7 +581,14 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
     log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
 }
 
+/// Cross-worker stanzas that could not be handed to the delivery system,
+/// most often because they exceeded the 4080-byte slot (S14). Atomic: every
+/// worker increments it; the M1 metrics task can export it later.
+pub var cross_worker_drops = std.atomic.Value(u64).init(0);
+
 /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
+/// Returns false when the stanza did not fit a delivery slot or the queue
+/// failed; the caller must treat that recipient as undelivered (S14).
 fn enqueueCrossThreadStanza(
     server: *Server,
     route: SessionEntry,
@@ -583,52 +598,61 @@ fn enqueueCrossThreadStanza(
     id_str: []const u8,
     inner_xml: []const u8,
     kind: StanzaKind,
-) void {
-    const ds = server.delivery_system orelse return;
+) bool {
+    const ds = server.delivery_system orelse return false;
 
     const tag_name: []const u8 = switch (kind) {
         .message => "message",
         .presence => "presence",
         .iq => "iq",
-        .none => return,
+        .none => return false,
     };
 
     var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeByte('<') catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeAll(" from='") catch return;
-    xml.escapeWrite(w, from_str) catch return;
-    w.writeAll("' to='") catch return;
-    xml.escapeWrite(w, to_str) catch return;
-    w.writeByte('\'') catch return;
+    w.writeByte('<') catch return dropOversize(inner_xml.len, route);
+    w.writeAll(tag_name) catch return dropOversize(inner_xml.len, route);
+    w.writeAll(" from='") catch return dropOversize(inner_xml.len, route);
+    xml.escapeWrite(w, from_str) catch return dropOversize(inner_xml.len, route);
+    w.writeAll("' to='") catch return dropOversize(inner_xml.len, route);
+    xml.escapeWrite(w, to_str) catch return dropOversize(inner_xml.len, route);
+    w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
     if (type_str.len > 0) {
         if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-            w.writeAll(" type='") catch return;
-            xml.escapeWrite(w, type_str) catch return;
-            w.writeByte('\'') catch return;
+            w.writeAll(" type='") catch return dropOversize(inner_xml.len, route);
+            xml.escapeWrite(w, type_str) catch return dropOversize(inner_xml.len, route);
+            w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
         }
     }
     if (id_str.len > 0) {
-        w.writeAll(" id='") catch return;
-        xml.escapeWrite(w, id_str) catch return;
-        w.writeByte('\'') catch return;
+        w.writeAll(" id='") catch return dropOversize(inner_xml.len, route);
+        xml.escapeWrite(w, id_str) catch return dropOversize(inner_xml.len, route);
+        w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
     }
     if (inner_xml.len == 0) {
-        w.writeAll("/>") catch return;
+        w.writeAll("/>") catch return dropOversize(inner_xml.len, route);
     } else {
-        w.writeByte('>') catch return;
-        w.writeAll(inner_xml) catch return;
-        w.writeAll("</") catch return;
-        w.writeAll(tag_name) catch return;
-        w.writeByte('>') catch return;
+        w.writeByte('>') catch return dropOversize(inner_xml.len, route);
+        w.writeAll(inner_xml) catch return dropOversize(inner_xml.len, route);
+        w.writeAll("</") catch return dropOversize(inner_xml.len, route);
+        w.writeAll(tag_name) catch return dropOversize(inner_xml.len, route);
+        w.writeByte('>') catch return dropOversize(inner_xml.len, route);
     }
 
     ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
+        _ = cross_worker_drops.fetchAdd(1, .monotonic);
+        return false;
     };
+    return true;
+}
+
+fn dropOversize(inner_len: usize, route: SessionEntry) bool {
+    _ = cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
+    return false;
 }
 
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
@@ -661,15 +685,15 @@ fn sendCarbons(
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeByte('/') catch continue;
-            cw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(cw, entry.resource()) catch continue;
             cw.writeAll("' type='chat'>") catch continue;
 
             cw.writeByte('<') catch continue;
@@ -714,15 +738,15 @@ fn sendCarbons(
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeByte('/') catch continue;
-            cw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(cw, entry.resource()) catch continue;
             cw.writeAll("' type='chat'>") catch continue;
 
             cw.writeByte('<') catch continue;
