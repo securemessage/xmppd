@@ -1433,6 +1433,8 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_main_mod.addImport("op_backend", auth_op_backend_mod);
     oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
     oidc_main_mod.linkSystemLibrary("crypto", .{});

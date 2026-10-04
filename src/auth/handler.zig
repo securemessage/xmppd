@@ -19,16 +19,47 @@ const crypto_pool_mod = @import("crypto_pool");
 
 const log = std.log.scoped(.auth_handler);
 
+/// Three-state lock verdict (T352/S3): a store error must NOT be mapped to
+/// "unlocked" — that is fail-open on exactly the path that protects
+/// permanently locked accounts.
+pub const LockCheckResult = enum {
+    unlocked,
+    locked,
+    store_error,
+};
+
 /// Interface for permanent lock checking. The auth daemon sets this to
 /// a closure over the LockStore. Decouples handler from Backend type.
 pub const LockChecker = struct {
     ctx: *anyopaque,
-    checkFn: *const fn (ctx: *anyopaque, username: []const u8) bool,
+    checkFn: *const fn (ctx: *anyopaque, username: []const u8) LockCheckResult,
 
-    pub fn isLocked(self: LockChecker, username: []const u8) bool {
+    pub fn check(self: LockChecker, username: []const u8) LockCheckResult {
         return self.checkFn(self.ctx, username);
     }
 };
+
+/// Standard LockChecker adapter over a LockStore (shared by xmppd-auth and
+/// xmppd-auth-oidc so both enforce the same permanent locks).
+pub fn makeLockChecker(comptime Backend: type, ls: *@import("lock_store").LockStore(Backend), alloc: std.mem.Allocator) LockChecker {
+    const S = struct {
+        const Ctx = struct {
+            lock_store: *@import("lock_store").LockStore(Backend),
+            allocator: std.mem.Allocator,
+        };
+        var ctx: Ctx = undefined;
+
+        fn check(_: *anyopaque, username: []const u8) LockCheckResult {
+            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return .store_error;
+            return if (result != null) .locked else .unlocked;
+        }
+    };
+    S.ctx = .{ .lock_store = ls, .allocator = alloc };
+    return .{
+        .ctx = @ptrCast(&S.ctx),
+        .checkFn = &S.check,
+    };
+}
 
 /// Interface for invite code validation. The auth daemon sets this to
 /// a closure over the InviteStore.
@@ -178,6 +209,26 @@ pub fn AuthHandler(comptime Store: type) type {
             self.lock_checker = checker;
         }
 
+        /// Admission gate run by EVERY mechanism once the identity is known
+        /// (T352/S3): null means admitted. Fail closed on lock-store errors.
+        fn admit(self: *Self, username: []const u8) ?[]const u8 {
+            if (self.lock_checker) |checker| {
+                switch (checker.check(username)) {
+                    .locked => {
+                        log.info("auth rejected: account '{s}' is permanently locked", .{username});
+                        return "account-disabled";
+                    },
+                    .store_error => {
+                        // warn, not err: tests trip the runner on err logs.
+                        log.warn("lock store error checking '{s}' — failing closed", .{username});
+                        return "temporary-auth-failure";
+                    },
+                    .unlocked => {},
+                }
+            }
+            return null;
+        }
+
         /// Look up credentials in cache by precomputed hash.
         /// Returns cached creds if entry matches and is within TTL, null otherwise.
         fn cacheLookup(self: *Self, hash: u64, now: i64) ?sasl.StoredCredentials {
@@ -282,11 +333,13 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         fn handleAuthRequest(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
-            // Permanent lock check (if enabled)
-            if (self.lock_checker) |checker| {
-                if (req.username.len > 0 and checker.isLocked(req.username)) {
-                    log.info("auth rejected: account '{s}' is permanently locked", .{req.username});
-                    return .{ .reply = authFailure(req.conn_id, "account-disabled") };
+            // Permanent lock check when the entry message carries a username
+            // (core sends "" today; the mechanism handlers enforce the lock
+            // on the parsed identity post-S3 regardless).
+            if (req.username.len > 0) {
+                if (self.admit(req.username)) |reason| {
+                    log.info("auth rejected at entry: {s}", .{reason});
+                    return .{ .reply = authFailure(req.conn_id, reason) };
                 }
             }
 
@@ -343,6 +396,11 @@ pub fn AuthHandler(comptime Store: type) type {
 
             const username = payload[authcid_start..authcid_end];
             const password = payload[passwd_start..];
+
+            // Lock check on the parsed identity (S3).
+            if (self.admit(username)) |reason| {
+                return .{ .reply = authFailure(req.conn_id, reason) };
+            }
 
             // Per-account rate limiting (username was "" at auth_request entry)
             if (self.rate_limiter) |rl| {
@@ -478,6 +536,10 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             if (result) |validated_user| {
+                // Lock check on the IdP-verified identity (S3).
+                if (self.admit(validated_user)) |reason| {
+                    return authFailure(req.conn_id, reason);
+                }
                 log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
                 if (self.rate_limiter) |rl| rl.recordSuccess(validated_user);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
@@ -520,6 +582,13 @@ pub fn AuthHandler(comptime Store: type) type {
                     session.deinit();
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
+
+                // Lock check on the parsed identity (S3) — before any
+                // challenge work happens for a locked account.
+                if (self.admit(username)) |reason| {
+                    session.deinit();
+                    return authFailure(req.conn_id, reason);
+                }
 
                 // Per-account rate limiting (username was "" at auth_request entry)
                 if (self.rate_limiter) |rl| {
@@ -1053,6 +1122,116 @@ test "AuthHandler: PLAIN auth wrong password" {
     } }) orelse return error.NoResponse;
 
     try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+}
+
+test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T352/S3)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "lockeduser", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, username: []const u8) LockCheckResult {
+            return if (std.mem.eql(u8, username, "lockeduser")) .locked else .unlocked;
+        }
+    }.f });
+
+    var payload: [25]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1..11], "lockeduser");
+    payload[11] = 0;
+    @memcpy(payload[12..21], "secret123");
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 1,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0..21],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+}
+
+test "AuthHandler: locked account rejected at SCRAM before the challenge is issued (T352/S3)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "lockedscram", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, username: []const u8) LockCheckResult {
+            return if (std.mem.eql(u8, username, "lockedscram")) .locked else .unlocked;
+        }
+    }.f });
+
+    var client = sasl.ScramClient.init(allocator, "lockedscram", "secret123");
+    defer client.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try client.clientFirst(),
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    // No challenge state may linger for the rejected conn_id.
+    try std.testing.expect(handler.findScramSlot(7) == null);
+}
+
+test "AuthHandler: lock store error fails closed (T352/S3)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, _: []const u8) LockCheckResult {
+            return .store_error;
+        }
+    }.f });
+
+    var payload: [16]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1..6], "alice");
+    payload[6] = 0;
+    @memcpy(payload[7..16], "secret123");
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 2,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0..16],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
 }
 
 test "AuthHandler: SCRAM-SHA-256 full exchange" {

@@ -31,6 +31,9 @@ const ChangeList = event_loop_mod.ChangeList;
 const config_mod = @import("config");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
+const OpBackendType = @import("op_backend").Backend;
+const lock_store_mod = @import("lock_store");
+const LockStore = lock_store_mod.LockStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd_auth_oidc);
 
@@ -51,6 +54,7 @@ pub fn main() !void {
 
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
+    var db_path: []const u8 = "/var/db/xmppd";
 
     _ = args.next(); // Skip argv[0]
 
@@ -58,6 +62,11 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
             config_path = args.next() orelse {
                 log.err("--config requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--db")) {
+            db_path = args.next() orelse {
+                log.err("--db requires a value", .{});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--socket")) {
@@ -109,6 +118,10 @@ pub fn main() !void {
     if (cfg.get("oidc", "socket")) |s| {
         socket_path = s;
     }
+    // Same db resolution as xmppd-auth: [server] db_path when not overridden.
+    if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
+        if (cfg.get("server", "db_path")) |v| db_path = v;
+    }
 
     log.info("xmppd-auth-oidc starting", .{});
     log.info("  issuer: {s}", .{issuer});
@@ -151,6 +164,15 @@ pub fn main() !void {
         log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
     }
     defer handler.deinit();
+
+    // Permanent account locks come from the shared store, like xmppd-auth
+    // (T352/S3). OIDC without a reachable store fails closed per attempt.
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
+    var backend = try OpBackendType.open(auth_path, .{});
+    defer backend.close();
+    var lock_store = LockStore.init(&backend);
+    handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
     // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)

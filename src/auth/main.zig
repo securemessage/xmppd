@@ -228,7 +228,7 @@ pub fn main() !void {
     } else {
         log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
     }
-    handler.setLockChecker(makeLockChecker(&lock_store, allocator));
+    handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
     handler.reg_config = reg_config;
     if (reg_config.enabled and reg_config.require_invite) {
         handler.invite_validator = makeInviteValidator(&invite_store, allocator);
@@ -488,30 +488,6 @@ fn makeInviteValidator(is: *InviteStore, alloc: std.mem.Allocator) InviteValidat
     return .{
         .ctx = @ptrCast(&S.ctx),
         .validateFn = &S.check,
-    };
-}
-
-/// Context for the lock checker callback — holds references to LockStore + allocator.
-const LockCheckerCtx = struct {
-    lock_store: *LockStore,
-    allocator: std.mem.Allocator,
-};
-
-/// Create a LockChecker interface backed by a LockStore.
-fn makeLockChecker(ls: *LockStore, alloc: std.mem.Allocator) LockChecker {
-    const S = struct {
-        var ctx: LockCheckerCtx = undefined;
-
-        fn check(raw_ctx: *anyopaque, username: []const u8) bool {
-            _ = raw_ctx;
-            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return false;
-            return result != null;
-        }
-    };
-    S.ctx = .{ .lock_store = ls, .allocator = alloc };
-    return .{
-        .ctx = @ptrCast(&S.ctx),
-        .checkFn = &S.check,
     };
 }
 
