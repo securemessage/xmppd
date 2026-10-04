@@ -681,6 +681,15 @@ test "S23: TLS write retry resends only the pinned slice" {
     try std.testing.expect(server_conn.isTlsEstablished());
     try std.testing.expect(client_done);
 
+    // Q11: the accessors behind the post-handshake kTLS log line.
+    {
+        const tls = &(server_conn.tls_conn orelse unreachable);
+        try std.testing.expect(tls.versionName().len > 0);
+        try std.testing.expect(tls.cipherName().len > 0);
+        _ = tls.ktlsSend();
+        _ = tls.ktlsRecv();
+    }
+
     // Tiny buffers both directions: the first large TLS write must
     // WANT_WRITE (unix sockets buffer on both the send and receive side).
     {

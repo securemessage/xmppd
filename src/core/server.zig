@@ -1085,6 +1085,13 @@ pub const Server = struct {
 
         if (complete) {
             log.info("connection {d} TLS handshake complete", .{id});
+            // AGENTS.md: kTLS engagement and cipher must be logged after
+            // every handshake; userland fallback is otherwise silent.
+            if (session.conn.tls_conn) |*tls| {
+                log.info("connection {d} tls: {s} cipher={s} ktls tx={} rx={}", .{
+                    id, tls.versionName(), tls.cipherName(), tls.ktlsSend(), tls.ktlsRecv(),
+                });
+            }
             // Notify the stream FSM that TLS is established
             session.stream.tlsEstablished();
             // Reset XML reader for stream restart after STARTTLS
