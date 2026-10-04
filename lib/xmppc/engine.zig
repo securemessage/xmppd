@@ -64,27 +64,6 @@ pub const Handle = packed struct {
 
 /// One kqueue registration change, staged until the waiting kevent() call.
 const Change = Kevent;
-
-/// Synchronous hostname resolution (the one blocking call in the client).
-fn resolveHost(host: []const u8) !std.c.sockaddr.in {
-    var name_buf: [256]u8 = undefined;
-    if (host.len >= name_buf.len) return error.NameTooLong;
-    @memcpy(name_buf[0..host.len], host);
-    name_buf[host.len] = 0;
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.INET;
-    hints.socktype = posix.SOCK.STREAM;
-
-    var result: ?*std.c.addrinfo = null;
-    const rc = std.c.getaddrinfo(@ptrCast(&name_buf), null, &hints, &result);
-    if (@intFromEnum(rc) != 0 or result == null) return error.ResolutionFailed;
-    defer std.c.freeaddrinfo(result.?);
-
-    const addr_in: *const std.c.sockaddr.in = @ptrCast(@alignCast(result.?.addr.?));
-    return .{ .port = 0, .addr = addr_in.addr };
-}
-
 // ============================================================================
 // Engine
 // ============================================================================
@@ -530,6 +509,9 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         if (self.thread) |*t| {
+            // T252: the loop thread may be parked in kevent() with live
+            // sessions — wake it before joining or this hang never ends.
+            self.requestWake();
             t.join();
             self.thread = null;
         }
@@ -1050,19 +1032,18 @@ pub const Engine = struct {
         self.addWrite(fd, h);
     }
 
-    /// Direct connect without DNS for a slotted session (literal IP).
-    /// Engine thread only.
+    /// Direct connect for a slotted session whose host is a literal IP (the
+    /// launch path already parseIp'd it — build the sockaddr directly: no
+    /// blocking getaddrinfo on the engine thread, and IPv6 literals work
+    /// (T251). Engine thread only.
     fn connectPrepared(self: *Engine, s: *Session) !void {
-        const addr_v4 = resolveHost(s.host) catch {
+        var addr = std.net.Address.parseIp(s.host, s.port) catch
             return error.NameResolutionFailed;
-        };
-        var addr = addr_v4;
-        addr.port = std.mem.nativeToBig(u16, s.port);
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch |serr| {
+        const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch |serr| {
             log.warn("socket() failed: {}", .{serr});
             return error.SocketCreate;
         };
-        posix.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {
             if (err != error.WouldBlock) {
                 log.warn("connect() to {s}:{d} failed immediately: {}", .{ s.host, s.port, err });
                 posix.close(fd);
