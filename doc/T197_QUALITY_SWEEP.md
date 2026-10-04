@@ -646,6 +646,24 @@ F7 handshake pool (the engine thread's serial handshakes caused the 0.6-2.6 s
 T32 stalls). First-pass items T251-T253 (Phase 0), T283-T300, T240 and T241
 are part of it.
 
+PR #5 (387bc30) and PR #6 (d85dd37), merged 2026-10-04, touch only
+`lib/xmppc` and its tests. They add public API that WS8 must keep through
+the `lib/net` and ADR-1 cutovers, with their socketpair tests carried over:
+
+- `Engine.schedule`/`cancelTimer` (consumer one-shot timers; the loop stays
+  alive while timers are pending). Today each timer is its own
+  `EVFILT_TIMER` knote; WS8 maps them onto the `lib/net` timer wheel.
+- `Stanza.archive` (MAM result unwrapping with nested capture depth). The
+  ADR-1 tree reader replaces the hand-written nested capture in
+  `parser.zig`; the unwrap rules (wrapper counted once for XEP-0198, empty
+  wrapper delivers nothing, positional accept inside `<forwarded>`) stay.
+- `xmppc.TlsPolicy` re-export.
+
+The 64-entry staged-change cap and its "do not block while changes remain"
+workaround (805e2d2) go away with the `lib/net` loop (T240). The resolver's
+1 s housekeeping tick (`engine.zig` `TICK_UDATA`) is replaced by timer-wheel
+deadlines in X2/WS8. First consumer of these APIs: continuum-xmpp-bridge.
+
 ---
 
 ## 6. Measurement plan
