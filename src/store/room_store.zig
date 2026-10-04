@@ -373,6 +373,20 @@ pub fn RoomStore(comptime Backend: type) type {
             }
             return count;
         }
+        /// Iterate every room JID with no capacity limit (S19). The key
+        /// slice borrows the iterator's storage and is valid only for the
+        /// duration of the callback.
+        pub fn forEachRoom(
+            self: *Self,
+            ctx: anytype,
+            comptime cb: fn (@TypeOf(ctx), []const u8) anyerror!void,
+        ) !void {
+            var iter = try self.db.iterator(NS_ROOMS, "");
+            defer iter.deinit();
+            while (iter.next()) |entry| {
+                try cb(ctx, entry.key);
+            }
+        }
     };
 }
 

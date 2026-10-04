@@ -538,21 +538,36 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
         server.room_store = ctx.room_store;
         server.muc_host = ctx.muc_host;
 
-        // Load persistent rooms from store (T105) — only rooms owned by this worker
+        // Load persistent rooms from store (T105) — only rooms owned by this
+        // worker. Callback iteration: a fixed jid buffer silently skipped
+        // every room past its capacity (S19).
         if (ctx.room_store) |store| {
-            var jid_buf: [256][]const u8 = undefined;
-            const room_count = store.listRooms(&jid_buf) catch 0;
-            const worker_count = server.getWorkerCount();
-            var loaded: usize = 0;
-            for (jid_buf[0..room_count]) |jid| {
-                defer ctx.allocator.free(jid);
-                if (room_registry_mod.roomOwner(jid, worker_count) != worker_id) continue;
-                const config = store.loadRoom(jid) catch continue orelse continue;
-                _ = reg.createRoom(jid, config) catch continue;
-                loaded += 1;
-            }
-            if (loaded > 0) {
-                log.info("worker {d}: loaded {d} persistent rooms", .{ worker_id, loaded });
+            const LoadCtx = struct {
+                reg: *RoomRegistry,
+                store: *GenericRoomStore,
+                worker_count: u16,
+                worker_id: u16,
+                loaded: usize = 0,
+            };
+            const loadOne = struct {
+                fn f(lctx: *LoadCtx, jid: []const u8) !void {
+                    if (room_registry_mod.roomOwner(jid, lctx.worker_count) != lctx.worker_id) return;
+                    const config = lctx.store.loadRoom(jid) catch return orelse return;
+                    _ = lctx.reg.createRoom(jid, config) catch return;
+                    lctx.loaded += 1;
+                }
+            }.f;
+            var load_ctx: LoadCtx = .{
+                .reg = reg,
+                .store = store,
+                .worker_count = server.getWorkerCount(),
+                .worker_id = worker_id,
+            };
+            store.forEachRoom(&load_ctx, loadOne) catch |err| {
+                log.warn("worker {d}: persistent room load aborted: {}", .{ worker_id, err });
+            };
+            if (load_ctx.loaded > 0) {
+                log.info("worker {d}: loaded {d} persistent rooms", .{ worker_id, load_ctx.loaded });
             }
         }
     }

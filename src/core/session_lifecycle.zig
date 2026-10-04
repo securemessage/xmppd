@@ -795,3 +795,38 @@ test "T152: rebind with same resource evicts stale session" {
     const entry2 = sm.findByFullJid("alice", "localhost", "phone").?;
     try std.testing.expectEqual(@as(u32, 2), entry2.local_session_id);
 }
+
+test "S19: forEachRoom iterates more than 256 persistent rooms" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+
+    var db = try op_backend.Backend.open(path, .{});
+    defer db.close();
+    const RoomStore = @import("room_store").RoomStore(op_backend.Backend);
+    var store = RoomStore.init(&db, allocator);
+
+    // 300 rooms: the old [256] jid_buf in the startup loader silently
+    // skipped every room past 256.
+    const total: usize = 300;
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var jid_buf: [64]u8 = undefined;
+        const jid = std.fmt.bufPrint(&jid_buf, "room{d}@conf.localhost", .{i}) catch unreachable;
+        const config = @import("room_store").RoomConfig{ .persistent = true };
+        try store.saveRoom(jid, &config);
+    }
+
+    var seen: usize = 0;
+    const countOne = struct {
+        fn f(count: *usize, jid: []const u8) !void {
+            _ = jid;
+            count.* += 1;
+        }
+    }.f;
+    try store.forEachRoom(&seen, countOne);
+    try std.testing.expectEqual(total, seen);
+}
