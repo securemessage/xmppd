@@ -20,6 +20,7 @@
 //! falling back to per-occupant stanza construction.
 
 const std = @import("std");
+const xml = @import("xml");
 const room_registry = @import("room_registry");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
@@ -112,7 +113,7 @@ pub fn buildPrefix(
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("<message from='") catch return null;
-    w.writeAll(from_str) catch return null;
+    xml.escapeWrite(w, from_str) catch return null;
     w.writeAll("' to='") catch return null;
     return @intCast(fbs.pos);
 }
@@ -132,7 +133,7 @@ pub fn buildSuffix(
     w.writeAll("' type='groupchat'") catch return null;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return null;
-        w.writeAll(id_str) catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
         w.writeByte('\'') catch return null;
     }
     if (inner_xml.len == 0) {
@@ -148,19 +149,20 @@ pub fn buildSuffix(
 /// Build a complete stanza from pre-built prefix + recipient JID + suffix into a buffer.
 /// Returns the total length, or null if the buffer would overflow.
 /// Used for cross-thread MPSC delivery where we need the full stanza as contiguous bytes.
+/// The recipient JID lands inside the prefix's `to='...'` attribute, so it is
+/// XML-escaped here (S1); prefix and suffix are already serialized XML.
 pub fn buildComplete(
     buf: []u8,
     prefix: []const u8,
     recipient_jid: []const u8,
     suffix: []const u8,
 ) ?usize {
-    const total = prefix.len + recipient_jid.len + suffix.len;
-    if (total > buf.len) return null;
-
-    @memcpy(buf[0..prefix.len], prefix);
-    @memcpy(buf[prefix.len .. prefix.len + recipient_jid.len], recipient_jid);
-    @memcpy(buf[prefix.len + recipient_jid.len .. total], suffix);
-    return total;
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeAll(prefix) catch return null;
+    xml.escapeWrite(w, recipient_jid) catch return null;
+    w.writeAll(suffix) catch return null;
+    return fbs.pos;
 }
 
 // ============================================================================
@@ -302,6 +304,28 @@ test "buildPrefix produces correct output" {
     const len = buildPrefix(&buf, "room@conference.example.com/alice").?;
     const result = buf[0..len];
     try std.testing.expectEqualStrings("<message from='room@conference.example.com/alice' to='", result);
+}
+
+test "buildPrefix escapes decoded entities in from JID (S1)" {
+    // The scanner decodes entities on read; a nick of "a&apos;b" arrives here
+    // as "a'b" and must be re-encoded or it breaks out of the attribute.
+    var buf: [512]u8 = undefined;
+    const len = buildPrefix(&buf, "room@conference.example.com/a'b<c\"d").?;
+    const result = buf[0..len];
+    try std.testing.expectEqualStrings("<message from='room@conference.example.com/a&apos;b&lt;c&quot;d' to='", result);
+}
+
+test "buildSuffix escapes decoded entities in id (S1)" {
+    var buf: [16500]u8 = undefined;
+    const len = buildSuffix(&buf, "x'><message from='evil", "<body>hi</body>").?;
+    const result = buf[0..len];
+    try std.testing.expectEqualStrings("' type='groupchat' id='x&apos;&gt;&lt;message from=&apos;evil'><body>hi</body></message>", result);
+}
+
+test "buildComplete escapes decoded entities in recipient JID (S1)" {
+    var buf: [1024]u8 = undefined;
+    const total = buildComplete(&buf, "<message from='r@c/a' to='", "u'1@d/res'2", "' type='groupchat'/>").?;
+    try std.testing.expectEqualStrings("<message from='r@c/a' to='u&apos;1@d/res&apos;2' type='groupchat'/>", buf[0..total]);
 }
 
 test "buildSuffix with body" {

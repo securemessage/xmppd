@@ -333,7 +333,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (inner_xml.len > 0) {
         pw.writeByte('>') catch return;
@@ -384,7 +384,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeAll("' type='unavailable'/>") catch return;
     const presence_xml = pres_fbs.getWritten();
 
@@ -453,9 +453,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                 var probe_fbs = std.io.fixedBufferStream(&probe_buf);
                 const pbw = probe_fbs.writer();
                 pbw.writeAll("<presence from='") catch continue;
-                pbw.writeAll(bare_jid) catch continue;
+                xml.escapeWrite(pbw, bare_jid) catch continue;
                 pbw.writeAll("' to='") catch continue;
-                pbw.writeAll(contact_bare) catch continue;
+                xml.escapeWrite(pbw, contact_bare) catch continue;
                 pbw.writeAll("' type='probe'/>") catch continue;
                 server.sendPresenceViaS2s(bare_jid, contact_bare, probe_fbs.getWritten(), changes);
                 continue;
@@ -482,13 +482,13 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
             const ppw = pres_fbs.writer();
             ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(contact.local) catch continue;
+            xml.escapeWrite(ppw, contact.local) catch continue;
             ppw.writeByte('@') catch continue;
-            ppw.writeAll(contact.domain) catch continue;
+            xml.escapeWrite(ppw, contact.domain) catch continue;
             ppw.writeByte('/') catch continue;
-            ppw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(ppw, entry.resource()) catch continue;
             ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
+            xml.escapeWrite(ppw, to_str) catch continue;
             ppw.writeByte('\'') catch continue;
             if (contact_inner.len > 0) {
                 ppw.writeByte('>') catch continue;
@@ -556,9 +556,9 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     var sub_pres_fbs = std.io.fixedBufferStream(&sub_pres_buf);
     const spw = sub_pres_fbs.writer();
     spw.writeAll("<presence from='") catch return;
-    spw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(spw, owner_bare) catch return;
     spw.writeAll("' to='") catch return;
-    spw.writeAll(to_str) catch return;
+    xml.escapeWrite(spw, to_str) catch return;
     spw.writeAll("' type='subscribe'") catch return;
     if (inner_xml.len > 0) {
         spw.writeByte('>') catch return;
@@ -665,9 +665,9 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     var sd_pres_fbs = std.io.fixedBufferStream(&sd_pres_buf);
     const sdpw = sd_pres_fbs.writer();
     sdpw.writeAll("<presence from='") catch return;
-    sdpw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(sdpw, owner_bare) catch return;
     sdpw.writeAll("' to='") catch return;
-    sdpw.writeAll(to_str) catch return;
+    xml.escapeWrite(sdpw, to_str) catch return;
     sdpw.writeAll("' type='subscribed'/>") catch return;
     const sd_pres_xml = sd_pres_fbs.getWritten();
 
@@ -705,11 +705,11 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
             const cpw = cpres_fbs.writer();
             cpw.writeAll("<presence from='") catch continue;
-            cpw.writeAll(to_jid.local) catch continue;
+            xml.escapeWrite(cpw, to_jid.local) catch continue;
             cpw.writeByte('@') catch continue;
-            cpw.writeAll(to_jid.domain) catch continue;
+            xml.escapeWrite(cpw, to_jid.domain) catch continue;
             cpw.writeByte('/') catch continue;
-            cpw.writeAll(pentry.resource()) catch continue;
+            xml.escapeWrite(cpw, pentry.resource()) catch continue;
             cpw.writeByte('\'') catch continue;
             if (contact_inner.len > 0) {
                 cpw.writeByte('>') catch continue;
@@ -797,7 +797,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     usbw.writeAll("<presence from='") catch return;
     usbw.writeAll(owner_bare) catch return;
     usbw.writeAll("' to='") catch return;
-    usbw.writeAll(to_str) catch return;
+    xml.escapeWrite(usbw, to_str) catch return;
     usbw.writeAll("' type='unsubscribe'/>") catch return;
     const unsub_pres_xml = unsub_pres_fbs.getWritten();
 
@@ -883,13 +883,13 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
             var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
             const uw = unavail_fbs.writer();
             uw.writeAll("<presence from='") catch continue;
-            uw.writeAll(bound.local) catch continue;
+            xml.escapeWrite(uw, bound.local) catch continue;
             uw.writeByte('@') catch continue;
-            uw.writeAll(bound.domain) catch continue;
+            xml.escapeWrite(uw, bound.domain) catch continue;
             uw.writeByte('/') catch continue;
-            uw.writeAll(oent.resource()) catch continue;
+            xml.escapeWrite(uw, oent.resource()) catch continue;
             uw.writeAll("' to='") catch continue;
-            uw.writeAll(to_str) catch continue;
+            xml.escapeWrite(uw, to_str) catch continue;
             uw.writeAll("' type='unavailable'/>") catch continue;
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unavail_fbs.getWritten(), changes);
         }
@@ -902,9 +902,9 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     var unsd_pres_fbs = std.io.fixedBufferStream(&unsd_pres_buf);
     const usdw = unsd_pres_fbs.writer();
     usdw.writeAll("<presence from='") catch return;
-    usdw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(usdw, owner_bare) catch return;
     usdw.writeAll("' to='") catch return;
-    usdw.writeAll(to_str) catch return;
+    xml.escapeWrite(usdw, to_str) catch return;
     usdw.writeAll("' type='unsubscribed'/>") catch return;
     const unsd_pres_xml = unsd_pres_fbs.getWritten();
 
@@ -1025,11 +1025,11 @@ fn broadcastToOwnResources(
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (sender_session.stanza_type.len > 0) {
         pw.writeAll(" type='") catch return;
-        pw.writeAll(sender_session.stanza_type) catch return;
+        xml.escapeWrite(pw, sender_session.stanza_type) catch return;
         pw.writeByte('\'') catch return;
     }
     if (inner_xml.len > 0) {
@@ -1090,11 +1090,11 @@ fn sendOtherResourcesPresence(
         var pres_fbs = std.io.fixedBufferStream(&pres_buf);
         const pw = pres_fbs.writer();
         pw.writeAll("<presence from='") catch continue;
-        pw.writeAll(local) catch continue;
+        xml.escapeWrite(pw, local) catch continue;
         pw.writeByte('@') catch continue;
-        pw.writeAll(domain) catch continue;
+        xml.escapeWrite(pw, domain) catch continue;
         pw.writeByte('/') catch continue;
-        pw.writeAll(entry_resource) catch continue;
+        xml.escapeWrite(pw, entry_resource) catch continue;
         pw.writeByte('\'') catch continue;
         if (entry.priority != 0) {
             pw.writeAll("><priority>") catch continue;
@@ -1144,11 +1144,11 @@ pub fn dispatchDirectedPresenceToBareJid(
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (sender_session.stanza_type.len > 0) {
         pw.writeAll(" type='") catch return;
-        pw.writeAll(sender_session.stanza_type) catch return;
+        xml.escapeWrite(pw, sender_session.stanza_type) catch return;
         pw.writeByte('\'') catch return;
     }
     if (inner_xml.len > 0) {

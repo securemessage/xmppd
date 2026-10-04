@@ -223,9 +223,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         const aw = aug_fbs.writer();
         aw.writeAll(inner_xml) catch break :blk inner_xml;
         aw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch break :blk inner_xml;
-        aw.writeAll(archive_stanza_id) catch break :blk inner_xml;
+        xml.escapeWrite(aw, archive_stanza_id) catch break :blk inner_xml;
         aw.writeAll("' by='") catch break :blk inner_xml;
-        aw.writeAll(server.server_host) catch break :blk inner_xml;
+        xml.escapeWrite(aw, server.server_host) catch break :blk inner_xml;
         aw.writeAll("'/>") catch break :blk inner_xml;
         break :blk aug_fbs.getWritten();
     } else inner_xml;
@@ -280,26 +280,26 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
             const sw = stanza_fbs.writer();
             sw.writeAll("<message from='") catch {};
-            sw.writeAll(from_str) catch {};
+            xml.escapeWrite(sw, from_str) catch {};
             sw.writeAll("' to='") catch {};
-            sw.writeAll(to_str) catch {};
+            xml.escapeWrite(sw, to_str) catch {};
             sw.writeByte('\'') catch {};
             if (type_str.len > 0) {
                 sw.writeAll(" type='") catch {};
-                sw.writeAll(type_str) catch {};
+                xml.escapeWrite(sw, type_str) catch {};
                 sw.writeByte('\'') catch {};
             }
             if (id_str.len > 0) {
                 sw.writeAll(" id='") catch {};
-                sw.writeAll(id_str) catch {};
+                xml.escapeWrite(sw, id_str) catch {};
                 sw.writeByte('\'') catch {};
             }
             sw.writeByte('>') catch {};
             sw.writeAll(inner_xml) catch {};
             sw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch {};
-            sw.writeAll(archive_stanza_id) catch {};
+            xml.escapeWrite(sw, archive_stanza_id) catch {};
             sw.writeAll("' by='") catch {};
-            sw.writeAll(server.server_host) catch {};
+            xml.escapeWrite(sw, server.server_host) catch {};
             sw.writeAll("'/>") catch {};
             sw.writeAll("</message>") catch {};
             const full_stanza = stanza_fbs.getWritten();
@@ -353,18 +353,18 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     var stanza_fbs2 = std.io.fixedBufferStream(&stanza_buf2);
                     const sw2 = stanza_fbs2.writer();
                     sw2.writeAll("<message from='") catch {};
-                    sw2.writeAll(from_str) catch {};
+                    xml.escapeWrite(sw2, from_str) catch {};
                     sw2.writeAll("' to='") catch {};
-                    sw2.writeAll(to_str) catch {};
+                    xml.escapeWrite(sw2, to_str) catch {};
                     sw2.writeByte('\'') catch {};
                     if (type_str.len > 0) {
                         sw2.writeAll(" type='") catch {};
-                        sw2.writeAll(type_str) catch {};
+                        xml.escapeWrite(sw2, type_str) catch {};
                         sw2.writeByte('\'') catch {};
                     }
                     if (id_str.len > 0) {
                         sw2.writeAll(" id='") catch {};
-                        sw2.writeAll(id_str) catch {};
+                        xml.escapeWrite(sw2, id_str) catch {};
                         sw2.writeByte('\'') catch {};
                     }
                     if (inner_xml.len == 0) {
@@ -422,18 +422,18 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             mw.writeByte('<') catch continue;
             mw.writeAll(tag_name) catch continue;
             mw.writeAll(" from='") catch continue;
-            mw.writeAll(from_str) catch continue;
+            xml.escapeWrite(mw, from_str) catch continue;
             mw.writeAll("' to='") catch continue;
-            mw.writeAll(to_str) catch continue;
+            xml.escapeWrite(mw, to_str) catch continue;
             mw.writeByte('\'') catch continue;
             if (type_str.len > 0 and !(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
                 mw.writeAll(" type='") catch continue;
-                mw.writeAll(type_str) catch continue;
+                xml.escapeWrite(mw, type_str) catch continue;
                 mw.writeByte('\'') catch continue;
             }
             if (id_str.len > 0) {
                 mw.writeAll(" id='") catch continue;
-                mw.writeAll(id_str) catch continue;
+                xml.escapeWrite(mw, id_str) catch continue;
                 mw.writeByte('\'') catch continue;
             }
             if (delivery_inner_xml.len == 0) {
@@ -455,20 +455,20 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         mw.writeByte('<') catch continue;
         mw.writeAll(tag_name) catch continue;
         mw.writeAll(" from='") catch continue;
-        mw.writeAll(from_str) catch continue;
+        xml.escapeWrite(mw, from_str) catch continue;
         mw.writeAll("' to='") catch continue;
-        mw.writeAll(to_str) catch continue;
+        xml.escapeWrite(mw, to_str) catch continue;
         mw.writeByte('\'') catch continue;
         if (type_str.len > 0) {
             if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
                 mw.writeAll(" type='") catch continue;
-                mw.writeAll(type_str) catch continue;
+                xml.escapeWrite(mw, type_str) catch continue;
                 mw.writeByte('\'') catch continue;
             }
         }
         if (id_str.len > 0) {
             mw.writeAll(" id='") catch continue;
-            mw.writeAll(id_str) catch continue;
+            xml.escapeWrite(mw, id_str) catch continue;
             mw.writeByte('\'') catch continue;
         }
 
@@ -525,20 +525,20 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
     sw.writeByte('<') catch return;
     sw.writeAll(tag_name) catch return;
     sw.writeAll(" from='") catch return;
-    sw.writeAll(from_str) catch return;
+    xml.escapeWrite(sw, from_str) catch return;
     sw.writeAll("' to='") catch return;
-    sw.writeAll(to_str) catch return;
+    xml.escapeWrite(sw, to_str) catch return;
     sw.writeByte('\'') catch return;
     if (type_str.len > 0) {
         if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
             sw.writeAll(" type='") catch return;
-            sw.writeAll(type_str) catch return;
+            xml.escapeWrite(sw, type_str) catch return;
             sw.writeByte('\'') catch return;
         }
     }
     if (id_str.len > 0) {
         sw.writeAll(" id='") catch return;
-        sw.writeAll(id_str) catch return;
+        xml.escapeWrite(sw, id_str) catch return;
         sw.writeByte('\'') catch return;
     }
     if (inner_xml.len == 0) {
@@ -600,20 +600,20 @@ fn enqueueCrossThreadStanza(
     w.writeByte('<') catch return;
     w.writeAll(tag_name) catch return;
     w.writeAll(" from='") catch return;
-    w.writeAll(from_str) catch return;
+    xml.escapeWrite(w, from_str) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(to_str) catch return;
+    xml.escapeWrite(w, to_str) catch return;
     w.writeByte('\'') catch return;
     if (type_str.len > 0) {
         if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
             w.writeAll(" type='") catch return;
-            w.writeAll(type_str) catch return;
+            xml.escapeWrite(w, type_str) catch return;
             w.writeByte('\'') catch return;
         }
     }
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     if (inner_xml.len == 0) {
@@ -677,18 +677,18 @@ fn sendCarbons(
             cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(from_str) catch continue;
+            xml.escapeWrite(cw, from_str) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(to_str) catch continue;
+            xml.escapeWrite(cw, to_str) catch continue;
             cw.writeByte('\'') catch continue;
             if (type_str.len > 0) {
                 cw.writeAll(" type='") catch continue;
-                cw.writeAll(type_str) catch continue;
+                xml.escapeWrite(cw, type_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (id_str.len > 0) {
                 cw.writeAll(" id='") catch continue;
-                cw.writeAll(id_str) catch continue;
+                xml.escapeWrite(cw, id_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (delivery_inner_xml.len == 0) {
@@ -730,18 +730,18 @@ fn sendCarbons(
             cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(from_str) catch continue;
+            xml.escapeWrite(cw, from_str) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(to_str) catch continue;
+            xml.escapeWrite(cw, to_str) catch continue;
             cw.writeByte('\'') catch continue;
             if (type_str.len > 0) {
                 cw.writeAll(" type='") catch continue;
-                cw.writeAll(type_str) catch continue;
+                xml.escapeWrite(cw, type_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (id_str.len > 0) {
                 cw.writeAll(" id='") catch continue;
-                cw.writeAll(id_str) catch continue;
+                xml.escapeWrite(cw, id_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (delivery_inner_xml.len == 0) {
@@ -780,12 +780,12 @@ pub fn sendNotAuthorized(session: *Session, id_str: []const u8, to_str: []const 
     w.writeAll(" type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     if (to_str.len > 0) {
         w.writeAll(" from='") catch return;
-        w.writeAll(to_str) catch return;
+        xml.escapeWrite(w, to_str) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
@@ -810,13 +810,13 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
     w.writeAll(" type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll(" from='") catch return;
-    w.writeAll(to_str) catch return;
+    xml.escapeWrite(w, to_str) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(from_str) catch return;
+    xml.escapeWrite(w, from_str) catch return;
     w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
     w.writeAll(tag_name) catch return;
     w.writeByte('>') catch return;

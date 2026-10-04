@@ -1019,6 +1019,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    fanout_test_mod.addImport("xml", xml_mod);
     fanout_test_mod.addImport("room_registry", room_registry_test_mod);
     fanout_test_mod.addImport("room_store", room_store_test_mod);
 
@@ -1066,6 +1067,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    caps_test_mod.addImport("xml", xml_mod);
 
     const caps_tests = b.addTest(.{
         .name = "caps-tests",

@@ -12,6 +12,7 @@
 //! - `deliverOfflineMessages` — deliver queued messages on presence available
 
 const std = @import("std");
+const xml = @import("xml");
 const xmpp = @import("xmpp");
 
 const server_mod = @import("server.zig");
@@ -177,7 +178,7 @@ fn sendBindRejected(session: *Session) void {
     w.writeAll("<iq type='error'") catch return;
     if (session.bind_iq_id.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(session.bind_iq_id) catch return;
+        xml.escapeWrite(w, session.bind_iq_id) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++

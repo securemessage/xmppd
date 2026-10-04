@@ -1357,12 +1357,12 @@ pub const Server = struct {
         w.writeAll(" type='error'") catch return;
         if (to_attr.len > 0) {
             w.writeAll(" from='") catch return;
-            w.writeAll(to_attr) catch return;
+            xml.escapeWrite(w, to_attr) catch return;
             w.writeByte('\'') catch return;
         }
         if (id_attr.len > 0) {
             w.writeAll(" id='") catch return;
-            w.writeAll(id_attr) catch return;
+            xml.escapeWrite(w, id_attr) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
@@ -2092,7 +2092,7 @@ pub const Server = struct {
                             var vc_fbs = std.io.fixedBufferStream(&vc_buf);
                             const vw = vc_fbs.writer();
                             vw.writeAll("<vCard xmlns='vcard-temp'><PHOTO><EXTVAL>") catch {};
-                            vw.writeAll(m.photo_url) catch {};
+                            xml.escapeWrite(vw, m.photo_url) catch {};
                             vw.writeAll("</EXTVAL></PHOTO></vCard>") catch {};
                             vcard.set(bare_jid, vc_fbs.getWritten()) catch {};
                             log.info("OIDC photo imported for '{s}'", .{stable_username});
@@ -2437,11 +2437,11 @@ pub const Server = struct {
                 var err_fbs = std.io.fixedBufferStream(&err_buf);
                 const ew = err_fbs.writer();
                 ew.writeAll("<message type='error' from='") catch return;
-                ew.writeAll(m.to_jid) catch return;
+                xml.escapeWrite(ew, m.to_jid) catch return;
                 ew.writeAll("' to='") catch return;
-                ew.writeAll(m.from_jid) catch return;
+                xml.escapeWrite(ew, m.from_jid) catch return;
                 ew.writeAll("'><error type='cancel'><") catch return;
-                ew.writeAll(m.error_type) catch return;
+                xml.escapeWrite(ew, m.error_type) catch return;
                 ew.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
                 const err_xml = err_fbs.getWritten();
 
@@ -2512,11 +2512,11 @@ pub const Server = struct {
                 w.writeAll(" xmlns:") catch return;
                 w.writeAll(elem.prefix) catch return;
                 w.writeAll("='") catch return;
-                w.writeAll(elem.namespace_uri) catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
                 w.writeByte('\'') catch return;
             } else {
                 w.writeAll(" xmlns='") catch return;
-                w.writeAll(elem.namespace_uri) catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
                 w.writeByte('\'') catch return;
             }
         }
@@ -2579,11 +2579,11 @@ pub const Server = struct {
                 w.writeAll(" xmlns:") catch return;
                 w.writeAll(elem.prefix) catch return;
                 w.writeAll("='") catch return;
-                w.writeAll(elem.namespace_uri) catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
                 w.writeByte('\'') catch return;
             } else {
                 w.writeAll(" xmlns='") catch return;
-                w.writeAll(elem.namespace_uri) catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
                 w.writeByte('\'') catch return;
             }
         }
@@ -2795,18 +2795,18 @@ pub const Server = struct {
                 writer.writeAll("<iq type='result'") catch return;
                 if (session.bind_iq_id.len > 0) {
                     writer.writeAll(" id='") catch return;
-                    writer.writeAll(session.bind_iq_id) catch return;
+                    xml.escapeWrite(writer, session.bind_iq_id) catch return;
                     writer.writeByte('\'') catch return;
                 }
                 writer.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>") catch return;
                 if (bound_jid.local.len > 0) {
-                    writer.writeAll(bound_jid.local) catch return;
+                    xml.escapeWrite(writer, bound_jid.local) catch return;
                     writer.writeByte('@') catch return;
                 }
-                writer.writeAll(bound_jid.domain) catch return;
+                xml.escapeWrite(writer, bound_jid.domain) catch return;
                 if (bound_jid.resource.len > 0) {
                     writer.writeByte('/') catch return;
-                    writer.writeAll(bound_jid.resource) catch return;
+                    xml.escapeWrite(writer, bound_jid.resource) catch return;
                 }
                 writer.writeAll("</jid></bind></iq>") catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
@@ -4171,16 +4171,7 @@ pub const Server = struct {
 /// Re-encode text for XML output. The XML parser decodes entities (&amp; → &),
 /// so when serializing parsed content back to XML we must re-encode them.
 fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
-    for (text) |c| {
-        switch (c) {
-            '&' => try writer.writeAll("&amp;"),
-            '<' => try writer.writeAll("&lt;"),
-            '>' => try writer.writeAll("&gt;"),
-            '\'' => try writer.writeAll("&apos;"),
-            '"' => try writer.writeAll("&quot;"),
-            else => try writer.writeByte(c),
-        }
-    }
+    return xml.escapeWrite(writer, text);
 }
 
 /// Decode base64 into a fixed buffer. Returns the decoded slice or null on error.

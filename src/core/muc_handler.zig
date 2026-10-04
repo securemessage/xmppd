@@ -155,7 +155,8 @@ pub fn handleMucGroupchat(
         return;
     }
 
-    // Build the from JID: room@conference.host/sender_nick
+    // Build the from JID: room@conference.host/sender_nick. Kept raw here;
+    // buildPrefix escapes the whole from_str once on emit (S1).
     var from_buf: [384]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
@@ -232,11 +233,11 @@ pub fn handleMucGroupchat(
         var arch_fbs = std.io.fixedBufferStream(&arch_buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
-        aw.writeAll(from_str) catch return;
+        xml.escapeWrite(aw, from_str) catch return;
         aw.writeAll("' type='groupchat'") catch return;
         if (id_str.len > 0) {
             aw.writeAll(" id='") catch return;
-            aw.writeAll(id_str) catch return;
+            xml.escapeWrite(aw, id_str) catch return;
             aw.writeByte('\'') catch return;
         }
         aw.writeByte('>') catch return;
@@ -336,11 +337,11 @@ pub fn handleMucDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
     w.writeAll("<identity category='conference' type='text' name='Chat Rooms'/>") catch return;
     w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
@@ -367,11 +368,11 @@ pub fn handleMucDiscoItems(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#items'>") catch return;
 
     // List local public rooms (owned by this worker)
@@ -379,17 +380,17 @@ pub fn handleMucDiscoItems(
     const count = reg.listPublicRooms(&room_ptrs);
     for (room_ptrs[0..count]) |room| {
         w.writeAll("<item jid='") catch break;
-        w.writeAll(room.getJid()) catch break;
+        xml.escapeWrite(w, room.getJid()) catch break;
         w.writeAll("' name='") catch break;
         const name = room.config.getName();
         if (name.len > 0) {
-            w.writeAll(name) catch break;
+            xml.escapeWrite(w, name) catch break;
         } else {
             const jid = room.getJid();
             if (std.mem.indexOfScalar(u8, jid, '@')) |at| {
-                w.writeAll(jid[0..at]) catch break;
+                xml.escapeWrite(w, jid[0..at]) catch break;
             } else {
-                w.writeAll(jid) catch break;
+                xml.escapeWrite(w, jid) catch break;
             }
         }
         w.writeAll("'/>") catch break;
@@ -402,17 +403,17 @@ pub fn handleMucDiscoItems(
         // Skip rooms that are also in our local shard (avoid duplicates)
         if (reg.findByJid(entry.getJid()) != null) continue;
         w.writeAll("<item jid='") catch break;
-        w.writeAll(entry.getJid()) catch break;
+        xml.escapeWrite(w, entry.getJid()) catch break;
         w.writeAll("' name='") catch break;
         const dname = entry.getName();
         if (dname.len > 0) {
-            w.writeAll(dname) catch break;
+            xml.escapeWrite(w, dname) catch break;
         } else {
             const djid = entry.getJid();
             if (std.mem.indexOfScalar(u8, djid, '@')) |at| {
-                w.writeAll(djid[0..at]) catch break;
+                xml.escapeWrite(w, djid[0..at]) catch break;
             } else {
-                w.writeAll(djid) catch break;
+                xml.escapeWrite(w, djid) catch break;
             }
         }
         w.writeAll("'/>") catch break;
@@ -464,11 +465,11 @@ pub fn handleRoomDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
 
     if (reg.findByJid(room_jid)) |room| {
@@ -476,7 +477,7 @@ pub fn handleRoomDiscoInfo(
         w.writeAll("<identity category='conference' type='text'") catch return;
         if (name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(name) catch return;
+            xml.escapeWrite(w, name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll("/>") catch return;
@@ -643,11 +644,11 @@ pub fn handleMucAdminIq(
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
-    rw.writeAll(room_jid) catch return;
+    xml.escapeWrite(rw, room_jid) catch return;
     rw.writeAll("' to='") catch return;
     writeSessionJid(rw, session) catch return;
     rw.writeAll("' id='") catch return;
-    rw.writeAll(iq_id) catch return;
+    xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
     session.conn.queueSend(result_fbs.getWritten()) catch return;
@@ -670,11 +671,11 @@ fn sendIqErrorFromRoom(
     const w = fbs.writer();
 
     w.writeAll("<iq type='error' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
@@ -723,11 +724,11 @@ pub fn handleMucOwnerGet(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/muc#owner'>") catch return;
     w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
     w.writeAll("<title>Room Configuration</title>") catch return;
@@ -737,12 +738,12 @@ pub fn handleMucOwnerGet(
 
     // Room name
     w.writeAll("<field var='muc#roomconfig_roomname' type='text-single' label='Room Name'><value>") catch return;
-    w.writeAll(room.config.getName()) catch return;
+    xml.escapeWrite(w, room.config.getName()) catch return;
     w.writeAll("</value></field>") catch return;
 
     // Room description
     w.writeAll("<field var='muc#roomconfig_roomdesc' type='text-single' label='Description'><value>") catch return;
-    w.writeAll(room.config.getSubject()) catch return;
+    xml.escapeWrite(w, room.config.getSubject()) catch return;
     w.writeAll("</value></field>") catch return;
 
     // Boolean fields
@@ -755,7 +756,7 @@ pub fn handleMucOwnerGet(
 
     // Password
     w.writeAll("<field var='muc#roomconfig_roomsecret' type='text-private' label='Password'><value>") catch return;
-    w.writeAll(room.config.getPassword()) catch return;
+    xml.escapeWrite(w, room.config.getPassword()) catch return;
     w.writeAll("</value></field>") catch return;
 
     w.writeAll("</x></query></iq>") catch return;
@@ -836,11 +837,11 @@ pub fn handleMucOwnerSet(
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
-    rw.writeAll(room_jid) catch return;
+    xml.escapeWrite(rw, room_jid) catch return;
     rw.writeAll("' to='") catch return;
     writeSessionJid(rw, session) catch return;
     rw.writeAll("' id='") catch return;
-    rw.writeAll(iq_id) catch return;
+    xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
     session.conn.queueSend(result_fbs.getWritten()) catch return;
@@ -855,9 +856,9 @@ pub fn handleMucOwnerSet(
 /// Write a boolean form field element.
 fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, value: bool) void {
     w.writeAll("<field var='") catch return;
-    w.writeAll(var_name) catch return;
+    xml.escapeWrite(w, var_name) catch return;
     w.writeAll("' type='boolean' label='") catch return;
-    w.writeAll(label) catch return;
+    xml.escapeWrite(w, label) catch return;
     w.writeAll("'><value>") catch return;
     w.writeAll(if (value) "1" else "0") catch return;
     w.writeAll("</value></field>") catch return;
@@ -895,7 +896,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<message from='") catch continue;
-        w.writeAll(room.getJid()) catch continue;
+        xml.escapeWrite(w, room.getJid()) catch continue;
         w.writeAll("' to='") catch continue;
         writeSessionJid(w, target) catch continue;
         w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch continue;
@@ -1178,9 +1179,9 @@ fn sendOccupantPresence(
 
     // from = room@host/nick
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(occ.getNick()) catch return;
+    xml.escapeWrite(w, occ.getNick()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, target) catch return;
     w.writeAll("'>") catch return;
@@ -1215,9 +1216,9 @@ fn sendSelfPresence(
     const w = fbs.writer();
 
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(nick) catch return;
+    xml.escapeWrite(w, nick) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
@@ -1251,9 +1252,9 @@ fn broadcastOccupantJoin(
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(pw, room.getJid()) catch return;
     pw.writeByte('/') catch return;
-    pw.writeAll(nick) catch return;
+    xml.escapeWrite(pw, nick) catch return;
     pw.writeAll("' to='") catch return;
     const prefix = prefix_fbs.getWritten();
 
@@ -1311,9 +1312,9 @@ fn broadcastOccupantLeave(
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(pw, room.getJid()) catch return;
     pw.writeByte('/') catch return;
-    pw.writeAll(removed.getNick()) catch return;
+    xml.escapeWrite(pw, removed.getNick()) catch return;
     pw.writeAll("' to='") catch return;
     const prefix = prefix_fbs.getWritten();
 
@@ -1431,7 +1432,7 @@ fn sendRoomHistory(
         w.writeAll(stanza[first_gt..close_pos]) catch continue;
         // Append delay stamp
         w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-        w.writeAll(room_jid) catch continue;
+        xml.escapeWrite(w, room_jid) catch continue;
         w.writeAll("' stamp='") catch continue;
         w.writeAll(delay_str) catch continue;
         w.writeAll("'/>") catch continue;
@@ -1483,11 +1484,11 @@ fn sendRoomSubject(
     const w = fbs.writer();
 
     w.writeAll("<message from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='groupchat'><subject>") catch return;
-    w.writeAll(subject) catch return;
+    xml.escapeWrite(w, subject) catch return;
     w.writeAll("</subject></message>") catch return;
 
     session.conn.queueSend(fbs.getWritten()) catch return;
@@ -1514,9 +1515,9 @@ fn sendPresenceError(
     const w = fbs.writer();
 
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room_local) catch return;
+    xml.escapeWrite(w, room_local) catch return;
     w.writeByte('@') catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='error'><error type='cancel'><") catch return;
@@ -1544,15 +1545,15 @@ fn sendMessageError(
     const w = fbs.writer();
 
     w.writeAll("<message from='") catch return;
-    w.writeAll(room_local) catch return;
+    xml.escapeWrite(w, room_local) catch return;
     w.writeByte('@') catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><error type='cancel'><") catch return;
@@ -1611,11 +1612,11 @@ pub fn processRemoteJoin(
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<presence from='") catch return;
-        w.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(w, ev.room_jid) catch return;
         w.writeByte('/') catch return;
-        w.writeAll(ev.nick) catch return;
+        xml.escapeWrite(w, ev.nick) catch return;
         w.writeAll("' to='") catch return;
-        w.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(w, ev.real_jid) catch return;
         w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
         return;
@@ -1630,9 +1631,9 @@ pub fn processRemoteJoin(
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
-            ew.writeAll(ev.room_jid) catch return;
+            xml.escapeWrite(ew, ev.room_jid) catch return;
             ew.writeAll("' to='") catch return;
-            ew.writeAll(ev.real_jid) catch return;
+            xml.escapeWrite(ew, ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
             ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
@@ -1656,9 +1657,9 @@ pub fn processRemoteJoin(
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
-            ew.writeAll(ev.room_jid) catch return;
+            xml.escapeWrite(ew, ev.room_jid) catch return;
             ew.writeAll("' to='") catch return;
-            ew.writeAll(ev.real_jid) catch return;
+            xml.escapeWrite(ew, ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
             ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
@@ -1675,9 +1676,9 @@ pub fn processRemoteJoin(
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
-        ew.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(ew, ev.room_jid) catch return;
         ew.writeAll("' to='") catch return;
-        ew.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(ew, ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><registration-required xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
@@ -1689,9 +1690,9 @@ pub fn processRemoteJoin(
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
-        ew.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(ew, ev.room_jid) catch return;
         ew.writeAll("' to='") catch return;
-        ew.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(ew, ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
@@ -1717,11 +1718,11 @@ pub fn processRemoteJoin(
         var occ_fbs = std.io.fixedBufferStream(&occ_buf);
         const ow = occ_fbs.writer();
         ow.writeAll("<presence from='") catch continue;
-        ow.writeAll(r.getJid()) catch continue;
+        xml.escapeWrite(ow, r.getJid()) catch continue;
         ow.writeByte('/') catch continue;
-        ow.writeAll(occ.getNick()) catch continue;
+        xml.escapeWrite(ow, occ.getNick()) catch continue;
         ow.writeAll("' to='") catch continue;
-        ow.writeAll(ev.real_jid) catch continue;
+        xml.escapeWrite(ow, ev.real_jid) catch continue;
         ow.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch continue;
         ow.writeAll(occ.affiliation.toName()) catch continue;
         ow.writeAll("' role='") catch continue;
@@ -1739,11 +1740,11 @@ pub fn processRemoteJoin(
         var self_fbs = std.io.fixedBufferStream(&self_buf);
         const sw = self_fbs.writer();
         sw.writeAll("<presence from='") catch return;
-        sw.writeAll(r.getJid()) catch return;
+        xml.escapeWrite(sw, r.getJid()) catch return;
         sw.writeByte('/') catch return;
-        sw.writeAll(ev.nick) catch return;
+        xml.escapeWrite(sw, ev.nick) catch return;
         sw.writeAll("' to='") catch return;
-        sw.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(sw, ev.real_jid) catch return;
         sw.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
         sw.writeAll(affiliation.toName()) catch return;
         sw.writeAll("' role='") catch return;
@@ -1760,11 +1761,11 @@ pub fn processRemoteJoin(
         var subj_fbs = std.io.fixedBufferStream(&subj_buf);
         const sjw = subj_fbs.writer();
         sjw.writeAll("<message from='") catch return;
-        sjw.writeAll(r.getJid()) catch return;
+        xml.escapeWrite(sjw, r.getJid()) catch return;
         sjw.writeAll("' to='") catch return;
-        sjw.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(sjw, ev.real_jid) catch return;
         sjw.writeAll("' type='groupchat'><subject>") catch return;
-        sjw.writeAll(subject) catch return;
+        xml.escapeWrite(sjw, subject) catch return;
         sjw.writeAll("</subject></message>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, subj_fbs.getWritten()) catch {};
     }
@@ -1893,11 +1894,11 @@ pub fn processRemoteGroupchat(
         var arch_fbs = std.io.fixedBufferStream(&arch_buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
-        aw.writeAll(from_str) catch return;
+        xml.escapeWrite(aw, from_str) catch return;
         aw.writeAll("' type='groupchat'") catch return;
         if (ev.stanza_id.len > 0) {
             aw.writeAll(" id='") catch return;
-            aw.writeAll(ev.stanza_id) catch return;
+            xml.escapeWrite(aw, ev.stanza_id) catch return;
             aw.writeByte('\'') catch return;
         }
         aw.writeByte('>') catch return;
@@ -1923,11 +1924,11 @@ pub fn processRemoteDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(ev.reply_to_jid) catch return;
+    xml.escapeWrite(w, ev.reply_to_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(ev.iq_id) catch return;
+    xml.escapeWrite(w, ev.iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
 
     if (reg.findByJid(ev.room_jid)) |room| {
@@ -1935,7 +1936,7 @@ pub fn processRemoteDiscoInfo(
         w.writeAll("<identity category='conference' type='text'") catch return;
         if (name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(name) catch return;
+            xml.escapeWrite(w, name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll("/>") catch return;
@@ -2169,11 +2170,11 @@ fn sendRoomHistoryRemote(
 
         w.writeAll(stanza[0..first_gt]) catch continue;
         w.writeAll(" to='") catch continue;
-        w.writeAll(real_jid) catch continue;
+        xml.escapeWrite(w, real_jid) catch continue;
         w.writeByte('\'') catch continue;
         w.writeAll(stanza[first_gt..close_pos]) catch continue;
         w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-        w.writeAll(room_jid) catch continue;
+        xml.escapeWrite(w, room_jid) catch continue;
         w.writeAll("' stamp='") catch continue;
         w.writeAll(delay_str) catch continue;
         w.writeAll("'/>") catch continue;
@@ -2222,17 +2223,17 @@ fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u
 
 fn writeSessionJid(w: anytype, session: *const Session) !void {
     const bound = session.stream.bound_jid orelse return;
-    try w.writeAll(bound.local);
+    try xml.escapeWrite(w, bound.local);
     try w.writeByte('@');
-    try w.writeAll(bound.domain);
+    try xml.escapeWrite(w, bound.domain);
     if (bound.resource.len > 0) {
         try w.writeByte('/');
-        try w.writeAll(bound.resource);
+        try xml.escapeWrite(w, bound.resource);
     }
 }
 
 fn writeOccupantRealJid(w: anytype, occ: *const Occupant) !void {
-    try w.writeAll(occ.getRealJid());
+    try xml.escapeWrite(w, occ.getRealJid());
 }
 
 /// Look up a user's XEP-0084 avatar hash from PEP metadata node.
@@ -2354,9 +2355,9 @@ pub fn processRemoteAdminAction(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(ev.iq_id) catch return;
+    xml.escapeWrite(w, ev.iq_id) catch return;
     w.writeAll("'/>") catch return;
 
     const ds = server.delivery_system orelse return;
@@ -2457,9 +2458,9 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='error' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><error type='cancel'><") catch return;
     w.writeAll(error_type) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;

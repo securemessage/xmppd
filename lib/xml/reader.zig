@@ -347,6 +347,24 @@ pub const Reader = struct {
 
 // --- Tests ---
 
+/// Write `value` XML-escaped, suitable for attribute values (quoted with
+/// either quote style) and character data: & < > ' " are entity-encoded.
+/// The scanner decodes entities on read, so parsed content must be
+/// re-encoded when re-emitted; writing decoded values raw enables stanza
+/// injection via quote breakout (S1).
+pub fn escapeWrite(writer: anytype, value: []const u8) !void {
+    for (value) |c| {
+        switch (c) {
+            '&' => try writer.writeAll("&amp;"),
+            '<' => try writer.writeAll("&lt;"),
+            '>' => try writer.writeAll("&gt;"),
+            '\'' => try writer.writeAll("&apos;"),
+            '"' => try writer.writeAll("&quot;"),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
 test "reader: stream restart mid-buffer after reset" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);
@@ -610,6 +628,13 @@ test "reader: nesting past the stacks is a hard TooDeep error (S12)" {
         _ = ev;
     }
     try std.testing.expect(got_too_deep);
+}
+
+test "escapeWrite encodes the five escapables (S1)" {
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try escapeWrite(fbs.writer(), "a&b<c>d'e\"f");
+    try std.testing.expectEqualStrings("a&amp;b&lt;c&gt;d&apos;e&quot;f", fbs.getWritten());
 }
 
 test "scanner tests" {
