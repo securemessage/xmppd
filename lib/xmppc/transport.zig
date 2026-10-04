@@ -24,8 +24,9 @@ pub const Result = union(enum) {
 
 pub const Transport = struct {
     link: Link,
-    /// Bytes of the currently pending TLS write retry (0 = none). The same
-    /// buffer address must be retried with at least this length.
+    /// Bytes of the currently pending TLS write retry (0 = none). The retry
+    /// must use the identical pointer AND length (AGENTS.md rule; session
+    /// slices write_buf accordingly through pinnedLen/hasPendingWrite).
     tls_pending: usize = 0,
 
     pub const Kind = enum { plain, tls };
@@ -76,6 +77,11 @@ pub const Transport = struct {
     /// pointer will be retried when the socket drains.
     pub fn hasPendingWrite(self: *const Transport) bool {
         return self.tls_pending > 0;
+    }
+
+    /// Length of the pinned outstanding TLS write — the retry slice length.
+    pub fn pinnedLen(self: *const Transport) usize {
+        return self.tls_pending;
     }
 
     /// Read into buf. EOF/TLS close_notify is .closed (not 0).

@@ -739,14 +739,16 @@ pub const Session = struct {
             try self.overflow.appendSlice(self.engine.allocator, data);
             return;
         }
+        // While a TLS write is pinned, EVERY new byte goes to overflow —
+        // even when it would fit: an in-place append would stretch the
+        // pending retry slice, violating the identical-length retry rule
+        // (T253). consumeWritten merges overflow back once the pin clears.
+        const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
+        if (tls_pinned) {
+            try self.overflow.appendSlice(self.engine.allocator, data);
+            return;
+        }
         if (self.write_len + data.len > self.write_buf.len) {
-            // Growing would move write_buf under a pending TLS retry.
-            const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
-            if (tls_pinned) {
-                try self.overflow.appendSlice(self.engine.allocator, data);
-                return;
-            }
-            // Compact the consumed prefix first — growth is the last resort.
             if (self.write_start > 0) {
                 std.mem.copyForwards(u8, self.write_buf, self.write_buf[self.write_start..self.write_len]);
                 self.write_len -= self.write_start;
@@ -821,7 +823,11 @@ pub const Session = struct {
 
     fn sendSome(self: *Session) !usize {
         const tp = if (self.tport) |*t| t else return error.NoTransport;
-        return switch (try tp.write(self.write_buf[self.write_start..self.write_len])) {
+        // A pending TLS retry must be re-driven with the identical slice
+        // (pointer and length) — never with later-appended bytes folded in
+        // (T253; AGENTS.md kTLS rule; SSL_MODE_ENABLE_PARTIAL_WRITE is not set).
+        const end = if (tp.hasPendingWrite()) @min(self.write_start + tp.pinnedLen(), self.write_len) else self.write_len;
+        return switch (try tp.write(self.write_buf[self.write_start..end])) {
             .data => |n| n,
             .would_block => 0,
             .closed => error.ConnectionClosed,
@@ -1213,11 +1219,12 @@ test "write path: appending in place during a pending TLS write keeps the buffer
     s.tport = Transport.initPlain(-1); // only the pin bookkeeping is used
     s.tport.?.tls_pending = s.write_len;
     const pinned = s.write_buf.ptr;
-    // Fits: the retry may legally pass a longer length from the same address.
+    // Fits, but must STILL go to overflow: the pinned retry slice may not
+    // grow (T253; what the retry sees must equal the pinned call exactly).
     try s.queue("<message/>");
     try std.testing.expect(s.write_buf.ptr == pinned);
-    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
-    try std.testing.expectEqualStrings("<presence/><message/>", s.write_buf[0..s.write_len]);
+    try std.testing.expectEqualStrings("<message/>", s.overflow.items);
+    try std.testing.expectEqualStrings("<presence/>", s.write_buf[0..s.write_len]);
 }
 
 test "write path: buffer grows normally when no TLS write is pending" {
