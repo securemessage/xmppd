@@ -1276,6 +1276,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(master_exe);
 
+    // xmppd master tests (same module instance — Zig forbids re-rooting)
+    const master_tests = b.addTest(.{
+        .name = "master-tests",
+        .root_module = master_mod,
+    });
+    master_tests.root_module.link_libc = true;
+    const run_master_tests = b.addRunArtifact(master_tests);
+
     // xmppd-auth: the authentication daemon
     const auth_ipc_protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),
@@ -1587,6 +1595,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_auth_handler_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
+    test_step.dependOn(&run_master_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);

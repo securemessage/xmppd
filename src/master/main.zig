@@ -300,13 +300,19 @@ pub fn main() !void {
     }
 
     // --- Orphan child cleanup ---
-    // Kill any stale children from a previous master that died ungracefully
+    // Kill any stale children from a previous master that died ungracefully.
+    // The exe basename ride-along keeps us from ever SIGKILLing a pid that
+    // was recycled by an unrelated process (T259).
     {
         var orphan_buf: [4096]u8 = undefined;
-        const orphan_names = [_][]const u8{ "auth.pid", "s2s.pid", "core.pid" };
-        for (orphan_names) |name| {
-            const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, name }) catch continue;
-            cleanupOrphan(p);
+        const orphan_spec = [_]struct { file: []const u8, exe: []const u8 }{
+            .{ .file = "auth.pid", .exe = "xmppd-auth" },
+            .{ .file = "s2s.pid", .exe = "xmppd-s2s" },
+            .{ .file = "core.pid", .exe = "xmppd-core" },
+        };
+        for (orphan_spec) |spec| {
+            const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, spec.file }) catch continue;
+            cleanupOrphan(p, spec.exe);
         }
     }
 
@@ -602,6 +608,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid("/var/run/xmppd/auth.pid", new_pid);
                     } else if (t.ident == CORE_UDATA) {
                         const new_pid = core_sup.spawnChild() catch |err| {
                             log.err("failed to respawn core: {}", .{err});
@@ -609,6 +616,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid("/var/run/xmppd/core.pid", new_pid);
                     } else if (t.ident == S2S_UDATA) {
                         const new_pid = s2s_sup.spawnChild() catch |err| {
                             log.err("failed to respawn s2s: {}", .{err});
@@ -616,6 +624,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid("/var/run/xmppd/s2s.pid", new_pid);
                     }
                 },
                 .signal => |s| {
@@ -662,9 +671,34 @@ fn removeChildPid(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
+/// FreeBSD sysctl read of a live process's binary path. Absent from zig's
+/// std.c mapping for this Zig version. kern.proc.pathname has no byname
+/// form; it takes a four-element mib { CTL_KERN, KERN_PROC,
+/// KERN_PROC_PATHNAME, pid }.
+extern "c" fn sysctl(mib: [*c]const c_int, miblen: c_uint, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+
+const CTL_KERN: c_int = 1;
+const KERN_PROC: c_int = 14;
+const KERN_PROC_PATHNAME: c_int = 12;
+
+/// True when the live process `pid` runs a binary whose basename starts
+/// with expected (covers xmppd-auth vs xmppd-auth-oidc). The orphan killer
+/// must never signal a pid that the kernel recycled (T259).
+fn procMatchesBinary(pid: posix.pid_t, expected_basename: []const u8) bool {
+    const mib = [_]c_int{ CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid };
+    var exe_buf: [1024]u8 = undefined;
+    var len: usize = exe_buf.len;
+    if (sysctl(&mib, mib.len, &exe_buf, &len, null, 0) != 0) return false;
+    if (len == 0 or len > exe_buf.len) return false;
+    const full = std.mem.sliceTo(exe_buf[0..len], 0);
+    const base = if (std.mem.lastIndexOfScalar(u8, full, '/')) |slash| full[slash + 1 ..] else full;
+    return std.mem.startsWith(u8, base, expected_basename);
+}
+
 /// Check for an orphaned child process from a previous master instance.
-/// If the PID file exists and the process is still alive, terminate it.
-fn cleanupOrphan(path: []const u8) void {
+/// If the PID file exists and the process is still alive AND still runs the
+/// expected child binary, terminate it.
+fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
     const file = std.fs.cwd().openFile(path, .{}) catch return;
     defer file.close();
 
@@ -680,6 +714,14 @@ fn cleanupOrphan(path: []const u8) void {
     const ret = std.c.kill(pid, 0);
     if (ret != 0) {
         // Process doesn't exist — clean up stale PID file
+        std.fs.cwd().deleteFile(path) catch {};
+        return;
+    }
+
+    // A live pid under that number might NOT be our child — pids recycle
+    // (T259). Only signal when the binary identity still matches.
+    if (!procMatchesBinary(pid, expected_basename)) {
+        log.warn("pid file {s} references pid={d} running another binary — NOT killing it (recycled pid)", .{ path, pid });
         std.fs.cwd().deleteFile(path) catch {};
         return;
     }
@@ -804,4 +846,12 @@ fn detectCpuCount() u16 {
         return @intCast(@min(ncpu, 64));
     }
     return 1;
+}
+
+test "procMatchesBinary: matches own binary, rejects a foreign name (T259)" {
+    const self_pid = std.c.getpid();
+    // The test executable is "master-tests"; same prefix logic as the
+    // xmppd-core / xmppd-auth / xmppd-s2s check in cleanupOrphan.
+    try std.testing.expect(procMatchesBinary(self_pid, "master-tests"));
+    try std.testing.expect(!procMatchesBinary(self_pid, "xmppd-core"));
 }
