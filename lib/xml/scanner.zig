@@ -350,8 +350,7 @@ pub const Scanner = struct {
                     // Reading entity name after `&` in text content.
                     // Uses val_buf to accumulate entity name (buf holds text content).
                     if (c == ';') {
-                        const decoded = try resolveEntity(self.val_buf.items);
-                        try self.buf.append(a, decoded);
+                        try resolveEntityInto(self.val_buf.items, &self.buf, a);
                         self.val_buf.clearRetainingCapacity();
                         self.state = .content;
                     } else if (self.val_buf.items.len > 8) {
@@ -364,9 +363,8 @@ pub const Scanner = struct {
                     // Reading entity name after `&` in attribute value.
                     // Uses buf to accumulate entity name (val_buf holds attr value).
                     if (c == ';') {
-                        const decoded = try resolveEntity(self.buf.items);
+                        try resolveEntityInto(self.buf.items, &self.val_buf, a);
                         self.buf.clearRetainingCapacity();
-                        try self.val_buf.append(a, decoded);
                         self.state = .attr_value;
                     } else if (self.buf.items.len > 8) {
                         return error.InvalidEntityReference;
@@ -406,36 +404,47 @@ pub const Scanner = struct {
     }
 };
 
-/// Resolve an XML entity reference name to its character value.
+/// Resolve an XML entity reference and append its UTF-8 encoding to `out`.
 ///
 /// Supports the 5 predefined XML entities (required by all XML parsers)
-/// and numeric character references (&#NNN; and &#xHH;).
+/// and numeric character references (&#NNN; and &#xHH;). Numeric values
+/// must satisfy the XML 1.0 Char production and are UTF-8 encoded (S21:
+/// previously truncated to a lone low byte, producing invalid UTF-8).
 ///
 /// Custom/undeclared entity references return error — XMPP forbids DTDs
 /// so there is no mechanism to define custom entities (RFC 6120 §11.1).
-fn resolveEntity(name: []const u8) !u8 {
+fn resolveEntityInto(name: []const u8, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
     // Predefined XML entities
-    if (std.mem.eql(u8, name, "amp")) return '&';
-    if (std.mem.eql(u8, name, "lt")) return '<';
-    if (std.mem.eql(u8, name, "gt")) return '>';
-    if (std.mem.eql(u8, name, "apos")) return '\'';
-    if (std.mem.eql(u8, name, "quot")) return '"';
+    if (std.mem.eql(u8, name, "amp")) return out.append(a, '&');
+    if (std.mem.eql(u8, name, "lt")) return out.append(a, '<');
+    if (std.mem.eql(u8, name, "gt")) return out.append(a, '>');
+    if (std.mem.eql(u8, name, "apos")) return out.append(a, '\'');
+    if (std.mem.eql(u8, name, "quot")) return out.append(a, '"');
 
-    // Numeric character reference: &#NNN; (decimal)
+    // Numeric character reference: &#NNN; (decimal) or &#xHH; (hex)
     if (name.len > 1 and name[0] == '#') {
-        if (name[1] == 'x' or name[1] == 'X') {
-            // Hexadecimal: &#xHH;
-            const val = std.fmt.parseInt(u8, name[2..], 16) catch return error.InvalidEntityReference;
-            return val;
-        } else {
-            // Decimal: &#NNN;
-            const val = std.fmt.parseInt(u8, name[1..], 10) catch return error.InvalidEntityReference;
-            return val;
-        }
+        const val: u21 = if (name[1] == 'x' or name[1] == 'X')
+            std.fmt.parseInt(u21, name[2..], 16) catch return error.InvalidEntityReference
+        else
+            std.fmt.parseInt(u21, name[1..], 10) catch return error.InvalidEntityReference;
+        if (!isXmlChar(val)) return error.InvalidEntityReference;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(val, &buf) catch return error.InvalidEntityReference;
+        try out.appendSlice(a, buf[0..n]);
+        return;
     }
 
     // Unknown entity — forbidden in XMPP (no DTD to define custom entities)
     return error.InvalidEntityReference;
+}
+
+/// XML 1.0 (Fifth Edition) Char production: #x9 | #xA | #xD |
+/// [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+fn isXmlChar(cp: u21) bool {
+    return cp == 0x9 or cp == 0xA or cp == 0xD or
+        (cp >= 0x20 and cp <= 0xD7FF) or
+        (cp >= 0xE000 and cp <= 0xFFFD) or
+        (cp >= 0x10000 and cp <= 0x10FFFF);
 }
 
 // --- Tests ---
@@ -623,6 +632,49 @@ test "entity decoding: unknown entity rejected" {
 
     const result = scanner.next(input, &pos);
     try std.testing.expectError(error.InvalidEntityReference, result);
+}
+
+test "entity decoding: numeric refs are UTF-8 encoded, not truncated (S21)" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    // &#233; = U+00E9 'é' (0xC3 0xA9), &#x1F600; = U+1F600 (4 bytes).
+    // &#x42; stays a single ASCII byte. Mixed with an attribute value.
+    const input = "<x attr='&#233;'>a&#233;b&#x1F600;c&#x42;</x>";
+    var pos: usize = 0;
+
+    _ = (try scanner.next(input, &pos)).?; // element_open
+    const attr_tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.attribute, attr_tok.type);
+    try std.testing.expectEqualStrings("\xc3\xa9", attr_tok.value);
+
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+    const tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.text, tok.type);
+    try std.testing.expectEqualStrings("a\xc3\xa9b\xf0\x9f\x98\x80cB", tok.name);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tok.name));
+}
+
+test "entity decoding: non-Char numeric refs rejected (S21)" {
+    const cases = [_][]const u8{
+        "<x>&#0;</x>", // NUL is not an XML Char
+        "<x>&#1;</x>", // C0 control
+        "<x>&#xB;</x>", // vertical tab
+        "<x>&#xD800;</x>", // UTF-16 surrogate half
+        "<x>&#xFFFE;</x>", // noncharacter
+        "<x>&#x110000;</x>", // beyond Unicode range
+    };
+    for (cases) |input| {
+        const allocator = std.testing.allocator;
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+
+        var pos: usize = 0;
+        _ = (try scanner.next(input, &pos)).?; // element_open
+        _ = (try scanner.next(input, &pos)).?; // element_open_end
+        try std.testing.expectError(error.InvalidEntityReference, scanner.next(input, &pos));
+    }
 }
 
 test "DOCTYPE rejected (RFC 6120 section 11.1)" {
