@@ -122,9 +122,12 @@ pub const OutboundConnection = struct {
         allocator: std.mem.Allocator,
         local_domain: []const u8,
         remote_domain: []const u8,
-    ) OutboundConnection {
+    ) !OutboundConnection {
+        // Copy the domain — callers hand slices that borrow the IPC recv
+        // buffer; the pool key depends on it being stable (T275).
+        const domain = try allocator.dupe(u8, remote_domain);
         return .{
-            .remote_domain = remote_domain,
+            .remote_domain = domain,
             .local_domain = local_domain,
             .state = .connecting,
             .stream = S2sStream.init(.initiating, local_domain),
@@ -135,9 +138,12 @@ pub const OutboundConnection = struct {
 
     pub fn deinit(self: *OutboundConnection, allocator: std.mem.Allocator) void {
         for (self.pending_stanzas.items) |stanza| {
+            allocator.free(stanza.from_jid);
+            allocator.free(stanza.to_jid);
             allocator.free(stanza.xml);
         }
         self.pending_stanzas.deinit(allocator);
+        allocator.free(self.remote_domain);
         if (self.target_host.len > 0) {
             allocator.free(self.target_host);
             self.target_host = "";
@@ -303,12 +309,18 @@ pub const OutboundConnection = struct {
     }
 
     /// Queue a stanza for delivery once the connection is established.
+    /// from/to/xml are all copied: the caller's slices borrow the IPC recv
+    /// buffer whose next frame rewrites them (T275).
     pub fn queueStanza(self: *OutboundConnection, allocator: std.mem.Allocator, from: []const u8, to: []const u8, xml: []const u8) !void {
+        const from_copy = try allocator.dupe(u8, from);
+        errdefer allocator.free(from_copy);
+        const to_copy = try allocator.dupe(u8, to);
+        errdefer allocator.free(to_copy);
         const xml_copy = try allocator.dupe(u8, xml);
         errdefer allocator.free(xml_copy);
         try self.pending_stanzas.append(allocator, .{
-            .from_jid = from,
-            .to_jid = to,
+            .from_jid = from_copy,
+            .to_jid = to_copy,
             .xml = xml_copy,
         });
     }
@@ -537,8 +549,17 @@ pub const ConnectionPool = struct {
         }
 
         const conn = try self.allocator.create(OutboundConnection);
-        conn.* = OutboundConnection.init(self.allocator, local_domain, remote_domain);
-        try self.connections.put(remote_domain, conn);
+        conn.* = OutboundConnection.init(self.allocator, local_domain, remote_domain) catch |err| {
+            self.allocator.destroy(conn);
+            return err;
+        };
+        // The map key is the connection's own duped domain (T275): one
+        // owner, freed at deinit; a caller-borrowed slice never reaches it.
+        self.connections.put(conn.remote_domain, conn) catch |err| {
+            conn.deinit(self.allocator);
+            self.allocator.destroy(conn);
+            return err;
+        };
         return conn;
     }
 
@@ -569,7 +590,7 @@ pub const ConnectionPool = struct {
 
 test "OutboundConnection: init and basic state" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     try std.testing.expectEqual(OutboundState.connecting, conn.state);
@@ -581,7 +602,7 @@ test "OutboundConnection: init and basic state" {
 
 test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = false;
@@ -591,7 +612,7 @@ test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
 
 test "OutboundConnection: TCP connected → TLS handshake (direct TLS path)" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = true;
@@ -601,7 +622,7 @@ test "OutboundConnection: TCP connected → TLS handshake (direct TLS path)" {
 
 test "OutboundConnection: full DANE-verified lifecycle" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     // Direct TLS path
@@ -632,7 +653,7 @@ test "OutboundConnection: full DANE-verified lifecycle" {
 
 test "OutboundConnection: STARTTLS lifecycle with no DANE" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = false;
@@ -668,7 +689,7 @@ test "OutboundConnection: STARTTLS lifecycle with no DANE" {
 
 test "OutboundConnection: DANE failure rejects connection" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = true;
@@ -681,7 +702,7 @@ test "OutboundConnection: DANE failure rejects connection" {
 
 test "OutboundConnection: queue and count pending stanzas" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     try conn.queueStanza(alloc, "alice@a.example", "bob@b.example", "<message><body>hi</body></message>");
@@ -691,7 +712,7 @@ test "OutboundConnection: queue and count pending stanzas" {
 
 test "OutboundConnection: buildStreamOpen" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
@@ -704,7 +725,7 @@ test "OutboundConnection: buildStreamOpen" {
 
 test "OutboundConnection: buildSaslExternal" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
@@ -717,7 +738,7 @@ test "OutboundConnection: buildSaslExternal" {
 
 test "OutboundConnection: buildStarttls" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [256]u8 = undefined;
