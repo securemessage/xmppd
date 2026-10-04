@@ -420,9 +420,13 @@ pub const S2sDaemon = struct {
         return null;
     }
 
-    /// Close an outbound connection slot.
-    fn closeOutbound(self: *S2sDaemon, slot: usize) void {
+    /// Close an outbound connection slot. Purges its staged kevent entries
+    /// first: a same-iteration accept can reuse the fd number (T238/T277).
+    fn closeOutbound(self: *S2sDaemon, batch: *ChangeList, slot: usize) void {
         if (slot >= MAX_OUTBOUND_CONNS) return;
+        if (self.outbound[slot]) |conn| {
+            batch.purgeFd(conn.fd);
+        }
         if (self.outbound_readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
@@ -465,9 +469,13 @@ pub const S2sDaemon = struct {
         }
     }
 
-    /// Close an inbound session.
-    pub fn closeInbound(self: *S2sDaemon, slot: usize) void {
+    /// Close an inbound session. Purges its staged kevent entries first:
+    /// a same-iteration accept can reuse the fd number (T238/T277).
+    pub fn closeInbound(self: *S2sDaemon, batch: *ChangeList, slot: usize) void {
         if (slot >= MAX_INBOUND_SESSIONS) return;
+        if (self.inbound[slot]) |session| {
+            batch.purgeFd(session.fd);
+        }
         if (self.readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
@@ -820,14 +828,14 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         switch (err) {
             error.WouldBlock => return,
             else => {
-                daemon.closeInbound(slot);
+                daemon.closeInbound(batch, slot);
                 return;
             },
         }
     };
 
     if (n == 0) {
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     }
 
@@ -867,7 +875,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/> — stream policy-violation", .{ slot, session.read_end - session.read_start });
         sendStreamError(session, .policy_violation);
         _ = session.flushWrite() catch {};
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     }
 
@@ -894,7 +902,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
 fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, session: *S2sSession) void {
     const complete = session.continueHandshake() catch {
         log.err("inbound S2S id={d} TLS handshake failed", .{slot});
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     };
 
@@ -1168,7 +1176,7 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (authenticated peer domain {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
         sendStreamError(session, err);
         _ = session.flushWrite() catch {};
-        daemon.closeInbound(session.id);
+        daemon.closeInbound(batch, session.id);
         return;
     }
 
@@ -1402,7 +1410,7 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     }
 
     _ = session.flushWrite() catch {
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     };
 
@@ -1414,7 +1422,7 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
             session.pending_tls_ctx = null;
             session.upgradeToTls(ctx) catch {
                 log.err("inbound S2S id={d} deferred TLS upgrade failed", .{session.id});
-                daemon.closeInbound(slot);
+                daemon.closeInbound(batch, slot);
                 return;
             };
             log.info("inbound S2S id={d} starting TLS handshake (deferred)", .{session.id});
@@ -1448,7 +1456,7 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             if (rc != 0 or err_opt != 0) {
                 log.err("outbound TCP connect failed for {s}", .{conn.remote_domain});
                 conn.fail("tcp-connect-failed");
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
                 return;
             }
 
@@ -1464,12 +1472,12 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 const stream_open = conn.buildStreamOpen(&buf) catch return;
                 conn.queueWrite(stream_open) catch {
                     conn.fail("write-failed");
-                    daemon.closeOutbound(slot);
+                    daemon.closeOutbound(batch, slot);
                     return;
                 };
                 _ = conn.flushWrite() catch {
                     conn.fail("write-failed");
-                    daemon.closeOutbound(slot);
+                    daemon.closeOutbound(batch, slot);
                     return;
                 };
                 // Wait for remote stream open + features
@@ -1487,7 +1495,7 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             // Flush pending write buffer
             _ = conn.flushWrite() catch {
                 conn.fail("write-failed");
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
                 return;
             };
             // A <proceed/>-response that was queued behind a partial flush:
@@ -1524,14 +1532,14 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             error.WouldBlock => return,
             else => {
                 conn.fail("read-failed");
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
                 return;
             },
         }
     };
     if (n == 0) {
         log.info("outbound connection to {s} closed by peer", .{conn.remote_domain});
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     }
 
@@ -1543,7 +1551,7 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     while (true) {
         const event = reader.next(data, &pos) catch {
             conn.fail("xml-parse-error");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
         if (event == null) break;
@@ -1566,7 +1574,7 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     if ((conn.isTlsHandshaking() or conn.tls_upgrade_pending) and conn.read_start < conn.read_end) {
         log.warn("outbound to {s}: {d} plaintext bytes after <proceed/> — policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
         conn.fail("policy-violation");
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     }
 
@@ -1639,7 +1647,7 @@ fn processOutboundEvent(
             {
                 log.warn("outbound SASL failure from {s}", .{conn.remote_domain});
                 conn.handleAuthFailure();
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
             }
             // Handle dialback result response: <db:result type='valid'/>
             else if (std.mem.eql(u8, elem.local_name, "result") and
@@ -1656,7 +1664,7 @@ fn processOutboundEvent(
                 } else if (result_type.len > 0) {
                     log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
                     conn.handleAuthFailure();
-                    daemon.closeOutbound(slot);
+                    daemon.closeOutbound(batch, slot);
                 }
             }
             // Handle db:verify response (dialback callback path)
@@ -1736,7 +1744,7 @@ fn processOutboundEvent(
         },
         .stream_close => {
             log.info("outbound stream closed by {s}", .{conn.remote_domain});
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
         },
         .xml_declaration => {},
         .text => {},
@@ -1747,13 +1755,13 @@ fn processOutboundEvent(
 fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
     const ctx = daemon.tls_client_ctx orelse {
         conn.fail("no-client-tls-context");
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     };
 
     conn.upgradeToTls(ctx) catch {
         conn.fail("tls-init-failed");
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     };
 
@@ -1766,7 +1774,7 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
     const complete = conn.continueHandshake() catch {
         log.err("outbound TLS handshake failed for {s}", .{conn.remote_domain});
         conn.fail("tls-handshake-failed");
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     };
 
@@ -1782,7 +1790,7 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         conn.read_end = 0;
 
         // DANE verification
-        performOutboundDane(daemon, slot, conn);
+        performOutboundDane(daemon, batch, slot, conn);
 
         // If DANE failed, connection was closed
         if (conn.isFailed()) return;
@@ -1792,12 +1800,12 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         const stream_open = conn.buildStreamOpen(&buf) catch return;
         conn.queueWrite(stream_open) catch {
             conn.fail("write-failed");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
         _ = conn.flushWrite() catch {
             conn.fail("write-failed");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
 
@@ -1821,7 +1829,7 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 }
 
 /// Perform DANE verification after outbound TLS handshake.
-fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnection) void {
+fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
     const dane_mod = @import("dane.zig");
 
     // Query TLSA records for the target host/port
@@ -1891,7 +1899,7 @@ fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnectio
         conn.setDaneResult(status);
 
         if (conn.isFailed()) {
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
         }
     } else {
         conn.setDaneResult(.no_records);
@@ -2161,7 +2169,9 @@ test "S2sDaemon: closeInbound" {
     const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
     try std.testing.expectEqual(@as(usize, 1), daemon.inboundCount());
 
-    daemon.closeInbound(slot);
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.closeInbound(&cl, slot);
     try std.testing.expectEqual(@as(usize, 0), daemon.inboundCount());
 }
 
