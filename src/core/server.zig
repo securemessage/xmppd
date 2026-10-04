@@ -426,6 +426,17 @@ pub const Session = struct {
         self.stanza_type = "";
     }
 
+    /// Queue a complete outbound stanza (message/presence/iq) and count it
+    /// for XEP-0198 (S15). Counting is not optional: `<a h='...'/>` maps by
+    /// position, so every stanza sent outside this helper shifts the ack
+    /// window and makes a later ack discard a stanza the client never saw.
+    /// Nonzas (`<r/>`, `<a/>`, features, SASL elements, stream errors) must
+    /// go through conn.queueSend directly.
+    pub fn queueSendStanza(self: *Session, data: []const u8) !void {
+        try self.conn.queueSend(data);
+        self.smTrackOutbound(data);
+    }
+
     /// Track an outbound stanza for SM purposes.
     /// Increments sm_out_seq and buffers the stanza in the unacked queue (if resume enabled).
     /// Call this after successfully queueing a complete stanza (message/presence/iq) to the client.
@@ -436,14 +447,12 @@ pub const Session = struct {
         self.sm_out_seq +%= 1;
         if (self.sm_unacked) |queue| {
             switch (queue.push(stanza_data)) {
-                .pushed, .alloc_failed => {},
-                .overflow => {
-                    // T178: XEP-0198 has no gap signaling — an evicted stanza
-                    // breaks the at-least-once promise invisibly. Fail the
-                    // session (ejabberd/Prosody behavior) instead of silently
-                    // continuing with a corrupted replay queue.
+                .pushed => {},
+                // A stanza the client will count but we cannot replay is the
+                // same silent-gap class as overflow (S15) — fail the session.
+                .alloc_failed, .overflow => {
                     self.sm_overflow = true;
-                    log.warn("connection {d} SM unacked queue overflow ({d} stanzas) — failing session", .{ self.conn.id, sm_state.UNACKED_CAPACITY });
+                    log.warn("connection {d} SM unacked queue failure ({d} stanzas) — failing session", .{ self.conn.id, sm_state.UNACKED_CAPACITY });
                 },
             }
             // T178: give the client the chance to ack before the queue can
@@ -1368,7 +1377,7 @@ pub const Server = struct {
         w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
         w.writeAll(tag_name) catch return;
         w.writeByte('>') catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
@@ -2809,7 +2818,7 @@ pub const Server = struct {
                     xml.escapeWrite(writer, bound_jid.resource) catch return;
                 }
                 writer.writeAll("</jid></bind></iq>") catch return;
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                session.queueSendStanza(fbs.getWritten()) catch return;
             },
             .send_error => |err| {
                 xmpp.stream.writeStreamError(writer, err) catch return;

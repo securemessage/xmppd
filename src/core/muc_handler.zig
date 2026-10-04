@@ -347,7 +347,7 @@ pub fn handleMucDiscoInfo(
     w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -421,7 +421,7 @@ pub fn handleMucDiscoItems(
 
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -517,7 +517,7 @@ pub fn handleRoomDiscoInfo(
 
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -651,7 +651,7 @@ pub fn handleMucAdminIq(
     xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
-    session.conn.queueSend(result_fbs.getWritten()) catch return;
+    session.queueSendStanza(result_fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -680,7 +680,7 @@ fn sendIqErrorFromRoom(
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -761,7 +761,7 @@ pub fn handleMucOwnerGet(
 
     w.writeAll("</x></query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -844,7 +844,7 @@ pub fn handleMucOwnerSet(
     xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
-    session.conn.queueSend(result_fbs.getWritten()) catch return;
+    session.queueSendStanza(result_fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1223,7 +1223,7 @@ fn sendSelfPresence(
     writeSessionJid(w, session) catch return;
     w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1438,7 +1438,7 @@ fn sendRoomHistory(
         w.writeAll("'/>") catch continue;
         w.writeAll(close_tag) catch continue;
 
-        session.conn.queueSend(fbs.getWritten()) catch continue;
+        session.queueSendStanza(fbs.getWritten()) catch continue;
     }
 
     if (session.conn.hasPendingWrite()) {
@@ -1491,7 +1491,7 @@ fn sendRoomSubject(
     xml.escapeWrite(w, subject) catch return;
     w.writeAll("</subject></message>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1524,7 +1524,7 @@ fn sendPresenceError(
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1560,7 +1560,7 @@ fn sendMessageError(
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
