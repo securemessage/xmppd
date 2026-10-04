@@ -337,8 +337,10 @@ pub fn main() !void {
     log.info("worker threads: {d}", .{workers});
 
     // --- Bind privileged ports while still root ---
-    // Create N C2S sockets with SO_REUSEPORT (one per worker thread).
-    // Fds survive fork+exec (no CLOEXEC) — children use --listen-fd 5,6,7,...
+    // Create N C2S sockets with SO_REUSEPORT (one per worker thread), and
+    // the S2S listener. Children receive them remapped to fds 3.. on exec
+    // (Supervisor.applyFdPass, T356/S7): the --listen-fd list is therefore
+    // always the deterministic 3,4,...,3+N-1.
     const MAX_WORKERS = 64;
     var c2s_listen_fds: [MAX_WORKERS]posix.fd_t = .{-1} ** MAX_WORKERS;
     var c2s_fd_count: u16 = 0;
@@ -371,7 +373,7 @@ pub fn main() !void {
     }
     defer if (s2s_listen_fd >= 0) posix.close(s2s_listen_fd);
 
-    // Format fd numbers as comma-separated string for --listen-fd arg
+    // Deterministic fd list: applyFdPass remaps the sockets to 3,4,5,...
     var c2s_fd_str_buf: [256]u8 = undefined;
     var c2s_fd_str_len: usize = 0;
     {
@@ -381,13 +383,12 @@ pub fn main() !void {
                 c2s_fd_str_buf[c2s_fd_str_len] = ',';
                 c2s_fd_str_len += 1;
             }
-            const written = std.fmt.bufPrint(c2s_fd_str_buf[c2s_fd_str_len..], "{d}", .{c2s_listen_fds[i]}) catch break;
+            const written = std.fmt.bufPrint(c2s_fd_str_buf[c2s_fd_str_len..], "{d}", .{3 + i}) catch break;
             c2s_fd_str_len += written.len;
         }
     }
     const c2s_fd_str = c2s_fd_str_buf[0..c2s_fd_str_len];
-    var s2s_fd_str_buf: [12]u8 = undefined;
-    const s2s_fd_str = std.fmt.bufPrint(&s2s_fd_str_buf, "{d}", .{s2s_listen_fd}) catch "4";
+    const s2s_fd_str = "3"; // the single remapped s2s listener slot
 
     // Build child argv: pass --config, --db, --socket to auth, s2s, and core children
     var auth_args_buf: [6][]const u8 = undefined;
@@ -498,6 +499,14 @@ pub fn main() !void {
         Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
     else
         Supervisor.init(core_path, core_args_buf[0..core_argc]);
+
+    // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
+    // listener, auth nothing; everything else in the master's table closes.
+    core_sup.pass_fds = c2s_listen_fds[0..c2s_fd_count];
+    if (s2s_listen_fd >= 0) {
+        var s2s_pass = [_]posix.fd_t{s2s_listen_fd};
+        s2s_sup.pass_fds = &s2s_pass;
+    }
 
     log.info("config: auth_socket={s} s2s={any} s2s_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,

@@ -20,6 +20,11 @@ const posix = std.posix;
 
 const log = std.log.scoped(.supervisor);
 
+// libc entries absent from std.c (FreeBSD): supplementary group reset and
+// fd-table truncation used by the child's privilege/hygiene path (T356/S7).
+extern "c" fn setgroups(size: c_int, list: *const posix.gid_t) c_int;
+extern "c" fn closefrom(lowfd: c_int) void;
+
 /// Minimum backoff delay (nanoseconds).
 const MIN_BACKOFF_NS: u64 = 1 * std.time.ns_per_s;
 /// Maximum backoff delay (nanoseconds).
@@ -47,6 +52,9 @@ pub const Supervisor = struct {
     /// Unprivileged user/group IDs for the child process (0 = no drop).
     uid: std.posix.uid_t = 0,
     gid: std.posix.gid_t = 0,
+    /// Listener sockets the child inherits, remapped to 3..3+len-1; every
+    /// other fd above stderr is closed. Empty = the whole table is closed.
+    pass_fds: []const posix.fd_t = &.{},
     /// Current child PID, or null if not running.
     child_pid: ?posix.pid_t = null,
     /// Child state.
@@ -77,6 +85,25 @@ pub const Supervisor = struct {
             .uid = uid,
             .gid = gid,
         };
+    }
+
+    /// Child-side fd hygiene (T356/S7): remap pass_fds to 3..3+len-1 and
+    /// truncate the rest of the table. Two-phase through a scratch zone so
+    /// a dup2 target can never clobber a still-needed source. Failures exit
+    /// the child (125); only valid between fork and exec.
+    pub fn applyFdPass(self: *Supervisor) void {
+        const TMP_BASE: i32 = 8192;
+        for (self.pass_fds, 0..) |src, i| {
+            if (src <= 2) continue; // stdio stays put
+            if (std.c.dup2(src, TMP_BASE + @as(i32, @intCast(i))) < 0) std.c._exit(125);
+        }
+        var i: usize = 0;
+        while (i < self.pass_fds.len) : (i += 1) {
+            if (self.pass_fds[i] <= 2) continue;
+            if (std.c.dup2(TMP_BASE + @as(i32, @intCast(i)), 3 + @as(i32, @intCast(i))) < 0) std.c._exit(125);
+            _ = std.c.close(TMP_BASE + @as(i32, @intCast(i)));
+        }
+        closefrom(@intCast(3 + self.pass_fds.len));
     }
 
     /// Spawn the child process using fork+execve.
@@ -121,15 +148,22 @@ pub const Supervisor = struct {
             var empty_mask = posix.sigemptyset();
             posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
 
-            // Drop privileges before exec if configured
+            // Drop privileges before exec if configured. setgroups first:
+            // without it the child keeps root's supplementary groups
+            // (wheel, operator) even after setuid (T356/S7).
             if (self.gid != 0) {
-                const ret_g = std.c.setgid(self.gid);
-                if (ret_g != 0) std.c._exit(125);
+                if (setgroups(1, &self.gid) != 0) std.c._exit(125);
+                if (std.c.setgid(self.gid) != 0) std.c._exit(125);
             }
             if (self.uid != 0) {
                 const ret_u = std.c.setuid(self.uid);
                 if (ret_u != 0) std.c._exit(125);
             }
+
+            // fd hygiene: remap the passed listener sockets to 3..N, close
+            // everything else (S7 — before this, every child inherited
+            // every listener and internal master fd).
+            self.applyFdPass();
 
             const envp = [_:null]?[*:0]const u8{null};
             _ = std.c.execve(
@@ -297,4 +331,46 @@ test "Supervisor: fork and wait" {
     const status = try sup.waitChild();
     const exit_code = (status >> 8) & 0xFF;
     try std.testing.expectEqual(@as(u32, 0), exit_code);
+}
+
+test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356/S7)" {
+    // Three socketpairs: the first two are the pass_fds (child must see them
+    // remapped to 3 and 4); the third is a stray the child must NOT have
+    // after closefrom. The child reports over fd4.
+    var p1: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p1) != 0) return error.Socketpair;
+    defer posix.close(p1[0]);
+    defer posix.close(p1[1]);
+    var p2: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p2) != 0) return error.Socketpair;
+    defer posix.close(p2[0]);
+    defer posix.close(p2[1]);
+    var stray: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &stray) != 0) return error.Socketpair;
+    defer posix.close(stray[0]);
+    defer posix.close(stray[1]);
+
+    var sup = Supervisor.init("/unused", &.{});
+    sup.pass_fds = &.{ p1[1], p2[1] };
+    const stray_child_end = stray[1];
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        sup.applyFdPass();
+        var verdict: [4]u8 = .{ 'N', 'O', 'N', 'E' }; // overwritten below
+        if (std.c.write(3, "x", 1) == 1) verdict[0] = 'Y'; // remapped listener works
+        if (std.c.write(stray_child_end, "x", 1) < 0) verdict[1] = 'Y'; // stray end is gone
+        _ = std.c.write(4, &verdict, verdict.len); // report over remapped fd4
+        std.c._exit(0);
+    }
+
+    var buf: [4]u8 = undefined;
+    const n = try posix.read(p2[0], &buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("YY", buf[0..2]);
+
+    var sup2 = Supervisor.init("/nonexistent", &.{});
+    sup2.child_pid = pid;
+    sup2.state = .running;
+    _ = try sup2.waitChild();
 }
