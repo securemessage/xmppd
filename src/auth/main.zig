@@ -332,7 +332,7 @@ pub fn main() !void {
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch {
                                 log.err("change list full accepting IPC slot {d} — closing the lane", .{slot});
                                 batch.purgeFd(conn.fd);
-                                ipc.closeClient(slot);
+                                closeIpcLane(ipc, &handler, slot);
                                 continue;
                             };
 
@@ -341,7 +341,7 @@ pub fn main() !void {
                             const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&mechs) };
                             conn.queueSend(ml_msg) catch {
                                 batch.purgeFd(conn.fd);
-                                ipc.closeClient(slot);
+                                closeIpcLane(ipc, &handler, slot);
                                 continue;
                             };
                             if (conn.hasPendingSend()) {
@@ -366,7 +366,7 @@ pub fn main() !void {
                 .fd_writable => |e| {
                     if (e.udata >= CLIENT_UDATA_BASE) {
                         const slot = e.udata - CLIENT_UDATA_BASE;
-                        flushIpcClient(ipc, &batch, slot, &read_paused);
+                        flushIpcClient(ipc, &handler, &batch, slot, &read_paused);
                     }
                 },
                 else => {},
@@ -384,7 +384,7 @@ pub fn main() !void {
             _ = conn.flush() catch {
                 log.err("IPC client {d} flush error — closing", .{slot});
                 batch.purgeFd(conn.fd);
-                ipc.closeClient(slot);
+                closeIpcLane(ipc, &handler, slot);
                 read_paused[slot] = false;
                 continue;
             };
@@ -392,7 +392,7 @@ pub fn main() !void {
                 batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
                     log.err("change list full arming write for IPC slot {d} — closing the lane", .{slot});
                     batch.purgeFd(conn.fd);
-                    ipc.closeClient(slot);
+                    closeIpcLane(ipc, &handler, slot);
                     read_paused[slot] = false;
                     continue;
                 };
@@ -409,7 +409,14 @@ pub fn main() !void {
 const RX_PAUSE_AT: usize = 768 << 10;
 const RX_RESUME_AT: usize = 256 << 10;
 
-fn updateReadBackpressure(ipc: *IpcServer, batch: *ChangeList, slot: usize, read_paused: []bool) void {
+/// Close an IPC client lane: its in-flight SCRAM sessions die with it
+/// (T279) instead of waiting for the 60 s stale probe.
+fn closeIpcLane(ipc: *IpcServer, handler: *AuthHandler, slot: usize) void {
+    handler.closeLaneSessions(slot);
+    ipc.closeClient(slot);
+}
+
+fn updateReadBackpressure(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, read_paused: []bool) void {
     const conn = ipc.getClient(slot) orelse return;
     if (conn.fd < 0) return;
     const pend = conn.pendingSendBytes();
@@ -420,7 +427,7 @@ fn updateReadBackpressure(ipc: *IpcServer, batch: *ChangeList, slot: usize, read
             // loop on a drowned lane (S22). Close rather than lie.
             log.err("change list full pausing IPC slot {d} — closing the lane", .{slot});
             batch.purgeFd(conn.fd);
-            ipc.closeClient(slot);
+            closeIpcLane(ipc, handler, slot);
             read_paused[slot] = false;
             return;
         };
@@ -430,7 +437,7 @@ fn updateReadBackpressure(ipc: *IpcServer, batch: *ChangeList, slot: usize, read
         batch.enableRead(conn.fd) catch {
             log.err("change list full resuming IPC slot {d} — closing the lane", .{slot});
             batch.purgeFd(conn.fd);
-            ipc.closeClient(slot);
+            closeIpcLane(ipc, handler, slot);
             return;
         };
         log.info("IPC client {d}: backlog drained to {d}B — resuming intake", .{ slot, pend });
@@ -438,20 +445,20 @@ fn updateReadBackpressure(ipc: *IpcServer, batch: *ChangeList, slot: usize, read
 }
 
 fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, ipc_gens: []const u32, read_paused: []bool, flush_pending: []bool) void {
-    defer updateReadBackpressure(ipc, batch, slot, read_paused);
+    defer updateReadBackpressure(ipc, handler, batch, slot, read_paused);
     const conn = ipc.getClient(slot) orelse return;
 
     const n = conn.recv() catch |err| {
         log.err("IPC client {d} recv error: {} — closing", .{ slot, err });
         batch.purgeFd(conn.fd);
-        ipc.closeClient(slot);
+        closeIpcLane(ipc, handler, slot);
         read_paused[slot] = false;
         return;
     };
 
     if (n == 0) {
         batch.purgeFd(conn.fd);
-        ipc.closeClient(slot);
+        closeIpcLane(ipc, handler, slot);
         return;
     }
 
@@ -459,7 +466,7 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
     while (true) {
         const msg = conn.nextMessage() catch {
             batch.purgeFd(conn.fd);
-            ipc.closeClient(slot);
+            closeIpcLane(ipc, handler, slot);
             return;
         };
 
@@ -469,7 +476,7 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
             .reply => |response| {
                 conn.queueSend(response) catch {
                     batch.purgeFd(conn.fd);
-                    ipc.closeClient(slot);
+                    closeIpcLane(ipc, handler, slot);
                     return;
                 };
 
@@ -502,20 +509,20 @@ fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Co
     const conn = ipc.getClient(slot) orelse return;
     conn.queueSend(reply.msg) catch {
         batch.purgeFd(conn.fd);
-        ipc.closeClient(slot);
+        closeIpcLane(ipc, handler, slot);
         read_paused[slot] = false;
         return;
     };
     if (conn.hasPendingSend()) flush_pending[slot] = true;
-    updateReadBackpressure(ipc, batch, slot, read_paused);
+    updateReadBackpressure(ipc, handler, batch, slot, read_paused);
 }
 
-fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize, read_paused: []bool) void {
+fn flushIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, read_paused: []bool) void {
     const conn = ipc.getClient(slot) orelse return;
 
     _ = conn.flush() catch {
         batch.purgeFd(conn.fd);
-        ipc.closeClient(slot);
+        closeIpcLane(ipc, handler, slot);
         read_paused[slot] = false;
         return;
     };
@@ -525,11 +532,11 @@ fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize, read_paused:
         batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
             log.err("change list full arming write in flushIpcClient for slot {d} — closing the lane", .{slot});
             batch.purgeFd(conn.fd);
-            ipc.closeClient(slot);
+            closeIpcLane(ipc, handler, slot);
             read_paused[slot] = false;
         };
     }
-    updateReadBackpressure(ipc, batch, slot, read_paused);
+    updateReadBackpressure(ipc, handler, batch, slot, read_paused);
 }
 
 /// Context for the invite validator callback.

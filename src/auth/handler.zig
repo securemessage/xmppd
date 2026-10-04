@@ -145,6 +145,9 @@ const ScramSession = struct {
     conn_id: u32,
     server: sasl.ScramServer,
     active: bool = false,
+    /// IPC lane slot of the client that started the exchange — lets a dead
+    /// lane sweep its in-flight sessions on close (T279).
+    lane: u16 = 0,
     /// Last activity (unix seconds); drives lazy reclamation of slots whose
     /// XMPP connection died mid-exchange (see SCRAM_SLOT_STALE_SECONDS).
     touched_at: i64 = 0,
@@ -357,7 +360,7 @@ pub fn AuthHandler(comptime Store: type) type {
             return switch (req.mechanism) {
                 .plain => self.handlePlainAuth(req, slot, slot_gen),
                 .scram_sha_256 => if (comptime @hasDecl(Store, "lookup"))
-                    .{ .reply = self.handleScramInit(req) }
+                    .{ .reply = self.handleScramInit(req, slot) }
                 else
                     .{ .reply = authFailure(req.conn_id, "mechanism-not-supported") },
                 .oauthbearer => if (comptime @hasDecl(Store, "validateToken"))
@@ -559,7 +562,7 @@ pub fn AuthHandler(comptime Store: type) type {
             }
         }
 
-        fn handleScramInit(self: *Self, req: protocol.AuthRequest) protocol.Message {
+        fn handleScramInit(self: *Self, req: protocol.AuthRequest, ipc_slot: usize) protocol.Message {
             if (comptime !@hasDecl(Store, "lookup")) {
                 return authFailure(req.conn_id, "mechanism-not-supported");
             } else {
@@ -569,8 +572,12 @@ pub fn AuthHandler(comptime Store: type) type {
                 };
 
                 var session = &self.scram_sessions[slot];
+                // Re-auth on an already-live conn_id: the previous exchange's
+                // ScramServer must go before we overwrite it (T279).
+                if (session.active) session.deinit();
                 session.server = sasl.ScramServer.init(self.allocator);
                 session.conn_id = req.conn_id;
+                session.lane = @intCast(ipc_slot);
                 session.active = true;
                 session.touched_at = std.time.timestamp();
 
@@ -856,6 +863,16 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn cleanupSession(self: *Self, conn_id: u32) void {
             if (self.findScramSlot(conn_id)) |slot| {
                 self.scram_sessions[slot].deinit();
+            }
+        }
+
+        /// Deinit every in-flight SCRAM session the given IPC lane owns;
+        /// called before closing that IPC client so dead lanes cannot wedge
+        /// sessions into the 60 s stale probe (T279).
+        pub fn closeLaneSessions(self: *Self, lane: usize) void {
+            const lane_u16: u16 = @intCast(lane);
+            for (&self.scram_sessions) |*s| {
+                if (s.active and s.lane == lane_u16) s.deinit();
             }
         }
 
@@ -1232,6 +1249,86 @@ test "AuthHandler: lock store error fails closed (T352/S3)" {
     } }) orelse return error.NoResponse;
 
     try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
+}
+
+test "AuthHandler: re-auth on a live conn_id deinits the previous exchange (T279)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var client_a = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client_a.deinit();
+    var client_b = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client_b.deinit();
+
+    for ([_]*sasl.ScramClient{ &client_a, &client_b }) |client| {
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 42,
+            .mechanism = .scram_sha_256,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        try std.testing.expect(reply == .auth_challenge);
+    }
+}
+
+test "AuthHandler: closing an IPC lane sweeps its in-flight SCRAM sessions (T279)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var other_lane = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer other_lane.deinit();
+    var doomed_lane = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer doomed_lane.deinit();
+
+    // conn 1 rides lane 3, conn 2 rides lane 4 (the slot arg of
+    // handleMessage is the IPC lane).
+    const conn1 = 42;
+    const conn2 = 43;
+    {
+        const r1 = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = conn1,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try doomed_lane.clientFirst(),
+        } }, 3, 1);
+        try std.testing.expect(r1 == .reply);
+        _ = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = conn2,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try other_lane.clientFirst(),
+        } }, 4, 1);
+    }
+
+    try std.testing.expect(handler.findScramSlot(conn1) != null);
+    try std.testing.expect(handler.findScramSlot(conn2) != null);
+
+    handler.closeLaneSessions(3);
+    try std.testing.expect(handler.findScramSlot(conn1) == null);
+    try std.testing.expect(handler.findScramSlot(conn2) != null);
 }
 
 test "AuthHandler: SCRAM-SHA-256 full exchange" {
