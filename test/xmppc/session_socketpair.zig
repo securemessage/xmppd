@@ -1307,3 +1307,38 @@ test "engine: cancelTimer drops a pending timer" {
     alloc.destroy(engine);
     try std.testing.expect(!probe.canceled_fired);
 }
+
+fn timerHammer(engine: *Engine, probe: *TimerProbe) void {
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const t = engine.schedule(60_000, canceledTimerCb, probe) catch return;
+        engine.cancelTimer(t);
+    }
+}
+
+test "engine: schedule/cancelTimer from foreign threads while the loop runs" {
+    const alloc = std.testing.allocator;
+    var probe: TimerProbe = .{};
+    const engine = try alloc.create(Engine);
+    engine.* = try Engine.init(alloc);
+    // Keep-alive so the loop is running while foreign threads touch timers.
+    const keepalive = try engine.schedule(60_000, canceledTimerCb, &probe);
+    try engine.run();
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, timerHammer, .{ engine, &probe });
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 1), engine.timersPending());
+
+    // A timer scheduled from this (foreign) thread fires on the loop, even
+    // when its EV_ADD is staged behind the hammer's >64-entry backlog.
+    _ = try engine.schedule(10, timerCb, &probe);
+    timerProbeWait(&probe, 1, 2000);
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+
+    // Cancelling the last pending timer lets the loop exit (deinit joins).
+    engine.cancelTimer(keepalive);
+    engine.deinit();
+    alloc.destroy(engine);
+    try std.testing.expect(!probe.canceled_fired);
+}
