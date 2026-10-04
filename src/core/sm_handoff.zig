@@ -52,6 +52,9 @@ pub const ResumeBundle = struct {
     stanzas: std.ArrayListUnmanaged([]u8) = .{},
     /// sm_out_seq value of stanzas[0], i.e. the source queue's base_seq.
     base_seq: u32,
+    /// Source queue's last acked h (S24). Carried so a backwards h after the
+    /// handoff is still rejected instead of wiping the rebuilt queue.
+    last_h: u32 = 0,
     /// Room JIDs of every MUC room the detached session occupied at handoff
     /// (T177 occupant migration). Nicks/roles/affiliations are NOT bundled:
     /// the canonical occupant record on each room's owning worker is the

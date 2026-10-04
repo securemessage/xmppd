@@ -3614,6 +3614,7 @@ pub const Server = struct {
                 return fail(self, req, "item-not-found", "bundle alloc failed");
             },
             .base_seq = if (detached.sm_unacked) |q| q.base_seq else 1,
+            .last_h = if (detached.sm_unacked) |q| q.last_h else 0,
             .created = std.time.timestamp(),
         };
         @memcpy(&bundle.previd, req.previd[0..sm_state.SM_ID_HEX_LEN]);
@@ -3736,6 +3737,7 @@ pub const Server = struct {
         };
         queue.* = sm_state.SmUnackedQueue.init(self.allocator);
         queue.base_seq = bundle.base_seq;
+        queue.last_h = bundle.last_h;
         var replay_count: u32 = 0;
         for (bundle.stanzas.items) |stanza| {
             switch (queue.push(stanza)) {
