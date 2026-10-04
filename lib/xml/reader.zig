@@ -89,6 +89,12 @@ pub const Event = union(enum) {
 /// Maximum number of namespace prefix bindings (XMPP uses very few)
 const max_ns_bindings = 16;
 
+/// Maximum element nesting the namespace tracking supports. Servers
+/// enforce their own (smaller) stanza depth limit; the mark and default-ns
+/// stacks are sized from this and fail with error.TooDeep as a backstop,
+/// so push and pop can never desync (S12).
+pub const max_ns_depth = 64;
+
 const NsBinding = struct {
     prefix: []const u8,
     uri: []const u8,
@@ -107,13 +113,13 @@ pub const Reader = struct {
     /// the matching close restores it. A redeclared prefix on a nested
     /// stanza then shadows the outer one only for that element's lifetime
     /// (T232); `resolveNamespace` always prefers the newest binding.
-    ns_marks: [64]u32 = undefined,
+    ns_marks: [max_ns_depth]u32 = undefined,
     ns_mark_depth: u32 = 0,
     /// Default namespace URI
     default_ns: []const u8 = "",
     /// Namespace stack — saves default_ns on element_open, restores on element_close.
-    /// XMPP stanzas are shallow (depth rarely exceeds 5–6), so 16 entries suffice.
-    ns_stack: [16][]const u8 = undefined,
+    /// Sized to max_ns_depth so any depth a consumer allows stays synced (S12).
+    ns_stack: [max_ns_depth][]const u8 = undefined,
     ns_stack_depth: u32 = 0,
     /// Whether we're inside the stream element
     stream_opened: bool = false,
@@ -169,15 +175,15 @@ pub const Reader = struct {
                     self.current_element_local = try self.arenaDupe(token.local_name);
                     self.attrs.clearRetainingCapacity();
                     // Scope mark: the matching close restores this many bindings.
-                    if (self.ns_mark_depth < self.ns_marks.len) {
-                        self.ns_marks[self.ns_mark_depth] = self.ns_binding_count;
-                        self.ns_mark_depth += 1;
-                    }
+                    // Both stacks advance in lockstep; full is a hard error,
+                    // never a silent skip (S12).
+                    if (self.ns_mark_depth >= self.ns_marks.len or
+                        self.ns_stack_depth >= self.ns_stack.len) return error.TooDeep;
+                    self.ns_marks[self.ns_mark_depth] = self.ns_binding_count;
+                    self.ns_mark_depth += 1;
                     // Push current default namespace before this element's xmlns decls modify it
-                    if (self.ns_stack_depth < self.ns_stack.len) {
-                        self.ns_stack[self.ns_stack_depth] = self.default_ns;
-                        self.ns_stack_depth += 1;
-                    }
+                    self.ns_stack[self.ns_stack_depth] = self.default_ns;
+                    self.ns_stack_depth += 1;
                 },
                 .namespace_decl => {
                     const uri = try self.nsDupe(token.value);
@@ -532,6 +538,78 @@ test "reader: arena stays bounded over 200k stanzas on a long-lived stream (S11)
     try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
     try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", reader.resolveNamespace("stream"));
     try std.testing.expectEqualStrings("", reader.resolveNamespace("x"));
+}
+
+test "reader: deep nesting within the stacks keeps ns context synced (S12)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    // 40 nested elements, each redeclaring the default ns: within the
+    // 64-entry stacks and the server's 50-depth limit.
+    var buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<message>") catch unreachable;
+    for (0..40) |i| {
+        w.print("<e{d} xmlns='urn:deep-{d}'>", .{ i, i }) catch unreachable;
+    }
+    for (0..40) |i| {
+        w.print("</e{d}>", .{39 - i}) catch unreachable;
+    }
+    w.writeAll("</message><presence/>") catch unreachable;
+    const input = fbs.getWritten();
+
+    pos = 0;
+    var saw_presence = false;
+    while (try reader.next(input, &pos)) |ev| {
+        if (ev == .element_start and std.mem.eql(u8, ev.element_start.local_name, "presence")) {
+            saw_presence = true;
+            // The stream's default ns must be intact after 40 push/pop pairs.
+            try std.testing.expectEqualStrings("jabber:client", ev.element_start.namespace_uri);
+        }
+    }
+    try std.testing.expect(saw_presence);
+    try std.testing.expectEqual(@as(u32, 1), reader.ns_stack_depth); // stream level only
+    try std.testing.expectEqual(@as(u32, 1), reader.ns_mark_depth);
+    try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
+}
+
+test "reader: nesting past the stacks is a hard TooDeep error (S12)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<message>") catch unreachable;
+    for (0..max_ns_depth + 1) |i| {
+        w.print("<e{d}>", .{i}) catch unreachable;
+    }
+    const input = fbs.getWritten();
+
+    pos = 0;
+    var got_too_deep = false;
+    while (true) {
+        const ev = reader.next(input, &pos) catch |err| switch (err) {
+            error.TooDeep => {
+                got_too_deep = true;
+                break;
+            },
+            else => return err,
+        } orelse break;
+        _ = ev;
+    }
+    try std.testing.expect(got_too_deep);
 }
 
 test "scanner tests" {

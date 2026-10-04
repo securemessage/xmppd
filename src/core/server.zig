@@ -129,6 +129,11 @@ const CHANGE_BUF_SIZE = 1024;
 /// Connection is terminated with a stream error if exceeded.
 const MAX_ELEMENT_DEPTH = 50;
 
+comptime {
+    // The reader's namespace stacks must outlast any depth we accept (S12).
+    std.debug.assert(MAX_ELEMENT_DEPTH <= xml.max_ns_depth);
+}
+
 /// Auth IPC exchange state per connection.
 const AuthState = enum {
     /// No auth exchange in progress.
