@@ -93,6 +93,11 @@ pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
     const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
+    /// Consumer-timer udata range base: token N rides as TIMER_UDATA - N.
+    /// The range sits below the reserved sentinels and far above any Handle
+    /// encode, so loopOnce routes it to onTimerEvent before Handle decode.
+    const TIMER_UDATA: usize = std.math.maxInt(usize) - 3;
+    const TIMER_MAX = 65536;
 
     /// One queued command for a session. `start` launches a session slotted
     /// by a foreign-thread startSession; `stanza` is application payload
@@ -102,6 +107,11 @@ pub const Engine = struct {
         stanza: []u8,
         stop: []u8,
     };
+
+    /// One-shot timer callback; runs on the engine thread like session
+    /// events (it may startSession/postStanza/stopSession inline).
+    pub const TimerFn = *const fn (ctx: ?*anyopaque, engine: *Engine) void;
+    const Timer = struct { cb: TimerFn, ctx: ?*anyopaque };
 
     const QueuedCmd = struct { handle: Handle, cmd: Command };
 
@@ -322,6 +332,16 @@ pub const Engine = struct {
     /// closed, stanza. Always delivered on the engine thread.
     on_event: ?@import("session.zig").EventHandler = null,
     on_event_ctx: ?*anyopaque = null,
+
+    /// One-shot consumer timers: reconnect backoff and other delayed
+    /// actions. The kqueue timer (EV_ONESHOT) is the single source of a
+    /// firing; the map entry is consumed when it dispatches. The loop keeps
+    /// running while timers are pending even with no live sessions.
+    /// `timers` and `next_timer` are guarded by `timers_lock` (schedule and
+    /// cancelTimer may run on any thread); callbacks run outside the lock.
+    timers: std.AutoHashMapUnmanaged(usize, Timer) = .{},
+    next_timer: usize = 0,
+    timers_lock: std.Thread.Mutex = .{},
 
     /// Cross-thread command mailbox (postStanza / stopSession): the ONLY
     /// way foreign threads touch a session. Copied here under the lock,
@@ -551,6 +571,7 @@ pub const Engine = struct {
         }
         self.free_slots.deinit(self.allocator);
         self.changes.deinit(self.allocator);
+        self.timers.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
         if (self.tls_ctx_ca) |*c| c.deinit();
         // Leftover posted-but-never-applied commands.
@@ -779,6 +800,76 @@ pub const Engine = struct {
         }
         _ = self.stats.cmds_posted.fetchAdd(1, .monotonic);
         self.requestWake();
+    }
+
+    // ---- consumer timers ------------------------------------------------
+
+    /// Run `cb(ctx, engine)` once on the engine thread after `delay_ms`
+    /// (>= 0; 0 fires on the next loop pass). Returns a cancel token.
+    /// Callable from any thread. As with foreign-thread startSession, a
+    /// foreign caller must ensure the loop is running with work pending (or
+    /// schedule before run()): a loop that already exited is not restarted.
+    /// The callback may touch engine state directly; it runs on the loop.
+    pub fn schedule(self: *Engine, delay_ms: i64, cb: TimerFn, ctx: ?*anyopaque) !usize {
+        if (delay_ms < 0) return error.InvalidDelay;
+        self.timers_lock.lock();
+        defer self.timers_lock.unlock();
+        // Tokens wrap through the TIMER window; a pending-timer collision scans
+        // forward to the next free token (TIMER_MAX bounds concurrency, not
+        // lifetime count).
+        var tries: usize = 0;
+        while (tries < TIMER_MAX) : (tries += 1) {
+            const token = TIMER_UDATA - self.next_timer;
+            self.next_timer = @mod(self.next_timer + 1, TIMER_MAX);
+            if (self.timers.contains(token)) continue;
+            try self.timers.put(self.allocator, token, .{ .cb = cb, .ctx = ctx });
+            var tev = kev(token, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, token);
+            tev.data = delay_ms; // EVFILT_TIMER expiry sits in data (ms)
+            // A map entry without a staged registration would keep the loop
+            // alive forever with nothing to fire it.
+            self.stageOrFail(tev) catch |err| {
+                _ = self.timers.remove(token);
+                return err;
+            };
+            return token;
+        }
+        return error.TimerLimit;
+    }
+
+    /// Cancel a pending timer from any thread. No-op for a fired or unknown
+    /// token. A cancel racing a callback that is already running is lost,
+    /// matching EV_ONESHOT semantics.
+    pub fn cancelTimer(self: *Engine, token: usize) void {
+        self.timers_lock.lock();
+        defer self.timers_lock.unlock();
+        if (self.timers.remove(token)) {
+            self.stage(kev(token, std.c.EVFILT.TIMER, std.c.EV.DELETE, token));
+        }
+    }
+
+    /// Pending consumer timers (keep-alive for the loop when every session
+    /// is dead; e.g. reconnect backoff).
+    pub fn timersPending(self: *Engine) usize {
+        self.timers_lock.lock();
+        defer self.timers_lock.unlock();
+        return self.timers.count();
+    }
+
+    /// Dispatch one kevent from the consumer-timer udata window. An EV_ERROR
+    /// receipt means the kernel rejected the change (errno in `data`): a
+    /// failed EV_ADD drops the timer without running it and is logged; a
+    /// failed EV_DELETE (entry already gone) is ignored.
+    fn onTimerEvent(self: *Engine, ev: Kevent) void {
+        if (ev.filter != std.c.EVFILT.TIMER) return;
+        self.timers_lock.lock();
+        const entry = self.timers.fetchRemove(ev.udata);
+        self.timers_lock.unlock();
+        const kv = entry orelse return;
+        if (ev.flags & std.c.EV.ERROR != 0) {
+            log.warn("consumer timer {d} rejected by kqueue (errno {d}); dropped without firing", .{ TIMER_UDATA - ev.udata, ev.data });
+            return;
+        }
+        kv.value.cb(kv.value.ctx, self);
     }
 
     /// Send one application stanza from ANY thread: the bytes are copied
@@ -1065,10 +1156,11 @@ pub const Engine = struct {
         }
     }
 
-    /// Run the kqueue loop on a dedicated thread. The loop exits when the
-    /// live-session count reaches zero — consumers adding sessions from
-    /// other threads (thread-safe startSession) must have at least one
-    /// session started before calling run().
+    /// Run the kqueue loop on a dedicated thread. The loop lives while any
+    /// session is live or any consumer timer is pending, so backoff timers
+    /// keep the engine up after its last session dies. Consumers adding
+    /// sessions from other threads (thread-safe startSession) must have a
+    /// session or timer pending before calling run().
     pub fn run(self: *Engine) !void {
         self.run_gen +%= 1;
         self.waitLoopExit();
@@ -1080,7 +1172,7 @@ pub const Engine = struct {
     pub fn runSync(self: *Engine) !void {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count.load(.monotonic) > 0) {
+        while (self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) {
             self.loopOnce() catch {
                 // kevent error — fail every session and stop rather than spin.
                 var i: usize = 0;
@@ -1099,7 +1191,7 @@ pub const Engine = struct {
         const gen = self.run_gen;
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while (self.live_count.load(.monotonic) > 0 and self.run_gen == gen) {
+        while ((self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) and self.run_gen == gen) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -1131,7 +1223,7 @@ pub const Engine = struct {
         // never runs. No-op when nothing died.
         if (self.reap_pending) self.reapDead();
         // Nothing armed: never wait.
-        if (self.live_count.load(.monotonic) == 0) return;
+        if (self.live_count.load(.monotonic) == 0 and self.timersPending() == 0) return;
         // Fold everything staged since the last iteration into THIS kevent:
         // snapshot the buffer, then release the lock — event handlers stage
         // new changes during dispatch (they'd otherwise self-deadlock).
@@ -1147,10 +1239,16 @@ pub const Engine = struct {
         // and a level-triggered WRITE livelock at ~32 sessions).
         std.mem.copyForwards(Change, self.changes.items, self.changes.items[staged_count..]);
         self.changes.items.len -= staged_count;
+        // Wakes are coalesced, so changes left past this batch have no wake
+        // of their own and would wait for an unrelated event. While a
+        // backlog remains, this kevent() still applies its batch and returns
+        // ready events, but does not block.
+        const backlog = self.changes.items.len > 0;
         self.changes_lock.unlock();
+        const no_block = posix.timespec{ .sec = 0, .nsec = 0 };
 
         const t_wait_start = std.time.nanoTimestamp();
-        const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, null) catch {
+        const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, if (backlog) &no_block else null) catch {
             return error.SystemResources;
         };
         const t_wait_end = std.time.nanoTimestamp();
@@ -1167,6 +1265,13 @@ pub const Engine = struct {
             }
             if (ev.udata == TICK_UDATA) {
                 if (self.resolver) |*r| r.tick();
+                continue;
+            }
+            // Consumer timer window: dispatch the callback and consume the
+            // map entry (EV_ONESHOT already dropped the registration). A
+            // cancelled timer whose event raced the DELETE finds no entry.
+            if (ev.udata <= TIMER_UDATA and ev.udata > TIMER_UDATA - TIMER_MAX) {
+                self.onTimerEvent(ev);
                 continue;
             }
             const h = Handle.decode(ev.udata);
@@ -1228,9 +1333,14 @@ pub const Engine = struct {
     /// otherwise not apply the registration until an unrelated fd event.
     /// Never calls kevent for registration alone (project kqueue rule).
     fn stage(self: *Engine, ev: Change) void {
+        self.stageOrFail(ev) catch {};
+    }
+
+    /// `stage` for callers that must not lose the change (consumer timers).
+    fn stageOrFail(self: *Engine, ev: Change) !void {
         self.changes_lock.lock();
         defer self.changes_lock.unlock();
-        self.changes.append(self.allocator, ev) catch {};
+        try self.changes.append(self.allocator, ev);
         self.requestWake();
     }
 };
@@ -1332,4 +1442,49 @@ test "engine: wake pipe never blocks on un-read staged changes (T236)" {
     defer eng.loop_tid.store(0, .release);
     eng.requestWake();
     try std.testing.expectError(error.WouldBlock, posix.read(eng.wake_pipe[0], &wbuf));
+}
+
+fn countingTimerCb(ctx: ?*anyopaque, engine: *Engine) void {
+    _ = engine;
+    const n: *usize = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+}
+
+test "engine: schedule rejects a negative delay without arming anything" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    var fired: usize = 0;
+    try std.testing.expectError(error.InvalidDelay, eng.schedule(-1, countingTimerCb, &fired));
+    try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
+    eng.changes_lock.lock();
+    defer eng.changes_lock.unlock();
+    try std.testing.expectEqual(@as(usize, 0), eng.changes.items.len);
+}
+
+test "engine: timer EV_ERROR receipt drops the timer without firing it" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    var fired: usize = 0;
+    const rejected = try eng.schedule(10, countingTimerCb, &fired);
+    const ok = try eng.schedule(10, countingTimerCb, &fired);
+
+    // Kernel rejection of the EV_ADD: flags EV_ERROR, errno in data.
+    var receipt = kev(rejected, std.c.EVFILT.TIMER, std.c.EV.ERROR, rejected);
+    receipt.data = @intFromEnum(posix.E.NOMEM);
+    eng.onTimerEvent(receipt);
+    try std.testing.expectEqual(@as(usize, 0), fired);
+    try std.testing.expectEqual(@as(usize, 1), eng.timersPending());
+
+    // Receipt for a token with no entry (e.g. EV_DELETE after dispatch): inert.
+    eng.onTimerEvent(receipt);
+    try std.testing.expectEqual(@as(usize, 0), fired);
+
+    // A real expiry still fires the other timer exactly once.
+    const expiry = kev(ok, std.c.EVFILT.TIMER, 0, ok);
+    eng.onTimerEvent(expiry);
+    eng.onTimerEvent(expiry);
+    try std.testing.expectEqual(@as(usize, 1), fired);
+    try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
 }

@@ -16,7 +16,10 @@
 //! Consumers receive everything through ONE tagged-union event handler
 //! (`Engine.setEventHandler` with `Event`: established / closed / stanza —
 //! a C-ABI wrapper maps 1:1) and write stanzas with `Session.sendStanza`
-//! (established streams only).
+//! (established streams only). Delayed work (reconnect backoff, periodic
+//! application duties) uses `Engine.schedule`/`Engine.cancelTimer`: one-shot
+//! timers on the same kqueue loop whose callbacks run on the engine thread
+//! and keep the loop alive while pending (T-A9AE7D9C).
 //!
 //! Design invariants (see Continuum board XMPPC/task-brief-91e96a28):
 //!   * Own API boundary from day one — nothing here imports src/; src/ does not
@@ -51,6 +54,10 @@ pub const Features = stream.Features;
 pub const StreamHeader = stream.StreamHeader;
 pub const StreamError = stream.StreamError;
 pub const SmResult = stream.SmResult;
+
+/// Re-exported so consumers can set Engine.default_tls_policy without a
+/// direct import of the internals.
+pub const TlsPolicy = @import("tls").VerifyMode;
 
 pub const SaslClient = sasl.SaslClient;
 
