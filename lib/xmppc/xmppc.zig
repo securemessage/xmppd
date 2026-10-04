@@ -68,6 +68,7 @@ pub const Event = session.Event;
 pub const EventHandler = session.EventHandler;
 pub const Stanza = session.Stanza;
 pub const StanzaChild = parser.StanzaChild;
+pub const ArchiveMeta = parser.ArchiveMeta;
 pub const Transport = transport.Transport;
 pub const Handle = engine.Handle;
 
