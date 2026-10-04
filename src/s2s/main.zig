@@ -1111,6 +1111,28 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
     }
 }
 
+/// Domainpart of a JID: after '@' when a localpart exists, the whole JID
+/// otherwise; always cut at the resource separator.
+fn jidDomain(jid: []const u8) []const u8 {
+    var rest = jid;
+    if (std.mem.indexOfScalar(u8, jid, '@')) |at| rest = jid[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    return rest;
+}
+
+/// RFC 6120 §4.9.3.9 / §4.9.3.6: an inbound stanza's `from` domain must be
+/// the domain the peer authenticated as (dialback or EXTERNAL+DANE), and
+/// `to` must be our own domain. The stream's remote_domain is exactly that
+/// authenticated identity (dialback proves it; SASL EXTERNAL is gated on
+/// DANE), so the comparison is the real check, not the from= at stream open.
+fn validateInboundAddress(local_domain: []const u8, peer_domain: []const u8, from: []const u8, to: []const u8) ?StreamError {
+    const from_dom = jidDomain(from);
+    if (from_dom.len == 0 or !std.ascii.eqlIgnoreCase(from_dom, peer_domain)) return .invalid_from;
+    const to_dom = jidDomain(to);
+    if (to_dom.len == 0 or !std.ascii.eqlIgnoreCase(to_dom, local_domain)) return .host_unknown;
+    return null;
+}
+
 /// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
 fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
     defer session.resetStanza();
@@ -1120,6 +1142,17 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
 
     if (from.len == 0 or to.len == 0) {
         log.warn("inbound stanza missing from/to, dropping", .{});
+        return;
+    }
+
+    // Authenticated-domain and served-host checks before anything is
+    // forwarded (T351/S2): without them any federated peer could speak as
+    // any local user.
+    if (validateInboundAddress(daemon.local_domain, session.getRemoteDomain(), from, to)) |err| {
+        log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (authenticated peer domain {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
+        sendStreamError(session, err);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(session.id);
         return;
     }
 
@@ -2070,4 +2103,27 @@ test "S2sDaemon: stop" {
     try std.testing.expect(daemon.running);
     daemon.stop();
     try std.testing.expect(!daemon.running);
+}
+
+test "S2sDaemon: inbound address validation enforces authenticated domain and served host (T351/S2)" {
+    const local = "us.example";
+    const peer = "them.example";
+
+    // Happy: from authenticated peer domain to our domain (full and bare forms).
+    try std.testing.expect(validateInboundAddress(local, peer, "romeo@them.example/orchard", "juliet@us.example/capulet") == null);
+    try std.testing.expect(validateInboundAddress(local, peer, "them.example", "us.example") == null);
+
+    // Peer authenticated as them.example forging a local user.
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "juliet@us.example", "romeo@them.example").?);
+    // A stranger domain speaking through an authenticated session.
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "eve@evil.example", "juliet@us.example").?);
+    // from without a domain at all.
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "naked", "juliet@us.example").?);
+
+    // Right sender, wrong destination domain (we do not serve it).
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, peer, "romeo@them.example", "someone@else.example").?);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, peer, "romeo@them.example/c", "someone@else.example/x").?);
+
+    // Domain compare is case-insensitive.
+    try std.testing.expect(validateInboundAddress(local, "THEM.example", "romeo@them.example", "juliet@US.example") == null);
 }
