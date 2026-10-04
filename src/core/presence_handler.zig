@@ -580,7 +580,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
             log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
             return;
         };
-        var target_entries: [16]SessionEntry = undefined;
+        var target_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
         const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_entries);
         if (target_count > 0) {
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
@@ -692,7 +692,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
     // The approver now has 'from' the contact = contact's presence should be visible.
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        var probe_entries: [16]SessionEntry = undefined;
+        var probe_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
         const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &probe_entries);
         for (probe_entries[0..probe_count]) |pentry| {
             // Look up the contact's session to retrieve their stored presence inner XML.
@@ -876,7 +876,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_jid = to_jid_parsed;
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
         const unsub_sm = server.session_map orelse return;
-        var owner_entries: [16]SessionEntry = undefined;
+        var owner_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
         const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, &owner_entries);
         for (owner_entries[0..owner_count]) |oent| {
             var unavail_buf: [512]u8 = undefined;
@@ -1041,7 +1041,7 @@ fn broadcastToOwnResources(
     }
     const presence_xml = pres_fbs.getWritten();
 
-    var entries: [16]SessionEntry = undefined;
+    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = sm.findByBareJid(local, domain, &entries);
 
     for (entries[0..count]) |entry| {
@@ -1077,7 +1077,7 @@ fn sendOtherResourcesPresence(
 ) void {
     const sm = server.session_map orelse return;
 
-    var entries: [16]SessionEntry = undefined;
+    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = sm.findAvailableByBareJid(local, domain, &entries);
 
     for (entries[0..count]) |entry| {
@@ -1161,7 +1161,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     const presence_xml = pres_fbs.getWritten();
 
     // Deliver to all available resources of the target bare JID
-    var entries: [16]SessionEntry = undefined;
+    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = sm.findAvailableByBareJid(target_local, target_domain, &entries);
 
     for (entries[0..count]) |entry| {
@@ -1261,7 +1261,7 @@ pub fn deliverPresenceToTarget(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
+    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = sm.findByBareJid(target_local, target_domain, &entries);
 
     for (entries[0..count]) |ent| {

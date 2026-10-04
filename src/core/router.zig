@@ -124,8 +124,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Route: find target session(s) via unified session map.
     const sm = server.session_map orelse return;
-    var entries_buf: [16]SessionEntry = undefined;
-    var local_ids: [16]usize = undefined;
+    var entries_buf: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
+    var local_ids: [session_map_mod.DEFAULT_MAX_RESOURCES]usize = undefined;
     var target_count: usize = 0;
 
     var remote_delivered: bool = false;
@@ -670,7 +670,7 @@ fn sendCarbons(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
+    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
     if (count == 0) return;
 

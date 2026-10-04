@@ -2343,7 +2343,7 @@ pub const Server = struct {
                 };
 
                 const s2s_sm = self.session_map orelse return;
-                var s2s_entries: [16]SessionEntry = undefined;
+                var s2s_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
                 const target_count = if (to_jid.resource.len > 0) blk: {
                     if (s2s_sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
                         s2s_entries[0] = e;
@@ -2420,7 +2420,7 @@ pub const Server = struct {
                 const from_jid = xmpp.Jid.parse(m.from_jid) catch return;
 
                 const fail_sm = self.session_map orelse return;
-                var sender_entries: [16]SessionEntry = undefined;
+                var sender_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
                 const sender_count = if (from_jid.resource.len > 0) blk: {
                     if (fail_sm.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |e| {
                         sender_entries[0] = e;
