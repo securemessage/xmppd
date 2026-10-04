@@ -1239,10 +1239,16 @@ pub const Engine = struct {
         // and a level-triggered WRITE livelock at ~32 sessions).
         std.mem.copyForwards(Change, self.changes.items, self.changes.items[staged_count..]);
         self.changes.items.len -= staged_count;
+        // Wakes are coalesced, so changes left past this batch have no wake
+        // of their own and would wait for an unrelated event. While a
+        // backlog remains, this kevent() still applies its batch and returns
+        // ready events, but does not block.
+        const backlog = self.changes.items.len > 0;
         self.changes_lock.unlock();
+        const no_block = posix.timespec{ .sec = 0, .nsec = 0 };
 
         const t_wait_start = std.time.nanoTimestamp();
-        const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, null) catch {
+        const n = posix.kevent(self.kq, staged[0..staged_count], &evbuf, if (backlog) &no_block else null) catch {
             return error.SystemResources;
         };
         const t_wait_end = std.time.nanoTimestamp();
