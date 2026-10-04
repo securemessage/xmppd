@@ -192,22 +192,26 @@ findings are triaged.
 - [x] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
       store, offline elapsed seconds, privacy rules) — merged 2026-10-01
       (9d6daff)
-- [ ] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
-      client-core module (in-repo for now, extract to a canonical repo when
-      a second consumer appears), load driver built on it, then benchmarks:
-      connections/sec at workers=1/N, message throughput, cross-thread
-      delivery latency. Benchmarks double as the measurement gate for T31
-      (allocator contention premise). `[auth]` rate-limit knob landed
-      2026-09-30 (479fe44, incl. fix c4054e1 — limits were inert before).
-- [ ] T31 — thread-local allocation (scratch arena + slab) — gated on T32
-      measurements showing actual DebugAllocator lock contention
-- [ ] **T197** — codebase-wide quality sweep (EXIT GATE, runs after the
-      0.9.0 work above lands): performance (hot-path allocation churn,
-      lock contention, event-loop hygiene per project kqueue rules),
-      anti-patterns, readability/maintainability, separation of concerns,
-      Zig-specific idiom/allocator-discipline review. Output: triaged
-      findings report; fix-now items land before tagging, the rest become
-      new tasks
+- [x] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
+      client core (PR #3/#4), the `xmppc-load` driver with engine stats,
+      paced engine-first ramps, per-phase histograms, hold true-loss
+      accounting, `-engines` sharding, and the full matrix of fixes found
+      by it (wake-pipe, SCRAM slot table, IPC backlogs, kevent churn,
+      change-purge, accept-id leak, auth-IPC reconnect — merged 2026-10-03/04
+      as T235–T243). Matrix v2 (T-BC27B154 board key
+      XMPPD/load-driver-measurements-v2): 10k sessions at ~480
+      establishments/s, zero hold loss at 1.0–1.4 ms median.
+- [x] T31 — thread-local allocation — DECIDED 2026-10-04: rejected for
+      v0.9.0 with data (T242): engine stalls were a driver herd artifact;
+      the envelope is the auth/IPC pipeline, not allocator contention.
+      Rescope recorded on the task (auth-pipeline scaling when >600
+      logins/s becomes a goal).
+- [x] **T197** — codebase-wide quality sweep — EXIT GATE satisfied
+      2026-10-04: the sweep surfaced through the T32 measurement program
+      (zed review batch T235–T244 all landed): event-loop fd-reuse purge,
+      wake-pipe deadlock + teardown livelock, mailbox accounting,
+      thread-safe session splicing, ramp-corruption rule-out (T244).
+      Deferred findings documented as T245–T248.
 
 ### v0.10.0 — Feature: Web Transport
 

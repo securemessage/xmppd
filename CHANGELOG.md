@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (v0.9.0)
+## v0.9.0 — 2026-10-04
 
 ### Features
 
@@ -58,6 +58,21 @@
   `[core] max_resources_per_account` (default 256) backed by a heap-grown
   entry list — multi-resource accounts (agent/bot deployments) no longer
   hit the wall (a3babac).
+- lib/xmppc client library: reusable client core in `lib/xmppc` — one
+  kqueue engine driving N sessions (generational slot handles, threaded or
+  inline loop, thread-safe `startSession`/`postStanza`/`stopSession`),
+  async DNS resolution with SRV chain, DANE-first TLS with PKIX fallback,
+  SCRAM-SHA-256/-1 client SASL with channel binding (tls-exporter /
+  tls-server-end-point), XEP-0198 enable/resume with an engine-owned
+  unacked queue and replay, event-funnel consumer API, stable TLS write
+  pinning, application-level raw stanza access (PR #3, PR #4, T2xx).
+- T32 load driver (`test/xmppc/load.zig`, `zig build xmppc-load`): paced
+  multi-thousand-session ramps against a live rig with engine stats,
+  per-phase establishment histograms, true-loss hold accounting, and
+  multi-engine sharding (`-engines E`).
+- SASL expansion: SCRAM-SHA-1 client + SCRAM-PLUS channel binding
+  (9435631), OpaqueString profile + SCRAM `n=`/`r=` escaping (42e1ba6),
+  RFC 5802 conformance vector + live interop evidence (297c6a3).
 
 ### Fixes
 
@@ -96,6 +111,33 @@
   ended up with an EMPTY resource (`user@host/`). The resource now comes
   from the detached session's bound JID — MUC fan-in and fan-out stay
   correct after resume (T177 work, 02893d9).
+- Auth rate limiting vs SCRAM concurrency under load: the slot table's
+  home-slot probing now scales to 8192 entries with lazy stale reclaim
+  (54c5ccb/a293b02), a connection that dies mid-exchange is dropped
+  daemon-side via the auth_abort IPC message (3104120), and both growable
+  IPC backlogs no longer lie not-authorized under SASL bursts
+  (05a455c/6cf6b6c — overflow answers temporary-auth-failure).
+- Core loop churn (w4/N=5000 class): closers purge their staged kqueue
+  entries instead of staging EV_DELETEs of soon-closed fds (same-iteration
+  fd reuse would disarm a fresh connection) and kevent per-entry batch
+  failure is surfaced as EV_ERROR receipts handled without a full replay
+  (899fe48, also fixes the accept-side session-id pool leak that froze
+  busy workers for minutes); kevent batch hardening + real listen backlog
+  (18e24ce).
+- Auth-IPC resilience: a dead xmppd-auth no longer leaves workers
+  unable to authenticate until restart — each worker fails in-flight SASL
+  with retryable temporary-auth-failure and re-links on a 1 s reconnect
+  timer (228827d).
+- xmppc client library fixes: PBKDF2 salt truncation past 252 bytes
+  (c1baf03), staged-changelist tail livelock at 32 sessions (f2a8ae9),
+  drain-phase stopSession hang (1ada2af), wake-pipe blocking-write
+  deadlock at ~8192 pending sessions and the coalescing-flag teardown
+  livelock (7349477/d3286a3), thread-safe engine splicing with chunked
+  session storage (d3286a3).
+- c2s: kept bind IQ id across the cross-worker kick (T220, cbff998); s2s:
+  remote_domain copied off the reader arena across stream restarts
+  (T221, 2efbad2); lib/xml: namespace prefix bindings scoped to their
+  element (T232, 6190d36).
 
 ### Testing
 
@@ -106,6 +148,13 @@
   Cross-worker handoff is verified via server-log evidence.
 - New `e2e-resource-takeover.py`: repeated same-resource bind takeovers,
   cross-worker kick evidence via server log.
+- T32 load driver matrix (T242 v2 method: ECDSA rig cert, paced engine-first
+  ramp, one build, 3 runs/cell, median): 10,000 sessions establish at
+  ~480 logins/s on both workers=1 and workers=4 rigs; hold loss zero, dupes
+  zero, median delivery 1.0–1.4 ms. SINT (Smack 4.5.0-beta9 extensions):
+  461/554 pass (8 failed, 85 skipped by feature detection); filed T245
+  (low-level modular stress loss), T246 (XEP-0410 self-ping), T247
+  (PEP disco identity), T248 (pre-bind policy vs Smack modular).
 
 ## v0.8.11 — 2026-09-30
 
