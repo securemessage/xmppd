@@ -471,13 +471,6 @@ pub const Session = struct {
     }
 };
 
-/// Entry in the SM-ID → session slot hash map (T127).
-const SmIdEntry = struct {
-    occupied: bool = false,
-    sm_id: [sm_state.SM_ID_HEX_LEN]u8 = undefined,
-    slot: usize = 0,
-};
-
 /// T177: breadcrumb left when a detached session is handed off to another
 /// worker. resolved hop-by-hop because the SM-ID prefix never updates.
 const SmRedirect = struct {
@@ -493,15 +486,6 @@ const MAX_SM_REDIRECTS: usize = 256;
 const MAX_SM_REDIRECT_HOPS: u8 = 8;
 
 /// FNV-1a hash of an SM-ID for map indexing (T127).
-fn hashSmId(id: *const [sm_state.SM_ID_HEX_LEN]u8) usize {
-    var h: u64 = 0xcbf29ce484222325;
-    for (id) |byte| {
-        h ^= byte;
-        h *%= 0x100000001b3;
-    }
-    return @intCast(h % 64);
-}
-
 /// The XMPP core server.
 pub const Server = struct {
     loop: EventLoop,
@@ -599,9 +583,11 @@ pub const Server = struct {
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
-    /// SM-ID → session slot index map for O(1) resume lookup (T127).
-    /// Open-addressing table with FNV-1a hash. Capacity must exceed max concurrent detached sessions.
-    sm_id_map: [64]SmIdEntry = [_]SmIdEntry{SmIdEntry{}} ** 64,
+    /// SM-ID → session slot index map for O(1) resume lookup (T127, S17).
+    /// AutoHashMapUnmanaged: the old fixed 64-entry open-addressing table
+    /// silently failed inserts when full and broke probe chains on remove
+    /// (no tombstones) — spurious item-not-found on resume.
+    sm_id_map: std.AutoHashMapUnmanaged([sm_state.SM_ID_HEX_LEN]u8, usize) = .{},
 
     /// T177: SM-ID → worker redirects for sessions handed off to another
     /// worker by a cross-worker resume. The SM-ID prefix permanently names
@@ -903,6 +889,7 @@ pub const Server = struct {
         }
         self.allocator.free(self.sessions);
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
+        self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
         self.loop.deinit();
@@ -4047,51 +4034,28 @@ pub const Server = struct {
     /// Find a detached session by SM-ID. O(1) via hash map (T127).
     fn findDetachedSession(self: *Server, sm_id: []const u8) ?usize {
         if (sm_id.len != sm_state.SM_ID_HEX_LEN) return null;
-        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
-        var idx = hash % 64;
-        var probes: usize = 0;
-        while (probes < 64) : (probes += 1) {
-            const entry = &self.sm_id_map[idx];
-            if (!entry.occupied) return null;
-            if (std.mem.eql(u8, &entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN])) return entry.slot;
-            idx = (idx + 1) % 64;
-        }
-        return null;
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        return self.sm_id_map.get(key);
     }
 
     /// Insert an SM-ID → slot mapping.
     pub fn smIdMapInsert(self: *Server, sm_id: []const u8, slot: usize) void {
         if (sm_id.len != sm_state.SM_ID_HEX_LEN) return;
-        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
-        var idx = hash % 64;
-        var probes: usize = 0;
-        while (probes < 64) : (probes += 1) {
-            const entry = &self.sm_id_map[idx];
-            if (!entry.occupied) {
-                entry.occupied = true;
-                @memcpy(&entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN]);
-                entry.slot = slot;
-                return;
-            }
-            idx = (idx + 1) % 64;
-        }
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        self.sm_id_map.put(self.allocator, key, slot) catch |err| {
+            // An SM-ID that is not findable loses its resume capability.
+            log.err("SM-ID map insert failed ({}): detached sessions become unresumable", .{err});
+        };
     }
 
     /// Remove an SM-ID from the map.
     pub fn smIdMapRemove(self: *Server, sm_id: []const u8) void {
         if (sm_id.len != sm_state.SM_ID_HEX_LEN) return;
-        const hash = hashSmId(sm_id[0..sm_state.SM_ID_HEX_LEN]);
-        var idx = hash % 64;
-        var probes: usize = 0;
-        while (probes < 64) : (probes += 1) {
-            const entry = &self.sm_id_map[idx];
-            if (!entry.occupied) return;
-            if (std.mem.eql(u8, &entry.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN])) {
-                entry.occupied = false;
-                return;
-            }
-            idx = (idx + 1) % 64;
-        }
+        var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        @memcpy(&key, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+        _ = self.sm_id_map.remove(key);
     }
 
     /// T177: record that previd's session moved to `worker` (cross-worker
@@ -4629,4 +4593,58 @@ test "cross-thread delivery: generation mismatch drops stanza" {
 
     // No session at slot 3, so nothing should crash or write
     try std.testing.expect(server.sessions[3] == null);
+}
+
+test "S17: SM-ID map holds more than 64 detached sessions" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    defer server.deinit();
+
+    // 200 inserts: the old 64-entry table silently dropped everything past 64.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
+        server.smIdMapInsert(&id, i);
+    }
+    try std.testing.expectEqual(@as(u32, 200), server.sm_id_map.count());
+
+    i = 0;
+    while (i < 200) : (i += 1) {
+        var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
+        try std.testing.expectEqual(@as(?usize, i), server.findDetachedSession(&id));
+    }
+}
+
+test "S17: SM-ID map remove does not break later lookups" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    defer server.deinit();
+
+    // Insert a batch, remove every third entry, then verify the rest are
+    // still findable (open addressing without tombstones lost the tail of
+    // each probe chain here).
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
+        server.smIdMapInsert(&id, i + 1000);
+    }
+    i = 0;
+    while (i < 100) : (i += 3) {
+        var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
+        server.smIdMapRemove(&id);
+    }
+    i = 0;
+    while (i < 100) : (i += 1) {
+        var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+        _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
+        if (i % 3 == 0) {
+            try std.testing.expectEqual(@as(?usize, null), server.findDetachedSession(&id));
+        } else {
+            try std.testing.expectEqual(@as(?usize, i + 1000), server.findDetachedSession(&id));
+        }
+    }
 }
