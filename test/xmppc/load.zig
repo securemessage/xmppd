@@ -52,6 +52,10 @@ const Options = struct {
     msg_rate: u64 = 0, // aggregate client-tx stanzas/sec during the hold
     msg_size: usize = 128, // <body> payload bytes
     deadline: u64 = 120,
+    /// Shard sessions across this many Engine instances, each on its own
+    /// thread (T-E232E8AE): proves the driver is never the bottleneck and
+    /// its loop stalls are read per engine size, not amortised.
+    engines: usize = 1,
     quiet: bool = false,
 
     fn parse(o: *Options, args: []const [:0]u8) !void {
@@ -83,6 +87,7 @@ const Options = struct {
                         "  -msg-rate R          (aggregate stanzas/sec during hold; 0=off)\n" ++
                         "  -msg-size B          (body payload bytes; default 128)\n" ++
                         "  -deadline S          (max seconds to reach all-settled)\n" ++
+                        "  -engines E           (engine threads; sessions shard round-robin)\n" ++
                         "  -quiet               (suppress per-second hold lines)\n",
                     .{},
                 );
@@ -123,6 +128,9 @@ const Options = struct {
                 o.msg_size = try std.fmt.parseUnsigned(usize, val, 10);
             } else if (std.mem.eql(u8, key, "deadline")) {
                 o.deadline = try std.fmt.parseUnsigned(u64, val, 10);
+            } else if (std.mem.eql(u8, key, "engines")) {
+                o.engines = try std.fmt.parseUnsigned(usize, val, 10);
+                if (o.engines == 0) return error.BadOption;
             } else {
                 std.debug.print("load: unknown option -{s}\n", .{key});
                 return error.BadOption;
@@ -201,7 +209,21 @@ var g = struct {
     /// Set by main right before the stopSession teardown: closes after this
     /// are our own, not load-phase failures.
     draining: bool = false,
+    /// Per-phase establishment latency samples in ns (T-E232E8AE): tcp
+    /// connect, stream-open to STARTTLS schedule, TLS handshake, SASL,
+    /// bind+SM. Sampled at .established from Session milestones.
+    ph_connect_ns: std.ArrayListUnmanaged(u64) = .{},
+    ph_starttls_ns: std.ArrayListUnmanaged(u64) = .{},
+    ph_tls_ns: std.ArrayListUnmanaged(u64) = .{},
+    ph_sasl_ns: std.ArrayListUnmanaged(u64) = .{},
+    ph_bind_ns: std.ArrayListUnmanaged(u64) = .{},
 }{};
+
+/// Composite key for per-session driver state: handle.index spaces repeat
+/// across engines (T-E232E8AE -engines), so key on (engine, index).
+fn keyOf(engine_idx: usize, handle_index: u32) usize {
+    return engine_idx * 65536 + @as(usize, handle_index);
+}
 
 fn slotEnsure(comptime T: type, list: *std.ArrayListUnmanaged(T), idx: usize, fill: T) !*T {
     while (list.items.len <= idx) try list.append(std.heap.c_allocator, fill);
@@ -224,9 +246,32 @@ fn bumpReason(reason: []const u8) void {
     }
 }
 
+/// Sample one session's establishment phase split from its milestones
+/// (caller holds nothing; arrays append under g.lock).
+fn samplePhases(session: anytype) void {
+    const t0 = session.milestoneNs(.start);
+    const t1 = session.milestoneNs(.tcp_up);
+    const t2 = session.milestoneNs(.tls_start);
+    const t3 = session.milestoneNs(.tls_done);
+    const t4 = session.milestoneNs(.sasl_done);
+    const t5 = session.milestoneNs(.established);
+    if (t0 == 0) return;
+    if (t1 > t0) g.ph_connect_ns.append(std.heap.c_allocator, t1 - t0) catch {};
+    if (t2 > t1 and t1 > 0) g.ph_starttls_ns.append(std.heap.c_allocator, t2 - t1) catch {};
+    if (t3 > t2 and t2 > 0) g.ph_tls_ns.append(std.heap.c_allocator, t3 - t2) catch {};
+    if (t4 > t3 and t3 > 0) g.ph_sasl_ns.append(std.heap.c_allocator, t4 - t3) catch {};
+    if (t5 > t4 and t4 > 0) g.ph_bind_ns.append(std.heap.c_allocator, t5 - t4) catch {};
+}
+
+fn pctUs(samples: []u64, num: usize, den: usize) u64 {
+    if (samples.len == 0) return 0;
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return samples[@min(samples.len - 1, (samples.len * num) / den)] / 1000;
+}
+
 fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
-    _ = ctx;
-    const idx: usize = @intCast(handle.index);
+    const engine_idx: usize = if (ctx) |c| @intFromPtr(c) else 0;
+    const idx = keyOf(engine_idx, handle.index);
     switch (ev) {
         .established => {
             const session = engine.sessionAt(handle) orelse return;
@@ -236,6 +281,7 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
                 null;
             g.lock.lock();
             defer g.lock.unlock();
+            samplePhases(session);
             if (slotEnsure(bool, &g.was_established, idx, false)) |w| w.* = true else |_| {}
             if (slotEnsure(?[]u8, &g.jids, idx, null)) |jp| jp.* = jid_str else |_| {}
             g.established += 1;
@@ -299,21 +345,24 @@ pub fn main() !void {
 
     const rss_base = maxRssKiB();
 
-    var engine = try Engine.init(std.heap.c_allocator);
-    try engine.useTls(null); // lab rig on lo0: userland TLS (PR 296498)
-    engine.default_tls_policy = .none;
+    const engines = try std.heap.c_allocator.alloc(Engine, o.engines);
+    for (engines, 0..) |*e, ei| {
+        e.* = try Engine.init(std.heap.c_allocator);
+        try e.useTls(null); // lab rig on lo0: userland TLS (PR 296498)
+        e.default_tls_policy = .none;
+        // ctx = engine ordinal for the composite key (small int in a ptr).
+        e.setEventHandler(onEvent, @ptrFromInt(ei));
+    }
 
     g.total = o.count;
     g.quiet = o.quiet;
 
-    engine.setEventHandler(onEvent, null);
-
-    // Sessions are started at the paced rate WHILE the engine runs
-    // (startSession is thread-safe, T237): the loop launches each one as
-    // posted, so pacing spaces real protocol progress. Previously all N
-    // were registered before engine.run(), and the "paced" ramp released
-    // as a herd once the loop started.
-    var handles = try std.ArrayList(Handle).initCapacity(std.heap.c_allocator, o.count);
+    // Sessions are started at the paced rate WHILE the engines run
+    // (startSession is thread-safe, T237), sharded round-robin across the
+    // -engines loops so the driver's own thread is provably not the
+    // bottleneck (T-E232E8AE): stall_max_us is read per engine below.
+    const SessRef = struct { eng: usize, h: Handle };
+    var handles = try std.ArrayList(SessRef).initCapacity(std.heap.c_allocator, o.count);
     defer handles.deinit(std.heap.c_allocator);
     const pace_start = std.time.nanoTimestamp();
     for (0..o.count) |i| {
@@ -324,9 +373,11 @@ pub fn main() !void {
             const now = std.time.nanoTimestamp();
             if (target > now) std.Thread.sleep(@intCast(target - now));
         }
+        const ei = i % o.engines;
+        const eng = &engines[ei];
         const res = try std.fmt.allocPrint(std.heap.c_allocator, "{s}-{d}", .{ o.resource, i });
         defer std.heap.c_allocator.free(res);
-        const h = engine.startSession(.{
+        const h = eng.startSession(.{
             .host = o.host,
             .port = o.port,
             .domain = o.domain,
@@ -337,10 +388,10 @@ pub fn main() !void {
             std.debug.print("load: startSession {d}: {}\n", .{ i, err });
             std.c._exit(1);
         };
-        handles.appendAssumeCapacity(h);
-        // run() exits when the live-session count reaches zero: spin it up
-        // once the first session exists.
-        if (i == 0) try engine.run();
+        handles.appendAssumeCapacity(.{ .eng = ei, .h = h });
+        // run() exits when the live-session count reaches zero: spin each
+        // engine up once its first session exists.
+        if (i < o.engines) try eng.run();
     }
 
     // End-to-end ramp clock starts when the FIRST connect is issued — paced
@@ -360,7 +411,7 @@ pub fn main() !void {
     g.lock.unlock();
     const t_settled = std.time.nanoTimestamp();
 
-    const snap_ramp = engine.statsSnapshot();
+    const snap_ramp = aggStats(engines);
     const ramp_wall_s = @as(f64, @floatFromInt(@max(1, t_settled - t_start))) / std.time.ns_per_s;
     const conn_s = rate(snap_ramp.connects_completed, snap_ramp.first_connect_ns, snap_ramp.last_connect_ns);
     const login_s_pipe = rate(snap_ramp.sessions_established, snap_ramp.first_established_ns, snap_ramp.last_established_ns);
@@ -368,7 +419,7 @@ pub fn main() !void {
 
     std.debug.print(
         "load: ramp t={d:.2}s established={d}/{d} failed={d} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} bytes_rx={d} bytes_tx={d} stall_max_us={d} scram_derives={d} cache_hits={d}\n",
-        .{ ramp_wall_s, settled_established, g.total, settled_failed, conn_s, login_s_pipe, login_s_wall, snap_ramp.bytes_rx, snap_ramp.bytes_tx, snap_ramp.max_iter_us, engine.scram_derives, engine.scram_cache_hits },
+        .{ ramp_wall_s, settled_established, g.total, settled_failed, conn_s, login_s_pipe, login_s_wall, snap_ramp.bytes_rx, snap_ramp.bytes_tx, snap_ramp.max_iter_us, scramTotal(engines), hitsTotal(engines) },
     );
 
     // Hold phase.
@@ -398,18 +449,19 @@ pub fn main() !void {
             // Round-robin to the next established session.
             var tried: usize = 0;
             while (tried < handles.items.len) : (tried += 1) {
-                const h = handles.items[rr % handles.items.len];
+                const ref = handles.items[rr % handles.items.len];
                 rr +%= 1;
+                const jk = keyOf(ref.eng, ref.h.index);
                 const target: ?[]const u8 = blk: {
                     g.lock.lock();
                     defer g.lock.unlock();
-                    break :blk if (h.index < g.jids.items.len) g.jids.items[@intCast(h.index)] else null;
+                    break :blk if (jk < g.jids.items.len) g.jids.items[jk] else null;
                 };
                 const jid = target orelse continue;
                 const send_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
                 const stanza = std.fmt.allocPrint(std.heap.c_allocator, "<message id='l{d}-{d}' to='{s}'><body>{s}</body></message>", .{ stanza_seq, send_ns, jid, body_pad }) catch continue;
                 defer std.heap.c_allocator.free(stanza);
-                engine.postStanza(h, stanza) catch {
+                engines[ref.eng].postStanza(ref.h, stanza) catch {
                     g.lock.lock();
                     g.post_drops += 1;
                     g.lock.unlock();
@@ -423,7 +475,7 @@ pub fn main() !void {
         }
         if (!g.quiet and now >= next_report) {
             next_report += std.time.ns_per_s;
-            const snap = engine.statsSnapshot();
+            const snap = aggStats(engines);
             g.lock.lock();
             std.debug.print("load: hold t={d:.1}s posted={d} rx={d} drops={d} stall_max_us={d}\n", .{ @as(f64, @floatFromInt(now - hold_start)) / std.time.ns_per_s, g.stanzas_posted, g.stanzas_rx, g.post_drops, snap.max_iter_us });
             g.lock.unlock();
@@ -437,25 +489,25 @@ pub fn main() !void {
     const drain_end = std.time.nanoTimestamp() + 3 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < drain_end) std.Thread.sleep(10 * std.time.ns_per_ms);
 
-    const snap_end = engine.statsSnapshot();
+    const snap_end = aggStats(engines);
     const rss_end = maxRssKiB();
 
-    // Teardown: stop everything, wait for the engine to reap, join threads.
+    // Teardown: stop everything, wait for the engines to reap, join threads.
     g.lock.lock();
     g.draining = true;
     g.lock.unlock();
-    for (handles.items) |h| engine.stopSession(h, "load-done");
+    for (handles.items) |ref| engines[ref.eng].stopSession(ref.h, "load-done");
     var tries: u32 = 0;
-    while (engine.sessionCount() > 0 and tries < 1000) : (tries += 1) {
+    while (liveTotal(engines) > 0 and tries < 1000) : (tries += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
         // Teardown forensics: once per second while sessions linger, show
         // the fail/reap/drop counters (T237/T244 hang diagnostics).
         if (tries % 100 == 99) {
-            const st = engine.statsSnapshot();
-            std.debug.print("load: teardown live={d} fails={d} reaped={d} stop_drops={d} posted={d} drained={d} wk_wr={d} wk_rd={d} wk_pend={}\n", .{ engine.sessionCount(), st.sessions_failed, st.sessions_reaped, st.stops_dropped, st.cmds_posted, st.cmds_drained, st.wakes_written, st.wakes_read, st.wake_pending });
+            const st = aggStats(engines);
+            std.debug.print("load: teardown live={d} fails={d} reaped={d} stop_drops={d} posted={d} drained={d} wk_wr={d} wk_rd={d}\n", .{ liveTotal(engines), st.sessions_failed, st.sessions_reaped, st.stops_dropped, st.cmds_posted, st.cmds_drained, st.wakes_written, st.wakes_read });
         }
     }
-    engine.deinit();
+    for (engines) |*e| e.deinit();
 
     g.lock.lock();
     const est = g.established;
@@ -495,8 +547,28 @@ pub fn main() !void {
 
     std.debug.print(
         "load: LOAD n={d} established={d} failed={d} post_closes={d} ramp_s={d:.2} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} ramp_bytes_per_session={d} hold_s={d:.1} hold_posted={d} hold_rx={d} hold_rx_distinct={d} hold_dupes={d} hold_lost={d} hold_drops={d} lat_p50_us={d} lat_p99_us={d} lat_max_us={d} hold_bytes_per_session={d} stall_max_us={d} scram_derives={d} cache_hits={d} mem_bytes_per_session_est={d} first_fail={s}\n",
-        .{ o.count, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, rx_distinct, rx_dupes, hold_lost, post_drops, lat_p50_us, lat_p99_us, lat_max_us, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, engine.scram_derives, engine.scram_cache_hits, mem_est_bytes, first_fail },
+        .{ o.count, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, rx_distinct, rx_dupes, hold_lost, post_drops, lat_p50_us, lat_p99_us, lat_max_us, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, scramTotal(engines), hitsTotal(engines), mem_est_bytes, first_fail },
     );
+
+    // Per-phase establishment split (T-E232E8AE), one line per phase:
+    // where ramp seconds actually go (connect / STARTTLS / TLS / SASL /
+    // bind+SM).
+    g.lock.lock();
+    const ph: [5]struct { n: []const u8, s: []u64 } = .{
+        .{ .n = "connect", .s = g.ph_connect_ns.items },
+        .{ .n = "starttls", .s = g.ph_starttls_ns.items },
+        .{ .n = "tls", .s = g.ph_tls_ns.items },
+        .{ .n = "sasl", .s = g.ph_sasl_ns.items },
+        .{ .n = "bind+sm", .s = g.ph_bind_ns.items },
+    };
+    for (ph) |p| {
+        std.debug.print("load: phase {s} n={d} p50_us={d} p99_us={d} max_us={d}\n", .{ p.n, p.s.len, pctUs(p.s, 1, 2), pctUs(p.s, 99, 100), blk: {
+            if (p.s.len == 0) break :blk 0;
+            std.mem.sort(u64, p.s, {}, std.sort.asc(u64));
+            break :blk p.s[p.s.len - 1] / 1000;
+        } });
+    }
+    g.lock.unlock();
 
     var it = g.fail_reasons.iterator();
     while (it.next()) |e| std.debug.print("load: fail-reason {s} x{d}\n", .{ e.key_ptr.*, e.value_ptr.* });
@@ -509,4 +581,52 @@ pub fn main() !void {
 fn rate(count: u64, first_ns: u64, last_ns: u64) f64 {
     if (count == 0 or first_ns == 0 or last_ns <= first_ns) return @floatFromInt(count);
     return @as(f64, @floatFromInt(count)) / (@as(f64, @floatFromInt(last_ns - first_ns)) / std.time.ns_per_s);
+}
+
+/// Cross-engine aggregation (T-E232E8AE): sums for counters, max for stall,
+/// min/max endpoints for the rate windows.
+fn aggStats(engines: []Engine) Engine.StatsFlat {
+    var a = Engine.StatsFlat{};
+    for (engines) |*e| {
+        const s = e.statsSnapshot();
+        a.connects_completed += s.connects_completed;
+        a.sessions_established += s.sessions_established;
+        a.bytes_rx += s.bytes_rx;
+        a.bytes_tx += s.bytes_tx;
+        a.max_iter_us = @max(a.max_iter_us, s.max_iter_us);
+        a.first_connect_ns = minNonzero(a.first_connect_ns, s.first_connect_ns);
+        a.last_connect_ns = @max(a.last_connect_ns, s.last_connect_ns);
+        a.first_established_ns = minNonzero(a.first_established_ns, s.first_established_ns);
+        a.last_established_ns = @max(a.last_established_ns, s.last_established_ns);
+        a.sessions_failed += s.sessions_failed;
+        a.sessions_reaped += s.sessions_reaped;
+        a.stops_dropped += s.stops_dropped;
+        a.cmds_posted += s.cmds_posted;
+        a.cmds_drained += s.cmds_drained;
+        a.wakes_written += s.wakes_written;
+        a.wakes_read += s.wakes_read;
+    }
+    return a;
+}
+
+fn minNonzero(a: u64, b: u64) u64 {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    return @min(a, b);
+}
+
+fn liveTotal(engines: []Engine) usize {
+    var n: usize = 0;
+    for (engines) |*e| n += e.sessionCount();
+    return n;
+}
+fn scramTotal(engines: []Engine) usize {
+    var n: usize = 0;
+    for (engines) |*e| n += e.scram_derives;
+    return n;
+}
+fn hitsTotal(engines: []Engine) usize {
+    var n: usize = 0;
+    for (engines) |*e| n += e.scram_cache_hits;
+    return n;
 }

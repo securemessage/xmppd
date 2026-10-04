@@ -131,6 +131,9 @@ pub const Session = struct {
         dead,
     };
 
+    /// Per-phase establishment steps for Session.milestones (T-E232E8AE).
+    pub const Milestone = enum(u8) { start, tcp_up, tls_start, tls_done, sasl_done, established };
+
     engine: *Engine,
     /// This session's slot handle on the engine (public id + kqueue udata).
     handle: Handle = .{ .index = 0, .generation = 0 },
@@ -140,6 +143,12 @@ pub const Session = struct {
     destructed: bool = false,
     phase: Phase = .connecting,
     failed: bool = false,
+
+    /// Establishment-step timestamps, ns since epoch; 0 = not reached yet.
+    /// The load driver reads these at .established for per-phase latency
+    /// histograms (T-E232E8AE). Written on the engine thread except .start
+    /// (setConfig, caller thread during prepare).
+    milestones: [@typeInfo(Milestone).@"enum".fields.len]u64 = @splat(0),
 
     /// Copy of the last fail() reason — callbacks and post-mortem readers
     /// (e.g. smoke's summary line) may outlive the parser buffers the
@@ -225,6 +234,14 @@ pub const Session = struct {
     /// caller's config storage is never retained (T-25A16875).
     arena_state: std.heap.ArenaAllocator,
 
+    fn mark(self: *Session, m: Milestone) void {
+        self.milestones[@intFromEnum(m)] = @intCast(@max(0, std.time.nanoTimestamp()));
+    }
+    /// ns epoch of one establishment milestone, 0 while unreached.
+    pub fn milestoneNs(self: *const Session, m: Milestone) u64 {
+        return self.milestones[@intFromEnum(m)];
+    }
+
     pub fn init(allocator: std.mem.Allocator) !Session {
         const parser = try allocator.create(Parser);
         parser.* = Parser.init(allocator);
@@ -242,6 +259,7 @@ pub const Session = struct {
     /// Called by the Engine before the session is slotted.
     pub fn setConfig(self: *Session, config: SessionConfig) !void {
         const a = self.arena_state.allocator();
+        self.mark(.start);
         self.host = try a.dupe(u8, config.host);
         self.domain = try a.dupe(u8, config.domain);
         self.user = try a.dupe(u8, config.user);
@@ -341,6 +359,7 @@ pub const Session = struct {
             switch (res) {
                 .complete => {
                     self.tls_handshake = false;
+                    self.mark(.tls_done);
                     self.disarmWrite(engine);
                     // Guardrail rule 3: right after the handshake, check and
                     // log kernel-TLS offload per direction — fallback to
@@ -643,6 +662,7 @@ pub const Session = struct {
                     return;
                 };
             }
+            self.mark(.sasl_done);
         }
         const action = self.fsm.feed(ev);
         self.handleAction(engine, action);
@@ -679,6 +699,7 @@ pub const Session = struct {
             // re-ran this branch and staged duplicate EV_DELETEs — with a
             // changelist those surface as spurious EV_ERROR events).
             self.phase = .connected;
+            self.mark(.tcp_up);
             engine.noteConnect();
             const action = self.fsm.openStream();
             self.handleAction(engine, action);
@@ -831,6 +852,7 @@ pub const Session = struct {
         switch (action) {
             .established => {
                 self.phase = .established;
+                self.mark(.established);
                 engine.noteEstablished();
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
@@ -971,6 +993,7 @@ pub const Session = struct {
                     engine.tls_ctx orelse return error.TlsNotConfigured
                 else
                     engine.clientCaTlsContext() catch return error.TlsNotConfigured;
+                self.mark(.tls_start);
                 tp.upgradeToTls(ctx, sni) catch return error.TlsInitFailed;
                 if (!use_dane and self.tls_policy != .none) {
                     const tc = tp.tlsConn() orelse return error.TlsMissing;
