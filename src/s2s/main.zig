@@ -852,12 +852,24 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         // Session may have been closed by processInboundEvent
         if (daemon.getInbound(slot) == null) return;
 
-        // After STARTTLS, stop processing pre-TLS buffer
-        if (session.isTlsHandshaking()) break;
+        // After STARTTLS, stop processing pre-TLS buffer — also when the
+        // upgrade merely pends behind a partially-flushed <proceed/> (T250).
+        if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
     }
 
     // Mark consumed bytes
     if (pos > 0) session.consume(pos);
+
+    // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
+    // mean the peer spoke before receiving it; they are a protocol error,
+    // never silently discarded at handshake completion.
+    if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
+        log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/> — stream policy-violation", .{ slot, session.read_end - session.read_start });
+        sendStreamError(session, .policy_violation);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(slot);
+        return;
+    }
 
     // After SASL success, flush <success/> and drain any OpenSSL-buffered
     // post-auth stream data. Same pattern as post-TLS handshake (line 843):
@@ -892,7 +904,9 @@ fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, ses
         session.stream.tlsEstablished();
         // Reset XML reader for stream restart after STARTTLS
         if (daemon.readers[slot]) |reader| reader.reset();
-        // Clear any stale pre-TLS data from the read buffer
+        // Invariant: no plaintext can outlive <proceed/> (T250 rejects any
+        // leftover with policy-violation); the zeroing stays as a start
+        // state guard.
         session.read_start = 0;
         session.read_end = 0;
 
@@ -1320,18 +1334,27 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             const proceed = session.buildTlsProceed(&buf) catch return;
             session.queueWrite(proceed) catch {};
 
-            // Flush the proceed XML before upgrading to TLS
-            _ = session.flushWrite() catch {};
-
-            // Start TLS handshake
-            if (daemon.tls_ctx) |ctx| {
-                session.upgradeToTls(ctx) catch {
-                    log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
-                    return;
-                };
-                log.info("inbound S2S id={d} starting TLS handshake", .{session.id});
+            // Only upgrade once the plaintext buffer is fully flushed — a
+            // partially sent <proceed/> would otherwise leak into the TLS
+            // record stream (T250). A partial flush defers the upgrade to
+            // the writable handler.
+            if (session.flushWrite() catch false) {
+                if (daemon.tls_ctx) |ctx| {
+                    session.upgradeToTls(ctx) catch {
+                        log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
+                        return;
+                    };
+                    log.info("inbound S2S id={d} starting TLS handshake", .{session.id});
+                } else {
+                    log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                }
             } else {
-                log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                if (daemon.tls_ctx) |ctx| {
+                    session.tls_upgrade_pending = true;
+                    session.pending_tls_ctx = ctx;
+                } else {
+                    log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                }
             }
         },
         .send_sasl_success => {
@@ -1382,6 +1405,23 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         daemon.closeInbound(slot);
         return;
     };
+
+    // A <proceed/> whose flush had fallen short now drained: run the
+    // deferred TLS upgrade (T250).
+    if (session.tls_upgrade_pending and !session.hasPendingWrite()) {
+        session.tls_upgrade_pending = false;
+        if (session.pending_tls_ctx) |ctx| {
+            session.pending_tls_ctx = null;
+            session.upgradeToTls(ctx) catch {
+                log.err("inbound S2S id={d} deferred TLS upgrade failed", .{session.id});
+                daemon.closeInbound(slot);
+                return;
+            };
+            log.info("inbound S2S id={d} starting TLS handshake (deferred)", .{session.id});
+            batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+        }
+        return;
+    }
 
     // If still more to write, re-register for another one-shot write event
     if (session.hasPendingWrite()) {
@@ -1450,6 +1490,18 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 daemon.closeOutbound(slot);
                 return;
             };
+            // A <proceed/>-response that was queued behind a partial flush:
+            // upgrade only now that the plaintext buffer is empty (T250).
+            if (conn.tls_upgrade_pending) {
+                if (!conn.hasPendingWrite()) {
+                    conn.tls_upgrade_pending = false;
+                    conn.state = .tls_handshake;
+                    startOutboundTls(daemon, batch, slot, conn);
+                } else {
+                    batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+                }
+                return;
+            }
             if (conn.hasPendingWrite()) {
                 batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
             }
@@ -1501,12 +1553,22 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
         // Connection may have been closed
         if (daemon.outbound[slot] == null) return;
 
-        // After STARTTLS, stop processing pre-TLS buffer
-        if (conn.isTlsHandshaking()) break;
+        // After STARTTLS, stop processing pre-TLS buffer — also while the
+        // upgrade pends behind an unflushed buffer (T250).
+        if (conn.isTlsHandshaking() or conn.tls_upgrade_pending) break;
     }
 
     // Mark consumed bytes
     if (pos > 0) conn.consume(pos);
+
+    // STARTTLS read-ahead hygiene (T250): plaintext past <proceed/> means
+    // the remote spoke before we started TLS — protocol violation, close.
+    if ((conn.isTlsHandshaking() or conn.tls_upgrade_pending) and conn.read_start < conn.read_end) {
+        log.warn("outbound to {s}: {d} plaintext bytes after <proceed/> — policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
+        conn.fail("policy-violation");
+        daemon.closeOutbound(slot);
+        return;
+    }
 
     // Request write notification if there's data to flush
     if (conn.hasPendingWrite()) {
@@ -1539,9 +1601,12 @@ fn processOutboundEvent(
             if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls)) {
                 if (std.mem.eql(u8, elem.local_name, "proceed")) {
                     log.info("outbound STARTTLS proceed from {s}", .{conn.remote_domain});
-                    conn.handleStarttlsProceed();
                     reader.reset();
-                    startOutboundTls(daemon, batch, slot, conn);
+                    if (conn.handleStarttlsProceed()) {
+                        startOutboundTls(daemon, batch, slot, conn);
+                    }
+                    // Not drained: tls_upgrade_pending is set; the writable
+                    // handler upgrades once the buffer empties (T250).
                 }
             }
             // <stream:features> children
@@ -1711,7 +1776,8 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 
         // Reset XML reader for post-TLS stream restart
         if (daemon.outbound_readers[slot]) |reader| reader.reset();
-        // Clear stale pre-TLS data from the read buffer
+        // Invariant per T250: no plaintext may outlive <proceed/>
+        // (leftovers are rejected with policy-violation); zero for safety.
         conn.read_start = 0;
         conn.read_end = 0;
 

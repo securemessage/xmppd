@@ -57,6 +57,11 @@ pub const S2sSession = struct {
     write_buf: [WRITE_BUF_SIZE]u8 = undefined,
     write_start: usize = 0,
     write_end: usize = 0,
+    /// <proceed/> queued but not fully flushed: the TLS upgrade waits for
+    /// the drain (T250 — a partially sent proceed must never reach the
+    /// peer through the TLS record layer).
+    tls_upgrade_pending: bool = false,
+    pending_tls_ctx: ?SslContext = null,
     /// DANE verification status for the peer.
     dane_status: DaneStatus = .pending,
     /// Remote domain (set from stream open).

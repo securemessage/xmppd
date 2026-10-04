@@ -88,6 +88,10 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
+    /// STARTTLS proceed received but our own write buffer had not drained:
+    /// the handshake starts when handleOutboundWritable finishes flushing
+    /// (T250).
+    tls_upgrade_pending: bool = false,
     /// If set, this outbound connection is a dialback verification callback.
     /// The value is the inbound session slot that initiated the callback.
     /// After db:verify response, the result is sent back on that inbound session.
@@ -395,11 +399,17 @@ pub const OutboundConnection = struct {
         return .none;
     }
 
-    /// STARTTLS proceed received — start TLS handshake.
-    pub fn handleStarttlsProceed(self: *OutboundConnection) void {
-        // Flush any pending plaintext writes before upgrading
-        _ = self.flushWrite() catch {};
-        self.state = .tls_handshake;
+    /// STARTTLS proceed received — flush our side first; the caller upgrades
+    /// when this returns true, or parks us via tls_upgrade_pending on false
+    /// (T250: a partially-written plaintext tail must never enter TLS).
+    pub fn handleStarttlsProceed(self: *OutboundConnection) bool {
+        const drained = self.flushWrite() catch false;
+        if (drained) {
+            self.state = .tls_handshake;
+            return true;
+        }
+        self.tls_upgrade_pending = true;
+        return false;
     }
 
     /// SASL success received — connection is authenticated.
@@ -636,7 +646,7 @@ test "OutboundConnection: STARTTLS lifecycle with no DANE" {
     try std.testing.expectEqual(OutboundState.starttls_negotiation, conn.state);
 
     // Proceed received
-    conn.handleStarttlsProceed();
+    _ = conn.handleStarttlsProceed();
     try std.testing.expectEqual(OutboundState.tls_handshake, conn.state);
 
     // TLS done, DANE check
