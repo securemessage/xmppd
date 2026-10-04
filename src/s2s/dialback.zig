@@ -103,7 +103,10 @@ pub fn verifyKey(
 ) bool {
     if (received_key_hex.len != KEY_HEX_LEN) return false;
     const expected = computeKeyHex(secret, target, origin, stream_id);
-    return std.mem.eql(u8, &expected, received_key_hex);
+    // Constant-time: this compares an HMAC-derived dialback key (T261).
+    var got_bytes: [KEY_HEX_LEN]u8 = undefined;
+    @memcpy(&got_bytes, received_key_hex);
+    return std.crypto.timing_safe.eql([KEY_HEX_LEN]u8, expected, got_bytes);
 }
 
 /// Build a `<db:result>` stanza (initiating server sends this).

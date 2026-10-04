@@ -312,11 +312,11 @@ pub const ScramServer = struct {
             r.* = p ^ s;
         }
 
-        // Verify: H(recovered_client_key) == StoredKey
+        // Verify: H(recovered_client_key) == StoredKey (constant-time: it
+        // authenticates the peer's proof of the shared secret — T211).
         var recovered_stored_key: [32]u8 = undefined;
         Sha256.hash(&recovered_client_key, &recovered_stored_key, .{});
-
-        if (!std.mem.eql(u8, &recovered_stored_key, &creds.stored_key)) {
+        if (!std.crypto.timing_safe.eql([32]u8, recovered_stored_key, creds.stored_key)) {
             self.state = .failed;
             return error.AuthenticationFailed;
         }
@@ -871,7 +871,6 @@ test "SCRAM-SHA-1 client: RFC 5802 test vector" {
     try client.handleServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
     try std.testing.expect(client.isComplete());
 }
-
 
 test "SCRAM client: forged server signature is rejected" {
     const allocator = std.testing.allocator;
