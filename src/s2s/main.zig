@@ -911,7 +911,9 @@ fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, ses
         if (session.tls_state) |state| {
             switch (state) {
                 .handshake_want_read => batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {},
-                .handshake_want_write => batch.addWrite(session.fd, INBOUND_UDATA_BASE + slot) catch {},
+                // One-shot: a writable idle TLS socket is ALWAYS writable;
+                // a persistent arm would spin kevent at 100% CPU (S10).
+                .handshake_want_write => batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {},
                 .established => {},
             }
         }
@@ -1743,7 +1745,9 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         if (conn.tls_state) |state| {
             switch (state) {
                 .handshake_want_read => batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
-                .handshake_want_write => batch.addWrite(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
+                // One-shot: same persistent-write spin trap as the inbound
+                // hold (S10).
+                .handshake_want_write => batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
                 .established => {},
             }
         }
