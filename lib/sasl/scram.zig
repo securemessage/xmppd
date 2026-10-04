@@ -181,9 +181,14 @@ pub const ScramServer = struct {
         // gs2-header is "n,," (no channel binding, no authzid) for basic SCRAM
         // or "y,," or "p=..." for channel binding variants
 
-        // Capture the gs2 channel binding flag
+        // Capture the gs2 channel binding flag. RFC 5802 admits exactly
+        // n, y, p — anything else must fail here: an unknown flag used to
+        // sail straight past validateChannelBinding (T260).
         if (message.len > 0) {
-            self.gs2_cb_flag = message[0];
+            switch (message[0]) {
+                'n', 'y', 'p' => self.gs2_cb_flag = message[0],
+                else => return error.ChannelBindingMismatch,
+            }
         }
 
         // Skip gs2-header (everything up to and including the second comma after the flag)
@@ -383,6 +388,10 @@ pub const ScramServer = struct {
             if (!std.mem.eql(u8, client_cb, self.cb_data)) {
                 return error.ChannelBindingMismatch;
             }
+        } else {
+            // Belt and braces: handleClientFirst already rejects unknown
+            // flags; never let a fresh code path skip CB verification.
+            return error.ChannelBindingMismatch;
         }
     }
 
@@ -1053,4 +1062,16 @@ test "gs2 'p=tls-exporter' binds the c= payload" {
         client_final,
         "c=cD10bHMtZXhwb3J0ZXIsLAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f,r=clientnonceservernonce,p=",
     ));
+}
+
+test "ScramServer: unknown gs2 channel-binding flag is rejected (T260)" {
+    const alloc = std.testing.allocator;
+    var server = ScramServer.init(alloc);
+    defer server.deinit();
+    // 'x' is not in {n, y, p}: previously this flag silently skipped all
+    // channel-binding checks in validateChannelBinding.
+    try std.testing.expectError(
+        error.ChannelBindingMismatch,
+        server.handleClientFirst("x,,n=alice,r=AAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
 }
