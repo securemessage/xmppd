@@ -79,6 +79,13 @@ pub const Event = union(enum) {
 ///
 /// Wraps the low-level scanner to produce higher-level events suitable
 /// for XMPP stream processing. Tracks namespace context and element depth.
+///
+/// Event payload lifetime: `element_start`, `element_end` and `text`
+/// payloads are borrowed from the stanza arena and stay valid until the
+/// next top-level stanza begins (depth-1 `element_open`), which resets the
+/// arena (S11). Consumers must copy anything they keep across stanzas.
+/// Namespace context declared on the stream element itself lives in the
+/// separate `ns_arena` and survives stanza resets until `reset()`.
 /// Maximum number of namespace prefix bindings (XMPP uses very few)
 const max_ns_bindings = 16;
 
@@ -110,8 +117,12 @@ pub const Reader = struct {
     ns_stack_depth: u32 = 0,
     /// Whether we're inside the stream element
     stream_opened: bool = false,
-    /// Arena for element/attribute data
+    /// Arena for element/attribute data; reset at every top-level stanza
+    /// open so a long-lived stream does not accumulate tokens (S11).
     arena: std.heap.ArenaAllocator,
+    /// Arena for stream-level (depth 0) namespace declarations; these must
+    /// survive the per-stanza reset for the life of the stream.
+    ns_arena: std.heap.ArenaAllocator,
     /// Allocator for dynamic collections
     allocator: std.mem.Allocator,
     /// Name of the element currently being assembled
@@ -123,6 +134,7 @@ pub const Reader = struct {
         return .{
             .scan = Scanner.init(allocator),
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .ns_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
         };
     }
@@ -131,6 +143,7 @@ pub const Reader = struct {
         self.scan.deinit();
         self.attrs.deinit(self.allocator);
         self.arena.deinit();
+        self.ns_arena.deinit();
     }
 
     /// Feed input data and get the next XMPP stream event.
@@ -144,6 +157,13 @@ pub const Reader = struct {
                     return Event.xml_declaration;
                 },
                 .element_open => {
+                    if (self.stream_opened and self.depth == 1) {
+                        // New top-level stanza: everything the reader
+                        // produced for the previous stanza dies here. The
+                        // stream-level namespace context lives in ns_arena
+                        // and survives (S11).
+                        _ = self.arena.reset(.retain_capacity);
+                    }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
                     self.current_element_local = try self.arenaDupe(token.local_name);
@@ -160,12 +180,12 @@ pub const Reader = struct {
                     }
                 },
                 .namespace_decl => {
-                    const uri = try self.arenaDupe(token.value);
+                    const uri = try self.nsDupe(token.value);
                     if (token.prefix.len == 0) {
                         // Default namespace
                         self.default_ns = uri;
                     } else {
-                        const prefix = try self.arenaDupe(token.prefix);
+                        const prefix = try self.nsDupe(token.prefix);
                         if (self.ns_binding_count >= max_ns_bindings) return error.TooManyNsBindings;
                         self.ns_bindings[self.ns_binding_count] = .{
                             .prefix = prefix,
@@ -291,6 +311,14 @@ pub const Reader = struct {
         return try self.arena.allocator().dupe(u8, s);
     }
 
+    /// Dupe namespace strings: declarations on the stream element (depth 0)
+    /// go to the long-lived ns_arena so they survive the per-stanza reset;
+    /// stanza-level declarations die with the stanza.
+    fn nsDupe(self: *Reader, s: []const u8) ![]const u8 {
+        const a = if (self.depth == 0) self.ns_arena.allocator() else self.arena.allocator();
+        return try a.dupe(u8, s);
+    }
+
     /// Reset the reader for a new stream (e.g., after STARTTLS or SASL reset).
     /// Clears both the Reader state and the underlying Scanner so a fresh
     /// XML stream can be parsed from scratch.
@@ -306,6 +334,7 @@ pub const Reader = struct {
         self.current_element_local = "";
         self.attrs.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);
+        _ = self.ns_arena.reset(.retain_capacity);
         self.scan.reset();
     }
 };
@@ -472,6 +501,37 @@ test "reader: namespace resolution" {
 
     try std.testing.expectEqualStrings("jabber:client", reader.resolveNamespace(""));
     try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", reader.resolveNamespace("stream"));
+}
+
+test "reader: arena stays bounded over 200k stanzas on a long-lived stream (S11)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    const stanza = "<message id='m1' from='a@b/c' to='d@e' xmlns:x='urn:stanza-scoped'><body>payload</body><x:a/></message>";
+    // Warmup: one full stanza so the arena retains its steady-state capacity.
+    pos = 0;
+    while (try reader.next(stanza, &pos)) |_| {}
+    const cap_after_first = reader.arena.queryCapacity();
+    try std.testing.expect(cap_after_first > 0);
+
+    // 200k stanzas later the capacity must be exactly the same: the
+    // per-stanza reset keeps a long-lived stream flat (S11 regression test).
+    for (0..200_000) |_| {
+        pos = 0;
+        while (try reader.next(stanza, &pos)) |_| {}
+    }
+    try std.testing.expectEqual(cap_after_first, reader.arena.queryCapacity());
+    // The stanza-scoped x binding was unwound by the element close; only the
+    // stream-level bindings (default ns, stream prefix) survive the resets.
+    try std.testing.expectEqual(@as(u32, 1), reader.ns_binding_count);
+    try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
+    try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", reader.resolveNamespace("stream"));
+    try std.testing.expectEqualStrings("", reader.resolveNamespace("x"));
 }
 
 test "scanner tests" {

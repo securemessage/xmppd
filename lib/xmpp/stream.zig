@@ -280,6 +280,9 @@ pub const Stream = struct {
     }
 
     /// Called when SASL authentication succeeds.
+    /// `username` is borrowed: it must stay valid for the life of the
+    /// stream (callers pass a session-owned buffer, e.g. core's
+    /// Session.auth_username_buf). `server_final` is consumed before return.
     pub fn saslSuccess(self: *Stream, username: []const u8, server_final: []const u8) StreamAction {
         self.authenticated = true;
         self.authenticated_jid = Jid{

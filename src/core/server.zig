@@ -323,7 +323,10 @@ pub const Session = struct {
     /// Whether a <remove/> element was seen inside jabber:iq:register (account deletion).
     reg_has_remove: bool = false,
     /// IQ id for a pending password change/deletion response (awaiting auth daemon reply).
+    /// Points into reg_pending_iq_buf (never the reader arena, S11).
     reg_pending_iq_id: []const u8 = "",
+    reg_pending_iq_buf: [256]u8 = undefined,
+    reg_pending_iq_len: usize = 0,
 
     /// XEP-0198: Stream Management state.
     sm_enabled: bool = false,

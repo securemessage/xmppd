@@ -994,6 +994,21 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     pushRosterItem(server, bound.local, bound.domain, item_jid, session.iq_roster_item_name, result_sub, result_ask, changes);
 }
 
+/// Stage the IQ id for a pending auth-daemon reply. The id borrows the
+/// reader arena, which resets when the next stanza arrives (S11), long
+/// before the reply; copy it into the session. Returns false (after
+/// sending not-acceptable) when the id cannot be tracked.
+fn stageRegPendingIq(server: *Server, session: *Session, iq_id: []const u8) bool {
+    if (iq_id.len > session.reg_pending_iq_buf.len) {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return false;
+    }
+    @memcpy(session.reg_pending_iq_buf[0..iq_id.len], iq_id);
+    session.reg_pending_iq_len = iq_id.len;
+    session.reg_pending_iq_id = session.reg_pending_iq_buf[0..iq_id.len];
+    return true;
+}
+
 /// Handle password change (XEP-0077 §3.3). Sends PasswordChangeRequest to auth daemon.
 /// Only allowed for authenticated sessions with a bound JID.
 fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
@@ -1017,6 +1032,8 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
         return;
     }
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .password_change_request = .{
             .conn_id = session.ipcConnId(),
@@ -1024,12 +1041,11 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
             .new_password = new_password,
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Store the IQ id so we can respond when the result arrives
-    session.reg_pending_iq_id = iq_id;
 
     // Ensure IPC write is registered
     if (server.ipc.hasPendingSend()) {
@@ -1081,6 +1097,8 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
     // whether an invite is required.
     const reg_invite = session.reg_invite_buf[0..session.reg_invite_len];
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .register_request = .{
             .conn_id = session.ipcConnId(),
@@ -1090,11 +1108,11 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
             .client_ip = session.conn.peerAddr(),
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    session.reg_pending_iq_id = iq_id;
 
     if (server.ipc.hasPendingSend()) {
         changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
@@ -1116,18 +1134,19 @@ fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, ch
         return;
     }
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .account_delete_request = .{
             .conn_id = session.ipcConnId(),
             .username = bound.local,
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Store the IQ id so we can respond when the result arrives
-    session.reg_pending_iq_id = iq_id;
 
     // Ensure IPC write is registered
     if (server.ipc.hasPendingSend()) {
@@ -2224,4 +2243,42 @@ fn writeGravatarHash(writer: anytype, bare_jid: []const u8) void {
     std.crypto.hash.Md5.hash(lower_buf[0..len], &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     writer.writeAll(&hex) catch {};
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "S11: staged reg IQ id survives the reader-arena reset" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit(); // closes fds[0]
+
+    // The id arrives as a slice into the connection's reader arena.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_id = try arena.allocator().dupe(u8, "pw-change-42");
+    try std.testing.expect(stageRegPendingIq(&server, session, arena_id));
+
+    // The next stanza resets the arena (S11) and later stanzas reuse the
+    // memory; the staged id must be a session-owned copy.
+    _ = arena.reset(.retain_capacity);
+    _ = try arena.allocator().dupe(u8, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    try std.testing.expectEqualStrings("pw-change-42", session.reg_pending_iq_id);
+
+    // Overlong ids are rejected and leave the staged id untouched.
+    var long_buf: [300]u8 = undefined;
+    @memset(&long_buf, 'y');
+    try std.testing.expect(!stageRegPendingIq(&server, session, &long_buf));
+    try std.testing.expectEqualStrings("pw-change-42", session.reg_pending_iq_id);
 }
