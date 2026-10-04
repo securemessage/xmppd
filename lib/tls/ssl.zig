@@ -233,6 +233,9 @@ pub const SslConn = struct {
     /// The socket this connection is bound to (kept for callers that swap
     /// transports — e.g. lib/xmppc's Transport union — and need the fd back).
     sock_fd: std.posix.fd_t = -1,
+    /// Client role (initClient): channel binding picks the PEER certificate
+    /// for tls-server-end-point, not our own (T263).
+    is_client: bool = false,
 
     pub fn sockFd(self: *const SslConn) std.posix.fd_t {
         return self.sock_fd;
@@ -279,7 +282,7 @@ pub const SslConn = struct {
             _ = c.SSL_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(h)));
         }
 
-        return SslConn{ .ssl = ssl, .sock_fd = fd };
+        return SslConn{ .ssl = ssl, .sock_fd = fd, .is_client = true };
     }
 
     /// Require the peer certificate to match `hostname` (PKIX path only;
@@ -505,8 +508,11 @@ pub const SslConn = struct {
             }
             return null;
         } else if (version >= c.TLS1_2_VERSION) {
-            // tls-server-end-point (RFC 5929): SHA-256 hash of server certificate
-            const x509 = c.SSL_get_certificate(self.ssl) orelse return null;
+            // tls-server-end-point (RFC 5929): SHA-256 hash of the SERVER
+            // certificate. That is our local cert when we're the server
+            // (TLS accept), but the PEER's cert when we're the client —
+            // T263: client mode used to hash our own (or null when absent).
+            const x509 = (if (self.is_client) c.SSL_get0_peer_certificate(self.ssl) else c.SSL_get_certificate(self.ssl)) orelse return null;
             const der_len = c.i2d_X509(x509, null);
             if (der_len <= 0 or der_len > 65535) return null;
 
