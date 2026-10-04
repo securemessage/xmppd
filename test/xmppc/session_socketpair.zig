@@ -374,11 +374,14 @@ const pre_tls_features =
     "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>" ++
     "<mechanism>PLAIN</mechanism></mechanisms></stream:features>";
 
+const post_auth_features_only =
+    "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
+    "<session xmlns='urn:ietf:params:xml:ns:xmpp-session'><optional/></session>" ++
+    "<sm xmlns='urn:xmpp:sm:3'/></stream:features>";
+
 fn sendPostAuthFeatures(rig: *Rig) !void {
     try rig.send("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-2' version='1.0'>" ++
-        "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
-        "<session xmlns='urn:ietf:params:xml:ns:xmpp-session'><optional/></session>" ++
-        "<sm xmlns='urn:xmpp:sm:3'/></stream:features>");
+        post_auth_features_only);
 }
 
 /// Plain happy path: features -> PLAIN auth -> success -> features -> bind ->
@@ -1127,6 +1130,69 @@ test "socketpair: TLS upgrade, full happy path, kTLS flags verified false" {
     // flags were actually observed (guardrails rule 3), both directions.
     try std.testing.expect(!out.ktls_send);
     try std.testing.expect(!out.ktls_recv);
+}
+
+test "socketpair: stale read cursor after mid-parse stream restart (T-41BBBA06)" {
+    // T412: the v0.9.1 M5 baseline panicked parseAll when the handshake
+    // completed inside the same handler chain that consumed <proceed/>:
+    // the plaintext cursor (pos=50) survived the completion's read_len=0
+    // and the compaction sliced read_buf[50..0]. The scheduler race behind
+    // the inline completion is not deterministic from the rig side, so
+    // loop the full upgrade: a stale-cursor compaction aborts the run
+    // under ReleaseSafe the moment it recurs.
+    const alloc = std.testing.allocator;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var server = try makeTlsServer(alloc);
+        defer server.deinit();
+        var ctx = try setup(alloc, true);
+        defer teardown(alloc, &ctx.rig, ctx.engine);
+        try driveTlsUpgrade(&server, &ctx.rig, false);
+        defer if (ctx.rig.tls_conn) |*t| t.deinit();
+        try drivePostAuthPlain(&ctx.rig);
+        const out = waitTerminal(5000);
+        try std.testing.expect(out.established);
+    }
+}
+
+test "socketpair: plaintext bytes past <proceed/> are a protocol error (T-41BBBA06)" {
+    // STARTTLS hygiene: nothing may follow <proceed/> in the plaintext
+    // stream (the peer's TLS flight cannot precede our ClientHello), so
+    // trailing bytes are a protocol error and never silently discarded.
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, true);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try ctx.rig.send("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-t1' version='1.0'>" ++
+        "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>");
+    try ctx.rig.expect("<starttls", 2000);
+    try ctx.rig.send("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><presence/>");
+    const out = waitTerminal(2000);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("protocol-error", out.reason);
+}
+
+test "socketpair: pipelined SASL success + new stream header in one segment" {
+    // The mid-parse restart after SASL success must keep parsing the
+    // remainder of the current buffer with the reset reader (the buffer
+    // is NOT zeroed there); losing it would wedge the session waiting
+    // for a header that already arrived.
+    const alloc = std.testing.allocator;
+    var ctx = try setup(alloc, false);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try ctx.rig.send(pre_tls_features);
+    try ctx.rig.expect("<auth", 2000);
+    try ctx.rig.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>" ++
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='srv-2' version='1.0'>");
+    try ctx.rig.send(post_auth_features_only);
+    try ctx.rig.expect("<bind", 3000);
+    try ctx.rig.send("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/smoke</jid></bind></iq>");
+    try ctx.rig.expect("<enable", 3000);
+    try ctx.rig.send("<enabled xmlns='urn:xmpp:sm:3' id='sm-piped' resume='true'/>");
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+    try std.testing.expectEqualStrings("sm-piped", out.sm_id);
 }
 
 test "socketpair: DANE-EE TLSA match authenticates the TLS peer" {

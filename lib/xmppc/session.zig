@@ -220,6 +220,11 @@ pub const Session = struct {
     /// Bytes queued while write_buf is pinned by a pending TLS write and
     /// full, in order; moved into write_buf once the pending write completes.
     overflow: std.ArrayListUnmanaged(u8) = .{},
+    /// Bumped every time the parse state restarts mid-stream (TLS upgrade
+    /// completion, stream restart after SASL). parseAll snapshots it before
+    /// each handler call so a reset detected afterwards can drop the stale
+    /// read-buffer cursor instead of compacting past it (T-41BBBA06).
+    stream_epoch: u32 = 0,
 
     /// Bound full JID (set when the bind result is parsed).
     bound_jid: ?Jid = null,
@@ -388,6 +393,7 @@ pub const Session = struct {
                     self.reader.reset();
                     self.read_len = 0;
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                     self.handleAction(engine, self.fsm.feed(.tls_established));
                     return;
                 },
@@ -602,6 +608,7 @@ pub const Session = struct {
         const allocator = engine.allocator;
         const parser = self.parser orelse return;
         var pos: usize = 0;
+        var epoch = self.stream_epoch;
         while (true) {
             const ev_start = pos;
             const ev = self.reader.next(self.read_buf[0..self.read_len], &pos) catch {
@@ -642,8 +649,25 @@ pub const Session = struct {
             }
             if (parser.pending) |sev| {
                 parser.pending = null;
+                // STARTTLS hygiene (T215/T250 class): anything buffered past
+                // <proceed/> arrived before our ClientHello could — the peer
+                // spoke out of turn. Reject rather than let the upgrade path
+                // silently discard it.
+                if (sev == .starttls_proceed and pos < self.read_len) {
+                    self.fail(allocator, "protocol-error");
+                    return;
+                }
                 self.handleServerEvent(engine, sev);
                 if (self.failed) return;
+                // A handler that restarts the stream (TLS upgrade zeroed the
+                // read buffer; SASL success reset the reader) invalidates the
+                // cursor: a stale pos must never reach the compaction below
+                // (T-41BBBA06: copyForwards read_buf[50..0] panic).
+                if (self.stream_epoch != epoch) {
+                    if (pos > self.read_len) return;
+                    epoch = self.stream_epoch;
+                    continue;
+                }
             }
         }
         if (pos > 0) {
@@ -946,6 +970,7 @@ pub const Session = struct {
                 if (have_tls or self.fsm.state == .awaiting_stream_header_auth) {
                     self.reader.reset();
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                 }
                 self.queuef("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='{s}' version='1.0'>", .{self.domain}) catch return error.QueueFailed;
                 self.writeAfter(engine);
