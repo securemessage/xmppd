@@ -292,6 +292,10 @@ pub const ChangeList = struct {
     /// disarm the new session (T238; the 7145-EBADF churn class at w4/N=5000
     /// was the visible tip).
     pub fn purgeFd(self: *ChangeList, fd: posix.fd_t) void {
+        // A connection closed EARLIER has fd = -1: nothing of it can be
+        // staged (its number went back to the pool at close time) — and
+        // casting -1 to usize would panic in safe builds.
+        if (fd < 0) return;
         const target: usize = @intCast(fd);
         var i: usize = 0;
         while (i < self.len) {

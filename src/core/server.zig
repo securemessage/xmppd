@@ -106,8 +106,17 @@ const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
 /// Timer ident for periodic SM resume expiry sweep.
 const SM_EXPIRY_TIMER_IDENT = LISTENER_UDATA - 4;
 
+/// Timer ident for auth-IPC reconnect retries.
+const AUTH_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 5;
+
 /// Interval for SM detached session expiry sweep (milliseconds).
 const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
+
+/// Auth-IPC reconnect backoff (milliseconds). One-shot timer, re-armed on
+/// failure — constant pacing is deliberate: the auth daemon restarts in
+/// O(100ms) under the supervisor, and longer backoffs just extend the
+/// no-auth window for the whole worker.
+const AUTH_RECONNECT_MS: u32 = 1_000;
 
 /// Maximum changelist entries per event loop iteration.
 /// Must be large enough to accommodate presence broadcasts, roster pushes,
@@ -501,6 +510,11 @@ pub const Server = struct {
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
 
+    /// Auth daemon socket path copy (for reconnects, T243). Empty = no
+    /// reconnect configured (e.g. configureAuth never ran).
+    auth_ipc_path_buf: [108]u8 = undefined,
+    auth_ipc_path_len: usize = 0,
+
     /// IPC client for S2S daemon communication (federation).
     s2s_ipc: IpcClient = .{},
 
@@ -725,13 +739,73 @@ pub const Server = struct {
 
     /// Connect to the auth daemon IPC socket.
     /// Must be called before `run()`. Without this, SASL auth requests
-    /// will receive temporary-auth-failure.
+    /// will receive temporary-auth-failure. The path is retained: when the
+    /// daemon dies mid-run the worker reconnects on a 1 s one-shot timer
+    /// instead of failing all authentication forever (T243).
     pub fn configureAuth(self: *Server, socket_path: []const u8) !void {
+        if (socket_path.len > self.auth_ipc_path_buf.len) return error.PathTooLong;
+        @memcpy(self.auth_ipc_path_buf[0..socket_path.len], socket_path);
+        self.auth_ipc_path_len = socket_path.len;
         self.ipc.connect(socket_path) catch |err| {
             log.err("failed to connect to auth daemon at {s}: {}", .{ socket_path, err });
             return error.AuthConfigFailed;
         };
         log.info("connected to auth daemon at {s}", .{socket_path});
+    }
+
+    fn authIpcPath(self: *const Server) ?[]const u8 {
+        if (self.auth_ipc_path_len == 0) return null;
+        return self.auth_ipc_path_buf[0..self.auth_ipc_path_len];
+    }
+
+    fn armAuthReconnect(self: *Server, changes: *ChangeList) void {
+        _ = self;
+        changes.addTimer(AUTH_RECONNECT_TIMER_IDENT, AUTH_RECONNECT_MS, true) catch {};
+    }
+
+    /// Auth-IPC link died (EOF, reset, or churn-failure receipt): drop it,
+    /// fail every session mid-SASL with a retryable error, purge the fd's
+    /// staged changes, and start the reconnect timer.
+    fn dropIpcAuth(self: *Server, changes: *ChangeList) void {
+        // NB: IpcClient.recv()/flush() clear .connected themselves before
+        // returning the error, so keyed on connected we'd never act — and
+        // the unclosed fd's EOF knote would spin the loop (measured:
+        // ~860k log lines/min). Guard on "we still hold a link" instead.
+        if (self.ipc.fd < 0) return;
+        const old_fd = self.ipc.fd;
+        log.err("auth daemon IPC lost (fd={d}) — failing in-flight SASL, reconnect armed in {d}ms", .{ old_fd, AUTH_RECONNECT_MS });
+        self.ipc.close();
+        changes.purgeFd(old_fd);
+        // Sessions parked mid-exchange would hang forever without a reply.
+        for (self.sessions) |maybe| {
+            const session = maybe orelse continue;
+            if (session.auth_state == .none) continue;
+            session.auth_state = .none;
+            session.sasl_collecting = .none;
+            self.executeAction(session, session.stream.saslFailure("temporary-auth-failure"));
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+        }
+        // The mechanism list is re-sent by the daemon on connect; don't
+        // advertise a dead daemon's set meanwhile.
+        self.auth_mechanism_count = 0;
+        self.armAuthReconnect(changes);
+    }
+
+    fn tryAuthReconnect(self: *Server, changes: *ChangeList) void {
+        if (self.ipc.connected) return;
+        const path = self.authIpcPath() orelse return;
+        self.ipc.connect(path) catch |err| {
+            log.warn("auth daemon reconnect failed: {} — retrying in {d}ms", .{ err, AUTH_RECONNECT_MS });
+            self.armAuthReconnect(changes);
+            return;
+        };
+        log.info("auth daemon IPC reconnected ({s})", .{path});
+        changes.addRead(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        if (self.ipc.hasPendingSend()) {
+            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        }
     }
 
     /// Configure the roster store (generic backend-backed).
@@ -848,6 +922,12 @@ pub const Server = struct {
         // Register periodic timer for SM resume expiry sweep
         try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
 
+        // Auth daemon not connected at boot (standalone run or it crashed
+        // before we came up): arm the reconnect timer (T243).
+        if (!self.ipc.connected and self.authIpcPath() != null) {
+            self.armAuthReconnect(&changes);
+        }
+
         while (self.running) {
             // Mark active before processing events (coalesced signaling)
             if (self.delivery_system) |ds| {
@@ -905,10 +985,14 @@ pub const Server = struct {
                     .timer => |t| {
                         if (t.ident == SM_EXPIRY_TIMER_IDENT) {
                             session_lifecycle.expireDetachedSessions(self, &changes);
+                        } else if (t.ident == AUTH_RECONNECT_TIMER_IDENT) {
+                            self.tryAuthReconnect(&changes);
                         }
                     },
                     .fd_error => |e| {
-                        if (e.udata != LISTENER_UDATA and e.udata != IPC_AUTH_UDATA and e.udata != IPC_S2S_UDATA and e.udata != WAKE_PIPE_UDATA) {
+                        if (e.udata == IPC_AUTH_UDATA) {
+                            self.dropIpcAuth(&changes);
+                        } else if (e.udata != LISTENER_UDATA and e.udata != IPC_S2S_UDATA and e.udata != WAKE_PIPE_UDATA) {
                             session_lifecycle.closeSession(self, e.udata, &changes);
                         }
                     },
@@ -1764,7 +1848,8 @@ pub const Server = struct {
 
         if (!self.ipc.connected) {
             log.warn("connection {d} auth request but no auth daemon", .{session.conn.id});
-            const fail_action = session.stream.saslFailure("not-authorized");
+            // Retryable: the reconnect timer re-links the auth daemon.
+            const fail_action = session.stream.saslFailure("temporary-auth-failure");
             self.executeAction(session, fail_action);
             return;
         }
@@ -1823,7 +1908,7 @@ pub const Server = struct {
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
-            const fail_action = session.stream.saslFailure("not-authorized");
+            const fail_action = session.stream.saslFailure("temporary-auth-failure");
             self.executeAction(session, fail_action);
             return;
         }
@@ -1863,7 +1948,7 @@ pub const Server = struct {
     fn handleIpcReadable(self: *Server, changes: *ChangeList) void {
         _ = self.ipc.recv() catch |err| {
             log.err("auth daemon IPC recv error: {}", .{err});
-            self.ipc.close();
+            self.dropIpcAuth(changes);
             return;
         };
 
