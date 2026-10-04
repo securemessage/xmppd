@@ -202,10 +202,10 @@ work).
 
 | ADR | Decision |
 |-----|----------|
-| ADR-1 | Approved, modified: no shim; one cutover per consumer (see Risk) |
+| ADR-1 | Approved, modified: no shim; one cutover per consumer (see Migration) |
 | ADR-2, 3, 4, 6, 7, 8, 9, 10, 12 | Approved as written |
 | ADR-5 | Approved; durability stays at full sync (no `MDB_NOMETASYNC`) |
-| ADR-11 | Open: the handshake-on-loop exception is under discussion |
+| ADR-11 | Approved, modified: option B, TLS handshake pool; no exception to the loop rule |
 
 ### ADR-1: Stanza-at-a-time XML processing (removes D1)
 
@@ -441,13 +441,40 @@ work).
 - Evaluate (measure, then decide): `SSL_CTX_set_num_tickets` (default 2) and
   `SSL_MODE_RELEASE_BUFFERS` (idle memory vs per-read allocation churn with
   kTLS).
-- **Handshake CPU.** Document ECDSA P-256 as the default certificate (dev1:
-  RSA-2048 sign 620/s/core vs ECDSA P-256 19.8k/s/core [M T242]). Handshake
-  private-key operations stay on the loop with a per-iteration handshake
-  budget. This is an explicit exception to "no CPU-bound work on event-loop
-  threads" and needs sign-off; OpenSSL async-job offload is the fallback if M2
-  shows handshake-driven stalls.
-- **Cost.** S-M. **Recommendation: approve, including the exception.**
+- **Handshake CPU (measured).** `openssl speed` on dev1, OpenSSL 3.5.6, one
+  core: ECDSA P-256 sign ~20k/s (~50 us), X25519 ~15k/s, P-256 ECDH ~9k/s,
+  ML-KEM-768 encapsulation ~16k/s, RSA-2048 sign ~680/s (~1.5 ms). A full
+  TLS 1.3 server handshake with an ECDSA certificate and the default hybrid
+  group is estimated at ~240 us (not yet measured end to end; M5 measures it).
+  The signature is ~20% of that; key exchange is the rest. Resumption
+  (`psk_dhe_ke`) skips the signature but not the key exchange. The T32 rig
+  saw 0.6-2.6 s loop stalls at N=5000 from serial userland handshakes, and a
+  w1 ceiling of ~20 logins/s.
+- **Handshake pool (decision).** No TLS handshake runs on an event loop that
+  serves established sessions. `lib/net` provides a handshake pool: N threads
+  (`[tls] handshake_threads`), each with its own kqueue, drive
+  `SSL_do_handshake` event-driven under the same kTLS rules (socket BIO only,
+  exact pointer and length on retry, no key update).
+  1. The worker parks the session (slot reserved, generation-checked), removes
+     the fd from its kqueue and hands `{token, fd, SSL*}` to a pool thread:
+     after `<proceed/>` for STARTTLS (the ADR-2 rule guarantees an empty
+     outbox and no read-ahead), at accept for Direct TLS once T102 exists.
+  2. The pool thread completes the handshake, logs kTLS TX/RX and the cipher,
+     runs DANE verification (DER copies and chain checks), removes the fd from
+     its kqueue and posts the result over the ADR-3 ring.
+  3. The worker re-registers the fd and continues the stream.
+  Disconnects and handshake deadlines are handled on the pool thread (lifecycle
+  timer wheel). Each pool thread bounds its concurrent handshakes; excess load
+  waits in the kernel accept queue. With kTLS, worker loops then do no crypto.
+  The same pool serves s2s (X1) and `lib/xmppc` (WS8). Precedent: the T121
+  crypto pool and the xmppc PBKDF2 worker (T-7AD30E73).
+- **Rejected.** (A) Handshakes on the loop with a per-iteration budget: breaks
+  the loop rule and still stalls established sessions. (C) OpenSSL
+  `SSL_MODE_ASYNC` with a custom in-process provider (the nginx/HAProxy QAT and
+  Envoy private-key-provider pattern): offloads only the signature, needs
+  provider plumbing (engines are removed in OpenSSL 4.0) and runs async fibers
+  in-process. BoringSSL/AWS-LC private-key hooks: no kTLS.
+- **Cost.** M. **Decision: approved, option B.**
 
 ### ADR-12: Core module layout
 
@@ -553,7 +580,7 @@ Exit: M5 scenarios re-run; deltas recorded; no regression in R1-R3.
 | F4 | `lib/xml/writer.zig` `StanzaWriter` on `std.Io.Writer`: typed attributes, text always escaped, `rawSpan` only for reader-validated spans, sticky overflow checked at `finish()`, one SIMD run-copy escaper (replaces the three copies [S]) | - | M |
 | F5 | `lib/conf` typed configuration (ADR-9) | ADR-9 | M |
 | F6 | `lib/runtime`: root allocator selection (Q1 moves here), async logger, counter registry (ADR-10) | ADR-7, ADR-10 | M |
-| F7 | One `SSL_CTX` per process shared by workers; ticket and RELEASE_BUFFERS evaluation (ADR-11) | ADR-11, M5 | S |
+| F7 | One `SSL_CTX` per process; `lib/net` TLS handshake pool and core c2s adoption (ADR-11); ticket and RELEASE_BUFFERS evaluation. Scheduled after C4 (completion ring) | F3, C3, C4, M5 | M |
 
 ### 5.5 Phase 2: core data path (WS4)
 
@@ -605,7 +632,7 @@ recorded.
 
 | ID | Task | Depends | Size |
 |----|------|---------|------|
-| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335) | F3, C5 | L |
+| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
 | X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; one DANE-EE, DANE-TA, PKIX policy for s2s; multiple SRV targets and connect deadlines (T276, T296, T312, T333) | F2 | M |
 | X3 | Master: readiness pipes per child (T282), loop-driven shutdown with SIGKILL escalation on a one-shot timer, SIGHUP to all children, pid files on respawn and identity-checked orphan kill (T259, T336, T337), shared `bindTcp` honoring `bind_address` and IPv6 (V16) | F2 | M |
 | X4 | All daemons on `lib/conf` (ADR-9), master first | F5 | M |
@@ -614,8 +641,10 @@ recorded.
 
 Existing Continuum task T-BC27B154 (Phorge T222) stays the gate. Its
 Transport, buffer and DNS items now land on `lib/net` and `lib/dns/async`
-instead of xmppc-private copies. First-pass items T251-T253 (Phase 0) and
-T283-T300 are part of it.
+instead of xmppc-private copies. TLS handshakes and `verifyDane` move to the
+F7 handshake pool (the engine thread's serial handshakes caused the 0.6-2.6 s
+T32 stalls). First-pass items T251-T253 (Phase 0), T283-T300, T240 and T241
+are part of it.
 
 ---
 
@@ -685,8 +714,8 @@ These apply to every change in this plan and are checked in review.
     counting-allocator test.
 11. **Event loops never block**: no `Thread.sleep`, no blocking DNS, no
     blocking HTTP, no storage commits, no synchronous log writes on a loop
-    thread. CPU-bound work goes to a pool with a completion event; the one
-    documented exception is ADR-11.
+    thread. CPU-bound work (TLS handshakes, password hashing, compression,
+    bulk parsing) goes to a pool with a completion event. No exceptions.
 12. **kqueue**: one `kevent()` per iteration with the staged changelist;
     registration never fails silently; `EV_CLEAR` only where the handler
     drains fully; inter-thread wake by pipe (or `EVFILT_USER`), never by
@@ -941,3 +970,30 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | X4 | T-374F12AE | T410 |
 | WS8 | T-79BA9962 | T222 (gate T-BC27B154) |
 | Release gate | T-0910A7BE | T411 |
+
+**Existing Phorge tasks folded into v0.9.1** (tagged with the milestone; each
+closes when its plan item lands):
+
+| Phorge | Plan item |
+|--------|-----------|
+| T48 (TCP backpressure on queue full) | C2, C4 |
+| T111 (shadow room reconciliation) | C4, C8 |
+| T56 (sharded SessionMap) | C6 |
+| T57 (occupant generation staleness) | C3, Q3 |
+| T65 (s2s DNS, probe pacing, connect storm) | X1, X2, F7 pool |
+| T186 (s2s blocking DNS incl. inbound DANE) | X2 |
+| T85 (MAM backward paging) | D6 (V1), D3 |
+| T185 (account-delete presence) | D3 (V17) |
+| T187 (stub/workaround audit) | M4 |
+| T33 (listener fd passing) | S7, X3 |
+| T43, T122 (documentation) | R8 |
+| T219 (OIDC test fixtures) | F5, A8 |
+| T240 (xmppc EV_CLEAR, full changelist) | WS8 |
+| T241 (xmppc PBKDF2 coalescing) | WS8, Q7 |
+| T245 (SINT message loss) | S14-S16, S24, C2; closes under R3 |
+| T246 (XEP-0410 MUC self-ping) | C8; R3 |
+| T247 (pubsub disco identity) | C10; R3 |
+| T248 (pre-bind stanza vs parked bind/resume) | C11, verify then decide |
+
+Closed during the sweep: T179, T214, T236 (verified fixed), T218 (duplicate of
+T249), T32 (superseded by M1-M5).
