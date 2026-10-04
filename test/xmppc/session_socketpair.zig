@@ -1156,6 +1156,34 @@ test "socketpair: DANE-EE TLSA match authenticates the TLS peer" {
     try std.testing.expectEqualStrings("sm-tls", out.sm_id);
 }
 
+test "socketpair: DANE-EE TLSA SPKI (selector 1) match authenticates the TLS peer" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    // TLSA 3 1 1: DANE-EE, SPKI, SHA-256 — the selector used for
+    // cert-rotation-friendly records.
+    var der_buf: [4096]u8 = undefined;
+    const der = try testCertDer(&der_buf);
+    const fp = tls_mod.CertFingerprint.fromDer(der);
+    try std.testing.expect(fp.spki_der.len > 0);
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 3, .selector = 1, .matching_type = 1, .association_data = &fp.spki },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
+
+    const out = waitTerminal(5000);
+    if (!out.established) std.debug.print("dane-ee-spki not established: failed={} reason='{s}'\n", .{ out.failed, out.reason });
+    try std.testing.expect(out.established);
+    try std.testing.expectEqualStrings("alice@localhost/smoke", out.bound_jid);
+}
+
 test "socketpair: DANE mismatch fails closed" {
     const alloc = std.testing.allocator;
     var server = try makeTlsServer(alloc);
