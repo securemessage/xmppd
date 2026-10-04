@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const backend_mod = @import("backend");
+const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.roster_store);
 
@@ -78,7 +79,7 @@ pub fn RosterStore(comptime Backend: type) type {
         /// Get a roster item by owner + contact JID.
         pub fn getItem(self: *Self, allocator: std.mem.Allocator, owner: []const u8, contact: []const u8) !?RosterEntry {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, owner, contact);
+            const key = try store_keys.join2(&key_buf, owner, contact);
 
             const raw = try self.backend.get(allocator, NAMESPACE, key) orelse return null;
             defer allocator.free(raw);
@@ -94,7 +95,7 @@ pub fn RosterStore(comptime Backend: type) type {
         /// groups_data is pre-serialized: [len_be(2) | text] * group_count.
         pub fn setItemWithGroups(self: *Self, owner: []const u8, contact: []const u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) !void {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, owner, contact);
+            const key = try store_keys.join2(&key_buf, owner, contact);
 
             var val_buf: [4096]u8 = undefined;
             const val = serializeEntry(&val_buf, name, subscription, ask, groups_data, group_count);
@@ -104,7 +105,7 @@ pub fn RosterStore(comptime Backend: type) type {
         /// Remove a roster item.
         pub fn removeItem(self: *Self, owner: []const u8, contact: []const u8) !void {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, owner, contact);
+            const key = try store_keys.join2(&key_buf, owner, contact);
             try self.backend.delete(NAMESPACE, key);
         }
 
@@ -155,8 +156,8 @@ pub fn RosterStore(comptime Backend: type) type {
         /// Caller owns the returned slice and must free each item's contact_jid,
         /// name (if non-empty), and groups (if non-empty), then free the slice itself.
         pub fn getAllItems(self: *Self, allocator: std.mem.Allocator, owner: []const u8) ![]RosterItem {
-            var prefix_buf: [256]u8 = undefined;
-            const prefix = ownerPrefix(&prefix_buf, owner);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, owner);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -204,8 +205,8 @@ pub fn RosterStore(comptime Backend: type) type {
 
         /// Count roster items for an owner.
         pub fn countForOwner(self: *Self, owner: []const u8) !usize {
-            var prefix_buf: [256]u8 = undefined;
-            const prefix = ownerPrefix(&prefix_buf, owner);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, owner);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -224,8 +225,8 @@ pub fn RosterStore(comptime Backend: type) type {
         };
 
         fn scanBySubscriptionFixed(self: *Self, owner: []const u8, filter: SubFilter, jid_buf: []u8, out: [][]const u8) !usize {
-            var prefix_buf: [256]u8 = undefined;
-            const prefix = ownerPrefix(&prefix_buf, owner);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, owner);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -256,8 +257,8 @@ pub fn RosterStore(comptime Backend: type) type {
         }
 
         fn scanBySubscription(self: *Self, allocator: std.mem.Allocator, owner: []const u8, filter: SubFilter) ![][]const u8 {
-            var prefix_buf: [256]u8 = undefined;
-            const prefix = ownerPrefix(&prefix_buf, owner);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, owner);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -292,19 +293,6 @@ pub fn RosterStore(comptime Backend: type) type {
 // Key/Value helpers
 // ============================================================================
 
-fn compositeKey(buf: []u8, owner: []const u8, contact: []const u8) []const u8 {
-    const len = owner.len + 1 + contact.len;
-    @memcpy(buf[0..owner.len], owner);
-    buf[owner.len] = 0;
-    @memcpy(buf[owner.len + 1 .. len], contact);
-    return buf[0..len];
-}
-
-fn ownerPrefix(buf: []u8, owner: []const u8) []const u8 {
-    @memcpy(buf[0..owner.len], owner);
-    buf[owner.len] = 0;
-    return buf[0 .. owner.len + 1];
-}
 
 fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) []const u8 {
     buf[0] = @intFromEnum(subscription);
@@ -490,4 +478,27 @@ test "Subscription: fromString/toString roundtrip" {
     try std.testing.expectEqual(Subscription.both, Subscription.fromString("both"));
     try std.testing.expectEqual(Subscription.remove, Subscription.fromString("remove"));
     try std.testing.expectEqualStrings("both", Subscription.both.toString());
+}
+
+
+test "S4: oversized keys fail with KeyTooLong instead of overflowing the buffer" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestStore.init(&db);
+
+    const long_owner = "o" ** 300;
+    const long_contact = "c" ** 300;
+
+    // owner + separator + contact = 601 > 511: every key-building entry
+    // point must reject, never abort.
+    try std.testing.expectError(error.KeyTooLong, store.setItem(long_owner, long_contact, "X", .both, false));
+    try std.testing.expectError(error.KeyTooLong, store.removeItem(long_owner, long_contact));
+    try std.testing.expectError(error.KeyTooLong, store.getItem(std.testing.allocator, long_owner, long_contact));
+    try std.testing.expectError(error.KeyTooLong, store.countForOwner("o" ** 600));
+
+    // A key of exactly 511 bytes still fits.
+    const ok_owner = "o" ** 255;
+    const ok_contact = "c" ** 255;
+    try store.setItem(ok_owner, ok_contact, "Fits", .both, false);
+    try std.testing.expectEqual(@as(usize, 1), try store.countForOwner(ok_owner));
 }

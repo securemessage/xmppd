@@ -383,12 +383,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const store_keys_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/keys.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const roster_store_mod_for_server = b.createModule(.{
         .root_source_file = b.path("src/store/roster_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     roster_store_mod_for_server.addImport("backend", server_backend_mod);
+    roster_store_mod_for_server.addImport("store_keys", store_keys_mod);
     const session_map_mod_for_server = b.createModule(.{
         .root_source_file = b.path("src/core/session_map.zig"),
         .target = target,
@@ -484,13 +490,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_block_store_mod.addImport("backend", server_backend_mod);
+    server_block_store_mod.addImport("store_keys", store_keys_mod);
     server_test_mod.addImport("block_store", server_block_store_mod);
+    server_test_mod.addImport("store_keys", store_keys_mod);
     const server_pep_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/pep_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     server_pep_store_mod.addImport("backend", server_backend_mod);
+    server_pep_store_mod.addImport("store_keys", store_keys_mod);
     server_test_mod.addImport("pep_store", server_pep_store_mod);
     server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
@@ -621,6 +630,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     generic_roster_store_test_mod.addImport("backend", backend_test_mod);
+    generic_roster_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const generic_roster_store_tests = b.addTest(.{
         .name = "generic-roster-store-tests",
@@ -939,6 +949,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pep_store_test_mod.addImport("backend", backend_test_mod);
+    pep_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const pep_store_tests = b.addTest(.{
         .name = "pep-store-tests",
@@ -955,6 +966,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     block_store_test_mod.addImport("backend", backend_test_mod);
+    block_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const block_store_tests = b.addTest(.{
         .name = "block-store-tests",
@@ -962,6 +974,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_block_store_tests = b.addRunArtifact(block_store_tests);
+
+    // --- Store keys tests ---
+
+    const store_keys_tests = b.addTest(.{
+        .name = "store-keys-tests",
+        .root_module = store_keys_mod,
+    });
+
+    const run_store_keys_tests = b.addRunArtifact(store_keys_tests);
 
     // --- Room store tests ---
 
@@ -1227,6 +1248,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
+    core_mod.addImport("store_keys", store_keys_mod);
     core_mod.addImport("session_map", session_map_mod_for_server);
     core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
@@ -1614,6 +1636,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_invite_store_tests.step);
     test_step.dependOn(&run_pep_store_tests.step);
     test_step.dependOn(&run_block_store_tests.step);
+    test_step.dependOn(&run_store_keys_tests.step);
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);

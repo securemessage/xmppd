@@ -865,6 +865,14 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     bare_fbs.writer().writeAll(bound.domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
+    // S4: the store key joins owner + contact into a bounded buffer; a
+    // contact JID that cannot fit must be rejected at ingress instead of
+    // aborting the daemon downstream.
+    if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    }
+
     const item_sub = session.iq_roster_item_sub;
     const Subscription = @import("roster_store").Subscription;
 
@@ -1619,6 +1627,12 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     const item_id = if (session.iq_roster_item_jid.len > 0) session.iq_roster_item_jid else "current";
     const payload = session.pep_payload.items;
 
+    // S4: bounded store keys; reject a node/item pair that cannot fit.
+    if (!@import("store_keys").fits3(bare_jid, node, item_id)) {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return;
+    }
+
     ps.publish(bare_jid, node, item_id, payload) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -2000,6 +2014,12 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
         return;
     }
 
+    // S4: bounded store keys; an oversized blocked JID is malformed.
+    if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    }
+
     bs.block(bare_jid, item_jid) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -2039,6 +2059,11 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
         bs.removeAll(server.allocator, bare_jid) catch {};
         log.info("connection {d} unblocked all", .{session.conn.id});
     } else {
+        // S4: bounded store keys; an oversized blocked JID is malformed.
+        if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        }
         bs.unblock(bare_jid, item_jid) catch {
             sendIqError(server, session, iq_id, "internal-server-error");
             return;

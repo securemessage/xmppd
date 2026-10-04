@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const backend_mod = @import("backend");
+const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.pep_store);
 
@@ -39,24 +40,24 @@ pub fn PepStore(comptime Backend: type) type {
 
         /// Publish (create or replace) an item in a PEP node.
         pub fn publish(self: *Self, user: []const u8, node: []const u8, item_id: []const u8, payload: []const u8) !void {
-            var key_buf: [1024]u8 = undefined;
-            const key = compositeKey(&key_buf, user, node, item_id);
+            var key_buf: [512]u8 = undefined;
+            const key = try store_keys.join3(&key_buf, user, node, item_id);
             try self.backend.put(NAMESPACE, key, payload);
         }
 
         /// Get a single item from a PEP node by item ID.
         /// Caller owns the returned slice.
         pub fn getItem(self: *Self, allocator: std.mem.Allocator, user: []const u8, node: []const u8, item_id: []const u8) !?[]u8 {
-            var key_buf: [1024]u8 = undefined;
-            const key = compositeKey(&key_buf, user, node, item_id);
+            var key_buf: [512]u8 = undefined;
+            const key = try store_keys.join3(&key_buf, user, node, item_id);
             return self.backend.get(allocator, NAMESPACE, key);
         }
 
         /// Get all items from a PEP node. Returns item IDs and their payloads.
         /// Caller owns the returned slice and must free with freeItems.
         pub fn getItems(self: *Self, allocator: std.mem.Allocator, user: []const u8, node: []const u8) ![]PepItem {
-            var prefix_buf: [768]u8 = undefined;
-            const prefix = nodePrefix(&prefix_buf, user, node);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix2(&prefix_buf, user, node);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -99,8 +100,8 @@ pub fn PepStore(comptime Backend: type) type {
 
         /// Delete a specific item from a PEP node.
         pub fn deleteItem(self: *Self, user: []const u8, node: []const u8, item_id: []const u8) !void {
-            var key_buf: [1024]u8 = undefined;
-            const key = compositeKey(&key_buf, user, node, item_id);
+            var key_buf: [512]u8 = undefined;
+            const key = try store_keys.join3(&key_buf, user, node, item_id);
             try self.backend.delete(NAMESPACE, key);
         }
 
@@ -110,18 +111,16 @@ pub fn PepStore(comptime Backend: type) type {
             defer freeItems(allocator, items);
 
             for (items) |item| {
-                var key_buf: [1024]u8 = undefined;
-                const key = compositeKey(&key_buf, user, node, item.id);
+                var key_buf: [512]u8 = undefined;
+                const key = try store_keys.join3(&key_buf, user, node, item.id);
                 self.backend.delete(NAMESPACE, key) catch {};
             }
         }
 
         /// Remove all PEP data for a user (account deletion cascade).
         pub fn removeAll(self: *Self, allocator: std.mem.Allocator, user: []const u8) !void {
-            var prefix_buf: [256]u8 = undefined;
-            @memcpy(prefix_buf[0..user.len], user);
-            prefix_buf[user.len] = 0;
-            const prefix = prefix_buf[0 .. user.len + 1];
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, user);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -144,24 +143,6 @@ pub fn PepStore(comptime Backend: type) type {
     };
 }
 
-fn compositeKey(buf: []u8, user: []const u8, node: []const u8, item_id: []const u8) []const u8 {
-    const len = user.len + 1 + node.len + 1 + item_id.len;
-    @memcpy(buf[0..user.len], user);
-    buf[user.len] = 0;
-    @memcpy(buf[user.len + 1 .. user.len + 1 + node.len], node);
-    buf[user.len + 1 + node.len] = 0;
-    @memcpy(buf[user.len + 1 + node.len + 1 .. len], item_id);
-    return buf[0..len];
-}
-
-fn nodePrefix(buf: []u8, user: []const u8, node: []const u8) []const u8 {
-    const len = user.len + 1 + node.len + 1;
-    @memcpy(buf[0..user.len], user);
-    buf[user.len] = 0;
-    @memcpy(buf[user.len + 1 .. user.len + 1 + node.len], node);
-    buf[user.len + 1 + node.len] = 0;
-    return buf[0..len];
-}
 
 // ============================================================================
 // Tests
@@ -287,4 +268,23 @@ test "PepStore: removeAll" {
     try std.testing.expect(item1 == null);
     const item2 = try store.getItem(allocator, "alice@localhost", "storage:bookmarks", "bm1");
     try std.testing.expect(item2 == null);
+}
+
+
+test "S4: oversized PEP keys fail with KeyTooLong" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestStore.init(&db);
+
+    const long_user = "u" ** 300;
+    const long_node = "n" ** 300;
+    try std.testing.expectError(error.KeyTooLong, store.publish(long_user, long_node, "id", "payload"));
+    try std.testing.expectError(error.KeyTooLong, store.deleteItem(long_user, long_node, "id"));
+    try std.testing.expectError(error.KeyTooLong, store.getItems(std.testing.allocator, long_user, long_node));
+    try std.testing.expectError(error.KeyTooLong, store.removeAll(std.testing.allocator, "u" ** 600));
+
+    try store.publish("u" ** 255, "n" ** 100, "i" ** 152, "payload");
+    const items = try store.getItems(std.testing.allocator, "u" ** 255, "n" ** 100);
+    defer TestStore.freeItems(std.testing.allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
 }

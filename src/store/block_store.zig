@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const backend_mod = @import("backend");
+const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.block_store);
 
@@ -34,7 +35,7 @@ pub fn BlockStore(comptime Backend: type) type {
         /// Check if `blocked_jid` is on `user`'s block list.
         pub fn isBlocked(self: *Self, allocator: std.mem.Allocator, user: []const u8, blocked_jid: []const u8) !bool {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, user, blocked_jid);
+            const key = try store_keys.join2(&key_buf, user, blocked_jid);
             const raw = try self.backend.get(allocator, NAMESPACE, key);
             if (raw) |v| {
                 allocator.free(v);
@@ -46,22 +47,22 @@ pub fn BlockStore(comptime Backend: type) type {
         /// Add `blocked_jid` to `user`'s block list.
         pub fn block(self: *Self, user: []const u8, blocked_jid: []const u8) !void {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, user, blocked_jid);
+            const key = try store_keys.join2(&key_buf, user, blocked_jid);
             try self.backend.put(NAMESPACE, key, &[_]u8{0});
         }
 
         /// Remove `blocked_jid` from `user`'s block list.
         pub fn unblock(self: *Self, user: []const u8, blocked_jid: []const u8) !void {
             var key_buf: [512]u8 = undefined;
-            const key = compositeKey(&key_buf, user, blocked_jid);
+            const key = try store_keys.join2(&key_buf, user, blocked_jid);
             try self.backend.delete(NAMESPACE, key);
         }
 
         /// Get all blocked JIDs for a user.
         /// Caller owns the returned slice and each element; free with freeBlockList.
         pub fn getBlockList(self: *Self, allocator: std.mem.Allocator, user: []const u8) ![][]const u8 {
-            var prefix_buf: [256]u8 = undefined;
-            const prefix = userPrefix(&prefix_buf, user);
+            var prefix_buf: [512]u8 = undefined;
+            const prefix = try store_keys.prefix(&prefix_buf, user);
 
             var iter = try self.backend.iterator(NAMESPACE, prefix);
             defer iter.deinit();
@@ -99,19 +100,6 @@ pub fn BlockStore(comptime Backend: type) type {
     };
 }
 
-fn compositeKey(buf: []u8, user: []const u8, blocked_jid: []const u8) []const u8 {
-    const len = user.len + 1 + blocked_jid.len;
-    @memcpy(buf[0..user.len], user);
-    buf[user.len] = 0;
-    @memcpy(buf[user.len + 1 .. len], blocked_jid);
-    return buf[0..len];
-}
-
-fn userPrefix(buf: []u8, user: []const u8) []const u8 {
-    @memcpy(buf[0..user.len], user);
-    buf[user.len] = 0;
-    return buf[0 .. user.len + 1];
-}
 
 // ============================================================================
 // Tests
@@ -219,4 +207,20 @@ test "BlockStore: block is idempotent" {
     defer TestStore.freeBlockList(allocator, list);
     // Should still have exactly 1 entry (not duplicated)
     try std.testing.expectEqual(@as(usize, 1), list.len);
+}
+
+
+test "S4: oversized block keys fail with KeyTooLong" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestStore.init(&db);
+
+    const long_user = "u" ** 300;
+    const long_jid = "j" ** 300;
+    try std.testing.expectError(error.KeyTooLong, store.block(long_user, long_jid));
+    try std.testing.expectError(error.KeyTooLong, store.unblock(long_user, long_jid));
+    try std.testing.expectError(error.KeyTooLong, store.isBlocked(std.testing.allocator, long_user, long_jid));
+
+    try store.block("u" ** 255, "j" ** 255);
+    try std.testing.expect(try store.isBlocked(std.testing.allocator, "u" ** 255, "j" ** 255));
 }
