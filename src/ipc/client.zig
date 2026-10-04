@@ -100,9 +100,13 @@ pub const IpcClient = struct {
         if (!self.connected) return error.NotConnected;
         const alloc = self.alloc orelse return error.NoAllocator;
 
-        // Encode into a temporary buffer
-        var frame_buf: [4096]u8 = undefined;
-        const frame_len = try protocol.encode(msg, &frame_buf);
+        // Encode into a temporary buffer sized for the protocol maximum
+        // (T257: the old 4 KiB cap silently failed large s2s_deliver frames).
+        var frame_buf: [protocol.MAX_PAYLOAD_SIZE + protocol.HEADER_SIZE]u8 = undefined;
+        const frame_len = protocol.encode(msg, &frame_buf) catch |err| {
+            log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
+            return err;
+        };
 
         const unsent = self.send_list.items.len - self.send_start;
         if (unsent + frame_len > SEND_CAP) return error.SendBufferFull;
@@ -222,7 +226,6 @@ pub const IpcClient = struct {
         self.recv_len = remaining;
         self.recv_consumed = 0;
     }
-
 };
 
 // ============================================================================

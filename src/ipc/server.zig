@@ -99,8 +99,14 @@ pub const IpcConn = struct {
     /// Queue a response message for sending. Grows the backlog buffer on
     /// demand; returns SendBufferFull only past CLIENT_SEND_CAP.
     pub fn queueSend(self: *IpcConn, msg: protocol.Message) !void {
-        var frame_buf: [4096]u8 = undefined;
-        const frame_len = try protocol.encode(msg, &frame_buf);
+        // Sized for the protocol maximum (T257): the old 4 KiB buffer made
+        // every oversized frame an encode error the caller usually caught
+        // and swallowed.
+        var frame_buf: [protocol.MAX_PAYLOAD_SIZE + protocol.HEADER_SIZE]u8 = undefined;
+        const frame_len = protocol.encode(msg, &frame_buf) catch |err| {
+            log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
+            return err;
+        };
 
         const alloc = self.alloc orelse return error.NoAllocator;
         const unsent = self.send_list.items.len - self.send_start;
@@ -342,6 +348,28 @@ test "IpcConn: queueSend buffers past the old 16KiB cap without dropping the cli
         } });
     }
     try std.testing.expect(conn.pendingSendBytes() > 16384);
+    try std.testing.expect(conn.hasPendingSend());
+}
+
+test "IpcConn: frames larger than the old 4 KiB encode buffer are deliverable (T257)" {
+    // Regression: encode used a 4096-byte scratch while the wire protocol
+    // allows 64 KiB; an 8 KiB s2s_inbound stanza failed encode and the
+    // caller's catch dropped it without a log.
+    var conn = IpcConn{};
+    conn.fd = -1;
+    conn.alloc = std.testing.allocator;
+    conn.active = true;
+    defer if (conn.alloc) |a| conn.send_list.deinit(a);
+
+    const big = try std.testing.allocator.alloc(u8, 8192);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+
+    try conn.queueSend(.{ .s2s_inbound = .{
+        .from_jid = "a@example.com",
+        .to_jid = "b@example.com",
+        .stanza_xml = big,
+    } });
     try std.testing.expect(conn.hasPendingSend());
 }
 
