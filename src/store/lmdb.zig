@@ -1,8 +1,12 @@
 //! # LMDB Storage Backend
 //!
 //! Implements the StorageBackend trait using LMDB (via zig-lmdb).
-//! Namespaces map to LMDB named databases (DBI handles), cached on first access.
-//! Auto-resizes on MDB_MAP_FULL (Postfix pattern).
+//! Namespaces map to LMDB named databases (DBI handles): the canonical set
+//! (backend.canonical_namespaces) is opened at startup under one write
+//! transaction; any other namespace is created lazily under dbi_lock (S9 —
+//! cache mutation is mutex-guarded, and the env map size is never resized
+//! at runtime because LMDB documents that as unsafe with open read txns;
+//! MAP_FULL surfaces as an error, tune via [server] lmdb_map_size_mb).
 
 const std = @import("std");
 const lmdb = @import("lmdb");
@@ -11,7 +15,6 @@ const backend = @import("backend");
 const log = std.log.scoped(.lmdb_store);
 
 const MAX_DBS = 16;
-const MAX_RESIZE_RETRIES = 3;
 
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
@@ -26,6 +29,11 @@ pub const LmdbBackend = struct {
     dbi_cache: [MAX_DBS]DbiCacheEntry,
     dbi_count: u32,
     map_size: usize,
+    /// Guards dbi_cache lookups/appends (S9); also serializes writes of
+    /// dbi_count from WriteBatch abort.
+    dbi_lock: std.Thread.Mutex = .{},
+    /// Set once the 80% warning has fired.
+    usage_warned: bool = false,
 
     comptime {
         backend.assertBackend(LmdbBackend);
@@ -53,12 +61,37 @@ pub const LmdbBackend = struct {
             },
         );
 
-        return .{
+        var self: LmdbBackend = .{
             .env = env,
             .dbi_cache = undefined,
             .dbi_count = 0,
             .map_size = opts.map_size,
         };
+        if (!opts.read_only) try self.openCanonicalNamespaces();
+        self.warnIfNearlyFull();
+        return self;
+    }
+
+    /// Open every canonical namespace in one write transaction (S9): no
+    /// worker thread creates a DBI mid-operation, so the cache races in
+    /// getOrCreateDbi/resolveDbi can only ever fire for a genuinely new
+    /// (test-only) namespace.
+    fn openCanonicalNamespaces(self: *LmdbBackend) !void {
+        const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
+        errdefer txn.abort();
+        for (backend.canonical_namespaces) |ns| {
+            var name_z: [65]u8 = undefined;
+            if (ns.len > 64) return error.MDB_BAD_VALSIZE;
+            @memcpy(name_z[0..ns.len], ns);
+            name_z[ns.len] = 0;
+            const db = try lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{ .create = true });
+            const entry = &self.dbi_cache[self.dbi_count];
+            @memcpy(entry.name_buf[0..ns.len], ns);
+            entry.name_len = @intCast(ns.len);
+            entry.dbi = db.dbi;
+            self.dbi_count += 1;
+        }
+        try txn.commit();
     }
 
     pub fn close(self: *LmdbBackend) void {
@@ -81,24 +114,26 @@ pub const LmdbBackend = struct {
 
     pub fn put(self: *LmdbBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
         const dbi = try self.getOrCreateDbi(ns);
-        var retries: u8 = 0;
-        while (retries < MAX_RESIZE_RETRIES) : (retries += 1) {
-            const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
-            const db = lmdb.Database{ .txn = txn, .dbi = dbi };
-            db.set(key, value) catch |err| {
-                txn.abort();
-                if (err == error.MDB_MAP_FULL) {
-                    self.map_size *|= 2;
-                    log.info("MDB_MAP_FULL, resizing to {d} bytes", .{self.map_size});
-                    try self.env.resize(self.map_size);
-                    continue;
-                }
-                return err;
-            };
-            try txn.commit();
-            return;
+        const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
+        errdefer txn.abort();
+        const db = lmdb.Database{ .txn = txn, .dbi = dbi };
+        try db.set(key, value);
+        try txn.commit();
+        self.warnIfNearlyFull();
+    }
+
+    /// Log once when live content crosses 80% of the map. LMDB documents
+    /// env resizing with open read transactions as unsafe, so a full map is
+    /// an operational error (restart with a bigger configured map) rather
+    /// than something we paper over at runtime (S9).
+    fn warnIfNearlyFull(self: *LmdbBackend) void {
+        if (self.usage_warned) return;
+        const st = self.env.stat() catch return;
+        const used_bytes = (@as(usize, st.branch_pages + st.leaf_pages + st.overflow_pages)) * @as(usize, st.psize);
+        if (used_bytes > self.map_size / 5 * 4) {
+            self.usage_warned = true;
+            log.warn("LMDB map above 80% used ({d} of {d} bytes) — raise [server] lmdb_map_size_mb and restart before MAP_FULL", .{ used_bytes, self.map_size });
         }
-        return error.MDB_MAP_FULL;
     }
 
     pub fn delete(self: *LmdbBackend, ns: []const u8, key: []const u8) !void {
@@ -134,7 +169,10 @@ pub const LmdbBackend = struct {
 
     pub fn writeBatch(self: *LmdbBackend) !WriteBatch {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
-        return .{ .txn = txn, .backend = self, .dbi_count_at_start = self.dbi_count };
+        self.dbi_lock.lock();
+        const dc = self.dbi_count;
+        self.dbi_lock.unlock();
+        return .{ .txn = txn, .backend = self, .dbi_count_at_start = dc };
     }
 
     // -- Iterator --
@@ -200,10 +238,14 @@ pub const LmdbBackend = struct {
         pub fn abort(self: *WriteBatch) void {
             self.txn.abort();
             // Roll back DBI cache entries created during this batch
+            self.backend.dbi_lock.lock();
             self.backend.dbi_count = self.dbi_count_at_start;
+            self.backend.dbi_lock.unlock();
         }
 
         fn resolveDbi(self: *WriteBatch, ns: []const u8) !lmdb.Database.DBI {
+            self.backend.dbi_lock.lock();
+            defer self.backend.dbi_lock.unlock();
             for (self.backend.dbi_cache[0..self.backend.dbi_count]) |entry| {
                 if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
                     return entry.dbi;
@@ -231,6 +273,10 @@ pub const LmdbBackend = struct {
     // -- Internal --
 
     fn getOrCreateDbi(self: *LmdbBackend, ns: []const u8) !lmdb.Database.DBI {
+        // S9: lookup and lazy creation share this lock; canonical namespaces
+        // are already open so this contends only for test/unknown names.
+        self.dbi_lock.lock();
+        defer self.dbi_lock.unlock();
         for (self.dbi_cache[0..self.dbi_count]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
                 return entry.dbi;
@@ -402,4 +448,28 @@ test "LmdbBackend: writeBatch abort" {
 
     const val = try db.get(std.testing.allocator, "users", "alice");
     try std.testing.expect(val == null);
+}
+
+test "LmdbBackend: MAP_FULL is a hard error — no runtime env resize (T358/S9)" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{ .map_size = 128 * 1024 });
+    defer db.close();
+
+    var big: [16384]u8 = @splat('x');
+    var key_buf: [32]u8 = undefined;
+    var got_full = false;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const key = std.fmt.bufPrint(&key_buf, "k{d}", .{i}) catch unreachable;
+        db.put("users", key, &big) catch |err| {
+            if (err == error.MDB_MAP_FULL) {
+                got_full = true;
+                break;
+            }
+            return err;
+        };
+    }
+    try std.testing.expect(got_full);
+    // The map size is untouched: nothing resized underneath readers.
+    try std.testing.expectEqual(@as(usize, 128 * 1024), db.map_size);
 }

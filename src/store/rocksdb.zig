@@ -29,6 +29,9 @@ pub const RocksDbBackend = struct {
     cf_count: u32,
     path_buf: [4096]u8,
     path_len: usize,
+    /// Guards cf_cache lookups/appends (S9): canonical column families are
+    /// created at open(); the lock covers only test/unknown names.
+    cf_lock: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(RocksDbBackend);
@@ -108,6 +111,7 @@ pub const RocksDbBackend = struct {
                 .path_len = path.len,
             };
             @memcpy(self.path_buf[0..path.len], path);
+            try self.ensureCanonicalCfs();
             return self;
         }
 
@@ -191,7 +195,14 @@ pub const RocksDbBackend = struct {
         }
 
         c.rocksdb_list_column_families_destroy(cf_names, cf_count);
+        try self.ensureCanonicalCfs();
         return self;
+    }
+
+    /// Canonical namespaces exist as column families from day one (S9), so
+    /// workers never race lazy creation on the cf cache.
+    fn ensureCanonicalCfs(self: *RocksDbBackend) !void {
+        for (backend.canonical_namespaces) |ns| _ = try self.getOrCreateCf(ns);
     }
 
     pub fn close(self: *RocksDbBackend) void {
@@ -409,6 +420,9 @@ pub const RocksDbBackend = struct {
     // -- Internal --
 
     fn getOrCreateCf(self: *RocksDbBackend, ns: []const u8) !*c.rocksdb_column_family_handle_t {
+        // S9: cache lookup and lazy creation share this lock.
+        self.cf_lock.lock();
+        defer self.cf_lock.unlock();
         // Check cache
         for (self.cf_cache[0..self.cf_count]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))

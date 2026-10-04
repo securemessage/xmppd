@@ -32,8 +32,10 @@ pub const OpenOptions = struct {
     /// Maximum number of namespaces (LMDB: max_dbs, others: ignored).
     max_namespaces: u32 = 16,
 
-    /// Initial map size in bytes (LMDB-specific, ignored by others).
-    /// Auto-resized on MDB_MAP_FULL.
+    /// LMDB map size in bytes (ignored by other backends). Never resized at
+    /// runtime (S9: LMDB forbids env resize with concurrent readers); a
+    /// daemon hitting MDB_MAP_FULL must be restarted with a larger value
+    /// (config key: [server] lmdb_map_size_mb).
     map_size: usize = 64 * 1024 * 1024,
 
     /// Create the database/directory if it doesn't exist.
@@ -41,6 +43,24 @@ pub const OpenOptions = struct {
 
     /// Open in read-only mode.
     read_only: bool = false,
+};
+
+/// Every store namespace. Backends open/create all of them at open() (S9)
+/// so no worker thread ever creates a container mid-operation (LMDB DBI
+/// creation races the handle cache otherwise).
+pub const canonical_namespaces = [_][]const u8{
+    "users",
+    "rosters",
+    "vcards",
+    "pep",
+    "locks",
+    "lastact",
+    "invites",
+    "blocklist",
+    "offline",
+    "rooms",
+    "messages",
+    "by_contact",
 };
 
 /// A key-value entry returned by iterators.

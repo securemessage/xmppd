@@ -24,6 +24,9 @@ pub const SqliteBackend = struct {
     db: *c.sqlite3,
     table_cache: [MAX_TABLES]TableCacheEntry,
     table_count: u32,
+    /// Guards table_cache lookups/appends (S9): canonical tables are
+    /// created at open(); the lock covers only test/unknown names.
+    table_lock: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(SqliteBackend);
@@ -50,11 +53,19 @@ pub const SqliteBackend = struct {
         // Busy timeout 5 seconds
         _ = c.sqlite3_busy_timeout(db.?, 5000);
 
-        return .{
+        var self: SqliteBackend = .{
             .db = db.?,
             .table_cache = undefined,
             .table_count = 0,
         };
+        // Canonical tables exist from day one (S9): workers never race a
+        // lazy CREATE TABLE on the handle cache.
+        try self.ensureCanonicalTables();
+        return self;
+    }
+
+    fn ensureCanonicalTables(self: *SqliteBackend) !void {
+        for (backend.canonical_namespaces) |ns| try self.ensureTable(ns);
     }
 
     pub fn close(self: *SqliteBackend) void {
@@ -266,7 +277,9 @@ pub const SqliteBackend = struct {
                 _ = execSimple(self.backend.db, "ROLLBACK");
                 // Rollback may have undone CREATE TABLE statements made inside
                 // the transaction. Reset table cache to the state before BEGIN.
+                self.backend.table_lock.lock();
                 self.backend.table_count = self.table_count_at_start;
+                self.backend.table_lock.unlock();
             }
         }
     };
@@ -274,6 +287,9 @@ pub const SqliteBackend = struct {
     // -- Internal --
 
     fn ensureTable(self: *SqliteBackend, ns: []const u8) !void {
+        // S9: cache lookup and lazy creation share this lock.
+        self.table_lock.lock();
+        defer self.table_lock.unlock();
         // Check cache
         for (self.table_cache[0..self.table_count]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))

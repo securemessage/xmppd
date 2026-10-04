@@ -55,6 +55,7 @@ pub fn main() !void {
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
     var db_path: []const u8 = "/var/db/xmppd";
+    var map_size_mb: usize = 64;
 
     _ = args.next(); // Skip argv[0]
 
@@ -122,6 +123,9 @@ pub fn main() !void {
     if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
         if (cfg.get("server", "db_path")) |v| db_path = v;
     }
+    if (cfg.get("server", "lmdb_map_size_mb")) |v| {
+        map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
+    }
 
     log.info("xmppd-auth-oidc starting", .{});
     log.info("  issuer: {s}", .{issuer});
@@ -169,7 +173,7 @@ pub fn main() !void {
     // (T352/S3). OIDC without a reachable store fails closed per attempt.
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
-    var backend = try OpBackendType.open(auth_path, .{});
+    var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
     defer backend.close();
     var lock_store = LockStore.init(&backend);
     handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));

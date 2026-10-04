@@ -66,6 +66,7 @@ pub fn main() !void {
 
     var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
+    var map_size_mb: usize = 64;
     var rate_policy = RatePolicy{};
     var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
@@ -144,6 +145,10 @@ pub fn main() !void {
         if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
             if (c.get("server", "db_path")) |v| db_path = v;
         }
+        // LMDB map size: fixed at open, never resized at runtime (S9).
+        if (c.get("server", "lmdb_map_size_mb")) |v| {
+            map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
+        }
 
         // [auth] section
         if (std.mem.eql(u8, socket_path, "/var/run/xmppd/auth.sock")) {
@@ -204,7 +209,7 @@ pub fn main() !void {
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
 
     // Open storage backend
-    var backend = try OpBackendType.open(auth_path, .{});
+    var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
     defer backend.close();
     var store = UserStore.init(&backend);
     var lock_store = LockStore.init(&backend);
