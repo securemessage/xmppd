@@ -371,15 +371,17 @@ pub const S2sSession = struct {
     }
 
     /// Build the stream open response XML for an inbound connection.
+    /// id/from are our own bytes, but `to` is the peer-supplied stream-open
+    /// from= value — escaped like any client/peer-controlled attribute (S1).
     pub fn buildStreamOpenResponse(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
-        try writer.writeAll(self.stream.local_domain);
+        try xmlEscapeWrite(writer, self.stream.local_domain);
         try writer.writeAll("' to='");
-        try writer.writeAll(self.getRemoteDomain());
+        try xmlEscapeWrite(writer, self.getRemoteDomain());
         try writer.writeAll("' id='");
-        try writer.writeAll(self.getStreamId());
+        try xmlEscapeWrite(writer, self.getStreamId());
         try writer.writeAll("' version='1.0'>");
         return fbs.getWritten();
     }
@@ -563,24 +565,26 @@ pub const S2sSession = struct {
         const w = fbs.writer();
         try w.writeByte('<');
         try w.writeAll(self.getStanzaTag());
+        // from/to/type/id carry peer input — entity-decoded by the parser, so
+        // they must be re-escaped on the way out (S1 injection guard).
         if (self.stanza_from_len > 0) {
             try w.writeAll(" from='");
-            try w.writeAll(self.getStanzaFrom());
+            try xmlEscapeWrite(w, self.getStanzaFrom());
             try w.writeByte('\'');
         }
         if (self.stanza_to_len > 0) {
             try w.writeAll(" to='");
-            try w.writeAll(self.getStanzaTo());
+            try xmlEscapeWrite(w, self.getStanzaTo());
             try w.writeByte('\'');
         }
         if (self.stanza_type_len > 0) {
             try w.writeAll(" type='");
-            try w.writeAll(self.getStanzaType());
+            try xmlEscapeWrite(w, self.getStanzaType());
             try w.writeByte('\'');
         }
         if (self.stanza_id_len > 0) {
             try w.writeAll(" id='");
-            try w.writeAll(self.getStanzaId());
+            try xmlEscapeWrite(w, self.getStanzaId());
             try w.writeByte('\'');
         }
         if (self.stanza_inner_len == 0) {
@@ -597,7 +601,9 @@ pub const S2sSession = struct {
 };
 
 /// Re-encode text for XML output (entities like &amp; must be re-escaped).
-fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
+/// Shared by the s2s builders in this directory; folds into lib/xml's
+/// escapeWrite once the S1 core-side merge lands (openhands lane).
+pub fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
     for (text) |c| {
         switch (c) {
             '&' => try writer.writeAll("&amp;"),
@@ -703,6 +709,32 @@ test "S2sSession: buildTlsProceed" {
     var buf: [256]u8 = undefined;
     const out = try session.buildTlsProceed(&buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "<proceed") != null);
+}
+
+test "S2sSession: stream-open response escapes peer-controlled and local attrs (S1)" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true; // no real fd — nothing to close on teardown
+    session.setRemoteDomain("bad' to='injected.attacker.example' x='");
+    var buf: [512]u8 = undefined;
+    const out = try session.buildStreamOpenResponse(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&apos;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "injected.attacker.example' x='") == null);
+}
+
+test "S2sSession: stanza from/to/type/id attrs are re-escaped (S1)" {
+    var session = S2sSession.init(-1, 1, "a.example");
+    session.closed = true; // no real fd
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &.{.{ .name = "to", .local_name = "to", .prefix = "", .value = "x'=x'" }},
+        .self_closing = false,
+    });
+    var buf: [512]u8 = undefined;
+    const out = try session.buildStanzaXml(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x&apos;=x&apos;") != null);
 }
 
 test "S2sSession: buildStreamError" {

@@ -120,12 +120,13 @@ pub fn buildDbResult(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:result xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(origin);
+    try esc(w, origin);
     try w.writeAll("' to='");
-    try w.writeAll(target);
+    try esc(w, target);
     try w.writeAll("'>");
-    try w.writeAll(key_hex);
+    try w.writeAll(key_hex); // local HMAC hex, always safe
     try w.writeAll("</db:result>");
     return fbs.getWritten();
 }
@@ -141,10 +142,11 @@ pub fn buildDbResultResponse(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:result xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' type='");
     try w.writeAll(if (valid) "valid" else "invalid");
     try w.writeAll("'/>");
@@ -163,12 +165,13 @@ pub fn buildDbVerify(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:verify xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' id='");
-    try w.writeAll(stream_id);
+    try esc(w, stream_id);
     try w.writeAll("'>");
     try w.writeAll(key_hex);
     try w.writeAll("</db:verify>");
@@ -187,12 +190,13 @@ pub fn buildDbVerifyResponse(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:verify xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' id='");
-    try w.writeAll(stream_id);
+    try esc(w, stream_id);
     try w.writeAll("' type='");
     try w.writeAll(if (valid) "valid" else "invalid");
     try w.writeAll("'/>");
@@ -427,6 +431,13 @@ test "buildDbResult: correct XML format" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "to='b.example'") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "jabber:server:dialback") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "</db:result>") != null);
+}
+
+test "buildDbResult: from/to attrs escaped (S1)" {
+    var buf: [512]u8 = undefined;
+    const key = [_]u8{'a'} ** KEY_HEX_LEN;
+    const xml = try buildDbResult(&buf, "a'&\"<>.example", "b.example", &key);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "a&apos;&amp;&quot;&lt;&gt;.example") != null);
 }
 
 test "buildDbResultResponse: valid response" {

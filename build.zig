@@ -746,6 +746,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_connector_test_mod.addImport("xml", xml_mod);
     s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
     s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -765,6 +766,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_dane_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dane_test_mod.addImport("xml", xml_mod);
     s2s_dane_test_mod.linkSystemLibrary("ssl", .{});
     s2s_dane_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -781,7 +783,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/s2s/dialback.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    // dialback re-uses the session's XML escaping (S1); session.zig then
+    // pulls in ssl/xml/connector for the test module.
+    s2s_dialback_test_mod.addImport("xml", xml_mod);
+    s2s_dialback_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dialback_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_dialback_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_dialback_tests = b.addTest(.{
         .name = "s2s-dialback-tests",
@@ -799,6 +808,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_session_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_session_test_mod.addImport("xml", xml_mod);
     s2s_session_test_mod.linkSystemLibrary("ssl", .{});
     s2s_session_test_mod.linkSystemLibrary("crypto", .{});
 

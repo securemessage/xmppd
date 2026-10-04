@@ -443,13 +443,15 @@ pub const OutboundConnection = struct {
     }
 
     /// Get the stream open XML to send to the remote server.
+    /// remote_domain was peer-supplied at queue time (T275 duped it, but the
+    /// incoming bytes may still be entity-decoded specials — escape (S1).
     pub fn buildStreamOpen(self: *const OutboundConnection, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
-        try writer.writeAll(self.local_domain);
+        try @import("session.zig").xmlEscapeWrite(writer, self.local_domain);
         try writer.writeAll("' to='");
-        try writer.writeAll(self.remote_domain);
+        try @import("session.zig").xmlEscapeWrite(writer, self.remote_domain);
         try writer.writeAll("' version='1.0'>");
         return fbs.getWritten();
     }
