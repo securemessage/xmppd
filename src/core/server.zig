@@ -73,6 +73,7 @@ pub const caps_mod = @import("caps.zig");
 const router = @import("router.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const room_registry_mod = @import("room_registry");
+const room_mailbox_mod = @import("room_mailbox");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
@@ -3013,7 +3014,9 @@ pub const Server = struct {
                 }
                 const r = room.?;
                 r.mailbox.enqueue(payload) catch {
-                    log.warn("room mailbox full for {s}, dropping message", .{room_jid});
+                    _ = room_mailbox_mod.mailbox_drops.fetchAdd(1, .monotonic);
+                    log.warn("room mailbox full for {s} — bouncing to sender (S16)", .{room_jid});
+                    muc_handler.bounceRoomMailboxFull(self, msg, room_jid, changes);
                 };
             },
             .room_directory_update => |ev| {

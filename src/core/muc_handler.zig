@@ -2287,6 +2287,88 @@ pub fn handleRoomDirectoryUpdate(server: *Server, ev: actor_message.RoomDirector
     }
 }
 
+/// S16: a room-mailbox overflow drop must not be silent. Sends an explicit
+/// resource-constraint error to the originator of the dropped actor message,
+/// cross-worker when the sender lives on another worker. Best-effort: if the
+/// sender cannot be resolved (unknown occupant, dead session) the drop is
+/// already logged and counted by the caller.
+pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_jid: []const u8, changes: *ChangeList) void {
+    switch (msg) {
+        .room_message => |ev| {
+            // ev.from_jid is the sender's occupant JID (room/nick); the
+            // canonical occupant record on this worker holds the delivery
+            // triple for the bounce.
+            const reg = server.room_registry orelse return;
+            const room = reg.findByJid(room_jid) orelse return;
+            const slash = std.mem.lastIndexOfScalar(u8, ev.from_jid, '/') orelse return;
+            const nick = ev.from_jid[slash + 1 ..];
+            for (&room.occupants) |*slot| {
+                const occ = slot.* orelse continue;
+                if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+                if (!std.mem.eql(u8, occ.getNick(), nick)) continue;
+                var buf: [640]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&buf);
+                const w = fbs.writer();
+                w.writeAll("<message from='") catch return;
+                xml.escapeWrite(w, room_jid) catch return;
+                w.writeAll("' to='") catch return;
+                xml.escapeWrite(w, ev.from_jid) catch return;
+                w.writeAll("' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+                deliverToTriple(server, fbs.getWritten(), occ.worker_id, occ.session_id, occ.generation, changes);
+                return;
+            }
+        },
+        .room_join, .room_part => |ev| {
+            var buf: [640]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
+            w.writeAll("<presence from='") catch return;
+            xml.escapeWrite(w, room_jid) catch return;
+            w.writeAll("' to='") catch return;
+            xml.escapeWrite(w, ev.real_jid) catch return;
+            w.writeAll("' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+            deliverToTriple(server, fbs.getWritten(), ev.worker_id, ev.session_id, ev.generation, changes);
+        },
+        .room_disco_info, .room_disco_items => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        .room_admin => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        .room_mam_query => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        else => {},
+    }
+}
+
+fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, worker: u16, session_id: u32, generation: u32, changes: *ChangeList) void {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<iq type='error' from='") catch return;
+    xml.escapeWrite(w, room_jid) catch return;
+    w.writeAll("' id='") catch return;
+    xml.escapeWrite(w, iq_id) catch return;
+    w.writeAll("'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+    deliverToTriple(server, fbs.getWritten(), worker, session_id, generation, changes);
+}
+
+/// Deliver a small stanza to a (worker, session, generation) triple, locally
+/// when the session lives on this worker or via the MPSC otherwise.
+fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id: usize, generation: u32, changes: *ChangeList) void {
+    if (worker == server.worker_id) {
+        const session = server.sessions[session_id] orelse return;
+        session.queueSendStanza(stanza) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    } else {
+        const ds = server.delivery_system orelse return;
+        ds.deliver(worker, @intCast(session_id), generation, stanza) catch {};
+    }
+}
+
 /// Process a remote admin action (kick/ban/voice) on the owning worker.
 pub fn processRemoteAdminAction(
     server: *Server,
