@@ -494,7 +494,18 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch continue;
         if (stanza_xml) |xml_data| {
             defer server.allocator.free(xml_data);
-            session.conn.queueSend(xml_data) catch continue;
+            session.queueSendStanza(xml_data) catch {
+                // Send buffer full (S13): stop here. This message and the
+                // rest stay in the store and deliver on the next available
+                // event, after the connection drains. Deleting them anyway
+                // used to lose the whole backlog past the first buffer-full.
+                log.warn("offline delivery to {s} paused at {d}/{d} messages (send buffer full)", .{ bare_jid, delivered, pointers.len });
+                break;
+            };
+            // Only delete what was actually handed to the connection.
+            store.deletePointer(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+                log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+            };
             delivered += 1;
         }
     }
@@ -503,7 +514,6 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 
-    store.clearAll(bare_jid) catch {};
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
 }
 
@@ -532,6 +542,10 @@ const posix = std.posix;
 const ChangeListT = @import("event_loop.zig").ChangeList;
 const SessionMap = @import("session_map").SessionMap;
 const xmpp_lib = @import("xmpp");
+const op_backend = @import("op_backend");
+const archive_backend = @import("archive_backend");
+const offline_store_mod = @import("generic_offline_store");
+const archive_store_mod = @import("archive_store");
 
 fn testSocketPair() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
@@ -554,10 +568,12 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
     return session;
 }
 
+
 // T158 regression test: SM detach timer (300s) must expire sessions correctly —
 // not early (which would kill resumable sessions) and not late/never (memory leak).
 test "T158: detach timer expires sessions at 300s, not before" {
     const allocator = std.testing.allocator;
+
     var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
@@ -606,6 +622,77 @@ test "T158: detach timer expires sessions at 300s, not before" {
     // Clean up session 2 manually to avoid allocator leak
     server.sessions[2].?.sm_resume_enabled = false;
     destroySession(&server, 2, server.sessions[2].?, &changes);
+}
+
+// S13 regression test: an offline backlog larger than the connection write
+// buffer must not be deleted wholesale. Only handed-to-the-connection
+// messages may be removed; the rest deliver on a later available event.
+test "S13: offline delivery keeps undelivered messages when the send buffer fills" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const session = try makeAuthenticatedSession(&server, 1, "bob");
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // 40 messages of ~1 KiB each: roughly 40 KiB of backlog against the
+    // 16 KiB connection write buffer, so delivery must pause partway.
+    const total: usize = 40;
+    var stanza_buf: [1024]u8 = undefined;
+    const pad = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const stanza_id = std.fmt.bufPrint(&id_buf, "s{d}", .{i}) catch unreachable;
+        const stanza = std.fmt.bufPrint(&stanza_buf, "<message from='alice@localhost' to='bob@localhost' id='{s}'><body>{s}</body></message>", .{ stanza_id, pad }) catch unreachable;
+        const ts: u64 = 1000 + @as(u64, @intCast(i));
+        try arch_store.store("bob@localhost", "alice@localhost", stanza_id, ts, stanza);
+        _ = try offline_store.storePointer("bob@localhost", "alice@localhost", stanza_id, ts);
+    }
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // Delivery must have stopped at the buffer limit: some messages were
+    // handed to the connection and deleted, the rest are still queued.
+    const remaining = try offline_store.countMessages("bob@localhost");
+    try std.testing.expect(remaining > 0);
+    try std.testing.expect(remaining < total);
+    try std.testing.expect(session.conn.hasPendingWrite());
+
+    // The survivors must be the tail of the backlog (oldest delivered first).
+    const survivors = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(survivors);
+    try std.testing.expectEqual(remaining, survivors.len);
+    var id_expect_buf: [16]u8 = undefined;
+    const expect_id = std.fmt.bufPrint(&id_expect_buf, "s{d}", .{total - remaining}) catch unreachable;
+    try std.testing.expectEqualStrings(expect_id, survivors[0].stanza_id);
 }
 
 test "T158: detach timer does not expire session at exactly 299s" {
