@@ -18,6 +18,9 @@ const protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.ipc_server);
 
+// FreeBSD: absent from zig's std.c for this version.
+extern "c" fn getpeereid(fd: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
+
 /// Maximum simultaneous IPC client connections.
 /// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
 pub const MAX_IPC_CLIENTS = 80;
@@ -199,6 +202,15 @@ pub const IpcServer = struct {
         try posix.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un));
         try posix.listen(sock, 8);
 
+        // The socket must not be world-writable (T258): group mode is the
+        // operator escape hatch; the directory perms narrow it further.
+        var path_z: [104]u8 = undefined;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        if (std.c.chmod(@ptrCast(&path_z), 0o660) != 0) {
+            log.warn("chmod(0660) on {s} failed", .{path});
+        }
+
         self.listen_fd = sock;
         @memcpy(self.socket_path[0..path.len], path);
         self.path_len = path.len;
@@ -215,6 +227,18 @@ pub const IpcServer = struct {
                 else => error.AcceptFailed,
             };
         };
+
+        // Peer credentials gate (T258): only root or the daemon's own uid
+        // may join. Before this, any local process could drive the auth
+        // daemon (register without invite, auth_abort others' sessions).
+        var euid: std.c.uid_t = 0;
+        var egid: std.c.gid_t = 0;
+        const self_uid = std.c.getuid();
+        if (getpeereid(client_fd, &euid, &egid) != 0 or (euid != 0 and euid != self_uid)) {
+            log.warn("IPC connection rejected: peer euid {d} is neither root nor daemon uid {d}", .{ euid, self_uid });
+            posix.close(client_fd);
+            return null;
+        }
 
         // Find a free slot
         for (&self.clients, 0..) |*slot, i| {
@@ -371,6 +395,19 @@ test "IpcConn: frames larger than the old 4 KiB encode buffer are deliverable (T
         .stanza_xml = big,
     } });
     try std.testing.expect(conn.hasPendingSend());
+}
+
+test "IpcServer: socket file lands with mode 0660 (T258)" {
+    const path = "/tmp/xmppd-test-ipc-mode.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var server = IpcServer.init(std.testing.allocator);
+    try server.listen(path);
+    defer server.deinit();
+
+    const st = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u32, 0o660), @as(u32, @intCast(st.mode & 0o777)));
 }
 
 test "IpcServer: deinit cleans up socket file" {

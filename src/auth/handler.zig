@@ -774,7 +774,10 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Privileged admin requests (xmppctl) bypass registration policy
+            // Privileged admin requests (xmppctl) bypass registration policy.
+            // The marker remains a convention between local daemons; the
+            // socket itself is now peer-credential checked at accept (T258),
+            // so only root or the daemon uid may even open it.
             const is_admin = std.mem.eql(u8, req.client_ip, "ctl");
 
             // Check if registration is enabled (skip for admin)
