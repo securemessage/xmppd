@@ -608,6 +608,10 @@ pub fn handleMucAdminIq(
     // Parse the requested action
     if (std.mem.eql(u8, new_role_str, "none")) {
         // Kick — remove occupant and broadcast with status 307
+        if (target_idx == requester_idx) {
+            sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
+            return;
+        }
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         // T114: Send shadow_part to the kicked occupant's worker
@@ -622,11 +626,8 @@ pub fn handleMucAdminIq(
             } });
         }
 
-        // Auto-destroy transient empty rooms
-        if (room.occupant_count == 0 and !room.config.persistent) {
-            broadcastDirectoryUpdate(server, room_jid, room.config.getName(), false);
-            _ = reg.destroyRoom(room_jid);
-        }
+        // Empty transient rooms are destroyed by cleanupEmptyRooms, never
+        // mid-processing (S6).
     } else if (std.mem.eql(u8, new_role_str, "visitor")) {
         // Revoke voice — set role to visitor
         if (room.occupants[target_idx]) |*occ| {
@@ -2404,6 +2405,10 @@ pub fn processRemoteAdminAction(
 
     if (std.mem.eql(u8, ev.new_role, "none")) {
         // Kick
+        if (target_idx == requester_idx) {
+            sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "not-allowed");
+            return;
+        }
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         // T114: Send shadow_part to the kicked occupant's worker so it removes the
@@ -2418,10 +2423,9 @@ pub fn processRemoteAdminAction(
                 .generation = 0,
             } });
         }
-        if (room.occupant_count == 0 and !room.config.persistent) {
-            broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
-            _ = reg.destroyRoom(ev.room_jid);
-        }
+        // Do NOT destroy the room here: ev.room_jid/ev.iq_id borrow this
+        // room's mailbox payload and are read again below (S6). Destruction
+        // is deferred to cleanupEmptyRooms.
     } else if (std.mem.eql(u8, ev.new_role, "visitor")) {
         if (room.occupants[target_idx]) |*occ| {
             occ.role = .visitor;
@@ -2547,4 +2551,54 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     w.writeAll(error_type) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
     ds.deliver(target_worker, @intCast(target_session), target_generation, fbs.getWritten()) catch {};
+}
+
+test "S6: self-kick is rejected and the room survives actor processing" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+    _ = try room.addOccupant("solo", "solo@localhost/x", "solo@localhost", 0, 0, 1, .moderator, .owner);
+
+    var scratch: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // The only occupant kicks themselves: rejected, nothing removed.
+    processRemoteAdminAction(&server, .{
+        .room_jid = "room@conference.localhost",
+        .actor_jid = "solo@localhost/x",
+        .target_nick = "solo",
+        .new_role = "none",
+        .iq_id = "kick1",
+        .reply_to_worker = 0,
+        .reply_to_session = 0,
+        .reply_to_generation = 1,
+    }, &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
+
+    // A kick of another occupant must not destroy the room mid-processing
+    // either: cleanupEmptyRooms is the only destroy site.
+    _ = try room.addOccupant("vic", "vic@localhost/y", "vic@localhost", 1, 0, 1, .participant, .none);
+    processRemoteAdminAction(&server, .{
+        .room_jid = "room@conference.localhost",
+        .actor_jid = "solo@localhost/x",
+        .target_nick = "vic",
+        .new_role = "none",
+        .iq_id = "kick2",
+        .reply_to_worker = 0,
+        .reply_to_session = 0,
+        .reply_to_generation = 1,
+    }, &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
+
+    // Once the last occupant is gone, the deferred cleanup pass destroys it.
+    _ = room.removeByRealJid("solo@localhost/x");
+    cleanupEmptyRooms(&server);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") == null);
 }
