@@ -834,6 +834,31 @@ test "reader: S11 inter-stanza whitespace is not copied into the arena" {
     try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
 }
 
+
+test "reader: S26 one giant stanza does not inflate the arena for the stream" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const body = "x" ** (256 * 1024);
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<message to='a@b'><body>" ++ body ++ "</body></message>" ++
+        "<presence/>";
+    var pos: usize = 0;
+    var saw_small_capacity = false;
+    while (true) {
+        const ev = reader.next(input, &pos) catch return error.UnexpectedError;
+        if (ev == null) return error.ExpectedPresence;
+        if (ev.? == .element_start and std.mem.eql(u8, ev.?.element_start.name, "presence")) {
+            // The giant message is gone; retained arena capacity must be
+            // bounded, not sized for the biggest stanza ever seen.
+            saw_small_capacity = reader.arena.queryCapacity() <= max_arena_retain;
+            break;
+        }
+    }
+    try std.testing.expect(saw_small_capacity);
+}
+
 test "reader: S11 comments are rejected as restricted XML" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);
