@@ -1550,10 +1550,21 @@ pub const Server = struct {
                 session.sm_r_outstanding = false;
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "h")) {
-                        const client_h = std.fmt.parseInt(u32, attr.value, 10) catch 0;
+                        const client_h = std.fmt.parseInt(u32, attr.value, 10) catch {
+                            // A malformed handled-count cannot be trusted;
+                            // parsing it as 0 would silently desync the ack
+                            // window (S24).
+                            self.sendSmHandledCountError(session, changes);
+                            return;
+                        };
                         session.sm_out_h = client_h;
                         if (session.sm_unacked) |queue| {
-                            queue.ack(client_h);
+                            // XEP-0198 §3: h above the number of stanzas
+                            // sent fails the stream.
+                            if (queue.ack(client_h) == .too_high) {
+                                self.sendSmHandledCountError(session, changes);
+                                return;
+                            }
                         }
                         break;
                     }
@@ -3353,7 +3364,13 @@ pub const Server = struct {
             if (std.mem.eql(u8, attr.local_name, "previd")) {
                 previd = attr.value;
             } else if (std.mem.eql(u8, attr.local_name, "h")) {
-                h_value = std.fmt.parseInt(u32, attr.value, 10) catch 0;
+                h_value = std.fmt.parseInt(u32, attr.value, 10) catch {
+                    // Malformed h must not silently become 0: that would
+                    // look like a backwards report and desync the replay
+                    // (S24).
+                    self.sendSmFailed(session, "bad-request", changes);
+                    return;
+                };
                 h_found = true;
             }
         }
@@ -3423,7 +3440,21 @@ pub const Server = struct {
 
         // Process client's h value — ack stanzas the client received before disconnect
         if (detached.sm_unacked) |queue| {
-            queue.ack(h_value);
+            switch (queue.ack(h_value)) {
+                .ok => {},
+                // XEP-0198 §4: h above the number sent fails the resume.
+                .too_high => {
+                    self.sendSmFailed(session, "handled-count-too-high", changes);
+                    return;
+                },
+                // A backwards report means the client lost track of what it
+                // already acked; replaying would redeliver stanzas it
+                // processed (S24).
+                .backwards => {
+                    self.sendSmFailed(session, "unexpected-request", changes);
+                    return;
+                },
+            }
         }
 
         // Snapshot local MUC occupancies (T177): the detached slot is torn
@@ -3664,7 +3695,13 @@ pub const Server = struct {
         // eligible — the bundle carries the room list and the requesting
         // worker replays occupant moves after it re-binds.
 
-        if (detached.sm_unacked) |q| q.ack(req.h);
+        if (detached.sm_unacked) |q| {
+            switch (q.ack(req.h)) {
+                .ok => {},
+                .too_high => return fail(self, req, "handled-count-too-high", "h above sent count"),
+                .backwards => return fail(self, req, "unexpected-request", "h moved backwards"),
+            }
+        }
 
         const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch
             return fail(self, req, "item-not-found", "bundle alloc failed");
@@ -4097,6 +4134,18 @@ pub const Server = struct {
         }
     }
 
+    /// XEP-0198 §3: an <a/> whose handled-count is malformed or above the
+    /// number of stanzas sent fails the stream (S24).
+    fn sendSmHandledCountError(self: *Server, session: *Session, changes: *ChangeList) void {
+        var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        const w = fbs.writer();
+        w.writeAll("<stream:error><undefined-condition xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>" ++
+            "<handled-count-too-high xmlns='urn:xmpp:sm:3'/></stream:error>") catch return;
+        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.conn.flushSync();
+        session_lifecycle.forceCloseSession(self, session.conn.id, changes);
+    }
+
     /// Send SM <failed/> with a specific error condition.
     fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, changes: *ChangeList) void {
         _ = self;
@@ -4104,7 +4153,15 @@ pub const Server = struct {
         const w = fbs.writer();
         w.writeAll("<failed xmlns='urn:xmpp:sm:3'><") catch return;
         w.writeAll(condition) catch return;
-        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>") catch return;
+        // handled-count-too-high lives in the SM namespace (XEP-0198 §4),
+        // the failure conditions in the stanza namespace.
+        const ns = if (std.mem.eql(u8, condition, "handled-count-too-high"))
+            "urn:xmpp:sm:3"
+        else
+            "urn:ietf:params:xml:ns:xmpp-stanzas";
+        w.writeAll(" xmlns='") catch return;
+        w.writeAll(ns) catch return;
+        w.writeAll("'/></failed>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         if (session.conn.hasPendingWrite()) {
             _ = session.conn.flushSend() catch {};
@@ -4915,7 +4972,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
+        .{ "server.zig", @embedFile("server.zig"), 27 }, // stream/SASL/SM nonzas + queueSendStanza itself.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
         .{ "message.zig", @embedFile("message.zig"), 0 },
@@ -5104,6 +5161,227 @@ test "Server: S11 register flow iq ids survive the reader-arena reset" {
     const n2 = posix.read(fds[1], &drain_buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n2], "id='reg2-longer-id'") != null);
     try std.testing.expect(server.sessions[1] != null);
+}
+
+test "Server: S24 a h above the sent count fails the stream" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .active;
+    session.sm_enabled = true;
+    const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    _ = queue.push("<message/>");
+    _ = queue.push("<presence/>");
+    session.sm_unacked = queue;
+
+    // 2 stanzas outstanding, client claims 5 handled.
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='5'/>");
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "undefined-condition") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "handled-count-too-high") != null);
+}
+
+test "Server: S24 malformed a h fails the stream" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .active;
+    session.sm_enabled = true;
+
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='five'/>");
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "handled-count-too-high") != null);
+}
+
+test "Server: S24 backwards and too-high resume h fail without replay" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Detached session on slot 2: client had acked 5, 3 stanzas outstanding.
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    const detached = try std.testing.allocator.create(Session);
+    detached.* = Session.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
+    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.sm_detached = true;
+    detached.sm_detach_time = std.time.timestamp();
+    const det_queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
+    det_queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    det_queue.base_seq = 6;
+    det_queue.last_h = 5;
+    _ = det_queue.push("<message/>");
+    _ = det_queue.push("<message/>");
+    _ = det_queue.push("<message/>");
+    detached.sm_unacked = det_queue;
+    server.sessions[2] = detached;
+
+    var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+    sm_state.generateSmId(server.worker_id, &previd);
+    server.smIdMapInsert(&previd, 2);
+
+    // Fresh connection resuming the detached session.
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = xmpp.Jid.parse("alice@localhost") catch null;
+
+    var resume_buf: [128]u8 = undefined;
+    const backwards = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='3'/>", .{previd}) catch unreachable;
+    _ = try posix.write(fds[1], backwards);
+    server.handleReadable(1, &changes);
+
+    var buf: [4096]u8 = undefined;
+    const n1 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1], "<failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1], "unexpected-request") != null);
+    // The detached session and its replay queue are untouched.
+    try std.testing.expect(server.sessions[2] != null);
+    try std.testing.expectEqual(@as(u32, 3), det_queue.count);
+    try std.testing.expectEqual(@as(u32, 5), det_queue.last_h);
+
+    const too_high = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='100'/>", .{previd}) catch unreachable;
+    _ = try posix.write(fds[1], too_high);
+    server.handleReadable(1, &changes);
+
+    const n2 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n2], "<failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n2], "handled-count-too-high") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n2], "urn:xmpp:sm:3'/></failed>") != null);
+    try std.testing.expectEqual(@as(u32, 3), det_queue.count);
+
+    // Malformed h fails instead of parsing as 0.
+    const malformed = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='x'/>", .{previd}) catch unreachable;
+    _ = try posix.write(fds[1], malformed);
+    server.handleReadable(1, &changes);
+
+    const n3 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n3], "<failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n3], "bad-request") != null);
+    try std.testing.expectEqual(@as(u32, 3), det_queue.count);
+}
+
+test "Server: S24 cross-worker handoff carries last_h" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    sm_handoff.resetForTesting();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+    sm_state.generateSmId(server.worker_id, &previd);
+
+    session.sm_resume_pending = true;
+    session.sm_resume_epoch = 7;
+    @memcpy(&session.sm_resume_previd, &previd);
+
+    // The owning worker's queue: client had acked 5, 3 stanzas outstanding.
+    const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch unreachable;
+    bundle.* = .{
+        .previd = previd,
+        .sm_in_h = 0,
+        .sm_out_seq = 8,
+        .sm_out_h = 3,
+        .r_outstanding = false,
+        .roster_interested = false,
+        .carbons_enabled = false,
+        .csi_active = false,
+        .username = sm_handoff.allocator.dupe(u8, "alice") catch unreachable,
+        .resource = sm_handoff.allocator.dupe(u8, "res") catch unreachable,
+        .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
+        .base_seq = 6,
+        .last_h = 5,
+        .created = std.time.timestamp(),
+    };
+    bundle.stanzas.append(sm_handoff.allocator, sm_handoff.allocator.dupe(u8, "<message/>") catch unreachable) catch unreachable;
+    try sm_handoff.put(&previd, bundle);
+
+    server.handleSmResumeReply(.{
+        .previd = &previd,
+        .req_session = 1,
+        .req_epoch = 7,
+        .status = "ok",
+    }, &changes);
+
+    const queue = session.sm_unacked.?;
+    try std.testing.expectEqual(@as(u32, 5), queue.last_h);
+    try std.testing.expectEqual(@as(u32, 6), queue.base_seq);
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 8), session.sm_out_seq);
+
+    // A backwards <a/> after the handoff discards nothing (the carried
+    // last_h is what rejects it).
+    try std.testing.expectEqual(sm_state.SmUnackedQueue.AckResult.backwards, queue.ack(3));
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 5), queue.last_h);
 }
 
 
