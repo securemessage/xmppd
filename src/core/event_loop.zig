@@ -297,15 +297,16 @@ pub const ChangeList = struct {
         // casting -1 to usize would panic in safe builds.
         if (fd < 0) return;
         const target: usize = @intCast(fd);
-        var i: usize = 0;
-        while (i < self.len) {
-            if (self.buf[i].ident == target) {
-                self.len -= 1;
-                self.buf[i] = self.buf[self.len]; // swap-remove; order is per-fd irrelevant
-            } else {
-                i += 1;
-            }
+        // Order-preserving compaction: a swap-remove would move another
+        // fd's newest entry ahead of its older ones, inverting a staged
+        // EV_DELETE/EV_ADD pair (S20).
+        var dst: usize = 0;
+        for (0..self.len) |src| {
+            if (self.buf[src].ident == target) continue;
+            self.buf[dst] = self.buf[src];
+            dst += 1;
         }
+        self.len = dst;
         if (self.purged_len < self.purged.len) {
             self.purged[self.purged_len] = fd;
             self.purged_len += 1;
@@ -1432,4 +1433,30 @@ test "S10: removeWrite after the backlog drains lets kevent block again" {
     try std.testing.expectEqual(@as(usize, 0), drained.len);
     const still_idle = try loop.poll(50);
     try std.testing.expectEqual(@as(usize, 0), still_idle.len);
+}
+
+test "S20: purgeFd keeps the staged order of other fds' entries" {
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+
+    // Interleave: one entry for fd 30, one for fd 10, then a staged
+    // EV_ADD/EV_DELETE pair for fd 20. Swap-remove would pull fd 20's
+    // newest entry ahead of its older one and invert the pair.
+    try batch.addRead(30, 0xC);
+    try batch.addRead(10, 0xA);
+    try batch.addWrite(20, 0xB1);
+    try batch.removeWrite(20);
+    batch.purgeFd(10);
+
+    const out = batch.slice();
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(usize, 30), out[0].ident);
+    try std.testing.expectEqual(@as(usize, 20), out[1].ident);
+    try std.testing.expectEqual(std.c.EV.ADD | std.c.EV.ENABLE, out[1].flags);
+    try std.testing.expectEqual(@as(usize, 20), out[2].ident);
+    try std.testing.expectEqual(std.c.EV.DELETE, out[2].flags);
+
+    // Purging an fd with no staged entries is a no-op.
+    batch.purgeFd(99);
+    try std.testing.expectEqual(@as(usize, 3), batch.slice().len);
 }
