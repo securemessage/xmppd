@@ -2681,42 +2681,45 @@ pub const Server = struct {
 
     fn accumulatePepElement(self: *Server, session: *Session, elem: xml.Element) void {
         const a = self.allocator;
-        session.pep_payload.append(a, '<') catch return;
-        session.pep_payload.appendSlice(a, elem.name) catch return;
+        const w = session.pep_payload.writer(a);
+        w.writeByte('<') catch return;
+        w.writeAll(elem.name) catch return;
 
         if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client) and
             !std.mem.eql(u8, elem.namespace_uri, xml.ns.pubsub))
         {
+            // Escaped: the scanner decodes entities, so a raw write lets a
+            // quote close the attribute and inject markup (S1).
             if (elem.prefix.len > 0) {
-                session.pep_payload.appendSlice(a, " xmlns:") catch return;
-                session.pep_payload.appendSlice(a, elem.prefix) catch return;
-                session.pep_payload.appendSlice(a, "='") catch return;
-                session.pep_payload.appendSlice(a, elem.namespace_uri) catch return;
-                session.pep_payload.append(a, '\'') catch return;
+                w.writeAll(" xmlns:") catch return;
+                w.writeAll(elem.prefix) catch return;
+                w.writeAll("='") catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
             } else {
-                session.pep_payload.appendSlice(a, " xmlns='") catch return;
-                session.pep_payload.appendSlice(a, elem.namespace_uri) catch return;
-                session.pep_payload.append(a, '\'') catch return;
+                w.writeAll(" xmlns='") catch return;
+                xml.escapeWrite(w, elem.namespace_uri) catch return;
+                w.writeByte('\'') catch return;
             }
         }
 
         for (elem.attributes) |attr| {
-            session.pep_payload.append(a, ' ') catch return;
-            session.pep_payload.appendSlice(a, attr.name) catch return;
-            session.pep_payload.appendSlice(a, "='") catch return;
-            session.pep_payload.appendSlice(a, attr.value) catch return;
-            session.pep_payload.append(a, '\'') catch return;
+            w.writeByte(' ') catch return;
+            w.writeAll(attr.name) catch return;
+            w.writeAll("='") catch return;
+            xml.escapeWrite(w, attr.value) catch return;
+            w.writeByte('\'') catch return;
         }
 
         if (elem.self_closing) {
-            session.pep_payload.appendSlice(a, "/>") catch return;
+            w.writeAll("/>") catch return;
         } else {
-            session.pep_payload.append(a, '>') catch return;
+            w.writeByte('>') catch return;
         }
     }
 
     fn accumulatePepText(self: *Server, session: *Session, text: []const u8) void {
-        session.pep_payload.appendSlice(self.allocator, text) catch return;
+        xml.escapeWrite(session.pep_payload.writer(self.allocator), text) catch return;
     }
 
     fn accumulatePepClose(self: *Server, session: *Session, name: []const u8) void {
@@ -4831,4 +4834,42 @@ test "S17: SM-ID map remove does not break later lookups" {
             try std.testing.expectEqual(@as(?usize, i + 1000), server.findDetachedSession(&id));
         }
     }
+}
+
+test "S1: PEP accumulator escapes attributes, namespaces and text" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    // The scanner decodes entities, so these values arrive decoded; a raw
+    // re-emit closes the attribute and injects a second stanza (S1).
+    const attrs = [_]xml.Attribute{
+        .{ .name = "lat", .value = "1'><message from='admin@localhost'><body>pwn</body></message><x a='", .prefix = "", .local_name = "lat" },
+    };
+    const elem: xml.Element = .{
+        .name = "geoloc",
+        .prefix = "",
+        .local_name = "geoloc",
+        .namespace_uri = "urn:x'y",
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    server.accumulatePepElement(session, elem);
+    server.accumulatePepText(session, "10</lat><evil/>");
+    server.accumulatePepClose(session, "geoloc");
+
+    const payload = session.pep_payload.items;
+    try std.testing.expect(std.mem.indexOf(u8, payload, "<message") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "<evil/>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "xmlns='urn:x&apos;y'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "&lt;evil/&gt;") != null);
 }

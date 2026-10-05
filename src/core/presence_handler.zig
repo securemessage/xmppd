@@ -795,7 +795,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     var unsub_pres_fbs = std.io.fixedBufferStream(&unsub_pres_buf);
     const usbw = unsub_pres_fbs.writer();
     usbw.writeAll("<presence from='") catch return;
-    usbw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(usbw, owner_bare) catch return;
     usbw.writeAll("' to='") catch return;
     xml.escapeWrite(usbw, to_str) catch return;
     usbw.writeAll("' type='unsubscribe'/>") catch return;

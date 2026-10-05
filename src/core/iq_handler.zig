@@ -1770,7 +1770,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         rw.writeAll("'>") catch return;
         for (items) |item| {
             rw.writeAll("<item id='") catch return;
-            rw.writeAll(item.id) catch return;
+            xml.escapeWrite(rw, item.id) catch return;
             rw.writeAll("'>") catch return;
             rw.writeAll(item.payload) catch return;
             rw.writeAll("</item>") catch return;

@@ -2257,8 +2257,15 @@ fn getAvatarHash(server: *Server, bare_jid: []const u8) ?[]const u8 {
 }
 
 /// Write XEP-0153 vcard-temp:x:update element with avatar photo hash.
+/// The hash comes from client-published metadata; anything that is not a
+/// hex digest is refused so it cannot carry markup into presence (S1).
 fn writeVcardUpdate(w: anytype, avatar_hash: ?[]const u8) void {
     const hash = avatar_hash orelse return;
+    if (hash.len == 0 or hash.len > 64) return;
+    for (hash) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) return;
+    }
     w.writeAll("<x xmlns='vcard-temp:x:update'><photo>") catch return;
     w.writeAll(hash) catch return;
     w.writeAll("</photo></x>") catch return;
@@ -2594,4 +2601,15 @@ test "S6: self-kick is rejected and the room survives actor processing" {
     _ = room.removeByRealJid("solo@localhost/x");
     cleanupEmptyRooms(&server);
     try std.testing.expect(reg.findByJid("room@conference.localhost") == null);
+}
+
+test "S1: vcard update photo requires a hex hash" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    writeVcardUpdate(fbs.writer(), "0123456789abcdef0123456789abcdef01234567");
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "<photo>0123456789abcdef") != null);
+
+    fbs.reset();
+    writeVcardUpdate(fbs.writer(), "x'</photo><message from='admin@localhost'/>");
+    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
 }
