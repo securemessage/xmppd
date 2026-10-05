@@ -78,6 +78,10 @@ pub const Scanner = struct {
     buf: std.ArrayList(u8) = .{},
     /// Secondary buffer for attribute values
     val_buf: std.ArrayList(u8) = .{},
+    /// Entity name accumulator for `&...;` references, kept separate from
+    /// buf and val_buf: buf holds the attribute name and val_buf the value
+    /// while a reference is read inside an attribute value.
+    ent_buf: std.ArrayList(u8) = .{},
     /// The quote character for the current attribute value
     quote_char: u8 = 0,
     /// Track if we just saw a `/` that might precede `>`
@@ -99,6 +103,7 @@ pub const Scanner = struct {
     pub fn deinit(self: *Scanner) void {
         self.buf.deinit(self.allocator);
         self.val_buf.deinit(self.allocator);
+        self.ent_buf.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.token_arena.deinit();
     }
@@ -114,6 +119,7 @@ pub const Scanner = struct {
         self.state = .content;
         self.buf.clearRetainingCapacity();
         self.val_buf.clearRetainingCapacity();
+        self.ent_buf.clearRetainingCapacity();
         self.quote_char = 0;
         self.saw_slash = false;
         self.pending.clearRetainingCapacity();
@@ -300,8 +306,9 @@ pub const Scanner = struct {
                             };
                         }
                     } else if (c == '&') {
-                        // Entity reference in attribute value
-                        self.buf.clearRetainingCapacity();
+                        // Entity reference in attribute value; buf still
+                        // holds the attribute name, so the entity name is
+                        // accumulated in ent_buf instead.
                         self.state = .entity_attr;
                     } else {
                         try self.val_buf.append(a, c);
@@ -346,29 +353,29 @@ pub const Scanner = struct {
                     }
                 },
                 .entity_content => {
-                    // Reading entity name after `&` in text content.
-                    // Uses val_buf to accumulate entity name (buf holds text content).
+                    // Reading entity name after `&` in text content; the
+                    // decoded character is appended to buf (the text).
                     if (c == ';') {
-                        try resolveEntityInto(self.val_buf.items, &self.buf, a);
-                        self.val_buf.clearRetainingCapacity();
+                        try resolveEntityInto(self.ent_buf.items, &self.buf, a);
+                        self.ent_buf.clearRetainingCapacity();
                         self.state = .content;
-                    } else if (self.val_buf.items.len > 8) {
+                    } else if (self.ent_buf.items.len > 11) {
                         return error.InvalidEntityReference;
                     } else {
-                        try self.val_buf.append(a, c);
+                        try self.ent_buf.append(a, c);
                     }
                 },
                 .entity_attr => {
-                    // Reading entity name after `&` in attribute value.
-                    // Uses buf to accumulate entity name (val_buf holds attr value).
+                    // Reading entity name after `&` in an attribute value;
+                    // the decoded character is appended to val_buf.
                     if (c == ';') {
-                        try resolveEntityInto(self.buf.items, &self.val_buf, a);
-                        self.buf.clearRetainingCapacity();
+                        try resolveEntityInto(self.ent_buf.items, &self.val_buf, a);
+                        self.ent_buf.clearRetainingCapacity();
                         self.state = .attr_value;
-                    } else if (self.buf.items.len > 8) {
+                    } else if (self.ent_buf.items.len > 11) {
                         return error.InvalidEntityReference;
                     } else {
-                        try self.buf.append(a, c);
+                        try self.ent_buf.append(a, c);
                     }
                 },
             }
@@ -420,15 +427,28 @@ fn resolveEntityInto(name: []const u8, out: *std.ArrayList(u8), a: std.mem.Alloc
     if (std.mem.eql(u8, name, "apos")) return out.append(a, '\'');
     if (std.mem.eql(u8, name, "quot")) return out.append(a, '"');
 
-    // Numeric character reference: &#NNN; (decimal) or &#xHH; (hex)
+    // Numeric character reference: &#NNN; (decimal) or &#xHH; (hex). The
+    // CharRef production is digits only: no sign, no separators. Leading
+    // zeros are legal, so parse digit by digit with an overflow check
+    // instead of a length-limited parseInt.
     if (name.len > 1 and name[0] == '#') {
-        const val: u21 = if (name[1] == 'x' or name[1] == 'X')
-            std.fmt.parseInt(u21, name[2..], 16) catch return error.InvalidEntityReference
-        else
-            std.fmt.parseInt(u21, name[1..], 10) catch return error.InvalidEntityReference;
-        if (!isXmlChar(val)) return error.InvalidEntityReference;
+        const hex = name[1] == 'x' or name[1] == 'X';
+        const digits = if (hex) name[2..] else name[1..];
+        if (digits.len == 0) return error.InvalidEntityReference;
+        var val: u32 = 0;
+        for (digits) |d| {
+            const digit: u32 = if (hex)
+                std.fmt.charToDigit(d, 16) catch return error.InvalidEntityReference
+            else
+                std.fmt.charToDigit(d, 10) catch return error.InvalidEntityReference;
+            val = std.math.mul(u32, val, if (hex) @as(u32, 16) else 10) catch return error.InvalidEntityReference;
+            val = std.math.add(u32, val, digit) catch return error.InvalidEntityReference;
+        }
+        if (val > 0x10FFFF) return error.InvalidEntityReference;
+        const cp: u21 = @intCast(val);
+        if (!isXmlChar(cp)) return error.InvalidEntityReference;
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(val, &buf) catch return error.InvalidEntityReference;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidEntityReference;
         try out.appendSlice(a, buf[0..n]);
         return;
     }
@@ -789,3 +809,59 @@ test "S21: legal names still parse, including utf8 and whitespace before =" {
     try std.testing.expectEqual(TokenType.attribute, data.type);
     try std.testing.expectEqualStrings("data-x.y_z", data.name);
 }
+
+test "S21: entity in attribute value keeps the attribute name" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    const input = "<x id='a&amp;b' xmlns='urn:a&amp;b'/>";
+    var pos: usize = 0;
+
+    const open_tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.element_open, open_tok.type);
+    try std.testing.expectEqualStrings("x", open_tok.name);
+
+    const attr = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.attribute, attr.type);
+    try std.testing.expectEqualStrings("id", attr.name);
+    try std.testing.expectEqualStrings("a&b", attr.value);
+
+    // An entity inside xmlns still counts as a namespace declaration.
+    const ns = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.namespace_decl, ns.type);
+    try std.testing.expectEqualStrings("xmlns", ns.name);
+    try std.testing.expectEqualStrings("urn:a&b", ns.value);
+}
+
+test "S21: numeric char refs are strict digits, leading zeros allowed" {
+    const allocator = std.testing.allocator;
+
+    const bad = [_][]const u8{
+        "&#+65;", // sign is not part of the CharRef production
+        "&#1_0_0;", // underscores are not digits
+        "&#x4+1;",
+        "&#;",
+    };
+    for (bad) |ref| {
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+        var buf: [64]u8 = undefined;
+        const input = std.fmt.bufPrint(&buf, "<x>{s}</x>", .{ref}) catch unreachable;
+        var pos: usize = 0;
+        _ = (try scanner.next(input, &pos)).?; // <x>
+        _ = (try scanner.next(input, &pos)).?; // element_open_end
+        try std.testing.expectError(error.InvalidEntityReference, scanner.next(input, &pos));
+    }
+
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+    const input = "<x>&#0065;&#x41;</x>";
+    var pos: usize = 0;
+    _ = (try scanner.next(input, &pos)).?; // <x>
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+    const text = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.text, text.type);
+    try std.testing.expectEqualStrings("AA", text.name);
+}
+
