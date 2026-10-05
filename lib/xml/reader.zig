@@ -252,16 +252,17 @@ pub const Reader = struct {
                     self.depth += 1;
                     const elem = self.buildElement(true);
 
-                    if (std.mem.eql(u8, self.current_element_prefix, "stream") and
-                        std.mem.eql(u8, self.current_element_local, "stream") and
-                        self.depth != 1)
+                    // Only a streams-namespace <stream:stream> is a stream
+                    // open; any other stream-prefixed child (a legal empty
+                    // <stream:features/>) is an ordinary element (S27).
+                    if (std.mem.eql(u8, elem.namespace_uri, "http://etherx.jabber.org/streams") and
+                        std.mem.eql(u8, self.current_element_local, "stream"))
                     {
-                        // Nested inside an open stream: protocol violation (S27).
-                        return error.NestedStreamElement;
-                    }
-
-                    // Self-closing at depth 1 would be unusual for stream but handle it
-                    if (std.mem.eql(u8, self.current_element_prefix, "stream")) {
+                        if (self.depth != 1) {
+                            // Nested inside an open stream: protocol violation (S27).
+                            return error.NestedStreamElement;
+                        }
+                        // Self-closing at depth 1 would be unusual for stream but handle it
                         return Event{ .stream_open = elem };
                     }
 
@@ -592,6 +593,33 @@ test "reader: S27 nested stream:stream is a protocol error" {
         _ = (try reader.next(nested, &pos)).?; // <message>
         try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
     }
+}
+
+test "reader: S27 self-closing stream child is an ordinary element" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>" ++
+        "<stream:features/>" ++
+        "<presence/>";
+    var pos: usize = 0;
+
+    const ev1 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev1 == .stream_open);
+
+    // A legal empty stream child: element event, not a second stream_open,
+    // and depth is popped so the stanza arena reset still fires.
+    const ev2 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev2 == .element_start);
+    try std.testing.expectEqualStrings("features", ev2.element_start.local_name);
+    try std.testing.expect(ev2.element_start.self_closing);
+    try std.testing.expectEqual(@as(usize, 1), reader.depth);
+
+    const ev3 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev3 == .element_start);
+    try std.testing.expectEqualStrings("presence", ev3.element_start.local_name);
+    try std.testing.expectEqual(@as(usize, 1), reader.depth);
 }
 
 test "reader: parse message stanza" {
