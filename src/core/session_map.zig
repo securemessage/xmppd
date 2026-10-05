@@ -188,7 +188,17 @@ pub const SessionMap = struct {
         const gop = try self.bare_map.getOrPut(bare_key);
         if (!gop.found_existing) gop.value_ptr.* = EntryList{};
 
-        try gop.value_ptr.append(self.allocator, entry, self.max_resources);
+        gop.value_ptr.append(self.allocator, entry, self.max_resources) catch |err| {
+            // Roll back a fresh getOrPut entry so the map never holds a
+            // dangling key or an orphaned empty list (T254).
+            if (!gop.found_existing) {
+                var kv = self.bare_map.fetchRemove(bare_key).?;
+                kv.value.deinit(self.allocator);
+                self.allocator.free(kv.key);
+                bare_owned = false; // key freed above
+            }
+            return err;
+        };
         bare_owned = gop.found_existing;
 
         self.full_map.put(full_key, entry) catch |err| {
@@ -196,7 +206,8 @@ pub const SessionMap = struct {
             _ = gop.value_ptr.orderedRemove(gop.value_ptr.len - 1);
             if (!gop.found_existing) {
                 // fresh getOrPut entry that never housed a binding
-                const kv = self.bare_map.fetchRemove(bare_key).?;
+                var kv = self.bare_map.fetchRemove(bare_key).?;
+                kv.value.deinit(self.allocator);
                 self.allocator.free(kv.key);
                 bare_owned = false; // key freed above
             }
@@ -728,6 +739,46 @@ test "SessionMap: bare_map cleaned on last unbind" {
 
     _ = map.unbind("alice", "localhost", "desktop");
     try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
+}
+
+test "SessionMap: T254 resource cap rejection keeps maps consistent" {
+    var map = SessionMap.init(std.testing.allocator, false, 2);
+    defer map.deinit();
+
+    _ = try map.bind(0, 1, "alice", "localhost", "a");
+    _ = try map.bind(0, 2, "alice", "localhost", "b");
+    try std.testing.expectError(error.TooManyResources, map.bind(0, 3, "alice", "localhost", "c"));
+
+    var buf: [4]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expect(map.findByFullJid("alice", "localhost", "c") == null);
+
+    // The rejected bind consumed nothing: a freed slot is reusable.
+    _ = map.unbind("alice", "localhost", "a");
+    _ = try map.bind(0, 4, "alice", "localhost", "c");
+    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+}
+
+test "SessionMap: T254 OOM rollback at every bind allocation point" {
+    // Fail each allocation in turn. A failed bind must leave both maps
+    // without the half-bound account and own no memory: deinit on the
+    // testing allocator reports any leak or double free.
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var map = SessionMap.init(failing.allocator(), false, 0);
+        if (map.bind(0, 1, "alice", "localhost", "mobile")) |_| {
+            map.deinit();
+            break;
+        } else |_| {
+            var buf: [4]SessionEntry = undefined;
+            try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
+            try std.testing.expect(map.findByFullJid("alice", "localhost", "mobile") == null);
+            map.deinit();
+        }
+    } else {
+        return error.TestUnexpectedResult; // bind never succeeded: test is stuck
+    }
 }
 
 test "SessionMap: workers on different threads" {
