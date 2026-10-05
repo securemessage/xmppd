@@ -128,6 +128,15 @@ pub const S2sSession = struct {
     stanza_id_len: usize = 0,
     stanza_inner_buf: [16384]u8 = undefined,
     stanza_inner_len: usize = 0,
+    /// Namespace prefix/URI re-emitted by accumulateElement (S1 review).
+    /// Prefix of the stanza ROOT for buildStanzaXml's root xmlns emission.
+    stanza_root_ns_prefix_buf: [64]u8 = undefined,
+    stanza_root_ns_prefix_len: usize = 0,
+    stanza_root_ns_uri_buf: [256]u8 = undefined,
+    stanza_root_ns_uri_len: usize = 0,
+    /// True once any accumulate* call overflowed stanza_inner_buf; polite
+    /// dropping of a stanza whose inner buffer can't fit it (not forward).
+    stanza_accum_overflowed: bool = false,
 
     /// Record a domain as authenticated for this session (dedup,
     /// case-insensitive). A full set drops new entries: restart with it is
@@ -530,6 +539,8 @@ pub const S2sSession = struct {
     pub fn startStanza(self: *S2sSession, elem: xml.Element) void {
         self.stanza_active = true;
         self.stanza_inner_len = 0;
+        self.stanza_accum_overflowed = false;
+        self.startStanzaCaptureNs(elem.prefix, elem.namespace_uri);
         // Tag name
         const tl = @min(elem.local_name.len, self.stanza_tag_buf.len);
         @memcpy(self.stanza_tag_buf[0..tl], elem.local_name[0..tl]);
@@ -560,23 +571,63 @@ pub const S2sSession = struct {
         }
     }
 
+    pub fn stanzaRootNsPrefix(self: *const S2sSession) []const u8 {
+        return self.stanza_root_ns_prefix_buf[0..self.stanza_root_ns_prefix_len];
+    }
+
+    pub fn stanzaRootNsUri(self: *const S2sSession) []const u8 {
+        return self.stanza_root_ns_uri_buf[0..self.stanza_root_ns_uri_len];
+    }
+
+    pub fn startStanzaCaptureNs(self: *S2sSession, prefix: []const u8, uri: []const u8) void {
+        const pl = @min(prefix.len, self.stanza_root_ns_prefix_buf.len);
+        @memcpy(self.stanza_root_ns_prefix_buf[0..pl], prefix[0..pl]);
+        self.stanza_root_ns_prefix_len = pl;
+        const ul = @min(uri.len, self.stanza_root_ns_uri_buf.len);
+        @memcpy(self.stanza_root_ns_uri_buf[0..ul], uri[0..ul]);
+        self.stanza_root_ns_uri_len = ul;
+    }
+
+    pub fn stanzaBroken(self: *const S2sSession) bool {
+        return self.stanza_accum_overflowed;
+    }
+
+    fn markOverflow(self: *S2sSession) void {
+        self.stanza_accum_overflowed = true;
+    }
+
     /// Accumulate a child element opening tag into the stanza inner buffer.
+    /// Namespace declarations carry peer-owned syntax like any other attr:
+    /// they are re-emitted (S1 review: `<received xmlns='urn:xmpp:receipts'/>`
+    /// used to lose the xmlns entirely). The reader has already resolved the
+    /// binding by parse time; we just need to say it back out.
     pub fn accumulateElement(self: *S2sSession, elem: xml.Element) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeByte('<') catch return;
-        w.writeAll(elem.name) catch return;
+        w.writeByte('<') catch return self.markOverflow();
+        w.writeAll(elem.name) catch return self.markOverflow();
+        if (elem.namespace_uri.len > 0) {
+            if (elem.prefix.len > 0) {
+                w.writeAll(" xmlns:") catch return self.markOverflow();
+                w.writeAll(elem.prefix) catch return self.markOverflow();
+            } else {
+                w.writeAll(" xmlns") catch return self.markOverflow();
+            }
+            w.writeAll("='") catch return self.markOverflow();
+            xmlEscapeWrite(w, elem.namespace_uri) catch return self.markOverflow();
+            w.writeByte('\'') catch return self.markOverflow();
+        }
         for (elem.attributes) |attr| {
-            w.writeByte(' ') catch return;
-            w.writeAll(attr.name) catch return;
-            w.writeAll("='") catch return;
-            xmlEscapeWrite(w, attr.value) catch return;
-            w.writeByte('\'') catch return;
+            w.writeByte(' ') catch return self.markOverflow();
+            w.writeAll(attr.name) catch return self.markOverflow();
+            w.writeAll("='") catch return self.markOverflow();
+            xmlEscapeWrite(w, attr.value) catch return self.markOverflow();
+            w.writeByte('\'') catch return self.markOverflow();
         }
         if (elem.self_closing) {
-            w.writeAll("/>") catch return;
+            w.writeAll("/>") catch return self.markOverflow();
         } else {
-            w.writeByte('>') catch return;
+            w.writeByte('>') catch return self.markOverflow();
         }
         self.stanza_inner_len += fbs.pos;
     }
@@ -584,7 +635,7 @@ pub const S2sSession = struct {
     /// Accumulate text content (XML-escaped) into the stanza inner buffer.
     pub fn accumulateText(self: *S2sSession, text: []const u8) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch return;
+        xmlEscapeWrite(fbs.writer(), text) catch return self.markOverflow();
         self.stanza_inner_len += fbs.pos;
     }
 
@@ -607,6 +658,9 @@ pub const S2sSession = struct {
         self.stanza_to_len = 0;
         self.stanza_type_len = 0;
         self.stanza_id_len = 0;
+        self.stanza_root_ns_prefix_len = 0;
+        self.stanza_root_ns_uri_len = 0;
+        self.stanza_accum_overflowed = false;
     }
 
     /// Get the accumulated stanza tag name.
@@ -640,11 +694,24 @@ pub const S2sSession = struct {
     }
 
     /// Build the complete stanza XML from accumulated parts.
+    /// The root element's namespace binding is preserved (S1 review).
     pub fn buildStanzaXml(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.writeByte('<');
         try w.writeAll(self.getStanzaTag());
+        // Root namespace: re-emit it the way the peer declared it.
+        if (self.stanza_root_ns_uri_len > 0) {
+            if (self.stanza_root_ns_prefix_len > 0) {
+                try w.writeAll(" xmlns:");
+                try w.writeAll(self.stanzaRootNsPrefix());
+            } else {
+                try w.writeAll(" xmlns");
+            }
+            try w.writeAll("='");
+            try xmlEscapeWrite(w, self.stanzaRootNsUri());
+            try w.writeByte('\'');
+        }
         // from/to/type/id carry peer input — entity-decoded by the parser, so
         // they must be re-escaped on the way out (S1 injection guard).
         if (self.stanza_from_len > 0) {
@@ -1071,4 +1138,64 @@ test "S2sSession: isTlsHandshaking" {
 
     session.tls_state = .established;
     try std.testing.expect(!session.isTlsHandshaking());
+}
+
+test "S2sSession: xmlns declarations on nested elements are preserved (S1 review)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = "eve@them.example" },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = "bob@us.example" },
+        },
+        .self_closing = false,
+    });
+    session.accumulateElement(.{
+        .name = "received",
+        .prefix = "",
+        .local_name = "received",
+        .namespace_uri = "urn:xmpp:receipts",
+        .attributes = &.{},
+        .self_closing = true,
+    });
+    session.accumulateClose("message");
+    const inner = session.getStanzaInner();
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns='urn:xmpp:receipts'") != null);
+
+    var buf: [2048]u8 = undefined;
+    const out = try session.buildStanzaXml(&buf);
+    // Root element gets its xmlns='jabber:server' re-emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out, "xmlns='jabber:server'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<received xmlns='urn:xmpp:receipts'/>") != null);
+}
+
+test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1 review)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{},
+        .self_closing = false,
+    });
+    // One giant text payload to exceed the 16 KiB inner buffer.
+    var huge: [20000]u8 = undefined;
+    @memset(&huge, 'x');
+    session.accumulateText(&huge);
+    try std.testing.expect(session.stanzaBroken());
+    session.accumulateText("&amp;");
+    try std.testing.expect(session.stanzaBroken());
+
+    session.resetStanza();
+    try std.testing.expect(!session.stanzaBroken());
 }

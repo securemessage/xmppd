@@ -1232,6 +1232,15 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     const from = session.getStanzaFrom();
     const to = session.getStanzaTo();
 
+    // A stanza whose children overflowed the accumulator must not forward
+    // (S1 review: before, accumulate*'s silent catch made it past as
+    // truncated XML). The lane stays open; the stanza is counted and gone.
+    if (session.stanzaBroken()) {
+        log.warn("inbound S2S id={d} stanza dropped: inner accumulation overflowed (from={s} to={s})", .{ session.id, from, to });
+        session.resetStanza();
+        return;
+    }
+
     if (from.len == 0 or to.len == 0) {
         // RFC 6120 §4.9.3.10: missing from/to on an established stream.
         log.warn("inbound stanza missing from/to (improper-addressing)", .{});
