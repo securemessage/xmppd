@@ -521,9 +521,11 @@ pub fn main() !void {
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
     // listener, auth nothing; everything else in the master's table closes.
     core_sup.pass_fds = c2s_listen_fds[0..c2s_fd_count];
+    // Hoisted: pass_fds points at it at spawn AND every respawn (S7 review).
+    var s2s_pass_fds: [1]posix.fd_t = undefined;
     if (s2s_listen_fd >= 0) {
-        var s2s_pass = [_]posix.fd_t{s2s_listen_fd};
-        s2s_sup.pass_fds = &s2s_pass;
+        s2s_pass_fds[0] = s2s_listen_fd;
+        s2s_sup.pass_fds = s2s_pass_fds[0..1];
     }
 
     log.info("config: auth_socket={s} s2s={any} s2s_socket={s} db={s} cert={s} key={s}", .{
