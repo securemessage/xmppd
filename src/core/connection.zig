@@ -593,6 +593,97 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
     try std.testing.expect(!conn.hasPendingWrite());
 }
 
+test "Connection: flushSync on a dead descriptor returns instead of spinning" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend("<stream:error/>");
+
+    // The fd dies mid-flush (peer teardown raced the graceful close).
+    // flushSend surfaces EBADF as an error and flushSync must give up
+    // immediately, not retry the dead descriptor 100 times.
+    posix.close(fds[0]);
+    conn.flushSync();
+    try std.testing.expect(conn.hasPendingWrite());
+}
+
+test "Connection: flushSync makes short-write progress then exits bounded" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    // Fill the kernel buffer so only part of the payload fits.
+    var filler: [4096]u8 = @splat('x');
+    var filled: usize = 0;
+    while (posix.write(fds[0], &filler)) |n| {
+        filled += n;
+    } else |_| {}
+    try std.testing.expect(filled > 0);
+
+    // Free a slice of space: one short write's worth, not the whole queue.
+    var drain: [4096]u8 = undefined;
+    _ = try posix.read(fds[1], &drain);
+
+    var conn = Connection.init(fds[0], 1);
+    // Bigger than the freed window, smaller than the 16KB write buffer.
+    var payload_buf: [8192]u8 = @splat('y');
+    const marker = "<stream:error";
+    @memcpy(payload_buf[0..marker.len], marker);
+    try conn.queueSend(&payload_buf);
+
+    conn.flushSync();
+
+    // Progress happened (a short write drained into the freed space) but
+    // the peer never reads the rest, so flushSync must exit via its
+    // attempt cap with data still pending — never spin forever.
+    try std.testing.expect(conn.hasPendingWrite());
+    var all: [262144]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], all[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, all[0..total], marker) != null);
+}
+
+test "Connection: flushSync on a blocking fd coalesces short writes to completion" {
+    // Blocking pair: a write that cannot complete waits for the peer, so
+    // a slow reader turns one big payload into many short writes.
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(isize, 0), rc);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const payload_len = 12 * 1024;
+    var payload: [payload_len]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+
+    // Slow reader: small reads so the writer never lands one big write.
+    const Drainer = struct {
+        fn run(fd: posix.fd_t, want: usize, got: *usize) void {
+            var buf: [97]u8 = undefined;
+            got.* = 0;
+            while (got.* < want) {
+                const n = std.posix.read(fd, &buf) catch return;
+                if (n == 0) return;
+                got.* += n;
+            }
+        }
+    };
+    var got: usize = 0;
+    const t = try std.Thread.spawn(.{}, Drainer.run, .{ fds[1], payload_len, &got });
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend(&payload);
+    conn.flushSync();
+
+    try std.testing.expect(!conn.hasPendingWrite());
+    t.join();
+    try std.testing.expectEqual(payload_len, got);
+}
+
 // ---------------------------------------------------------------------------
 // S23: TLS write retry pinning (real TLS over a socketpair)
 // ---------------------------------------------------------------------------
