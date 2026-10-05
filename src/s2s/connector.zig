@@ -143,9 +143,7 @@ pub const OutboundConnection = struct {
 
     pub fn deinit(self: *OutboundConnection, allocator: std.mem.Allocator) void {
         for (self.pending_stanzas.items) |stanza| {
-            allocator.free(stanza.from_jid);
-            allocator.free(stanza.to_jid);
-            allocator.free(stanza.xml);
+            stanza.deinit(allocator);
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
@@ -513,11 +511,17 @@ pub const OutboundConnection = struct {
     }
 };
 
-/// A stanza queued for delivery.
+/// A stanza queued for delivery. Owns all three slices.
 pub const PendingStanza = struct {
     from_jid: []const u8,
     to_jid: []const u8,
     xml: []const u8,
+
+    pub fn deinit(self: PendingStanza, allocator: std.mem.Allocator) void {
+        allocator.free(self.from_jid);
+        allocator.free(self.to_jid);
+        allocator.free(self.xml);
+    }
 };
 
 /// Actions the connector tells the event loop to perform.

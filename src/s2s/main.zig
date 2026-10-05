@@ -401,13 +401,30 @@ pub const S2sDaemon = struct {
     }
 
     /// Flush queued stanzas on an established outbound connection.
+    /// Every flushed PendingStanza frees all three owned slices; a full
+    /// write buffer keeps the unconsumed tail queued (T275 review: before,
+    /// from_jid/to_jid leaked per stanza and the tail was dropped silently).
     fn flushOutboundStanzas(self: *S2sDaemon, conn: *OutboundConnection) void {
-        for (conn.pending_stanzas.items) |stanza| {
+        const items = conn.pending_stanzas.items;
+        var i: usize = 0;
+        while (i < items.len) : (i += 1) {
+            const stanza = items[i];
             conn.queueWrite(stanza.xml) catch {
-                log.err("outbound write buffer full for {s}", .{conn.remote_domain});
-                break;
+                // Compact the consumed head; the tail stays in order and is
+                // retried by the next flush. Not counted or bounced here —
+                // the structural answer is X1's bounded queue with
+                // delivery-failed (T278); the loud log rides this hotfix.
+                // Backpressure, not a drop: the tail is retried by the next
+                // flush, so warn-level is enough.
+                log.warn("outbound write buffer full for {s}: {d} stanza(s) stay queued", .{ conn.remote_domain, items.len - i });
+                std.mem.copyForwards(connector_mod.PendingStanza, conn.pending_stanzas.items[0 .. items.len - i], items[i..]);
+                conn.pending_stanzas.items.len -= i;
+                _ = conn.flushWrite() catch {
+                    log.err("outbound write failed for {s}", .{conn.remote_domain});
+                };
+                return;
             };
-            self.allocator.free(stanza.xml);
+            stanza.deinit(self.allocator);
         }
         conn.pending_stanzas.clearRetainingCapacity();
         _ = conn.flushWrite() catch {
@@ -2344,6 +2361,39 @@ test "S2sDaemon: stanza reject path resets before closeInbound frees (S2 review)
     // With the fix, the reset happened before free, so the marker survives.
     const stanza_active_byte: *const u8 = @ptrCast(&session.stanza_active);
     try std.testing.expectEqual(@as(u8, 0xA5), stanza_active_byte.*);
+}
+
+test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow tail (T275 review)" {
+    // std.testing.allocator reports any leak at teardown: pre-fix the two
+    // flushed stanzas' from_jid/to_jid would leak, and a full buffer would
+    // drop the tail silently.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.handleAuthSuccess(); // mark established without the protocol dance
+
+    const pad = try alloc.alloc(u8, 9000);
+    defer alloc.free(pad);
+    @memset(pad, 'x');
+    const big = try std.fmt.allocPrint(alloc, "<message from='a@us.example' to='b@them.example'><body>{s}</body></message>", .{pad});
+    defer alloc.free(big);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>small</body></message>");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big); // third does not fit the 16 KiB buffer
+
+    daemon.flushOutboundStanzas(conn);
+    // One stanza must survive queued for the next flush, in order.
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
+    try std.testing.expectEqualStrings("b@them.example", conn.pending_stanzas.items[0].to_jid);
 }
 
 test "S2sDaemon: stop" {
