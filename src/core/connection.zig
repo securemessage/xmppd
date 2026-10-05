@@ -607,7 +607,7 @@ const tls_test_c = @cImport({
 
 /// Generate a self-signed EC cert + key as one combined PEM inside `dir` and
 /// return its path (caller frees). Test-only fixture for TLS socketpair tests.
-fn makeTestPem(allocator: std.mem.Allocator, dir: std.fs.Dir) ![:0]u8 {
+pub fn makeTestPem(allocator: std.mem.Allocator, dir: std.fs.Dir) ![:0]u8 {
     const cc = tls_test_c;
 
     const pctx = cc.EVP_PKEY_CTX_new_id(cc.EVP_PKEY_EC, null) orelse return error.SslInitFailed;

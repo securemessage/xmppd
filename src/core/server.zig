@@ -520,6 +520,9 @@ pub const Server = struct {
 
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
+    /// Whether EVFILT_WRITE is armed for the auth/S2S IPC fds. Reconciled
+    /// once per loop iteration; see reconcileIpcWriteInterest (S10).
+    ipc_write_armed: bool = false,
 
     /// Auth daemon socket path copy (for reconnects, T243). Empty = no
     /// reconnect configured (e.g. configureAuth never ran).
@@ -528,6 +531,7 @@ pub const Server = struct {
 
     /// IPC client for S2S daemon communication (federation).
     s2s_ipc: IpcClient = .{},
+    s2s_write_armed: bool = false,
 
     /// Session map — unified JID-keyed routing table (thread-safe, replaces both
     /// SessionRegistry and SharedSessionRegistry). Null before configureServer().
@@ -798,8 +802,9 @@ pub const Server = struct {
         // ~860k log lines/min). Guard on "we still hold a link" instead.
         if (self.ipc.fd < 0) return;
         const old_fd = self.ipc.fd;
-        log.err("auth daemon IPC lost (fd={d}) — failing in-flight SASL, reconnect armed in {d}ms", .{ old_fd, AUTH_RECONNECT_MS });
+        log.warn("auth daemon IPC lost (fd={d}) — failing in-flight SASL, reconnect armed in {d}ms", .{ old_fd, AUTH_RECONNECT_MS });
         self.ipc.close();
+        self.ipc_write_armed = false;
         changes.purgeFd(old_fd);
         // Sessions parked mid-exchange would hang forever without a reply.
         for (self.sessions) |maybe| {
@@ -828,9 +833,7 @@ pub const Server = struct {
         };
         log.info("auth daemon IPC reconnected ({s})", .{path});
         changes.addRead(self.ipc.fd, IPC_AUTH_UDATA) catch {};
-        if (self.ipc.hasPendingSend()) {
-            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     /// Configure the roster store (generic backend-backed).
@@ -1123,6 +1126,10 @@ pub const Server = struct {
             // T178: fail sessions whose SM unacked queue overflowed during
             // this batch (any delivery path may have set the flag).
             session_lifecycle.reapSmOverflow(self, &changes);
+
+            // S10: single point of truth for IPC write interest; heals
+            // any re-arm lost while handling this batch.
+            self.reconcileIpcWriteInterest(&changes);
         }
     }
 
@@ -1199,11 +1206,13 @@ pub const Server = struct {
                 changes.addRead(session.conn.fd, id) catch {};
             }
         } else {
-            // Re-arm the appropriate kqueue filter
+            // Re-arm the appropriate kqueue filter. Write interest is
+            // one-shot: a persistent filter fires on every kevent while
+            // the handshake waits for the client's next flight (S10).
             if (session.conn.tls_state) |state| {
                 switch (state) {
                     .handshake_want_read => changes.addRead(session.conn.fd, id) catch {},
-                    .handshake_want_write => changes.addWrite(session.conn.fd, id) catch {},
+                    .handshake_want_write => changes.addWriteOnce(session.conn.fd, id) catch {},
                     .established => {},
                 }
             }
@@ -1993,6 +2002,7 @@ pub const Server = struct {
 
     /// Called when </auth> is reached — we have the full base64 payload.
     fn processSaslAuthComplete(self: *Server, session: *Session, changes: *ChangeList) void {
+        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
@@ -2046,14 +2056,12 @@ pub const Server = struct {
 
         session.auth_state = .awaiting_challenge;
 
-        // Ensure we watch for IPC writes if needed
-        if (self.ipc.hasPendingSend()) {
-            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     /// Called when </response> is reached — we have the full SCRAM response.
     fn processSaslResponseComplete(self: *Server, session: *Session, changes: *ChangeList) void {
+        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
@@ -2085,9 +2093,7 @@ pub const Server = struct {
 
         session.auth_state = .awaiting_result;
 
-        if (self.ipc.hasPendingSend()) {
-            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     // ========================================================================
@@ -2104,8 +2110,12 @@ pub const Server = struct {
         // Process all complete messages
         while (true) {
             const msg = self.ipc.nextMessage() catch |err| {
-                log.err("auth daemon IPC decode error: {} len={d} consumed={d}", .{ err, self.ipc.recv_len, self.ipc.recv_consumed });
-                break;
+                // A decode error does not consume the frame; keeping the
+                // link retries the same bytes forever and wedges every
+                // SASL exchange behind it. Drop and reconnect (S10).
+                log.warn("auth daemon IPC decode error: {} len={d} consumed={d} — dropping link", .{ err, self.ipc.recv_len, self.ipc.recv_consumed });
+                self.dropIpcAuth(changes);
+                return;
             };
             if (msg == null) break;
             self.dispatchAuthResponse(msg.?, changes);
@@ -2118,12 +2128,52 @@ pub const Server = struct {
             self.dropIpcAuth(changes);
             return;
         };
-        if (self.ipc.hasPendingSend()) {
-            changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        // Write interest (arm on backlog, disarm on drain) is reconciled
+        // once per loop iteration; see reconcileIpcWriteInterest (S10).
+    }
+
+    /// S10: sole owner of IPC write interest, called once per loop
+    /// iteration. Arming scattered across send sites could lose a re-arm
+    /// to a full changelist and strand pending frames (the pre-S10
+    /// persistent filter spun and hid it); disarming here keeps an idle
+    /// link from re-firing writable every kevent.
+    fn reconcileIpcWriteInterest(self: *Server, changes: *ChangeList) void {
+        if (self.ipc.connected and self.ipc.fd >= 0) {
+            if (self.ipc.hasPendingSend()) {
+                if (!self.ipc_write_armed) {
+                    changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch |err| {
+                        log.err("auth IPC write arm failed ({}) — dropping link", .{err});
+                        self.dropIpcAuth(changes);
+                        return;
+                    };
+                    self.ipc_write_armed = true;
+                }
+            } else if (self.ipc_write_armed) {
+                changes.removeWrite(self.ipc.fd) catch {};
+                self.ipc_write_armed = false;
+            }
         } else {
-            // An idle unix socket is always writable; leaving the filter
-            // armed after a drain spins kevent() at 100% CPU (S10).
-            changes.removeWrite(self.ipc.fd) catch {};
+            self.ipc_write_armed = false;
+        }
+
+        if (self.s2s_ipc.connected and self.s2s_ipc.fd >= 0) {
+            if (self.s2s_ipc.hasPendingSend()) {
+                if (!self.s2s_write_armed) {
+                    changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch |err| {
+                        log.err("s2s IPC write arm failed ({}) — dropping link", .{err});
+                        const dead_fd = self.s2s_ipc.fd;
+                        self.s2s_ipc.close();
+                        changes.purgeFd(dead_fd);
+                        return;
+                    };
+                    self.s2s_write_armed = true;
+                }
+            } else if (self.s2s_write_armed) {
+                changes.removeWrite(self.s2s_ipc.fd) catch {};
+                self.s2s_write_armed = false;
+            }
+        } else {
+            self.s2s_write_armed = false;
         }
     }
 
@@ -2419,6 +2469,7 @@ pub const Server = struct {
     /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
     /// Used by subscription/presence handlers where the stanza XML is already built.
     pub fn forwardPresenceXmlToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
+        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         if (!self.s2s_ipc.connected) {
             log.info("connection {d} presence to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
             return;
@@ -2432,15 +2483,13 @@ pub const Server = struct {
             log.err("connection {d} failed to forward presence to S2S", .{session.conn.id});
             return;
         };
-
-        if (self.s2s_ipc.hasPendingSend()) {
-            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
     /// Variant without a session reference — used by broadcast presence.
     pub fn sendPresenceViaS2s(self: *Server, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
+        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         if (!self.s2s_ipc.connected) return;
 
         self.s2s_ipc.send(.{ .s2s_deliver = .{
@@ -2448,23 +2497,29 @@ pub const Server = struct {
             .to_jid = to_str,
             .stanza_xml = stanza_xml,
         } }) catch return;
-
-        if (self.s2s_ipc.hasPendingSend()) {
-            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.recv() catch {
             log.err("S2S daemon IPC recv error", .{});
+            const dead_fd = self.s2s_ipc.fd;
             self.s2s_ipc.close();
+            changes.purgeFd(dead_fd);
+            self.s2s_write_armed = false;
             return;
         };
 
         while (true) {
             const msg = self.s2s_ipc.nextMessage() catch {
-                log.err("S2S daemon IPC decode error", .{});
-                break;
+                // Same wedge class as the auth link (S10): an unconsumed
+                // bad frame would be retried forever.
+                log.warn("S2S daemon IPC decode error — dropping link", .{});
+                const dead_fd = self.s2s_ipc.fd;
+                self.s2s_ipc.close();
+                changes.purgeFd(dead_fd);
+                self.s2s_write_armed = false;
+                return;
             };
             if (msg == null) break;
             self.dispatchS2sResponse(msg.?, changes);
@@ -2477,14 +2532,10 @@ pub const Server = struct {
             const dead_fd = self.s2s_ipc.fd;
             self.s2s_ipc.close();
             changes.purgeFd(dead_fd);
+            self.s2s_write_armed = false;
             return;
         };
-        if (self.s2s_ipc.hasPendingSend()) {
-            changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-        } else {
-            // Same spin guard as flushIpc (S10).
-            changes.removeWrite(self.s2s_ipc.fd) catch {};
-        }
+        // Write interest: reconcileIpcWriteInterest (S10).
     }
 
     fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
@@ -5566,6 +5617,157 @@ test "Server: S24 cross-worker handoff carries last_h" {
     try std.testing.expectEqual(@as(u32, 5), queue.last_h);
 }
 
+
+test "Server: S10 reconcile arms and disarms auth IPC write interest" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    server.ipc.fd = fds[0];
+    server.ipc.connected = true;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Unix pairs buffer ~64 KiB: fill the send path, then the IPC send
+    // cannot flush fully and a backlog remains.
+    var fill_buf: [65536]u8 = undefined;
+    @memset(&fill_buf, 'x');
+    _ = posix.write(fds[0], &fill_buf) catch 0;
+    const big_payload = "P" ** 3000;
+    try server.ipc.send(.{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "u",
+        .payload = big_payload,
+    } });
+    try std.testing.expect(server.ipc.hasPendingSend());
+
+    // Pending backlog: reconcile arms write interest exactly once.
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expect(server.ipc_write_armed);
+    try std.testing.expectEqual(@as(usize, 1), changes.slice().len);
+    changes.reset();
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expectEqual(@as(usize, 0), changes.slice().len);
+
+    // Drain the peer and flush: reconcile disarms the idle link.
+    var drain_buf: [8192]u8 = undefined;
+    while (server.ipc.hasPendingSend()) {
+        _ = posix.read(fds[1], &drain_buf) catch {};
+        server.flushIpc(&changes);
+    }
+    try std.testing.expect(server.ipc.connected);
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expect(!server.ipc_write_armed);
+    try std.testing.expectEqual(@as(usize, 1), changes.slice().len);
+    try std.testing.expectEqual(std.c.EV.DELETE, changes.slice()[0].flags);
+}
+
+test "Server: S10 auth IPC decode error drops the link" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    server.ipc.fd = fds[0];
+    server.ipc.connected = true;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A well-formed frame whose tag does not decode.
+    const garbage = [_]u8{ 1, 0, 0, 0, 0xFE };
+    _ = try posix.write(fds[1], &garbage);
+    server.handleIpcReadable(&changes);
+
+    // The bad frame is never consumed; only dropping the link unwedges it.
+    try std.testing.expect(!server.ipc.connected);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), server.ipc.fd);
+}
+
+test "Server: S10 s2s IPC decode error drops the link" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    server.s2s_ipc.fd = fds[0];
+    server.s2s_ipc.connected = true;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A well-formed frame whose tag does not decode.
+    const garbage = [_]u8{ 1, 0, 0, 0, 0xFE };
+    _ = try posix.write(fds[1], &garbage);
+    server.handleS2sIpcReadable(&changes);
+
+    try std.testing.expect(!server.s2s_ipc.connected);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), server.s2s_ipc.fd);
+}
+
+test "Server: S10 handshake write interest is one-shot" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    // Small send buffer: the server's first handshake flight cannot go out
+    // in one write, so the handshake parks in want_write.
+    const sndbuf: c_int = 1024;
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+    _ = client_tls.doHandshake() catch .want_read;
+
+    try session.conn.upgradeToTls(server.ssl_ctx.?);
+
+    // Fill the server->client direction: the handshake flight cannot go
+    // out, so the handshake parks in want_write. The filler only pollutes
+    // the client's side, which this test never reads again.
+    var fill_buf: [65536]u8 = undefined;
+    @memset(&fill_buf, 'x');
+    while (true) {
+        _ = posix.write(fds[0], &fill_buf) catch break;
+    }
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    server.continueTlsHandshake(1, session, &changes);
+    try std.testing.expectEqual(connection_mod.TlsState.handshake_want_write, session.conn.tls_state.?);
+
+    // The staged re-arm must be EV_ONESHOT; a persistent filter fires on
+    // every kevent while the client's next flight is in flight (S10).
+    var found_oneshot = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.WRITE) {
+            try std.testing.expect((ev.flags & std.c.EV.ONESHOT) != 0);
+            found_oneshot = true;
+        }
+    }
+    try std.testing.expect(found_oneshot);
+}
 
 // Force analysis of sibling files whose tests otherwise never run.
 test {
