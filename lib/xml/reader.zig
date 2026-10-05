@@ -876,3 +876,64 @@ test "reader: S11 comments are rejected as restricted XML" {
     }
 }
 
+
+test "reader: event spans never overshoot the segment end under adversarial splits" {
+    const allocator = std.testing.allocator;
+    const doc = "<?xml version='1.0'?>" ++
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>" ++
+        "<iq type='set' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>r&amp;x</resource></bind></iq>" ++
+        "<message to='a@b' from='c@d'><body>hello &lt;world&gt;</body></message>" ++
+        "<presence/>";
+
+    // A payload slice that starts inside the segment must also end inside
+    // it: a span may borrow from the input or from the arena, never
+    // overshoot the input end.
+    const SpanChecker = struct {
+        fn check(s: []const u8, input: []const u8) !void {
+            if (s.len == 0) return;
+            const base = @intFromPtr(input.ptr);
+            const p = @intFromPtr(s.ptr);
+            if (p >= base and p < base + input.len) {
+                try std.testing.expect(p + s.len <= base + input.len);
+            }
+        }
+        fn event(ev: Event, input: []const u8) !void {
+            switch (ev) {
+                .stream_open, .element_start => |el| {
+                    try check(el.name, input);
+                    try check(el.namespace_uri, input);
+                    for (el.attributes) |attr| {
+                        try check(attr.name, input);
+                        try check(attr.value, input);
+                    }
+                },
+                .element_end => |name| try check(name, input),
+                .text => |txt| try check(txt, input),
+                else => {},
+            }
+        }
+    };
+
+    // Replay the server's consume pattern byte by byte (the most
+    // adversarial segmentation): accumulate one more byte per step,
+    // parse with pos = 0, then consume the parsed prefix. pos must
+    // never pass the segment end.
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    var consumed: usize = 0;
+    var step: usize = 1;
+    while (step <= doc.len) : (step += 1) {
+        const input = doc[consumed..step];
+        var pos: usize = 0;
+        while (true) {
+            const ev = try reader.next(input, &pos);
+            try std.testing.expect(pos <= input.len);
+            if (ev == null) break;
+            try SpanChecker.event(ev.?, input);
+        }
+        consumed += pos;
+    }
+    try std.testing.expectEqual(doc.len, consumed);
+}
