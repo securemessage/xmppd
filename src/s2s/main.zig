@@ -907,7 +907,14 @@ fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, ses
     };
 
     if (complete) {
-        log.info("inbound S2S id={d} TLS handshake complete", .{slot});
+        // Q11: offload fallback is silent, so engagement, version and cipher
+        // are logged once per handshake (tokens: ktls, ktls-tx, ktls-rx, sw).
+        if (session.tls_conn) |*tls| {
+            const mode: []const u8 = if (tls.ktlsSend() and tls.ktlsRecv()) "ktls" else if (tls.ktlsSend()) "ktls-tx" else if (tls.ktlsRecv()) "ktls-rx" else "sw";
+            log.info("inbound S2S id={d} TLS handshake complete version={s} cipher={s} mode={s}", .{ slot, tls.versionName(), tls.cipherName(), mode });
+        } else {
+            log.info("inbound S2S id={d} TLS handshake complete mode=none", .{slot});
+        }
         // Notify the stream FSM that TLS is established
         session.stream.tlsEstablished();
         // Reset XML reader for stream restart after STARTTLS
@@ -1779,7 +1786,14 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
     };
 
     if (complete) {
-        log.info("outbound TLS handshake complete for {s}", .{conn.remote_domain});
+        // Q11: offload fallback is silent, so engagement, version and cipher
+        // are logged once per handshake (tokens: ktls, ktls-tx, ktls-rx, sw).
+        if (conn.tls_conn) |*tls| {
+            const mode: []const u8 = if (tls.ktlsSend() and tls.ktlsRecv()) "ktls" else if (tls.ktlsSend()) "ktls-tx" else if (tls.ktlsRecv()) "ktls-rx" else "sw";
+            log.info("outbound TLS handshake complete for {s} version={s} cipher={s} mode={s}", .{ conn.remote_domain, tls.versionName(), tls.cipherName(), mode });
+        } else {
+            log.info("outbound TLS handshake complete for {s} mode=none", .{conn.remote_domain});
+        }
         conn.tlsHandshakeComplete();
 
         // Reset XML reader for post-TLS stream restart

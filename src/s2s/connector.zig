@@ -929,6 +929,15 @@ test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind 
     defer server.deinit();
     try driveTestTlsHandshake(&server, &conn.tls_conn.?);
 
+    // Q11: the accessors behind the post-handshake kTLS log line.
+    {
+        const tls = &(conn.tls_conn orelse unreachable);
+        try std.testing.expect(tls.versionName().len > 0);
+        try std.testing.expect(tls.cipherName().len > 0);
+        _ = tls.ktlsSend();
+        _ = tls.ktlsRecv();
+    }
+
     var head: [head_len]u8 = undefined;
     for (&head, 0..) |*b, i| b.* = @truncate(i);
     const tail = "TAIL-AFTER-PINNED-WRITE";
