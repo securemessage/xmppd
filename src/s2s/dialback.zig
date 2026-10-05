@@ -126,7 +126,7 @@ pub fn buildDbResult(
     try w.writeAll("' to='");
     try esc(w, target);
     try w.writeAll("'>");
-    try w.writeAll(key_hex); // local HMAC hex, always safe
+    try esc(w, key_hex); // normally local HMAC hex; escape anyway (S1 review)
     try w.writeAll("</db:result>");
     return fbs.getWritten();
 }
@@ -153,6 +153,21 @@ pub fn buildDbResultResponse(
     return fbs.getWritten();
 }
 
+/// Whether text has the shape of a dialback key: exactly 64 lowercase-hex
+/// characters (computeKeyHex output). The callback path re-emits a captured
+/// peer key, which may have contained entity-decoded markup (S1 review),
+/// so capture validates against this and builders escape regardless.
+pub fn isValidKeyHex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |ch| {
+        switch (ch) {
+            '0'...'9', 'a'...'f' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Build a `<db:verify>` stanza (receiving server sends this to the authoritative server).
 ///
 /// `<db:verify from='verifier' to='origin' id='stream_id'>KEY_HEX</db:verify>`
@@ -173,7 +188,7 @@ pub fn buildDbVerify(
     try w.writeAll("' id='");
     try esc(w, stream_id);
     try w.writeAll("'>");
-    try w.writeAll(key_hex);
+    try esc(w, key_hex);
     try w.writeAll("</db:verify>");
     return fbs.getWritten();
 }
@@ -591,4 +606,41 @@ test "hexEncode: known value" {
     const input = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF } ++ [_]u8{0} ** 28;
     const hex = hexEncode(&input);
     try std.testing.expect(std.mem.startsWith(u8, &hex, "deadbeef"));
+}
+
+test "isValidKeyHex: exactly 64 lowercase hex" {
+    const secret = [_]u8{0x42} ** SECRET_LEN;
+    const key_hex = computeKeyHex(&secret, "b.example", "a.example", "s2s-1");
+    try std.testing.expect(isValidKeyHex(&key_hex));
+    try std.testing.expectEqual(@as(usize, 64), key_hex.len);
+
+    try std.testing.expect(!isValidKeyHex(""));
+    try std.testing.expect(!isValidKeyHex("deadbeef"));
+
+    var longer: [65]u8 = undefined;
+    @memcpy(longer[0..64], &key_hex);
+    longer[64] = 'f';
+    try std.testing.expect(!isValidKeyHex(&longer));
+
+    var nonhex = key_hex;
+    nonhex[0] = 'G';
+    try std.testing.expect(!isValidKeyHex(&nonhex));
+
+    var upper = key_hex;
+    // Force an uppercase hex letter somewhere (first hex letter, fallback 1).
+    var i: usize = 0;
+    while (i < 64 and (key_hex[i] < 'a' or key_hex[i] > 'f')) : (i += 1) {}
+    try std.testing.expect(i < 64);
+    upper[i] = std.ascii.toUpper(upper[i]);
+    try std.testing.expect(!isValidKeyHex(&upper));
+
+    // The S1-review case: entity-decoded markup in a captured key.
+    try std.testing.expect(!isValidKeyHex("</db:result><message from='victim.example' to='x@us.example'><body/padding padding padding padd</"));
+}
+
+test "buildDbVerify escapes even a hostile captured key (S1 review)" {
+    var buf: [2048]u8 = undefined;
+    const out = try buildDbVerify(&buf, "us.example", "them.example", "s2s-1", "</db:verify><message/>");
+    try std.testing.expect(std.mem.indexOf(u8, out, "</db:verify><message/>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&lt;/db:verify&gt;") != null);
 }

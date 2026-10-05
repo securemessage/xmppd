@@ -1276,6 +1276,19 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         log.warn("dialback callback: missing origin or key", .{});
         return;
     }
+    // S1: the captured key re-enters an outbound stream verbatim; only a
+    // HMAC hex shape can ever be legitimate (entity-decoded markup in a
+    // db:result is rejected, not forwarded).
+    if (!dialback.isValidKeyHex(key)) {
+        log.warn("dialback callback: invalid key shape from {s} ({d} bytes); answering type=invalid", .{ origin, key.len });
+        var resp_buf: [512]u8 = undefined;
+        const resp = dialback.buildDbResultResponse(&resp_buf, session.stream.local_domain, origin, false) catch return;
+        session.queueWrite(resp) catch {};
+        if (session.hasPendingWrite()) {
+            batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
+        }
+        return;
+    }
     // S2: the db:result to= must be us; without the check an attacker-named
     // target is verified on our account.
     if (!std.ascii.eqlIgnoreCase(session.getDbResultTo(), daemon.local_domain)) {
