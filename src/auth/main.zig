@@ -481,9 +481,10 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
                 };
 
                 // Clean up SCRAM session after sending success/failure
+                // (lane, conn_id) keyed: lanes share conn_id numbers (T279).
                 switch (response) {
-                    .auth_success => |s| handler.cleanupSession(s.conn_id),
-                    .auth_failure => |f| handler.cleanupSession(f.conn_id),
+                    .auth_success => |s| handler.cleanupSession(@intCast(slot), s.conn_id),
+                    .auth_failure => |f| handler.cleanupSession(@intCast(slot), f.conn_id),
                     else => {},
                 }
 

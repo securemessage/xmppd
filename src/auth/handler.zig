@@ -328,12 +328,12 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn handleMessage(self: *Self, msg: protocol.Message, slot: u32, slot_gen: u32) HandleResult {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
-                .sasl_response => |resp| .{ .reply = self.handleSaslResponse(resp) },
+                .sasl_response => |resp| .{ .reply = self.handleSaslResponse(@intCast(slot), resp) },
                 .auth_abort => |a| blk: {
                     // The XMPP connection vanished mid-exchange; release its
                     // SCRAM slot immediately instead of waiting for the stale
                     // sweep — the core may already be reusing the conn.id.
-                    self.cleanupSession(a.conn_id);
+                    self.cleanupSession(@intCast(slot), a.conn_id);
                     break :blk .none;
                 },
                 .password_change_request => |req| .{ .reply = self.handlePasswordChange(req) },
@@ -583,7 +583,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 return authFailure(req.conn_id, "mechanism-not-supported");
             } else {
                 // Find or create a SCRAM session for this conn_id
-                const slot = self.findOrCreateScramSlot(req.conn_id) orelse {
+                const slot = self.findOrCreateScramSlot(@intCast(ipc_slot), req.conn_id) orelse {
                     return authFailure(req.conn_id, "temporary-auth-failure");
                 };
 
@@ -656,9 +656,10 @@ pub fn AuthHandler(comptime Store: type) type {
             }
         }
 
-        fn handleSaslResponse(self: *Self, resp: protocol.SaslResponse) protocol.Message {
-            // Find the SCRAM session for this conn_id
-            const slot = self.findScramSlot(resp.conn_id) orelse {
+        fn handleSaslResponse(self: *Self, lane: u16, resp: protocol.SaslResponse) protocol.Message {
+            // Find the SCRAM session for this lane's conn_id (T279 review:
+            // another lane's identical conn_id must not qualify).
+            const slot = self.findScramSlot(lane, resp.conn_id) orelse {
                 // No exchange for this conn: aborted, swept as stale, or the
                 // auth_request never arrived. Was completely silent.
                 log.warn("SCRAM final for conn={d} has no exchange (aborted/swept/lost)", .{resp.conn_id});
@@ -886,8 +887,10 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         /// Clean up a SCRAM session after the response has been sent.
-        pub fn cleanupSession(self: *Self, conn_id: u32) void {
-            if (self.findScramSlot(conn_id)) |slot| {
+        /// Lookup is keyed on (lane, conn_id): conn_id alone collides
+        /// across core worker lanes each numbering from 1 (T279 review).
+        pub fn cleanupSession(self: *Self, lane: u16, conn_id: u32) void {
+            if (self.findScramSlot(lane, conn_id)) |slot| {
                 self.scram_sessions[slot].deinit();
             }
         }
@@ -907,8 +910,10 @@ pub fn AuthHandler(comptime Store: type) type {
         /// by construction. The table must probe instead of failing on the
         /// first occupied home slot (birthday collisions are guaranteed);
         /// null now means the table is genuinely full.
-        fn findOrCreateScramSlot(self: *Self, conn_id: u32) ?usize {
-            if (self.findScramSlot(conn_id)) |slot| return slot;
+        /// (lane, conn_id) is the key: the same conn_id legimately recurs
+        /// once per core worker lane (T279 review).
+        fn findOrCreateScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
+            if (self.findScramSlot(lane, conn_id)) |slot| return slot;
             const now = std.time.timestamp();
             const start = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
             var i: usize = 0;
@@ -926,11 +931,12 @@ pub fn AuthHandler(comptime Store: type) type {
             return null;
         }
 
-        fn findScramSlot(self: *Self, conn_id: u32) ?usize {
+        fn findScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
             // Probing leaves holes on cleanup; a full scan over 256 entries
-            // is cheaper than tombstone bookkeeping.
+            // is cheaper than tombstone bookkeeping. (lane, conn_id) key
+            // (T279): never hand another lane's active exchange back here.
             for (&self.scram_sessions, 0..) |*s, slot| {
-                if (s.active and s.conn_id == conn_id) return slot;
+                if (s.active and s.conn_id == conn_id and s.lane == lane) return slot;
             }
             return null;
         }
@@ -1010,7 +1016,7 @@ test "AuthHandler: SCRAM slot table probes past conn_id home-slot collisions" {
             else => return error.UnexpectedReply,
         }
     }
-    for (conn_ids) |cid| handler.cleanupSession(cid);
+    for (conn_ids) |cid| handler.cleanupSession(0, cid);
 }
 
 test "AuthHandler: SCRAM slot table full means null, not aliasing" {
@@ -1059,7 +1065,7 @@ test "AuthHandler: SCRAM slot table full means null, not aliasing" {
     try std.testing.expectEqualStrings("temporary-auth-failure", overflow.auth_failure.reason);
 
     cid = 1;
-    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(cid);
+    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(0, cid);
 }
 
 test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path" {
@@ -1074,7 +1080,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
 
     // Simulate a connection that died mid-exchange: its slot stays active.
     const dead_conn: u32 = 42;
-    const dead_slot = handler.findOrCreateScramSlot(dead_conn).?;
+    const dead_slot = handler.findOrCreateScramSlot(0, dead_conn).?;
     handler.scram_sessions[dead_slot] = .{
         .conn_id = dead_conn,
         .server = sasl.ScramServer.init(allocator),
@@ -1085,7 +1091,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
     // A fresh login aliasing the same home slot (same low 16 bits = same
     // session slot, newer generation) must reclaim it, not fail.
     const fresh_conn: u32 = 42 + (1 << 16);
-    const got = handler.findOrCreateScramSlot(fresh_conn).?;
+    const got = handler.findOrCreateScramSlot(0, fresh_conn).?;
     try std.testing.expectEqual(dead_slot, got);
     try std.testing.expect(!handler.scram_sessions[got].active); // reclaimed, caller activates
 
@@ -1097,7 +1103,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .touched_at = std.time.timestamp(),
     };
     const blocked_conn: u32 = 43 + (1 << 16); // aliases neighbor slot 43
-    const alt = handler.findOrCreateScramSlot(blocked_conn).?;
+    const alt = handler.findOrCreateScramSlot(0, blocked_conn).?;
     try std.testing.expect(alt != dead_slot);
     handler.scram_sessions[dead_slot].deinit();
     handler.scram_sessions[alt].deinit();
@@ -1237,7 +1243,7 @@ test "AuthHandler: locked account rejected at SCRAM before the challenge is issu
 
     try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
     // No challenge state may linger for the rejected conn_id.
-    try std.testing.expect(handler.findScramSlot(7) == null);
+    try std.testing.expect(handler.findScramSlot(0, 7) == null);
 }
 
 test "AuthHandler: lock store error fails closed (T352/S3)" {
@@ -1349,12 +1355,59 @@ test "AuthHandler: closing an IPC lane sweeps its in-flight SCRAM sessions (T279
         } }, 4, 1);
     }
 
-    try std.testing.expect(handler.findScramSlot(conn1) != null);
-    try std.testing.expect(handler.findScramSlot(conn2) != null);
+    try std.testing.expect(handler.findScramSlot(3, conn1) != null);
+    try std.testing.expect(handler.findScramSlot(4, conn2) != null);
 
     handler.closeLaneSessions(3);
-    try std.testing.expect(handler.findScramSlot(conn1) == null);
-    try std.testing.expect(handler.findScramSlot(conn2) != null);
+    try std.testing.expect(handler.findScramSlot(3, conn1) == null);
+    try std.testing.expect(handler.findScramSlot(4, conn2) != null);
+}
+
+test "AuthHandler: identical conn_id on two lanes holds two exchanges; abort(kill) on one leaves the other (T279 review)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var lane_a = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer lane_a.deinit();
+    var lane_b = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer lane_b.deinit();
+
+    // Each worker lane numbers its connections from 1; conn_id 7 exists
+    // once per lane legitimately. Both exchanges must be alive at once.
+    _ = handler.handleMessage(.{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try lane_a.clientFirst(),
+    } }, 3, 1);
+    _ = handler.handleMessage(.{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try lane_b.clientFirst(),
+    } }, 4, 1);
+
+    try std.testing.expect(handler.findScramSlot(3, 7) != null);
+    try std.testing.expect(handler.findScramSlot(4, 7) != null);
+
+    // Killing lane 3's client mid-exchange must not disturb lane 4's
+    // exchange with the same conn_id.
+    _ = handler.handleMessage(.{ .auth_abort = .{ .conn_id = 7 } }, 3, 1);
+    try std.testing.expect(handler.findScramSlot(3, 7) == null);
+    try std.testing.expect(handler.findScramSlot(4, 7) != null);
 }
 
 test "AuthHandler: SCRAM-SHA-256 full exchange" {
@@ -1405,7 +1458,7 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     try client.handleServerFinal(success_msg.auth_success.server_final);
     try std.testing.expect(client.isComplete());
 
-    handler.cleanupSession(5);
+    handler.cleanupSession(0, 5);
 }
 
 test "AuthHandler: SCRAM unknown user" {
@@ -1469,7 +1522,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
-        handler.cleanupSession(20);
+        handler.cleanupSession(0, 20);
     }
 
     // Verify cache is populated
@@ -1498,7 +1551,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
-        handler.cleanupSession(21);
+        handler.cleanupSession(0, 21);
     }
 }
 
@@ -1535,7 +1588,7 @@ test "AuthHandler: credential cache invalidated on password change" {
             .payload = client_final,
         } }) orelse return error.NoResponse;
 
-        handler.cleanupSession(30);
+        handler.cleanupSession(0, 30);
     }
 
     // Cache should be populated
