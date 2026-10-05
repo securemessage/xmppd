@@ -1196,9 +1196,11 @@ fn validateInboundAddress(local_domain: []const u8, muc_host: ?[]const u8, auth_
 }
 
 /// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
+///
+/// closeInbound frees the session; every reject path resets the stanza
+/// accumulator before closing so nothing touches freed memory afterwards
+/// (S2 review: the deferred reset used to run after the free).
 fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
-    defer session.resetStanza();
-
     const from = session.getStanzaFrom();
     const to = session.getStanzaTo();
 
@@ -1207,6 +1209,7 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         log.warn("inbound stanza missing from/to (improper-addressing)", .{});
         sendStreamError(session, .improper_addressing);
         _ = session.flushWrite() catch {};
+        session.resetStanza();
         daemon.closeInbound(batch, session.id);
         return;
     }
@@ -1219,6 +1222,7 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (peer pinned {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
         sendStreamError(session, err);
         _ = session.flushWrite() catch {};
+        session.resetStanza();
         daemon.closeInbound(batch, session.id);
         return;
     }
@@ -1227,8 +1231,10 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     var stanza_buf: [20480]u8 = undefined;
     const stanza_xml = session.buildStanzaXml(&stanza_buf) catch {
         log.warn("inbound stanza too large, dropping", .{});
+        session.resetStanza();
         return;
     };
+    defer session.resetStanza();
 
     log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), from, to });
 
@@ -2243,6 +2249,88 @@ test "S2sDaemon: closeInbound" {
     var cl = ChangeList.init(&scratch);
     daemon.closeInbound(&cl, slot);
     try std.testing.expectEqual(@as(usize, 0), daemon.inboundCount());
+}
+
+/// Test allocator that poisons freed chunks, so a write-after-free is
+/// visible by reading through the old pointer (S2 review, reject path).
+const PoisonOnFreeAllocator = struct {
+    inner: std.mem.Allocator,
+
+    fn allocator(self: *PoisonOnFreeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xA5);
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "S2sDaemon: stanza reject path resets before closeInbound frees (S2 review)" {
+    // Before this fix, dispatchInboundStanza ended with a deferred
+    // resetStanza() that ran AFTER closeInbound destroyed the session.
+    // The inner allocator must not scribble the chunk on free itself:
+    // DebugAllocator re-poisons with its own magic, so wrap c_allocator.
+    var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
+    const alloc = pf.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    try daemon.listen("127.0.0.1", 0);
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    _ = std.c.getsockname(daemon.listener_fd, @ptrCast(&addr), &addr_len);
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(client_fd);
+    const connect_addr = std.c.sockaddr.in{ .port = addr.port, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
+        if (err != error.WouldBlock) return err;
+    };
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
+    const session = daemon.getInbound(slot).?;
+
+    // A from= with nothing authenticated rejects (invalid_from).
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = "eve@evil.example" },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = "juliet@us.example" },
+        },
+        .self_closing = true,
+    });
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    dispatchInboundStanza(&daemon, session, &cl);
+    try std.testing.expect(daemon.getInbound(slot) == null); // rejected and closed
+
+    // The freed chunk is poison-filled; if resetStanza had run after the
+    // free it would have re-written stanza_active to false (UB captured).
+    // With the fix, the reset happened before free, so the marker survives.
+    const stanza_active_byte: *const u8 = @ptrCast(&session.stanza_active);
+    try std.testing.expectEqual(@as(u8, 0xA5), stanza_active_byte.*);
 }
 
 test "S2sDaemon: stop" {
