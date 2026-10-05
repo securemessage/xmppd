@@ -860,9 +860,12 @@ fn printVersion() void {
 /// it preserves historic POSIX behavior and delivers all to one socket.
 /// SO_REUSEPORT_LB was introduced in FreeBSD 12.0 specifically for this purpose.
 fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
+    // CLOEXEC on every master-bound listener (S7 review): only children
+    // explicitly granted a fd (via applyFdPass mapping them onto 3..N)
+    // may hold them; anything spawn elsewhere after fork never inherits.
     const fd = try posix.socket(
         posix.AF.INET,
-        posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
+        posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
         0,
     );
     errdefer posix.close(fd);

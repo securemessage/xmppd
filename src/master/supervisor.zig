@@ -87,22 +87,44 @@ pub const Supervisor = struct {
         };
     }
 
-    /// Child-side fd hygiene (T356/S7): remap pass_fds to 3..3+len-1 and
-    /// truncate the rest of the table. Two-phase through a scratch zone so
-    /// a dup2 target can never clobber a still-needed source. Failures exit
-    /// the child (125); only valid between fork and exec.
+    /// Child-side fd hygiene (T356/S7 review): remap pass_fds to 3..3+len-1
+    /// and truncate the rest of the table. Failures exit the child (125);
+    /// only valid between fork and exec.
+    ///
+    /// Zed's guidance: dup each source once through fcntl(F_DUPFD) so the
+    /// kernel allocates free descriptors above the target zone FIRST (with
+    /// no clobber and no RLIMIT_NOFILE-8192 dependency), then move into
+    /// place with dup2 (closes target atomically before copying). The old
+    /// TMP_BASE=8192 scratch broke under any lowered RLIMIT_NOFILE.
     pub fn applyFdPass(self: *Supervisor) void {
-        const TMP_BASE: i32 = 8192;
-        for (self.pass_fds, 0..) |src, i| {
+        const scratch_max = 64; // Supervisor.pass_fds has no more entries than MAX_WORKERS
+        var scratch: [scratch_max]i32 = @splat(-1);
+        const n = @min(self.pass_fds.len, scratch_max);
+        // Phase 1: park sources ABOVE the target zone (min = 3+n) so nothing
+        // inside 3..3+n-1 matters during phase 2, and the scratch base never
+        // exceeds the caller's RLIMIT_NOFILE.
+        const scratch_min: i32 = 3 + @as(i32, @intCast(n));
+        for (self.pass_fds[0..n], 0..) |src, i| {
             if (src <= 2) continue; // stdio stays put
-            if (std.c.dup2(src, TMP_BASE + @as(i32, @intCast(i))) < 0) std.c._exit(125);
+            const target: i32 = 3 + @as(i32, @intCast(i));
+            if (src == target) continue; // already in position
+            scratch[i] = std.c.fcntl(src, std.c.F.DUPFD, scratch_min);
+            if (scratch[i] < 0) std.c._exit(125);
         }
-        var i: usize = 0;
-        while (i < self.pass_fds.len) : (i += 1) {
-            if (self.pass_fds[i] <= 2) continue;
-            if (std.c.dup2(TMP_BASE + @as(i32, @intCast(i)), 3 + @as(i32, @intCast(i))) < 0) std.c._exit(125);
-            _ = std.c.close(TMP_BASE + @as(i32, @intCast(i)));
+
+        // Phase 2: duplicate parked copies into their final slots with dup2
+        // (target closed atomically by the dup call), then close originals
+        // and strays above the band.
+        for (self.pass_fds[0..n], 0..) |src, i| {
+            if (src <= 2) continue;
+            const target: i32 = 3 + @as(i32, @intCast(i));
+            if (src == target) continue;
+            if (std.c.dup2(scratch[i], target) < 0) std.c._exit(125);
+            _ = std.c.close(scratch[i]);
         }
+
+        // Everything not in the target band or stdio goes (original sources
+        // included).
         closefrom(@intCast(3 + self.pass_fds.len));
     }
 
@@ -148,11 +170,15 @@ pub const Supervisor = struct {
             var empty_mask = posix.sigemptyset();
             posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
 
-            // Drop privileges before exec if configured. setgroups first:
-            // without it the child keeps root's supplementary groups
-            // (wheel, operator) even after setuid (T356/S7).
-            if (self.gid != 0) {
+            // Drop privileges before exec if configured. setgroups always
+            // runs on ANY drop (uid or gid), never gated on gid alone: a
+            // uid-only drop would otherwise keep root's supplementary groups
+            // (wheel, operator) — S7 review point. Order: setgroups, setgid,
+            // setuid.
+            if (self.gid != 0 or self.uid != 0) {
                 if (setgroups(1, &self.gid) != 0) std.c._exit(125);
+            }
+            if (self.gid != 0) {
                 if (std.c.setgid(self.gid) != 0) std.c._exit(125);
             }
             if (self.uid != 0) {
