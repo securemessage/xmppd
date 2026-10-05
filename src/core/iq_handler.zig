@@ -930,7 +930,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 .both => .to,
                                 else => contact_entry.subscription,
                             };
-                            roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch {};
+                            roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch |err| {
+                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                            };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
                         }
@@ -966,7 +968,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 .both => .from,
                                 else => contact_entry.subscription,
                             };
-                            roster.setItem(item_jid, bare_jid, "", new_sub, false) catch {};
+                            roster.setItem(item_jid, bare_jid, "", new_sub, false) catch |err| {
+                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                            };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
                         }

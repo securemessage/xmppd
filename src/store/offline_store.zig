@@ -19,6 +19,8 @@
 
 const std = @import("std");
 const backend = @import("backend");
+/// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
+const MAX_KEY_LEN = 511;
 
 const NS_OFFLINE = "offline";
 
@@ -170,6 +172,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         fn buildKey(self: *Self, recipient: []const u8, timestamp: u64, stanza_id: []const u8) ![]u8 {
             // recipient\x00timestamp_be(8)\x00stanza_id
             const len = recipient.len + 1 + 8 + 1 + stanza_id.len;
+            if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
             var pos: usize = 0;
             @memcpy(key[pos..][0..recipient.len], recipient);
@@ -185,6 +188,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         }
 
         fn buildRecipientPrefix(self: *Self, recipient: []const u8) ![]u8 {
+            if (recipient.len + 1 > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, recipient.len + 1);
             @memcpy(key[0..recipient.len], recipient);
             key[recipient.len] = 0;
@@ -292,4 +296,14 @@ test "GenericOfflineStore: countMessages" {
     _ = try store.storePointer("bob@example.com", "alice@example.com/d", "msg-002", 2000);
 
     try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@example.com"));
+}
+
+test "OfflineStore: S4 over-long recipient is rejected with KeyTooLong" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, std.testing.allocator);
+
+    var long_recipient: [600]u8 = undefined;
+    @memset(&long_recipient, 'a');
+    try std.testing.expectError(error.KeyTooLong, store.storePointer(&long_recipient, "bob@localhost", "s1", 1));
 }

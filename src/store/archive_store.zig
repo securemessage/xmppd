@@ -13,6 +13,9 @@
 
 const std = @import("std");
 const backend = @import("backend");
+/// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig. Key
+/// strings here carry an 8-byte timestamp, so they cannot reuse join2.
+const MAX_KEY_LEN = 511;
 
 const NS_MESSAGES = "messages";
 const NS_BY_CONTACT = "by_contact";
@@ -312,6 +315,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
         fn buildPrimaryKey(self: *Self, owner: []const u8, timestamp: u64, stanza_id: []const u8) ![]u8 {
             // owner\x00timestamp_be(8)\x00stanza_id
             const len = owner.len + 1 + 8 + 1 + stanza_id.len;
+            if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
             var pos: usize = 0;
             @memcpy(key[pos..][0..owner.len], owner);
@@ -329,6 +333,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
         fn buildContactKey(self: *Self, owner: []const u8, with: []const u8, timestamp: u64) ![]u8 {
             // owner\x00with\x00timestamp_be(8)
             const len = owner.len + 1 + with.len + 1 + 8;
+            if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
             var pos: usize = 0;
             @memcpy(key[pos..][0..owner.len], owner);
@@ -345,6 +350,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
 
         fn buildOwnerPrefix(self: *Self, owner: []const u8) ![]u8 {
             // owner\x00
+            if (owner.len + 1 > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, owner.len + 1);
             @memcpy(key[0..owner.len], owner);
             key[owner.len] = 0;
@@ -354,6 +360,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
         fn buildContactPrefix(self: *Self, owner: []const u8, with: []const u8) ![]u8 {
             // owner\x00with\x00
             const len = owner.len + 1 + with.len + 1;
+            if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
             var pos: usize = 0;
             @memcpy(key[pos..][0..owner.len], owner);
@@ -507,4 +514,14 @@ test "ArchiveStore: separate owners" {
     var result_bob = try store.query("bob@example.com", .{});
     defer freeQueryResult(std.testing.allocator, &result_bob);
     try std.testing.expectEqual(@as(usize, 1), result_bob.messages.len);
+}
+
+test "ArchiveStore: S4 over-long owner is rejected with KeyTooLong" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = ArchiveStore(MemoryBackend).init(&db, std.testing.allocator);
+
+    var long_owner: [600]u8 = undefined;
+    @memset(&long_owner, 'a');
+    try std.testing.expectError(error.KeyTooLong, store.store(&long_owner, "bob@localhost", "s1", 1, "<message/>"));
 }

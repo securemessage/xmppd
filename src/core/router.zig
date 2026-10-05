@@ -382,7 +382,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     }
                     const full_stanza2 = stanza_fbs2.getWritten();
                     const offline_id = if (id_str.len > 0) id_str else "offline";
-                    archive.store(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch {};
+                    archive.store(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch |err| {
+                        log.warn("offline archive store failed for {s}: {s}", .{ recipient_bare2, @errorName(err) });
+                    };
                     if (store.storePointer(recipient_bare2, sender_bare, offline_id, archive_timestamp) catch false) {
                         log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
                         return;

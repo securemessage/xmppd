@@ -873,7 +873,9 @@ pub const Server = struct {
             return;
         }
         if (self.archive) |archive| {
-            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch {};
+            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch |err| {
+                log.warn("archive store failed for {s}: {s}", .{ owner, @errorName(err) });
+            };
         }
     }
 
@@ -2587,7 +2589,9 @@ pub const Server = struct {
                                 // Inline store (NOT the T87 queue): the offline
                                 // pointer goes down right after, and offline fetch
                                 // reads the archive row via getMessage.
-                                archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch {};
+                                archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch |err| {
+                                    log.warn("S2S offline archive store failed for {s}: {s}", .{ recipient_bare, @errorName(err) });
+                                };
                                 if (store.storePointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts) catch false) {
                                     log.info("S2S inbound to {s} stored offline", .{m.to_jid});
                                     return;

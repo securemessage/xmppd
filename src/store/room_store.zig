@@ -22,6 +22,8 @@
 
 const std = @import("std");
 const backend = @import("backend");
+/// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
+const MAX_KEY_LEN = 511;
 
 const NS_ROOMS = "rooms";
 const NS_AFFILIATIONS = "room_affiliations";
@@ -294,39 +296,38 @@ pub fn RoomStore(comptime Backend: type) type {
             try self.db.delete(NS_ROOMS, room_jid);
 
             // Delete all affiliations for this room (prefix scan)
-            var key_buf: [512]u8 = undefined;
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
             const prefix_len = room_jid.len + 1; // room_jid + \x00
-            if (prefix_len > key_buf.len) return;
+            if (prefix_len > MAX_KEY_LEN) return error.KeyTooLong;
             @memcpy(key_buf[0..room_jid.len], room_jid);
             key_buf[room_jid.len] = 0;
             const prefix = key_buf[0..prefix_len];
 
-            var iter = try self.db.iterator(NS_AFFILIATIONS, prefix);
-            defer iter.deinit();
-
-            // Collect keys to delete (can't delete during iteration)
-            var del_keys: [256][256]u8 = undefined;
-            var del_lens: [256]usize = undefined;
-            var del_count: usize = 0;
-
-            while (iter.next()) |entry| {
-                if (del_count >= 256) break;
-                const klen = @min(entry.key.len, 256);
-                @memcpy(del_keys[del_count][0..klen], entry.key[0..klen]);
-                del_lens[del_count] = klen;
-                del_count += 1;
-            }
-
-            for (0..del_count) |i| {
-                self.db.delete(NS_AFFILIATIONS, del_keys[i][0..del_lens[i]]) catch {};
+            // Keys cannot be deleted during iteration and may be up to 511
+            // bytes, so take one key per fresh iterator until none match.
+            while (true) {
+                var iter = try self.db.iterator(NS_AFFILIATIONS, prefix);
+                const entry = iter.next() orelse {
+                    iter.deinit();
+                    break;
+                };
+                var del_buf: [MAX_KEY_LEN]u8 = undefined;
+                if (entry.key.len > del_buf.len) {
+                    iter.deinit();
+                    return error.KeyTooLong;
+                }
+                @memcpy(del_buf[0..entry.key.len], entry.key);
+                const del_key = del_buf[0..entry.key.len];
+                iter.deinit();
+                try self.db.delete(NS_AFFILIATIONS, del_key);
             }
         }
 
         /// Set a user's affiliation in a room.
         pub fn setAffiliation(self: *Self, room_jid: []const u8, bare_jid: []const u8, affiliation: Affiliation) !void {
-            var key_buf: [512]u8 = undefined;
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
             const key_len = room_jid.len + 1 + bare_jid.len;
-            if (key_len > key_buf.len) return error.KeyTooLong;
+            if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
             @memcpy(key_buf[0..room_jid.len], room_jid);
             key_buf[room_jid.len] = 0;
             @memcpy(key_buf[room_jid.len + 1 ..][0..bare_jid.len], bare_jid);
@@ -343,9 +344,9 @@ pub fn RoomStore(comptime Backend: type) type {
 
         /// Get a user's affiliation in a room.
         pub fn getAffiliation(self: *Self, room_jid: []const u8, bare_jid: []const u8) !Affiliation {
-            var key_buf: [512]u8 = undefined;
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
             const key_len = room_jid.len + 1 + bare_jid.len;
-            if (key_len > key_buf.len) return .none;
+            if (key_len > MAX_KEY_LEN) return .none;
             @memcpy(key_buf[0..room_jid.len], room_jid);
             key_buf[room_jid.len] = 0;
             @memcpy(key_buf[room_jid.len + 1 ..][0..bare_jid.len], bare_jid);
@@ -633,4 +634,37 @@ test "RoomStore: update room config" {
     const loaded = (try store.loadRoom("room@conference.localhost")).?;
     try std.testing.expectEqualStrings("Updated", loaded.getName());
     try std.testing.expect(loaded.moderated);
+}
+
+test "RoomStore: S4 affiliation keys bounded at 511, destroyRoom clears long keys" {
+    const allocator = std.testing.allocator;
+    var db = try backend.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = RoomStore(backend.MemoryBackend).init(&db, allocator);
+
+    const room_jid = "room@conference.localhost"; // 25 bytes
+
+    // 25 + 1 + 485 = 511: the largest legal key must still work.
+    var bare511: [485]u8 = undefined;
+    @memset(&bare511, 'u');
+    try store.setAffiliation(room_jid, &bare511, .member);
+    try std.testing.expectEqual(Affiliation.member, try store.getAffiliation(room_jid, &bare511));
+
+    // 512 bytes is over the LMDB limit and must be rejected up front.
+    var bare512: [486]u8 = undefined;
+    @memset(&bare512, 'v');
+    try std.testing.expectError(error.KeyTooLong, store.setAffiliation(room_jid, &bare512, .member));
+
+    // destroyRoom must delete keys longer than 256 bytes; the old
+    // collection buffer truncated them and left the rows behind.
+    var long_bare: [300]u8 = undefined;
+    @memset(&long_bare, 'w');
+    try store.setAffiliation(room_jid, &long_bare, .admin);
+    var config = RoomConfig{};
+    try store.saveRoom(room_jid, &config);
+    try store.destroyRoom(room_jid);
+
+    var iter = try db.iterator("room_affiliations", room_jid);
+    defer iter.deinit();
+    try std.testing.expect(iter.next() == null);
 }

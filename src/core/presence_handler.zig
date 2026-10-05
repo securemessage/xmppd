@@ -26,6 +26,7 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const generic_roster = @import("roster_store");
+const store_keys = @import("store_keys");
 const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
@@ -187,6 +188,21 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
             bw.writeByte('@') catch return;
             bw.writeAll(to_jid.domain) catch return;
             session.stanza_to = bare_fbs.getWritten();
+        }
+    }
+
+    // An over-long target would overflow the bounded roster key and fail
+    // silently downstream (S4): reject it at ingress.
+    if (to_str.len > 0) {
+        const bound = session.stream.bound_jid orelse return;
+        var ob_buf: [520]u8 = undefined;
+        var ob_fbs = std.io.fixedBufferStream(&ob_buf);
+        ob_fbs.writer().writeAll(bound.local) catch return;
+        ob_fbs.writer().writeByte('@') catch return;
+        ob_fbs.writer().writeAll(bound.domain) catch return;
+        if (!store_keys.fits2(ob_fbs.getWritten(), session.stanza_to)) {
+            rejectOversizeSubscriptionTo(session, session.stanza_to, changes);
+            return;
         }
     }
 
@@ -514,6 +530,29 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     }
 }
 
+
+/// RFC 6120 4.9.3.10: a subscription stanza whose over-long `to` would
+/// overflow the 511-byte store key is rejected, not dropped (S4).
+fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: *ChangeList) void {
+    const jid = session.stream.authenticated_jid orelse return;
+    var buf: [4608]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<presence from='") catch return;
+    xml.escapeWrite(w, to_str) catch return;
+    w.writeAll("' to='") catch return;
+    xml.escapeWrite(w, jid.local) catch return;
+    w.writeByte('@') catch return;
+    xml.escapeWrite(w, jid.domain) catch return;
+    w.writeByte('/') catch return;
+    xml.escapeWrite(w, jid.resource) catch return;
+    w.writeAll("' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+    }
+}
+
 // ========================================================================
 // Subscription state machine (RFC 6121 Section 3)
 // ========================================================================
@@ -646,9 +685,13 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             @memcpy(contact_name_buf[0..copy_len], existing.name[0..copy_len]);
             contact_name_len = copy_len;
         }
-        roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch {};
+        roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch |err| {
+            log.warn("contact roster update failed for {s}: {s}", .{ to_str, @errorName(err) });
+        };
     } else {
-        roster.setItem(to_str, owner_bare, "", .to, false) catch {};
+        roster.setItem(to_str, owner_bare, "", .to, false) catch |err| {
+            log.warn("contact roster insert failed for {s}: {s}", .{ to_str, @errorName(err) });
+        };
     }
     server.invalidateSubCache(to_str);
 
@@ -1273,4 +1316,38 @@ pub fn deliverPresenceToTarget(
             ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, presence_xml) catch {};
         }
     }
+}
+
+test "S4: subscription presence with an over-long to gets jid-malformed" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = session;
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.authenticated_jid = session.stream.bound_jid;
+
+    // 600-byte target: inside the stanza budget but over a 511-byte store key.
+    var to_buf: [600]u8 = undefined;
+    @memset(&to_buf, 'a');
+    @memcpy(to_buf[588..], "@example.org");
+    session.stanza_to = &to_buf;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, session, .subscribe, "", &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
 }
