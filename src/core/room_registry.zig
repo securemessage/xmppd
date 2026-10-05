@@ -224,6 +224,10 @@ pub const Room = struct {
             return error.RoomFull;
         }
 
+        // Index inserts must not fail once a slot is taken.
+        try self.nick_map.ensureUnusedCapacity(self.allocator, 1);
+        try self.jid_map.ensureUnusedCapacity(self.allocator, 1);
+
         // Find free slot
         for (&self.occupants, 0..) |*slot, i| {
             if (slot.* == null) {
@@ -242,8 +246,8 @@ pub const Room = struct {
                 self.worker_mask.set(worker_id);
                 // Update hash map indices (keys point into occupant inline buffers)
                 const slot_idx: u8 = @intCast(i);
-                self.nick_map.put(self.allocator, self.occupants[i].?.getNick(), slot_idx) catch {};
-                self.jid_map.put(self.allocator, self.occupants[i].?.getRealJid(), slot_idx) catch {};
+                self.nick_map.putAssumeCapacity(self.occupants[i].?.getNick(), slot_idx);
+                self.jid_map.putAssumeCapacity(self.occupants[i].?.getRealJid(), slot_idx);
                 return i;
             }
         }
@@ -283,7 +287,7 @@ pub const Room = struct {
         const slot_idx: u8 = @intCast(index);
         _ = self.jid_map.fetchRemove(occ.getRealJid());
         occ.setRealJid(new_real_jid);
-        self.jid_map.put(self.allocator, occ.getRealJid(), slot_idx) catch {};
+        self.jid_map.putAssumeCapacity(occ.getRealJid(), slot_idx);
         occ.session_id = new_session;
         occ.worker_id = new_worker;
         occ.generation = new_generation;

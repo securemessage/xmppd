@@ -1641,6 +1641,35 @@ pub fn processRemoteJoin(
             ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
         }
+        // Same user, same nick, different resource: the latest resource
+        // takes the nick over (XEP-0045 7.2.14), like the local join
+        // path; adding a second occupant would desync nick_map (T256).
+        r.collapseOccupant(existing_idx, ev.real_jid, ev.worker_id, ev.session_id, ev.generation);
+        var buf: [2048]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+        w.writeAll("<presence from='") catch return;
+        xml.escapeWrite(w, ev.room_jid) catch return;
+        w.writeByte('/') catch return;
+        xml.escapeWrite(w, ev.nick) catch return;
+        w.writeAll("' to='") catch return;
+        xml.escapeWrite(w, ev.real_jid) catch return;
+        w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+        w.writeAll(existing.affiliation.toName()) catch return;
+        w.writeAll("' role='") catch return;
+        w.writeAll(existing.role.toName()) catch return;
+        w.writeAll("'/><status code='110'/></x></presence>") catch return;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
+        // Refresh the remote worker's shadow for multicast fan-out.
+        server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_join = .{
+            .room_jid = ev.room_jid,
+            .real_jid = ev.real_jid,
+            .nick = ev.nick,
+            .worker_id = ev.worker_id,
+            .session_id = ev.session_id,
+            .generation = ev.generation,
+        } });
+        return;
     }
 
     // Determine affiliation and role
@@ -2738,4 +2767,60 @@ test "S16: mailbox-full bounce goes to the sender's real JID, not a nick twin" {
     var cbuf: [1024]u8 = undefined;
     const cn = posix.read(carol_fds[1], &cbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), cn);
+}
+
+test "T256: remote-join twin collapses onto the existing occupant" {
+    const allocator = std.testing.allocator;
+    const reg_mod = @import("room_registry");
+    const dq_mod = @import("delivery_queue");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = reg_mod.RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // alice's first resource joins from worker 1.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "alice@localhost/phone",
+        .nick = "ally",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    const room = registry.findByJid("room@conference.localhost").?;
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+
+    // Her second resource joins with the same nick: takeover, no twin.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "alice@localhost/laptop",
+        .nick = "ally",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    const idx = room.findByNick("ally").?;
+    const occ = room.occupants[idx].?;
+    try std.testing.expectEqualStrings("alice@localhost/laptop", occ.getRealJid());
+    try std.testing.expectEqual(@as(usize, 9), occ.session_id);
+    try std.testing.expectEqual(idx, room.findByRealJid("alice@localhost/laptop").?);
+    // The old resource is gone from the index.
+    try std.testing.expect(room.findByRealJid("alice@localhost/phone") == null);
+
+    // Removing the collapsed occupant leaves no stale nick mapping.
+    _ = room.removeOccupant(idx);
+    try std.testing.expect(room.findByNick("ally") == null);
 }
