@@ -184,7 +184,7 @@ fn sendBindRejected(session: *Session) void {
     w.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
         "<error type='cancel'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>" ++
         "</error></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// T154: the session_kick reply arrived — the full JID is free now. Retry

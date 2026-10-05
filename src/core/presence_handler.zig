@@ -251,7 +251,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
 
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
-                        session.conn.queueSend(query_xml) catch {};
+                        session.queueSendStanza(query_xml) catch {};
                         if (session.conn.hasPendingWrite()) {
                             changes.addWrite(session.conn.fd, session.conn.id) catch {};
                         }
@@ -503,7 +503,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             // became available). Deliver locally regardless of which worker
             // the contact is on — we already have their resource from the
             // session map; no need to ask the remote worker.
-            session.conn.queueSend(presence_xml) catch continue;
+            session.queueSendStanza(presence_xml) catch continue;
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
@@ -719,7 +719,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
                 cpw.writeAll("/>") catch continue;
             }
             // Deliver to the approver's session
-            session.conn.queueSend(cpres_fbs.getWritten()) catch continue;
+            session.queueSendStanza(cpres_fbs.getWritten()) catch continue;
         }
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
@@ -976,7 +976,7 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
     var delivered: usize = 0;
     while (iter.next()) |kv| {
         // Value is the stored subscribe presence XML
-        session.conn.queueSend(kv.value) catch continue;
+        session.queueSendStanza(kv.value) catch continue;
         delivered += 1;
 
         // Delete after delivery (dequeue)
@@ -1052,8 +1052,7 @@ fn broadcastToOwnResources(
                 target.smTrackOutbound(presence_xml);
                 continue;
             }
-            target.conn.queueSend(presence_xml) catch continue;
-            target.smTrackOutbound(presence_xml);
+            target.queueSendStanza(presence_xml) catch continue;
             _ = target.conn.flushSend() catch {};
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
@@ -1105,7 +1104,7 @@ fn sendOtherResourcesPresence(
         }
         const presence_xml = pres_fbs.getWritten();
 
-        new_session.conn.queueSend(presence_xml) catch continue;
+        new_session.queueSendStanza(presence_xml) catch continue;
         if (new_session.conn.hasPendingWrite()) {
             changes.addWrite(new_session.conn.fd, new_session.conn.id) catch {};
         }

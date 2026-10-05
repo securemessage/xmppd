@@ -2212,7 +2212,7 @@ pub const Server = struct {
                     w.writeAll(m.reason) catch return;
                     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
                 }
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                session.queueSendStanza(fbs.getWritten()) catch return;
 
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -2235,7 +2235,7 @@ pub const Server = struct {
                     const w = fbs.writer();
                     iq_handler.writeIqHeader(self, w, session, "result", iq_id);
                     w.writeAll("/>") catch return;
-                    session.conn.queueSend(fbs.getWritten()) catch return;
+                    session.queueSendStanza(fbs.getWritten()) catch return;
 
                     // Close the stream per XEP-0077 §3.2
                     session.conn.queueSend("</stream:stream>") catch {};
@@ -2250,7 +2250,7 @@ pub const Server = struct {
                     w.writeAll("><error type='cancel'><") catch return;
                     w.writeAll(m.reason) catch return;
                     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                    session.conn.queueSend(fbs.getWritten()) catch return;
+                    session.queueSendStanza(fbs.getWritten()) catch return;
 
                     if (session.conn.hasPendingWrite()) {
                         changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -4872,4 +4872,59 @@ test "S1: PEP accumulator escapes attributes, namespaces and text" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "<evil/>") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "xmlns='urn:x&apos;y'") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "&lt;evil/&gt;") != null);
+}
+
+test "S15: queueSendStanza counts the stanza for XEP-0198" {
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    // session.deinit() closes fds[0].
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.sm_enabled = true;
+    // Owned by session.deinit once assigned.
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+
+    const before = session.sm_out_seq;
+    try session.queueSendStanza("<message from='a@localhost' to='b@localhost'/>");
+    try std.testing.expectEqual(before + 1, session.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 1), queue.pending());
+}
+
+test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
+    // XEP-0198 acks map stanzas by position, so any stanza sent via raw
+    // conn.queueSend shifts the ack window (S15). Nonzas (stream features,
+    // SASL, SM elements, stream errors) are the only legitimate raw sends.
+    // Counts may only shrink; a new raw site must be justified as a nonza
+    // here. The pattern is split so this test does not match itself.
+    const needle = "conn.queue" ++ "Send(";
+    const cases = .{
+        .{ "connection.zig", @embedFile("connection.zig"), 7 }, // Connection layer self-tests; no Session.
+        .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
+        .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
+        .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.
+        .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
+        .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
+        .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
+        .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
+        .{ "message.zig", @embedFile("message.zig"), 0 },
+        .{ "caps.zig", @embedFile("caps.zig"), 0 },
+    };
+    inline for (cases) |case| {
+        const name = case[0];
+        const src = case[1];
+        const expected = case[2];
+        var count: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, needle)) |hit| {
+            count += 1;
+            pos = hit + needle.len;
+        }
+        if (count != expected) {
+            log.err("S15 ratchet: {s} has {d} raw sends, allowlist says {d}", .{ name, count, expected });
+            return error.RatchetMismatch;
+        }
+    }
 }

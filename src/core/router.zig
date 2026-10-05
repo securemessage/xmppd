@@ -815,7 +815,7 @@ pub fn sendNotAuthorized(session: *Session, id_str: []const u8, to_str: []const 
     w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
     w.writeAll(tag_name) catch return;
     w.writeByte('>') catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Send a service-unavailable error for a stanza that can't be delivered.
@@ -844,5 +844,5 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
     w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
     w.writeAll(tag_name) catch return;
     w.writeByte('>') catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
