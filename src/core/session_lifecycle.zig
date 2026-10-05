@@ -796,7 +796,7 @@ test "T152: rebind with same resource evicts stale session" {
     try std.testing.expectEqual(@as(u32, 2), entry2.local_session_id);
 }
 
-test "S19: forEachRoom iterates more than 256 persistent rooms" {
+test "S19: startup loader loads more than 256 persistent rooms" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -820,13 +820,36 @@ test "S19: forEachRoom iterates more than 256 persistent rooms" {
         try store.saveRoom(jid, &config);
     }
 
-    var seen: usize = 0;
-    const countOne = struct {
-        fn f(count: *usize, jid: []const u8) !void {
-            _ = jid;
-            count.* += 1;
-        }
-    }.f;
-    try store.forEachRoom(&seen, countOne);
-    try std.testing.expectEqual(total, seen);
+    // Drive the same loader configureServer uses. Decoding inside the
+    // iteration must not open a nested read txn (MDB_BAD_RSLOT on LMDB);
+    // with the old loadRoom-inside-iterate code this loads zero rooms.
+    const room_registry_mod = @import("room_registry");
+    var reg = try allocator.create(room_registry_mod.RoomRegistry);
+    defer allocator.destroy(reg);
+    reg.* = room_registry_mod.RoomRegistry.init(allocator);
+    defer reg.deinit();
+
+    const worker_count: u16 = 4;
+    const worker_id: u16 = 2;
+    const loaded = room_registry_mod.loadPersistentRooms(reg, &store, worker_count, worker_id);
+
+    var expected: usize = 0;
+    i = 0;
+    while (i < total) : (i += 1) {
+        var jid_buf: [64]u8 = undefined;
+        const jid = std.fmt.bufPrint(&jid_buf, "room{d}@conf.localhost", .{i}) catch unreachable;
+        if (room_registry_mod.roomOwner(jid, worker_count) == worker_id) expected += 1;
+    }
+    try std.testing.expect(expected > 0);
+    try std.testing.expectEqual(expected, loaded);
+    try std.testing.expectEqual(expected, reg.count);
+
+    // Rooms must be addressable by JID; other workers' rooms must not be.
+    i = 0;
+    while (i < total) : (i += 17) {
+        var jid_buf: [64]u8 = undefined;
+        const jid = std.fmt.bufPrint(&jid_buf, "room{d}@conf.localhost", .{i}) catch unreachable;
+        const owned = room_registry_mod.roomOwner(jid, worker_count) == worker_id;
+        try std.testing.expectEqual(owned, reg.findByJid(jid) != null);
+    }
 }

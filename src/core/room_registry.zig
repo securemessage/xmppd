@@ -44,6 +44,43 @@ pub fn roomOwner(room_jid: []const u8, worker_count: u16) u16 {
     return @intCast(hash % worker_count);
 }
 
+/// Load persistent rooms owned by `worker_id` from the store into the
+/// registry at startup (T105). Each config is decoded from the iterator's
+/// value: opening a second read transaction inside the iteration fails on
+/// LMDB without MDB_NOTLS (MDB_BAD_RSLOT). Every skipped room is logged
+/// with its error. Returns the number of rooms loaded.
+pub fn loadPersistentRooms(reg: *RoomRegistry, store: anytype, worker_count: u16, worker_id: u16) usize {
+    const LoadCtx = struct {
+        reg: *RoomRegistry,
+        worker_count: u16,
+        worker_id: u16,
+        loaded: usize = 0,
+    };
+    const loadOne = struct {
+        fn f(ctx: *LoadCtx, jid: []const u8, value: []const u8) !void {
+            if (roomOwner(jid, ctx.worker_count) != ctx.worker_id) return;
+            const config = RoomConfig.deserialize(value) orelse {
+                log.warn("worker {d}: skipping room {s}: config decode failed", .{ ctx.worker_id, jid });
+                return;
+            };
+            _ = ctx.reg.createRoom(jid, config) catch |err| {
+                log.warn("worker {d}: skipping room {s}: {}", .{ ctx.worker_id, jid, err });
+                return;
+            };
+            ctx.loaded += 1;
+        }
+    }.f;
+    var ctx: LoadCtx = .{
+        .reg = reg,
+        .worker_count = worker_count,
+        .worker_id = worker_id,
+    };
+    store.forEachRoom(&ctx, loadOne) catch |err| {
+        log.warn("worker {d}: persistent room load aborted: {}", .{ worker_id, err });
+    };
+    return ctx.loaded;
+}
+
 /// Maximum occupants per room.
 pub const MAX_OCCUPANTS = 128;
 
