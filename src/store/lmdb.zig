@@ -12,6 +12,19 @@ const std = @import("std");
 const lmdb = @import("lmdb");
 const backend = @import("backend");
 
+// LMDB C API supplement: the zig-lmdb wrapper's Environment.info() drops
+// me_last_pgno, which is the only reliable "how much of the map is in use"
+// measure (mdb_env_stat covers MAIN_DBI only, S9 review).
+const MdbEnvInfoC = extern struct {
+    me_mapaddr: usize,
+    me_mapsize: usize,
+    me_last_pgno: usize,
+    me_last_txnid: usize,
+    me_maxreaders: c_uint,
+    me_numreaders: c_uint,
+};
+extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
+
 const log = std.log.scoped(.lmdb_store);
 
 const MAX_DBS = 16;
@@ -27,13 +40,16 @@ pub const Backend = LmdbBackend;
 pub const LmdbBackend = struct {
     env: lmdb.Environment,
     dbi_cache: [MAX_DBS]DbiCacheEntry,
-    dbi_count: u32,
+    /// Cache append counter; acquire/release so the canonical prefixes are
+    /// readable without any lock after open() (S9 review).
+    dbi_count: std.atomic.Value(u32) = .init(0),
     map_size: usize,
-    /// Guards dbi_cache lookups/appends (S9); also serializes writes of
-    /// dbi_count from WriteBatch abort.
+    /// Guards dbi_cache appends only. Never held across a call that begins
+    /// an LMDB write txn (the old shape deadlocked: txn begin takes the
+    /// LMDB writer lock while a WriteBatch holder waits for dbi_lock).
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
-    usage_warned: bool = false,
+    usage_warned: std.atomic.Value(bool) = .init(false),
 
     comptime {
         backend.assertBackend(LmdbBackend);
@@ -64,7 +80,7 @@ pub const LmdbBackend = struct {
         var self: LmdbBackend = .{
             .env = env,
             .dbi_cache = undefined,
-            .dbi_count = 0,
+            .dbi_count = .init(0),
             .map_size = opts.map_size,
         };
         if (!opts.read_only) try self.openCanonicalNamespaces();
@@ -93,11 +109,11 @@ pub const LmdbBackend = struct {
                 txn.abort();
                 return err;
             };
-            const entry = &self.dbi_cache[self.dbi_count];
+            const entry = &self.dbi_cache[self.dbi_count.load(.monotonic)];
             @memcpy(entry.name_buf[0..ns.len], ns);
             entry.name_len = @intCast(ns.len);
             entry.dbi = db.dbi;
-            self.dbi_count += 1;
+            self.dbi_count.store(self.dbi_count.load(.monotonic) + 1, .release);
         }
         try txn.commit();
     }
@@ -134,17 +150,20 @@ pub const LmdbBackend = struct {
         self.warnIfNearlyFull();
     }
 
-    /// Log once when live content crosses 80% of the map. LMDB documents
-    /// env resizing with open read transactions as unsafe, so a full map is
-    /// an operational error (restart with a bigger configured map) rather
-    /// than something we paper over at runtime (S9).
+    /// Log once when live content crosses 80% of the map; a full map is an
+    /// operational error (restart with a bigger [server] lmdb_map_size_mb
+    /// rather than resized at runtime, which LMDB forbids with open read
+    /// txns). Uses mdb_env_info me_last_pgno: mdb_env_stat covers MAIN_DBI
+    /// only and reported 4 KiB used at MAP_FULL (S9 review).
     fn warnIfNearlyFull(self: *LmdbBackend) void {
-        if (self.usage_warned) return;
+        if (self.usage_warned.load(.acquire)) return;
+        var info: MdbEnvInfoC = undefined;
+        if (mdb_env_info(self.env.ptr, &info) != 0) return;
         const st = self.env.stat() catch return;
-        const used_bytes = (@as(usize, st.branch_pages + st.leaf_pages + st.overflow_pages)) * @as(usize, st.psize);
+        const used_bytes: usize = @intCast((info.me_last_pgno + 1) * @as(usize, st.psize));
         if (used_bytes > self.map_size / 5 * 4) {
-            self.usage_warned = true;
-            log.warn("LMDB map above 80% used ({d} of {d} bytes) — raise [server] lmdb_map_size_mb and restart before MAP_FULL", .{ used_bytes, self.map_size });
+            self.usage_warned.store(true, .release);
+            log.warn("LMDB map above 80 percent used ({d} of {d} bytes): raise [server] lmdb_map_size_mb and restart before MAP_FULL", .{ used_bytes, self.map_size });
         }
     }
 
@@ -182,7 +201,7 @@ pub const LmdbBackend = struct {
     pub fn writeBatch(self: *LmdbBackend) !WriteBatch {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
         self.dbi_lock.lock();
-        const dc = self.dbi_count;
+        const dc = self.dbi_count.load(.acquire);
         self.dbi_lock.unlock();
         return .{ .txn = txn, .backend = self, .dbi_count_at_start = dc };
     }
@@ -251,14 +270,15 @@ pub const LmdbBackend = struct {
             self.txn.abort();
             // Roll back DBI cache entries created during this batch
             self.backend.dbi_lock.lock();
-            self.backend.dbi_count = self.dbi_count_at_start;
+            self.backend.dbi_count.store(self.dbi_count_at_start, .release);
             self.backend.dbi_lock.unlock();
         }
 
         fn resolveDbi(self: *WriteBatch, ns: []const u8) !lmdb.Database.DBI {
             self.backend.dbi_lock.lock();
             defer self.backend.dbi_lock.unlock();
-            for (self.backend.dbi_cache[0..self.backend.dbi_count]) |entry| {
+            const dc_n = self.backend.dbi_count.load(.acquire);
+            for (self.backend.dbi_cache[0..dc_n]) |entry| {
                 if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
                     return entry.dbi;
             }
@@ -271,12 +291,13 @@ pub const LmdbBackend = struct {
                 @ptrCast(name_z[0..ns.len :0]),
                 .{ .create = true },
             );
-            if (self.backend.dbi_count < MAX_DBS) {
-                var e = &self.backend.dbi_cache[self.backend.dbi_count];
+            const dc2 = self.backend.dbi_count.load(.acquire);
+            if (dc2 < MAX_DBS) {
+                var e = &self.backend.dbi_cache[dc2];
                 @memcpy(e.name_buf[0..ns.len], ns);
                 e.name_len = @intCast(ns.len);
                 e.dbi = db.dbi;
-                self.backend.dbi_count += 1;
+                self.backend.dbi_count.store(dc2 + 1, .release);
             }
             return db.dbi;
         }
@@ -284,17 +305,24 @@ pub const LmdbBackend = struct {
 
     // -- Internal --
 
-    fn getOrCreateDbi(self: *LmdbBackend, ns: []const u8) !lmdb.Database.DBI {
-        // S9: lookup and lazy creation share this lock; canonical namespaces
-        // are already open so this contends only for test/unknown names.
-        self.dbi_lock.lock();
-        defer self.dbi_lock.unlock();
-        for (self.dbi_cache[0..self.dbi_count]) |entry| {
+    fn findDbi(self: *LmdbBackend, ns: []const u8) ?lmdb.Database.DBI {
+        // Canonical prefixes never move after open(); readers go lock-free
+        // on an acquire-counted cache (S9 review).
+        const n = self.dbi_count.load(.acquire);
+        for (self.dbi_cache[0..n]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
                 return entry.dbi;
         }
-        if (self.dbi_count >= MAX_DBS) return error.MDB_DBS_FULL;
+        return null;
+    }
 
+    fn getOrCreateDbi(self: *LmdbBackend, ns: []const u8) !lmdb.Database.DBI {
+        if (self.findDbi(ns)) |d| return d;
+
+        // A new namespace is test-only beyond the canonical set. The write
+        // txn must not begin while holding dbi_lock (S9 review: a WriteBatch
+        // holder waits for dbi_lock here while the txn begin waits on the
+        // LMDB writer lock = deadlock window).
         var name_z: [65]u8 = undefined;
         if (ns.len > 64) return error.MDB_BAD_VALSIZE;
         @memcpy(name_z[0..ns.len], ns);
@@ -313,11 +341,18 @@ pub const LmdbBackend = struct {
         // dead after this either way (S9 review).
         try txn.commit();
 
-        var entry = &self.dbi_cache[self.dbi_count];
+        self.dbi_lock.lock();
+        defer self.dbi_lock.unlock();
+        // Another creator may have raced in while the txn ran.
+        if (self.findDbi(ns)) |d| return d;
+        const n = self.dbi_count.load(.acquire);
+        if (n >= MAX_DBS) return error.MDB_DBS_FULL;
+
+        var entry = &self.dbi_cache[n];
         @memcpy(entry.name_buf[0..ns.len], ns);
         entry.name_len = @intCast(ns.len);
         entry.dbi = db.dbi;
-        self.dbi_count += 1;
+        self.dbi_count.store(n + 1, .release);
 
         return db.dbi;
     }

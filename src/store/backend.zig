@@ -63,6 +63,8 @@ pub const canonical_namespaces = [_][]const u8{
     "rooms",
     "messages",
     "by_contact",
+    "pending_sub", // presence_handler subscription tracking
+    "room_affiliations", // MUC persistent affiliations
 };
 
 /// A key-value entry returned by iterators.
@@ -391,6 +393,20 @@ test "OpenOptions defaults" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
     try std.testing.expect(opts.create);
     try std.testing.expect(!opts.read_only);
+}
+
+test "canonical_namespaces covers every store namespace (S9 review)" {
+    // pending_sub (presence_handler) and room_affiliations (room_store)
+    // joined late (S9 review); membership asserts so nothing is dropped.
+    var saw_sub = false;
+    var saw_aff = false;
+    for (canonical_namespaces) |ns| {
+        if (std.mem.eql(u8, ns, "pending_sub")) saw_sub = true;
+        if (std.mem.eql(u8, ns, "room_affiliations")) saw_aff = true;
+    }
+    try std.testing.expect(saw_sub);
+    try std.testing.expect(saw_aff);
+    try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
 }
 
 test "Entry struct" {
