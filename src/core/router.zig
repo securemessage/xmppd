@@ -129,7 +129,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var target_count: usize = 0;
 
     var remote_delivered: bool = false;
-    var cross_worker_failed: bool = false;
 
     const route_count = if (to_jid.resource.len > 0) blk: {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
@@ -254,10 +253,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 remote_delivered = true;
             } else {
                 // S14: stanza did not fit a delivery slot (or the queue
-                // failed). Never pretend it was delivered — fall through to
-                // the same offline-store/bounce path as an unavailable
-                // resource below.
-                cross_worker_failed = true;
+                // failed). This one resource goes undelivered; local and
+                // other remote resources still get their copies below, and
+                // offline-store/bounce happens only when nothing succeeded.
             }
         }
     }
@@ -317,7 +315,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    if ((target_count == 0 and !remote_delivered) or cross_worker_failed) {
+    if (target_count == 0 and !remote_delivered) {
         // RFC 6121 §8.5.2.1a: Presence stanzas to non-existent users are silently ignored.
         if (session.stanza_kind == .presence) return;
 
@@ -782,6 +780,7 @@ fn sendCarbons(
 
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
+                _ = cross_worker_drops.fetchAdd(1, .monotonic);
             };
         }
     }

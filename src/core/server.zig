@@ -4928,3 +4928,61 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         }
     }
 }
+
+test "S14: failed cross-worker resource does not block local delivery" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    // bob has a local resource (worker 0, session 5) and a remote one
+    // (worker 1, session 7). The stanza exceeds the 4080-byte delivery
+    // slot, so the cross-worker enqueue fails.
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = target;
+
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // The local resource still receives the stanza.
+    _ = try target.conn.flushSend();
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>") != null);
+
+    // The sender is not bounced: another resource took the message.
+    _ = alice.conn.flushSend() catch {};
+    var abuf: [1024]u8 = undefined;
+    const an = posix.read(alice_fds[1], &abuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), an);
+}
