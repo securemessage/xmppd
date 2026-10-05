@@ -1586,15 +1586,37 @@ pub fn build(b: *std.Build) void {
     // xmppd-bench: M3 microbenchmarks (T-61BC40BB). Always ReleaseFast;
     // bench numbers from a Debug build are useless. Benches ride only the
     // public API surface that exists at the pinned baseline d85dd37.
+    // The dependency modules get their own ReleaseFast instances: sharing
+    // xml_mod/sasl_mod etc. would bench Debug code under a plain build.
+    const bench_xml_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xml/reader.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_sasl_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_session_map_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/session_map.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_delivery_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_mod.addImport("xml", xml_mod);
-    bench_mod.addImport("sasl", sasl_mod);
-    bench_mod.addImport("session_map", session_map_mod_for_server);
-    bench_mod.addImport("delivery_queue", delivery_queue_mod);
+    bench_mod.addImport("xml", bench_xml_mod);
+    bench_mod.addImport("sasl", bench_sasl_mod);
+    bench_mod.addImport("session_map", bench_session_map_mod);
+    bench_mod.addImport("delivery_queue", bench_delivery_mod);
     const bench_exe = b.addExecutable(.{
         .name = "xmppd-bench",
         .root_module = bench_mod,
