@@ -1583,6 +1583,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ipc_server_tests.step);
     test_step.dependOn(&run_user_store_tests.step);
     test_step.dependOn(&run_auth_handler_tests.step);
+    // xmppd-bench: M3 microbenchmarks (T-61BC40BB). Always ReleaseFast;
+    // bench numbers from a Debug build are useless. Benches ride only the
+    // public API surface that exists at the pinned baseline d85dd37.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("xml", xml_mod);
+    bench_mod.addImport("sasl", sasl_mod);
+    bench_mod.addImport("session_map", session_map_mod_for_server);
+    bench_mod.addImport("delivery_queue", delivery_queue_mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "xmppd-bench",
+        .root_module = bench_mod,
+    });
+    const bench_install = b.addInstallArtifact(bench_exe, .{});
+    const bench_step = b.step("bench", "Run the M3 microbenchmarks (ReleaseFast)");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    bench_step.dependOn(&bench_install.step);
+
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
