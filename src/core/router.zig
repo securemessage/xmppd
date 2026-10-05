@@ -579,11 +579,6 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
     log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
 }
 
-/// Cross-worker stanzas that could not be handed to the delivery system,
-/// most often because they exceeded the 4080-byte slot (S14). Atomic: every
-/// worker increments it; the M1 metrics task can export it later.
-pub var cross_worker_drops = std.atomic.Value(u64).init(0);
-
 /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
 /// Returns false when the stanza did not fit a delivery slot or the queue
 /// failed; the caller must treat that recipient as undelivered (S14).
@@ -641,14 +636,14 @@ fn enqueueCrossThreadStanza(
 
     ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
-        _ = cross_worker_drops.fetchAdd(1, .monotonic);
+        _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;
     };
     return true;
 }
 
 fn dropOversize(inner_len: usize, route: SessionEntry) bool {
-    _ = cross_worker_drops.fetchAdd(1, .monotonic);
+    _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
     log.warn("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
     return false;
 }
@@ -780,7 +775,7 @@ fn sendCarbons(
 
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
-                _ = cross_worker_drops.fetchAdd(1, .monotonic);
+                _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             };
         }
     }

@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const xml = @import("xml");
+const xmpp = @import("xmpp");
 const room_registry = @import("room_registry");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
@@ -2299,33 +2300,33 @@ pub fn handleRoomDirectoryUpdate(server: *Server, ev: actor_message.RoomDirector
 /// S16: a room-mailbox overflow drop must not be silent. Sends an explicit
 /// resource-constraint error to the originator of the dropped actor message,
 /// cross-worker when the sender lives on another worker. Best-effort: if the
-/// sender cannot be resolved (unknown occupant, dead session) the drop is
-/// already logged and counted by the caller.
+/// sender's session no longer exists the drop is already logged and counted
+/// by the caller.
 pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_jid: []const u8, changes: *ChangeList) void {
     switch (msg) {
         .room_message => |ev| {
-            // ev.from_jid is the sender's occupant JID (room/nick); the
-            // canonical occupant record on this worker holds the delivery
-            // triple for the bounce.
-            const reg = server.room_registry orelse return;
-            const room = reg.findByJid(room_jid) orelse return;
-            const slash = std.mem.lastIndexOfScalar(u8, ev.from_jid, '/') orelse return;
-            const nick = ev.from_jid[slash + 1 ..];
-            for (&room.occupants) |*slot| {
-                const occ = slot.* orelse continue;
-                if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
-                if (!std.mem.eql(u8, occ.getNick(), nick)) continue;
-                var buf: [640]u8 = undefined;
-                var fbs = std.io.fixedBufferStream(&buf);
-                const w = fbs.writer();
-                w.writeAll("<message from='") catch return;
-                xml.escapeWrite(w, room_jid) catch return;
-                w.writeAll("' to='") catch return;
-                xml.escapeWrite(w, ev.from_jid) catch return;
-                w.writeAll("' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
-                deliverToTriple(server, fbs.getWritten(), occ.worker_id, occ.session_id, occ.generation, changes);
-                return;
+            // ev.from_jid is the sender's real full JID. Bounce straight to
+            // it: resolving through the occupant list could match a nick
+            // equal to the sender's resource and would both bounce the
+            // wrong user and leak the real JID (S16).
+            const jid = xmpp.Jid.parse(ev.from_jid) catch return;
+            const sm = server.session_map orelse return;
+            const entry = sm.findByFullJid(jid.local, jid.domain, jid.resource) orelse return;
+            var buf: [768]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
+            w.writeAll("<message from='") catch return;
+            xml.escapeWrite(w, room_jid) catch return;
+            w.writeAll("' to='") catch return;
+            xml.escapeWrite(w, ev.from_jid) catch return;
+            w.writeAll("' type='error'") catch return;
+            if (ev.stanza_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                xml.escapeWrite(w, ev.stanza_id) catch return;
+                w.writeByte('\'') catch return;
             }
+            w.writeAll("><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+            deliverToTriple(server, fbs.getWritten(), entry.worker_id, entry.local_session_id, entry.generation, changes);
         },
         .room_join, .room_part => |ev| {
             var buf: [640]u8 = undefined;
@@ -2367,6 +2368,10 @@ fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, wor
 /// when the session lives on this worker or via the MPSC otherwise.
 fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id: usize, generation: u32, changes: *ChangeList) void {
     if (worker == server.worker_id) {
+        // The triple may be stale: a reused session slot must never get a
+        // stanza meant for its previous holder.
+        const sm = server.session_map orelse return;
+        if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
         session.queueSendStanza(stanza) catch return;
         if (session.conn.hasPendingWrite()) {
@@ -2374,7 +2379,9 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         }
     } else {
         const ds = server.delivery_system orelse return;
-        ds.deliver(worker, @intCast(session_id), generation, stanza) catch {};
+        ds.deliver(worker, @intCast(session_id), generation, stanza) catch {
+            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        };
     }
 }
 
@@ -2673,4 +2680,62 @@ test "S1: room config form values are stored decoded, escaped once on output" {
     const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
     try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
+}
+
+test "S16: mailbox-full bounce goes to the sender's real JID, not a nick twin" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const sm_mod = @import("session_map");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = sm_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    server.worker_id = 0;
+
+    // bob sent the message from his real full JID; carol is another
+    // occupant whose room nick equals bob's resource.
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = bob;
+    _ = try sm.bind(0, 0, "bob", "localhost", "phone");
+
+    var carol_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &carol_fds));
+    defer posix.close(carol_fds[1]);
+    const carol = try allocator.create(Session);
+    carol.* = Session.init(carol_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = carol;
+    _ = try sm.bind(0, 1, "carol", "localhost", "tablet");
+
+    const msg = actor_message.Message{ .room_message = .{
+        .room_jid = "room@conference.localhost",
+        .from_jid = "bob@localhost/phone",
+        .inner_xml = "<body>hi</body>",
+        .stanza_id = "m42",
+    } };
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
+
+    // bob gets the error bounce, addressed from the room to his real JID.
+    _ = try bob.conn.flushSend();
+    var buf: [1024]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &buf) catch 0;
+    const bounce = buf[0..bn];
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "from='room@conference.localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "to='bob@localhost/phone'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "id='m42'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "resource-constraint") != null);
+
+    // carol gets nothing and learns nothing about bob's real JID.
+    _ = carol.conn.flushSend() catch {};
+    var cbuf: [1024]u8 = undefined;
+    const cn = posix.read(carol_fds[1], &cbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), cn);
 }

@@ -27,6 +27,11 @@ const log = std.log.scoped(.delivery_queue);
 /// Maximum stanza payload size per delivery slot.
 pub const MAX_PAYLOAD_SIZE = 4080;
 
+/// Cross-worker stanzas that could not be handed to the delivery system,
+/// most often because they exceeded the 4080-byte slot (S14). Atomic: every
+/// worker increments it; the M1 metrics task can export it later.
+pub var cross_worker_drops = std.atomic.Value(u64).init(0);
+
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
