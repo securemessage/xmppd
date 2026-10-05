@@ -169,11 +169,19 @@ pub fn main() !void {
     }
     defer handler.deinit();
 
-    // Permanent account locks come from the shared store, like xmppd-auth
-    // (T352/S3). OIDC without a reachable store fails closed per attempt.
+    // Permanent account locks come from the shared store, read-only, no
+    // creation: an OIDC daemon seeing an empty/missing store must not boot
+    // into fail-open (S3 review). A startup error kills the daemon outright.
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
-    var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
+    var backend = OpBackendType.open(auth_path, .{
+        .map_size = map_size_mb * 1024 * 1024,
+        .create = false,
+        .read_only = true,
+    }) catch |err| {
+        log.err("lock store open failed for {s} — refusing to start: {}", .{ auth_path, err });
+        return err;
+    };
     defer backend.close();
     var lock_store = LockStore.init(&backend);
     handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));

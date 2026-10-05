@@ -57,7 +57,9 @@ pub fn LockStore(comptime Backend: type) type {
             const data = raw orelse return null;
             defer allocator.free(data);
 
-            if (data.len < LOCK_VALUE_SIZE) return null; // Corrupt entry
+            // Corrupt entry: treat as locked, never silently unlocked
+            // (S3 review). The caller maps store errors to closed.
+            if (data.len < LOCK_VALUE_SIZE) return error.CorruptLockRecord;
             return deserialize(data[0..LOCK_VALUE_SIZE]);
         }
 
@@ -171,4 +173,19 @@ test "LockStore: multiple users independent" {
     // alice is locked, bob is not
     try std.testing.expect((try store.isLocked(allocator, "alice")) != null);
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
+}
+
+test "LockStore: a corrupt lock record reads as an error, not unlocked (S3 review)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // Write a truncated record straight into the namespace: before the S3
+    // review fix, isLocked returned null (unlocked) for it.
+    try db.put(NAMESPACE, "alice", "x");
+
+    try std.testing.expectError(error.CorruptLockRecord, store.isLocked(allocator, "alice"));
 }

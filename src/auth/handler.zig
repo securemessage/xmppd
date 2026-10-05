@@ -28,6 +28,14 @@ pub const LockCheckResult = enum {
     store_error,
 };
 
+/// Normalize an IdP-issued identity to its localpart for lock storage: the
+/// IdP's own claim ("Alice@morante.dev", "alice") resolves to the row the
+/// admission check enforces for every other mechanism (S3 review).
+fn localpartOf(identity: []const u8) []const u8 {
+    const cut = if (std.mem.indexOfScalar(u8, identity, '@')) |p| identity[0..p] else identity;
+    return cut;
+}
+
 /// Interface for permanent lock checking. The auth daemon sets this to
 /// a closure over the LockStore. Decouples handler from Backend type.
 pub const LockChecker = struct {
@@ -419,11 +427,19 @@ pub fn AuthHandler(comptime Store: type) type {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
-                    log.info("PLAIN auth success (IdP): '{s}'", .{validated_user});
-                    if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                    // S3 review: locks bind to the identity the IdP handed
+                    // back, normalized to its localpart ("Alice@domain" and
+                    // "Alice" resolve to the same "alice" admission every
+                    // mechanism enforces).
+                    const identity = localpartOf(validated_user);
+                    if (self.admit(identity)) |reason| {
+                        return .{ .reply = authFailure(req.conn_id, reason) };
+                    }
+                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ username, identity });
+                    if (self.rate_limiter) |rl| rl.recordSuccess(identity);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
-                        .username = validated_user,
+                        .username = identity,
                         .server_final = "",
                     } } };
                 } else {
@@ -662,6 +678,13 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             const username = session.server.username;
+            // S3 review: re-check the lock at client-final; a lock that
+            // arrived between challenge and final must not authenticate.
+            if (self.admit(username)) |reason| {
+                session.deinit();
+                return authFailure(resp.conn_id, reason);
+            }
+
             log.info("SCRAM auth success: '{s}' conn={d}", .{ username, resp.conn_id });
             if (self.rate_limiter) |rl| rl.recordSuccess(username);
 

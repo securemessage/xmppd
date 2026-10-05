@@ -409,14 +409,13 @@ pub fn main() !void {
         auth_args_buf[auth_argc] = cp;
         auth_argc += 1;
     }
-    // Only pass --db to auth backends that need it (not OIDC)
-    const is_oidc_auth = std.mem.indexOf(u8, auth_path, "oidc") != null;
-    if (!is_oidc_auth) {
-        auth_args_buf[auth_argc] = "--db";
-        auth_argc += 1;
-        auth_args_buf[auth_argc] = db_path;
-        auth_argc += 1;
-    }
+    // All auth backends get --db: xmppd-auth uses it for credentials AND
+    // locks; xmppd-auth-oidc reads only the shared lock table (S3 review:
+    // without it the OIDC daemon opened a fresh store and found nothing).
+    auth_args_buf[auth_argc] = "--db";
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = db_path;
+    auth_argc += 1;
     auth_args_buf[auth_argc] = "--socket";
     auth_argc += 1;
     auth_args_buf[auth_argc] = auth_socket;

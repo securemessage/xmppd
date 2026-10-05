@@ -83,7 +83,7 @@ pub const LmdbBackend = struct {
             .dbi_count = .init(0),
             .map_size = opts.map_size,
         };
-        if (!opts.read_only) try self.openCanonicalNamespaces();
+        if (!opts.read_only) try self.openCanonicalNamespaces() else try self.openCanonicalNamespacesReadOnly();
         self.warnIfNearlyFull();
         return self;
     }
@@ -115,6 +115,28 @@ pub const LmdbBackend = struct {
             entry.dbi = db.dbi;
             self.dbi_count.store(self.dbi_count.load(.monotonic) + 1, .release);
         }
+        try txn.commit();
+    }
+
+    /// Read-only openings (the OIDC daemon, S3 review): open the canonical
+    /// namespaces from a read txn, never create. A missing namespace means
+    // the store predates v0.9.1 hardening; open fails.
+    fn openCanonicalNamespacesReadOnly(self: *LmdbBackend) !void {
+        const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
+        for (backend.canonical_namespaces) |ns| {
+            var name_z: [65]u8 = undefined;
+            if (ns.len > 64) return error.MDB_BAD_VALSIZE;
+            @memcpy(name_z[0..ns.len], ns);
+            name_z[ns.len] = 0;
+            const db = try lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{});
+            const entry = &self.dbi_cache[self.dbi_count.load(.monotonic)];
+            @memcpy(entry.name_buf[0..ns.len], ns);
+            entry.name_len = @intCast(ns.len);
+            entry.dbi = db.dbi;
+            self.dbi_count.store(self.dbi_count.load(.monotonic) + 1, .release);
+        }
+        // Commit (not abort): handles opened in an aborted read txn are not
+        // usable in later read txns on this LMDB (get() returned EINVAL).
         try txn.commit();
     }
 
@@ -523,4 +545,27 @@ test "LmdbBackend: MAP_FULL is a hard error — no runtime env resize (T358/S9)"
     try std.testing.expect(got_full);
     // The map size is untouched: nothing resized underneath readers.
     try std.testing.expectEqual(@as(usize, 128 * 1024), db.map_size);
+}
+
+test "LmdbBackend: read-only open with create=false serves reads, refuses to write (S3 review)" {
+    const path = freshTestDir();
+    // Seed with a writer open
+    {
+        var w = try LmdbBackend.open(path, .{});
+        try w.put("locks", "alice", "locked");
+        w.close();
+    }
+
+    var db = try LmdbBackend.open(path, .{ .create = false, .read_only = true });
+    defer db.close();
+
+    const val = try db.get(std.testing.allocator, "locks", "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("locked", val.?);
+
+    // Read-only mode: a write attempt must fail before hitting LMDB's
+    // env, or the LMDB layer must report EACCES (exact error differs).
+    if (db.put("locks", "bob", "x")) |_| {
+        return error.ShouldHaveFailed;
+    } else |_| {}
 }
