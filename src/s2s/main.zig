@@ -1890,11 +1890,13 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         conn.read_start = 0;
         conn.read_end = 0;
 
-        // DANE verification
+        // DANE verification. performOutboundDane may closeOutbound (frees
+        // conn and clears the slot): read the slot table afterwards, never
+        // the possibly-freed pointer (T277 review).
         performOutboundDane(daemon, batch, slot, conn);
 
         // If DANE failed, connection was closed
-        if (conn.isFailed()) return;
+        if (daemon.outbound[slot] == null) return;
 
         // Send post-TLS stream open
         var buf: [2048]u8 = undefined;
@@ -2108,18 +2110,27 @@ fn handleIpcAccept(daemon: *S2sDaemon, batch: *ChangeList) void {
     log.info("core connected via IPC slot={d}", .{slot.?});
 }
 
+/// Close an IPC client lane with full hygiene: purges its staged kevent
+/// entries first (T277). A same-iteration accept may reuse the fd number,
+/// and still-staged add/remove entries would attach to the new socket.
+fn closeIpcClientLane(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
+    const client = daemon.ipc.getClient(ipc_slot) orelse return;
+    batch.purgeFd(client.fd);
+    daemon.ipc.closeClient(ipc_slot);
+}
+
 /// Handle readable data on an IPC client connection.
 fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
     const client = daemon.ipc.getClient(ipc_slot) orelse return;
 
     const n = client.recv() catch {
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     };
     if (n == 0) {
         // EOF — core disconnected
         log.info("core disconnected from IPC slot={d}", .{ipc_slot});
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     }
 
@@ -2127,7 +2138,7 @@ fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
     while (true) {
         const msg = client.nextMessage() catch {
             log.err("IPC decode error on slot={d}", .{ipc_slot});
-            daemon.ipc.closeClient(ipc_slot);
+            closeIpcClientLane(daemon, batch, ipc_slot);
             return;
         };
         if (msg == null) break;
@@ -2145,7 +2156,7 @@ fn handleIpcWritable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
     const client = daemon.ipc.getClient(ipc_slot) orelse return;
 
     _ = client.flush() catch {
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     };
 
@@ -2448,4 +2459,55 @@ test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (
     try std.testing.expectEqualStrings("", jidDomain("/x"));
     try std.testing.expectEqualStrings("", jidDomain("user@/x"));
     try std.testing.expectEqualStrings("", jidDomain(""));
+}
+
+test "S2sDaemon: IPC lane close purges staged kevent entries before closeClient (T277 review)" {
+    // Repro of the T238-class bug: closeClient on an IPC lane queued the fd
+    // at + IPC_CLIENT_UDATA_BASE in a staged changelist; the same iteration
+    // could then accept a fresh core connection reusing the fd number and
+    // fire these entries on it. The fix (closeIpcClientLane) calls purgeFd
+    // first; this test shows the outside-observable behavior: starting
+    // points are staged write events, end state is zero remaining entries
+    // for the dead fd.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Listen on a temp socket and connect an IPC client directly.
+    const path = "/tmp/xmppd-s2s-ipc-test.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try daemon.ipc.listen(path);
+    defer daemon.ipc.deinit();
+
+    const cli = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(cli);
+    var uaddr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+    uaddr.family = posix.AF.UNIX;
+    @memcpy(uaddr.path[0..path.len], path);
+    posix.connect(cli, @ptrCast(&uaddr), @sizeOf(std.c.sockaddr.un)) catch |err| {
+        if (err != error.WouldBlock) return err;
+    };
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    const slot = (try daemon.ipc.accept()) orelse return error.NoClient;
+    const client = daemon.ipc.getClient(slot) orelse return error.NoClient;
+    const fd = client.fd;
+
+    // Recreate the staged-entries state the T277 report saw: EV_ADD for the
+    // IPC fd in the changelist while the lane is about to die.
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try cl.addWriteOnce(fd, IPC_CLIENT_UDATA_BASE + slot);
+    // entries.length is implementation-internal; only behavior matters.
+
+    closeIpcClientLane(&daemon, &cl, slot);
+
+    // The accepted client must be closed (no dangling IPC lane)...
+    try std.testing.expect(daemon.ipc.getClient(slot) == null);
+    // ...and no staged entries must remain pointing at its fd.
+    var i: usize = 0;
+    while (i < cl.len) : (i += 1) {
+        try std.testing.expect(cl.buf[i].ident != @as(usize, @intCast(fd)));
+    }
 }
