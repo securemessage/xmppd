@@ -5349,6 +5349,114 @@ test "S14: failed cross-worker resource does not block local delivery" {
     try std.testing.expectEqual(@as(usize, 0), an);
 }
 
+test "S14: oversize cross-worker stanza falls back to the offline store" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // bob's only resource lives on worker 1: the direct handoff is the
+    // cross-thread enqueue, and the stanza exceeds the delivery slot, so
+    // the fallback alone decides what happens to it.
+    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Nothing delivered live; the fallback parked it offline.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+
+    // The sender is not bounced: the message is held, not lost.
+    _ = alice.conn.flushSend() catch {};
+    var abuf: [1024]u8 = undefined;
+    const an = posix.read(alice_fds[1], &abuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), an);
+}
+
+test "S14: oversize cross-worker stanza with no offline store bounces" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    // bob remote-only again, but no offline store: the bounce fallback
+    // is the only path left.
+    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    _ = alice.conn.flushSend() catch {};
+    var abuf: [2048]u8 = undefined;
+    const an = posix.read(alice_fds[1], &abuf) catch 0;
+    try std.testing.expect(an > 0);
+    try std.testing.expect(std.mem.indexOf(u8, abuf[0..an], "service-unavailable") != null);
+}
+
 test "Server: S11 stray close tag closes the stream not-well-formed" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
