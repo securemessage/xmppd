@@ -209,28 +209,33 @@ pub const ChangeList = struct {
 
     /// Add an fd for read monitoring.
     pub fn addRead(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         self.untrackPurged(fd); // fd number legitimately reused by a new owner
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
     /// Add an fd for write monitoring.
     pub fn addWrite(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
     /// Remove read monitoring for an fd.
     pub fn removeRead(self: *ChangeList, fd: posix.fd_t) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DELETE, 0));
     }
 
     /// Remove write monitoring for an fd.
     pub fn removeWrite(self: *ChangeList, fd: posix.fd_t) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
     }
 
     /// Add a one-shot read monitor (fires once when readable, then auto-removes).
     pub fn addReadOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
@@ -239,6 +244,7 @@ pub const ChangeList = struct {
     /// Idiomatic for flush-on-demand: register when data is queued, fires once
     /// kernel send buffer has space.
     pub fn addWriteOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (fd < 0) return; // never stage a closed fd: @intCast(-1) panics (S28)
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
@@ -1459,4 +1465,23 @@ test "S20: purgeFd keeps the staged order of other fds' entries" {
     // Purging an fd with no staged entries is a no-op.
     batch.purgeFd(99);
     try std.testing.expectEqual(@as(usize, 3), batch.slice().len);
+}
+
+test "S28: staging a closed fd (-1) is a no-op, never a panic" {
+    // An SM-detached session keeps its slot with fd = -1 and possibly
+    // unsent bytes; a stale batch event or a late flush then reaches
+    // staging with the dead fd. @intCast(-1) panicked the whole core
+    // under the M5 SM reconnect storm.
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+
+    try batch.addRead(-1, 0xA);
+    try batch.addWrite(-1, 0xA);
+    try batch.addReadOnce(-1, 0xA);
+    try batch.addWriteOnce(-1, 0xA);
+    try batch.removeRead(-1);
+    try batch.removeWrite(-1);
+    batch.purgeFd(-1);
+
+    try std.testing.expectEqual(@as(usize, 0), batch.slice().len);
 }
