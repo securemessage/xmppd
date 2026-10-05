@@ -20,6 +20,10 @@ const log = std.log.scoped(.ipc_server);
 
 // FreeBSD: absent from zig's std.c for this version.
 extern "c" fn getpeereid(fd: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
+/// FreeBSD 15 maps neither geteuid nor getegid in this zig's std.c; declare
+/// both locally next to getpeereid.
+extern "c" fn geteuid() std.c.uid_t;
+extern "c" fn getegid() std.c.gid_t;
 
 /// Maximum simultaneous IPC client connections.
 /// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
@@ -236,14 +240,20 @@ pub const IpcServer = struct {
             };
         };
 
-        // Peer credentials gate (T258): only root or the daemon's own uid
-        // may join. Before this, any local process could drive the auth
-        // daemon (register without invite, auth_abort others' sessions).
+        // Peer credentials gate (T258 review): root, the daemon's own uid,
+        // OR the daemon's own group (uid-only or euid-only gating made the
+        // 0660 socket mode a silent no-op). The `ctl` sentinel for
+        // maintenance tooling remains for a follow-up.
         var euid: std.c.uid_t = 0;
         var egid: std.c.gid_t = 0;
-        const self_uid = std.c.getuid();
-        if (getpeereid(client_fd, &euid, &egid) != 0 or (euid != 0 and euid != self_uid)) {
-            log.warn("IPC connection rejected: peer euid {d} is neither root nor daemon uid {d}", .{ euid, self_uid });
+        // Only getpeereid is mapped for FreeBSD in this zig's std.c; both
+        // geteuid/getegid are declared as externs below.
+        const self_euid = geteuid();
+        const self_egid = getegid();
+        const ok_creds = getpeereid(client_fd, &euid, &egid) == 0 and
+            (euid == 0 or euid == self_euid or egid == self_egid);
+        if (!ok_creds) {
+            log.warn("IPC connection rejected: peer euid {d} is neither root nor daemon uid {d} (group {d} not {d})", .{ euid, self_euid, egid, self_egid });
             posix.close(client_fd);
             return null;
         }

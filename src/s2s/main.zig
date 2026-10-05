@@ -2355,10 +2355,9 @@ const PoisonOnFreeAllocator = struct {
 };
 
 test "S2sDaemon: stanza reject path resets before closeInbound frees (S2 review)" {
-    // Before this fix, dispatchInboundStanza ended with a deferred
-    // resetStanza() that ran AFTER closeInbound destroyed the session.
-    // The inner allocator must not scribble the chunk on free itself:
-    // DebugAllocator re-poisons with its own magic, so wrap c_allocator.
+    // resetStanza must run BEFORE closeInbound destroys the session here:
+    // DebugAllocator re-poisons with its own magic, so wrap c_allocator to
+    // observe the right order on the chunk.
     var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
     const alloc = pf.allocator();
     var daemon = try S2sDaemon.init(alloc, "us.example");
