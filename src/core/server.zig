@@ -1978,10 +1978,15 @@ pub const Server = struct {
     fn flushIpc(self: *Server, changes: *ChangeList) void {
         _ = self.ipc.flush() catch {
             log.err("auth daemon IPC flush error", .{});
+            self.dropIpcAuth(changes);
             return;
         };
         if (self.ipc.hasPendingSend()) {
             changes.addWrite(self.ipc.fd, IPC_AUTH_UDATA) catch {};
+        } else {
+            // An idle unix socket is always writable; leaving the filter
+            // armed after a drain spins kevent() at 100% CPU (S10).
+            changes.removeWrite(self.ipc.fd) catch {};
         }
     }
 
@@ -2332,10 +2337,16 @@ pub const Server = struct {
     fn flushS2sIpc(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.flush() catch {
             log.err("S2S daemon IPC flush error", .{});
+            const dead_fd = self.s2s_ipc.fd;
+            self.s2s_ipc.close();
+            changes.purgeFd(dead_fd);
             return;
         };
         if (self.s2s_ipc.hasPendingSend()) {
             changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        } else {
+            // Same spin guard as flushIpc (S10).
+            changes.removeWrite(self.s2s_ipc.fd) catch {};
         }
     }
 

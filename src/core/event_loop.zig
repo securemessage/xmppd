@@ -1402,3 +1402,34 @@ test "EventLoop: modifyFd disable and enable" {
     try std.testing.expectEqual(@as(usize, 1), events2.len);
     try std.testing.expect(events2[0] == .fd_readable);
 }
+
+test "S10: removeWrite after the backlog drains lets kevent block again" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Arm a persistent write filter, the way IPC send sites do.
+    var scratch: [4]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    try batch.addWrite(pipe_fds[1], 0x510);
+    const armed = try loop.submitAndPoll(batch.slice(), 100);
+    try std.testing.expectEqual(@as(usize, 1), armed.len);
+    try std.testing.expect(armed[0] == .fd_writable);
+
+    // Without a remove the idle fd stays writable: the pre-fix spin.
+    const spinning = try loop.poll(0);
+    try std.testing.expectEqual(@as(usize, 1), spinning.len);
+    try std.testing.expect(spinning[0] == .fd_writable);
+
+    // Drained backlog: flushIpc/flushS2sIpc stage removeWrite. The next
+    // wait must block instead of re-firing forever.
+    batch.reset();
+    try batch.removeWrite(pipe_fds[1]);
+    const drained = try loop.submitAndPoll(batch.slice(), 50);
+    try std.testing.expectEqual(@as(usize, 0), drained.len);
+    const still_idle = try loop.poll(50);
+    try std.testing.expectEqual(@as(usize, 0), still_idle.len);
+}
