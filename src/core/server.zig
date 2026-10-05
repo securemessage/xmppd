@@ -1186,8 +1186,11 @@ pub const Server = struct {
 
             while (true) {
                 const event = session.reader.next(data, &pos) catch |err| {
-                    log.err("connection {d} XML parse error: {}", .{ id, err });
+                    // Client-side protocol violation, not a server fault.
+                    log.warn("connection {d} XML parse error: {}", .{ id, err });
                     self.sendStreamError(session, .not_well_formed);
+                    // Flush the error and closing tag before teardown.
+                    session.conn.flushSync();
                     session_lifecycle.forceCloseSession(self, id, changes);
                     return;
                 };
@@ -4558,7 +4561,9 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     try std.testing.expect(session.conn.hasPendingWrite());
 
     // Drain the peer, then let the write-ready handler finish.
-    while (posix.read(fds[1], &drain_buf)) |_| {} else |_| {}
+    while (posix.read(fds[1], &drain_buf)) |n| {
+        if (n == 0) break;
+    } else |_| {}
     server.handleWritable(1, &changes);
     try std.testing.expect(!session.conn.hasPendingWrite());
 }
@@ -4591,6 +4596,40 @@ test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" 
     try std.testing.expect(server.sessions[1] == null);
     const n = posix.read(fds[1], &drain_buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n], "policy-violation") != null);
+}
+
+test "Server: S27 nested stream:stream closes with not-well-formed" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // A second stream header inside the open stream: protocol violation.
+    const nested = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], nested);
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break; // EOF: the server closed its side
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "not-well-formed") != null);
 }
 
 test "Server: direct TLS skips STARTTLS features" {

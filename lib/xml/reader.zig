@@ -214,6 +214,17 @@ pub const Reader = struct {
                     // For non-self-closing elements, namespace is restored on element_close
 
                     // The stream:stream element is special
+                    if (std.mem.eql(u8, self.current_element_prefix, "stream") and
+                        std.mem.eql(u8, self.current_element_local, "stream"))
+                    {
+                        if (self.depth != 1) {
+                            // Nested inside an open stream: protocol
+                            // violation (S27).
+                            return error.NestedStreamElement;
+                        }
+                        self.stream_opened = true;
+                        return Event{ .stream_open = elem };
+                    }
                     if (self.depth == 1 and std.mem.eql(u8, self.current_element_prefix, "stream")) {
                         self.stream_opened = true;
                         return Event{ .stream_open = elem };
@@ -224,6 +235,14 @@ pub const Reader = struct {
                 .element_self_close => {
                     self.depth += 1;
                     const elem = self.buildElement(true);
+
+                    if (std.mem.eql(u8, self.current_element_prefix, "stream") and
+                        std.mem.eql(u8, self.current_element_local, "stream") and
+                        self.depth != 1)
+                    {
+                        // Nested inside an open stream: protocol violation (S27).
+                        return error.NestedStreamElement;
+                    }
 
                     // Self-closing at depth 1 would be unusual for stream but handle it
                     if (std.mem.eql(u8, self.current_element_prefix, "stream")) {
@@ -461,6 +480,45 @@ test "reader: parse stream opening" {
     try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", ev2.stream_open.namespace_uri);
     try std.testing.expect(reader.stream_opened);
     try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
+}
+
+test "reader: S27 nested stream:stream is a protocol error" {
+    const allocator = std.testing.allocator;
+    const stream = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+
+    // Non-self-closing nested form.
+    {
+        var reader = Reader.init(allocator);
+        defer reader.deinit();
+        var pos: usize = 0;
+        _ = try reader.next(stream, &pos);
+        const nested = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+        pos = 0;
+        try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
+    }
+
+    // Self-closing nested form.
+    {
+        var reader = Reader.init(allocator);
+        defer reader.deinit();
+        var pos: usize = 0;
+        _ = try reader.next(stream, &pos);
+        const nested = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'/>";
+        pos = 0;
+        try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
+    }
+
+    // Nested inside a stanza.
+    {
+        var reader = Reader.init(allocator);
+        defer reader.deinit();
+        var pos: usize = 0;
+        _ = try reader.next(stream, &pos);
+        const nested = "<message><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'/></message>";
+        pos = 0;
+        _ = (try reader.next(nested, &pos)).?; // <message>
+        try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
+    }
 }
 
 test "reader: parse message stanza" {
