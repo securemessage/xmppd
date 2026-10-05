@@ -31,6 +31,9 @@ pub const MAX_PAYLOAD_SIZE: u32 = 65536;
 /// Frame header size (4-byte LE length).
 pub const HEADER_SIZE: usize = 4;
 
+/// Largest possible wire frame (header + max payload).
+pub const MAX_FRAME_SIZE: usize = MAX_PAYLOAD_SIZE + HEADER_SIZE;
+
 /// Message tags for the IPC protocol.
 pub const Tag = enum(u8) {
     // Auth IPC (0x01–0x05)

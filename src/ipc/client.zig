@@ -17,8 +17,10 @@ const protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.ipc_client);
 
-/// IPC receive buffer size — 32KB should handle many concurrent auth exchanges.
-const RECV_BUF_SIZE = 32768;
+/// IPC receive buffer: one full wire frame (T257 review: 32 KiB truncated a
+/// 32-64 KiB s2s frame; the lane is now sized like a peer frame). Heap,
+/// allocated at connect.
+const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
 
 /// Hard cap on unsent frames to the daemon (heap-grown past the old 16 KiB
 /// fixed buffer, which died in bursts: T32 measured ~50 in-flight auth
@@ -29,8 +31,9 @@ pub const IpcClient = struct {
     /// The Unix socket file descriptor (-1 if not connected).
     fd: posix.fd_t = -1,
 
-    /// Receive buffer for partial frame reassembly.
-    recv_buf: [RECV_BUF_SIZE]u8 = undefined,
+    /// Receive buffer for partial frame reassembly, heap-allocated on
+    /// connect() with RECV_BUF_SIZE bytes.
+    recv_buf: []u8 = &.{},
     recv_len: usize = 0,
     /// Bytes consumed by the last nextMessage() call, pending compaction.
     /// The buffer is compacted lazily — at the start of the next
@@ -74,6 +77,12 @@ pub const IpcClient = struct {
         self.recv_consumed = 0;
         self.send_start = 0;
         self.send_list.clearRetainingCapacity();
+
+        // The wire sees whole frames; the receive buffer must hold one.
+        if (self.recv_buf.len == 0) {
+            const a = self.alloc orelse return error.NoAllocator;
+            self.recv_buf = try a.alloc(u8, RECV_BUF_SIZE);
+        }
     }
 
     /// Close the IPC connection.
@@ -87,11 +96,20 @@ pub const IpcClient = struct {
         self.recv_consumed = 0;
         self.send_start = 0;
         self.send_list.clearRetainingCapacity();
+        // Free only on deinit: reconnect reuses the owned buffer.
     }
 
-    /// Free the growable backlog (owner's lifetime ends).
+    /// Free the growable backlog and the receive buffer (owner's lifetime
+    /// ends). The connection must be closed first.
     pub fn deinit(self: *IpcClient) void {
-        if (self.alloc) |a| self.send_list.deinit(a);
+        if (self.alloc) |a| {
+            self.send_list.deinit(a);
+            if (self.recv_buf.len > 0) {
+                a.free(self.recv_buf);
+                self.recv_buf = &.{};
+            }
+            self.alloc = null;
+        }
     }
 
     /// Send a message to the auth daemon.
@@ -100,23 +118,23 @@ pub const IpcClient = struct {
         if (!self.connected) return error.NotConnected;
         const alloc = self.alloc orelse return error.NoAllocator;
 
-        // Encode into a temporary buffer sized for the protocol maximum
-        // (T257: the old 4 KiB cap silently failed large s2s_deliver frames).
-        var frame_buf: [protocol.MAX_PAYLOAD_SIZE + protocol.HEADER_SIZE]u8 = undefined;
-        const frame_len = protocol.encode(msg, &frame_buf) catch |err| {
-            log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
-            return err;
-        };
-
-        const unsent = self.send_list.items.len - self.send_start;
-        if (unsent + frame_len > SEND_CAP) return error.SendBufferFull;
-        // Reclaim the consumed prefix before growing.
+        // Encode directly into the backlog: no 64 KiB stack scratch on an
+        // event-loop thread (T257 review). Compact the consumed prefix
+        // FIRST so the frame lands immediately behind the unsent tail.
+        var unsent = self.send_list.items.len - self.send_start;
         if (self.send_start >= unsent or self.send_start >= 4096) {
             std.mem.copyForwards(u8, self.send_list.items, self.send_list.items[self.send_start..]);
             self.send_list.items.len = unsent;
             self.send_start = 0;
         }
-        try self.send_list.appendSlice(alloc, frame_buf[0..frame_len]);
+        try self.send_list.ensureUnusedCapacity(alloc, protocol.MAX_FRAME_SIZE);
+        const frame_len = protocol.encode(msg, self.send_list.unusedCapacitySlice()) catch |err| {
+            log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
+            return err;
+        };
+        unsent = self.send_list.items.len;
+        if (unsent + frame_len > SEND_CAP) return error.SendBufferFull;
+        self.send_list.items.len += frame_len;
 
         // Try to flush immediately
         _ = self.flush() catch {};
@@ -165,8 +183,14 @@ pub const IpcClient = struct {
         // Apply deferred compaction before reading new data
         self.compactRecvBuf();
 
+        // Tests and late-alloc'd owners reach here without connect().
+        if (self.recv_buf.len == 0) {
+            const a = self.alloc orelse return error.NoAllocator;
+            self.recv_buf = try a.alloc(u8, RECV_BUF_SIZE);
+        }
+
         // Read into recv_buf
-        const space = RECV_BUF_SIZE - self.recv_len;
+        const space = self.recv_buf.len - self.recv_len;
         if (space == 0) return error.RecvBufferFull;
 
         const n = posix.read(self.fd, self.recv_buf[self.recv_len .. self.recv_len + space]) catch |err| {
