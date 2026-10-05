@@ -58,6 +58,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const metrics = @import("metrics.zig");
 
 // ============================================================================
 // Public Types
@@ -278,7 +279,11 @@ pub const ChangeList = struct {
     }
 
     fn append(self: *ChangeList, ev: posix.Kevent) !void {
-        if (self.len >= self.buf.len) return error.ChangeListFull;
+        if (self.len >= self.buf.len) {
+            // M1/App. C: a dropped change silently wedges a connection.
+            if (metrics.get()) |c| _ = c.drop_changelist_full.fetchAdd(1, .monotonic);
+            return error.ChangeListFull;
+        }
         self.buf[self.len] = ev;
         self.len += 1;
     }

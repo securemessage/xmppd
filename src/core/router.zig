@@ -26,6 +26,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
+const metrics = @import("metrics.zig");
 const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
@@ -36,16 +37,28 @@ const log = std.log.scoped(.router);
 pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) void {
     defer session.resetStanza();
 
+    if (metrics.get()) |c| switch (session.stanza_kind) {
+        .message => _ = c.stanzas_message.fetchAdd(1, .monotonic),
+        .presence => _ = c.stanzas_presence.fetchAdd(1, .monotonic),
+        .iq => _ = c.stanzas_iq.fetchAdd(1, .monotonic),
+        .none => {},
+    };
+
     const to_str = session.stanza_to;
     const id_str = session.stanza_id;
     const type_str = session.stanza_type;
     const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
 
-    if (to_str.len == 0) return;
+    // App. C: missing or invalid 'to' drops the stanza silently.
+    if (to_str.len == 0) {
+        if (metrics.get()) |c| _ = c.drop_no_route.fetchAdd(1, .monotonic);
+        return;
+    }
 
     // Parse target JID
     const to_jid = xmpp.Jid.parse(to_str) catch {
         log.warn("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
+        if (metrics.get()) |c| _ = c.drop_no_route.fetchAdd(1, .monotonic);
         return;
     };
 

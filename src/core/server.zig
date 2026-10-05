@@ -83,6 +83,7 @@ const actor_message = @import("message.zig");
 pub const sm_state = @import("sm_state.zig");
 const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
+const metrics = @import("metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
@@ -910,6 +911,10 @@ pub const Server = struct {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
         var changes = ChangeList.init(&change_buf);
 
+        // M1: per-worker counters live on this thread; SIGUSR1 dumps them.
+        metrics.bind(self.worker_id);
+        try self.loop.addSignal(posix.SIG.USR1);
+
         // Initial registration: listener for read
         try changes.addRead(self.listener.fd, LISTENER_UDATA);
 
@@ -946,8 +951,12 @@ pub const Server = struct {
             // T238 proof obligation (safe builds): nothing staged may
             // reference an fd purged by a same-iteration close.
             changes.assertNoPurgedEntries();
+            const staged_changes = changes.count();
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
+
+            // M1: time event processing only, not the blocked kevent wait.
+            var iter_timer = std.time.Timer.start() catch null;
 
             // Process MPSC wake pipe first (if in event batch) to deliver cross-thread
             // messages before any session-closing events in the same batch.
@@ -989,6 +998,8 @@ pub const Server = struct {
                     .signal => |s| {
                         if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
                             self.running = false;
+                        } else if (s.signo == posix.SIG.USR1) {
+                            self.dumpMetrics();
                         }
                     },
                     .timer => |t| {
@@ -1042,7 +1053,23 @@ pub const Server = struct {
             // T178: fail sessions whose SM unacked queue overflowed during
             // this batch (any delivery path may have set the flag).
             session_lifecycle.reapSmOverflow(self, &changes);
+
+            if (iter_timer) |*t| metrics.recordIteration(t.read());
+            if (metrics.get()) |c| {
+                _ = c.kevent_events.fetchAdd(events.len, .monotonic);
+                _ = c.kevent_changes.fetchAdd(staged_changes, .monotonic);
+            }
         }
+    }
+
+    /// M1: SIGUSR1 handler — dump this worker's counters (own thread).
+    fn dumpMetrics(self: *Server) void {
+        metrics.dump(self.worker_id, .{
+            .room_mailbox_drops = room_mailbox_mod.mailbox_drops.load(.monotonic),
+            .ring_drops_full = delivery_queue_mod.ring_drops_full.load(.monotonic),
+            .ring_drops_payload = delivery_queue_mod.ring_drops_payload.load(.monotonic),
+            .envelopes_cross_worker = delivery_queue_mod.envelopes_total.load(.monotonic),
+        });
     }
 
     /// Stop the server (callable from signal handler or test).
@@ -2963,6 +2990,7 @@ pub const Server = struct {
     /// then drain per-room mailboxes.
     fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
         const ds = self.delivery_system orelse return;
+        if (metrics.get()) |c| _ = c.wakes.fetchAdd(1, .monotonic);
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
         _ = self.drainRoomMailboxes(changes);
@@ -4630,6 +4658,61 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
         total += n;
     } else |_| {}
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "not-well-formed") != null);
+}
+
+test "Server: M1 counters track client traffic through the read path" {
+    metrics.bind(9);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base_in = c.bytes_in.load(.monotonic);
+    const base_out = c.bytes_out.load(.monotonic);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // Client bytes were counted on recv; the features reply was counted
+    // on flush.
+    try std.testing.expect(c.bytes_in.load(.monotonic) >= base_in + stream_open.len);
+    try std.testing.expect(c.bytes_out.load(.monotonic) > base_out);
+
+    // The drop counters are bumped at their choke points, not per session.
+    const base_full = c.drop_send_buffer_full.load(.monotonic);
+    const big = [_]u8{'x'} ** (16384 + 1);
+    try std.testing.expectError(error.WriteBufferFull, session.conn.queueSend(&big));
+    try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
+}
+
+test "Server: M1 SIGUSR1 dump runs against a live worker block" {
+    metrics.bind(10);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    _ = c.stanzas_message.fetchAdd(3, .monotonic);
+    _ = c.wakes.fetchAdd(2, .monotonic);
+    metrics.recordIteration(500);
+    // Exercises the dump formatting against a bound worker; output goes to
+    // the test log.
+    metrics.dump(10, .{
+        .room_mailbox_drops = 1,
+        .ring_drops_full = 2,
+        .ring_drops_payload = 3,
+        .envelopes_cross_worker = 4,
+    });
+    try std.testing.expectEqual(@as(u64, 3), c.stanzas_message.load(.monotonic));
 }
 
 test "Server: direct TLS skips STARTTLS features" {

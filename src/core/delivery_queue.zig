@@ -27,6 +27,13 @@ const log = std.log.scoped(.delivery_queue);
 /// Maximum stanza payload size per delivery slot.
 pub const MAX_PAYLOAD_SIZE = 4080;
 
+/// M1 (App. C): cross-worker ring drops and envelopes. Module-global
+/// because this file is its own build module; the M1 SIGUSR1 dump reads
+/// them from the server side (same pattern as room_mailbox.mailbox_drops).
+pub var ring_drops_full = std.atomic.Value(u64).init(0);
+pub var ring_drops_payload = std.atomic.Value(u64).init(0);
+pub var envelopes_total = std.atomic.Value(u64).init(0);
+
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
@@ -82,7 +89,10 @@ pub const MpscQueue = struct {
         target_generation: u32,
         payload: []const u8,
     ) !void {
-        if (payload.len > MAX_PAYLOAD_SIZE) return error.PayloadTooLarge;
+        if (payload.len > MAX_PAYLOAD_SIZE) {
+            _ = ring_drops_payload.fetchAdd(1, .monotonic);
+            return error.PayloadTooLarge;
+        }
 
         // CAS loop to reserve a slot
         while (true) {
@@ -91,6 +101,7 @@ pub const MpscQueue = struct {
 
             // Check if queue is full
             if (current_tail -% current_head >= QUEUE_SLOTS) {
+                _ = ring_drops_full.fetchAdd(1, .monotonic);
                 return error.QueueFull;
             }
 
@@ -292,6 +303,7 @@ pub const DeliverySystem = struct {
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
         try self.queues[target_worker].enqueue(target_session_id, target_generation, payload);
+        _ = envelopes_total.fetchAdd(1, .monotonic);
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). One pipe
