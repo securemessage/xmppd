@@ -400,11 +400,12 @@ pub const Engine = struct {
     /// wait would never return to reach the runLoop's reap.
     reap_pending: bool = false,
 
-    /// Bumped on every run(): a previous loop that is still unwinding (its
-    /// last session died while a foreign thread already attached the next
-    /// one, reviving live_count) sees its generation go stale and exits
-    /// before the replacement thread spawns.
-    run_gen: u32 = 0,
+    /// Bumped on every run() and once by deinit(): a thread reading a stale
+    /// generation must exit. deinit() bumps it so a loop parked in kevent()
+    /// with live sessions unwinds on the wake instead of re-parking (T252
+    /// review: the T252 wake alone re-ran the generation check and blocked
+    /// forever).
+    run_gen: std.atomic.Value(u32) = .init(0),
 
     // --- XEP-0198 outbound unacked queues (T-9BC4D065) ---
     // Keyed by SM id; a queue outlives the Session that produced it because
@@ -510,7 +511,9 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         if (self.thread) |*t| {
             // T252: the loop thread may be parked in kevent() with live
-            // sessions — wake it before joining or this hang never ends.
+            // sessions. Bump run_gen first so the wake does not re-park on
+            // the generation check, then wake and join.
+            _ = self.run_gen.fetchAdd(1, .acq_rel);
             self.requestWake();
             t.join();
             self.thread = null;
@@ -1143,7 +1146,7 @@ pub const Engine = struct {
     /// sessions from other threads (thread-safe startSession) must have a
     /// session or timer pending before calling run().
     pub fn run(self: *Engine) !void {
-        self.run_gen +%= 1;
+        _ = self.run_gen.fetchAdd(1, .acq_rel);
         self.waitLoopExit();
         const t = std.Thread.spawn(.{}, Engine.runLoop, .{self}) catch return error.ThreadSpawn;
         self.thread = t;
@@ -1169,10 +1172,10 @@ pub const Engine = struct {
     }
 
     fn runLoop(self: *Engine) void {
-        const gen = self.run_gen;
+        const gen = self.run_gen.load(.acquire);
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
-        while ((self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) and self.run_gen == gen) {
+        while ((self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) and self.run_gen.load(.acquire) == gen) {
             self.loopOnce() catch break;
             self.reapDead();
         }
@@ -1389,6 +1392,30 @@ test "engine: startSession from a foreign thread launches via the mailbox (T237)
     try eng.run();
     eng.waitLoopExit(); // joins once the refused session has been reaped
     try std.testing.expectEqual(@as(u32, 1), probe.closes.load(.monotonic));
+}
+
+test "engine: deinit with one live session never hangs (T252 review)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+
+    // A live, never-touched session: the loop thread parks in kevent.
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.Socketpair;
+    const h = try eng.attachFd(fds[0], .{
+        .domain = "localhost",
+        .user = "u",
+        .password = "p",
+        .resource = "r",
+    });
+    _ = h;
+    try eng.run();
+    std.Thread.sleep(20 * std.time.ns_per_ms); // let the loop park
+
+    // Before T252-review fix this never returned: deinit wakes the loop,
+    // which rechecked run_gen == its snapshot and re-parked forever.
+    eng.deinit();
+    std.posix.close(fds[1]);
 }
 
 test "engine: wake pipe never blocks on un-read staged changes (T236)" {
