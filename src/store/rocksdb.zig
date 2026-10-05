@@ -476,12 +476,14 @@ fn freshTestDir() []const u8 {
 
 test "RocksDbBackend: open and close" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     db.close();
 }
 
 test "RocksDbBackend: put and get" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -498,6 +500,7 @@ test "RocksDbBackend: put and get" {
 
 test "RocksDbBackend: delete" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -513,6 +516,7 @@ test "RocksDbBackend: delete" {
 
 test "RocksDbBackend: overwrite value" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -526,6 +530,7 @@ test "RocksDbBackend: overwrite value" {
 
 test "RocksDbBackend: separate namespaces" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -543,6 +548,7 @@ test "RocksDbBackend: separate namespaces" {
 
 test "RocksDbBackend: iterator prefix-bounded" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -563,6 +569,7 @@ test "RocksDbBackend: iterator prefix-bounded" {
 
 test "RocksDbBackend: iterator returns key and value" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -578,6 +585,7 @@ test "RocksDbBackend: iterator returns key and value" {
 
 test "RocksDbBackend: writeBatch commit" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -597,6 +605,7 @@ test "RocksDbBackend: writeBatch commit" {
 
 test "RocksDbBackend: writeBatch abort" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -610,6 +619,7 @@ test "RocksDbBackend: writeBatch abort" {
 
 test "RocksDbBackend: reopen preserves data" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     {
         var db = try RocksDbBackend.open(path, .{});
         try db.put("users", "alice", "persisted");
