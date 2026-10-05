@@ -266,6 +266,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_socketpair_tests = b.addRunArtifact(socketpair_tests);
 
+    // M4 counting-allocator check (T-4D163119): own module and step so the
+    // CI quality lane can run it without the full test suite.
+    const alloc_bound_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/xmppc/alloc_bound.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    alloc_bound_test_mod.addImport("xmppc", xmppc_mod);
+    const alloc_bound_tests = b.addTest(.{
+        .name = "xmppc-alloc-bound-tests",
+        .root_module = alloc_bound_test_mod,
+    });
+    const run_alloc_bound_tests = b.addRunArtifact(alloc_bound_tests);
+    const alloc_test_step = b.step("alloc-test", "Run the M4 counting-allocator 1:1 path check");
+    alloc_test_step.dependOn(&run_alloc_bound_tests.step);
+
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
@@ -1574,6 +1591,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_dns_tests.step);
     test_step.dependOn(&run_xmppc_tests.step);
     test_step.dependOn(&run_socketpair_tests.step);
+    test_step.dependOn(&run_alloc_bound_tests.step);
     test_step.dependOn(&run_event_loop_tests.step);
     test_step.dependOn(&run_connection_tests.step);
     test_step.dependOn(&run_listener_tests.step);
