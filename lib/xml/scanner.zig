@@ -440,7 +440,7 @@ fn resolveEntityInto(name: []const u8, out: *std.ArrayList(u8), a: std.mem.Alloc
 
 /// XML 1.0 (Fifth Edition) Char production: #x9 | #xA | #xD |
 /// [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
-fn isXmlChar(cp: u21) bool {
+pub fn isXmlChar(cp: u21) bool {
     return cp == 0x9 or cp == 0xA or cp == 0xD or
         (cp >= 0x20 and cp <= 0xD7FF) or
         (cp >= 0xE000 and cp <= 0xFFFD) or

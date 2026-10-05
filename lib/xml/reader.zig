@@ -384,6 +384,48 @@ pub fn escapeWrite(writer: anytype, value: []const u8) !void {
     }
 }
 
+/// Decode the five predefined entities and numeric character references,
+/// writing the decoded bytes. The inverse of escapeWrite, for content that
+/// was captured from escaped XML text (for example an accumulated stanza
+/// buffer) and must be stored decoded. Malformed or unknown references and
+/// code points outside the XML Char production are rejected.
+pub fn decodeWrite(writer: anytype, value: []const u8) !void {
+    var i: usize = 0;
+    while (i < value.len) {
+        const c = value[i];
+        if (c != '&') {
+            try writer.writeByte(c);
+            i += 1;
+            continue;
+        }
+        const semi = std.mem.indexOfScalarPos(u8, value, i, ';') orelse return error.InvalidEntityReference;
+        const name = value[i + 1 .. semi];
+        if (std.mem.eql(u8, name, "amp")) {
+            try writer.writeByte('&');
+        } else if (std.mem.eql(u8, name, "lt")) {
+            try writer.writeByte('<');
+        } else if (std.mem.eql(u8, name, "gt")) {
+            try writer.writeByte('>');
+        } else if (std.mem.eql(u8, name, "apos")) {
+            try writer.writeByte('\'');
+        } else if (std.mem.eql(u8, name, "quot")) {
+            try writer.writeByte('"');
+        } else if (name.len > 1 and name[0] == '#') {
+            const cp: u21 = if (name.len > 2 and (name[1] == 'x' or name[1] == 'X'))
+                std.fmt.parseInt(u21, name[2..], 16) catch return error.InvalidEntityReference
+            else
+                std.fmt.parseInt(u21, name[1..], 10) catch return error.InvalidEntityReference;
+            if (!scanner.isXmlChar(cp)) return error.InvalidEntityReference;
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidEntityReference;
+            try writer.writeAll(buf[0..n]);
+        } else {
+            return error.InvalidEntityReference;
+        }
+        i = semi + 1;
+    }
+}
+
 test "reader: stream restart mid-buffer after reset" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);

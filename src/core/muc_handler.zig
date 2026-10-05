@@ -813,10 +813,12 @@ pub fn handleMucOwnerSet(
     config.password_protected = parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom") orelse config.password_protected;
     config.allow_invites = parseFormBool(form_xml, "muc#roomconfig_allowinvites") orelse config.allow_invites;
 
-    // Text fields
-    if (parseFormValue(form_xml, "muc#roomconfig_roomname")) |name| config.setName(name);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomdesc")) |desc| config.setSubject(desc);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret")) |pw| config.setPassword(pw);
+    // Text fields (stored decoded; output escapes, so values do not grow
+    // on each round trip)
+    var text_buf: [512]u8 = undefined;
+    if (parseFormValue(form_xml, "muc#roomconfig_roomname", &text_buf)) |name| config.setName(name);
+    if (parseFormValue(form_xml, "muc#roomconfig_roomdesc", &text_buf)) |desc| config.setSubject(desc);
+    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| config.setPassword(pw);
 
     // Apply config to the in-memory room
     room.config = config;
@@ -867,14 +869,18 @@ fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, val
 
 /// Parse a boolean value from a form field in XML.
 fn parseFormBool(xml_data: []const u8, field_var: []const u8) ?bool {
-    const value = parseFormValue(xml_data, field_var) orelse return null;
+    var buf: [16]u8 = undefined;
+    const value = parseFormValue(xml_data, field_var, &buf) orelse return null;
     if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
     return null;
 }
 
-/// Parse the <value>...</value> content for a given field var from form XML.
-fn parseFormValue(xml_data: []const u8, field_var: []const u8) ?[]const u8 {
+/// Parse the <value>...</value> content for a given field var from form XML,
+/// decoded into `buf` (the form buffer holds escaped XML; storing it raw
+/// would double-escape on every output round trip). Returns null when the
+/// field is absent, the value does not fit, or the entities are malformed.
+fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) ?[]const u8 {
     // Find field_var in the XML
     const var_pos = std.mem.indexOf(u8, xml_data, field_var) orelse return null;
     // Find the next <value> after this field
@@ -883,7 +889,9 @@ fn parseFormValue(xml_data: []const u8, field_var: []const u8) ?[]const u8 {
     const content_start = value_start_tag + 7; // len("<value>")
     const remaining = after_var[content_start..];
     const value_end = std.mem.indexOf(u8, remaining, "</value>") orelse return null;
-    return remaining[0..value_end];
+    var fbs = std.io.fixedBufferStream(buf);
+    xml.decodeWrite(fbs.writer(), remaining[0..value_end]) catch return null;
+    return fbs.getWritten();
 }
 
 /// Broadcast status code 104 (config changed) to all room occupants.
@@ -2612,4 +2620,57 @@ test "S1: vcard update photo requires a hex hash" {
     fbs.reset();
     writeVcardUpdate(fbs.writer(), "x'</photo><message from='admin@localhost'/>");
     try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+}
+
+test "S1: room config form values are stored decoded, escaped once on output" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    var store = room_store.RoomStore(server_mod.OpBackendType).init(&db, allocator);
+    server.room_store = &store;
+    try store.setAffiliation("room@conference.localhost", "owner@localhost", .owner);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = session; // owned by server.deinit from here on
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+
+    // stanza_buf holds the re-serialized (escaped) form submission.
+    const form = "<query xmlns='http://jabber.org/protocol/muc#owner'>" ++
+        "<x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='muc#roomconfig_roomname'><value>A&amp;B &lt;C&gt;</value></field>" ++
+        "</x></query>";
+    @memcpy(session.stanza_buf[0..form.len], form);
+    session.stanza_buf_len = form.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
+
+    // Stored decoded; with the raw-slice parse this is the escaped form.
+    try std.testing.expectEqualStrings("A&B <C>", room.config.getName());
+
+    // The config form response escapes exactly once: no &amp;amp; growth.
+    handleMucOwnerGet(&server, session, "room", "cfg2", &changes);
+    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
 }
