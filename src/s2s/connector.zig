@@ -113,6 +113,11 @@ pub const OutboundConnection = struct {
     write_buf: [WRITE_BUF_SIZE]u8 = undefined,
     write_start: usize = 0,
     write_end: usize = 0,
+    /// Length of the pinned TLS write starting at write_start. While > 0,
+    /// flushWrite retries exactly that slice: OpenSSL retains the caller
+    /// buffer across WANT_READ/WANT_WRITE (AGENTS.md identical pointer and
+    /// length rule), so bytes queued after the stall wait behind it (S23).
+    pinned_tls_len: usize = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
@@ -267,24 +272,40 @@ pub const OutboundConnection = struct {
 
     /// Flush the write buffer to the socket (TLS-aware).
     /// Returns true if all data was flushed.
+    ///
+    /// When a TLS write stalls, this retries only the pinned prefix; bytes
+    /// queued after the stall are flushed by later calls once the pin
+    /// releases. The TLS record layer never sees a slice that differs from
+    /// the stalled one in pointer or length (S23).
     pub fn flushWrite(self: *OutboundConnection) !bool {
         if (self.write_start >= self.write_end) return true;
 
-        const data = self.write_buf[self.write_start..self.write_end];
+        const flush_end = if (self.pinned_tls_len > 0)
+            self.write_start + self.pinned_tls_len
+        else
+            self.write_end;
+        const data = self.write_buf[self.write_start..flush_end];
 
         if (self.tls_conn) |*tls| {
             const result = tls.write(data) catch return error.ConnectionReset;
             switch (result) {
                 .ok => |n| {
                     self.write_start += n;
+                    self.pinned_tls_len -|= n;
                     if (self.write_start >= self.write_end) {
                         self.write_start = 0;
                         self.write_end = 0;
+                        self.pinned_tls_len = 0;
                         return true;
                     }
                     return false;
                 },
-                .want_read, .want_write => return false,
+                .want_read, .want_write => {
+                    // OpenSSL retains the caller buffer across the retry;
+                    // pin the exact slice and let nothing grow it.
+                    self.pinned_tls_len = data.len;
+                    return false;
+                },
             }
         }
 
@@ -796,6 +817,153 @@ test "ConnectionPool: remove" {
 
     pool.remove("b.example");
     try std.testing.expectEqual(@as(usize, 0), pool.count());
+}
+
+// --- S23: pinned TLS write retry under backpressure -----------------------
+
+/// Self-signed throwaway cert+key for "localhost" via the openssl CLI (no
+/// key material in the tree). error.SkipZigTest when the tool is missing.
+fn genTestTlsCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .cwd_dir = dir,
+        .max_output_bytes = 4096,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Drive both ends of a non-blocking TLS pair until the handshake finishes.
+fn driveTestTlsHandshake(server: *SslConn, client: *SslConn) !void {
+    const deadline = std.time.milliTimestamp() + 5000;
+    var s_done = false;
+    var c_done = false;
+    while ((!s_done or !c_done) and std.time.milliTimestamp() < deadline) {
+        if (!s_done) s_done = (try server.doHandshake()) == .complete;
+        if (!c_done) c_done = (try client.doHandshake()) == .complete;
+    }
+    if (!s_done or !c_done) return error.TlsHandshakeTimeout;
+}
+
+/// Connected non-blocking TCP loopback pair for TLS test rigs. AF_UNIX
+/// socketpairs do not enforce SO_SNDBUF strictly on stream sockets, so the
+/// backpressure rig needs real TCP; both ends run userland TLS (PR 296498).
+fn makeTestTcpPair() ![2]posix.fd_t {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return error.SocketFailed;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return error.BindFailed;
+    posix.listen(listen_fd, 1) catch return error.ListenFailed;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return error.GetSockNameFailed;
+
+    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch return error.SocketFailed;
+    errdefer posix.close(client_fd);
+    posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
+        error.WouldBlock => {},
+        else => return error.ConnectFailed,
+    };
+    const server_fd = posix.accept(listen_fd, null, null, posix.SOCK.NONBLOCK) catch return error.AcceptFailed;
+    errdefer posix.close(server_fd);
+
+    // nodelay keeps the interleaved drive loop free of delayed-ACK stalls.
+    const nodelay: c_int = 1;
+    try posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay)); // IPPROTO_TCP, TCP_NODELAY
+    try posix.setsockopt(server_fd, 6, 1, std.mem.asBytes(&nodelay));
+    return .{ client_fd, server_fd };
+}
+
+test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive (S23)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestTlsCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    const fds = try makeTestTcpPair();
+    // The listener side is only a scripted TLS server for this rig.
+    defer posix.close(fds[1]);
+
+    // Tiny send buffer on the connection side forces TLS write backpressure.
+    const head_len = 8192;
+    const sndbuf: c_int = 2048;
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    var actual_sndbuf: c_int = 0;
+    var optlen: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&actual_sndbuf), &optlen) != 0)
+        return error.SkipZigTest;
+    // One ~8 KiB TLS record must not fit, or the rig cannot stall the write.
+    if (actual_sndbuf >= head_len) return error.SkipZigTest;
+
+    // kTLS stays off on both ends: two kTLS peers over lo0 hit FreeBSD
+    // PR 296498 (EBADMSG). This rig is entirely userland TLS.
+    var client_ctx = try SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls();
+    var server_ctx = try SslContext.initServer(cert_path, key_path);
+    defer server_ctx.deinit();
+    server_ctx.disableKtls();
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc); // also closes fds[0]
+    conn.fd = fds[0];
+    conn.tls_conn = try SslConn.initClient(client_ctx, fds[0], null);
+    conn.tls_state = .established;
+    var server = try SslConn.init(server_ctx, fds[1]);
+    defer server.deinit();
+    try driveTestTlsHandshake(&server, &conn.tls_conn.?);
+
+    var head: [head_len]u8 = undefined;
+    for (&head, 0..) |*b, i| b.* = @truncate(i);
+    const tail = "TAIL-AFTER-PINNED-WRITE";
+
+    // First flush exceeds the send buffer: it must stall and pin the slice.
+    try conn.queueWrite(&head);
+    try std.testing.expect(!(try conn.flushWrite()));
+    try std.testing.expectEqual(@as(usize, head_len), conn.pinned_tls_len);
+
+    // Queue while pinned: the tail must wait behind the pinned slice, not
+    // grow the retry.
+    try conn.queueWrite(tail);
+
+    var received: [head_len + tail.len]u8 = undefined;
+    var got: usize = 0;
+    var chunk: [4096]u8 = undefined;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (got < received.len and std.time.milliTimestamp() < deadline) {
+        if (conn.hasPendingWrite()) {
+            _ = conn.flushWrite() catch return error.FlushFailed;
+        }
+        const rr = server.read(&chunk) catch return error.PeerReadFailed;
+        switch (rr) {
+            .ok => |n| {
+                @memcpy(received[got .. got + n], chunk[0..n]);
+                got += n;
+            },
+            .want_read, .want_write => {},
+        }
+    }
+    try std.testing.expectEqual(received.len, got);
+    try std.testing.expect(std.mem.eql(u8, &head, received[0..head_len]));
+    try std.testing.expectEqualStrings(tail, received[head_len..][0..tail.len]);
+    try std.testing.expectEqual(@as(usize, 0), conn.pinned_tls_len);
+    try std.testing.expect(!conn.hasPendingWrite());
 }
 
 test "ConnectionPool: getEstablished" {
