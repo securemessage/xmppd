@@ -221,6 +221,10 @@ pub const Session = struct {
     bind_collecting_resource: bool = false,
     bind_pending: bool = false,
 
+    /// Set when <starttls> arrived with a separate close tag: the upgrade
+    /// triggers on </starttls> (T215).
+    starttls_close_pending: bool = false,
+
     /// IQ stanza accumulation — tracks child element namespace for dispatching.
     iq_active: bool = false,
     iq_type: []const u8 = "",
@@ -1197,9 +1201,23 @@ pub const Server = struct {
                     return;
                 }
 
+                const starttls_was_pending = session.stream.state == .starttls_pending;
                 self.processXmlEvent(session, event.?, changes);
 
                 if (self.sessions[id] == null) return;
+                // T215: anything past the complete <starttls/> element is
+                // plaintext read-ahead — a protocol violation (RFC 6120
+                // 5.4.3.2).
+                if (!starttls_was_pending and
+                    session.stream.state == .starttls_pending and
+                    pos < data.len)
+                {
+                    log.info("connection {d} plaintext read-ahead past <starttls/> — policy-violation", .{id});
+                    self.sendStreamError(session, .policy_violation);
+                    session.conn.flushSync();
+                    session_lifecycle.forceCloseSession(self, id, changes);
+                    return;
+                }
                 if (session.conn.isTlsHandshaking()) {
                     session.conn.consume(pos);
                     return;
@@ -1395,9 +1413,14 @@ pub const Server = struct {
         // STARTTLS namespace
         if (std.mem.eql(u8, ns, xml.ns.tls)) {
             if (std.mem.eql(u8, elem.local_name, "starttls")) {
-                const action = session.stream.handleStarttls();
-                self.executeAction(session, action);
-                // TLS handshake wiring comes in step 5g
+                if (elem.self_closing) {
+                    const action = session.stream.handleStarttls();
+                    self.executeAction(session, action);
+                } else {
+                    // <starttls></starttls> form: trigger on the close tag so
+                    // the read-ahead check (T215) sees a complete element.
+                    session.starttls_close_pending = true;
+                }
             }
             return;
         }
@@ -1673,6 +1696,16 @@ pub const Server = struct {
     }
 
     fn handleElementEnd(self: *Server, session: *Session, name: []const u8, changes: *ChangeList) void {
+        // <starttls></starttls> form (T215): upgrade on the close tag.
+        if (session.starttls_close_pending) {
+            session.starttls_close_pending = false;
+            const local = if (std.mem.lastIndexOfScalar(u8, name, ':')) |c| name[c + 1 ..] else name;
+            if (std.mem.eql(u8, local, "starttls")) {
+                const action = session.stream.handleStarttls();
+                self.executeAction(session, action);
+                return;
+            }
+        }
         // Stanza accumulation — child close tag or stanza dispatch
         if (session.stanza_kind != .none) {
             if (session.reader.depth > 1) {
@@ -2775,19 +2808,13 @@ pub const Server = struct {
                 writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
 
-                // Flush the proceed XML before upgrading to TLS
+                // T215: the handshake starts only after the plaintext
+                // <proceed/> has fully flushed; leftover bytes would be
+                // written through the TLS record layer. handleWritable
+                // completes the upgrade once the buffer drains.
                 _ = session.conn.flushSend() catch {};
-
-                // Start TLS handshake
-                if (self.ssl_ctx) |ctx| {
-                    session.conn.upgradeToTls(ctx) catch {
-                        log.err("connection {d} TLS upgrade failed", .{session.conn.id});
-                        return;
-                    };
-                    log.info("connection {d} starting TLS handshake", .{session.conn.id});
-                } else {
-                    log.warn("connection {d} STARTTLS requested but no TLS configured", .{session.conn.id});
-                }
+                if (session.conn.hasPendingWrite()) return;
+                self.startTlsUpgrade(session);
             },
             .send_sasl_success => |server_final| {
                 writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -2861,9 +2888,28 @@ pub const Server = struct {
         // If write buffer is drained, stop watching for writability
         if (!session.conn.hasPendingWrite()) {
             changes.removeWrite(session.conn.fd) catch {};
+            // T215: a STARTTLS upgrade deferred by backpressure starts now
+            // that <proceed/> is fully on the wire.
+            if (session.stream.state == .starttls_pending and !session.conn.isTlsHandshaking()) {
+                self.startTlsUpgrade(session);
+            }
         }
 
         self.applyReadBackpressure(session, changes);
+    }
+
+    /// Begin the TLS handshake once the plaintext <proceed/> is fully
+    /// flushed (T215). Called from executeAction and handleWritable.
+    fn startTlsUpgrade(self: *Server, session: *Session) void {
+        if (self.ssl_ctx) |ctx| {
+            session.conn.upgradeToTls(ctx) catch {
+                log.err("connection {d} TLS upgrade failed", .{session.conn.id});
+                return;
+            };
+            log.info("connection {d} starting TLS handshake", .{session.conn.id});
+        } else {
+            log.warn("connection {d} STARTTLS requested but no TLS configured", .{session.conn.id});
+        }
     }
 
     /// T110 client-side backpressure: while a connection's write buffer
@@ -4468,6 +4514,83 @@ test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error
     var buf: [256]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Drive the stream open so the FSM reaches features_tls.
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+
+    // Drain the peer side, then fill the kernel send path (unix pairs
+    // buffer 64 KiB and ignore SO_SNDBUF): with the socket full the
+    // queued <proceed/> cannot flush at once.
+    var drain_buf: [16384]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+    var filler: [12000]u8 = undefined;
+    @memset(&filler, 'x');
+    var fill: usize = 0;
+    while (fill < 8) : (fill += 1) {
+        session.conn.queueSend(&filler) catch break;
+        _ = session.conn.flushSend() catch {};
+    }
+    try std.testing.expect(session.conn.hasPendingWrite());
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    server.handleReadable(1, &changes);
+
+    // Upgrade deferred: FSM is pending but TLS has NOT started.
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(session.conn.tls_conn == null);
+    try std.testing.expect(session.conn.hasPendingWrite());
+
+    // Drain the peer, then let the write-ready handler finish.
+    while (posix.read(fds[1], &drain_buf)) |_| {} else |_| {}
+    server.handleWritable(1, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+}
+
+test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    // <starttls/> followed by more plaintext in the same flight.
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><message to='a@b'><body>x</body></message>");
+    server.handleReadable(1, &changes);
+
+    // Protocol violation: the session is closed with a stream error.
+    try std.testing.expect(server.sessions[1] == null);
+    const n = posix.read(fds[1], &drain_buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n], "policy-violation") != null);
 }
 
 test "Server: direct TLS skips STARTTLS features" {
