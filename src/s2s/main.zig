@@ -868,6 +868,17 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         return;
     }
 
+    // T250: while a <proceed/> is parked behind a partial flush, NO plaintext
+    // event may run: even one parsed event would cross the TLS record boundary
+    // as clear text. Any byte received while pending is a protocol error.
+    if (session.tls_upgrade_pending) {
+        log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending — stream policy-violation", .{ slot, session.read_end - session.read_start });
+        sendStreamError(session, .policy_violation);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(batch, slot);
+        return;
+    }
+
     // Parse XML from the read buffer and drive the S2S stream FSM
     const data = session.readableSlice();
     var pos: usize = 0;
@@ -1010,7 +1021,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 session.setRemoteDomain(from);
             }
             const action = session.stream.handleStreamOpen(from, to, version);
-            executeAction(daemon, session, action);
+            executeAction(daemon, session, action, batch);
 
             // After post-TLS stream open, perform DANE verification on peer cert
             if (session.stream.state == .features_auth and session.tls_conn != null and from.len > 0) {
@@ -1020,7 +1031,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // After stream open response, send features
             if (session.stream.getFeatures()) |_| {
                 const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
-                executeAction(daemon, session, features_action);
+                executeAction(daemon, session, features_action, batch);
             } else if (session.stream.isEstablished()) {
                 // Post-auth stream: send empty features
                 session.queueWrite("<stream:features/>") catch {};
@@ -1053,7 +1064,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 std.mem.eql(u8, elem.local_name, "starttls"))
             {
                 const action = session.stream.handleStarttls();
-                executeAction(daemon, session, action);
+                executeAction(daemon, session, action, batch);
             }
             // Handle SASL auth
             else if (std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl) and
@@ -1066,7 +1077,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 }
                 if (std.mem.eql(u8, mechanism, "EXTERNAL")) {
                     const action = session.stream.handleSaslExternal();
-                    executeAction(daemon, session, action);
+                    executeAction(daemon, session, action, batch);
                     // After successful SASL, the remote will restart the stream.
                     // State is awaiting_stream_open_tls (reused for post-SASL restart).
                     if (session.stream.state == .awaiting_stream_open_tls) {
@@ -1411,7 +1422,7 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
 }
 
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
-fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction) void {
+fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction, batch: ?*ChangeList) void {
     var buf: [2048]u8 = undefined;
 
     switch (action) {
@@ -1433,11 +1444,17 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             const proceed = session.buildTlsProceed(&buf) catch return;
             session.queueWrite(proceed) catch {};
 
-            // Only upgrade once the plaintext buffer is fully flushed — a
+            // Only upgrade once the plaintext buffer is fully flushed: a
             // partially sent <proceed/> would otherwise leak into the TLS
-            // record stream (T250). A partial flush defers the upgrade to
-            // the writable handler.
-            if (session.flushWrite() catch false) {
+            // record stream (T250). A partial flush (no error) defers the
+            // upgrade to the writable handler; a write error closes
+            // (T250 review: `catch false` parked forever there).
+            const flushed = session.flushWrite() catch {
+                log.err("inbound S2S id={d} write error at STARTTLS proceed", .{session.id});
+                if (batch) |b| daemon.closeInbound(b, session.id);
+                return;
+            };
+            if (flushed) {
                 if (daemon.tls_ctx) |ctx| {
                     session.upgradeToTls(ctx) catch {
                         log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
@@ -1706,9 +1723,13 @@ fn processOutboundEvent(
                     reader.reset();
                     if (conn.handleStarttlsProceed()) {
                         startOutboundTls(daemon, batch, slot, conn);
+                    } else {
+                        // Pending local bytes at <proceed/>: they were queued
+                        // after <starttls/>, so sending them now would push
+                        // plaintext into the TLS record layer. Close (T250).
+                        log.warn("outbound {s}: plaintext queued after <starttls/> at <proceed/>", .{conn.remote_domain});
+                        daemon.closeOutbound(batch, slot);
                     }
-                    // Not drained: tls_upgrade_pending is set; the writable
-                    // handler upgrades once the buffer empties (T250).
                 }
             }
             // <stream:features> children

@@ -430,17 +430,18 @@ pub const OutboundConnection = struct {
         return .none;
     }
 
-    /// STARTTLS proceed received — flush our side first; the caller upgrades
-    /// when this returns true, or parks us via tls_upgrade_pending on false
-    /// (T250: a partially-written plaintext tail must never enter TLS).
+    /// STARTTLS proceed received — by the time <proceed/> arrives, all bytes
+    /// through the <starttls/> request are by definition on the wire (the
+    /// peer could not have seen it otherwise; T250 review). Anything left in
+    /// the local write buffer was queued after <starttls/>; flushing it now
+    /// would push plaintext into the TLS record layer, so fail instead.
     pub fn handleStarttlsProceed(self: *OutboundConnection) bool {
-        const drained = self.flushWrite() catch false;
-        if (drained) {
-            self.state = .tls_handshake;
-            return true;
+        if (self.hasPendingWrite()) {
+            self.fail("plaintext-after-starttls");
+            return false;
         }
-        self.tls_upgrade_pending = true;
-        return false;
+        self.state = .tls_handshake;
+        return true;
     }
 
     /// SASL success received — connection is authenticated.
@@ -676,6 +677,42 @@ test "OutboundConnection: full DANE-verified lifecycle" {
     // Auth success
     conn.handleAuthSuccess();
     try std.testing.expect(conn.isEstablished());
+}
+
+test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the connection (T250 review)" {
+    const alloc = std.testing.allocator;
+
+    // TCP loopback pair with a tiny send buffer (unix socketpairs ignore
+    // SO_SNDBUF on FreeBSD): queue the <starttls/> request plus a tail.
+    const fds = try makeTestTcpPair();
+    defer posix.close(fds[1]); // fds[0] goes out via conn.deinit below
+
+    const sndbuf: c_int = 2048;
+    var actual_sndbuf: c_int = 0;
+    var optlen: posix.socklen_t = @sizeOf(c_int);
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    if (std.c.getsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&actual_sndbuf), &optlen) != 0)
+        return error.SkipZigTest;
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+    conn.fd = fds[0];
+    conn.tcpConnected();
+    conn.state = .starttls_negotiation;
+
+    // Queue the <starttls/> request... under backpressure something lingers.
+    var buf: [2048]u8 = undefined;
+    const msg = try conn.buildStarttls(&buf);
+    try conn.queueWrite(msg);
+
+    // And bytes that were queued AFTER <starttls/> (the protocol error).
+    try conn.queueWrite("<message to='them.example'><body>oops</body></message>");
+    try std.testing.expect(conn.hasPendingWrite());
+
+    // <proceed/> arrives: the connection must fail, no upgrade begins.
+    try std.testing.expect(!conn.handleStarttlsProceed());
+    try std.testing.expect(conn.isFailed());
+    try std.testing.expectEqualStrings("plaintext-after-starttls", conn.error_msg);
 }
 
 test "OutboundConnection: STARTTLS lifecycle with no DANE" {
