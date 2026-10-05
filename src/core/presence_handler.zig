@@ -432,8 +432,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
     // For each subscribed contact, check if local or remote. T130: local
     // contacts resolve in chunks of one lock hold instead of one per JID.
-    const SUBS_PER_CHUNK = 32;
-    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
+    // S18: chunk scratch lives on the heap, sized to the session map's
+    // resource cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
+    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
 
     var contact_i: usize = 0;
     while (contact_i < contact_jids.len) {
@@ -464,9 +465,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             parts_len += 1;
         }
 
-        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
-        var jid_idxs: [MAX_CHUNK_ENTRIES]u16 = undefined;
-        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, &jid_idxs);
+        const entries = server.scratchEntriesA();
+        const jid_idxs = server.scratchJidIdxsA();
+        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, jid_idxs);
 
         for (entries[0..target_count], jid_idxs[0..target_count]) |entry, idx| {
             const contact = parts_buf[idx];
@@ -580,8 +581,8 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
             log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
             return;
         };
-        var target_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-        const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_entries);
+        const target_entries = server.scratchEntriesB();
+        const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, target_entries);
         if (target_count > 0) {
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
         } else {
@@ -692,8 +693,8 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
     // The approver now has 'from' the contact = contact's presence should be visible.
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        var probe_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &probe_entries);
+        const probe_entries = server.scratchEntriesB();
+        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, probe_entries);
         for (probe_entries[0..probe_count]) |pentry| {
             // Look up the contact's session to retrieve their stored presence inner XML.
             const contact_inner = if (pentry.worker_id == server.worker_id) blk: {
@@ -876,8 +877,8 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_jid = to_jid_parsed;
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
         const unsub_sm = server.session_map orelse return;
-        var owner_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, &owner_entries);
+        const owner_entries = server.scratchEntriesB();
+        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, owner_entries);
         for (owner_entries[0..owner_count]) |oent| {
             var unavail_buf: [512]u8 = undefined;
             var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
@@ -1041,8 +1042,8 @@ fn broadcastToOwnResources(
     }
     const presence_xml = pres_fbs.getWritten();
 
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findByBareJid(local, domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
@@ -1076,8 +1077,8 @@ fn sendOtherResourcesPresence(
 ) void {
     const sm = server.session_map orelse return;
 
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(local, domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findAvailableByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
         const entry_resource = entry.resource();
@@ -1160,8 +1161,8 @@ pub fn dispatchDirectedPresenceToBareJid(
     const presence_xml = pres_fbs.getWritten();
 
     // Deliver to all available resources of the target bare JID
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(target_local, target_domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findAvailableByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
@@ -1191,8 +1192,9 @@ fn deliverPresenceToSubscribers(
 ) void {
     const sm = server.session_map orelse return;
 
-    const SUBS_PER_CHUNK = 32;
-    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
+    // S18: chunk scratch is heap, sized to the session map's resource
+    // cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
+    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
 
     var i: usize = 0;
     while (i < subscriber_jids.len) {
@@ -1221,8 +1223,8 @@ fn deliverPresenceToSubscribers(
         }
 
         // Resolve the whole chunk under one lock hold.
-        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
-        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, null);
+        const entries = server.scratchEntriesA();
+        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, null);
 
         // Local targets deliver inline.
         for (entries[0..count]) |entry| {
@@ -1260,8 +1262,8 @@ pub fn deliverPresenceToTarget(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findByBareJid(target_local, target_domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |ent| {
         if (ent.worker_id == server.worker_id) {

@@ -124,8 +124,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Route: find target session(s) via unified session map.
     const sm = server.session_map orelse return;
-    var entries_buf: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    var local_ids: [session_map_mod.DEFAULT_MAX_RESOURCES]usize = undefined;
+    const entries_buf = server.scratchEntriesA();
+    const local_ids = server.scratchIdsA();
     var target_count: usize = 0;
 
     var remote_delivered: bool = false;
@@ -139,7 +139,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // Resource not found (§8.5.3.2). For type='chat', fall back to best
         // available resource (§8.5.3.2.1). For others, store offline or bounce.
         if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "chat")) {
-            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
             if (avail_count > 0) {
                 var best_idx: usize = 0;
                 var best_prio: i8 = -128;
@@ -158,7 +158,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         break :blk @as(usize, 0);
     } else blk: {
         // RFC 6121 §8.5.2: Stanza addressed to bare JID — deliver to available resources.
-        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
         if (avail_count == 0) break :blk @as(usize, 0);
 
         if (session.stanza_kind == .iq) {
@@ -683,8 +683,8 @@ fn sendCarbons(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+    const entries = server.scratchEntriesB();
+    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
     for (entries[0..count]) |entry| {

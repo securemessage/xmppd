@@ -551,6 +551,18 @@ pub const Server = struct {
     /// archive_writer when attached.
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType) = null,
 
+    /// S18: per-worker heap scratch for session-map resolution. Replaces
+    /// ~70 KiB stack frames (DEFAULT_MAX_RESOURCES SessionEntry per
+    /// lookup). The event loop is single-threaded per worker: bank A
+    /// serves dispatchStanza and the chunked batch lookups, bank B the
+    /// leaf lookups (sendCarbons runs under dispatchStanza, so they
+    /// cannot share a bank). Grown lazily to the session map's resource
+    /// cap; chunk banks hold SCRATCH_CHUNK_JIDS * cap entries.
+    scratch_entries_a: []SessionEntry = &.{},
+    scratch_entries_b: []SessionEntry = &.{},
+    scratch_ids_a: []usize = &.{},
+    scratch_jid_idxs_a: []u16 = &.{},
+
     /// T87 async archive writer queue. Null in dev/single-process setups
     /// without a writer thread — writers then fall back to inline store()
     /// against `archive`.
@@ -899,6 +911,10 @@ pub const Server = struct {
         }
         self.allocator.free(self.sessions);
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
+        if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
+        if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
+        if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
+        if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
         self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
@@ -908,6 +924,66 @@ pub const Server = struct {
         if (self.s2s_ipc.connected) self.s2s_ipc.close();
         self.ipc.deinit();
         self.s2s_ipc.deinit();
+    }
+
+    /// Presence batching resolves this many bare JIDs per lock hold.
+    pub const SCRATCH_CHUNK_JIDS = 32;
+
+    pub fn scratchEntriesA(self: *Server) []SessionEntry {
+        self.growScratch();
+        return self.scratch_entries_a;
+    }
+
+    pub fn scratchEntriesB(self: *Server) []SessionEntry {
+        self.growScratch();
+        return self.scratch_entries_b;
+    }
+
+    pub fn scratchIdsA(self: *Server) []usize {
+        self.growScratch();
+        return self.scratch_ids_a;
+    }
+
+    pub fn scratchJidIdxsA(self: *Server) []u16 {
+        self.growScratch();
+        return self.scratch_jid_idxs_a;
+    }
+
+    fn growScratch(self: *Server) void {
+        const sm = self.session_map orelse return;
+        const chunk_need = SCRATCH_CHUNK_JIDS * sm.max_resources;
+        if (self.scratch_entries_a.len < chunk_need) {
+            if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
+            self.scratch_entries_a = self.allocator.alloc(SessionEntry, chunk_need) catch {
+                log.err("session-map scratch A alloc of {d} entries failed", .{chunk_need});
+                self.scratch_entries_a = &.{};
+                return;
+            };
+        }
+        if (self.scratch_ids_a.len < chunk_need) {
+            if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
+            self.scratch_ids_a = self.allocator.alloc(usize, chunk_need) catch {
+                log.err("session-map scratch ids alloc of {d} failed", .{chunk_need});
+                self.scratch_ids_a = &.{};
+                return;
+            };
+        }
+        if (self.scratch_jid_idxs_a.len < chunk_need) {
+            if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
+            self.scratch_jid_idxs_a = self.allocator.alloc(u16, chunk_need) catch {
+                log.err("session-map scratch jid idxs alloc of {d} failed", .{chunk_need});
+                self.scratch_jid_idxs_a = &.{};
+                return;
+            };
+        }
+        if (self.scratch_entries_b.len < sm.max_resources) {
+            if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
+            self.scratch_entries_b = self.allocator.alloc(SessionEntry, sm.max_resources) catch {
+                log.err("session-map scratch B alloc of {d} entries failed", .{sm.max_resources});
+                self.scratch_entries_b = &.{};
+                return;
+            };
+        }
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -2422,14 +2498,14 @@ pub const Server = struct {
                 };
 
                 const s2s_sm = self.session_map orelse return;
-                var s2s_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
+                var s2s_entries = self.scratchEntriesB();
                 const target_count = if (to_jid.resource.len > 0) blk: {
                     if (s2s_sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
                         s2s_entries[0] = e;
                         break :blk @as(usize, 1);
                     }
                     break :blk @as(usize, 0);
-                } else s2s_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &s2s_entries);
+                } else s2s_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, s2s_entries);
 
                 // Single timestamp for all S2S archive operations (T123)
                 const s2s_archive_ts: u64 = @intCast(std.time.timestamp());
@@ -2499,14 +2575,14 @@ pub const Server = struct {
                 const from_jid = xmpp.Jid.parse(m.from_jid) catch return;
 
                 const fail_sm = self.session_map orelse return;
-                var sender_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
+                var sender_entries = self.scratchEntriesB();
                 const sender_count = if (from_jid.resource.len > 0) blk: {
                     if (fail_sm.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |e| {
                         sender_entries[0] = e;
                         break :blk @as(usize, 1);
                     }
                     break :blk @as(usize, 0);
-                } else fail_sm.findAvailableByBareJid(from_jid.local, from_jid.domain, &sender_entries);
+                } else fail_sm.findAvailableByBareJid(from_jid.local, from_jid.domain, sender_entries);
 
                 // Build error stanza once for all targets
                 var err_buf: [1024]u8 = undefined;
@@ -4451,6 +4527,23 @@ test "Server: init and deinit" {
     try std.testing.expect(server.listener.fd >= 0);
     try std.testing.expect(server.running);
 }
+test "Server: S18 scratch banks size to the session map resource cap" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var sm = SessionMap.init(std.testing.allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    try std.testing.expectEqual(
+        Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES,
+        server.scratchEntriesA().len,
+    );
+    try std.testing.expectEqual(Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchIdsA().len);
+    try std.testing.expectEqual(Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchJidIdxsA().len);
+    try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchEntriesB().len);
+}
+
 
 test "Server: accept and close session" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);

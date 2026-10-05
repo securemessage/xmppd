@@ -1846,8 +1846,8 @@ fn sendPepNotification(
 
     // Deliver to the publisher's own resources (self-notification per XEP-0163 §4.3)
     const bound = session.stream.bound_jid orelse return;
-    var self_entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, &self_entries);
+    var self_entries = server.scratchEntriesB();
+    const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, self_entries);
     for (self_entries[0..self_count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
@@ -1913,8 +1913,8 @@ fn sendPepNotification(
         // Only deliver to local users for now (S2S PEP notifications are post-V1)
         if (!std.mem.eql(u8, sub_domain, server.server_host)) continue;
 
-        var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-        const count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries);
+        var entries = server.scratchEntriesB();
+        const count = sm.findAvailableByBareJid(sub_local, sub_domain, entries);
         for (entries[0..count]) |entry| {
             if (entry.worker_id == server.worker_id) {
                 const target = server.sessions[entry.local_session_id] orelse continue;
@@ -2095,8 +2095,8 @@ fn pushBlockPush(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
     for (entries[0..count]) |entry| {
@@ -2180,8 +2180,8 @@ pub fn pushRosterItem(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [session_map_mod.DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
-    const count = sm.findByBareJid(user_local, user_domain, &entries);
+    var entries = server.scratchEntriesB();
+    const count = sm.findByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
     // Look up current item to get groups and name for the push.

@@ -655,6 +655,38 @@ test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
     try std.testing.expectEqual(@as(usize, 2), map.findAvailableByBareJidBatch(&jids, &small, null));
 }
 
+test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
+    var map = SessionMap.init(std.testing.allocator, false, 0);
+    defer map.deinit();
+
+    // 32 JIDs x 20 available resources = 640 entries, over the old
+    // 32x16 chunk cap.
+    var local_buf: [32][10]u8 = undefined;
+    var jid_storage: [32]JidParts = undefined;
+    var sid: u32 = 1;
+    for (0..32) |j| {
+        const local = std.fmt.bufPrint(&local_buf[j], "user{d:0>6}", .{j}) catch unreachable;
+        jid_storage[j] = .{ .local = local, .domain = "localhost" };
+        for (0..20) |r| {
+            var res_buf: [16]u8 = undefined;
+            const res = std.fmt.bufPrint(&res_buf, "res{d:0>2}", .{r}) catch unreachable;
+            _ = try map.bind(0, sid, local, "localhost", res);
+            map.setPresenceAvailable(local, "localhost", res, true);
+            sid += 1;
+        }
+    }
+
+    var buf: [32 * 256]SessionEntry = undefined;
+    var idxs: [32 * 256]u16 = undefined;
+    const total = map.findAvailableByBareJidBatch(&jid_storage, &buf, &idxs);
+    try std.testing.expectEqual(@as(usize, 640), total);
+    // Entries stay grouped by JID in request order.
+    try std.testing.expectEqual(@as(u16, 0), idxs[0]);
+    try std.testing.expectEqual(@as(u16, 0), idxs[19]);
+    try std.testing.expectEqual(@as(u16, 1), idxs[20]);
+    try std.testing.expectEqual(@as(u16, 31), idxs[639]);
+}
+
 test "SessionMap: duplicate bind fails" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
