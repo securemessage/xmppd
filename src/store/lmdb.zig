@@ -76,15 +76,23 @@ pub const LmdbBackend = struct {
     /// worker thread creates a DBI mid-operation, so the cache races in
     /// getOrCreateDbi/resolveDbi can only ever fire for a genuinely new
     /// (test-only) namespace.
+    // No errdefer+commit pairing: mdb_txn_commit aborts the txn itself on
+    // failure, so an errdefer abort() would end the write txn twice on
+    // exactly the MAP_FULL/ENOSPC path that matters (S9 review).
     fn openCanonicalNamespaces(self: *LmdbBackend) !void {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
-        errdefer txn.abort();
         for (backend.canonical_namespaces) |ns| {
             var name_z: [65]u8 = undefined;
-            if (ns.len > 64) return error.MDB_BAD_VALSIZE;
+            if (ns.len > 64) {
+                txn.abort();
+                return error.MDB_BAD_VALSIZE;
+            }
             @memcpy(name_z[0..ns.len], ns);
             name_z[ns.len] = 0;
-            const db = try lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{ .create = true });
+            const db = lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{ .create = true }) catch |err| {
+                txn.abort();
+                return err;
+            };
             const entry = &self.dbi_cache[self.dbi_count];
             @memcpy(entry.name_buf[0..ns.len], ns);
             entry.name_len = @intCast(ns.len);
@@ -115,9 +123,13 @@ pub const LmdbBackend = struct {
     pub fn put(self: *LmdbBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
         const dbi = try self.getOrCreateDbi(ns);
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
-        errdefer txn.abort();
         const db = lmdb.Database{ .txn = txn, .dbi = dbi };
-        try db.set(key, value);
+        db.set(key, value) catch |err| {
+            txn.abort();
+            return err;
+        };
+        // commit() needs no error-guard: on failure mdb_txn_commit aborts
+        // the txn internally (S9 review).
         try txn.commit();
         self.warnIfNearlyFull();
     }
@@ -289,12 +301,16 @@ pub const LmdbBackend = struct {
         name_z[ns.len] = 0;
 
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
-        errdefer txn.abort();
-        const db = try lmdb.Database.open(
+        const db = lmdb.Database.open(
             txn,
             @ptrCast(name_z[0..ns.len :0]),
             .{ .create = true },
-        );
+        ) catch |err| {
+            txn.abort();
+            return err;
+        };
+        // mdb_txn_commit aborts on failure internally; the write txn is
+        // dead after this either way (S9 review).
         try txn.commit();
 
         var entry = &self.dbi_cache[self.dbi_count];
