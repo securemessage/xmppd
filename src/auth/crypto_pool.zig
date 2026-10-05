@@ -167,7 +167,9 @@ pub const CryptoPool = struct {
                 self.completions.append(self.allocator, .{ .id = job.id, .ok = false }) catch {};
                 continue;
             };
-            const ok = std.mem.eql(u8, &test_creds.stored_key, &job.expected_stored_key);
+            // T211 follow-up: constant-time compare for StoredKey (the
+            // reference in scram.zig uses the same pattern).
+            const ok = std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, job.expected_stored_key);
 
             {
                 self.completion_mutex.lock();

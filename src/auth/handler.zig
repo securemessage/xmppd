@@ -500,7 +500,8 @@ pub fn AuthHandler(comptime Store: type) type {
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
-                if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
+                // T211 follow-up: constant-time compare for StoredKey.
+                if (!std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, creds.stored_key)) {
                     log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
                     if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
