@@ -55,7 +55,7 @@ pub fn main() !void {
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
     var db_path: []const u8 = "/var/db/xmppd";
-    var map_size_mb: usize = 64;
+    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9 review)
 
     _ = args.next(); // Skip argv[0]
 

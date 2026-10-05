@@ -35,8 +35,10 @@ pub const OpenOptions = struct {
     /// LMDB map size in bytes (ignored by other backends). Never resized at
     /// runtime (S9: LMDB forbids env resize with concurrent readers); a
     /// daemon hitting MDB_MAP_FULL must be restarted with a larger value
-    /// (config key: [server] lmdb_map_size_mb).
-    map_size: usize = 64 * 1024 * 1024,
+    /// (config key: [server] lmdb_map_size_mb). Default 8 GiB: address space
+    /// is cheap on amd64, growth is preallocated sparse pages, and v0.8.x
+    /// production DBs already exceed 64 MiB (S9 review).
+    map_size: usize = 8 * 1024 * 1024 * 1024,
 
     /// Create the database/directory if it doesn't exist.
     create: bool = true,
@@ -384,7 +386,9 @@ test "MemoryBackend: separate namespaces" {
 test "OpenOptions defaults" {
     const opts = OpenOptions{};
     try std.testing.expectEqual(@as(u32, 16), opts.max_namespaces);
-    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), opts.map_size);
+    // 8 GiB default (S9 review): headroom for existing production DBs that
+    // already exceed 64 MiB; sparse maps cost address space only.
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
     try std.testing.expect(opts.create);
     try std.testing.expect(!opts.read_only);
 }
