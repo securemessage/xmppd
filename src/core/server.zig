@@ -5073,7 +5073,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     // here. The pattern is split so this test does not match itself.
     const needle = "conn.queue" ++ "Send(";
     const cases = .{
-        .{ "connection.zig", @embedFile("connection.zig"), 7 }, // Connection layer self-tests; no Session.
+        .{ "connection.zig", @embedFile("connection.zig"), 10 }, // Connection layer self-tests; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.

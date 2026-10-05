@@ -427,11 +427,12 @@ pub const Connection = struct {
     // --- Private helpers ---
 
     fn compactWriteBuf(self: *Connection) void {
-        // A TLS write retried after WANT_WRITE must use the same buffer
-        // address; moving it gives "bad write retry" (or corrupt data with
-        // kTLS). TLS writes are all-or-nothing, so write_start is already 0
-        // whenever a retry is pending and this is a no-op by construction.
-        if (self.tls_conn != null) return;
+        // A TLS write retried after WANT_WRITE must keep the pinned
+        // (pointer, length) pair; moving it gives "bad write retry" (or
+        // corrupt data with kTLS). Only an active pin blocks compaction:
+        // gating on tls_conn left write_start to creep until queueSend
+        // failed with the front of the buffer free.
+        if (self.tls_write_pending != 0) return;
         if (self.write_start == 0) return;
         const remaining = self.write_end - self.write_start;
         if (remaining > 0) {
@@ -727,4 +728,89 @@ test "S23: TLS write retry resends only the pinned slice" {
     try std.testing.expectEqualSlices(u8, b, received.items[a.len..]);
     try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
     try std.testing.expect(!server_conn.hasPendingWrite());
+}
+
+test "S23: TLS connection with no pinned retry compacts the write buffer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+
+    const fds = try makeSocketPair();
+    var server_conn = Connection.init(fds[0], 1);
+    defer server_conn.close();
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try server_conn.upgradeToTls(server_ctx);
+
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(server_conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch {};
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(server_conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    {
+        const sndbuf: c_int = 1024;
+        try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+        try posix.setsockopt(fds[1], posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&sndbuf));
+    }
+
+    const a = "A" ** 12000;
+    const b = "B" ** 512;
+    try server_conn.queueSend(a);
+    try std.testing.expectError(error.WouldBlock, server_conn.flushSend());
+    try std.testing.expectEqual(@as(usize, a.len), server_conn.tls_write_pending);
+    try server_conn.queueSend(b);
+
+    // Drain only the pinned slice, then stop: write_start has crept past
+    // 0 with no retry pinned.
+    var received = std.ArrayList(u8){};
+    defer received.deinit(allocator);
+    var rbuf: [16384]u8 = undefined;
+    iter = 0;
+    while (iter < 100000) : (iter += 1) {
+        _ = server_conn.flushSend() catch {};
+        if (server_conn.tls_write_pending == 0 and server_conn.write_start > 0) break;
+        switch (client_tls.read(&rbuf) catch .want_read) {
+            .ok => |n| try received.appendSlice(allocator, rbuf[0..n]),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
+    try std.testing.expectEqual(a.len, server_conn.write_start);
+    try std.testing.expectEqual(a.len + b.len, server_conn.write_end);
+
+    // Fewer than c.len bytes remain at the tail; queueSend must compact
+    // the freed front instead of failing WriteBufferFull.
+    const c = "C" ** 4096;
+    try server_conn.queueSend(c);
+    try std.testing.expectEqual(@as(usize, 0), server_conn.write_start);
+    try std.testing.expectEqual(b.len + c.len, server_conn.write_end);
+
+    // Everything queued still arrives, in order.
+    iter = 0;
+    while (iter < 100000 and received.items.len < a.len + b.len + c.len) : (iter += 1) {
+        _ = server_conn.flushSend() catch {};
+        switch (client_tls.read(&rbuf) catch .want_read) {
+            .ok => |n| try received.appendSlice(allocator, rbuf[0..n]),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(a.len + b.len + c.len, received.items.len);
+    try std.testing.expectEqualSlices(u8, a, received.items[0..a.len]);
+    try std.testing.expectEqualSlices(u8, b, received.items[a.len..][0..b.len]);
+    try std.testing.expectEqualSlices(u8, c, received.items[a.len + b.len ..]);
 }
