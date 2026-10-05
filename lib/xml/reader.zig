@@ -95,6 +95,12 @@ const max_ns_bindings = 16;
 /// so push and pop can never desync (S12).
 pub const max_ns_depth = 64;
 
+/// Retained capacity limits for the two arenas after a reset, so one
+/// oversized stanza (or stream header) cannot pin a large buffer for the
+/// life of the connection (S26). Sized well above the server's stanza cap.
+const max_arena_retain = 64 * 1024;
+const max_ns_arena_retain = 4 * 1024;
+
 const NsBinding = struct {
     prefix: []const u8,
     uri: []const u8,
@@ -121,6 +127,11 @@ pub const Reader = struct {
     /// Sized to max_ns_depth so any depth a consumer allows stays synced (S12).
     ns_stack: [max_ns_depth][]const u8 = undefined,
     ns_stack_depth: u32 = 0,
+    /// Open-element name stack: element_open_end pushes, element_close pops
+    /// and must match. A close with no match is stray or mismatched and a
+    /// not-well-formed error (S11).
+    elem_names: [max_ns_depth][]const u8 = undefined,
+    elem_depth: u32 = 0,
     /// Whether we're inside the stream element
     stream_opened: bool = false,
     /// Arena for element/attribute data; reset at every top-level stanza
@@ -167,8 +178,10 @@ pub const Reader = struct {
                         // New top-level stanza: everything the reader
                         // produced for the previous stanza dies here. The
                         // stream-level namespace context lives in ns_arena
-                        // and survives (S11).
-                        _ = self.arena.reset(.retain_capacity);
+                        // and survives (S11). Retained capacity is bounded
+                        // so one giant stanza does not inflate the arena
+                        // for the life of the stream (S26).
+                        _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
                     }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
@@ -210,6 +223,9 @@ pub const Reader = struct {
                 },
                 .element_open_end => {
                     self.depth += 1;
+                    if (self.elem_depth >= self.elem_names.len) return error.TooDeep;
+                    self.elem_names[self.elem_depth] = self.current_element_name;
+                    self.elem_depth += 1;
                     const elem = self.buildElement(false);
                     // For non-self-closing elements, namespace is restored on element_close
 
@@ -264,9 +280,16 @@ pub const Reader = struct {
                     return Event{ .element_start = elem };
                 },
                 .element_close => {
-                    if (self.depth > 0) {
-                        self.depth -= 1;
+                    // The close must match the innermost open element: a
+                    // stray or mismatched close would otherwise desync depth
+                    // and defeat the per-stanza arena reset (S11).
+                    if (self.elem_depth == 0 or
+                        !std.mem.eql(u8, self.elem_names[self.elem_depth - 1], token.name))
+                    {
+                        return error.MismatchedCloseTag;
                     }
+                    self.elem_depth -= 1;
+                    self.depth -= 1;
                     // Pop the ns scope mark: any prefix bound inside this
                     // element's tag disappears with the element.
                     if (self.ns_mark_depth > 0) {
@@ -290,8 +313,15 @@ pub const Reader = struct {
                     return Event{ .element_end = try self.arenaDupe(token.name) };
                 },
                 .text => {
+                    // Text outside a stanza (inter-stanza whitespace) is
+                    // forwarded without an arena copy so a peer cannot grow
+                    // the arena between stanzas (S11); its payload is
+                    // scanner-owned and dies at the next next() call.
                     if (token.name.len > 0) {
-                        return Event{ .text = try self.arenaDupe(token.name) };
+                        if (self.depth >= 2) {
+                            return Event{ .text = try self.arenaDupe(token.name) };
+                        }
+                        return Event{ .text = token.name };
                     }
                 },
                 .eof => return null,
@@ -349,6 +379,7 @@ pub const Reader = struct {
     /// XML stream can be parsed from scratch.
     pub fn reset(self: *Reader) void {
         self.depth = 0;
+        self.elem_depth = 0;
         self.stream_opened = false;
         self.default_ns = "";
         self.ns_stack_depth = 0;
@@ -358,8 +389,8 @@ pub const Reader = struct {
         self.current_element_prefix = "";
         self.current_element_local = "";
         self.attrs.clearRetainingCapacity();
-        _ = self.arena.reset(.retain_capacity);
-        _ = self.ns_arena.reset(.retain_capacity);
+        _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
+        _ = self.ns_arena.reset(.{ .retain_with_limit = max_ns_arena_retain });
         self.scan.reset();
     }
 };
@@ -740,3 +771,83 @@ test "escapeWrite encodes the five escapables (S1)" {
 test "scanner tests" {
     _ = scanner;
 }
+
+test "reader: S11 mismatched close tag is not-well-formed" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<message to='a@b'><body>hi</body></iq>";
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch |err| {
+            try std.testing.expectEqual(error.MismatchedCloseTag, err);
+            return;
+        };
+        if (ev == null) return error.ExpectedError;
+    }
+}
+
+test "reader: S11 stray close tag at stream level is not-well-formed" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "</junk>";
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch |err| {
+            try std.testing.expectEqual(error.MismatchedCloseTag, err);
+            return;
+        };
+        if (ev == null) return error.ExpectedError;
+    }
+}
+
+test "reader: S11 inter-stanza whitespace is not copied into the arena" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const padding = " " ** (128 * 1024);
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<presence/>" ++ padding ++ "<presence/>";
+    var pos: usize = 0;
+    var text_len: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch return error.UnexpectedError;
+        if (ev == null) return error.ExpectedText;
+        switch (ev.?) {
+            // Inter-stanza text is forwarded but never arena-copied (S11).
+            // Stop before the next element_open, which resets (and shrinks)
+            // the arena.
+            .text => |t| {
+                text_len += t.len;
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(text_len >= padding.len);
+    try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
+}
+
+test "reader: S11 comments are rejected as restricted XML" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<!-- hello --><presence/>";
+    var pos: usize = 0;
+    while (true) {
+        const ev = reader.next(input, &pos) catch |err| {
+            try std.testing.expectEqual(error.ForbiddenXmlConstruct, err);
+            return;
+        };
+        if (ev == null) return error.ExpectedError;
+    }
+}
+

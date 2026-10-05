@@ -62,8 +62,6 @@ const State = enum {
     xml_decl,
     /// After `<!`, waiting for `--` to confirm comment
     bang_start,
-    /// Reading a comment `<!-- ... -->`
-    comment,
     /// Reading an entity reference (`&...;`) in text content
     entity_content,
     /// Reading an entity reference (`&...;`) in attribute value
@@ -340,32 +338,11 @@ pub const Scanner = struct {
                     }
                 },
                 .bang_start => {
-                    // After `<!`, expect `--` for comment start.
-                    // Anything else (DOCTYPE, ENTITY, CDATA) is forbidden in XMPP.
+                    // After `<!`: comments, DOCTYPE, ENTITY and CDATA are all
+                    // forbidden in XMPP (RFC 6120 §11.1 restricted XML).
                     try self.buf.append(a, c);
                     if (self.buf.items.len == 2) {
-                        if (self.buf.items[0] == '-' and self.buf.items[1] == '-') {
-                            // Valid comment start `<!--`
-                            self.buf.clearRetainingCapacity();
-                            self.state = .comment;
-                        } else {
-                            // Forbidden: <!DOCTYPE, <!ENTITY, <![CDATA[, etc.
-                            // RFC 6120 §11.1: "a server MUST NOT process XML entity
-                            // references" and DTDs are forbidden.
-                            return error.ForbiddenXmlConstruct;
-                        }
-                    }
-                },
-                .comment => {
-                    // Consume comment until `-->`
-                    if (c == '>' and self.buf.items.len >= 2 and
-                        self.buf.items[self.buf.items.len - 1] == '-' and
-                        self.buf.items[self.buf.items.len - 2] == '-')
-                    {
-                        self.buf.clearRetainingCapacity();
-                        self.state = .content;
-                    } else {
-                        try self.buf.append(a, c);
+                        return error.ForbiddenXmlConstruct;
                     }
                 },
                 .entity_content => {
@@ -751,18 +728,15 @@ test "CDATA rejected" {
     try std.testing.expectError(error.ForbiddenXmlConstruct, result);
 }
 
-test "XML comment allowed" {
+test "XML comments are rejected as restricted XML" {
     const allocator = std.testing.allocator;
     var scanner = Scanner.init(allocator);
     defer scanner.deinit();
 
+    // RFC 6120 §11.1 restricted XML forbids comments.
     const input = "<!-- this is a comment --><presence/>";
     var pos: usize = 0;
-
-    // Comment is consumed silently, next token should be the element
-    const tok = (try scanner.next(input, &pos)).?;
-    try std.testing.expectEqual(TokenType.element_open, tok.type);
-    try std.testing.expectEqualStrings("presence", tok.name);
+    try std.testing.expectError(error.ForbiddenXmlConstruct, scanner.next(input, &pos));
 }
 
 test "S21: names outside the XML Name production are rejected" {

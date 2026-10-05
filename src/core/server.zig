@@ -1496,11 +1496,20 @@ pub const Server = struct {
             if (std.mem.eql(u8, elem.local_name, "iq")) {
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "id")) {
-                        session.bind_iq_id = attr.value;
+                        // An id too long to mirror must not be staged
+                        // truncated: the client would get back a different
+                        // id than it sent (S11).
+                        if (attr.value.len > session.bind_iq_id_buf.len) {
+                            log.warn("connection {d} bind id exceeds {d} bytes, policy-violation", .{ session.conn.id, session.bind_iq_id_buf.len });
+                            self.sendStreamError(session, .policy_violation);
+                            session.conn.flushSync();
+                            session_lifecycle.forceCloseSession(self, session.conn.id, changes);
+                            return;
+                        }
                         // Keep a session-owned copy and swap the pointer onto
                         // it: the reader slice is gone by the next stanza and
                         // the cross-worker kick path answers later (T220).
-                        const n = @min(attr.value.len, session.bind_iq_id_buf.len);
+                        const n = attr.value.len;
                         @memcpy(session.bind_iq_id_buf[0..n], attr.value[0..n]);
                         session.bind_iq_id_len = n;
                         session.bind_iq_id = session.bind_iq_id_buf[0..n];
@@ -4985,4 +4994,120 @@ test "S14: failed cross-worker resource does not block local delivery" {
     var abuf: [1024]u8 = undefined;
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), an);
+}
+
+test "Server: S11 stray close tag closes the stream not-well-formed" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    // A close tag with no matching open: depth must not desync.
+    _ = try posix.write(fds[1], "</junk>");
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "not-well-formed") != null);
+}
+
+test "Server: S11 overlong bind id is rejected, not truncated" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .features_bind;
+    const long_id = "i" ** 300;
+    const iq = "<iq type='set' id='" ++ long_id ++ "'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></iq>";
+    _ = try posix.write(fds[1], iq);
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "policy-violation") != null);
+}
+
+test "Server: S11 register flow iq ids survive the reader-arena reset" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [8192]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    // Registration is handled pre-auth; the TLS-offering state would
+    // demand STARTTLS first.
+    session.stream.state = .features_sasl;
+
+    _ = try posix.write(fds[1], "<iq type='get' id='reg1'><query xmlns='jabber:iq:register'/></iq>");
+    server.handleReadable(1, &changes);
+    const n1 = posix.read(fds[1], &drain_buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n1], "id='reg1'") != null);
+
+    // The next stanza resets the reader arena the id slice came from; the
+    // mirrored id in the reply must still be the client's.
+    _ = try posix.write(fds[1], "<iq type='get' id='reg2-longer-id'><query xmlns='jabber:iq:register'/></iq>");
+    server.handleReadable(1, &changes);
+    const n2 = posix.read(fds[1], &drain_buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n2], "id='reg2-longer-id'") != null);
+    try std.testing.expect(server.sessions[1] != null);
+}
+
+
+// Force analysis of sibling files whose tests otherwise never run.
+test {
+    _ = iq_handler;
 }
