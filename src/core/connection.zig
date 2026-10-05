@@ -636,7 +636,7 @@ test "Connection: flushSync makes short-write progress then exits bounded" {
 
     // Progress happened (a short write drained into the freed space) but
     // the peer never reads the rest, so flushSync must exit via its
-    // attempt cap with data still pending — never spin forever.
+    // attempt cap with data still pending, never spin forever.
     try std.testing.expect(conn.hasPendingWrite());
     var all: [262144]u8 = undefined;
     var total: usize = 0;

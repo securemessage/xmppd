@@ -1278,7 +1278,7 @@ pub const Server = struct {
             // upgrade; any further plaintext, in this segment or a later
             // one, is a protocol violation (RFC 6120 5.4.3.2).
             if (session.stream.state == .starttls_pending) {
-                log.info("connection {d} plaintext while STARTTLS pending — policy-violation", .{id});
+                log.info("connection {d} plaintext while STARTTLS pending: policy-violation", .{id});
                 self.sendStreamError(session, .policy_violation);
                 session.conn.flushSync();
                 session_lifecycle.forceCloseSession(self, id, changes);
