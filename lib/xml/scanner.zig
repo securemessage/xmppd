@@ -50,6 +50,8 @@ const State = enum {
     tag_attributes,
     /// Reading attribute name
     attr_name,
+    /// After an attribute name, skipping whitespace before `=`
+    attr_name_ws,
     /// After `=`, before attribute value quote
     attr_value_start,
     /// Reading attribute value
@@ -178,6 +180,7 @@ pub const Scanner = struct {
                 .tag_name => {
                     if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
                         self.state = .tag_attributes;
+                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
                         const name = try self.dupeAndClear(&self.buf);
                         const parsed = splitPrefixLocal(name);
                         return Token{
@@ -188,6 +191,7 @@ pub const Scanner = struct {
                         };
                     } else if (c == '>') {
                         self.state = .content;
+                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
                         const name = try self.dupeAndClear(&self.buf);
                         const parsed = splitPrefixLocal(name);
                         if (self.saw_slash) {
@@ -236,9 +240,24 @@ pub const Scanner = struct {
                 },
                 .attr_name => {
                     if (c == '=') {
+                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
                         self.state = .attr_value_start;
+                    } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                        // Whitespace before '=' is legal XML; do not fold it
+                        // into the attribute name.
+                        self.state = .attr_name_ws;
                     } else {
                         try self.buf.append(a, c);
+                    }
+                },
+                .attr_name_ws => {
+                    if (c == '=') {
+                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
+                        self.state = .attr_value_start;
+                    } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                        // Skip whitespace between name and '='
+                    } else {
+                        return error.InvalidName;
                     }
                 },
                 .attr_value_start => {
@@ -263,6 +282,8 @@ pub const Scanner = struct {
                                 .local_name = "",
                             };
                         } else if (std.mem.startsWith(u8, attr_name, "xmlns:")) {
+                            // An empty prefix is not a valid NCName.
+                            if (attr_name.len == 6) return error.InvalidName;
                             return Token{
                                 .type = .namespace_decl,
                                 .name = attr_name,
@@ -291,6 +312,7 @@ pub const Scanner = struct {
                 .close_tag_name => {
                     if (c == '>') {
                         self.state = .content;
+                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
                         const name = try self.dupeAndClear(&self.buf);
                         const parsed = splitPrefixLocal(name);
                         return Token{
@@ -445,6 +467,31 @@ pub fn isXmlChar(cp: u21) bool {
         (cp >= 0x20 and cp <= 0xD7FF) or
         (cp >= 0xE000 and cp <= 0xFFFD) or
         (cp >= 0x10000 and cp <= 0x10FFFF);
+}
+
+/// XML 1.0 NameStartChar, ASCII range enforced byte-wise; bytes >= 0x80 are
+/// accepted as UTF-8 name characters (full Unicode range tables are out of
+/// scope for a tokenizer). ':' stays valid so prefixed names parse.
+fn isNameStartChar(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+        c == '_' or c == ':' or c >= 0x80;
+}
+
+/// XML 1.0 NameChar (see isNameStartChar for the non-ASCII policy).
+fn isNameChar(c: u8) bool {
+    return isNameStartChar(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
+}
+
+/// A name token is re-emitted verbatim in accumulated XML, so anything
+/// outside the XML Name production (quotes, '<', ...) must be rejected here
+/// or it can inject markup downstream (S21).
+fn isValidXmlName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isNameStartChar(name[0])) return false;
+    for (name[1..]) |c| {
+        if (!isNameChar(c)) return false;
+    }
+    return true;
 }
 
 // --- Tests ---
@@ -716,4 +763,55 @@ test "XML comment allowed" {
     const tok = (try scanner.next(input, &pos)).?;
     try std.testing.expectEqual(TokenType.element_open, tok.type);
     try std.testing.expectEqualStrings("presence", tok.name);
+}
+
+test "S21: names outside the XML Name production are rejected" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        // '<' inside an element name would be re-emitted verbatim and could
+        // open a new element downstream.
+        "<foo<bar a='1'/>",
+        // Quote inside an attribute name.
+        "<a b'c='1'/>",
+        // Quote inside a close tag name.
+        "</a'>",
+        // Empty xmlns prefix.
+        "<a xmlns:='urn:x'/>",
+    };
+    for (cases) |input| {
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+        var pos: usize = 0;
+        var got_error = false;
+        for (0..8) |_| {
+            _ = scanner.next(input, &pos) catch |err| {
+                try std.testing.expectEqual(error.InvalidName, err);
+                got_error = true;
+                break;
+            } orelse break;
+        }
+        try std.testing.expect(got_error);
+    }
+}
+
+test "S21: legal names still parse, including utf8 and whitespace before =" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+    const input = "<stream:stream xml:lang ='en' data-x.y_z='\xc3\xa9'/>";
+    var pos: usize = 0;
+
+    const open_tok = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.element_open, open_tok.type);
+    try std.testing.expectEqualStrings("stream:stream", open_tok.name);
+
+    const lang = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.attribute, lang.type);
+    try std.testing.expectEqualStrings("xml:lang", lang.name);
+    try std.testing.expectEqualStrings("en", lang.value);
+
+    const data = (try scanner.next(input, &pos)).?;
+    try std.testing.expectEqual(TokenType.attribute, data.type);
+    try std.testing.expectEqualStrings("data-x.y_z", data.name);
 }
