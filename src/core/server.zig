@@ -3202,13 +3202,14 @@ pub const Server = struct {
         const mcast_payload = mcast_buf[0..mcast_len];
 
         // Iterate set bits in worker_mask, excluding self
-        var mask = room.worker_mask & ~(@as(u16, 1) << @intCast(self.worker_id));
-        while (mask != 0) {
-            const bit: u4 = @intCast(@ctz(mask));
-            ds.deliver(bit, delivery_queue_mod.MULTICAST_SENTINEL, 0, mcast_payload) catch |err| {
-                log.warn("multicast delivery failed to worker {d}: {}", .{ bit, err });
+        var mask = room.worker_mask;
+        mask.unset(self.worker_id);
+        var mask_it = mask.iterator(.{});
+        while (mask_it.next()) |bit| {
+            const wid: u16 = @intCast(bit);
+            ds.deliver(wid, delivery_queue_mod.MULTICAST_SENTINEL, 0, mcast_payload) catch |err| {
+                log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
             };
-            mask &= mask - 1; // clear lowest set bit
         }
     }
 

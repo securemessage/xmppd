@@ -970,7 +970,7 @@ fn handleJoin(
         @memcpy(existing.real_jid_buf[0..rjlen], real_jid[0..rjlen]);
         existing.real_jid_len = rjlen;
         // Update worker mask for new resource's worker
-        r.worker_mask |= (@as(u16, 1) << @intCast(server.worker_id));
+        r.worker_mask.set(server.worker_id);
         // Send self-presence to confirm the resource takeover
         sendSelfPresence(server, session, r, nick, muc_host, changes);
         log.info("{s} collapsed into existing occupant '{s}' in {s}", .{ real_jid, nick, room_jid });
