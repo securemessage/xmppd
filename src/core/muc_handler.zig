@@ -963,15 +963,8 @@ fn handleJoin(
         // Same user, same nick, different resource → collapse (latest resource wins)
         const local_sid: usize = session.conn.id;
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
-        existing.session_id = local_sid;
-        existing.worker_id = server.worker_id;
-        existing.generation = join_gen;
-        // Update the real JID to the new resource
-        const rjlen: u8 = @intCast(@min(real_jid.len, existing.real_jid_buf.len));
-        @memcpy(existing.real_jid_buf[0..rjlen], real_jid[0..rjlen]);
-        existing.real_jid_len = rjlen;
-        // Update worker mask for new resource's worker
-        r.worker_mask.set(server.worker_id);
+        // Re-keys jid_map and fixes worker_mask (T256).
+        r.collapseOccupant(existing_idx, real_jid, server.worker_id, local_sid, join_gen);
         // Send self-presence to confirm the resource takeover
         sendSelfPresence(server, session, r, nick, muc_host, changes);
         log.info("{s} collapsed into existing occupant '{s}' in {s}", .{ real_jid, nick, room_jid });

@@ -235,6 +235,28 @@ pub const Room = struct {
         return self.removeOccupant(idx);
     }
 
+    /// XEP-0045 7.2.14 nick collapse: the occupant at `index` takes the
+    /// nick over from a new resource. Re-keys jid_map (its key points
+    /// into the occupant's real_jid_buf, whose bytes are about to
+    /// change) and fixes worker_mask for the new worker (T256).
+    pub fn collapseOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_worker: u16, new_session: usize, new_generation: u32) void {
+        if (index >= MAX_OCCUPANTS) return;
+        const occ = &(self.occupants[index] orelse return);
+        const old_worker = occ.worker_id;
+        const slot_idx: u8 = @intCast(index);
+        _ = self.jid_map.fetchRemove(occ.getRealJid());
+        occ.setRealJid(new_real_jid);
+        self.jid_map.put(self.allocator, occ.getRealJid(), slot_idx) catch {};
+        occ.session_id = new_session;
+        occ.worker_id = new_worker;
+        occ.generation = new_generation;
+        std.debug.assert(new_worker < MAX_WORKERS);
+        self.worker_mask.set(new_worker);
+        if (!self.hasOccupantOnWorker(old_worker)) {
+            self.worker_mask.unset(old_worker);
+        }
+    }
+
     /// Move an occupant to another (worker, session, generation) — the
     /// SM-resume migration (T177). The occupant's identity (nick, role,
     /// affiliation, JIDs) is unchanged; only the delivery triple moves.
@@ -567,6 +589,36 @@ test "Room: updateOccupantMove clears old worker bit when last local occupant le
     // Unknown occupant: null, mask untouched
     try std.testing.expect(room.updateOccupantMove("ghost@localhost/x", 0, 1, 1) == null);
     try std.testing.expectEqual(@as(u64, 0b1000), room.worker_mask.mask);
+}
+
+test "Room: T256 collapseOccupant re-keys jid_map and fixes worker_mask" {
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 7, .participant, .none);
+    try std.testing.expectEqual(@as(u64, 0b1), room.worker_mask.mask);
+
+    // The nick collapses onto a new resource on another worker.
+    room.collapseOccupant(idx, "alice@localhost/desktop", 2, 41, 3);
+
+    // jid_map follows the new real JID; the old key is gone.
+    try std.testing.expectEqual(idx, room.findByRealJid("alice@localhost/desktop").?);
+    try std.testing.expect(room.findByRealJid("alice@localhost/mobile") == null);
+    try std.testing.expectEqualStrings("alice@localhost/desktop", room.occupants[idx].?.getRealJid());
+    const occ = room.occupants[idx].?;
+    try std.testing.expectEqual(@as(u16, 2), occ.worker_id);
+    try std.testing.expectEqual(@as(usize, 41), occ.session_id);
+    try std.testing.expectEqual(@as(u32, 3), occ.generation);
+    // Old worker's bit cleared (no other occupant there), new one set.
+    try std.testing.expectEqual(@as(u64, 0b100), room.worker_mask.mask);
+
+    // Parting via the NEW real JID actually removes the occupant.
+    try std.testing.expect(room.removeByRealJid("alice@localhost/desktop") != null);
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    try std.testing.expectEqual(@as(u64, 0), room.worker_mask.mask);
+    try std.testing.expect(room.findByNick("alice") == null);
 }
 
 test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {
