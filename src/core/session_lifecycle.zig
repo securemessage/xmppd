@@ -93,7 +93,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
     // the original stream-state-machine behavior.
     if (session.stream.state != .features_bind) {
         const action = session.stream.handleBind(resource);
-        server.executeAction(session, action);
+        server.executeAction(session, action, changes);
         return true;
     }
 
@@ -106,13 +106,13 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
     const eff_resource: []const u8 = if (resource.len > 0) resource else "default";
     const local = session.stream.authenticated_jid orelse {
         const action = session.stream.handleBind(resource);
-        server.executeAction(session, action);
+        server.executeAction(session, action, changes);
         return true;
     };
 
     if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource)) |_| {
         const action = session.stream.handleBind(eff_resource);
-        server.executeAction(session, action);
+        server.executeAction(session, action, changes);
         log.info("connection {d} session established: {s}@{s}/{s}", .{
             session.conn.id, local.local, local.domain, eff_resource,
         });
@@ -143,7 +143,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
                     return false;
                 };
                 const action = session.stream.handleBind(eff_resource);
-                server.executeAction(session, action);
+                server.executeAction(session, action, changes);
                 log.info("connection {d} session established (evicted stale resource): {s}@{s}/{s}", .{
                     session.conn.id, local.local, local.domain, eff_resource,
                 });
@@ -198,7 +198,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
     const bind_and_finish = struct {
         fn run(srv: *Server, sess: *Session, res: []const u8, changes_: *ChangeList) void {
             const action = sess.stream.handleBind(res);
-            srv.executeAction(sess, action);
+            srv.executeAction(sess, action, changes_);
             log.info("connection {d} session established (kicked remote resource)", .{sess.conn.id});
             if (sess.conn.hasPendingWrite()) {
                 _ = sess.conn.flushSend() catch {};

@@ -812,7 +812,7 @@ pub const Server = struct {
             if (session.auth_state == .none) continue;
             session.auth_state = .none;
             session.sasl_collecting = .none;
-            self.executeAction(session, session.stream.saslFailure("temporary-auth-failure"));
+            self.executeAction(session, session.stream.saslFailure("temporary-auth-failure"), changes);
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
@@ -1272,6 +1272,17 @@ pub const Server = struct {
                 return;
             }
 
+            // T215: while <proceed/> is queued the peer must wait for the
+            // upgrade; any further plaintext, in this segment or a later
+            // one, is a protocol violation (RFC 6120 5.4.3.2).
+            if (session.stream.state == .starttls_pending) {
+                log.info("connection {d} plaintext while STARTTLS pending — policy-violation", .{id});
+                self.sendStreamError(session, .policy_violation);
+                session.conn.flushSync();
+                session_lifecycle.forceCloseSession(self, id, changes);
+                return;
+            }
+
             var pos: usize = 0;
 
             while (true) {
@@ -1368,8 +1379,6 @@ pub const Server = struct {
     }
 
     fn handleStreamOpen(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
-        _ = changes;
-
         // Extract 'to' attribute
         var to: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1380,7 +1389,7 @@ pub const Server = struct {
         }
 
         const action = session.stream.handleStreamOpen(to, "1.0");
-        self.executeAction(session, action);
+        self.executeAction(session, action, changes);
     }
 
     /// Verdict of enforcePreBindStanzaPolicy (T182).
@@ -1508,7 +1517,7 @@ pub const Server = struct {
             if (std.mem.eql(u8, elem.local_name, "starttls")) {
                 if (elem.self_closing) {
                     const action = session.stream.handleStarttls();
-                    self.executeAction(session, action);
+                    self.executeAction(session, action, changes);
                 } else {
                     // <starttls></starttls> form: trigger on the close tag so
                     // the read-ahead check (T215) sees a complete element.
@@ -1521,7 +1530,7 @@ pub const Server = struct {
         // SASL namespace
         if (std.mem.eql(u8, ns, xml.ns.sasl)) {
             if (std.mem.eql(u8, elem.local_name, "auth")) {
-                self.handleSaslAuth(session, elem);
+                self.handleSaslAuth(session, elem, changes);
             } else if (std.mem.eql(u8, elem.local_name, "response")) {
                 // Start collecting SCRAM response text
                 session.sasl_collecting = .response;
@@ -1815,7 +1824,7 @@ pub const Server = struct {
             const local = if (std.mem.lastIndexOfScalar(u8, name, ':')) |c| name[c + 1 ..] else name;
             if (std.mem.eql(u8, local, "starttls")) {
                 const action = session.stream.handleStarttls();
-                self.executeAction(session, action);
+                self.executeAction(session, action, changes);
                 return;
             }
         }
@@ -1977,7 +1986,7 @@ pub const Server = struct {
     // SASL handling (via auth daemon IPC)
     // ========================================================================
 
-    fn handleSaslAuth(self: *Server, session: *Session, elem: xml.Element) void {
+    fn handleSaslAuth(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
         // Get mechanism from attribute
         var mechanism: []const u8 = "";
         for (elem.attributes) |attr| {
@@ -1996,20 +2005,19 @@ pub const Server = struct {
                 session.sasl_buf_len = 0;
                 session.sasl_mechanism = mechanism;
             },
-            else => self.executeAction(session, action),
+            else => self.executeAction(session, action, changes),
         }
     }
 
     /// Called when </auth> is reached — we have the full base64 payload.
     fn processSaslAuthComplete(self: *Server, session: *Session, changes: *ChangeList) void {
-        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
             log.warn("connection {d} auth request but no auth daemon", .{session.conn.id});
             // Retryable: the reconnect timer re-links the auth daemon.
             const fail_action = session.stream.saslFailure("temporary-auth-failure");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         }
 
@@ -2019,14 +2027,14 @@ pub const Server = struct {
         const decoded = b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL auth", .{session.conn.id});
             const fail_action = session.stream.saslFailure("not-authorized");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         };
 
         // Determine mechanism ID
         const mech_id = ipc_protocol.MechanismId.fromName(session.sasl_mechanism) orelse {
             const fail_action = session.stream.saslFailure("not-authorized");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         };
 
@@ -2050,7 +2058,7 @@ pub const Server = struct {
         }) catch {
             log.err("connection {d} failed to send auth request via IPC", .{session.conn.id});
             const fail_action = session.stream.saslFailure("temporary-auth-failure");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         };
 
@@ -2061,12 +2069,11 @@ pub const Server = struct {
 
     /// Called when </response> is reached — we have the full SCRAM response.
     fn processSaslResponseComplete(self: *Server, session: *Session, changes: *ChangeList) void {
-        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
         session.sasl_collecting = .none;
 
         if (!self.ipc.connected) {
             const fail_action = session.stream.saslFailure("temporary-auth-failure");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         }
 
@@ -2076,7 +2083,7 @@ pub const Server = struct {
         const decoded = b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL response", .{session.conn.id});
             const fail_action = session.stream.saslFailure("not-authorized");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         };
 
@@ -2087,7 +2094,7 @@ pub const Server = struct {
         } }) catch {
             log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
             const fail_action = session.stream.saslFailure("temporary-auth-failure");
-            self.executeAction(session, fail_action);
+            self.executeAction(session, fail_action, changes);
             return;
         };
 
@@ -2297,7 +2304,7 @@ pub const Server = struct {
                 }
 
                 const success_action = session.stream.saslSuccess(stable_username, server_final_b64);
-                self.executeAction(session, success_action);
+                self.executeAction(session, success_action, changes);
                 session.resetSasl();
                 if (session.conn.hasPendingWrite()) {
                     // Flush immediately rather than deferring to kqueue
@@ -2320,7 +2327,7 @@ pub const Server = struct {
             .auth_failure => |m| {
                 log.info("connection {d} auth failed: {s}", .{ conn_id, m.reason });
                 const fail_action = session.stream.saslFailure(m.reason);
-                self.executeAction(session, fail_action);
+                self.executeAction(session, fail_action, changes);
                 session.resetSasl();
 
                 if (session.conn.hasPendingWrite()) {
@@ -2942,7 +2949,7 @@ pub const Server = struct {
     // Execute StreamAction — write XML responses
     // ========================================================================
 
-    pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction) void {
+    pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction, changes: *ChangeList) void {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const writer = fbs.writer();
 
@@ -2972,7 +2979,7 @@ pub const Server = struct {
                 // completes the upgrade once the buffer drains.
                 _ = session.conn.flushSend() catch {};
                 if (session.conn.hasPendingWrite()) return;
-                self.startTlsUpgrade(session);
+                self.startTlsUpgrade(session, changes);
             },
             .send_sasl_success => |server_final| {
                 writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -3049,7 +3056,7 @@ pub const Server = struct {
             // T215: a STARTTLS upgrade deferred by backpressure starts now
             // that <proceed/> is fully on the wire.
             if (session.stream.state == .starttls_pending and !session.conn.isTlsHandshaking()) {
-                self.startTlsUpgrade(session);
+                self.startTlsUpgrade(session, changes);
             }
         }
 
@@ -3065,11 +3072,14 @@ pub const Server = struct {
     }
 
     /// Begin the TLS handshake once the plaintext <proceed/> is fully
-    /// flushed (T215). Called from executeAction and handleWritable.
-    fn startTlsUpgrade(self: *Server, session: *Session) void {
+    /// flushed (T215). Called from executeAction and handleWritable. A
+    /// failed upgrade closes the session: it would otherwise sit in
+    /// starttls_pending forever.
+    fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) void {
         if (self.ssl_ctx) |ctx| {
             session.conn.upgradeToTls(ctx) catch {
-                log.err("connection {d} TLS upgrade failed", .{session.conn.id});
+                log.warn("connection {d} TLS upgrade failed", .{session.conn.id});
+                session_lifecycle.closeSession(self, session.conn.id, changes);
                 return;
             };
             log.info("connection {d} starting TLS handshake", .{session.conn.id});
@@ -4749,6 +4759,14 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
+    // A real cert so the deferred upgrade actually starts (without it the
+    // startTlsUpgrade calls could be deleted and the test stayed green).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
@@ -4792,6 +4810,51 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     } else |_| {}
     server.handleWritable(1, &changes);
     try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // Buffer drained: the deferred upgrade has started the handshake.
+    try std.testing.expect(session.conn.tls_conn != null);
+    try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
+test "Server: T215 plaintext in a later segment while STARTTLS pending is a policy-violation" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    // <starttls/> alone: the FSM parks in starttls_pending.
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    server.handleReadable(1, &changes);
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // Plaintext in a LATER segment: the peer must send nothing until the
+    // upgrade. Reject and close (RFC 6120 5.4.3.2).
+    _ = try posix.write(fds[1], "<message to='a@b'><body>x</body></message>");
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break; // EOF: the server closed its side
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "policy-violation") != null);
 }
 
 test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" {
