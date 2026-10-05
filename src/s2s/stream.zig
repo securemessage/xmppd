@@ -93,6 +93,7 @@ pub const StreamOpenParams = struct {
 pub const StreamError = enum {
     host_unknown,
     invalid_from,
+    improper_addressing,
     not_authorized,
     invalid_namespace,
     not_well_formed,
@@ -104,6 +105,7 @@ pub const StreamError = enum {
         return switch (self) {
             .host_unknown => "host-unknown",
             .invalid_from => "invalid-from",
+            .improper_addressing => "improper-addressing",
             .not_authorized => "not-authorized",
             .invalid_namespace => "invalid-namespace",
             .not_well_formed => "not-well-formed",

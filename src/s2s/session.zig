@@ -96,6 +96,23 @@ pub const S2sSession = struct {
     /// Inbound dialback state tracker.
     inbound_dialback: dialback_mod.InboundDialback = .{},
 
+    /// Domains this session is authenticated for (S2). Written only by a
+    /// DANE-verified SASL EXTERNAL success or a dialback callback that
+    /// returned valid for that origin. A stanza's from= must be in the set
+    /// once the session is established; a restart header from= must never
+    /// re-identify the peer.
+    auth_domain_buf: [8][256]u8 = undefined,
+    auth_domain_len: [8]u16 = @splat(0),
+    auth_domain_count: usize = 0,
+    /// Domain pending DANE verification on the current TLS stream. Promoted
+    /// into the authenticated set only when the SASL EXTERNAL exchange for
+    /// it succeeds (executeAction .send_sasl_success).
+    dane_domain_buf: [256]u8 = undefined,
+    dane_domain_len: usize = 0,
+    /// Whether a stream open was already processed; any later open on this
+    /// socket is a restart (post-TLS, post-SASL, post-dialback).
+    stream_open_seen: bool = false,
+
     /// Inbound stanza accumulation — buffers child XML content for stanzas
     /// received on an established session, to be forwarded to xmppd-core via IPC.
     stanza_active: bool = false,
@@ -111,6 +128,48 @@ pub const S2sSession = struct {
     stanza_id_len: usize = 0,
     stanza_inner_buf: [16384]u8 = undefined,
     stanza_inner_len: usize = 0,
+
+    /// Record a domain as authenticated for this session (dedup,
+    /// case-insensitive). A full set drops new entries: restart with it is
+    /// rejected upstream by the from= check before FSM transitions.
+    pub fn addAuthenticatedDomain(self: *S2sSession, domain: []const u8) void {
+        if (domain.len == 0 or domain.len > 256) return;
+        if (self.isAuthenticatedDomain(domain)) return;
+        if (self.auth_domain_count >= 8) return;
+        const i = self.auth_domain_count;
+        @memcpy(self.auth_domain_buf[i][0..domain.len], domain);
+        self.auth_domain_len[i] = @intCast(domain.len);
+        self.auth_domain_count += 1;
+    }
+
+    pub fn isAuthenticatedDomain(self: *const S2sSession, domain: []const u8) bool {
+        for (self.auth_domain_buf[0..self.auth_domain_count], self.auth_domain_len[0..self.auth_domain_count]) |*buf, len| {
+            if (std.ascii.eqlIgnoreCase(buf[0..len], domain)) return true;
+        }
+        return false;
+    }
+
+    /// Stash the domain DANE is asked to verify (performInboundDane).
+    pub fn setDaneCandidate(self: *S2sSession, domain: []const u8) void {
+        const n = @min(domain.len, self.dane_domain_buf.len);
+        @memcpy(self.dane_domain_buf[0..n], domain[0..n]);
+        self.dane_domain_len = n;
+    }
+
+    /// Promote the DANE candidate into the authenticated set. Called from
+    /// the SASL-EXTERNAL success action; a no-op without a candidate.
+    pub fn promoteDaneCandidate(self: *S2sSession) void {
+        if (self.dane_domain_len > 0) {
+            self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
+        }
+    }
+
+    /// Whether a stream-restart from= is lawful: post-auth it must already
+    /// be authenticated; pre-auth (post-TLS) it must not change origin.
+    pub fn restartFromAllowed(self: *const S2sSession, from: []const u8) bool {
+        if (self.auth_domain_count > 0) return self.isAuthenticatedDomain(from);
+        return std.ascii.eqlIgnoreCase(from, self.getRemoteDomain());
+    }
 
     pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
         var session = S2sSession{
@@ -958,6 +1017,48 @@ test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still
     try std.testing.expectEqualStrings(tail, received[head_len..][0..tail.len]);
     try std.testing.expectEqual(@as(usize, 0), session.pinned_tls_len);
     try std.testing.expect(!session.hasPendingWrite());
+}
+
+test "S2sSession: authenticated-domain set (S2)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true; // no real fd
+
+    try std.testing.expectEqual(@as(usize, 0), session.auth_domain_count);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+
+    session.addAuthenticatedDomain("them.example");
+    session.addAuthenticatedDomain("OTHER.example");
+    session.addAuthenticatedDomain("them.example"); // dedup
+    try std.testing.expectEqual(@as(usize, 2), session.auth_domain_count);
+    try std.testing.expect(session.isAuthenticatedDomain("THEM.example")); // case-insensitive
+    try std.testing.expect(session.isAuthenticatedDomain("other.example"));
+    try std.testing.expect(!session.isAuthenticatedDomain("stranger.example"));
+}
+
+test "S2sSession: DANE candidate promotes only on demand (S2)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    session.setDaneCandidate("them.example");
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+    session.promoteDaneCandidate();
+    try std.testing.expect(session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sSession: restart from= pins origin until auth, then uses the set (S2)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    session.setRemoteDomain("them.example");
+    // Pre-auth restart must not change origin.
+    try std.testing.expect(session.restartFromAllowed("THEM.example"));
+    try std.testing.expect(!session.restartFromAllowed("victim.example"));
+
+    // Post-auth: only authenticated domains pass, including the victim one.
+    session.addAuthenticatedDomain("them.example");
+    try std.testing.expect(session.restartFromAllowed("them.example"));
+    try std.testing.expect(!session.restartFromAllowed("victim.example"));
+    try std.testing.expect(!session.restartFromAllowed(""));
 }
 
 test "S2sSession: isTlsHandshaking" {

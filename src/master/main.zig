@@ -60,6 +60,7 @@ pub fn main() !void {
     var s2s_enabled: bool = true;
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
+    var muc_host_cfg: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
     var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
     var run_dir: []const u8 = "/var/run/xmppd";
@@ -191,6 +192,9 @@ pub fn main() !void {
         if (std.mem.eql(u8, s2s_port, "5269")) {
             if (c.get("s2s", "port")) |v| s2s_port = v;
         }
+
+        // [muc] section (s2s federation to= served-host check)
+        if (c.get("muc", "host")) |v| muc_host_cfg = v;
 
         // [core] section — workers
         if (workers == 0) {
@@ -418,7 +422,7 @@ pub fn main() !void {
     auth_args_buf[auth_argc] = auth_socket;
     auth_argc += 1;
 
-    var s2s_args_buf: [14][]const u8 = undefined;
+    var s2s_args_buf: [16][]const u8 = undefined;
     var s2s_argc: usize = 0;
     if (config_path) |cp| {
         s2s_args_buf[s2s_argc] = "--config";
@@ -437,6 +441,14 @@ pub fn main() !void {
     s2s_args_buf[s2s_argc] = "--core-socket";
     s2s_argc += 1;
     s2s_args_buf[s2s_argc] = s2s_socket;
+    s2s_argc += 1;
+    // Served MUC host for the s2s to= check; defaults to conference.<host>.
+    var muc_host_buf: [512]u8 = undefined;
+    const muc_host: []const u8 = muc_host_cfg orelse
+        (std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch "conference");
+    s2s_args_buf[s2s_argc] = "--muc-host";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = muc_host;
     s2s_argc += 1;
     if (cert_path) |cp| {
         s2s_args_buf[s2s_argc] = "--cert";

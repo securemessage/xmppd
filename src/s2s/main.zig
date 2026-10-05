@@ -113,6 +113,11 @@ pub const S2sDaemon = struct {
     /// Inbound listener fd (-1 if not listening).
     listener_fd: posix.fd_t = -1,
 
+    /// Served MUC host for the to= check on inbound stanzas (S2 review):
+    /// the master forwards [muc] host as --muc-host; conference traffic is
+    /// served locally even though it is a different domain.
+    muc_host: ?[]const u8 = null,
+
     /// Inbound listener port.
     listener_port: u16 = 5269,
 
@@ -621,6 +626,7 @@ pub fn main() !void {
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
     var listen_fd: ?posix.fd_t = null;
+    var muc_host: ?[]const u8 = null;
 
     _ = args.next(); // Skip argv[0]
 
@@ -659,6 +665,11 @@ pub fn main() !void {
                 log.err("--key requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--muc-host")) {
+            muc_host = args.next() orelse {
+                log.err("--muc-host requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--listen-fd")) {
             const val = args.next() orelse {
                 log.err("--listen-fd requires a value", .{});
@@ -683,6 +694,7 @@ pub fn main() !void {
 
     var daemon = try S2sDaemon.init(allocator, host);
     defer daemon.deinit();
+    daemon.muc_host = muc_host;
 
     // Configure TLS if cert and key are provided
     if (cert_path) |cert| {
@@ -963,7 +975,23 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 if (std.mem.eql(u8, attr.local_name, "version")) version = attr.value;
             }
 
-            session.setRemoteDomain(from);
+            // S2: the peer may never re-identify on a restart. Post-auth the
+            // header from= must already be authenticated; pre-auth (post-TLS)
+            // it must not change from the pinned origin.
+            if (!session.stream_open_seen) {
+                session.stream_open_seen = true;
+                session.setRemoteDomain(from);
+            } else if (!session.restartFromAllowed(from)) {
+                log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
+                sendStreamError(session, .invalid_from);
+                _ = session.flushWrite() catch {};
+                daemon.closeInbound(batch, session.id);
+                return;
+            } else if (session.auth_domain_count > 0) {
+                // Authenticated domain may differ from the first open (dialback
+                // multiplexing); the tracked identity follows it.
+                session.setRemoteDomain(from);
+            }
             const action = session.stream.handleStreamOpen(from, to, version);
             executeAction(daemon, session, action);
 
@@ -1142,26 +1170,29 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
     }
 }
 
-/// Domainpart of a JID: after '@' when a localpart exists, the whole JID
-/// otherwise; always cut at the resource separator.
+/// Domainpart of a JID (RFC 7622 §3.1): cut at the resource separator
+/// FIRST, then split off the localpart. Cutting at '@' first would let
+/// "victim.example/x@them.example" resolve to "them.example" (S2 review).
 fn jidDomain(jid: []const u8) []const u8 {
-    var rest = jid;
-    if (std.mem.indexOfScalar(u8, jid, '@')) |at| rest = jid[at + 1 ..];
-    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
-    return rest;
+    const bare = if (std.mem.indexOfScalar(u8, jid, '/')) |slash| jid[0..slash] else jid;
+    if (std.mem.indexOfScalar(u8, bare, '@')) |at| return bare[at + 1 ..];
+    return bare;
 }
 
-/// RFC 6120 §4.9.3.9 / §4.9.3.6: an inbound stanza's `from` domain must be
-/// the domain the peer authenticated as (dialback or EXTERNAL+DANE), and
-/// `to` must be our own domain. The stream's remote_domain is exactly that
-/// authenticated identity (dialback proves it; SASL EXTERNAL is gated on
-/// DANE), so the comparison is the real check, not the from= at stream open.
-fn validateInboundAddress(local_domain: []const u8, peer_domain: []const u8, from: []const u8, to: []const u8) ?StreamError {
+/// RFC 6120 §4.9.3.9 / §4.9.3.6: an inbound stanza's from= domain must be
+/// authenticated for the session (dialback or EXTERNAL+DANE; auth_ok is the
+/// caller's set lookup), and to= must be a host we serve (bare domain or the
+/// MUC host).
+fn validateInboundAddress(local_domain: []const u8, muc_host: ?[]const u8, auth_ok: bool, from: []const u8, to: []const u8) ?StreamError {
     const from_dom = jidDomain(from);
-    if (from_dom.len == 0 or !std.ascii.eqlIgnoreCase(from_dom, peer_domain)) return .invalid_from;
+    if (from_dom.len == 0 or !auth_ok) return .invalid_from;
     const to_dom = jidDomain(to);
-    if (to_dom.len == 0 or !std.ascii.eqlIgnoreCase(to_dom, local_domain)) return .host_unknown;
-    return null;
+    if (to_dom.len == 0) return .host_unknown;
+    if (std.ascii.eqlIgnoreCase(to_dom, local_domain)) return null;
+    if (muc_host) |m| {
+        if (std.ascii.eqlIgnoreCase(to_dom, m)) return null;
+    }
+    return .host_unknown;
 }
 
 /// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
@@ -1172,15 +1203,20 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     const to = session.getStanzaTo();
 
     if (from.len == 0 or to.len == 0) {
-        log.warn("inbound stanza missing from/to, dropping", .{});
+        // RFC 6120 §4.9.3.10: missing from/to on an established stream.
+        log.warn("inbound stanza missing from/to (improper-addressing)", .{});
+        sendStreamError(session, .improper_addressing);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(batch, session.id);
         return;
     }
 
     // Authenticated-domain and served-host checks before anything is
     // forwarded (T351/S2): without them any federated peer could speak as
-    // any local user.
-    if (validateInboundAddress(daemon.local_domain, session.getRemoteDomain(), from, to)) |err| {
-        log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (authenticated peer domain {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
+    // any local user. from= must name a domain the session authenticated
+    // for (DANE+EXTERNAL or dialback), not whatever the header claims.
+    if (validateInboundAddress(daemon.local_domain, daemon.muc_host, session.isAuthenticatedDomain(jidDomain(from)), from, to)) |err| {
+        log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (peer pinned {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
         sendStreamError(session, err);
         _ = session.flushWrite() catch {};
         daemon.closeInbound(batch, session.id);
@@ -1232,6 +1268,15 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 
     if (origin.len == 0 or key.len == 0) {
         log.warn("dialback callback: missing origin or key", .{});
+        return;
+    }
+    // S2: the db:result to= must be us; without the check an attacker-named
+    // target is verified on our account.
+    if (!std.ascii.eqlIgnoreCase(session.getDbResultTo(), daemon.local_domain)) {
+        log.warn("dialback callback: db:result to={s} is not us ({s})", .{ session.getDbResultTo(), daemon.local_domain });
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(batch, session.id);
         return;
     }
 
@@ -1311,9 +1356,12 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
 
     if (valid) {
         session.inbound_dialback.setValid();
+        // S2: bind the authenticated identity to the VERIFIED origin, not to
+        // whatever the header claimed at stream open.
+        session.addAuthenticatedDomain(session.inbound_dialback.getOrigin());
         session.stream.setAuthenticated();
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{
-            session.getRemoteDomain(), inbound_slot,
+            session.inbound_dialback.getOrigin(), inbound_slot,
         });
     } else {
         session.inbound_dialback.setInvalid();
@@ -1373,6 +1421,9 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             }
         },
         .send_sasl_success => {
+            // S2: SASL EXTERNAL accepted (the FSM only reaches here after
+            // DANE verified): the verified domain joins the authenticated set.
+            session.promoteDaneCandidate();
             const success = session.buildSaslSuccess(&buf) catch return;
             session.queueWrite(success) catch {};
             _ = session.flushWrite() catch {};
@@ -1927,6 +1978,10 @@ fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 fn performInboundDane(daemon: *S2sDaemon, session: *S2sSession, remote_domain: []const u8) void {
     const dane_mod = @import("dane.zig");
 
+    // The candidate promotes into the session's authenticated set only if
+    // the SASL EXTERNAL exchange succeeds (S2).
+    session.setDaneCandidate(remote_domain);
+
     // Resolve the remote's SRV to find their actual S2S port for TLSA query
     const targets = dns.resolver.resolveXmpp(daemon.allocator, remote_domain, true) catch {
         session.stream.setDaneVerified(false);
@@ -2074,6 +2129,7 @@ fn printUsage() void {
         \\  --core-socket PATH  IPC socket for xmppd-core communication
         \\  --cert PATH         TLS certificate file (PEM)
         \\  --key PATH          TLS private key file (PEM)
+        \\  --muc-host HOST     Served MUC domain for the to= check (from master's [muc] host)
         \\  --help, -h          Show this help
         \\
     ;
@@ -2201,23 +2257,44 @@ test "S2sDaemon: stop" {
 
 test "S2sDaemon: inbound address validation enforces authenticated domain and served host (T351/S2)" {
     const local = "us.example";
-    const peer = "them.example";
+    const muc = "conference.us.example";
 
-    // Happy: from authenticated peer domain to our domain (full and bare forms).
-    try std.testing.expect(validateInboundAddress(local, peer, "romeo@them.example/orchard", "juliet@us.example/capulet") == null);
-    try std.testing.expect(validateInboundAddress(local, peer, "them.example", "us.example") == null);
+    // Happy: authenticated from= to our domain (full and bare forms).
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example/orchard", "juliet@us.example/capulet") == null);
+    try std.testing.expect(validateInboundAddress(local, muc, true, "them.example", "us.example") == null);
 
-    // Peer authenticated as them.example forging a local user.
-    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "juliet@us.example", "romeo@them.example").?);
-    // A stranger domain speaking through an authenticated session.
-    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "eve@evil.example", "juliet@us.example").?);
-    // from without a domain at all.
-    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, peer, "naked", "juliet@us.example").?);
+    // from= with a domain but the session has no authentication for any of
+    // it (auth_ok=false covers forging peers AND never-authenticated ones).
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, false, "user@them.example", "juliet@us.example").?);
+    // A bare "from=naked" IS a valid domain JID; it is only rejected because
+    // nothing authenticates it (auth_ok=false comes from the session set).
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, false, "naked", "juliet@us.example").?);
+    // Truly empty from= is a format rejection regardless.
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, true, "", "juliet@us.example").?);
 
     // Right sender, wrong destination domain (we do not serve it).
-    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, peer, "romeo@them.example", "someone@else.example").?);
-    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, peer, "romeo@them.example/c", "someone@else.example/x").?);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, muc, true, "romeo@them.example", "someone@else.example").?);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, muc, true, "romeo@them.example/c", "someone@else.example/x").?);
 
-    // Domain compare is case-insensitive.
-    try std.testing.expect(validateInboundAddress(local, "THEM.example", "romeo@them.example", "juliet@US.example") == null);
+    // The MUC host is served for federation (conference.<host>); without a
+    // muc_host configured it gets host-unknown.
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "r@conference.us.example") == null);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, null, true, "romeo@them.example", "r@conference.us.example").?);
+
+    // Compares are case-insensitive.
+    try std.testing.expect(validateInboundAddress(local, "CONFERENCE.us.example", true, "romeo@them.example", "r@Conference.US.example") == null);
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "juliet@US.example") == null);
+}
+
+test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (S2 review)" {
+    try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example/orchard"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("them.example"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("them.example/orchard"));
+    // Slash-first is the point: a forged domain must not survive inside the
+    // resourcepart.
+    try std.testing.expectEqualStrings("victim.example", jidDomain("victim.example/x@them.example"));
+    try std.testing.expectEqualStrings("", jidDomain("/x"));
+    try std.testing.expectEqualStrings("", jidDomain("user@/x"));
+    try std.testing.expectEqualStrings("", jidDomain(""));
 }
