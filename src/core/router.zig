@@ -414,6 +414,26 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     for (local_ids[0..target_count]) |tid| {
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
+        // S13: a session whose offline tail is still draining must not be
+        // overtaken by newer messages. Park this copy behind the tail; the
+        // drain delivers it in order. Only when the archived copy exists
+        // (is_archivable with an archive): the pointer references it.
+        if (target_session.offline_pending and session.stanza_kind == .message and
+            is_archivable and server.archive != null)
+        {
+            if (server.offline) |store| {
+                var recip_hold_buf: [256]u8 = undefined;
+                var recip_hold_fbs = std.io.fixedBufferStream(&recip_hold_buf);
+                recip_hold_fbs.writer().writeAll(to_jid.local) catch {};
+                recip_hold_fbs.writer().writeByte('@') catch {};
+                recip_hold_fbs.writer().writeAll(to_jid.domain) catch {};
+                const recipient_hold = recip_hold_fbs.getWritten();
+                if (store.storePointer(recipient_hold, sender_bare, archive_stanza_id, archive_timestamp) catch false) {
+                    log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
+                }
+            }
+            continue;
+        }
         // T153: a detached (SM resume pending) session has no live connection —
         // its conn.fd was already closed by detachSession(). Attempting
         // conn.queueSend()/changes.addWrite() here would register a kqueue

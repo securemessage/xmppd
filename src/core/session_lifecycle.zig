@@ -490,16 +490,29 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     defer store.freePointers(pointers);
 
     var delivered: usize = 0;
+    var completed = true;
     for (pointers) |ptr| {
-        const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch continue;
+        const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+            // Transient store failure: stop the drain and retry when the
+            // writable handler fires again. Continuing would deliver later
+            // messages ahead of this one, and the old code skipped it on
+            // every pass forever (S13).
+            log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(err) });
+            session.offline_pending = true;
+            completed = false;
+            break;
+        };
         if (stanza_xml) |xml_data| {
             defer server.allocator.free(xml_data);
             session.queueSendStanza(xml_data) catch {
-                // Send buffer full (S13): stop here. This message and the
-                // rest stay in the store and deliver on the next available
-                // event, after the connection drains. Deleting them anyway
-                // used to lose the whole backlog past the first buffer-full.
+                // Send buffer full: stop here and let the writable handler
+                // drain the tail at the low-water mark (S13). This message
+                // and the rest stay in the store. Deleting them anyway
+                // used to lose the whole backlog past the first
+                // buffer-full.
                 log.warn("offline delivery to {s} paused at {d}/{d} messages (send buffer full)", .{ bare_jid, delivered, pointers.len });
+                session.offline_pending = true;
+                completed = false;
                 break;
             };
             // Only delete what was actually handed to the connection.
@@ -507,14 +520,32 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
             };
             delivered += 1;
+        } else {
+            // The archive entry is gone; a dangling pointer would stall
+            // every future drain, so drop it.
+            store.deletePointer(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+                log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+            };
         }
     }
+
+    if (completed) session.offline_pending = false;
 
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
+}
+
+/// S13: continue a stalled offline drain once the connection's write
+/// buffer has drained. Called from the writable handler at the
+/// low-water mark, so delivery resumes without waiting for the next
+/// presence or reconnect.
+pub fn drainOfflinePending(server: *Server, session: *Session, changes: *ChangeList) void {
+    if (!session.offline_pending) return;
+    const bound = session.stream.bound_jid orelse return;
+    deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
 }
 
 /// Allocate a free session ID slot. O(1) via free-list stack (T128).
@@ -693,6 +724,138 @@ test "S13: offline delivery keeps undelivered messages when the send buffer fill
     var id_expect_buf: [16]u8 = undefined;
     const expect_id = std.fmt.bufPrint(&id_expect_buf, "s{d}", .{total - remaining}) catch unreachable;
     try std.testing.expectEqualStrings(expect_id, survivors[0].stanza_id);
+}
+
+// S13: the stalled tail must resume without waiting for the next presence
+// or reconnect. Simulates the writable-handler cycle: flush to the peer,
+// read it out, drain again at the low-water mark.
+test "S13: stalled offline drain resumes via drainOfflinePending" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so flushSend has somewhere to drain to.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    const total: usize = 40;
+    var stanza_buf: [4096]u8 = undefined;
+    const pad = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const stanza_id = std.fmt.bufPrint(&id_buf, "s{d}", .{i}) catch unreachable;
+        const stanza = std.fmt.bufPrint(&stanza_buf, "<message from='alice@localhost' to='bob@localhost' id='{s}'><body>{s}</body></message>", .{ stanza_id, pad }) catch unreachable;
+        const ts: u64 = 1000 + @as(u64, @intCast(i));
+        try arch_store.store("bob@localhost", "alice@localhost", stanza_id, ts, stanza);
+        _ = try offline_store.storePointer("bob@localhost", "alice@localhost", stanza_id, ts);
+    }
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    try std.testing.expect(session.offline_pending);
+    try std.testing.expect(try offline_store.countMessages("bob@localhost") > 0);
+
+    // Writable-handler cycle: read the peer out, flush more, drain again.
+    var rounds: usize = 0;
+    var buf: [65536]u8 = undefined;
+    while (session.offline_pending and rounds < 64) : (rounds += 1) {
+        while (true) {
+            const n = posix.read(fds[1], &buf) catch break;
+            if (n == 0) break;
+        }
+        _ = session.conn.flushSend() catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => break,
+        };
+        drainOfflinePending(&server, session, &changes);
+    }
+
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(rounds > 1);
+}
+
+// S13: a pointer whose archive entry is gone must not be skipped on every
+// pass forever; it is dropped and the rest of the backlog still delivers.
+test "S13: dangling offline pointer is dropped, not skipped forever" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const session = try makeAuthenticatedSession(&server, 1, "bob");
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // One real message, one pointer to an archive entry that does not exist.
+    try arch_store.store("bob@localhost", "alice@localhost", "s1", 1001, "<message from='alice@localhost' to='bob@localhost' id='s1'><body>hi</body></message>");
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "gone", 1000);
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.offline_pending);
 }
 
 test "T158: detach timer does not expire session at exactly 299s" {

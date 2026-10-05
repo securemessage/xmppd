@@ -358,6 +358,11 @@ pub const Session = struct {
     sm_detach_time: i64 = 0,
     /// Unacked stanza queue for resume replay. Allocated when resume is enabled.
     sm_unacked: ?*sm_state.SmUnackedQueue = null,
+    /// S13: offline delivery stalled on a full send buffer (or a store
+    /// error). Set until the writable handler drains the tail; new
+    /// messages to this session are held in the offline store so they
+    /// cannot overtake the tail.
+    offline_pending: bool = false,
     /// T178: set when the unacked queue overflowed (oldest stanza evicted).
     /// XEP-0198 has no gap signaling, so the session must be failed —
     /// reaped by session_lifecycle.reapSmOverflow at the end of the event
@@ -2921,6 +2926,14 @@ pub const Server = struct {
             }
         }
 
+        // S13: with the buffer at the low-water mark, continue a stalled
+        // offline drain; the tail goes out before any newer traffic.
+        if (session.offline_pending and
+            session.conn.pendingWriteBytes() <= connection_mod.WRITE_SUPPRESS_LOW)
+        {
+            session_lifecycle.drainOfflinePending(self, session, changes);
+        }
+
         self.applyReadBackpressure(session, changes);
     }
 
@@ -4993,6 +5006,82 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
             return error.RatchetMismatch;
         }
     }
+}
+
+test "Server: S13 message held behind a draining offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // bob is online but his offline tail is still draining (S13).
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.offline_pending = true;
+    server.sessions[5] = target;
+
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>held</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Not delivered live: it would overtake the draining tail.
+    _ = target.conn.flushSend() catch {};
+    var buf: [1024]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    // Parked behind the tail instead: one offline pointer referencing the
+    // archived stanza.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try arch_store.getMessage(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    try std.testing.expect(held != null);
+    if (held) |h| allocator.free(h);
 }
 
 test "S14: failed cross-worker resource does not block local delivery" {
