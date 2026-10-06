@@ -149,6 +149,11 @@ is still done first so the fix ships even if that ADR is rejected.
 | S22 | stall, high | **Auth loop drops kqueue registrations.** 16-entry changelist, one `addWriteOnce` per reply, `catch {}`. With several worker lanes at overload, replies strand until unrelated activity; prime suspect for the T242 login knee [S]. The OIDC loop already hit this once (`oidc_main.zig:272-273`). | `auth/main.zig:291, 423-424` [V] | Per-lane dirty flag; flush once per iteration; buffer `2*MAX_IPC_CLIENTS+8`; never swallow `ChangeListFull`. Re-measure (M5). |
 | S23 | kTLS rule, high | **TLS write retry length can grow.** After WANT_WRITE, `queueSend` keeps appending at `write_end` and `flushSend` retries with `write_buf[write_start..write_end]`: same pointer, longer length. `compactWriteBuf` only pins the pointer. Violates the AGENTS.md identical pointer-and-length rule; core analog of T253. Same in s2s session/connector [S]. | `core/connection.zig:233-249, 271-291, 409-414` [V] | Track the pending TLS length and retry exactly that slice; new bytes go behind it. Structural: F3/C2 Outbox pin. |
 | S24 | data loss, high | **SM ack on a backwards `h` wipes the replay queue** (Phorge T217). `acked_count = h -% (base_seq -% 1)` wraps above `count` when a client reports a lower `h` than before (for example `<resume h='0'>` after `<a h='5'/>`), and `discardAll()` drops every unacked stanza. | `sm_state.zig:130-137` [V] | Track the last acked `h`; a backwards `h` never discards (log and ignore, or fail the stream with `undefined-condition`). Fix the `<a/>`, local resume and cross-worker resume call sites. Tests: push 10, ack 5, ack 0 keeps 5; u32 wrap. Structural: C11. |
+| S25 | crash, high | **xmppc `parseAll` compacts with a stale position after an inline TLS completion** (Phorge T412). The `start_tls` action calls `onRead` inline, the handshake completes and resets the reader and `read_len`, then `parseAll` slices `read_buf[pos..0]`: a panic in ReleaseSafe, memory corruption in unchecked builds. Crashes the v0.9.0 `xmppc-load`. | `lib/xmppc/session.zig:386-391, 1005` [V] | Stream-epoch check after each handler, return without compaction on reset; client-side read-ahead rule after `<proceed/>`; socketpair regression tests. |
+| S26 | correctness, medium | **XML incomplete-document close runs before the fd-limit check** (T-C3286C8C). Verdict pending. | [S] | Verify, then fix in the reader or accept path. |
+| S27 | correctness, medium | **A nested `<stream:stream>` inside an open stream is accepted** instead of failing the stream. | `lib/xml` reader, core and s2s stream handlers [S] | RFC 6120 stream error (`not-well-formed` or `invalid-xml`), then close; test that sends a second stream header mid-stream. |
+| S28 | crash, high | **xmppd-core aborts under an SM reconnect storm** (integer out of bounds in `Server.run`; M5 baseline cell S1, run 1, whole core died). Likely a staged kevent on fd -1 during resume/close churn [S]. | `event_loop.zig:213, 229`; `server.zig:410`; core dump on board `XMPPD/v091-perf-baseline` [V] | Reproduce with a Debug build, never stage fd < 0, fix the path, regression test. |
+| S29 | refactor, high | **DANE verification is duplicated and hand-rolled.** `lib/tls/tls.zig` (`validateDane`, `CertFingerprint`, `extractSpki`) and `src/s2s/dane.zig` carry two copies of TLSA matching and of a DER parser (T312). Other Zig projects carry more copies. | `lib/tls/tls.zig`; `src/s2s/dane.zig`; `s2s/main.zig` `performInboundDane`, `performOutboundDane` [V] | Replace both with the shared `dane` package (git.morante.net `pacyworld/dane-zig`, module `dane-openssl`): OpenSSL built-in DANE during the handshake for xmppc and outbound s2s (TLSA lookup moves before the handshake), post-handshake verification for inbound s2s, SASL EXTERNAL gated on the verdict; delete both copies. Lands with the release, when the package is published (R11). Plan: dane-zig `doc/IMPLEMENTATION_PLAN.md` phase P4. |
 
 ### 3.2 First-pass P1s that stay in Phase 0
 
@@ -633,7 +638,7 @@ recorded.
 | ID | Task | Depends | Size |
 |----|------|---------|------|
 | X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
-| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; one DANE-EE, DANE-TA, PKIX policy for s2s; multiple SRV targets and connect deadlines (T276, T296, T312, T333) | F2 | M |
+| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
 | X3 | Master: readiness pipes per child (T282), loop-driven shutdown with SIGKILL escalation on a one-shot timer, SIGHUP to all children, pid files on respawn and identity-checked orphan kill (T259, T336, T337), shared `bindTcp` honoring `bind_address` and IPv6 (V16) | F2 | M |
 | X4 | All daemons on `lib/conf` (ADR-9), master first | F5 | M |
 
@@ -700,6 +705,7 @@ targets marked TBD are set from the M5 baseline before Phase 1 merges.
 | R8 | Docs: `ARCHITECTURE.md` rewritten (thread-per-core workers, actors, Outbox, envelope ring, storage service), `STORAGE_DESIGN.md` corrected, `CONFIGURATION.md` generated from the schema, `CHANGELOG.md` |
 | R9 | Port: poudriere ReleaseSafe build with the release allocator; package installs and runs in the xmppd jail |
 | R10 | Operator approval; then tag |
+| R11 | S29: the `dane` package is published (dane-zig phase P5) and xmppd depends on it by public URL and hash; `net-im/xmppd` carries the matching `ZIG_TUPLE` |
 
 ---
 
@@ -758,7 +764,8 @@ These apply to every change in this plan and are checked in review.
 | C (core data path) | T301, T303, T304, T306 (C5); T305 (C6); T307, T319, T322 (C1); T313 (C2); T316 (C3); T317 (C11); T320, T321 (C8); T245 correlate (C4) |
 | D (storage) | T269, T270 (D4); T271 (D2); T315, T318 (C11 with ADR-7 allocator); T323 (D1 + M1 counters) |
 | A (auth) | T272, T308, T309, T327 (A5); T273 (A8); T280 (A3/A4); T281 (A3); T324, T325 (A9); T326 (A4); T328, T329, T330 (A2) |
-| X (s2s, master) | T274, T278, T331, T332, T333, T334, T335 (X1); T276, T312 (X2); T282, T336, T337 (X3) |
+| X (s2s, master) | T274, T278, T331, T332, T333, T334, T335 (X1); T276 (X2); T282, T336, T337 (X3) |
+| Phase 0 (S29) | T312 |
 | WS8 (xmppc gate) | T283-T300 except those listed above |
 
 Corrections to the first pass:
@@ -1001,6 +1008,11 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | S21 | T-10C123F7 | T302 |
 | S22, S23 | T-FF8442D6, T-FA72FC5D | T369, T370 |
 | S24 | T-19EB034C | T217 |
+| S25 | T-41BBBA06 | T412 |
+| S26 | T-C3286C8C | pending |
+| S27 | T-901D7B19 | pending |
+| S28 | T-B9746EC8 | pending |
+| S29 | T-F6FF5130 (scope `DANE-ZIG`, phase P4) | pending |
 | First-pass P1 batch (3.2) | T-96F6A8B5 | T211, T215, T250-T254, T256-T261, T263, T275, T277, T279 |
 | V1 .. V19 verify-then-fix | T-3FE08568 | T371 |
 | M1 .. M5 | T-2B49596E, T-E7096DCE, T-61BC40BB, T-4D163119, T-9213A076 | T372-T376 |
