@@ -70,6 +70,11 @@ pub const SessionConfig = struct {
     user: []const u8,
     password: []const u8,
     resource: []const u8 = "",
+    /// Permit SASL PLAIN (over TLS only — the FSM's tls_required default
+    /// still applies). Off by default so a server listing PLAIN first
+    /// cannot steer the client onto it; enable for servers whose auth
+    /// backend cannot do SCRAM (e.g. OIDC password-grant stores).
+    allow_plain: bool = false,
     /// XEP-0198 resume id when reattaching to a detached stream.
     sm_resume_id: []const u8 = "",
     /// The OLD session's inbound stanza count ('h'), paired with
@@ -265,6 +270,7 @@ pub const Session = struct {
         self.user = try a.dupe(u8, config.user);
         self.password = try a.dupe(u8, config.password);
         self.resource = try a.dupe(u8, config.resource);
+        self.fsm.allow_plain = config.allow_plain;
         self.fsm.resume_id = try a.dupe(u8, config.sm_resume_id);
         self.resume_h = config.sm_resume_h;
     }
