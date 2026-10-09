@@ -218,6 +218,30 @@ pub const Room = struct {
         return occ;
     }
 
+    /// Retarget an occupant record to a different full JID and delivery
+    /// triple — the same-bare-JID, same-nick, different-resource instance
+    /// takeover (XEP-0045 §7.2.14 multi-session nick collapse). Identity
+    /// (nick, role, affiliation, bare JID) is unchanged; the jid_map index
+    /// entry is moved from the old real JID key to the new one. The old key
+    /// must be removed BEFORE the inline buffer is overwritten because map
+    /// keys alias occupant.real_jid_buf — removing after the overwrite hashes
+    /// the new JID text and misses the old bucket, orphaning the entry.
+    pub fn retargetOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_session: usize, new_worker: u16, new_generation: u32) void {
+        if (index >= MAX_OCCUPANTS) return;
+        const occ = &self.occupants[index].?;
+        const old_worker = occ.worker_id;
+        _ = self.jid_map.fetchRemove(occ.getRealJid());
+        occ.setRealJid(new_real_jid);
+        occ.session_id = new_session;
+        occ.worker_id = new_worker;
+        occ.generation = new_generation;
+        self.jid_map.put(self.allocator, occ.getRealJid(), @intCast(index)) catch {};
+        self.worker_mask |= @as(u16, 1) << @intCast(new_worker);
+        if (!self.hasOccupantOnWorker(old_worker)) {
+            self.worker_mask &= ~(@as(u16, 1) << @intCast(old_worker));
+        }
+    }
+
     /// Remove an occupant by full JID. Returns the removed occupant.
     pub fn removeByRealJid(self: *Room, real_jid: []const u8) ?Occupant {
         const idx = self.findByRealJid(real_jid) orelse return null;
@@ -555,6 +579,54 @@ test "Room: updateOccupantMove clears old worker bit when last local occupant le
     // Unknown occupant: null, mask untouched
     try std.testing.expect(room.updateOccupantMove("ghost@localhost/x", 0, 1, 1) == null);
     try std.testing.expectEqual(@as(u16, 0b1000), room.worker_mask);
+}
+
+test "Room: retargetOccupant moves jid_map index to the new real JID" {
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("firstroom@conference.localhost");
+
+    const idx = try room.addOccupant("daniel", "daniel@localhost/phone", "daniel@localhost", 2, 0, 2, .moderator, .owner);
+
+    // Same-bare-JID takeover (XEP-0045 §7.2.14 collapse): phone → desktop
+    room.retargetOccupant(idx, "daniel@localhost/desktop", 3, 0, 8);
+
+    // New JID resolves; old JID is gone from the index
+    const new_idx = room.findByRealJid("daniel@localhost/desktop").?;
+    try std.testing.expectEqual(idx, new_idx);
+    try std.testing.expect(room.findByRealJid("daniel@localhost/desktop") != null);
+    try std.testing.expect(room.findByRealJid("daniel@localhost/phone") == null);
+    try std.testing.expect(room.findByNick("daniel") != null);
+
+    const occ = room.occupants[idx].?;
+    try std.testing.expectEqualStrings("daniel@localhost/desktop", occ.getRealJid());
+    try std.testing.expectEqual(@as(usize, 3), occ.session_id);
+    try std.testing.expectEqual(@as(u32, 8), occ.generation);
+    try std.testing.expectEqual(Role.moderator, occ.role);
+    try std.testing.expectEqual(Affiliation.owner, occ.affiliation);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+
+    // Removal by the NEW JID must work — this was the ghost-occupant failure
+    const removed = room.removeByRealJid("daniel@localhost/desktop").?;
+    try std.testing.expectEqualStrings("daniel", removed.getNick());
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    try std.testing.expect(room.removeByRealJid("daniel@localhost/desktop") == null);
+}
+
+test "Room: retargetOccupant twice in a row stays coherent" {
+    var room = Room.init(std.testing.allocator);
+    defer room.deinit();
+    room.active = true;
+
+    const idx = try room.addOccupant("daniel", "daniel@localhost/a", "daniel@localhost", 1, 0, 1, .participant, .none);
+    room.retargetOccupant(idx, "daniel@localhost/b", 2, 0, 2);
+    room.retargetOccupant(idx, "daniel@localhost/c", 3, 0, 3);
+
+    try std.testing.expect(room.findByRealJid("daniel@localhost/a") == null);
+    try std.testing.expect(room.findByRealJid("daniel@localhost/b") == null);
+    try std.testing.expectEqual(idx, room.findByRealJid("daniel@localhost/c").?);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 }
 
 test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {

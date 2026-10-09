@@ -945,8 +945,8 @@ fn handleJoin(
     const r = room.?;
 
     // Check if already in room (rejoin = no-op with self-presence)
-    if (r.findByRealJid(real_jid)) |_| {
-        sendSelfPresence(server, session, r, nick, muc_host, changes);
+    if (r.findByRealJid(real_jid)) |self_idx| {
+        sendSelfPresence(server, session, r, &r.occupants[self_idx].?, muc_host, changes);
         return;
     }
 
@@ -961,18 +961,18 @@ fn handleJoin(
         // Same user, same nick, different resource → collapse (latest resource wins)
         const local_sid: usize = session.conn.id;
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
-        existing.session_id = local_sid;
-        existing.worker_id = server.worker_id;
-        existing.generation = join_gen;
-        // Update the real JID to the new resource
-        const rjlen: u8 = @intCast(@min(real_jid.len, existing.real_jid_buf.len));
-        @memcpy(existing.real_jid_buf[0..rjlen], real_jid[0..rjlen]);
-        existing.real_jid_len = rjlen;
-        // Update worker mask for new resource's worker
-        r.worker_mask |= (@as(u16, 1) << @intCast(server.worker_id));
-        // Send self-presence to confirm the resource takeover
-        sendSelfPresence(server, session, r, nick, muc_host, changes);
+        r.retargetOccupant(existing_idx, real_jid, local_sid, server.worker_id, join_gen);
         log.info("{s} collapsed into existing occupant '{s}' in {s}", .{ real_jid, nick, room_jid });
+        // The takeover resource gets the full join response (minus the join
+        // broadcast — the nick never changed, so other occupants see nothing).
+        for (&r.occupants) |*slot| {
+            const occ = slot.* orelse continue;
+            if (occ.session_id == local_sid and occ.worker_id == server.worker_id) continue; // skip self
+            sendOccupantPresence(server, session, r, &occ, muc_host, null, changes);
+        }
+        sendSelfPresence(server, session, r, &r.occupants[existing_idx].?, muc_host, changes);
+        sendRoomHistory(server, session, r, muc_host, changes);
+        sendRoomSubject(server, session, r, muc_host, changes);
         return;
     }
 
@@ -1204,7 +1204,7 @@ fn sendSelfPresence(
     server: *Server,
     session: *Session,
     room: *const Room,
-    nick: []const u8,
+    occ: *const Occupant,
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
@@ -1217,10 +1217,14 @@ fn sendSelfPresence(
     w.writeAll("<presence from='") catch return;
     w.writeAll(room.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(nick) catch return;
+    w.writeAll(occ.getNick()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
-    w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
+    w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    w.writeAll(occ.affiliation.toName()) catch return;
+    w.writeAll("' role='") catch return;
+    w.writeAll(occ.role.toName()) catch return;
+    w.writeAll("'/><status code='110'/></x></presence>") catch return;
 
     session.conn.queueSend(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
