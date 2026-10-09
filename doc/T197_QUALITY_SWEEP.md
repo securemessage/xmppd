@@ -155,6 +155,8 @@ is still done first so the fix ships even if that ADR is rejected.
 | S28 | crash, high | **xmppd-core aborts under an SM reconnect storm** (integer out of bounds in `Server.run`; M5 baseline cell S1, run 1, whole core died). Likely a staged kevent on fd -1 during resume/close churn [S]. | `event_loop.zig:213, 229`; `server.zig:410`; core dump on board `XMPPD/v091-perf-baseline` [V] | Reproduce with a Debug build, never stage fd < 0, fix the path, regression test. |
 | S29 | refactor, high | **DANE verification is duplicated and hand-rolled.** `lib/tls/tls.zig` (`validateDane`, `CertFingerprint`, `extractSpki`) and `src/s2s/dane.zig` carry two copies of TLSA matching and of a DER parser (T312). Other Zig projects carry more copies. | `lib/tls/tls.zig`; `src/s2s/dane.zig`; `s2s/main.zig` `performInboundDane`, `performOutboundDane` [V] | Replace both with the shared `dane` package (git.morante.net `pacyworld/dane-zig`, module `dane-openssl`): OpenSSL built-in DANE during the handshake for xmppc and outbound s2s (TLSA lookup moves before the handshake), post-handshake verification for inbound s2s, SASL EXTERNAL gated on the verdict; delete both copies. Lands with the release, when the package is published (R11). Plan: dane-zig `doc/IMPLEMENTATION_PLAN.md` phase P4. |
 
+| S30 | data loss, high | **Same-nick resource takeover orphans the room `jid_map`** (Phorge T413; production incident 2026-10-08, daniel@morante.dev/NaplesTB could not join, send, or see messages). `handleJoin` collapse overwrote the occupant's `real_jid_buf` in place; `jid_map` keys alias that buffer, so every `findByRealJid` missed from then on: takeover resource got no roster/history/subject, groupchat send bounced `not-acceptable` (sender lookup miss), and on disconnect `removeByRealJid` missed too — the ghost occupant collapsed every later join. `sendSelfPresence` also hardcoded `affiliation='owner' role='moderator'`. | `muc_handler.zig:954-977`; `room_registry.zig:117-119 (keys alias inline buffers)` [V]; production log `info(muc): ... collapsed into existing occupant` repeated across rebinds [V] | FIXED locally, pending push (6085363): `Room.retargetOccupant` removes the old index key before overwriting the buffer, takeover resource gets the full join response minus the join broadcast, `sendSelfPresence` uses real role/affiliation. e2e `e2e-muc-nick-takeover.py` red 5/10 on old build, green 10/10 at workers=1/4; unit tests double-retarget. Ship before tagging v0.9.1; S1 hotfix must escape the `sendSelfPresence` attribute writes. |
+
 ### 3.2 First-pass P1s that stay in Phase 0
 
 From the first pass (Appendix B), these remain standalone Phase 0 fixes:
@@ -706,6 +708,7 @@ targets marked TBD are set from the M5 baseline before Phase 1 merges.
 | R9 | Port: poudriere ReleaseSafe build with the release allocator; package installs and runs in the xmppd jail |
 | R10 | Operator approval; then tag |
 | R11 | S29: the `dane` package is published (dane-zig phase P5) and xmppd depends on it by public URL and hash; `net-im/xmppd` carries the matching `ZIG_TUPLE` |
+| R12 | S30/T413: the takeover fix (6085363) is pushed, `e2e-muc-nick-takeover.py` green in the w1/w4 lanes, and the corrupt production room state in `firstroom@conference.morante.dev` is cleared (service restart) |
 
 ---
 
@@ -1013,6 +1016,7 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | S27 | T-901D7B19 | pending |
 | S28 | T-B9746EC8 | pending |
 | S29 | T-F6FF5130 (scope `DANE-ZIG`, phase P4) | pending |
+| S30 | T-2CE71D47 | T413 |
 | First-pass P1 batch (3.2) | T-96F6A8B5 | T211, T215, T250-T254, T256-T261, T263, T275, T277, T279 |
 | V1 .. V19 verify-then-fix | T-3FE08568 | T371 |
 | M1 .. M5 | T-2B49596E, T-E7096DCE, T-61BC40BB, T-4D163119, T-9213A076 | T372-T376 |
