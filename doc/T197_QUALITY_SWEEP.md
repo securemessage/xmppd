@@ -671,6 +671,13 @@ workaround (805e2d2) go away with the `lib/net` loop (T240). The resolver's
 1 s housekeeping tick (`engine.zig` `TICK_UDATA`) is replaced by timer-wheel
 deadlines in X2/WS8. First consumer of these APIs: continuum-xmpp-bridge.
 
+Consumers outside this repository (Kumiko Chat, continuum-xmpp-bridge, Sonya
+Core planned) depend on `lib/xmppc` as a module of this repository and should
+pin a commit, not track master, while WS8 is in progress. Extraction into its
+own package (`git subtree split` of `lib/xmppc` and the libraries it imports,
+consumed by url and hash, xmppd included) follows the v0.9.1 tag, once
+`lib/net`, `lib/dns/async`, the stanza reader and S29 have landed.
+
 ---
 
 ## 6. Measurement plan
