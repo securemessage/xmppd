@@ -177,6 +177,11 @@ pub const Room = struct {
             return error.RoomFull;
         }
 
+        // Reserve index space first so an occupant is never stored without
+        // its nick_map and jid_map entries.
+        try self.nick_map.ensureUnusedCapacity(self.allocator, 1);
+        try self.jid_map.ensureUnusedCapacity(self.allocator, 1);
+
         // Find free slot
         for (&self.occupants, 0..) |*slot, i| {
             if (slot.* == null) {
@@ -194,8 +199,8 @@ pub const Room = struct {
                 self.worker_mask |= @as(u16, 1) << @intCast(worker_id);
                 // Update hash map indices (keys point into occupant inline buffers)
                 const slot_idx: u8 = @intCast(i);
-                self.nick_map.put(self.allocator, self.occupants[i].?.getNick(), slot_idx) catch {};
-                self.jid_map.put(self.allocator, self.occupants[i].?.getRealJid(), slot_idx) catch {};
+                self.nick_map.putAssumeCapacity(self.occupants[i].?.getNick(), slot_idx);
+                self.jid_map.putAssumeCapacity(self.occupants[i].?.getRealJid(), slot_idx);
                 return i;
             }
         }
@@ -218,16 +223,16 @@ pub const Room = struct {
         return occ;
     }
 
-    /// Retarget an occupant record to a different full JID and delivery
-    /// triple — the same-bare-JID, same-nick, different-resource instance
-    /// takeover (XEP-0045 §7.2.14 multi-session nick collapse). Identity
-    /// (nick, role, affiliation, bare JID) is unchanged; the jid_map index
-    /// entry is moved from the old real JID key to the new one. The old key
-    /// must be removed BEFORE the inline buffer is overwritten because map
-    /// keys alias occupant.real_jid_buf — removing after the overwrite hashes
-    /// the new JID text and misses the old bucket, orphaning the entry.
-    pub fn retargetOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_session: usize, new_worker: u16, new_generation: u32) void {
+    /// Moves an occupant record to a different full JID and delivery triple:
+    /// the same-bare-JID, same-nick, new-resource takeover. Nick, role,
+    /// affiliation and bare JID are unchanged; the jid_map entry moves from
+    /// the old real JID to the new one. jid_map keys alias
+    /// occupant.real_jid_buf, so the old key is removed before the buffer is
+    /// overwritten. Capacity is reserved first: on error.OutOfMemory nothing
+    /// has changed.
+    pub fn retargetOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_session: usize, new_worker: u16, new_generation: u32) error{OutOfMemory}!void {
         if (index >= MAX_OCCUPANTS) return;
+        try self.jid_map.ensureUnusedCapacity(self.allocator, 1);
         const occ = &self.occupants[index].?;
         const old_worker = occ.worker_id;
         _ = self.jid_map.fetchRemove(occ.getRealJid());
@@ -235,7 +240,7 @@ pub const Room = struct {
         occ.session_id = new_session;
         occ.worker_id = new_worker;
         occ.generation = new_generation;
-        self.jid_map.put(self.allocator, occ.getRealJid(), @intCast(index)) catch {};
+        self.jid_map.putAssumeCapacity(occ.getRealJid(), @intCast(index));
         self.worker_mask |= @as(u16, 1) << @intCast(new_worker);
         if (!self.hasOccupantOnWorker(old_worker)) {
             self.worker_mask &= ~(@as(u16, 1) << @intCast(old_worker));
@@ -589,8 +594,8 @@ test "Room: retargetOccupant moves jid_map index to the new real JID" {
 
     const idx = try room.addOccupant("daniel", "daniel@localhost/phone", "daniel@localhost", 2, 0, 2, .moderator, .owner);
 
-    // Same-bare-JID takeover (XEP-0045 §7.2.14 collapse): phone → desktop
-    room.retargetOccupant(idx, "daniel@localhost/desktop", 3, 0, 8);
+    // Same-bare-JID takeover: phone to desktop
+    try room.retargetOccupant(idx, "daniel@localhost/desktop", 3, 0, 8);
 
     // New JID resolves; old JID is gone from the index
     const new_idx = room.findByRealJid("daniel@localhost/desktop").?;
@@ -607,7 +612,7 @@ test "Room: retargetOccupant moves jid_map index to the new real JID" {
     try std.testing.expectEqual(Affiliation.owner, occ.affiliation);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 
-    // Removal by the NEW JID must work — this was the ghost-occupant failure
+    // Removal by the new JID works, so no ghost occupant remains
     const removed = room.removeByRealJid("daniel@localhost/desktop").?;
     try std.testing.expectEqualStrings("daniel", removed.getNick());
     try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
@@ -620,13 +625,66 @@ test "Room: retargetOccupant twice in a row stays coherent" {
     room.active = true;
 
     const idx = try room.addOccupant("daniel", "daniel@localhost/a", "daniel@localhost", 1, 0, 1, .participant, .none);
-    room.retargetOccupant(idx, "daniel@localhost/b", 2, 0, 2);
-    room.retargetOccupant(idx, "daniel@localhost/c", 3, 0, 3);
+    try room.retargetOccupant(idx, "daniel@localhost/b", 2, 0, 2);
+    try room.retargetOccupant(idx, "daniel@localhost/c", 3, 0, 3);
 
     try std.testing.expect(room.findByRealJid("daniel@localhost/a") == null);
     try std.testing.expect(room.findByRealJid("daniel@localhost/b") == null);
     try std.testing.expectEqual(idx, room.findByRealJid("daniel@localhost/c").?);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+}
+
+/// Adds occupants until jid_map has no free slot, so the next index insert
+/// must allocate. Returns the index of the first occupant.
+fn fillToMapCapacity(room: *Room) !usize {
+    var name_buf: [32]u8 = undefined;
+    var jid_buf: [64]u8 = undefined;
+    var first: ?usize = null;
+    var n: usize = 0;
+    // An empty map has no storage yet, so add at least one occupant.
+    while (first == null or room.jid_map.available > 0 or room.nick_map.available > 0) : (n += 1) {
+        const nick = try std.fmt.bufPrint(&name_buf, "u{d}", .{n});
+        const jid = try std.fmt.bufPrint(&jid_buf, "u{d}@localhost/r", .{n});
+        const idx = try room.addOccupant(nick, jid, jid[0 .. jid.len - 2], n, 0, 1, .participant, .none);
+        if (first == null) first = idx;
+    }
+    return first.?;
+}
+
+test "Room: retargetOccupant leaves the occupant indexed when the index cannot grow" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var room = Room.init(failing.allocator());
+    defer room.deinit();
+    room.active = true;
+
+    const idx = try fillToMapCapacity(&room);
+    const old_jid = room.occupants[idx].?.getRealJid();
+    var old_copy: [64]u8 = undefined;
+    @memcpy(old_copy[0..old_jid.len], old_jid);
+    const old = old_copy[0..old_jid.len];
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, room.retargetOccupant(idx, "u0@localhost/new", 99, 0, 9));
+
+    // Nothing changed: still reachable and removable by the old JID.
+    try std.testing.expectEqual(idx, room.findByRealJid(old).?);
+    try std.testing.expect(room.findByRealJid("u0@localhost/new") == null);
+    try std.testing.expect(room.removeByRealJid(old) != null);
+}
+
+test "Room: addOccupant stores nothing when the index cannot grow" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var room = Room.init(failing.allocator());
+    defer room.deinit();
+    room.active = true;
+
+    _ = try fillToMapCapacity(&room);
+    const count = room.occupant_count;
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, room.addOccupant("late", "late@localhost/r", "late@localhost", 500, 0, 1, .participant, .none));
+    try std.testing.expectEqual(count, room.occupant_count);
+    try std.testing.expect(room.findByNick("late") == null);
 }
 
 test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {

@@ -950,7 +950,7 @@ fn handleJoin(
         return;
     }
 
-    // Nickname conflict check + multi-session collapsing (XEP-0045 §7.2.14)
+    // Nickname conflict check and same-user resource takeover
     if (r.findByNick(nick)) |existing_idx| {
         const existing = &r.occupants[existing_idx].?;
         if (!std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
@@ -958,13 +958,16 @@ fn handleJoin(
             sendPresenceError(server, session, room_local, muc_host, "conflict", changes);
             return;
         }
-        // Same user, same nick, different resource → collapse (latest resource wins)
+        // Same user, same nick, different resource: the new resource takes
+        // over the occupant record.
         const local_sid: usize = session.conn.id;
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
-        r.retargetOccupant(existing_idx, real_jid, local_sid, server.worker_id, join_gen);
-        log.info("{s} collapsed into existing occupant '{s}' in {s}", .{ real_jid, nick, room_jid });
-        // The takeover resource gets the full join response (minus the join
-        // broadcast — the nick never changed, so other occupants see nothing).
+        if (!collapseOccupant(server, r, existing_idx, real_jid, server.worker_id, local_sid, join_gen, changes)) {
+            sendPresenceError(server, session, room_local, muc_host, "resource-constraint", changes);
+            return;
+        }
+        // The new resource gets the full join response without the join
+        // broadcast: the nick did not change, so other occupants see nothing.
         for (&r.occupants) |*slot| {
             const occ = slot.* orelse continue;
             if (occ.session_id == local_sid and occ.worker_id == server.worker_id) continue; // skip self
@@ -1371,6 +1374,89 @@ fn broadcastOccupantLeave(
     }
 }
 
+/// Same bare JID, same nick, new resource: the occupant record moves to the
+/// new resource (latest resource wins). The previous resource is told it
+/// left (unavailable self-presence with status 110) and its shadow copy on
+/// another worker is dropped; other occupants see no change. Returns false,
+/// with nothing changed, when the room index cannot grow.
+fn collapseOccupant(
+    server: *Server,
+    r: *Room,
+    idx: usize,
+    new_real_jid: []const u8,
+    new_worker: u16,
+    new_session: usize,
+    new_generation: u32,
+    changes: *ChangeList,
+) bool {
+    // By-value copy: the JID buffers are inline, so `before` keeps the
+    // previous resource after the record is retargeted.
+    const before = r.occupants[idx].?;
+    r.retargetOccupant(idx, new_real_jid, new_session, new_worker, new_generation) catch return false;
+    log.info("{s} took over occupant '{s}' in {s} from {s}", .{ new_real_jid, before.getNick(), r.getJid(), before.getRealJid() });
+
+    if (before.session_id == room_registry.REMOTE_OCCUPANT) return true;
+    notifyReplacedResource(server, r, &before, changes);
+    if (before.worker_id != server.worker_id) {
+        server.enqueueRoomActorMessage(before.worker_id, .{ .shadow_part = .{
+            .room_jid = r.getJid(),
+            .real_jid = before.getRealJid(),
+            .nick = before.getNick(),
+            .worker_id = before.worker_id,
+            .session_id = @intCast(before.session_id),
+            .generation = before.generation,
+        } });
+    }
+    return true;
+}
+
+/// Tells a resource replaced by a takeover that it is no longer in the room.
+/// A local target is checked against its bound JID so a reused session slot
+/// never receives it; a target on another worker goes through the
+/// generation-checked unicast.
+fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<presence from='") catch return;
+    w.writeAll(r.getJid()) catch return;
+    w.writeByte('/') catch return;
+    w.writeAll(before.getNick()) catch return;
+    w.writeAll("' to='") catch return;
+    w.writeAll(before.getRealJid()) catch return;
+    w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+    w.writeAll(before.affiliation.toName()) catch return;
+    w.writeAll("' role='none'/><status code='110'/></x></presence>") catch return;
+    const stanza = fbs.getWritten();
+
+    if (before.worker_id != server.worker_id) {
+        const ds = server.delivery_system orelse return;
+        ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch {};
+        return;
+    }
+    const target = server.sessions[before.session_id] orelse return;
+    const bound = target.stream.bound_jid orelse return;
+    var jid_buf: [256]u8 = undefined;
+    const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+    if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
+    fanout.deliverToSession(target, stanza, before.session_id, changes);
+}
+
+/// Presence error to a joiner on another worker.
+fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<presence from='") catch return;
+    w.writeAll(ev.room_jid) catch return;
+    w.writeAll("' to='") catch return;
+    w.writeAll(ev.real_jid) catch return;
+    w.writeAll("' type='error'><error type='cancel'><") catch return;
+    w.writeAll(condition) catch return;
+    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+    ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
+}
+
 /// Replay recent room history to a joining occupant (XEP-0045 §7.2.14).
 /// Queries the archive store for the last history_length messages and delivers
 /// each with a XEP-0203 delay stamp.
@@ -1586,7 +1672,7 @@ pub fn processRemoteJoin(
     changes: *ChangeList,
 ) void {
     const reg = server.room_registry orelse return;
-    const muc_host = server.muc_host orelse return;
+    if (server.muc_host == null) return;
     const ds = server.delivery_system orelse return;
 
     // Extract bare JID from real JID (everything before '/')
@@ -1608,19 +1694,24 @@ pub fn processRemoteJoin(
     // by handleRoomActorMessage for its mailbox, but has no occupants yet.
     const is_new_room = (r.occupant_count == 0);
 
-    // Check if already in room (rejoin)
-    if (r.findByRealJid(ev.real_jid)) |_| {
-        // Send self-presence back via MPSC unicast
+    // Check if already in room (rejoin): self-presence with the occupant's
+    // current affiliation and role.
+    if (r.findByRealJid(ev.real_jid)) |self_idx| {
+        const occ = r.occupants[self_idx].?;
         var buf: [2048]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<presence from='") catch return;
         w.writeAll(ev.room_jid) catch return;
         w.writeByte('/') catch return;
-        w.writeAll(ev.nick) catch return;
+        w.writeAll(occ.getNick()) catch return;
         w.writeAll("' to='") catch return;
         w.writeAll(ev.real_jid) catch return;
-        w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='owner' role='moderator'/><status code='110'/></x></presence>") catch return;
+        w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
+        w.writeAll(occ.affiliation.toName()) catch return;
+        w.writeAll("' role='") catch return;
+        w.writeAll(occ.role.toName()) catch return;
+        w.writeAll("'/><status code='110'/></x></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
         return;
     }
@@ -1628,7 +1719,16 @@ pub fn processRemoteJoin(
     // Nickname conflict check
     if (r.findByNick(ev.nick)) |existing_idx| {
         const existing = r.occupants[existing_idx].?;
-        if (!std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
+        if (std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
+            // Same user, same nick, new resource on another worker: the new
+            // resource takes over the occupant record.
+            if (!collapseOccupant(server, r, existing_idx, ev.real_jid, ev.worker_id, ev.session_id, ev.generation, changes)) {
+                sendRemotePresenceError(ds, ev, "resource-constraint");
+                return;
+            }
+            finishRemoteJoin(server, r, ev, existing.role, existing.affiliation, false, changes);
+            return;
+        } else {
             // Send conflict error back via MPSC
             var err_buf: [1024]u8 = undefined;
             var err_fbs = std.io.fixedBufferStream(&err_buf);
@@ -1688,7 +1788,7 @@ pub fn processRemoteJoin(
     }
 
     // Add occupant to canonical room on owning worker
-    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, 0, role, affiliation) catch {
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, role, affiliation) catch {
         var err_buf: [1024]u8 = undefined;
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
@@ -1702,6 +1802,25 @@ pub fn processRemoteJoin(
     };
 
     log.info("{s} joined {s} as '{s}' (remote, worker {d})", .{ ev.real_jid, ev.room_jid, ev.nick, ev.worker_id });
+    finishRemoteJoin(server, r, ev, role, affiliation, true, changes);
+}
+
+/// Join response for an occupant on another worker, sent over MPSC unicast:
+/// shadow entry on the joiner's worker, the other occupants' presence,
+/// self-presence (status 110), history and subject. `broadcast` announces
+/// the occupant to the room; a resource takeover keeps the nick, so it does
+/// not.
+fn finishRemoteJoin(
+    server: *Server,
+    r: *Room,
+    ev: actor_message.RoomEvent,
+    role: Role,
+    affiliation: Affiliation,
+    broadcast: bool,
+    changes: *ChangeList,
+) void {
+    const ds = server.delivery_system orelse return;
+    const muc_host = server.muc_host orelse return;
 
     // Send shadow_join to the remote worker so multicast fan-out works
     server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_join = .{
@@ -1735,7 +1854,9 @@ pub fn processRemoteJoin(
     }
 
     // Broadcast new occupant's presence to ALL occupants (multicast + local)
-    broadcastOccupantJoin(server, r, ev.nick, ev.real_jid, role, affiliation, muc_host, ev.session_id, changes);
+    if (broadcast) {
+        broadcastOccupantJoin(server, r, ev.nick, ev.real_jid, role, affiliation, muc_host, ev.session_id, changes);
+    }
 
     // Send self-presence with status 110 to the joiner
     {

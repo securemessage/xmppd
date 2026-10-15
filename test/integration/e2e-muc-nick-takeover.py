@@ -145,6 +145,15 @@ if __name__ == '__main__':
     check('takeover resource received history replay', 'takeover-history-probe-1' in rx, rx[-400:])
     check('takeover join was not a presence error', 'type=\'error\'' not in rx, rx[:250])
 
+    # The replaced resource is told it left; the other occupants see no change.
+    a1_rx = a1.drain(3)
+    check('replaced resource received unavailable self-presence (110)',
+          "type='unavailable'" in a1_rx and ("code='110'" in a1_rx or 'code="110"' in a1_rx)
+          and f'{ROOM}/alice' in a1_rx, a1_rx[:300])
+    bob_rx = bob.drain(2)
+    check('takeover is invisible to other occupants',
+          "type='unavailable'" not in bob_rx, bob_rx[:250])
+
     # Takeover resource must be able to send: reflection + fan-out
     a2_rx_start = len(a2.buf)
     a2.groupchat('takeover-send-probe-2')
@@ -154,6 +163,9 @@ if __name__ == '__main__':
           'takeover-send-probe-2' in a2_rx and 'not-acceptable' not in a2_rx, a2_rx[:250])
     check('takeover resource message fanned out to bob',
           'takeover-send-probe-2' in bob_rx, bob_rx[:250])
+    a1_rx = a1.drain(2)
+    check('replaced resource no longer receives room traffic',
+          'takeover-send-probe-2' not in a1_rx, a1_rx[:250])
 
     # Unclean disconnect must remove the occupant (no ghost)
     a2.sock.close()
