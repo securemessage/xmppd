@@ -1146,9 +1146,13 @@ pub const Engine = struct {
     /// sessions from other threads (thread-safe startSession) must have a
     /// session or timer pending before calling run().
     pub fn run(self: *Engine) !void {
-        _ = self.run_gen.fetchAdd(1, .acq_rel);
+        // The generation is snapshotted HERE and handed to the thread: a
+        // deinit racing the thread start bumps run_gen before the loop's
+        // first read, and a loop that read the bumped value itself would
+        // never see the mismatch and hang the join (T252 review).
+        const gen = self.run_gen.fetchAdd(1, .acq_rel) +% 1;
         self.waitLoopExit();
-        const t = std.Thread.spawn(.{}, Engine.runLoop, .{self}) catch return error.ThreadSpawn;
+        const t = std.Thread.spawn(.{}, Engine.runLoop, .{ self, gen }) catch return error.ThreadSpawn;
         self.thread = t;
     }
 
@@ -1171,8 +1175,7 @@ pub const Engine = struct {
         }
     }
 
-    fn runLoop(self: *Engine) void {
-        const gen = self.run_gen.load(.acquire);
+    fn runLoop(self: *Engine, gen: u32) void {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
         while ((self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) and self.run_gen.load(.acquire) == gen) {
@@ -1495,4 +1498,49 @@ test "engine: timer EV_ERROR receipt drops the timer without firing it" {
     eng.onTimerEvent(expiry);
     try std.testing.expectEqual(@as(usize, 1), fired);
     try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
+}
+
+test "engine: a generation bump right after run stops the loop (T252 review)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    var fired: usize = 0;
+    // A long pending timer keeps the loop alive: the pre-fix loop parks in
+    // kevent() until it expires, so the race below hangs the join.
+    _ = try eng.schedule(60_000, countingTimerCb, &fired);
+
+    try eng.run();
+    // Reproduce the T252 window on this thread: the deinit-style bump lands
+    // before the freshly spawned loop thread reads run_gen. The loop must
+    // exit because its generation ARGUMENT is stale; a loop that snapshots
+    // run_gen after the bump never sees a mismatch.
+    _ = eng.run_gen.fetchAdd(1, .acq_rel);
+    eng.requestWake();
+
+    const Ctx = struct {
+        eng: *Engine,
+        done: std.atomic.Value(bool) = .init(false),
+        fn joinThread(self: *@This()) void {
+            if (self.eng.thread) |*t| {
+                t.join();
+                self.eng.thread = null;
+            }
+            self.done.store(true, .release);
+        }
+    };
+    var ctx = Ctx{ .eng = &eng };
+    const jt = try std.Thread.spawn(.{}, Ctx.joinThread, .{&ctx});
+
+    // Watchdog: a hung loop fails the test instead of hanging the suite.
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!ctx.done.load(.acquire) and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    if (!ctx.done.load(.acquire)) {
+        jt.detach();
+        return error.WatchdogLoopDidNotExit;
+    }
+    jt.join();
+
+    eng.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fired);
 }
