@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const http = @import("http");
 const jwt = @import("jwt");
+const ssl = @import("ssl");
 
 const log = std.log.scoped(.oidc_store);
 
@@ -117,6 +118,27 @@ pub const OidcStore = struct {
         return &self.http_client.?;
     }
 
+    /// Derive the local identity from an IdP claim (S3 review): a claim
+    /// that carries a domain must name the configured user_domain, and the
+    /// localpart is copied into the stable username buffer (claim slices
+    /// borrow request-scoped memory). Null on mismatch or oversize.
+    fn claimIdentity(self: *OidcStore, raw_username: []const u8) ?[]const u8 {
+        if (raw_username.len == 0) return null;
+        if (self.config.user_domain) |dom| {
+            if (std.mem.indexOfScalar(u8, raw_username, '@')) |at| {
+                if (!std.ascii.eqlIgnoreCase(raw_username[at + 1 ..], dom)) {
+                    log.info("OIDC: claim '{s}' is outside user_domain '{s}'; rejected", .{ raw_username, dom });
+                    return null;
+                }
+            }
+        }
+        const localpart = extractLocalpart(raw_username);
+        if (localpart.len == 0 or localpart.len > self.username_buf.len) return null;
+        @memcpy(self.username_buf[0..localpart.len], localpart);
+        self.username_len = localpart.len;
+        return self.username_buf[0..self.username_len];
+    }
+
     /// Validate an OAUTHBEARER token. Returns the extracted username on success.
     /// The returned slice borrows from internal state — valid until next validateToken call.
     /// Tries JWT validation first; falls back to token introspection for opaque tokens.
@@ -172,15 +194,12 @@ pub const OidcStore = struct {
             return null;
         }
 
-        // Strip domain from email-style usernames to get JID localpart
-        // e.g., "alice@morante.dev" → "alice"
-        // Copy into stable buffer — JWT claim slices point into stack-local
-        // buffers inside jwt.parse() that die when this function returns.
-        const localpart = extractLocalpart(raw_username);
-        if (localpart.len > self.username_buf.len) return null;
-        @memcpy(self.username_buf[0..localpart.len], localpart);
-        self.username_len = localpart.len;
-        const username = self.username_buf[0..self.username_len];
+        // Domain-checked claim identity, copied into the stable buffer (JWT
+        // claim slices die with jwt.parse's stack locals) (S3 review).
+        const username = self.claimIdentity(raw_username) orelse {
+            log.info("OAUTHBEARER: claim identity rejected for sub='{s}'", .{parsed.claims.sub});
+            return null;
+        };
 
         // Capture profile photo URL from OIDC `picture` claim (standard OpenID Connect).
         // Copy into stable buffer for the same lifetime reason as username.
@@ -235,9 +254,28 @@ pub const OidcStore = struct {
             return null;
         }
 
-        // Success — the IdP authenticated the user. Return the username as-is.
-        log.info("ROPC: password validated for '{s}'", .{username});
-        return username;
+        // S3 review: the authenticated identity comes from the IdP's token
+        // claims, exactly like OAUTHBEARER. The typed username is never
+        // returned as-is: a case or domain variant of a locked account must
+        // not slip past the lock check.
+        return self.identityFromTokenResponse(allocator, response.body);
+    }
+
+    /// Derive the authenticated identity from an ROPC token response: the
+    /// id_token claims when present (full JWT validation), else the
+    /// access_token via introspection when an endpoint is configured. Null
+    /// when neither yields a validated identity (S3 review).
+    fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8) !?[]const u8 {
+        if (extractNamedField(body, "\"id_token\"")) |id_token| {
+            if (id_token.len > 0) return self.validateToken(allocator, id_token);
+        }
+        if (extractNamedField(body, "\"access_token\"")) |access_token| {
+            if (access_token.len > 0 and self.config.introspection_endpoint != null) {
+                return self.introspectToken(allocator, access_token);
+            }
+        }
+        log.info("ROPC: token response carries no usable id_token or access_token", .{});
+        return null;
     }
 
     /// Validate a token via the introspection endpoint (RFC 7662).
@@ -292,7 +330,13 @@ pub const OidcStore = struct {
             return null;
         };
 
-        const username = extractLocalpart(username_claim);
+        // Copy into the stable buffer: the claim slice borrows the response
+        // body, which dies with this scope. Domain-checked like every claim
+        // identity (S3 review).
+        const username = self.claimIdentity(username_claim) orelse {
+            log.info("introspection: claim identity rejected", .{});
+            return null;
+        };
         log.info("OAUTHBEARER: introspection validated for '{s}'", .{username});
         return username;
     }
@@ -606,4 +650,163 @@ test "extractLocalpart: bare username" {
 
 test "extractLocalpart: empty" {
     try std.testing.expectEqualStrings("", extractLocalpart(""));
+}
+
+// --- S3 review tests: claim identity and the ROPC identity path ------------
+
+test "OidcStore: claim identity enforces user_domain and keeps the localpart (S3 review)" {
+    const allocator = std.testing.allocator;
+    var store = OidcStore.init(allocator, .{
+        .issuer = "https://idp.example/",
+        .client_id = "xmppd",
+        .client_secret = "secret",
+        .token_endpoint = "https://idp.example/token",
+        .jwks_uri = "https://idp.example/certs",
+        .user_domain = "us.example",
+    });
+    defer store.deinit();
+
+    try std.testing.expectEqualStrings("alice", store.claimIdentity("alice").?);
+    try std.testing.expectEqualStrings("alice", store.claimIdentity("alice@us.example").?);
+    // Claim case is preserved; folding is the lock store's job.
+    try std.testing.expectEqualStrings("Alice", store.claimIdentity("Alice@US.EXAMPLE").?);
+    // A foreign domain in the claim is rejected when user_domain is set.
+    try std.testing.expect(store.claimIdentity("alice@other.example") == null);
+    try std.testing.expect(store.claimIdentity("") == null);
+
+    // Without user_domain configured any claim domain passes and is stripped.
+    store.config.user_domain = null;
+    try std.testing.expectEqualStrings("alice", store.claimIdentity("alice@wherever.example").?);
+}
+
+/// Write a fresh self-signed cert+key for "localhost" into `dir` via the
+/// system OpenSSL CLI. error.SkipZigTest when the tool is missing.
+fn genIdpTestCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .cwd_dir = dir,
+        .max_output_bytes = 4096,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Serve one HTTPS JSON response on a loopback TLS listener, then return.
+/// The bound port is published via port_out; a deadline keeps the test from
+/// hanging when the client never connects. kTLS stays off on this end (one
+/// userland TLS end avoids FreeBSD PR 296498 on loopback).
+fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, body: []const u8, port_out: *std.atomic.Value(u16)) void {
+    const posix = std.posix;
+    var ctx = ssl.SslContext.initServer(cert_path, key_path) catch return;
+    defer ctx.deinit();
+    ctx.disableKtls();
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn_fd);
+        var conn = ssl.SslConn.init(ctx, conn_fd) catch continue;
+        defer {
+            conn.shutdown();
+            conn.deinit();
+        }
+        // Drive the server-side handshake to completion.
+        var hs_done = false;
+        while (!hs_done and std.time.milliTimestamp() < deadline) {
+            const hs = conn.doHandshake() catch break;
+            hs_done = hs == .complete;
+        }
+        if (!hs_done) continue;
+        // Consume the request head (the form body is irrelevant here).
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const rr = conn.read(buf[total..]) catch break;
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) break;
+                    total += n;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        var resp: [8192]u8 = undefined;
+        const out = std.fmt.bufPrint(&resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+        var sent: usize = 0;
+        while (sent < out.len and std.time.milliTimestamp() < deadline) {
+            const wr = conn.write(out[sent..]) catch break;
+            switch (wr) {
+                .ok => |n| sent += n,
+                .want_read, .want_write => {},
+            }
+        }
+        return;
+    }
+}
+
+test "OidcStore: ROPC identity comes from token claims, never the typed name (S3 review)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genIdpTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(allocator, "{s}/cert.pem", .{base}, 0);
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(allocator, "{s}/key.pem", .{base}, 0);
+    defer allocator.free(key_path);
+
+    var port = std.atomic.Value(u16).init(0);
+    const body = "{\"access_token\":\"opaque-token\",\"token_type\":\"Bearer\"}";
+    const th = try std.Thread.spawn(.{}, serveOneTlsResponse, .{ cert_path.ptr, key_path.ptr, body, &port });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 5000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{port.load(.acquire)});
+
+    var store = OidcStore.init(allocator, .{
+        .issuer = "https://idp.example/",
+        .client_id = "xmppd",
+        .client_secret = "secret",
+        .token_endpoint = url,
+        .jwks_uri = url,
+        .ca_file = cert_path,
+        .user_domain = "us.example",
+    });
+    defer store.deinit();
+
+    // The IdP answered 200, but the response carries no id_token and no
+    // introspection endpoint is configured: no claim identity can be
+    // derived, so the typed name must never come back. Before the fix a
+    // case variant of a locked account ("ALICE@us.example" vs locked
+    // "alice") rode the typed name straight past the lock check.
+    const result = try store.validatePassword(allocator, "ALICE@us.example", "pw");
+    try std.testing.expect(result == null);
 }

@@ -1212,6 +1212,26 @@ pub fn build(b: *std.Build) void {
 
     const run_jwt_tests = b.addRunArtifact(jwt_tests);
 
+    // --- OIDC store tests (S3 review: the OIDC identity path had no step) ---
+    const oidc_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/oidc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    oidc_store_test_mod.addImport("http", http_test_mod);
+    oidc_store_test_mod.addImport("jwt", jwt_test_mod);
+    oidc_store_test_mod.addImport("ssl", ssl_mod);
+    oidc_store_test_mod.linkSystemLibrary("ssl", .{});
+    oidc_store_test_mod.linkSystemLibrary("crypto", .{});
+
+    const oidc_store_tests = b.addTest(.{
+        .name = "oidc-store-tests",
+        .root_module = oidc_store_test_mod,
+    });
+
+    const run_oidc_store_tests = b.addRunArtifact(oidc_store_tests);
+
     // --- Shared logging module ---
     const xmppd_log_mod = b.createModule(.{
         .root_source_file = b.path("src/log.zig"),
@@ -1417,6 +1437,7 @@ pub fn build(b: *std.Build) void {
     });
     oidc_store_mod.addImport("http", http_mod);
     oidc_store_mod.addImport("jwt", jwt_mod);
+    oidc_store_mod.addImport("ssl", ssl_mod);
     oidc_store_mod.linkSystemLibrary("ssl", .{});
     oidc_store_mod.linkSystemLibrary("crypto", .{});
 
@@ -1643,6 +1664,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
+    test_step.dependOn(&run_oidc_store_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
 }

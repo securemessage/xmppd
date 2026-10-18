@@ -119,16 +119,23 @@ pub const LmdbBackend = struct {
     }
 
     /// Read-only openings (the OIDC daemon, S3 review): open the canonical
-    /// namespaces from a read txn, never create. A missing namespace means
-    // the store predates v0.9.1 hardening; open fails.
+    /// namespaces from a read txn, never create. The read-only path serves
+    /// lock checks only, so a missing DBI other than "locks" (a store
+    /// provisioned by an older version or another daemon) is skipped with a
+    /// warning; a missing "locks" DBI fails the open (S3 review N8).
     fn openCanonicalNamespacesReadOnly(self: *LmdbBackend) !void {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
+        errdefer txn.abort();
         for (backend.canonical_namespaces) |ns| {
             var name_z: [65]u8 = undefined;
             if (ns.len > 64) return error.MDB_BAD_VALSIZE;
             @memcpy(name_z[0..ns.len], ns);
             name_z[ns.len] = 0;
-            const db = try lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{});
+            const db = lmdb.Database.open(txn, @ptrCast(name_z[0..ns.len :0]), .{}) catch |err| {
+                if (std.mem.eql(u8, ns, "locks")) return err;
+                log.warn("read-only open: namespace '{s}' missing; skipping", .{ns});
+                continue;
+            };
             const entry = &self.dbi_cache[self.dbi_count.load(.monotonic)];
             @memcpy(entry.name_buf[0..ns.len], ns);
             entry.name_len = @intCast(ns.len);
@@ -566,6 +573,52 @@ test "LmdbBackend: read-only open with create=false serves reads, refuses to wri
     // Read-only mode: a write attempt must fail before hitting LMDB's
     // env, or the LMDB layer must report EACCES (exact error differs).
     if (db.put("locks", "bob", "x")) |_| {
+        return error.ShouldHaveFailed;
+    } else |_| {}
+}
+
+test "LmdbBackend: read-only open needs only the locks namespace (S3 review N8)" {
+    const allocator = std.testing.allocator;
+
+    // Env provisioned with ONLY the "locks" DBI (a store written by an
+    // older or foreign daemon): the read-only open must succeed.
+    const path = freshTestDir();
+    std.fs.cwd().makePath(path) catch {};
+    {
+        var path_buf: [256:0]u8 = undefined;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const env = try lmdb.Environment.init(&path_buf, .{ .map_size = 1024 * 1024, .max_dbs = MAX_DBS });
+        defer env.deinit();
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        var db = try lmdb.Database.open(txn, "locks", .{ .create = true });
+        try db.set("alice", "locked");
+        try txn.commit();
+    }
+    var ro = try LmdbBackend.open(path, .{ .create = false, .read_only = true });
+    defer ro.close();
+    const v = try ro.get(allocator, "locks", "alice");
+    defer if (v) |x| allocator.free(x);
+    try std.testing.expect(v != null);
+
+    // An env WITHOUT the locks DBI still fails the read-only open: the
+    // daemon must not boot into fail-open on a store it cannot read.
+    const path2 = "/tmp/xmppd-test-lmdb-n8b";
+    std.fs.cwd().deleteTree(path2) catch {};
+    defer std.fs.cwd().deleteTree(path2) catch {};
+    try std.fs.cwd().makePath(path2);
+    {
+        var path_buf: [256:0]u8 = undefined;
+        @memcpy(path_buf[0..path2.len], path2);
+        path_buf[path2.len] = 0;
+        const env = try lmdb.Environment.init(&path_buf, .{ .map_size = 1024 * 1024, .max_dbs = MAX_DBS });
+        defer env.deinit();
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        try txn.commit();
+    }
+    if (LmdbBackend.open(path2, .{ .create = false, .read_only = true })) |opened| {
+        var m = opened;
+        m.close();
         return error.ShouldHaveFailed;
     } else |_| {}
 }

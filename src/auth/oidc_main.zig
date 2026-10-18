@@ -172,15 +172,31 @@ pub fn main() !void {
     // Permanent account locks come from the shared store, read-only, no
     // creation: an OIDC daemon seeing an empty/missing store must not boot
     // into fail-open (S3 review). A startup error kills the daemon outright.
+    // A fresh install has no environment yet: provision it once read-write,
+    // then reopen read-only, so the daemon does not crash-loop (S3 review
+    // N8).
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
-    var backend = OpBackendType.open(auth_path, .{
+    const ro_opts = .{
         .map_size = map_size_mb * 1024 * 1024,
         .create = false,
         .read_only = true,
-    }) catch |err| {
-        log.err("lock store open failed for {s} — refusing to start: {}", .{ auth_path, err });
-        return err;
+    };
+    var backend = OpBackendType.open(auth_path, ro_opts) catch |first_err| {
+        log.warn("lock store at {s} not readable yet ({}); provisioning read-write once", .{ auth_path, first_err });
+        var provision = OpBackendType.open(auth_path, .{
+            .map_size = map_size_mb * 1024 * 1024,
+            .create = true,
+            .read_only = false,
+        }) catch |err| {
+            log.err("lock store provisioning failed for {s}, refusing to start: {}", .{ auth_path, err });
+            return err;
+        };
+        provision.close();
+        OpBackendType.open(auth_path, ro_opts) catch |err| {
+            log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
+            return err;
+        }
     };
     defer backend.close();
     var lock_store = LockStore.init(&backend);

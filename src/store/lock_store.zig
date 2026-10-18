@@ -24,6 +24,18 @@ const log = std.log.scoped(.lock_store);
 const NAMESPACE = "locks";
 const LOCK_VALUE_SIZE = 5; // lock_type(1) + epoch(4)
 
+/// Lock keys are canonical ASCII-lowercase localparts: XMPP localparts are
+/// case-insensitive, so a lock on "alice" must hold for "Alice" and "ALICE"
+/// alike (S3 review). Empty or overlong names cannot be valid identities;
+/// the check path maps the error to fail-closed.
+const MAX_KEY_LEN = 256;
+
+fn canonicalKey(username: []const u8, buf: *[MAX_KEY_LEN]u8) error{KeyTooLong}![]const u8 {
+    if (username.len == 0 or username.len > MAX_KEY_LEN) return error.KeyTooLong;
+    for (username, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    return buf[0..username.len];
+}
+
 /// Lock type identifiers.
 pub const LockType = enum(u8) {
     permanent = 0x01,
@@ -50,7 +62,9 @@ pub fn LockStore(comptime Backend: type) type {
 
         /// Check if a username is locked. Returns the lock record if locked, null otherwise.
         pub fn isLocked(self: *Self, allocator: std.mem.Allocator, username: []const u8) !?LockRecord {
-            const raw = self.backend.get(allocator, NAMESPACE, username) catch |err| {
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
+            const key = try canonicalKey(username, &key_buf);
+            const raw = self.backend.get(allocator, NAMESPACE, key) catch |err| {
                 log.err("lock_store lookup failed for '{s}': {}", .{ username, err });
                 return err;
             };
@@ -65,18 +79,22 @@ pub fn LockStore(comptime Backend: type) type {
 
         /// Lock an account. Overwrites any existing lock.
         pub fn lock(self: *Self, username: []const u8, lock_type: LockType) !void {
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
+            const key = try canonicalKey(username, &key_buf);
             const now = currentEpoch();
             const value = serialize(lock_type, now);
-            try self.backend.put(NAMESPACE, username, &value);
+            try self.backend.put(NAMESPACE, key, &value);
             log.info("locked account: {s} (type={d})", .{ username, @intFromEnum(lock_type) });
         }
 
         /// Unlock an account. No-op if not locked.
         pub fn unlock(self: *Self, allocator: std.mem.Allocator, username: []const u8) !void {
-            const existing = try self.backend.get(allocator, NAMESPACE, username);
+            var key_buf: [MAX_KEY_LEN]u8 = undefined;
+            const key = try canonicalKey(username, &key_buf);
+            const existing = try self.backend.get(allocator, NAMESPACE, key);
             if (existing) |v| {
                 allocator.free(v);
-                try self.backend.delete(NAMESPACE, username);
+                try self.backend.delete(NAMESPACE, key);
                 log.info("unlocked account: {s}", .{username});
             }
         }
@@ -188,4 +206,43 @@ test "LockStore: a corrupt lock record reads as an error, not unlocked (S3 revie
     try db.put(NAMESPACE, "alice", "x");
 
     try std.testing.expectError(error.CorruptLockRecord, store.isLocked(allocator, "alice"));
+}
+
+test "LockStore: keys are case-folded on write and check (S3 review)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    try store.lock("alice", .permanent);
+    // A case variant of a locked name must hit the same lock row: before the
+    // fix, "Alice" logged in while "alice" was locked.
+    try std.testing.expect((try store.isLocked(allocator, "Alice")) != null);
+    try std.testing.expect((try store.isLocked(allocator, "ALICE")) != null);
+    try std.testing.expect((try store.isLocked(allocator, "alice")) != null);
+
+    // Writes fold too: locking "BoB" locks "bob", and unlock matches any case.
+    try store.lock("BoB", .permanent);
+    try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
+    try store.unlock(allocator, "BOB");
+    try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
+}
+
+test "LockStore: empty and overlong names fail closed (S3 review)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // A name that cannot be canonical is an error, and callers map lock
+    // store errors to fail-closed.
+    try std.testing.expectError(error.KeyTooLong, store.isLocked(allocator, ""));
+    var big: [300]u8 = undefined;
+    @memset(&big, 'a');
+    try std.testing.expectError(error.KeyTooLong, store.isLocked(allocator, &big));
+    try std.testing.expectError(error.KeyTooLong, store.lock("", .permanent));
 }

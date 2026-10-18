@@ -224,7 +224,10 @@ pub fn AuthHandler(comptime Store: type) type {
         /// (T352/S3): null means admitted. Fail closed on lock-store errors.
         fn admit(self: *Self, username: []const u8) ?[]const u8 {
             if (self.lock_checker) |checker| {
-                switch (checker.check(username)) {
+                // Locks are keyed by the canonical localpart: strip any
+                // domain the typed or claimed identity carries; the lock
+                // store folds case on both write and check (S3 review).
+                switch (checker.check(localpartOf(username))) {
                     .locked => {
                         log.info("auth rejected: account '{s}' is permanently locked", .{username});
                         return "account-disabled";
@@ -1282,6 +1285,112 @@ test "AuthHandler: lock store error fails closed (T352/S3)" {
     } }) orelse return error.NoResponse;
 
     try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
+}
+
+test "AuthHandler: locks catch case and domain variants of the typed name (S3 review)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    // A real LockStore on its own backend: xmppctl locks the canonical name
+    // and every variant of it must hit the same row.
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    // Case variant of the locked name, correct password.
+    {
+        var payload: [16]u8 = undefined;
+        payload[0] = 0;
+        @memcpy(payload[1..6], "Alice");
+        payload[6] = 0;
+        @memcpy(payload[7..16], "secret123");
+        const result = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 21,
+            .mechanism = .plain,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = payload[0..16],
+        } }) orelse return error.NoResponse;
+        try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    }
+    // Domain form of the locked name.
+    {
+        const user = "ALICE@us.example";
+        const pass = "secret123";
+        var payload: [64]u8 = undefined;
+        payload[0] = 0;
+        @memcpy(payload[1 .. 1 + user.len], user);
+        payload[1 + user.len] = 0;
+        @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+        const result = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 22,
+            .mechanism = .plain,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = payload[0 .. 2 + user.len + pass.len],
+        } }) orelse return error.NoResponse;
+        try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    }
+}
+
+test "AuthHandler: a lock landing between challenge and client-final rejects (S3 review)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const Gate = struct { locked: bool = false };
+    var gate = Gate{};
+    handler.setLockChecker(.{ .ctx = @ptrCast(&gate), .checkFn = struct {
+        fn f(ctx: *anyopaque, _: []const u8) LockCheckResult {
+            const g: *const Gate = @ptrCast(@alignCast(ctx));
+            return if (g.locked) .locked else .unlocked;
+        }
+    }.f });
+
+    var client = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client.deinit();
+
+    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 23,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try client.clientFirst(),
+    } }) orelse return error.NoResponse;
+    const challenge = challenge_msg.auth_challenge.challenge;
+    try std.testing.expect(challenge.len > 0);
+
+    // The account is locked while the exchange is in flight.
+    gate.locked = true;
+
+    const result = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 23,
+        .payload = try client.handleServerFirst(challenge),
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    // The rejected exchange leaves no session behind.
+    try std.testing.expect(handler.findScramSlot(0, 23) == null);
 }
 
 test "AuthHandler: re-auth on a live conn_id deinits the previous exchange (T279)" {
