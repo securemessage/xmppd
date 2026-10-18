@@ -2774,3 +2774,103 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2 rev
     try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
+
+test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // First open pinned the origin.
+    in1.session.stream_open_seen = true;
+    in1.session.setRemoteDomain("them.example");
+
+    // A restart that re-identifies the peer as another domain must fail the
+    // stream with invalid-from and close it.
+    var attrs = [_]xml.Attribute{ testAttr("from", "victim.example"), testAttr("to", "us.example"), testAttr("version", "1.0") };
+    const elem = xml.Element{
+        .name = "stream:stream",
+        .prefix = "stream",
+        .local_name = "stream",
+        .namespace_uri = "http://etherx.jabber.org/streams",
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .stream_open = elem }, &cl);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "</stream:stream>") != null);
+}
+
+test "S2sDaemon: stanza from unauthenticated domain on established session is rejected (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    in1.session.stream.setAuthenticated();
+
+    // from= names a domain this session never authenticated for.
+    var attrs = [_]xml.Attribute{ testAttr("from", "eve@evil.example"), testAttr("to", "juliet@us.example") };
+    const elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = elem }, &cl);
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+
+    // Positive control: an authenticated domain passes the set lookup and
+    // the session stays open.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    in2.session.stream.setAuthenticated();
+    in2.session.addAuthenticatedDomain("them.example");
+    var attrs2 = [_]xml.Attribute{ testAttr("from", "romeo@them.example/orchard"), testAttr("to", "juliet@us.example") };
+    const elem2 = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &attrs2,
+        .self_closing = true,
+    };
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
+    try std.testing.expect(daemon.getInbound(2) != null);
+}
+
+test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "other.example", key);
+
+    // The to= check must fail the stream before any callback is registered.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+}
