@@ -518,6 +518,12 @@ pub const Server = struct {
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
 
+    /// Test seam (T215): when set, the next TLS upgrade fails instead of
+    /// starting a handshake, which exercises the teardown that frees the
+    /// session. A real `upgradeToTls` failure needs `SSL_new` to run out of
+    /// memory, so no test can arrange one otherwise. Never set in production.
+    fail_next_tls_upgrade: bool = false,
+
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
     /// Whether EVFILT_WRITE is armed for the auth/S2S IPC fds. Reconciled
@@ -2983,7 +2989,10 @@ pub const Server = struct {
                 // completes the upgrade once the buffer drains.
                 _ = session.conn.flushSend() catch {};
                 if (session.conn.hasPendingWrite()) return;
-                self.startTlsUpgrade(session, changes);
+                // Nothing in this branch touches the session afterwards, and
+                // every caller returns on reaching it, so a failed upgrade
+                // that frees the session is not read here.
+                _ = self.startTlsUpgrade(session, changes);
             },
             .send_sasl_success => |server_final| {
                 writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -3058,9 +3067,10 @@ pub const Server = struct {
         if (!session.conn.hasPendingWrite()) {
             changes.removeWrite(session.conn.fd) catch {};
             // T215: a STARTTLS upgrade deferred by backpressure starts now
-            // that <proceed/> is fully on the wire.
+            // that <proceed/> is fully on the wire. A failed upgrade frees
+            // the session, so nothing below may touch it.
             if (session.stream.state == .starttls_pending and !session.conn.isTlsHandshaking()) {
-                self.startTlsUpgrade(session, changes);
+                if (!self.startTlsUpgrade(session, changes)) return;
             }
         }
 
@@ -3078,18 +3088,26 @@ pub const Server = struct {
     /// Begin the TLS handshake once the plaintext <proceed/> is fully
     /// flushed (T215). Called from executeAction and handleWritable. A
     /// failed upgrade closes the session: it would otherwise sit in
-    /// starttls_pending forever.
-    fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) void {
+    /// starttls_pending forever. Closing frees the session, so false means
+    /// the caller must stop touching it.
+    fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) bool {
         if (self.ssl_ctx) |ctx| {
+            if (self.fail_next_tls_upgrade) {
+                self.fail_next_tls_upgrade = false;
+                log.warn("connection {d} TLS upgrade failed", .{session.conn.id});
+                session_lifecycle.closeSession(self, session.conn.id, changes);
+                return false;
+            }
             session.conn.upgradeToTls(ctx) catch {
                 log.warn("connection {d} TLS upgrade failed", .{session.conn.id});
                 session_lifecycle.closeSession(self, session.conn.id, changes);
-                return;
+                return false;
             };
             log.info("connection {d} starting TLS handshake", .{session.conn.id});
         } else {
             log.warn("connection {d} STARTTLS requested but no TLS configured", .{session.conn.id});
         }
+        return true;
     }
 
     /// T110 client-side backpressure: while a connection's write buffer
@@ -4577,6 +4595,22 @@ fn extractAttrValue(tag: []const u8, attr_name: []const u8) []const u8 {
 // Tests
 // ============================================================================
 
+/// Helper: fill the connection's write buffer so it has pending bytes that
+/// cannot flush at once (unix socketpairs ignore SO_SNDBUF and buffer 64 KiB).
+/// Returns true once something is left queued. Test-only; split so the S15
+/// ratchet, which greps for raw sends, counts this one site rather than a
+/// copy per test.
+fn fillWriteBuffer(session: *Session) bool {
+    var filler: [12000]u8 = undefined;
+    @memset(&filler, 'x');
+    var fill: usize = 0;
+    while (fill < 8) : (fill += 1) {
+        session.conn.queueSend(&filler) catch break;
+        _ = session.conn.flushSend() catch {};
+    }
+    return session.conn.hasPendingWrite();
+}
+
 /// Helper: create a socketpair for testing.
 fn makeSocketPair() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
@@ -4791,14 +4825,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     // queued <proceed/> cannot flush at once.
     var drain_buf: [16384]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
-    var filler: [12000]u8 = undefined;
-    @memset(&filler, 'x');
-    var fill: usize = 0;
-    while (fill < 8) : (fill += 1) {
-        session.conn.queueSend(&filler) catch break;
-        _ = session.conn.flushSend() catch {};
-    }
-    try std.testing.expect(session.conn.hasPendingWrite());
+    try std.testing.expect(fillWriteBuffer(session));
 
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
     server.handleReadable(1, &changes);
@@ -4818,6 +4845,57 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     // Buffer drained: the deferred upgrade has started the handshake.
     try std.testing.expect(session.conn.tls_conn != null);
     try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
+test "Server: T215 failed deferred upgrade does not touch the freed session" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // A real cert so the deferred path is reached at all: without ssl_ctx,
+    // startTlsUpgrade only logs and never closes the session.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+
+    // Park the FSM in starttls_pending with <proceed/> still unflushed, so
+    // the upgrade is deferred to handleWritable.
+    var drain_buf: [16384]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+    try std.testing.expect(fillWriteBuffer(session));
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    server.handleReadable(1, &changes);
+    try std.testing.expect(session.stream.state == .starttls_pending);
+
+    // The upgrade will fail, and a failure closes the session and frees it.
+    server.fail_next_tls_upgrade = true;
+
+    while (posix.read(fds[1], &drain_buf)) |n| {
+        if (n == 0) break;
+    } else |_| {}
+    server.handleWritable(1, &changes);
+
+    // handleWritable must stop at the failed upgrade. Continuing into the
+    // offline-pending drain and the read-backpressure re-arm below it reads
+    // the freed session (segfault observed).
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(!server.fail_next_tls_upgrade);
 }
 
 test "Server: T215 plaintext in a later segment while STARTTLS pending is a policy-violation" {
