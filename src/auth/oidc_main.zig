@@ -196,7 +196,7 @@ pub fn main() !void {
         OpBackendType.open(auth_path, ro_opts) catch |err| {
             log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
             return err;
-        }
+        };
     };
     defer backend.close();
     var lock_store = LockStore.init(&backend);
