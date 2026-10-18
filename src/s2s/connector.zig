@@ -59,6 +59,46 @@ pub const DaneStatus = enum {
     pending,
 };
 
+/// Maximum concurrent dialback callbacks on one outbound connection.
+pub const MAX_PENDING_VERIFY = 8;
+
+/// One pending dialback verification exchange on an outbound connection:
+/// an inbound session submitted a db:result and we are waiting for the
+/// origin's verdict on our db:verify. Entries are keyed by (stream id,
+/// origin); a verdict only completes the entry whose id, from and to match,
+/// and only while the inbound slot still holds the same session
+/// (generation check) (S2 review).
+pub const PendingVerify = struct {
+    in_use: bool = false,
+    /// Inbound session slot that submitted the db:result.
+    inbound_slot: usize = 0,
+    /// Slot generation when the callback was registered.
+    inbound_gen: u32 = 0,
+    /// Inbound session stream id (the id= of our db:verify).
+    stream_id_buf: [64]u8 = undefined,
+    stream_id_len: usize = 0,
+    /// Claimed origin (from= of the db:result).
+    origin_buf: [256]u8 = undefined,
+    origin_len: usize = 0,
+    /// Dialback key to be verified.
+    key_buf: [128]u8 = undefined,
+    key_len: usize = 0,
+    /// db:verify was written to the peer.
+    verify_sent: bool = false,
+
+    pub fn streamId(self: *const PendingVerify) []const u8 {
+        return self.stream_id_buf[0..self.stream_id_len];
+    }
+
+    pub fn origin(self: *const PendingVerify) []const u8 {
+        return self.origin_buf[0..self.origin_len];
+    }
+
+    pub fn key(self: *const PendingVerify) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+};
+
 /// An outbound S2S connection to a remote domain.
 pub const OutboundConnection = struct {
     /// Remote domain we're connecting to.
@@ -92,15 +132,10 @@ pub const OutboundConnection = struct {
     /// the handshake starts when handleOutboundWritable finishes flushing
     /// (T250).
     tls_upgrade_pending: bool = false,
-    /// If set, this outbound connection is a dialback verification callback.
-    /// The value is the inbound session slot that initiated the callback.
-    /// After db:verify response, the result is sent back on that inbound session.
-    db_callback_inbound_slot: ?usize = null,
-    /// The key and stream ID for the pending db:verify request.
-    db_callback_key_buf: [128]u8 = undefined,
-    db_callback_key_len: usize = 0,
-    db_callback_stream_id_buf: [64]u8 = undefined,
-    db_callback_stream_id_len: usize = 0,
+    /// Pending dialback callbacks awaiting a verdict (S2 review). One entry
+    /// per (stream id, origin): a later db:result for the same origin no
+    /// longer overwrites another session's callback.
+    db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
@@ -448,6 +483,96 @@ pub const OutboundConnection = struct {
     pub fn handleAuthSuccess(self: *OutboundConnection) void {
         self.stream.setAuthenticated();
         self.state = .established;
+    }
+
+    /// Register a dialback callback. A repeated db:result for the same
+    /// (stream id, origin) replaces that entry; returns null when the table
+    /// is full.
+    pub fn addPendingVerify(
+        self: *OutboundConnection,
+        inbound_slot: usize,
+        inbound_gen: u32,
+        stream_id: []const u8,
+        origin: []const u8,
+        key: []const u8,
+    ) ?usize {
+        var idx: ?usize = null;
+        for (&self.db_pending, 0..) |*p, i| {
+            if (p.in_use) {
+                if (std.mem.eql(u8, p.streamId(), stream_id) and
+                    std.ascii.eqlIgnoreCase(p.origin(), origin))
+                {
+                    idx = i; // same exchange resubmitted: replace it
+                    break;
+                }
+            } else if (idx == null) {
+                idx = i;
+            }
+        }
+        const slot = idx orelse return null;
+        var p = &self.db_pending[slot];
+        p.* = .{
+            .in_use = true,
+            .inbound_slot = inbound_slot,
+            .inbound_gen = inbound_gen,
+        };
+        const sl = @min(stream_id.len, p.stream_id_buf.len);
+        @memcpy(p.stream_id_buf[0..sl], stream_id[0..sl]);
+        p.stream_id_len = sl;
+        const ol = @min(origin.len, p.origin_buf.len);
+        @memcpy(p.origin_buf[0..ol], origin[0..ol]);
+        p.origin_len = ol;
+        const kl = @min(key.len, p.key_buf.len);
+        @memcpy(p.key_buf[0..kl], key[0..kl]);
+        p.key_len = kl;
+        return slot;
+    }
+
+    /// Find the pending entry a verdict refers to: id must equal the entry's
+    /// stream id, from the claimed origin, to us (S2 review correlation).
+    pub fn findPendingVerify(
+        self: *const OutboundConnection,
+        id: []const u8,
+        from: []const u8,
+        to: []const u8,
+        local_domain: []const u8,
+    ) ?usize {
+        if (id.len == 0 or from.len == 0) return null;
+        if (!std.ascii.eqlIgnoreCase(to, local_domain)) return null;
+        for (self.db_pending, 0..) |p, i| {
+            if (!p.in_use) continue;
+            if (std.mem.eql(u8, p.streamId(), id) and
+                std.ascii.eqlIgnoreCase(p.origin(), from)) return i;
+        }
+        return null;
+    }
+
+    pub fn clearPendingVerify(self: *OutboundConnection, idx: usize) void {
+        if (idx < self.db_pending.len) self.db_pending[idx] = .{};
+    }
+
+    /// Any registered callback (sent or not).
+    pub fn hasPendingVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use) return true;
+        }
+        return false;
+    }
+
+    /// Any registered callback whose db:verify has not been written yet.
+    pub fn hasUnsentVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use and !p.verify_sent) return true;
+        }
+        return false;
+    }
+
+    pub fn pendingVerifyCount(self: *const OutboundConnection) usize {
+        var n: usize = 0;
+        for (self.db_pending) |p| {
+            if (p.in_use) n += 1;
+        }
+        return n;
     }
 
     /// SASL failure or auth rejected.

@@ -108,6 +108,9 @@ pub const S2sDaemon = struct {
     inbound: [MAX_INBOUND_SESSIONS]?*S2sSession = [_]?*S2sSession{null} ** MAX_INBOUND_SESSIONS,
     /// Per-session XML readers (parallel to inbound table).
     readers: [MAX_INBOUND_SESSIONS]?*XmlReader = [_]?*XmlReader{null} ** MAX_INBOUND_SESSIONS,
+    /// Per-slot generation counters: bumped on closeInbound so a stale
+    /// dialback callback can never land on a reused slot (S2 review).
+    inbound_gens: [MAX_INBOUND_SESSIONS]u32 = [_]u32{0} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
@@ -509,6 +512,7 @@ pub const S2sDaemon = struct {
             self.allocator.destroy(session);
             self.inbound[slot] = null;
         }
+        self.inbound_gens[slot] +%= 1;
     }
 
     /// Get an inbound session by slot index.
@@ -1347,61 +1351,91 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         return;
     };
 
-    // Tag this connection as a dialback callback and store the key/stream_id
-    conn.db_callback_inbound_slot = session.id;
-    const kl = @min(key.len, conn.db_callback_key_buf.len);
-    @memcpy(conn.db_callback_key_buf[0..kl], key[0..kl]);
-    conn.db_callback_key_len = kl;
-    const sl = @min(stream_id.len, conn.db_callback_stream_id_buf.len);
-    @memcpy(conn.db_callback_stream_id_buf[0..sl], stream_id[0..sl]);
-    conn.db_callback_stream_id_len = sl;
+    // Register the callback keyed by (stream id, origin) with the slot
+    // generation: a second db:result for the same origin can no longer
+    // overwrite this session's pending verify (S2 review).
+    if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, key) == null) {
+        log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
+        var resp_buf: [512]u8 = undefined;
+        const resp = dialback.buildDbResultResponse(&resp_buf, session.stream.local_domain, origin, false) catch return;
+        session.queueWrite(resp) catch {};
+        if (session.hasPendingWrite()) {
+            batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
+        }
+        return;
+    }
 
     if (conn.isEstablished()) {
-        // Connection already established — send db:verify immediately
+        // Connection already established: send db:verify immediately
         sendDbVerifyOnCallback(daemon, conn);
     } else if (conn.state == .connecting and conn.fd < 0) {
-        // New connection — initiate DNS + TCP connect
+        // New connection: initiate DNS + TCP connect
         daemon.initiateOutbound(batch, conn, origin);
     }
-    // else: connection is in progress — db:verify will be sent when established
+    // else: connection is in progress; db:verify is sent when established
 }
 
-/// Send a db:verify stanza on an outbound callback connection.
+/// Send db:verify stanzas for every registered callback that has not been
+/// sent yet on this outbound connection.
 fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
-    const key = conn.db_callback_key_buf[0..conn.db_callback_key_len];
-    const sid = conn.db_callback_stream_id_buf[0..conn.db_callback_stream_id_len];
+    for (&conn.db_pending) |*p| {
+        if (!p.in_use or p.verify_sent) continue;
+        const key = p.key();
+        const sid = p.streamId();
+        if (key.len == 0 or sid.len == 0) continue;
 
-    if (key.len == 0 or sid.len == 0) return;
+        var buf: [512]u8 = undefined;
+        const verify_xml = dialback.buildDbVerify(
+            &buf,
+            daemon.local_domain,
+            conn.remote_domain,
+            sid,
+            key,
+        ) catch continue;
 
-    var buf: [512]u8 = undefined;
-    const verify_xml = dialback.buildDbVerify(
-        &buf,
-        daemon.local_domain,
-        conn.remote_domain,
-        sid,
-        key,
-    ) catch return;
-
-    conn.queueWrite(verify_xml) catch return;
-    _ = conn.flushWrite() catch return;
-    log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
+        conn.queueWrite(verify_xml) catch {
+            log.warn("dialback callback: cannot queue db:verify for stream {s}", .{sid});
+            continue;
+        };
+        p.verify_sent = true;
+        log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
+    }
+    if (conn.hasPendingWrite()) {
+        _ = conn.flushWrite() catch {};
+    }
 }
 
-/// Handle a db:verify response on an outbound callback connection.
-/// Completes the inbound dialback by sending db:result on the original inbound session.
-fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, valid: bool) void {
-    const inbound_slot = conn.db_callback_inbound_slot orelse return;
+/// Handle a db:verify verdict that matched a pending callback entry.
+/// Answers db:result on the original inbound session, addressed to the
+/// verified origin, and only while the slot still holds the session that
+/// submitted the key (generation check) (S2 review).
+fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, idx: usize, valid: bool) void {
+    const pending = &conn.db_pending[idx];
+    const inbound_slot = pending.inbound_slot;
+    const gen = pending.inbound_gen;
+    // Copy the origin out before the entry is cleared.
+    var origin_buf: [256]u8 = undefined;
+    const origin_len = pending.origin_len;
+    @memcpy(origin_buf[0..origin_len], pending.origin_buf[0..origin_len]);
+    const origin = origin_buf[0..origin_len];
+    conn.clearPendingVerify(idx);
+
     const session = daemon.getInbound(inbound_slot) orelse {
         log.warn("dialback callback: inbound session {d} gone", .{inbound_slot});
         return;
     };
+    if (daemon.inbound_gens[inbound_slot] != gen) {
+        log.warn("dialback callback: inbound slot {d} was reused since the db:result; discarding verdict for {s}", .{ inbound_slot, origin });
+        return;
+    }
 
-    // Send db:result response on the original inbound connection
+    // Send db:result response on the original inbound connection, addressed
+    // to the verified origin (not the header-claimed remote domain).
     var resp_buf: [512]u8 = undefined;
     const resp = dialback.buildDbResultResponse(
         &resp_buf,
-        session.stream.local_domain,
-        session.getRemoteDomain(),
+        daemon.local_domain,
+        origin,
         valid,
     ) catch return;
 
@@ -1414,20 +1448,13 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         session.inbound_dialback.setValid();
         // S2: bind the authenticated identity to the VERIFIED origin, not to
         // whatever the header claimed at stream open.
-        session.addAuthenticatedDomain(session.inbound_dialback.getOrigin());
+        session.addAuthenticatedDomain(origin);
         session.stream.setAuthenticated();
-        log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{
-            session.inbound_dialback.getOrigin(), inbound_slot,
-        });
+        log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
         session.inbound_dialback.setInvalid();
-        log.warn("dialback callback: {s} invalid, inbound session {d} rejected", .{
-            session.getRemoteDomain(), inbound_slot,
-        });
+        log.warn("dialback callback: {s} invalid, inbound session {d} rejected", .{ origin, inbound_slot });
     }
-
-    // Clear the callback marker
-    conn.db_callback_inbound_slot = null;
 }
 
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
@@ -1778,8 +1805,24 @@ fn processOutboundEvent(
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
             {
                 var result_type: []const u8 = "";
+                var r_id: []const u8 = "";
+                var r_from: []const u8 = "";
+                var r_to: []const u8 = "";
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "type")) result_type = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "id")) r_id = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "from")) r_from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) r_to = attr.value;
+                }
+                // XEP-0185: the verdict on our db:verify is a typed db:result
+                // echoing the id. Complete the matching callback entry only;
+                // an unmatched verdict never authenticates anything here.
+                if (result_type.len > 0) {
+                    if (conn.findPendingVerify(r_id, r_from, r_to, daemon.local_domain)) |idx| {
+                        log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
+                        handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
+                        return;
+                    }
                 }
                 if (std.mem.eql(u8, result_type, "valid")) {
                     log.info("outbound dialback verified by {s}", .{conn.remote_domain});
@@ -1796,14 +1839,25 @@ fn processOutboundEvent(
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
             {
                 var verify_type: []const u8 = "";
+                var v_id: []const u8 = "";
+                var v_from: []const u8 = "";
+                var v_to: []const u8 = "";
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "type")) verify_type = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "id")) v_id = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "from")) v_from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) v_to = attr.value;
                 }
-                if (verify_type.len > 0 and conn.db_callback_inbound_slot != null) {
-                    const valid = std.mem.eql(u8, verify_type, "valid");
-                    log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
-                    handleDbVerifyResponse(daemon, batch, conn, valid);
-                }
+                if (verify_type.len == 0) return;
+                // Correlate by id/from/to before acting (S2 review): a verdict
+                // that names no pending exchange is ignored.
+                const idx = conn.findPendingVerify(v_id, v_from, v_to, daemon.local_domain) orelse {
+                    log.warn("dialback callback: unmatched db:verify verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, v_id, v_from, v_to });
+                    return;
+                };
+                const valid = std.mem.eql(u8, verify_type, "valid");
+                log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
+                handleDbVerifyResponse(daemon, batch, conn, idx, valid);
             }
         },
         .element_end => |name| {
@@ -1817,7 +1871,7 @@ fn processOutboundEvent(
                 }
 
                 // Dialback callback: after TLS+features, send db:verify instead of auth
-                if (conn.db_callback_inbound_slot != null) {
+                if (conn.hasPendingVerify()) {
                     sendDbVerifyOnCallback(daemon, conn);
                     return;
                 }
@@ -2539,4 +2593,184 @@ test "S2sDaemon: IPC lane close purges staged kevent entries before closeClient 
     while (i < cl.len) : (i += 1) {
         try std.testing.expect(cl.buf[i].ident != @as(usize, @intCast(fd)));
     }
+}
+
+// --- Test rig: drive processInboundEvent / processOutboundEvent directly ----
+
+/// Create an inbound session in `slot` over a UNIX socketpair. Returns the
+/// session and the peer fd; the test speaks the peer side.
+fn makeTestInbound(alloc: std.mem.Allocator, daemon: *S2sDaemon, slot: usize) !struct { session: *S2sSession, peer_fd: posix.fd_t } {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    const session = try alloc.create(S2sSession);
+    session.* = S2sSession.init(fds[0], slot, daemon.local_domain);
+    daemon.inbound[slot] = session;
+    const reader = try alloc.create(XmlReader);
+    errdefer alloc.destroy(reader);
+    reader.* = XmlReader.init(alloc);
+    daemon.readers[slot] = reader;
+    return .{ .session = session, .peer_fd = fds[1] };
+}
+
+/// Read whatever is currently available on a non-blocking peer fd.
+fn drainPeer(fd: posix.fd_t, buf: []u8) usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = posix.read(fd, buf[total..]) catch return total;
+        if (n == 0) return total;
+        total += n;
+    }
+    return total;
+}
+
+fn testAttr(name: []const u8, value: []const u8) xml.Attribute {
+    return .{ .name = name, .value = value, .prefix = "", .local_name = name };
+}
+
+/// Feed a db:result key submission through processInboundEvent the way the
+/// reader loop would (element_start, text, element_end).
+fn submitDbResult(daemon: *S2sDaemon, session: *S2sSession, cl: *ChangeList, from: []const u8, to: []const u8, key: []const u8) void {
+    const reader = daemon.readers[session.id].?;
+    var attrs = [_]xml.Attribute{ testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    processInboundEvent(daemon, session, reader, .{ .element_start = elem }, cl);
+    processInboundEvent(daemon, session, reader, .{ .text = key }, cl);
+    processInboundEvent(daemon, session, reader, .{ .element_end = "db:result" }, cl);
+}
+
+/// Feed a db:verify verdict through processOutboundEvent on a callback conn.
+fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, verdict: []const u8, id: []const u8, from: []const u8, to: []const u8) void {
+    var attrs = [_]xml.Attribute{ testAttr("type", verdict), testAttr("id", id), testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+/// An established callback connection on a socketpair: db:verify is written
+/// to the returned peer fd instead of the network, so no DNS happens.
+fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    errdefer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    conn.handleAuthSuccess(); // skip the protocol dance
+    return .{ .conn = conn, .peer_fd = fds[1] };
+}
+
+test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const key2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    // Two sessions claim the same origin; the second submission must not
+    // overwrite the first one's callback state.
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key1);
+    submitDbResult(&daemon, in2.session, &cl, "them.example", "us.example", key2);
+    try std.testing.expectEqual(@as(usize, 2), cb.conn.pendingVerifyCount());
+
+    // One db:verify per pending entry, each naming its own stream id.
+    var vbuf: [2048]u8 = undefined;
+    const verifies = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, verifies, "<db:verify"));
+    try std.testing.expect(std.mem.indexOf(u8, verifies, in1.session.getStreamId()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, in2.session.getStreamId()) != null);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // A verdict naming no pending entry authenticates nobody.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", "no-such-stream", "them.example", "us.example");
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
+
+    // Right id, wrong from=: still no match.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in2.session.getStreamId(), "other.example", "us.example");
+    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
+
+    // Right id/from/to for session 2: only session 2 authenticates.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in2.session.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(in2.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+
+    // The db:result answer goes to session 2, addressed to the verified
+    // origin; session 1's socket stays silent. The rig has no kqueue, so
+    // flush the queued write like handleInboundWritable would.
+    _ = try in2.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in2.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in1.peer_fd, &rbuf));
+
+    // Session 1's entry survived the other verdict and still resolves.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "invalid", in1.session.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(in1.session.inbound_dialback.isFailed());
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+}
+
+test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "3333333333333333333333333333333333333333333333333333333333333333";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    const old_sid = try alloc.dupe(u8, in1.session.getStreamId());
+    defer alloc.free(old_sid);
+
+    // The submitter disconnects; its slot is reused by a different peer.
+    daemon.closeInbound(&cl, 1);
+    posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in2.peer_fd);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // The stale verdict must not land on the new occupant of slot 1.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", old_sid, "them.example", "us.example");
+    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!in2.session.isEstablished());
+    var rbuf: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
