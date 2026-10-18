@@ -224,7 +224,14 @@ pub const Reader = struct {
                 .element_open_end => {
                     self.depth += 1;
                     if (self.elem_depth >= self.elem_names.len) return error.TooDeep;
-                    self.elem_names[self.elem_depth] = self.current_element_name;
+                    // The root name is matched again at its close, which comes
+                    // after every per-stanza reset. The stanza arena reuses that
+                    // slot for the next stanza's first token, so the root goes to
+                    // ns_arena, which lives until reset() (S11).
+                    self.elem_names[self.elem_depth] = if (self.elem_depth == 0)
+                        try self.ns_arena.allocator().dupe(u8, self.current_element_name)
+                    else
+                        self.current_element_name;
                     self.elem_depth += 1;
                     const elem = self.buildElement(false);
                     // For non-self-closing elements, namespace is restored on element_close
@@ -715,6 +722,78 @@ test "reader: arena stays bounded over 200k stanzas on a long-lived stream (S11)
     try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
     try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", reader.resolveNamespace("stream"));
     try std.testing.expectEqualStrings("", reader.resolveNamespace("x"));
+}
+
+/// Drains every event in `input`.
+fn drainAll(reader: *Reader, input: []const u8) !void {
+    var pos: usize = 0;
+    while (try reader.next(input, &pos)) |_| {}
+}
+
+test "reader: c2s stream close after stanzas still matches the root name (S11)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try std.testing.expect(reader.stream_opened);
+
+    // Each stanza resets the per-stanza arena, which hands the root name's
+    // slot to the next stanza's first token. "message" is shorter than
+    // "stream:stream", so a root read from that arena comes back corrupted
+    // and the clean close below is rejected as mismatched.
+    for (0..3) |_| {
+        try drainAll(&reader, "<message to='b@x'><body>hi</body></message>");
+    }
+
+    var close_pos: usize = 0;
+    const close = try reader.next("</stream:stream>", &close_pos);
+    try std.testing.expect(close.? == .stream_close);
+    try std.testing.expect(!reader.stream_opened);
+    try std.testing.expectEqual(@as(u32, 0), reader.elem_depth);
+}
+
+test "reader: s2s stream close after stanzas still matches the root name (S11)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try std.testing.expect(reader.stream_opened);
+
+    for (0..3) |_| {
+        try drainAll(&reader, "<message from='a@x' to='b@y'><body>hi</body></message>");
+    }
+
+    var close_pos: usize = 0;
+    const close = try reader.next("</stream:stream>", &close_pos);
+    try std.testing.expect(close.? == .stream_close);
+    try std.testing.expect(!reader.stream_opened);
+}
+
+test "reader: root name survives an arena reset past the retain limit (S11)" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+
+    // A stanza past max_arena_retain makes the next reset free the backing
+    // buffer instead of reusing it, so the root name in elem_names[0] dangles
+    // unless it was copied into ns_arena.
+    var big = std.ArrayList(u8){};
+    defer big.deinit(allocator);
+    try big.appendSlice(allocator, "<message><body>");
+    try big.appendNTimes(allocator, 'x', 96 * 1024);
+    try big.appendSlice(allocator, "</body></message>");
+    try drainAll(&reader, big.items);
+
+    // A small stanza so the freed buffer is not immediately reclaimed.
+    try drainAll(&reader, "<presence/>");
+
+    var close_pos: usize = 0;
+    const close = try reader.next("</stream:stream>", &close_pos);
+    try std.testing.expect(close.? == .stream_close);
 }
 
 test "reader: deep nesting within the stacks keeps ns context synced (S12)" {
