@@ -1430,11 +1430,11 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
-    w.writeAll(r.getJid()) catch return;
+    xml.escapeWrite(w, r.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(before.getNick()) catch return;
+    xml.escapeWrite(w, before.getNick()) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(before.getRealJid()) catch return;
+    xml.escapeWrite(w, before.getRealJid()) catch return;
     w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
     w.writeAll(before.affiliation.toName()) catch return;
     w.writeAll("' role='none'/><status code='110'/></x></presence>") catch return;
@@ -1459,9 +1459,9 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(ev.real_jid) catch return;
+    xml.escapeWrite(w, ev.real_jid) catch return;
     w.writeAll("' type='error'><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
@@ -2926,4 +2926,111 @@ test "T256: remote-join twin collapses onto the existing occupant" {
     // Removing the collapsed occupant leaves no stale nick mapping.
     _ = room.removeOccupant(idx);
     try std.testing.expect(room.findByNick("ally") == null);
+}
+
+/// Collects cross-worker deliveries so a test can inspect stanza bytes.
+/// Payloads point into reusable queue slots, so they are copied.
+const StanzaCollector = struct {
+    allocator: std.mem.Allocator,
+    stanzas: std.ArrayList([]const u8) = .{},
+
+    fn deinit(self: *StanzaCollector) void {
+        for (self.stanzas.items) |s| self.allocator.free(s);
+        self.stanzas.deinit(self.allocator);
+    }
+
+    fn onDelivery(ctx: *StanzaCollector, session_id: u32, generation: u32, payload: []const u8) void {
+        _ = session_id;
+        _ = generation;
+        const copy = ctx.allocator.dupe(u8, payload) catch @panic("oom");
+        ctx.stanzas.append(ctx.allocator, copy) catch @panic("oom");
+    }
+};
+
+test "S1: takeover notice escapes the replaced resource's nick and JID" {
+    const allocator = std.testing.allocator;
+    const reg_mod = @import("room_registry");
+    const dq_mod = @import("delivery_queue");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = reg_mod.RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // The nick carries a quote, so an unescaped write would close the from
+    // attribute and let the attacker inject attributes or elements.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "e'><evil a='",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    var collector = StanzaCollector{ .allocator = allocator };
+    defer collector.deinit();
+
+    // Second resource on the same bare JID takes the nick over; the replaced
+    // resource on worker 1 is told it left.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/laptop",
+        .nick = "e'><evil a='",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+
+    _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
+
+    var notice: ?[]const u8 = null;
+    for (collector.stanzas.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "type='unavailable'") != null) notice = payload;
+    }
+    const stanza = notice orelse return error.TestUnexpectedResult;
+
+    // The quote is escaped, so the from attribute stays a single attribute.
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "&apos;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "'><evil") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "<evil") == null);
+}
+
+test "S1: remote presence error escapes the room and target JIDs" {
+    const allocator = std.testing.allocator;
+    const dq_mod = @import("delivery_queue");
+
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    sendRemotePresenceError(&delivery_sys, .{
+        .room_jid = "r'@conference.localhost",
+        .real_jid = "eve@localhost/x'y",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 5,
+        .generation = 1,
+    }, "resource-constraint");
+
+    var collector = StanzaCollector{ .allocator = allocator };
+    defer collector.deinit();
+    _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.stanzas.items.len);
+    const stanza = collector.stanzas.items[0];
+
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "&apos;") != null);
+    // Neither raw quote reaches the wire, so both attributes stay closed.
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "from='r'@") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "to='eve@localhost/x'y'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "resource-constraint") != null);
 }
