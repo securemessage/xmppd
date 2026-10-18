@@ -181,7 +181,7 @@ pub fn main() !void {
         .map_size = map_size_mb * 1024 * 1024,
         .create = false,
         .read_only = true,
-    }) catch |first_err| {
+    }) catch |first_err| blk: {
         log.warn("lock store at {s} not readable yet ({}); provisioning read-write once", .{ auth_path, first_err });
         var provision = OpBackendType.open(auth_path, .{
             .map_size = map_size_mb * 1024 * 1024,
@@ -192,7 +192,7 @@ pub fn main() !void {
             return err;
         };
         provision.close();
-        OpBackendType.open(auth_path, .{
+        break :blk OpBackendType.open(auth_path, .{
             .map_size = map_size_mb * 1024 * 1024,
             .create = false,
             .read_only = true,
