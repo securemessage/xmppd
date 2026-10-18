@@ -521,6 +521,17 @@ pub const S2sDaemon = struct {
         return self.inbound[slot];
     }
 
+    /// Whether a host is one we serve: the local domain or the MUC host
+    /// (S2 review: conference.<host> is a valid dialback/stream target).
+    pub fn servesHost(self: *const S2sDaemon, host: []const u8) bool {
+        if (host.len == 0) return false;
+        if (std.ascii.eqlIgnoreCase(host, self.local_domain)) return true;
+        if (self.muc_host) |m| {
+            if (std.ascii.eqlIgnoreCase(host, m)) return true;
+        }
+        return false;
+    }
+
     /// Count active inbound sessions.
     pub fn inboundCount(self: *const S2sDaemon) usize {
         var count: usize = 0;
@@ -1024,6 +1035,19 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 // multiplexing); the tracked identity follows it.
                 session.setRemoteDomain(from);
             }
+            // The header to= selects which served host this stream addresses;
+            // replies echo it as their from= (S2 review). An unserved host
+            // fails the stream.
+            if (to.len > 0) {
+                if (!daemon.servesHost(to)) {
+                    log.warn("inbound S2S id={d} stream addressed to unserved host {s}", .{ session.id, to });
+                    sendStreamError(session, .host_unknown);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                }
+                session.setServedHost(to);
+            }
             const action = session.stream.handleStreamOpen(from, to, version);
             executeAction(daemon, session, action, batch);
 
@@ -1175,6 +1199,16 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 const from = session.getDbVerifyFrom();
                 const to = session.getDbVerifyTo();
                 const verify_id = session.getDbVerifyId();
+                // The db:verify to= names the authoritative host; only a host
+                // we serve can answer, and the answer echoes it (S2 review).
+                if (!daemon.servesHost(to)) {
+                    log.warn("dialback verify: addressed to unserved host {s}; failing stream", .{to});
+                    session.db_verify_pending = false;
+                    sendStreamError(session, .host_unknown);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                }
                 const valid = dialback.verifyKey(
                     &daemon.dialback_secret,
                     from,
@@ -1185,7 +1219,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 var resp_buf: [512]u8 = undefined;
                 const resp = dialback.buildDbVerifyResponse(
                     &resp_buf,
-                    session.stream.local_domain,
+                    to,
                     from,
                     verify_id,
                     valid,
@@ -1317,26 +1351,28 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         log.warn("dialback callback: missing origin or key", .{});
         return;
     }
+    // S2: the db:result to= must be a host we serve (the local domain or the
+    // MUC host); without the check an attacker-named target is verified on
+    // our account, and a MUC-addressed dialback used to be closed wrongly.
+    const target = session.getDbResultTo();
+    if (!daemon.servesHost(target)) {
+        log.warn("dialback callback: db:result to={s} is not a served host ({s})", .{ target, daemon.local_domain });
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
     // S1: the captured key re-enters an outbound stream verbatim; only a
     // HMAC hex shape can ever be legitimate (entity-decoded markup in a
     // db:result is rejected, not forwarded).
     if (!dialback.isValidKeyHex(key)) {
         log.warn("dialback callback: invalid key shape from {s} ({d} bytes); answering type=invalid", .{ origin, key.len });
         var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, session.stream.local_domain, origin, false) catch return;
+        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch return;
         session.queueWrite(resp) catch {};
         if (session.hasPendingWrite()) {
             batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
         }
-        return;
-    }
-    // S2: the db:result to= must be us; without the check an attacker-named
-    // target is verified on our account.
-    if (!std.ascii.eqlIgnoreCase(session.getDbResultTo(), daemon.local_domain)) {
-        log.warn("dialback callback: db:result to={s} is not us ({s})", .{ session.getDbResultTo(), daemon.local_domain });
-        sendStreamError(session, .invalid_from);
-        _ = session.flushWrite() catch {};
-        daemon.closeInbound(batch, session.id);
         return;
     }
 
@@ -1354,10 +1390,10 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     // Register the callback keyed by (stream id, origin) with the slot
     // generation: a second db:result for the same origin can no longer
     // overwrite this session's pending verify (S2 review).
-    if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, key) == null) {
+    if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, target, key) == null) {
         log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
         var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, session.stream.local_domain, origin, false) catch return;
+        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch return;
         session.queueWrite(resp) catch {};
         if (session.hasPendingWrite()) {
             batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
@@ -1387,7 +1423,7 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
         var buf: [512]u8 = undefined;
         const verify_xml = dialback.buildDbVerify(
             &buf,
-            daemon.local_domain,
+            if (p.target().len > 0) p.target() else daemon.local_domain,
             conn.remote_domain,
             sid,
             key,
@@ -1413,11 +1449,15 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     const pending = &conn.db_pending[idx];
     const inbound_slot = pending.inbound_slot;
     const gen = pending.inbound_gen;
-    // Copy the origin out before the entry is cleared.
+    // Copy the origin and served target out before the entry is cleared.
     var origin_buf: [256]u8 = undefined;
     const origin_len = pending.origin_len;
     @memcpy(origin_buf[0..origin_len], pending.origin_buf[0..origin_len]);
     const origin = origin_buf[0..origin_len];
+    var target_buf: [256]u8 = undefined;
+    const target_len = pending.target_len;
+    @memcpy(target_buf[0..target_len], pending.target_buf[0..target_len]);
+    const target = target_buf[0..target_len];
     conn.clearPendingVerify(idx);
 
     const session = daemon.getInbound(inbound_slot) orelse {
@@ -1429,12 +1469,13 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         return;
     }
 
-    // Send db:result response on the original inbound connection, addressed
-    // to the verified origin (not the header-claimed remote domain).
+    // Send db:result response on the original inbound connection, from the
+    // host the db:result named and to the verified origin (not the
+    // header-claimed remote domain).
     var resp_buf: [512]u8 = undefined;
     const resp = dialback.buildDbResultResponse(
         &resp_buf,
-        daemon.local_domain,
+        if (target.len > 0) target else daemon.local_domain,
         origin,
         valid,
     ) catch return;
@@ -1818,7 +1859,7 @@ fn processOutboundEvent(
                 // echoing the id. Complete the matching callback entry only;
                 // an unmatched verdict never authenticates anything here.
                 if (result_type.len > 0) {
-                    if (conn.findPendingVerify(r_id, r_from, r_to, daemon.local_domain)) |idx| {
+                    if (conn.findPendingVerify(r_id, r_from, r_to)) |idx| {
                         log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
                         handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
                         return;
@@ -1851,7 +1892,7 @@ fn processOutboundEvent(
                 if (verify_type.len == 0) return;
                 // Correlate by id/from/to before acting (S2 review): a verdict
                 // that names no pending exchange is ignored.
-                const idx = conn.findPendingVerify(v_id, v_from, v_to, daemon.local_domain) orelse {
+                const idx = conn.findPendingVerify(v_id, v_from, v_to) orelse {
                     log.warn("dialback callback: unmatched db:verify verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, v_id, v_from, v_to });
                     return;
                 };
@@ -2873,4 +2914,148 @@ test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2 r
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+}
+
+fn testStreamOpenElem(from: []const u8, to: []const u8, attrs: []xml.Attribute) xml.Element {
+    attrs[0] = testAttr("from", from);
+    attrs[1] = testAttr("to", to);
+    attrs[2] = testAttr("version", "1.0");
+    return xml.Element{
+        .name = "stream:stream",
+        .prefix = "stream",
+        .local_name = "stream",
+        .namespace_uri = "http://etherx.jabber.org/streams",
+        .attributes = attrs,
+        .self_closing = false,
+    };
+}
+
+test "S2sDaemon: MUC host is served on stream open; replies echo the requested host (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // Stream open addressed to the MUC host is accepted and answered as it.
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var attrs1 = [_]xml.Attribute{ testAttr("from", ""), testAttr("to", ""), testAttr("version", "") };
+    const open1 = testStreamOpenElem("them.example", "conference.us.example", &attrs1);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .stream_open = open1 }, &cl);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    const resp1 = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "to='them.example'") != null);
+
+    // A stream addressed to a host we do not serve fails with host-unknown.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    var attrs2 = [_]xml.Attribute{ testAttr("from", ""), testAttr("to", ""), testAttr("version", "") };
+    const open2 = testStreamOpenElem("them.example", "other.example", &attrs2);
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .stream_open = open2 }, &cl);
+    try std.testing.expect(daemon.getInbound(2) == null);
+    var rbuf2: [2048]u8 = undefined;
+    const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
+}
+
+test "S2sDaemon: db:result for the MUC host completes and answers as that host (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "5555555555555555555555555555555555555555555555555555555555555555";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
+    // Accepted (the old code closed it with invalid-from) and pending.
+    try std.testing.expect(daemon.getInbound(1) != null);
+
+    // The db:verify speaks as the MUC host.
+    var vbuf: [1024]u8 = undefined;
+    const verifies = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, verifies, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, "to='them.example'") != null);
+
+    // The verdict echoes the MUC host as to= and completes the exchange.
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "conference.us.example");
+    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+
+    // A verdict addressed to the local domain matches no MUC-host entry.
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+}
+
+test "S2sDaemon: db:verify for the MUC host is answered as that host (S2 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // We are the authoritative host; the key binds (verifier, MUC host, sid).
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    const sid = in1.session.getStreamId();
+    const key = dialback.computeKeyHex(&daemon.dialback_secret, "them.example", "conference.us.example", sid);
+
+    var attrs = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "conference.us.example"), testAttr("id", sid) };
+    const elem = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = elem }, &cl);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .text = &key }, &cl);
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+
+    // A db:verify for a host we do not serve fails the stream.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    var attrs2 = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "other.example"), testAttr("id", "x") };
+    const elem2 = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs2,
+        .self_closing = false,
+    };
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .text = "6666666666666666666666666666666666666666666666666666666666666666" }, &cl);
+    try std.testing.expect(daemon.getInbound(2) == null);
+    var rbuf2: [1024]u8 = undefined;
+    const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
 }

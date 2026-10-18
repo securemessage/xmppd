@@ -112,6 +112,10 @@ pub const S2sSession = struct {
     /// Whether a stream open was already processed; any later open on this
     /// socket is a restart (post-TLS, post-SASL, post-dialback).
     stream_open_seen: bool = false,
+    /// Host this stream is addressed to (to= of the stream header: the local
+    /// domain or the MUC host). Replies echo it as their from= (S2 review).
+    served_host_buf: [256]u8 = undefined,
+    served_host_len: usize = 0,
 
     /// Inbound stanza accumulation — buffers child XML content for stanzas
     /// received on an established session, to be forwarded to xmppd-core via IPC.
@@ -272,6 +276,20 @@ pub const S2sSession = struct {
         const copy_len = @min(domain.len, self.remote_domain_buf.len);
         @memcpy(self.remote_domain_buf[0..copy_len], domain[0..copy_len]);
         self.remote_domain_len = copy_len;
+    }
+
+    /// Set the host this stream is addressed to (validated by the caller
+    /// against the served hosts).
+    pub fn setServedHost(self: *S2sSession, host: []const u8) void {
+        const n = @min(host.len, self.served_host_buf.len);
+        @memcpy(self.served_host_buf[0..n], host[0..n]);
+        self.served_host_len = n;
+    }
+
+    /// The host replies speak as: the requested host, or the local domain
+    /// when the stream header carried no to=.
+    pub fn getServedHost(self: *const S2sSession) []const u8 {
+        return if (self.served_host_len > 0) self.served_host_buf[0..self.served_host_len] else self.stream.local_domain;
     }
 
     /// Whether the session is authenticated and established.
@@ -460,13 +478,14 @@ pub const S2sSession = struct {
     }
 
     /// Build the stream open response XML for an inbound connection.
-    /// id/from are our own bytes, but `to` is the peer-supplied stream-open
-    /// from= value — escaped like any client/peer-controlled attribute (S1).
+    /// id/from are our own bytes (from= echoes the requested served host),
+    /// but `to` is the peer-supplied stream-open from= value — escaped like
+    /// any client/peer-controlled attribute (S1).
     pub fn buildStreamOpenResponse(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
-        try xmlEscapeWrite(writer, self.stream.local_domain);
+        try xmlEscapeWrite(writer, self.getServedHost());
         try writer.writeAll("' to='");
         try xmlEscapeWrite(writer, self.getRemoteDomain());
         try writer.writeAll("' id='");

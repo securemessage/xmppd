@@ -80,6 +80,10 @@ pub const PendingVerify = struct {
     /// Claimed origin (from= of the db:result).
     origin_buf: [256]u8 = undefined,
     origin_len: usize = 0,
+    /// Host the db:result was addressed to (local domain or MUC host); our
+    /// db:verify and the final db:result answer speak as this host.
+    target_buf: [256]u8 = undefined,
+    target_len: usize = 0,
     /// Dialback key to be verified.
     key_buf: [128]u8 = undefined,
     key_len: usize = 0,
@@ -92,6 +96,10 @@ pub const PendingVerify = struct {
 
     pub fn origin(self: *const PendingVerify) []const u8 {
         return self.origin_buf[0..self.origin_len];
+    }
+
+    pub fn target(self: *const PendingVerify) []const u8 {
+        return self.target_buf[0..self.target_len];
     }
 
     pub fn key(self: *const PendingVerify) []const u8 {
@@ -494,6 +502,7 @@ pub const OutboundConnection = struct {
         inbound_gen: u32,
         stream_id: []const u8,
         origin: []const u8,
+        target: []const u8,
         key: []const u8,
     ) ?usize {
         var idx: ?usize = null;
@@ -522,6 +531,9 @@ pub const OutboundConnection = struct {
         const ol = @min(origin.len, p.origin_buf.len);
         @memcpy(p.origin_buf[0..ol], origin[0..ol]);
         p.origin_len = ol;
+        const tl = @min(target.len, p.target_buf.len);
+        @memcpy(p.target_buf[0..tl], target[0..tl]);
+        p.target_len = tl;
         const kl = @min(key.len, p.key_buf.len);
         @memcpy(p.key_buf[0..kl], key[0..kl]);
         p.key_len = kl;
@@ -529,20 +541,20 @@ pub const OutboundConnection = struct {
     }
 
     /// Find the pending entry a verdict refers to: id must equal the entry's
-    /// stream id, from the claimed origin, to us (S2 review correlation).
+    /// stream id, from the claimed origin, to the host the db:result named
+    /// (S2 review correlation).
     pub fn findPendingVerify(
         self: *const OutboundConnection,
         id: []const u8,
         from: []const u8,
         to: []const u8,
-        local_domain: []const u8,
     ) ?usize {
         if (id.len == 0 or from.len == 0) return null;
-        if (!std.ascii.eqlIgnoreCase(to, local_domain)) return null;
         for (self.db_pending, 0..) |p, i| {
             if (!p.in_use) continue;
             if (std.mem.eql(u8, p.streamId(), id) and
-                std.ascii.eqlIgnoreCase(p.origin(), from)) return i;
+                std.ascii.eqlIgnoreCase(p.origin(), from) and
+                std.ascii.eqlIgnoreCase(p.target(), to)) return i;
         }
         return null;
     }
