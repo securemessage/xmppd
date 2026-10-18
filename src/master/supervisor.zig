@@ -25,6 +25,10 @@ const log = std.log.scoped(.supervisor);
 extern "c" fn setgroups(size: c_int, list: *const posix.gid_t) c_int;
 extern "c" fn closefrom(lowfd: c_int) void;
 
+/// FD_CLOEXEC for fcntl(F_GETFD/F_SETFD) (FreeBSD <fcntl.h>; not exported
+/// by std.c).
+const FD_CLOEXEC: c_int = 1;
+
 /// Minimum backoff delay (nanoseconds).
 const MIN_BACKOFF_NS: u64 = 1 * std.time.ns_per_s;
 /// Maximum backoff delay (nanoseconds).
@@ -118,7 +122,15 @@ pub const Supervisor = struct {
         for (self.pass_fds[0..n], 0..) |src, i| {
             if (src <= 2) continue;
             const target: i32 = 3 + @as(i32, @intCast(i));
-            if (src == target) continue;
+            if (src == target) {
+                // Already in position. dup2 clears FD_CLOEXEC on remapped
+                // fds, but a skipped fd keeps its flag and listeners are
+                // SOCK_CLOEXEC: clear it or exec closes the socket (S7).
+                const flags = std.c.fcntl(src, std.c.F.GETFD);
+                if (flags < 0) std.c._exit(125);
+                if (std.c.fcntl(src, std.c.F.SETFD, flags & ~FD_CLOEXEC) < 0) std.c._exit(125);
+                continue;
+            }
             if (std.c.dup2(scratch[i], target) < 0) std.c._exit(125);
             _ = std.c.close(scratch[i]);
         }
@@ -126,6 +138,25 @@ pub const Supervisor = struct {
         // Everything not in the target band or stdio goes (original sources
         // included).
         closefrom(@intCast(3 + self.pass_fds.len));
+    }
+
+    /// A uid-only drop resolves the run user's primary gid parent-side
+    /// (getpwuid_r is not async-signal-safe for the forked child). Without
+    /// it setgroups([0]) would leave the child in wheel (S7 review). Fails
+    /// closed: no passwd entry, no spawn.
+    pub fn resolveRunGid(self: *Supervisor) !void {
+        if (self.uid == 0 or self.gid != 0) return;
+        var pw: std.c.passwd = undefined;
+        var pw_buf: [1024]u8 = undefined;
+        var result: ?*std.c.passwd = null;
+        const rc = std.c.getpwuid_r(self.uid, &pw, &pw_buf, pw_buf.len, &result);
+        if (rc != 0 or result == null) {
+            // warn, not err: the fail-closed path is exercised by tests and
+            // the runner fails a step on err-level logs.
+            log.warn("uid {d} has no passwd entry; refusing to spawn with root's groups", .{self.uid});
+            return error.PasswdLookupFailed;
+        }
+        self.gid = result.?.gid;
     }
 
     /// Spawn the child process using fork+execve.
@@ -139,6 +170,8 @@ pub const Supervisor = struct {
         if (self.exe_path.len == 0 or self.exe_path[0] != '/') {
             log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary", .{self.exe_path});
         }
+
+        try self.resolveRunGid();
 
         const pid = try posix.fork();
 
@@ -399,4 +432,119 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     sup2.child_pid = pid;
     sup2.state = .running;
     _ = try sup2.waitChild();
+}
+
+test "Supervisor: a pass_fd already at its target survives exec (S7 review)" {
+    // SOCK_CLOEXEC shape: the listener fd is already 3 and carries
+    // FD_CLOEXEC. applyFdPass must clear the flag, or execve closes the
+    // socket and the child loses the listener.
+    var p: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p) != 0) return error.Socketpair;
+    defer posix.close(p[0]);
+
+    var sup = Supervisor.init("/unused", &.{});
+    sup.pass_fds = &.{3};
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        // Park the write end at fd 3 (parent's table untouched) and restore
+        // the CLOEXEC flag dup2 cleared, mirroring a SOCK_CLOEXEC listener.
+        if (std.c.dup2(p[1], 3) < 0) std.c._exit(125);
+        if (std.c.fcntl(3, std.c.F.SETFD, FD_CLOEXEC) < 0) std.c._exit(125);
+        sup.applyFdPass();
+        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "printf Y >&3" };
+        const envp = [_:null]?[*:0]const u8{null};
+        _ = std.c.execve("/bin/sh", &argv, &envp);
+        std.c._exit(127);
+    }
+
+    // Only the child holds the write end now: if exec closed fd 3 the read
+    // sees EOF instead of "Y".
+    posix.close(p[1]);
+    var buf: [1]u8 = undefined;
+    const n = try posix.read(p[0], &buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 'Y'), buf[0]);
+
+    var sup2 = Supervisor.init("/nonexistent", &.{});
+    sup2.child_pid = pid;
+    sup2.state = .running;
+    _ = try sup2.waitChild();
+}
+
+test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7 review)" {
+    // The scratch F_DUPFD band sits right above the targets, so a small
+    // descriptor limit (10) does not break the remap. The old fixed
+    // TMP_BASE=8192 scratch failed here.
+    var p1: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p1) != 0) return error.Socketpair;
+    var p2: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p2) != 0) return error.Socketpair;
+
+    var sup = Supervisor.init("/unused", &.{});
+    sup.pass_fds = &.{ 6, 7 };
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        // Deterministic child table: sources at 6 and 7, nothing else above
+        // stderr, then cap the descriptor space at 10.
+        if (std.c.dup2(p1[1], 6) < 0) std.c._exit(125);
+        if (std.c.dup2(p2[1], 7) < 0) std.c._exit(125);
+        var fd: c_int = 5;
+        while (fd < 64) : (fd += 1) {
+            if (fd == 6 or fd == 7) continue;
+            _ = std.c.close(fd);
+        }
+        var lim: std.c.rlimit = undefined;
+        if (std.c.getrlimit(.NOFILE, &lim) != 0) std.c._exit(125);
+        lim.cur = 10;
+        if (std.c.setrlimit(.NOFILE, &lim) != 0) std.c._exit(125);
+        sup.applyFdPass();
+        var verdict: [2]u8 = .{ 'N', 'N' };
+        if (std.c.write(3, "x", 1) == 1) verdict[0] = 'Y'; // remapped listener works
+        if (std.c.write(4, "", 0) == 0) verdict[1] = 'Y'; // report channel is fd 4
+        _ = std.c.write(4, &verdict, 2);
+        std.c._exit(0);
+    }
+
+    posix.close(p1[1]);
+    posix.close(p2[1]);
+    defer posix.close(p1[0]);
+    defer posix.close(p2[0]);
+
+    var buf: [2]u8 = undefined;
+    const n = try posix.read(p2[0], &buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("YY", buf[0..2]);
+
+    var sup2 = Supervisor.init("/nonexistent", &.{});
+    sup2.child_pid = pid;
+    sup2.state = .running;
+    _ = try sup2.waitChild();
+}
+
+test "Supervisor: uid-only drop resolves the run user's gid (S7 review)" {
+    // setgroups([0]) on a uid-only drop kept wheel; the gid must come from
+    // the passwd entry of the run user.
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 65534; // nobody
+    try sup.resolveRunGid();
+    try std.testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
+
+    // No drop configured: untouched.
+    var sup2 = Supervisor.init("/unused", &.{});
+    try sup2.resolveRunGid();
+    try std.testing.expectEqual(@as(posix.gid_t, 0), sup2.gid);
+
+    // Explicit gid wins; no lookup.
+    var sup3 = Supervisor.init("/unused", &.{});
+    sup3.uid = 65534;
+    sup3.gid = 4242;
+    try sup3.resolveRunGid();
+    try std.testing.expectEqual(@as(posix.gid_t, 4242), sup3.gid);
+
+    // Unknown uid fails closed instead of spawning with root's groups.
+    var sup4 = Supervisor.init("/unused", &.{});
+    sup4.uid = 999999;
+    try std.testing.expectError(error.PasswdLookupFailed, sup4.resolveRunGid());
 }
