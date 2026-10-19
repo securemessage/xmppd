@@ -492,17 +492,19 @@ test "OpenOptions defaults" {
     try std.testing.expect(!opts.read_only);
 }
 
-test "canonical_namespaces covers every store namespace (S9 review)" {
-    // pending_sub (presence_handler) and room_affiliations (room_store)
-    // joined late (S9 review); membership asserts so nothing is dropped.
-    var saw_sub = false;
-    var saw_aff = false;
-    for (canonical_namespaces) |ns| {
-        if (std.mem.eql(u8, ns, "pending_sub")) saw_sub = true;
-        if (std.mem.eql(u8, ns, "room_affiliations")) saw_aff = true;
+test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted (S9 review)" {
+    // Real invariants instead of a list re-checking itself: a duplicate
+    // name would collide in the DBI cache lookups, and a name over 64
+    // bytes fails mdb_dbi_open (name_buf is [64]u8 plus NUL). The count
+    // ratchets the set: additions must be deliberate, removals break the
+    // stores that own them (pending_sub = presence_handler,
+    // room_affiliations = room_store).
+    for (canonical_namespaces, 0..) |ns, i| {
+        try std.testing.expect(ns.len > 0 and ns.len <= 64);
+        for (canonical_namespaces[i + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, ns, other));
+        }
     }
-    try std.testing.expect(saw_sub);
-    try std.testing.expect(saw_aff);
     try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
 }
 
