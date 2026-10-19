@@ -17,7 +17,7 @@ const protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.ipc_client);
 
-/// IPC receive buffer: one full wire frame (T257 review: 32 KiB truncated a
+/// IPC receive buffer: one full wire frame (T257: 32 KiB truncated a
 /// 32-64 KiB s2s frame; the lane is now sized like a peer frame). Heap,
 /// allocated at connect.
 const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
@@ -122,7 +122,7 @@ pub const IpcClient = struct {
         const alloc = self.alloc orelse return error.NoAllocator;
 
         // Encode directly into the backlog: no 64 KiB stack scratch on an
-        // event-loop thread (T257 review). Compact the consumed prefix
+        // event-loop thread (T257). Compact the consumed prefix
         // FIRST so the frame lands immediately behind the unsent tail.
         var unsent = self.send_list.items.len - self.send_start;
         if (self.send_start >= unsent or self.send_start >= 4096) {

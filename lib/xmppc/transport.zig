@@ -79,7 +79,7 @@ pub const Transport = struct {
         return self.tls_pending > 0;
     }
 
-    /// Length of the pinned outstanding TLS write — the retry slice length.
+    /// Length of the pinned outstanding TLS write: the retry slice length.
     pub fn pinnedLen(self: *const Transport) usize {
         return self.tls_pending;
     }

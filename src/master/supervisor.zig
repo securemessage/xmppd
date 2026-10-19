@@ -91,7 +91,7 @@ pub const Supervisor = struct {
         };
     }
 
-    /// Child-side fd hygiene (T356/S7 review): remap pass_fds to 3..3+len-1
+    /// Child-side fd hygiene (T356/S7): remap pass_fds to 3..3+len-1
     /// and truncate the rest of the table. Failures exit the child (125);
     /// only valid between fork and exec.
     ///
@@ -142,7 +142,7 @@ pub const Supervisor = struct {
 
     /// A uid-only drop resolves the run user's primary gid parent-side
     /// (getpwuid_r is not async-signal-safe for the forked child). Without
-    /// it setgroups([0]) would leave the child in wheel (S7 review). Fails
+    /// it setgroups([0]) would leave the child in wheel (S7). Fails
     /// closed: no passwd entry, no spawn.
     pub fn resolveRunGid(self: *Supervisor) !void {
         if (self.uid == 0 or self.gid != 0) return;
@@ -206,8 +206,7 @@ pub const Supervisor = struct {
             // Drop privileges before exec if configured. setgroups always
             // runs on ANY drop (uid or gid), never gated on gid alone: a
             // uid-only drop would otherwise keep root's supplementary groups
-            // (wheel, operator) — S7 review point. Order: setgroups, setgid,
-            // setuid.
+            // (wheel, operator), S7. Order: setgroups, setgid, setuid.
             if (self.gid != 0 or self.uid != 0) {
                 if (setgroups(1, &self.gid) != 0) std.c._exit(125);
             }
@@ -219,9 +218,9 @@ pub const Supervisor = struct {
                 if (ret_u != 0) std.c._exit(125);
             }
 
-            // fd hygiene: remap the passed listener sockets to 3..N, close
-            // everything else (S7 — before this, every child inherited
-            // every listener and internal master fd).
+            // fd hygiene: remap the passed listener sockets to 3..N and
+            // close everything else, so a child holds only its own fds
+            // (S7).
             self.applyFdPass();
 
             const envp = [_:null]?[*:0]const u8{null};
@@ -434,7 +433,7 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: a pass_fd already at its target survives exec (S7 review)" {
+test "Supervisor: a pass_fd already at its target survives exec (S7)" {
     // SOCK_CLOEXEC shape: the listener fd is already 3 and carries
     // FD_CLOEXEC. applyFdPass must clear the flag, or execve closes the
     // socket and the child loses the listener.
@@ -472,7 +471,7 @@ test "Supervisor: a pass_fd already at its target survives exec (S7 review)" {
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7 review)" {
+test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7)" {
     // The scratch F_DUPFD band sits right above the targets, so a small
     // descriptor limit (10) does not break the remap. The old fixed
     // TMP_BASE=8192 scratch failed here.
@@ -523,7 +522,7 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7 review)" {
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: uid-only drop resolves the run user's gid (S7 review)" {
+test "Supervisor: uid-only drop resolves the run user's gid (S7)" {
     // setgroups([0]) on a uid-only drop kept wheel; the gid must come from
     // the passwd entry of the run user.
     var sup = Supervisor.init("/unused", &.{});

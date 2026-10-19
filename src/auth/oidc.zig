@@ -118,7 +118,7 @@ pub const OidcStore = struct {
         return &self.http_client.?;
     }
 
-    /// Derive the local identity from an IdP claim (S3 review): a claim
+    /// Derive the local identity from an IdP claim (S3): a claim
     /// that carries a domain must name the configured user_domain, and the
     /// localpart is copied into the stable username buffer (claim slices
     /// borrow request-scoped memory). Null on mismatch or oversize.
@@ -195,7 +195,7 @@ pub const OidcStore = struct {
         }
 
         // Domain-checked claim identity, copied into the stable buffer (JWT
-        // claim slices die with jwt.parse's stack locals) (S3 review).
+        // claim slices die with jwt.parse's stack locals) (S3).
         const username = self.claimIdentity(raw_username) orelse {
             log.info("OAUTHBEARER: claim identity rejected for sub='{s}'", .{parsed.claims.sub});
             return null;
@@ -254,7 +254,7 @@ pub const OidcStore = struct {
             return null;
         }
 
-        // S3 review: the authenticated identity comes from the IdP's token
+        // S3: the authenticated identity comes from the IdP's token
         // claims, exactly like OAUTHBEARER. The typed username is never
         // returned as-is: a case or domain variant of a locked account must
         // not slip past the lock check.
@@ -264,7 +264,7 @@ pub const OidcStore = struct {
     /// Derive the authenticated identity from an ROPC token response: the
     /// id_token claims when present (full JWT validation), else the
     /// access_token via introspection when an endpoint is configured. Null
-    /// when neither yields a validated identity (S3 review).
+    /// when neither yields a validated identity (S3).
     fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8) !?[]const u8 {
         if (extractNamedField(body, "\"id_token\"")) |id_token| {
             if (id_token.len > 0) return self.validateToken(allocator, id_token);
@@ -332,7 +332,7 @@ pub const OidcStore = struct {
 
         // Copy into the stable buffer: the claim slice borrows the response
         // body, which dies with this scope. Domain-checked like every claim
-        // identity (S3 review).
+        // identity (S3).
         const username = self.claimIdentity(username_claim) orelse {
             log.info("introspection: claim identity rejected", .{});
             return null;
@@ -652,9 +652,9 @@ test "extractLocalpart: empty" {
     try std.testing.expectEqualStrings("", extractLocalpart(""));
 }
 
-// --- S3 review tests: claim identity and the ROPC identity path ------------
+// --- S3 tests: claim identity and the ROPC identity path ------------
 
-test "OidcStore: claim identity enforces user_domain and keeps the localpart (S3 review)" {
+test "OidcStore: claim identity enforces user_domain and keeps the localpart (S3)" {
     const allocator = std.testing.allocator;
     var store = OidcStore.init(allocator, .{
         .issuer = "https://idp.example/",
@@ -768,7 +768,7 @@ fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, body: 
     }
 }
 
-test "OidcStore: ROPC identity comes from token claims, never the typed name (S3 review)" {
+test "OidcStore: ROPC identity comes from token claims, never the typed name (S3)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -804,9 +804,9 @@ test "OidcStore: ROPC identity comes from token claims, never the typed name (S3
 
     // The IdP answered 200, but the response carries no id_token and no
     // introspection endpoint is configured: no claim identity can be
-    // derived, so the typed name must never come back. Before the fix a
-    // case variant of a locked account ("ALICE@us.example" vs locked
-    // "alice") rode the typed name straight past the lock check.
+    // derived, so the typed name must never come back. A typed case
+    // variant of a locked account ("ALICE@us.example" vs locked "alice")
+    // would otherwise ride it straight past the lock check.
     const result = try store.validatePassword(allocator, "ALICE@us.example", "pw");
     try std.testing.expect(result == null);
 }

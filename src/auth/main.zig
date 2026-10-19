@@ -66,7 +66,7 @@ pub fn main() !void {
 
     var db_path: []const u8 = "/var/db/xmppd";
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
-    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9 review)
+    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9)
     var rate_policy = RatePolicy{};
     var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
@@ -299,8 +299,8 @@ pub fn main() !void {
     var batch = ChangeList.init(&scratch);
 
     // Lanes that gained outbound backlog this iteration; flushed once per
-    // iteration at the end of event dispatch (S22). A write ever sitting
-    // un-staged used to strand replies until unrelated activity.
+    // iteration at the end of event dispatch (S22): a write sitting
+    // un-staged strands replies until unrelated activity.
     var flush_pending = [_]bool{false} ** @import("ipc_server").MAX_IPC_CLIENTS;
 
     // Main event loop
@@ -330,7 +330,7 @@ pub fn main() !void {
                             read_paused[slot] = false;
                             const conn = ipc.getClient(slot) orelse continue;
                             batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                                log.err("change list full accepting IPC slot {d} — closing the lane", .{slot});
+                                log.err("change list full accepting IPC slot {d}: closing the lane", .{slot});
                                 batch.purgeFd(conn.fd);
                                 closeIpcLane(ipc, &handler, slot);
                                 continue;
@@ -375,14 +375,14 @@ pub fn main() !void {
 
         // Coalesced flush: every lane that gained backlog this iteration
         // writes once here. A lane still holding backlog afterwards gets its
-        // one-shot write arm. Staging failures used to be swallowed (S22)
-        // and the lane's replies stranded; close such a lane loudly.
+        // one-shot write arm. A swallowed staging failure strands the
+        // lane's replies (S22); close such a lane loudly.
         for (&flush_pending, 0..) |*dirty, slot| {
             if (!dirty.*) continue;
             dirty.* = false;
             const conn = ipc.getClient(slot) orelse continue;
             _ = conn.flush() catch {
-                log.err("IPC client {d} flush error — closing", .{slot});
+                log.err("IPC client {d} flush error: closing", .{slot});
                 batch.purgeFd(conn.fd);
                 closeIpcLane(ipc, &handler, slot);
                 read_paused[slot] = false;
@@ -390,7 +390,7 @@ pub fn main() !void {
             };
             if (conn.hasPendingSend()) {
                 batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                    log.err("change list full arming write for IPC slot {d} — closing the lane", .{slot});
+                    log.err("change list full arming write for IPC slot {d}: closing the lane", .{slot});
                     batch.purgeFd(conn.fd);
                     closeIpcLane(ipc, &handler, slot);
                     read_paused[slot] = false;
@@ -425,7 +425,7 @@ fn updateReadBackpressure(ipc: *IpcServer, handler: *AuthHandler, batch: *Change
         batch.disableRead(conn.fd) catch {
             // Can't enforce the throttle: a missed EV_DISABLE would spin the
             // loop on a drowned lane (S22). Close rather than lie.
-            log.err("change list full pausing IPC slot {d} — closing the lane", .{slot});
+            log.err("change list full pausing IPC slot {d}: closing the lane", .{slot});
             batch.purgeFd(conn.fd);
             closeIpcLane(ipc, handler, slot);
             read_paused[slot] = false;
@@ -435,7 +435,7 @@ fn updateReadBackpressure(ipc: *IpcServer, handler: *AuthHandler, batch: *Change
     } else if (read_paused[slot] and pend < RX_RESUME_AT) {
         read_paused[slot] = false;
         batch.enableRead(conn.fd) catch {
-            log.err("change list full resuming IPC slot {d} — closing the lane", .{slot});
+            log.err("change list full resuming IPC slot {d}: closing the lane", .{slot});
             batch.purgeFd(conn.fd);
             closeIpcLane(ipc, handler, slot);
             return;
@@ -531,7 +531,7 @@ fn flushIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, sl
     // Re-arm write if more data pending
     if (conn.hasPendingSend()) {
         batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-            log.err("change list full arming write in flushIpcClient for slot {d} — closing the lane", .{slot});
+            log.err("change list full arming write in flushIpcClient for slot {d}: closing the lane", .{slot});
             batch.purgeFd(conn.fd);
             closeIpcLane(ipc, handler, slot);
             read_paused[slot] = false;

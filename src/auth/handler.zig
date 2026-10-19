@@ -20,7 +20,7 @@ const crypto_pool_mod = @import("crypto_pool");
 const log = std.log.scoped(.auth_handler);
 
 /// Three-state lock verdict (T352/S3): a store error must NOT be mapped to
-/// "unlocked" — that is fail-open on exactly the path that protects
+/// "unlocked": that is fail-open on exactly the path that protects
 /// permanently locked accounts.
 pub const LockCheckResult = enum {
     unlocked,
@@ -30,7 +30,7 @@ pub const LockCheckResult = enum {
 
 /// Normalize an IdP-issued identity to its localpart for lock storage: the
 /// IdP's own claim ("Alice@morante.dev", "alice") resolves to the row the
-/// admission check enforces for every other mechanism (S3 review).
+/// admission check enforces for every other mechanism (S3).
 fn localpartOf(identity: []const u8) []const u8 {
     const cut = if (std.mem.indexOfScalar(u8, identity, '@')) |p| identity[0..p] else identity;
     return cut;
@@ -153,7 +153,7 @@ const ScramSession = struct {
     conn_id: u32,
     server: sasl.ScramServer,
     active: bool = false,
-    /// IPC lane slot of the client that started the exchange — lets a dead
+    /// IPC lane slot of the client that started the exchange: lets a dead
     /// lane sweep its in-flight sessions on close (T279).
     lane: u16 = 0,
     /// Last activity (unix seconds); drives lazy reclamation of slots whose
@@ -226,7 +226,7 @@ pub fn AuthHandler(comptime Store: type) type {
             if (self.lock_checker) |checker| {
                 // Locks are keyed by the canonical localpart: strip any
                 // domain the typed or claimed identity carries; the lock
-                // store folds case on both write and check (S3 review).
+                // store folds case on both write and check (S3).
                 switch (checker.check(localpartOf(username))) {
                     .locked => {
                         log.info("auth rejected: account '{s}' is permanently locked", .{username});
@@ -234,7 +234,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     },
                     .store_error => {
                         // warn, not err: tests trip the runner on err logs.
-                        log.warn("lock store error checking '{s}' — failing closed", .{username});
+                        log.warn("lock store error checking '{s}': failing closed", .{username});
                         return "temporary-auth-failure";
                     },
                     .unlocked => {},
@@ -430,7 +430,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
-                    // S3 review: locks bind to the identity the IdP handed
+                    // S3: locks bind to the identity the IdP handed
                     // back, normalized to its localpart ("Alice@domain" and
                     // "Alice" resolve to the same "alice" admission every
                     // mechanism enforces).
@@ -610,7 +610,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
 
-                // Lock check on the parsed identity (S3) — before any
+                // Lock check on the parsed identity (S3): before any
                 // challenge work happens for a locked account.
                 if (self.admit(username)) |reason| {
                     session.deinit();
@@ -661,7 +661,7 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         fn handleSaslResponse(self: *Self, lane: u16, resp: protocol.SaslResponse) protocol.Message {
-            // Find the SCRAM session for this lane's conn_id (T279 review:
+            // Find the SCRAM session for this lane's conn_id (T279:
             // another lane's identical conn_id must not qualify).
             const slot = self.findScramSlot(lane, resp.conn_id) orelse {
                 // No exchange for this conn: aborted, swept as stale, or the
@@ -683,7 +683,7 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             const username = session.server.username;
-            // S3 review: re-check the lock at client-final; a lock that
+            // S3: re-check the lock at client-final; a lock that
             // arrived between challenge and final must not authenticate.
             if (self.admit(username)) |reason| {
                 session.deinit();
@@ -892,7 +892,7 @@ pub fn AuthHandler(comptime Store: type) type {
 
         /// Clean up a SCRAM session after the response has been sent.
         /// Lookup is keyed on (lane, conn_id): conn_id alone collides
-        /// across core worker lanes each numbering from 1 (T279 review).
+        /// across core worker lanes each numbering from 1 (T279).
         pub fn cleanupSession(self: *Self, lane: u16, conn_id: u32) void {
             if (self.findScramSlot(lane, conn_id)) |slot| {
                 self.scram_sessions[slot].deinit();
@@ -915,7 +915,7 @@ pub fn AuthHandler(comptime Store: type) type {
         /// first occupied home slot (birthday collisions are guaranteed);
         /// null now means the table is genuinely full.
         /// (lane, conn_id) is the key: the same conn_id legimately recurs
-        /// once per core worker lane (T279 review).
+        /// once per core worker lane (T279).
         fn findOrCreateScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
             if (self.findScramSlot(lane, conn_id)) |slot| return slot;
             const now = std.time.timestamp();
@@ -1287,7 +1287,7 @@ test "AuthHandler: lock store error fails closed (T352/S3)" {
     try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
 }
 
-test "AuthHandler: locks catch case and domain variants of the typed name (S3 review)" {
+test "AuthHandler: locks catch case and domain variants of the typed name (S3)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1346,7 +1346,7 @@ test "AuthHandler: locks catch case and domain variants of the typed name (S3 re
     }
 }
 
-test "AuthHandler: a lock landing between challenge and client-final rejects (S3 review)" {
+test "AuthHandler: a lock landing between challenge and client-final rejects (S3)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1473,7 +1473,7 @@ test "AuthHandler: closing an IPC lane sweeps its in-flight SCRAM sessions (T279
     try std.testing.expect(handler.findScramSlot(4, conn2) != null);
 }
 
-test "AuthHandler: identical conn_id on two lanes holds two exchanges; abort(kill) on one leaves the other (T279 review)" {
+test "AuthHandler: identical conn_id on two lanes holds two exchanges; abort(kill) on one leaves the other (T279)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});

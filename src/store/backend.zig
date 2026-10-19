@@ -37,7 +37,7 @@ pub const OpenOptions = struct {
     /// daemon hitting MDB_MAP_FULL must be restarted with a larger value
     /// (config key: [server] lmdb_map_size_mb). Default 8 GiB: address space
     /// is cheap on amd64, growth is preallocated sparse pages, and v0.8.x
-    /// production DBs already exceed 64 MiB (S9 review).
+    /// production DBs already exceed 64 MiB (S9).
     map_size: usize = 8 * 1024 * 1024 * 1024,
 
     /// Create the database/directory if it doesn't exist.
@@ -283,7 +283,7 @@ pub const MemoryBackend = struct {
 
 /// Test-only backend: every WriteBatch operation fails as if the map were
 /// full, and commit/abort counts are exposed so a caller can prove its
-/// errdefer abort ran (S9 review). The iterator serves a fixed entry list.
+/// errdefer abort ran (S9). The iterator serves a fixed entry list.
 pub const FailBatchBackend = struct {
     aborted: usize = 0,
     committed: usize = 0,
@@ -485,14 +485,14 @@ test "MemoryBackend: separate namespaces" {
 test "OpenOptions defaults" {
     const opts = OpenOptions{};
     try std.testing.expectEqual(@as(u32, 16), opts.max_namespaces);
-    // 8 GiB default (S9 review): headroom for existing production DBs that
+    // 8 GiB default (S9): headroom for existing production DBs that
     // already exceed 64 MiB; sparse maps cost address space only.
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
     try std.testing.expect(opts.create);
     try std.testing.expect(!opts.read_only);
 }
 
-test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted (S9 review)" {
+test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted (S9)" {
     // Real invariants instead of a list re-checking itself: a duplicate
     // name would collide in the DBI cache lookups, and a name over 64
     // bytes fails mdb_dbi_open (name_buf is [64]u8 plus NUL). The count

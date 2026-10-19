@@ -126,7 +126,7 @@ pub fn buildDbResult(
     try w.writeAll("' to='");
     try esc(w, target);
     try w.writeAll("'>");
-    try esc(w, key_hex); // normally local HMAC hex; escape anyway (S1 review)
+    try esc(w, key_hex); // normally local HMAC hex; escape anyway (S1)
     try w.writeAll("</db:result>");
     return fbs.getWritten();
 }
@@ -155,7 +155,7 @@ pub fn buildDbResultResponse(
 
 /// Whether text has the shape of a dialback key: exactly 64 lowercase-hex
 /// characters (computeKeyHex output). The callback path re-emits a captured
-/// peer key, which may have contained entity-decoded markup (S1 review),
+/// peer key, which may have contained entity-decoded markup (S1),
 /// so capture validates against this and builders escape regardless.
 pub fn isValidKeyHex(s: []const u8) bool {
     if (s.len != 64) return false;
@@ -638,7 +638,7 @@ test "isValidKeyHex: exactly 64 lowercase hex" {
     try std.testing.expect(!isValidKeyHex("</db:result><message from='victim.example' to='x@us.example'><body/padding padding padding padd</"));
 }
 
-test "buildDbVerify escapes even a hostile captured key (S1 review)" {
+test "buildDbVerify escapes even a hostile captured key (S1)" {
     var buf: [2048]u8 = undefined;
     const out = try buildDbVerify(&buf, "us.example", "them.example", "s2s-1", "</db:verify><message/>");
     try std.testing.expect(std.mem.indexOf(u8, out, "</db:verify><message/>") == null);

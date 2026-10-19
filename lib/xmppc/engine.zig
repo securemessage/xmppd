@@ -402,9 +402,8 @@ pub const Engine = struct {
 
     /// Bumped on every run() and once by deinit(): a thread reading a stale
     /// generation must exit. deinit() bumps it so a loop parked in kevent()
-    /// with live sessions unwinds on the wake instead of re-parking (T252
-    /// review: the T252 wake alone re-ran the generation check and blocked
-    /// forever).
+    /// with live sessions unwinds on the wake instead of re-parking: a wake
+    /// alone would merely re-run the generation check (T252).
     run_gen: std.atomic.Value(u32) = .init(0),
 
     // --- XEP-0198 outbound unacked queues (T-9BC4D065) ---
@@ -1036,7 +1035,7 @@ pub const Engine = struct {
     }
 
     /// Direct connect for a slotted session whose host is a literal IP (the
-    /// launch path already parseIp'd it — build the sockaddr directly: no
+    /// launch path already parseIp'd it, build the sockaddr directly: no
     /// blocking getaddrinfo on the engine thread, and IPv6 literals work
     /// (T251). Engine thread only.
     fn connectPrepared(self: *Engine, s: *Session) !void {
@@ -1149,7 +1148,7 @@ pub const Engine = struct {
         // The generation is snapshotted HERE and handed to the thread: a
         // deinit racing the thread start bumps run_gen before the loop's
         // first read, and a loop that read the bumped value itself would
-        // never see the mismatch and hang the join (T252 review).
+        // never see the mismatch and hang the join (T252).
         const gen = self.run_gen.fetchAdd(1, .acq_rel) +% 1;
         self.waitLoopExit();
         const t = std.Thread.spawn(.{}, Engine.runLoop, .{ self, gen }) catch return error.ThreadSpawn;
@@ -1397,7 +1396,7 @@ test "engine: startSession from a foreign thread launches via the mailbox (T237)
     try std.testing.expectEqual(@as(u32, 1), probe.closes.load(.monotonic));
 }
 
-test "engine: deinit with one live session never hangs (T252 review)" {
+test "engine: deinit with one live session never hangs (T252)" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
 
@@ -1500,12 +1499,13 @@ test "engine: timer EV_ERROR receipt drops the timer without firing it" {
     try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
 }
 
-test "engine: a generation bump right after run stops the loop (T252 review)" {
+test "engine: a generation bump right after run stops the loop (T252)" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
     var fired: usize = 0;
-    // A long pending timer keeps the loop alive: the pre-fix loop parks in
-    // kevent() until it expires, so the race below hangs the join.
+    // A long pending timer keeps the loop alive: a loop that snapshots the
+    // generation after the bump below parks in kevent() until the timer
+    // expires, so the race would hang the join.
     _ = try eng.schedule(60_000, countingTimerCb, &fired);
 
     try eng.run();

@@ -89,8 +89,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
             defer self.allocator.free(contact_key);
 
             // Atomic write: message + contact index. A failed put (MAP_FULL)
-            // must end the write txn: leaking it pins the writer lock (S9
-            // review).
+            // must end the write txn: leaking it pins the writer lock (S9).
             var batch = try self.db.writeBatch();
             errdefer batch.abort();
             try batch.put(NS_MESSAGES, primary_key, stanza_xml);
@@ -155,7 +154,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
             if (keys_to_delete.items.len == 0) return 0;
 
             var batch = try self.db.writeBatch();
-            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9 review)
+            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9)
             for (keys_to_delete.items) |k| {
                 try batch.delete(NS_MESSAGES, k);
             }
@@ -384,7 +383,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
 const MemoryBackend = backend.MemoryBackend;
 const FailBatchBackend = backend.FailBatchBackend;
 
-test "ArchiveStore: a failed batch put aborts the write txn (S9 review)" {
+test "ArchiveStore: a failed batch put aborts the write txn (S9)" {
     const allocator = std.testing.allocator;
     var db = try FailBatchBackend.open("", .{});
     var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
@@ -396,7 +395,7 @@ test "ArchiveStore: a failed batch put aborts the write txn (S9 review)" {
     try std.testing.expectEqual(@as(usize, 0), db.committed);
 }
 
-test "ArchiveStore: a failed retention batch aborts the write txn (S9 review)" {
+test "ArchiveStore: a failed retention batch aborts the write txn (S9)" {
     const allocator = std.testing.allocator;
 
     // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.

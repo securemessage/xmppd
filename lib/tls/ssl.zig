@@ -522,9 +522,8 @@ pub const SslConn = struct {
             return null;
         } else if (version >= c.TLS1_2_VERSION) {
             // tls-server-end-point (RFC 5929): SHA-256 hash of the SERVER
-            // certificate. That is our local cert when we're the server
-            // (TLS accept), but the PEER's cert when we're the client —
-            // T263: client mode used to hash our own (or null when absent).
+            // certificate: our local cert when we are the server (TLS
+            // accept), the PEER's cert when we are the client (T263).
             const x509 = (if (self.is_client) c.SSL_get0_peer_certificate(self.ssl) else c.SSL_get_certificate(self.ssl)) orelse return null;
             const der_len = c.i2d_X509(x509, null);
             if (der_len <= 0 or der_len > 65535) return null;

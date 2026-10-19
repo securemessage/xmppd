@@ -109,19 +109,19 @@ pub const S2sDaemon = struct {
     /// Per-session XML readers (parallel to inbound table).
     readers: [MAX_INBOUND_SESSIONS]?*XmlReader = [_]?*XmlReader{null} ** MAX_INBOUND_SESSIONS,
     /// Per-slot generation counters: bumped on closeInbound so a stale
-    /// dialback callback can never land on a reused slot (S2 review).
+    /// dialback callback can never land on a reused slot (S2).
     inbound_gens: [MAX_INBOUND_SESSIONS]u32 = [_]u32{0} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
     listener_fd: posix.fd_t = -1,
 
-    /// Served MUC host for the to= check on inbound stanzas (S2 review):
+    /// Served MUC host for the to= check on inbound stanzas (S2):
     /// the master forwards [muc] host as --muc-host; conference traffic is
     /// served locally even though it is a different domain.
     muc_host: ?[]const u8 = null,
 
-    /// Test seam (T277 review regression): when set, performOutboundDane
+    /// Test seam (T277 regression): when set, performOutboundDane
     /// applies this verdict without a TLSA query or chain verification, so
     /// the DANE-failed teardown path can run without live DNS and TLS.
     /// Always null in production.
@@ -412,7 +412,7 @@ pub const S2sDaemon = struct {
     /// Flush queued stanzas on an established outbound connection.
     /// Every flushed PendingStanza frees all three owned slices; a full
     /// write buffer keeps the unconsumed tail queued and arms a one-shot
-    /// write event so the writable edge resumes it (T275 review: an idle
+    /// write event so the writable edge resumes it (T275: an idle
     /// link stranded the tail before). A stanza that can never fit the
     /// write buffer is failed to the sender instead of wedging the queue.
     fn flushOutboundStanzas(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
@@ -541,7 +541,7 @@ pub const S2sDaemon = struct {
     }
 
     /// Whether a host is one we serve: the local domain or the MUC host
-    /// (S2 review: conference.<host> is a valid dialback/stream target).
+    /// (S2: conference.<host> is a valid dialback/stream target).
     pub fn servesHost(self: *const S2sDaemon, host: []const u8) bool {
         if (host.len == 0) return false;
         if (std.ascii.eqlIgnoreCase(host, self.local_domain)) return true;
@@ -906,7 +906,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     // event may run: even one parsed event would cross the TLS record boundary
     // as clear text. Any byte received while pending is a protocol error.
     if (session.tls_upgrade_pending) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending — stream policy-violation", .{ slot, session.read_end - session.read_start });
+        log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
         sendStreamError(session, .policy_violation);
         _ = session.flushWrite() catch {};
         daemon.closeInbound(batch, slot);
@@ -934,7 +934,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         // Session may have been closed by processInboundEvent
         if (daemon.getInbound(slot) == null) return;
 
-        // After STARTTLS, stop processing pre-TLS buffer — also when the
+        // After STARTTLS, stop processing pre-TLS buffer: also when the
         // upgrade merely pends behind a partially-flushed <proceed/> (T250).
         if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
     }
@@ -946,7 +946,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     // mean the peer spoke before receiving it; they are a protocol error,
     // never silently discarded at handshake completion.
     if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/> — stream policy-violation", .{ slot, session.read_end - session.read_start });
+        log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
         sendStreamError(session, .policy_violation);
         _ = session.flushWrite() catch {};
         daemon.closeInbound(batch, slot);
@@ -1055,7 +1055,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 session.setRemoteDomain(from);
             }
             // The header to= selects which served host this stream addresses;
-            // replies echo it as their from= (S2 review). An unserved host
+            // replies echo it as their from= (S2). An unserved host
             // fails the stream.
             if (to.len > 0) {
                 if (!daemon.servesHost(to)) {
@@ -1219,7 +1219,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 const to = session.getDbVerifyTo();
                 const verify_id = session.getDbVerifyId();
                 // The db:verify to= names the authoritative host; only a host
-                // we serve can answer, and the answer echoes it (S2 review).
+                // we serve can answer, and the answer echoes it (S2).
                 if (!daemon.servesHost(to)) {
                     log.warn("dialback verify: addressed to unserved host {s}; failing stream", .{to});
                     session.db_verify_pending = false;
@@ -1257,7 +1257,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
 
 /// Domainpart of a JID (RFC 7622 §3.1): cut at the resource separator
 /// FIRST, then split off the localpart. Cutting at '@' first would let
-/// "victim.example/x@them.example" resolve to "them.example" (S2 review).
+/// "victim.example/x@them.example" resolve to "them.example" (S2).
 fn jidDomain(jid: []const u8) []const u8 {
     const bare = if (std.mem.indexOfScalar(u8, jid, '/')) |slash| jid[0..slash] else jid;
     if (std.mem.indexOfScalar(u8, bare, '@')) |at| return bare[at + 1 ..];
@@ -1283,15 +1283,15 @@ fn validateInboundAddress(local_domain: []const u8, muc_host: ?[]const u8, auth_
 /// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
 ///
 /// closeInbound frees the session; every reject path resets the stanza
-/// accumulator before closing so nothing touches freed memory afterwards
-/// (S2 review: the deferred reset used to run after the free).
+/// accumulator before closing, so no deferred reset can touch freed
+/// memory (S2).
 fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
     const from = session.getStanzaFrom();
     const to = session.getStanzaTo();
 
-    // A stanza whose children overflowed the accumulator must not forward
-    // (S1 review: before, accumulate*'s silent catch made it past as
-    // truncated XML). The lane stays open; the stanza is counted and gone.
+    // A stanza whose children overflowed the accumulator must not forward:
+    // truncated XML is malformed input for the receiver (S1). The lane
+    // stays open; the stanza is counted and gone.
     if (session.stanzaBroken()) {
         log.warn("inbound S2S id={d} stanza dropped: inner accumulation overflowed (from={s} to={s})", .{ session.id, from, to });
         session.resetStanza();
@@ -1370,9 +1370,8 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         log.warn("dialback callback: missing origin or key", .{});
         return;
     }
-    // S2: the db:result to= must be a host we serve (the local domain or the
-    // MUC host); without the check an attacker-named target is verified on
-    // our account, and a MUC-addressed dialback used to be closed wrongly.
+    // S2: the db:result to= must be a host we serve (the local domain or
+    // the MUC host); an unserved target would be verified on our account.
     const target = session.getDbResultTo();
     if (!daemon.servesHost(target)) {
         log.warn("dialback callback: db:result to={s} is not a served host ({s})", .{ target, daemon.local_domain });
@@ -1407,8 +1406,8 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     };
 
     // Register the callback keyed by (stream id, origin) with the slot
-    // generation: a second db:result for the same origin can no longer
-    // overwrite this session's pending verify (S2 review).
+    // generation: each concurrent db:result for the same origin keeps its
+    // own pending verify (S2).
     if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, target, key) == null) {
         log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
         var resp_buf: [512]u8 = undefined;
@@ -1463,7 +1462,7 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
 /// Handle a db:verify verdict that matched a pending callback entry.
 /// Answers db:result on the original inbound session, addressed to the
 /// verified origin, and only while the slot still holds the session that
-/// submitted the key (generation check) (S2 review).
+/// submitted the key (generation check) (S2).
 fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, idx: usize, valid: bool) void {
     const pending = &conn.db_pending[idx];
     const inbound_slot = pending.inbound_slot;
@@ -1543,8 +1542,7 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             // Only upgrade once the plaintext buffer is fully flushed: a
             // partially sent <proceed/> would otherwise leak into the TLS
             // record stream (T250). A partial flush (no error) defers the
-            // upgrade to the writable handler; a write error closes
-            // (T250 review: `catch false` parked forever there).
+            // upgrade to the writable handler; a write error closes.
             const flushed = session.flushWrite() catch {
                 log.err("inbound S2S id={d} write error at STARTTLS proceed", .{session.id});
                 if (batch) |b| daemon.closeInbound(b, session.id);
@@ -1705,7 +1703,7 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 daemon.closeOutbound(batch, slot);
                 return;
             };
-            // T275 review: resume a kept stanza tail on the writable edge
+            // T275: resume a kept stanza tail on the writable edge
             // even when no new stanza arrives; an idle link stranded it.
             if (conn.state == .established and !conn.hasPendingWrite() and conn.pendingCount() > 0) {
                 daemon.flushOutboundStanzas(batch, conn);
@@ -1769,9 +1767,9 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     if (pos > 0) conn.consume(pos);
 
     // STARTTLS read-ahead hygiene (T250): plaintext past <proceed/> means
-    // the remote spoke before we started TLS — protocol violation, close.
+    // the remote spoke before we started TLS: protocol violation, close.
     if (conn.isTlsHandshaking() and conn.read_start < conn.read_end) {
-        log.warn("outbound to {s}: {d} plaintext bytes after <proceed/> — policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
+        log.warn("outbound to {s}: {d} plaintext bytes after <proceed/>: policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
         conn.fail("policy-violation");
         daemon.closeOutbound(batch, slot);
         return;
@@ -1901,7 +1899,7 @@ fn processOutboundEvent(
                     if (std.mem.eql(u8, attr.local_name, "to")) v_to = attr.value;
                 }
                 if (verify_type.len == 0) return;
-                // Correlate by id/from/to before acting (S2 review): a verdict
+                // Correlate by id/from/to before acting (S2): a verdict
                 // that names no pending exchange is ignored.
                 const idx = conn.findPendingVerify(v_id, v_from, v_to) orelse {
                     log.warn("dialback callback: unmatched db:verify verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, v_id, v_from, v_to });
@@ -2028,7 +2026,7 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 
         // DANE verification. performOutboundDane may closeOutbound (frees
         // conn and clears the slot): read the slot table afterwards, never
-        // the possibly-freed pointer (T277 review).
+        // the possibly-freed pointer (T277).
         performOutboundDane(daemon, batch, slot, conn);
 
         // If DANE failed, connection was closed
@@ -2070,7 +2068,7 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 /// Perform DANE verification after outbound TLS handshake.
 fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
     // Test seam: a forced verdict skips the live TLSA query and chain
-    // verification (T277 review regression rig); production leaves it null.
+    // verification (T277 regression rig); production leaves it null.
     if (daemon.dane_verdict_override) |verdict| {
         conn.setDaneResult(verdict);
         if (conn.isFailed()) {
@@ -2439,7 +2437,7 @@ test "S2sDaemon: closeInbound" {
 }
 
 /// Test allocator that poisons freed chunks, so a write-after-free is
-/// visible by reading through the old pointer (S2 review, reject path).
+/// visible by reading through the old pointer (S2, reject path).
 const PoisonOnFreeAllocator = struct {
     inner: std.mem.Allocator,
 
@@ -2470,7 +2468,7 @@ const PoisonOnFreeAllocator = struct {
     }
 };
 
-test "S2sDaemon: stanza reject path resets before closeInbound frees (S2 review)" {
+test "S2sDaemon: stanza reject path resets before closeInbound frees (S2)" {
     // resetStanza must run BEFORE closeInbound destroys the session here:
     // DebugAllocator re-poisons with its own magic, so wrap c_allocator to
     // observe the right order on the chunk.
@@ -2519,10 +2517,10 @@ test "S2sDaemon: stanza reject path resets before closeInbound frees (S2 review)
     try std.testing.expectEqual(@as(u8, 0xA5), stanza_active_byte.*);
 }
 
-test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow tail (T275 review)" {
-    // std.testing.allocator reports any leak at teardown: pre-fix the two
-    // flushed stanzas' from_jid/to_jid would leak, and a full buffer would
-    // drop the tail silently.
+test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow tail (T275)" {
+    // std.testing.allocator reports any leak at teardown: flushed stanzas
+    // must free from_jid/to_jid, and a full write buffer must keep the
+    // tail queued in order.
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -2554,7 +2552,7 @@ test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow t
     try std.testing.expectEqualStrings("b@them.example", conn.pending_stanzas.items[0].to_jid);
 }
 
-test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275 review)" {
+test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -2594,7 +2592,7 @@ test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275 
     try std.testing.expect(std.mem.indexOf(u8, got, "b@them.example") != null);
 }
 
-test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the queue (T275 review)" {
+test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the queue (T275)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -2609,7 +2607,7 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     conn.handleAuthSuccess();
 
     // A stanza that can never fit the 16 KiB write buffer, queued ahead of
-    // a deliverable one: before the fix it blocked the queue forever.
+    // a deliverable one: it must fail delivery and let the follower out.
     const huge_pad = try alloc.alloc(u8, 20000);
     defer alloc.free(huge_pad);
     @memset(huge_pad, 'y');
@@ -2671,7 +2669,7 @@ test "S2sDaemon: inbound address validation enforces authenticated domain and se
     try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "juliet@US.example") == null);
 }
 
-test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (S2 review)" {
+test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (S2)" {
     try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example"));
     try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example/orchard"));
     try std.testing.expectEqualStrings("them.example", jidDomain("them.example"));
@@ -2684,7 +2682,7 @@ test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (
     try std.testing.expectEqualStrings("", jidDomain(""));
 }
 
-test "S2sDaemon: IPC lane close purges staged kevent entries before closeClient (T277 review)" {
+test "S2sDaemon: IPC lane close purges staged kevent entries before closeClient (T277)" {
     // Repro of the T238-class bug: closeClient on an IPC lane queued the fd
     // at + IPC_CLIENT_UDATA_BASE in a staged changelist; the same iteration
     // could then accept a fresh core connection reusing the fd number and
@@ -2802,7 +2800,7 @@ fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeL
     processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
 }
 
-// --- T277 review regression rig: real TLS handshake over loopback ----------
+// --- T277 regression rig: real TLS handshake over loopback ----------
 
 /// Self-signed throwaway cert for "localhost" via the openssl CLI (no key
 /// material in the tree). error.SkipZigTest when the tool is missing.
@@ -2849,12 +2847,12 @@ fn makeS2sTestTcpPair() ![2]posix.fd_t {
     return .{ client_fd, server_fd };
 }
 
-test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277 review)" {
+test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)" {
     // Poison-on-free makes any post-closeOutbound read of the conn visible.
-    // The caller must consult the slot table (daemon.outbound[slot]); the
-    // pre-fix code read conn.isFailed() after performOutboundDane had freed
-    // it. The verdict override is the test seam; everything else is the
-    // real handshake-complete path.
+    // The caller must consult the slot table (daemon.outbound[slot]), never
+    // the conn pointer performOutboundDane may have freed. The verdict
+    // override is the test seam; everything else is the real
+    // handshake-complete path.
     var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
     const alloc = pf.allocator();
     var daemon = try S2sDaemon.init(alloc, "us.example");
@@ -2916,8 +2914,8 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277 
     continueOutboundTls(&daemon, &cl, 7, conn);
 
     // Teardown went through the slot table, and the freed conn chunk is
-    // poison-filled: the pre-fix conn.isFailed() read would have touched
-    // 0xA5 memory (invalid enum) and buildStreamOpen a wild pointer.
+    // poison-filled: any conn read here would touch 0xA5 memory (invalid
+    // enum) or a wild remote_domain pointer.
     try std.testing.expect(daemon.outbound[7] == null);
     const state_byte: *const u8 = @ptrCast(&conn.state);
     try std.testing.expectEqual(@as(u8, 0xA5), state_byte.*);
@@ -2936,7 +2934,7 @@ fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: 
     return .{ .conn = conn, .peer_fd = fds[1] };
 }
 
-test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2 review)" {
+test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3001,7 +2999,7 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2 review)
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
 
-test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2 review)" {
+test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3036,7 +3034,7 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2 rev
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
 
-test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2 review)" {
+test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3070,7 +3068,7 @@ test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2 revie
     try std.testing.expect(std.mem.indexOf(u8, resp, "</stream:stream>") != null);
 }
 
-test "S2sDaemon: stanza from unauthenticated domain on established session is rejected (S2 review)" {
+test "S2sDaemon: stanza from unauthenticated domain on established session is rejected (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3116,7 +3114,7 @@ test "S2sDaemon: stanza from unauthenticated domain on established session is re
     try std.testing.expect(daemon.getInbound(2) != null);
 }
 
-test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the stream (T250 review)" {
+test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the stream (T250)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3140,7 +3138,7 @@ test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the st
     try std.testing.expect(std.mem.indexOf(u8, resp, "policy-violation") != null);
 }
 
-test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2 review)" {
+test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3174,7 +3172,7 @@ fn testStreamOpenElem(from: []const u8, to: []const u8, attrs: []xml.Attribute) 
     };
 }
 
-test "S2sDaemon: MUC host is served on stream open; replies echo the requested host (S2 review)" {
+test "S2sDaemon: MUC host is served on stream open; replies echo the requested host (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3208,7 +3206,7 @@ test "S2sDaemon: MUC host is served on stream open; replies echo the requested h
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
 }
 
-test "S2sDaemon: db:result for the MUC host completes and answers as that host (S2 review)" {
+test "S2sDaemon: db:result for the MUC host completes and answers as that host (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3251,7 +3249,7 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host (
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
 }
 
-test "S2sDaemon: db:verify for the MUC host is answered as that host (S2 review)" {
+test "S2sDaemon: db:verify for the MUC host is answered as that host (S2)" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();

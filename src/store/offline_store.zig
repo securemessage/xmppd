@@ -149,7 +149,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             if (keys.items.len == 0) return;
 
             var batch = try self.db.writeBatch();
-            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9 review)
+            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9)
             for (keys.items) |k| {
                 try batch.delete(NS_OFFLINE, k);
             }
@@ -206,7 +206,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 const MemoryBackend = backend.MemoryBackend;
 const FailBatchBackend = backend.FailBatchBackend;
 
-test "GenericOfflineStore: a failed clearAll batch aborts the write txn (S9 review)" {
+test "GenericOfflineStore: a failed clearAll batch aborts the write txn (S9)" {
     const allocator = std.testing.allocator;
     const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
 

@@ -29,7 +29,7 @@ extern "c" fn getgroups(ngroups: c_int, grouplist: [*]std.c.gid_t) c_int;
 /// getpeereid exposes only the EFFECTIVE gid, so a peer carrying the
 /// daemon's group as a supplementary group passes the 0660 socket check
 /// yet fails the gate. cr_groups holds the effective gid first, then the
-/// supplementary groups (T258 review).
+/// supplementary groups (T258).
 const SOL_LOCAL: c_int = 0;
 const LOCAL_PEERCRED: c_int = 1;
 const XU_NGROUPS = 16;
@@ -61,7 +61,7 @@ pub fn peerCredentialsAuthorized(fd: c_int, self_euid: std.c.uid_t, self_egid: s
 /// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
 pub const MAX_IPC_CLIENTS = 80;
 
-/// Per-IPC-client receive buffer: one full wire frame (T257 review: the
+/// Per-IPC-client receive buffer: one full wire frame (T257: the
 /// 8 KiB buf silently closed the core-s2s lane on 9-16 KiB stanzas).
 /// Heap-allocated per client at accept time (80 slots * 64 KiB).
 const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
@@ -145,7 +145,7 @@ pub const IpcConn = struct {
         const alloc = self.alloc orelse return error.NoAllocator;
 
         // Encode directly into the backlog: no 64 KiB stack scratch on an
-        // event-loop thread (T257 review). The cap overflow or encode error
+        // event-loop thread (T257). The cap overflow or encode error
         // extends nothing (items.len is only bumped on success).
         var unsent = self.send_list.items.len - self.send_start;
         // Reclaim the consumed prefix FIRST so the new frame always lands
@@ -272,7 +272,7 @@ pub const IpcServer = struct {
             };
         };
 
-        // Peer credentials gate (T258 review): root, the daemon's own uid,
+        // Peer credentials gate (T258): root, the daemon's own uid,
         // OR membership in the daemon's group through ANY of the peer's
         // groups (LOCAL_PEERCRED cr_groups; getpeereid's effective gid made
         // the 0660 socket mode a silent no-op for supplementary members).
@@ -425,7 +425,7 @@ test "IpcConn: queueSend buffers past the old 16KiB cap without dropping the cli
     try std.testing.expect(conn.hasPendingSend());
 }
 
-test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a real socket (T257 review)" {
+test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a real socket (T257)" {
     // Regression: the receiver held an 8 KiB buffer, so a 9-16 KiB
     // core-to-s2s stanza frame filled the lane and the caller closed it.
     // This drives a real socketpair end to end.
@@ -501,7 +501,7 @@ test "IpcServer: socket file lands with mode 0660 (T258)" {
     try std.testing.expectEqual(@as(u32, 0o660), @as(u32, @intCast(st.mode & 0o777)));
 }
 
-test "IpcServer: peer gate reads cr_groups, not just the effective gid (T258 review)" {
+test "IpcServer: peer gate reads cr_groups, not just the effective gid (T258)" {
     // AF_UNIX socketpair: both ends carry this process's credentials, so
     // the gate sees our own uid and full group set.
     var fds: [2]posix.fd_t = undefined;

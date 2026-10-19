@@ -182,8 +182,8 @@ pub const ScramServer = struct {
         // or "y,," or "p=..." for channel binding variants
 
         // Capture the gs2 channel binding flag. RFC 5802 admits exactly
-        // n, y, p — anything else must fail here: an unknown flag used to
-        // sail straight past validateChannelBinding (T260).
+        // n, y, p; anything else must fail here, or an unknown flag sails
+        // straight past validateChannelBinding (T260).
         if (message.len > 0) {
             switch (message[0]) {
                 'n', 'y', 'p' => self.gs2_cb_flag = message[0],
@@ -318,7 +318,7 @@ pub const ScramServer = struct {
         }
 
         // Verify: H(recovered_client_key) == StoredKey (constant-time: it
-        // authenticates the peer's proof of the shared secret — T211).
+        // authenticates the peer's proof of the shared secret: T211).
         var recovered_stored_key: [32]u8 = undefined;
         Sha256.hash(&recovered_client_key, &recovered_stored_key, .{});
         if (!std.crypto.timing_safe.eql([32]u8, recovered_stored_key, creds.stored_key)) {

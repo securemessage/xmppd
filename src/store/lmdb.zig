@@ -3,7 +3,7 @@
 //! Implements the StorageBackend trait using LMDB (via zig-lmdb).
 //! Namespaces map to LMDB named databases (DBI handles): the canonical set
 //! (backend.canonical_namespaces) is opened at startup under one write
-//! transaction; any other namespace is created lazily under dbi_lock (S9 —
+//! transaction; any other namespace is created lazily under dbi_lock (S9 -
 //! cache mutation is mutex-guarded, and the env map size is never resized
 //! at runtime because LMDB documents that as unsafe with open read txns;
 //! MAP_FULL surfaces as an error, tune via [server] lmdb_map_size_mb).
@@ -14,7 +14,7 @@ const backend = @import("backend");
 
 // LMDB C API supplement: the zig-lmdb wrapper's Environment.info() drops
 // me_last_pgno, which is the only reliable "how much of the map is in use"
-// measure (mdb_env_stat covers MAIN_DBI only, S9 review).
+// measure (mdb_env_stat covers MAIN_DBI only, S9).
 const MdbEnvInfoC = extern struct {
     me_mapaddr: usize,
     me_mapsize: usize,
@@ -41,7 +41,7 @@ pub const LmdbBackend = struct {
     env: lmdb.Environment,
     dbi_cache: [MAX_DBS]DbiCacheEntry,
     /// Cache append counter; acquire/release so the canonical prefixes are
-    /// readable without any lock after open() (S9 review).
+    /// readable without any lock after open() (S9).
     dbi_count: std.atomic.Value(u32) = .init(0),
     map_size: usize,
     /// Guards dbi_cache appends only. Never held across a call that begins
@@ -94,7 +94,7 @@ pub const LmdbBackend = struct {
     /// (test-only) namespace.
     // No errdefer+commit pairing: mdb_txn_commit aborts the txn itself on
     // failure, so an errdefer abort() would end the write txn twice on
-    // exactly the MAP_FULL/ENOSPC path that matters (S9 review).
+    // exactly the MAP_FULL/ENOSPC path that matters (S9).
     fn openCanonicalNamespaces(self: *LmdbBackend) !void {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite });
         for (backend.canonical_namespaces) |ns| {
@@ -118,11 +118,11 @@ pub const LmdbBackend = struct {
         try txn.commit();
     }
 
-    /// Read-only openings (the OIDC daemon, S3 review): open the canonical
+    /// Read-only openings (the OIDC daemon, S3): open the canonical
     /// namespaces from a read txn, never create. The read-only path serves
     /// lock checks only, so a missing DBI other than "locks" (a store
     /// provisioned by an older version or another daemon) is skipped with a
-    /// warning; a missing "locks" DBI fails the open (S3 review N8).
+    /// warning; a missing "locks" DBI fails the open (S3 N8).
     fn openCanonicalNamespacesReadOnly(self: *LmdbBackend) !void {
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
         errdefer txn.abort();
@@ -174,7 +174,7 @@ pub const LmdbBackend = struct {
             return err;
         };
         // commit() needs no error-guard: on failure mdb_txn_commit aborts
-        // the txn internally (S9 review).
+        // the txn internally (S9).
         try txn.commit();
         self.warnIfNearlyFull();
     }
@@ -183,7 +183,7 @@ pub const LmdbBackend = struct {
     /// operational error (restart with a bigger [server] lmdb_map_size_mb
     /// rather than resized at runtime, which LMDB forbids with open read
     /// txns). Uses mdb_env_info me_last_pgno: mdb_env_stat covers MAIN_DBI
-    /// only and reported 4 KiB used at MAP_FULL (S9 review).
+    /// only and reported 4 KiB used at MAP_FULL (S9).
     fn warnIfNearlyFull(self: *LmdbBackend) void {
         if (self.usage_warned.load(.acquire)) return;
         var info: MdbEnvInfoC = undefined;
@@ -293,7 +293,7 @@ pub const LmdbBackend = struct {
 
         pub fn commit(self: *WriteBatch) !void {
             try self.txn.commit();
-            // A batch can fill the map like any single put (S9 review).
+            // A batch can fill the map like any single put (S9).
             self.backend.warnIfNearlyFull();
         }
 
@@ -338,7 +338,7 @@ pub const LmdbBackend = struct {
 
     fn findDbi(self: *LmdbBackend, ns: []const u8) ?lmdb.Database.DBI {
         // Canonical prefixes never move after open(); readers go lock-free
-        // on an acquire-counted cache (S9 review).
+        // on an acquire-counted cache (S9).
         const n = self.dbi_count.load(.acquire);
         for (self.dbi_cache[0..n]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
@@ -351,7 +351,7 @@ pub const LmdbBackend = struct {
         if (self.findDbi(ns)) |d| return d;
 
         // A new namespace is test-only beyond the canonical set. The write
-        // txn must not begin while holding dbi_lock (S9 review: a WriteBatch
+        // txn must not begin while holding dbi_lock (S9: a WriteBatch
         // holder waits for dbi_lock here while the txn begin waits on the
         // LMDB writer lock = deadlock window).
         var name_z: [65]u8 = undefined;
@@ -369,7 +369,7 @@ pub const LmdbBackend = struct {
             return err;
         };
         // mdb_txn_commit aborts on failure internally; the write txn is
-        // dead after this either way (S9 review).
+        // dead after this either way (S9).
         try txn.commit();
 
         self.dbi_lock.lock();
@@ -532,7 +532,7 @@ test "LmdbBackend: writeBatch abort" {
     try std.testing.expect(val == null);
 }
 
-test "LmdbBackend: MAP_FULL is a hard error — no runtime env resize (T358/S9)" {
+test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358/S9)" {
     const path = freshTestDir();
     var db = try LmdbBackend.open(path, .{ .map_size = 128 * 1024 });
     defer db.close();
@@ -556,7 +556,7 @@ test "LmdbBackend: MAP_FULL is a hard error — no runtime env resize (T358/S9)"
     try std.testing.expectEqual(@as(usize, 128 * 1024), db.map_size);
 }
 
-test "LmdbBackend: read-only open with create=false serves reads, refuses to write (S3 review)" {
+test "LmdbBackend: read-only open with create=false serves reads, refuses to write (S3)" {
     const path = freshTestDir();
     // Seed with a writer open
     {
@@ -579,7 +579,7 @@ test "LmdbBackend: read-only open with create=false serves reads, refuses to wri
     } else |_| {}
 }
 
-test "LmdbBackend: batch commit checks map usage and warns once (S9 review)" {
+test "LmdbBackend: batch commit checks map usage and warns once (S9)" {
     const allocator = std.testing.allocator;
     const path = freshTestDir();
     std.fs.cwd().makePath(path) catch {};
@@ -601,12 +601,12 @@ test "LmdbBackend: batch commit checks map usage and warns once (S9 review)" {
         try batch.put("messages", k, chunk);
     }
     try batch.commit();
-    // The warning must come from the batch commit path (S9 review: it only
+    // The warning must come from the batch commit path (S9: it only
     // ran on single puts before).
     try std.testing.expect(db.usage_warned.load(.acquire));
 }
 
-test "LmdbBackend: read-only open needs only the locks namespace (S3 review N8)" {
+test "LmdbBackend: read-only open needs only the locks namespace (S3 N8)" {
     const allocator = std.testing.allocator;
 
     // Env provisioned with ONLY the "locks" DBI (a store written by an

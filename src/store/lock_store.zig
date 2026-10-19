@@ -26,7 +26,7 @@ const LOCK_VALUE_SIZE = 5; // lock_type(1) + epoch(4)
 
 /// Lock keys are canonical ASCII-lowercase localparts: XMPP localparts are
 /// case-insensitive, so a lock on "alice" must hold for "Alice" and "ALICE"
-/// alike (S3 review). Empty or overlong names cannot be valid identities;
+/// alike (S3). Empty or overlong names cannot be valid identities;
 /// the check path maps the error to fail-closed.
 const MAX_KEY_LEN = 256;
 
@@ -72,7 +72,7 @@ pub fn LockStore(comptime Backend: type) type {
             defer allocator.free(data);
 
             // Corrupt entry: treat as locked, never silently unlocked
-            // (S3 review). The caller maps store errors to closed.
+            // (S3). The caller maps store errors to closed.
             if (data.len < LOCK_VALUE_SIZE) return error.CorruptLockRecord;
             return deserialize(data[0..LOCK_VALUE_SIZE]);
         }
@@ -193,7 +193,7 @@ test "LockStore: multiple users independent" {
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
 }
 
-test "LockStore: a corrupt lock record reads as an error, not unlocked (S3 review)" {
+test "LockStore: a corrupt lock record reads as an error, not unlocked (S3)" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -208,7 +208,7 @@ test "LockStore: a corrupt lock record reads as an error, not unlocked (S3 revie
     try std.testing.expectError(error.CorruptLockRecord, store.isLocked(allocator, "alice"));
 }
 
-test "LockStore: keys are case-folded on write and check (S3 review)" {
+test "LockStore: keys are case-folded on write and check (S3)" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -230,7 +230,7 @@ test "LockStore: keys are case-folded on write and check (S3 review)" {
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
 }
 
-test "LockStore: empty and overlong names fail closed (S3 review)" {
+test "LockStore: empty and overlong names fail closed (S3)" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 

@@ -65,7 +65,7 @@ pub const S2sSession = struct {
     /// length rule), so bytes queued after the stall wait behind it (S23).
     pinned_tls_len: usize = 0,
     /// <proceed/> queued but not fully flushed: the TLS upgrade waits for
-    /// the drain (T250 — a partially sent proceed must never reach the
+    /// the drain (T250: a partially sent proceed must never reach the
     /// peer through the TLS record layer).
     tls_upgrade_pending: bool = false,
     pending_tls_ctx: ?SslContext = null,
@@ -115,7 +115,7 @@ pub const S2sSession = struct {
     /// socket is a restart (post-TLS, post-SASL, post-dialback).
     stream_open_seen: bool = false,
     /// Host this stream is addressed to (to= of the stream header: the local
-    /// domain or the MUC host). Replies echo it as their from= (S2 review).
+    /// domain or the MUC host). Replies echo it as their from= (S2).
     served_host_buf: [256]u8 = undefined,
     served_host_len: usize = 0,
 
@@ -134,7 +134,7 @@ pub const S2sSession = struct {
     stanza_id_len: usize = 0,
     stanza_inner_buf: [16384]u8 = undefined,
     stanza_inner_len: usize = 0,
-    /// Namespace prefix/URI re-emitted by accumulateElement (S1 review).
+    /// Namespace prefix/URI re-emitted by accumulateElement (S1).
     /// Prefix of the stanza ROOT for buildStanzaXml's root xmlns emission.
     stanza_root_ns_prefix_buf: [64]u8 = undefined,
     stanza_root_ns_prefix_len: usize = 0,
@@ -487,7 +487,7 @@ pub const S2sSession = struct {
 
     /// Build the stream open response XML for an inbound connection.
     /// id/from are our own bytes (from= echoes the requested served host),
-    /// but `to` is the peer-supplied stream-open from= value — escaped like
+    /// but `to` is the peer-supplied stream-open from= value: escaped like
     /// any client/peer-controlled attribute (S1).
     pub fn buildStreamOpenResponse(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
@@ -625,10 +625,10 @@ pub const S2sSession = struct {
 
     /// Accumulate a child element opening tag into the stanza inner buffer.
     /// Namespace declarations carry peer-owned syntax like any other attr:
-    /// they are re-emitted (S1 review: `<received xmlns='urn:xmpp:receipts'/>`
-    /// used to lose the xmlns entirely). A prefixed attribute re-emits its
-    /// prefix binding too, resolved through the reader's namespace stack;
-    /// without it the forwarded element references an undeclared prefix.
+    /// they are re-emitted, so `<received xmlns='urn:xmpp:receipts'/>`
+    /// keeps its xmlns (S1). A prefixed attribute re-emits its prefix
+    /// binding too, resolved through the reader's namespace stack; without
+    /// it the forwarded element references an undeclared prefix.
     /// `reader` may be null in unit rigs, which then skips prefix bindings.
     pub fn accumulateElement(self: *S2sSession, elem: xml.Element, reader: ?*const xml.Reader) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
@@ -695,7 +695,7 @@ pub const S2sSession = struct {
 
     /// Accumulate a child element close tag into the stanza inner buffer.
     /// An overflow marks the stanza broken so it is dropped, never forwarded
-    /// unbalanced (S1 review).
+    /// unbalanced (S1).
     pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
@@ -750,7 +750,7 @@ pub const S2sSession = struct {
     }
 
     /// Build the complete stanza XML from accumulated parts.
-    /// The root element's namespace binding is preserved (S1 review).
+    /// The root element's namespace binding is preserved (S1).
     pub fn buildStanzaXml(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
@@ -768,7 +768,7 @@ pub const S2sSession = struct {
             try xmlEscapeWrite(w, self.stanzaRootNsUri());
             try w.writeByte('\'');
         }
-        // from/to/type/id carry peer input — entity-decoded by the parser, so
+        // from/to/type/id carry peer input: entity-decoded by the parser, so
         // they must be re-escaped on the way out (S1 injection guard).
         if (self.stanza_from_len > 0) {
             try w.writeAll(" from='");
@@ -916,7 +916,7 @@ test "S2sSession: buildTlsProceed" {
 
 test "S2sSession: stream-open response escapes peer-controlled and local attrs (S1)" {
     var session = S2sSession.init(-1, 1, "a.example");
-    session.closed = true; // no real fd — nothing to close on teardown
+    session.closed = true; // no real fd: nothing to close on teardown
     session.setRemoteDomain("bad' to='injected.attacker.example' x='");
     var buf: [512]u8 = undefined;
     const out = try session.buildStreamOpenResponse(&buf);
@@ -1218,7 +1218,7 @@ test "S2sSession: isTlsHandshaking" {
     try std.testing.expect(!session.isTlsHandshaking());
 }
 
-test "S2sSession: xmlns declarations on nested elements are preserved (S1 review)" {
+test "S2sSession: xmlns declarations on nested elements are preserved (S1)" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1253,7 +1253,7 @@ test "S2sSession: xmlns declarations on nested elements are preserved (S1 review
     try std.testing.expect(std.mem.indexOf(u8, out, "<received xmlns='urn:xmpp:receipts'/>") != null);
 }
 
-test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1 review)" {
+test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1)" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1278,7 +1278,7 @@ test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1 r
     try std.testing.expect(!session.stanzaBroken());
 }
 
-test "S2sSession: accumulateClose overflow marks the stanza broken (S1 review)" {
+test "S2sSession: accumulateClose overflow marks the stanza broken (S1)" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1292,9 +1292,9 @@ test "S2sSession: accumulateClose overflow marks the stanza broken (S1 review)" 
         .self_closing = false,
     });
     // Fill the inner buffer so only one byte of headroom is left: the close
-    // tag cannot fit and must mark the stanza broken, not return silently
-    // (before the fix an unbalanced stanza forwarded). 'x' does not escape,
-    // so the fill is byte-exact.
+    // tag cannot fit and must mark the stanza broken; a silent return would
+    // forward unbalanced XML. 'x' does not escape, so the fill is
+    // byte-exact.
     const fill = session.stanza_inner_buf.len - session.stanza_inner_len - 1;
     var body: [16384]u8 = undefined;
     @memset(body[0..fill], 'x');
@@ -1305,7 +1305,7 @@ test "S2sSession: accumulateClose overflow marks the stanza broken (S1 review)" 
     try std.testing.expect(session.stanzaBroken());
 }
 
-test "S2sSession: prefixed attributes keep their prefix declaration (S1 review)" {
+test "S2sSession: prefixed attributes keep their prefix declaration (S1)" {
     const alloc = std.testing.allocator;
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();

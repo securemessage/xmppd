@@ -656,7 +656,7 @@ pub const Session = struct {
             if (parser.pending) |sev| {
                 parser.pending = null;
                 // STARTTLS hygiene (T215/T250 class): anything buffered past
-                // <proceed/> arrived before our ClientHello could — the peer
+                // <proceed/> arrived before our ClientHello could: the peer
                 // spoke out of turn. Reject rather than let the upgrade path
                 // silently discard it.
                 if (sev == .starttls_proceed and pos < self.read_len) {
@@ -745,7 +745,7 @@ pub const Session = struct {
             try self.overflow.appendSlice(self.engine.allocator, data);
             return;
         }
-        // While a TLS write is pinned, EVERY new byte goes to overflow —
+        // While a TLS write is pinned, EVERY new byte goes to overflow -
         // even when it would fit: an in-place append would stretch the
         // pending retry slice, violating the identical-length retry rule
         // (T253). consumeWritten merges overflow back once the pin clears.
@@ -830,7 +830,7 @@ pub const Session = struct {
     fn sendSome(self: *Session) !usize {
         const tp = if (self.tport) |*t| t else return error.NoTransport;
         // A pending TLS retry must be re-driven with the identical slice
-        // (pointer and length) — never with later-appended bytes folded in
+        // (pointer and length): never with later-appended bytes folded in
         // (T253; AGENTS.md kTLS rule; SSL_MODE_ENABLE_PARTIAL_WRITE is not set).
         const end = if (tp.hasPendingWrite()) @min(self.write_start + tp.pinnedLen(), self.write_len) else self.write_len;
         return switch (try tp.write(self.write_buf[self.write_start..end])) {

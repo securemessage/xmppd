@@ -67,7 +67,7 @@ pub const MAX_PENDING_VERIFY = 8;
 /// origin's verdict on our db:verify. Entries are keyed by (stream id,
 /// origin); a verdict only completes the entry whose id, from and to match,
 /// and only while the inbound slot still holds the same session
-/// (generation check) (S2 review).
+/// (generation check) (S2).
 pub const PendingVerify = struct {
     in_use: bool = false,
     /// Inbound session slot that submitted the db:result.
@@ -136,7 +136,7 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
-    /// Pending dialback callbacks awaiting a verdict (S2 review). One entry
+    /// Pending dialback callbacks awaiting a verdict (S2). One entry
     /// per (stream id, origin): a later db:result for the same origin no
     /// longer overwrites another session's callback.
     db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
@@ -167,7 +167,7 @@ pub const OutboundConnection = struct {
         local_domain: []const u8,
         remote_domain: []const u8,
     ) !OutboundConnection {
-        // Copy the domain — callers hand slices that borrow the IPC recv
+        // Copy the domain: callers hand slices that borrow the IPC recv
         // buffer; the pool key depends on it being stable (T275).
         const domain = try allocator.dupe(u8, remote_domain);
         return .{
@@ -469,9 +469,9 @@ pub const OutboundConnection = struct {
         return .none;
     }
 
-    /// STARTTLS proceed received — by the time <proceed/> arrives, all bytes
+    /// STARTTLS proceed received: by the time <proceed/> arrives, all bytes
     /// through the <starttls/> request are by definition on the wire (the
-    /// peer could not have seen it otherwise; T250 review). Anything left in
+    /// peer could not have seen it otherwise; T250). Anything left in
     /// the local write buffer was queued after <starttls/>; flushing it now
     /// would push plaintext into the TLS record layer, so fail instead.
     pub fn handleStarttlsProceed(self: *OutboundConnection) bool {
@@ -538,7 +538,7 @@ pub const OutboundConnection = struct {
 
     /// Find the pending entry a verdict refers to: id must equal the entry's
     /// stream id, from the claimed origin, to the host the db:result named
-    /// (S2 review correlation).
+    /// (S2 correlation).
     pub fn findPendingVerify(
         self: *const OutboundConnection,
         id: []const u8,
@@ -597,7 +597,7 @@ pub const OutboundConnection = struct {
 
     /// Get the stream open XML to send to the remote server.
     /// remote_domain was peer-supplied at queue time (T275 duped it, but the
-    /// incoming bytes may still be entity-decoded specials — escape (S1).
+    /// incoming bytes may still be entity-decoded specials: escape (S1).
     pub fn buildStreamOpen(self: *const OutboundConnection, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
@@ -812,7 +812,7 @@ test "OutboundConnection: full DANE-verified lifecycle" {
     try std.testing.expect(conn.isEstablished());
 }
 
-test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the connection (T250 review)" {
+test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the connection (T250)" {
     const alloc = std.testing.allocator;
 
     // TCP loopback pair with a tiny send buffer (unix socketpairs ignore
@@ -840,8 +840,7 @@ test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the
 
     // ...and a tail queued AFTER <starttls/> (the protocol error), big
     // enough that the flush below cannot drain it into the tiny send
-    // buffer (T250 review: the old test never flushed, so the guard was
-    // only checked against bytes nothing had tried to send).
+    // buffer: the guard must catch bytes a real flush left behind (T250).
     const tail = try alloc.alloc(u8, 8192);
     defer alloc.free(tail);
     @memset(tail, 'x');

@@ -97,7 +97,7 @@ pub fn main() !void {
         return error.InvalidArgs;
     };
 
-    // Open storage backend (admin tool: generous map, fixed at open — S9
+    // Open storage backend (admin tool: generous map, fixed at open: S9
     // forbids runtime resize).
     var backend = try OpBackendType.open(auth_path, .{ .map_size = 256 * 1024 * 1024 });
     defer backend.close();

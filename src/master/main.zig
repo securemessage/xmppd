@@ -410,7 +410,7 @@ pub fn main() !void {
         auth_argc += 1;
     }
     // All auth backends get --db: xmppd-auth uses it for credentials AND
-    // locks; xmppd-auth-oidc reads only the shared lock table (S3 review:
+    // locks; xmppd-auth-oidc reads only the shared lock table (S3:
     // without it the OIDC daemon opened a fresh store and found nothing).
     auth_args_buf[auth_argc] = "--db";
     auth_argc += 1;
@@ -520,7 +520,7 @@ pub fn main() !void {
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
     // listener, auth nothing; everything else in the master's table closes.
     core_sup.pass_fds = c2s_listen_fds[0..c2s_fd_count];
-    // Hoisted: pass_fds points at it at spawn AND every respawn (S7 review).
+    // Hoisted: pass_fds points at it at spawn AND every respawn (S7).
     var s2s_pass_fds: [1]posix.fd_t = undefined;
     if (s2s_listen_fd >= 0) {
         s2s_pass_fds[0] = s2s_listen_fd;
@@ -672,7 +672,7 @@ pub fn main() !void {
 }
 
 /// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
-/// (T259 review: nothing under /var/run/xmppd is hardcoded anymore).
+/// (T259: nothing under /var/run/xmppd is hardcoded anymore).
 fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
     if (run_dir.len + 1 + file.len > buf.len) return error.PathTooLong;
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ run_dir, file }) catch unreachable;
@@ -680,7 +680,7 @@ fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
 
 /// Write a child PID file for orphan detection on restart. Contents: a
 /// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
-/// kinfo_proc. (T259 review: run_dir-scoped, failures are logged.)
+/// kinfo_proc. (T259: run_dir-scoped, failures are logged.)
 /// The child's kernel-reported start time in seconds, or null when the pid
 /// has no kinfo. writeChildPid records 0 for null; a stored 0 never matches
 /// a live process's ki_start, so the orphan-kill identity check spares it.
@@ -711,7 +711,7 @@ fn removeChildPid(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
-/// FreeBSD kinfo_proc slice for the orphan sanity check (T259 review).
+/// FreeBSD kinfo_proc slice for the orphan sanity check (T259).
 /// Layout probed from /usr/include/sys/user.h on 15.1 amd64: ppid at 76,
 /// start at 336, comm at 447, sizeof 1088. Returned by the
 /// { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid } sysctl.
@@ -734,7 +734,7 @@ comptime {
     std.debug.assert(@offsetOf(KinfoProc, "ki_comm") == 447);
 }
 
-/// Live-process identity via kern.proc.pid.X (T259 review). Handles the
+/// Live-process identity via kern.proc.pid.X (T259). Handles the
 /// `/usr/include/sys/user.h` ABI directly rather than kern.proc.pathname:
 /// after a pkg upgrade replaces the binary, PATHNAME returns ENOENT and
 /// the old implementation would skip the orphan kill *and* still delete
@@ -773,7 +773,7 @@ fn procIsOrphanMatch(pid: posix.pid_t, expected_basename: []const u8, expected_s
 /// PID files now live under run_dir and hold "PID START_SEC BASE". Kill
 /// only when the live process still matches comm + start time + ppid==1,
 /// so a recycled pid or a pkg-upgraded binary can never take a stray
-/// SIGKILL (T259 review). identity is re-verified before SIGKILL too.
+/// SIGKILL (T259). identity is re-verified before SIGKILL too.
 fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
     const file = std.fs.cwd().openFile(path, .{}) catch return;
     defer file.close();
@@ -803,7 +803,7 @@ fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
         return;
     }
     if (!procIsOrphanMatch(pid, expected_basename, pid_start)) {
-        log.warn("pid file {s} references pid={d} that is not our child — NOT killing it", .{ path, pid });
+        log.warn("pid file {s} references pid={d} that is not our child: NOT killing it", .{ path, pid });
         std.fs.cwd().deleteFile(path) catch {};
         return;
     }
@@ -869,7 +869,7 @@ fn printVersion() void {
 /// it preserves historic POSIX behavior and delivers all to one socket.
 /// SO_REUSEPORT_LB was introduced in FreeBSD 12.0 specifically for this purpose.
 fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
-    // CLOEXEC on every master-bound listener (S7 review): only children
+    // CLOEXEC on every master-bound listener (S7): only children
     // explicitly granted a fd (via applyFdPass mapping them onto 3..N)
     // may hold them; anything spawn elsewhere after fork never inherits.
     const fd = try posix.socket(
@@ -956,7 +956,7 @@ test "lookupKinfoProc returns false for a pid that does not exist" {
     try std.testing.expect(!lookupKinfoProcChecked(-1));
 }
 
-test "childStartSec: live pid has a start time; a dead pid returns null (T259 review)" {
+test "childStartSec: live pid has a start time; a dead pid returns null (T259)" {
     // writeChildPid must not silently store start 0 for a pid it cannot
     // look up; the null return is what makes the warn path reachable.
     try std.testing.expect(childStartSec(std.c.getpid()) != null);

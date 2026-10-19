@@ -55,7 +55,7 @@ pub fn main() !void {
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
     var db_path: []const u8 = "/var/db/xmppd";
-    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9 review)
+    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9)
 
     _ = args.next(); // Skip argv[0]
 
@@ -171,9 +171,9 @@ pub fn main() !void {
 
     // Permanent account locks come from the shared store, read-only, no
     // creation: an OIDC daemon seeing an empty/missing store must not boot
-    // into fail-open (S3 review). A startup error kills the daemon outright.
+    // into fail-open (S3). A startup error kills the daemon outright.
     // A fresh install has no environment yet: provision it once read-write,
-    // then reopen read-only, so the daemon does not crash-loop (S3 review
+    // then reopen read-only, so the daemon does not crash-loop (S3
     // N8).
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
