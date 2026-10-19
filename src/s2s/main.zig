@@ -295,7 +295,7 @@ pub const S2sDaemon = struct {
 
         if (conn.isEstablished()) {
             // Connection ready — flush queued stanzas
-            self.flushOutboundStanzas(conn);
+            self.flushOutboundStanzas(batch, conn);
         } else if (conn.isFailed()) {
             self.sendDeliveryFailed(from, to, conn.error_msg);
         } else if (conn.state == .connecting and conn.fd < 0) {
@@ -405,34 +405,47 @@ pub const S2sDaemon = struct {
 
     /// Flush queued stanzas on an established outbound connection.
     /// Every flushed PendingStanza frees all three owned slices; a full
-    /// write buffer keeps the unconsumed tail queued (T275 review: before,
-    /// from_jid/to_jid leaked per stanza and the tail was dropped silently).
-    fn flushOutboundStanzas(self: *S2sDaemon, conn: *OutboundConnection) void {
+    /// write buffer keeps the unconsumed tail queued and arms a one-shot
+    /// write event so the writable edge resumes it (T275 review: an idle
+    /// link stranded the tail before). A stanza that can never fit the
+    /// write buffer is failed to the sender instead of wedging the queue.
+    fn flushOutboundStanzas(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
         const items = conn.pending_stanzas.items;
         var i: usize = 0;
+        var kept: usize = 0;
+        var stalled = false;
         while (i < items.len) : (i += 1) {
             const stanza = items[i];
-            conn.queueWrite(stanza.xml) catch {
-                // Compact the consumed head; the tail stays in order and is
-                // retried by the next flush. Not counted or bounced here —
-                // the structural answer is X1's bounded queue with
-                // delivery-failed (T278); the loud log rides this hotfix.
-                // Backpressure, not a drop: the tail is retried by the next
-                // flush, so warn-level is enough.
-                log.warn("outbound write buffer full for {s}: {d} stanza(s) stay queued", .{ conn.remote_domain, items.len - i });
-                std.mem.copyForwards(connector_mod.PendingStanza, conn.pending_stanzas.items[0 .. items.len - i], items[i..]);
-                conn.pending_stanzas.items.len -= i;
-                _ = conn.flushWrite() catch {
-                    log.err("outbound write failed for {s}", .{conn.remote_domain});
-                };
-                return;
-            };
-            stanza.deinit(self.allocator);
+            if (stanza.xml.len > conn.write_buf.len) {
+                log.warn("outbound stanza too large for {s} ({d} bytes); delivery-failed", .{ conn.remote_domain, stanza.xml.len });
+                self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, "stanza-too-large");
+                stanza.deinit(self.allocator);
+                continue;
+            }
+            if (!stalled) {
+                if (conn.queueWrite(stanza.xml)) {
+                    stanza.deinit(self.allocator);
+                    continue;
+                } else |_| {
+                    // Backpressure, not a drop: the tail stays in order and
+                    // the writable edge retries it (the structural answer is
+                    // X1's bounded queue with delivery-failed, T278).
+                    log.warn("outbound write buffer full for {s}: {d} stanza(s) stay queued", .{ conn.remote_domain, items.len - i });
+                    stalled = true;
+                }
+            }
+            items[kept] = stanza;
+            kept += 1;
         }
-        conn.pending_stanzas.clearRetainingCapacity();
+        conn.pending_stanzas.items.len = kept;
         _ = conn.flushWrite() catch {
             log.err("outbound write failed for {s}", .{conn.remote_domain});
         };
+        if (conn.hasPendingWrite()) {
+            if (self.findOutboundSlot(conn)) |slot| {
+                batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+            }
+        }
     }
 
     /// Find the outbound slot for a given connection pointer.
@@ -1698,6 +1711,11 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 }
                 return;
             }
+            // T275 review: resume a kept stanza tail on the writable edge
+            // even when no new stanza arrives; an idle link stranded it.
+            if (conn.state == .established and !conn.hasPendingWrite() and conn.pendingCount() > 0) {
+                daemon.flushOutboundStanzas(batch, conn);
+            }
             if (conn.hasPendingWrite()) {
                 batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
             }
@@ -1868,7 +1886,7 @@ fn processOutboundEvent(
                 if (std.mem.eql(u8, result_type, "valid")) {
                     log.info("outbound dialback verified by {s}", .{conn.remote_domain});
                     conn.handleAuthSuccess();
-                    daemon.flushOutboundStanzas(conn);
+                    daemon.flushOutboundStanzas(batch, conn);
                 } else if (result_type.len > 0) {
                     log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
                     conn.handleAuthFailure();
@@ -1907,7 +1925,7 @@ fn processOutboundEvent(
                 // Post-auth features: connection is established, flush queued stanzas
                 if (conn.state == .established) {
                     log.info("outbound S2S to {s} fully established", .{conn.remote_domain});
-                    daemon.flushOutboundStanzas(conn);
+                    daemon.flushOutboundStanzas(batch, conn);
                     return;
                 }
 
@@ -2525,10 +2543,88 @@ test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow t
     try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
     try conn.queueStanza(alloc, "a@us.example", "b@them.example", big); // third does not fit the 16 KiB buffer
 
-    daemon.flushOutboundStanzas(conn);
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
     // One stanza must survive queued for the next flush, in order.
     try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
     try std.testing.expectEqualStrings("b@them.example", conn.pending_stanzas.items[0].to_jid);
+}
+
+test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.handleAuthSuccess();
+    daemon.outbound[0] = conn; // writable-edge dispatch finds it by slot
+
+    const pad = try alloc.alloc(u8, 9000);
+    defer alloc.free(pad);
+    @memset(pad, 'x');
+    const big = try std.fmt.allocPrint(alloc, "<message to='b@them.example'><body>{s}</body></message>", .{pad});
+    defer alloc.free(big);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>small</body></message>");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount()); // tail kept
+
+    // Drain the peer so the next flush has room, then fire the writable
+    // edge with NO new stanza arriving: the tail must resume by itself.
+    var rbuf: [20480]u8 = undefined;
+    _ = drainPeer(fds[1], &rbuf);
+    handleOutboundWritable(&daemon, &cl, 0);
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
+    const got = rbuf[0..drainPeer(fds[1], &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, got, "b@them.example") != null);
+}
+
+test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the queue (T275 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.handleAuthSuccess();
+
+    // A stanza that can never fit the 16 KiB write buffer, queued ahead of
+    // a deliverable one: before the fix it blocked the queue forever.
+    const huge_pad = try alloc.alloc(u8, 20000);
+    defer alloc.free(huge_pad);
+    @memset(huge_pad, 'y');
+    const huge = try std.fmt.allocPrint(alloc, "<message to='b@them.example'><body>{s}</body></message>", .{huge_pad});
+    defer alloc.free(huge);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", huge);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>after</body></message>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
+
+    // The queue drains: oversize failed to the sender, the follower went out.
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
+    var rbuf: [4096]u8 = undefined;
+    const got = rbuf[0..drainPeer(fds[1], &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, got, "after") != null);
 }
 
 test "S2sDaemon: stop" {
