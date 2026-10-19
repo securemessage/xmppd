@@ -185,16 +185,40 @@ pub const ChangeList = struct {
     purged: [64]posix.fd_t = undefined,
     purged_len: usize = 0,
 
+    /// Slots held back for the per-iteration IPC reconcile (S10), which must
+    /// be able to stage its own changes even when the batch is otherwise full.
+    /// Ordinary appends stop at buf.len - reserved.
+    reserved: usize = 0,
+    /// Set while the reconciler stages, letting it spend the reserved tail.
+    spending_reserved: bool = false,
+
     /// Initialize a changelist backed by the given scratch buffer.
     /// The buffer determines the maximum number of changes per batch.
     pub fn init(buf: []posix.Kevent) ChangeList {
         return .{ .buf = buf };
     }
 
+    /// Hold back `n` slots for the reconciler. Must be smaller than the buffer.
+    pub fn reserve(self: *ChangeList, n: usize) void {
+        self.reserved = n;
+    }
+
+    /// Let the following appends spend the reserved tail. Bracket with
+    /// endReserved(); the reconciler is the only intended caller.
+    pub fn beginReserved(self: *ChangeList) void {
+        self.spending_reserved = true;
+    }
+
+    pub fn endReserved(self: *ChangeList) void {
+        self.spending_reserved = false;
+    }
+
     /// Reset the changelist for reuse (zero-cost — just resets the length).
+    /// The reservation survives: it is set once per loop, not per batch.
     pub fn reset(self: *ChangeList) void {
         self.len = 0;
         self.purged_len = 0;
+        self.spending_reserved = false;
     }
 
     /// Returns the accumulated changes as a slice for `submitAndPoll()`.
@@ -284,7 +308,13 @@ pub const ChangeList = struct {
     }
 
     fn append(self: *ChangeList, ev: posix.Kevent) !void {
-        if (self.len >= self.buf.len) return error.ChangeListFull;
+        // Slots held back for the reconciler are off limits until it spends
+        // them, so an arm lost to a full batch cannot drop the auth link.
+        const limit = if (self.spending_reserved)
+            self.buf.len
+        else
+            self.buf.len - @min(self.reserved, self.buf.len);
+        if (self.len >= limit) return error.ChangeListFull;
         self.buf[self.len] = ev;
         self.len += 1;
     }

@@ -295,12 +295,12 @@ pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
 
     // Detach for SM resume if eligible (resume enabled, not already detached, not closing gracefully)
     if (session.sm_resume_enabled and !session.sm_detached and session.stream.isActive()) {
-        abortAuthIfInFlight(server, session, changes);
+        abortAuthIfInFlight(server, session);
         detachSession(server, id, session, changes);
         return;
     }
 
-    abortAuthIfInFlight(server, session, changes);
+    abortAuthIfInFlight(server, session);
     destroySession(server, id, session, changes);
 }
 
@@ -308,7 +308,7 @@ pub fn closeSession(server: *Server, id: usize, changes: *ChangeList) void {
 /// Used for intentional closes (stream close, protocol errors) where detach is inappropriate.
 pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void {
     const session = server.sessions[id] orelse return;
-    abortAuthIfInFlight(server, session, changes);
+    abortAuthIfInFlight(server, session);
     session.sm_resume_enabled = false; // Prevent detach
     destroySession(server, id, session, changes);
 }
@@ -317,14 +317,14 @@ pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void 
 /// mid-exchange. Without this the SCRAM slot lingers until the stale sweep,
 /// and a conn.id reused inside that window aliases the zombie exchange —
 /// observed as not-authorized storms under churn (T32).
-fn abortAuthIfInFlight(server: *Server, session: *Session, changes: *ChangeList) void {
+fn abortAuthIfInFlight(server: *Server, session: *Session) void {
     if (session.auth_state == .none) return;
     session.auth_state = .none;
     if (!server.ipc.connected) return;
     server.ipc.send(.{ .auth_abort = .{ .conn_id = session.ipcConnId() } }) catch return;
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
+    // Write interest is armed by reconcileIpcWriteInterest, once per loop
+    // iteration (S10). Arming here would leave a persistent filter with
+    // ipc_write_armed still false, so nothing would ever remove it.
 }
 
 /// Detach a session for SM resume: free connection resources, preserve session state.

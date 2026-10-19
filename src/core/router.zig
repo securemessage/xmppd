@@ -18,7 +18,6 @@ const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const StanzaKind = server_mod.StanzaKind;
-const IPC_S2S_UDATA = server_mod.IPC_S2S_UDATA;
 const ChangeList = @import("event_loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
@@ -617,10 +616,9 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
         return;
     };
 
-    if (server.s2s_ipc.hasPendingSend()) {
-        changes.addWrite(server.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-    }
-
+    // Write interest is armed by reconcileIpcWriteInterest, once per loop
+    // iteration (S10). Arming here would leave a persistent filter with
+    // s2s_write_armed still false, so nothing would ever remove it.
     log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
 }
 

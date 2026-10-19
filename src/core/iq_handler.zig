@@ -729,13 +729,13 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         } else if (std.mem.eql(u8, iq_type, "set")) {
             if (session.reg_has_remove) {
                 // Account deletion (post-auth only)
-                handleAccountDelete(server, session, iq_id, changes);
+                handleAccountDelete(server, session, iq_id);
             } else if (session.stream.bound_jid != null) {
                 // Authenticated — password change
-                handlePasswordChange(server, session, iq_id, changes);
+                handlePasswordChange(server, session, iq_id);
             } else {
                 // Pre-auth — in-band registration
-                handleRegisterSubmit(server, session, iq_id, changes);
+                handleRegisterSubmit(server, session, iq_id);
             }
             return;
         }
@@ -1023,7 +1023,7 @@ fn stageRegPendingIq(server: *Server, session: *Session, iq_id: []const u8) bool
 
 /// Handle password change (XEP-0077 §3.3). Sends PasswordChangeRequest to auth daemon.
 /// Only allowed for authenticated sessions with a bound JID.
-fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8) void {
 
     // Must be authenticated
     const bound = session.stream.bound_jid orelse {
@@ -1058,11 +1058,6 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Ensure IPC write is registered
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle registration form query (XEP-0077 §3.1).
@@ -1090,7 +1085,7 @@ fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void
 
 /// Handle registration submission (XEP-0077 §3.1, pre-auth).
 /// Sends RegisterRequest to auth daemon via IPC.
-fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8) void {
     const reg_username = session.reg_username_buf[0..session.reg_username_len];
     const reg_password = session.reg_password_buf[0..session.reg_password_len];
 
@@ -1125,15 +1120,11 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle account deletion (XEP-0077 §3.2). Sends AccountDeleteRequest to auth daemon.
 /// On success, core performs cascade cleanup (roster, vcard, offline, MAM).
-fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8) void {
     // Must be authenticated
     const bound = session.stream.bound_jid orelse {
         sendIqError(server, session, iq_id, "not-authorized");
@@ -1159,11 +1150,6 @@ fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, ch
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Ensure IPC write is registered
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle MAM query (XEP-0313). Queries the archive store and sends results.

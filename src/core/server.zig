@@ -113,6 +113,9 @@ const AUTH_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 5;
 /// Timer ident for retrying offline drains stalled on a store error (S13).
 const OFFLINE_RETRY_TIMER_IDENT = LISTENER_UDATA - 6;
 
+/// Timer ident for S2S-IPC reconnect retries (S10).
+const S2S_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 7;
+
 /// Interval for SM detached session expiry sweep (milliseconds).
 const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
 
@@ -126,10 +129,31 @@ const OFFLINE_RETRY_SWEEP_MS: u32 = 5_000;
 /// no-auth window for the whole worker.
 const AUTH_RECONNECT_MS: u32 = 1_000;
 
+/// S2S-IPC reconnect backoff (milliseconds). One-shot timer, re-armed on
+/// failure. Same pacing rationale as the auth link.
+const S2S_RECONNECT_MS: u32 = 1_000;
+
+/// Build the event loop's changelist, holding back the tail slots the IPC
+/// reconcile needs (S10). Every loop iteration ends with that reconcile, so its
+/// arm and disarm must survive a batch that event handling filled up.
+fn initLoopChangeList(buf: []posix.Kevent) ChangeList {
+    var changes = ChangeList.init(buf);
+    changes.reserve(IPC_RECONCILE_RESERVED);
+    return changes;
+}
+
 /// Maximum changelist entries per event loop iteration.
 /// Must be large enough to accommodate presence broadcasts, roster pushes,
 /// and SM acks across many concurrent connections without silent drops.
 const CHANGE_BUF_SIZE = 1024;
+
+/// Tail of the changelist held back for reconcileIpcWriteInterest (S10). The
+/// reconcile stages at most two writes and two removals, one pair per IPC
+/// link; holding that back means a batch filled by event handling can no
+/// longer cost an arm, and a failed arm is what dropped the auth link.
+/// dropIpcAuth's per-session writes stay best-effort as before, since one
+/// entry per mid-SASL session cannot be bounded by a fixed tail.
+const IPC_RECONCILE_RESERVED = 8;
 
 /// Maximum XML element nesting depth allowed.
 /// XMPP stanzas are shallow (stream=1, stanza=2, children=3-5 typically).
@@ -559,6 +583,11 @@ pub const Server = struct {
     s2s_ipc: IpcClient = .{},
     s2s_write_armed: bool = false,
 
+    /// S2S daemon socket path copy (for reconnects, S10). Empty = no
+    /// reconnect configured (e.g. configureS2s never ran).
+    s2s_ipc_path_buf: [108]u8 = undefined,
+    s2s_ipc_path_len: usize = 0,
+
     /// Session map — unified JID-keyed routing table (thread-safe, replaces both
     /// SessionRegistry and SharedSessionRegistry). Null before configureServer().
     session_map: ?*SessionMap = null,
@@ -868,6 +897,45 @@ pub const Server = struct {
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
+    fn s2sIpcPath(self: *const Server) ?[]const u8 {
+        if (self.s2s_ipc_path_len == 0) return null;
+        return self.s2s_ipc_path_buf[0..self.s2s_ipc_path_len];
+    }
+
+    fn armS2sReconnect(self: *Server, changes: *ChangeList) void {
+        _ = self;
+        changes.addTimer(S2S_RECONNECT_TIMER_IDENT, S2S_RECONNECT_MS, true) catch {};
+    }
+
+    fn tryS2sReconnect(self: *Server, changes: *ChangeList) void {
+        if (self.s2s_ipc.connected) return;
+        const path = self.s2sIpcPath() orelse return;
+        self.s2s_ipc.connect(path) catch |err| {
+            log.warn("S2S daemon reconnect failed: {}, retrying in {d}ms", .{ err, S2S_RECONNECT_MS });
+            self.armS2sReconnect(changes);
+            return;
+        };
+        log.info("S2S daemon IPC reconnected ({s})", .{path});
+        changes.addRead(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
+        // Write interest: reconcileIpcWriteInterest (S10).
+    }
+
+    /// S2S-IPC link died (recv error, undecodable frame, flush error, or a
+    /// kqueue error event): close it, purge the fd's staged changes, and arm
+    /// a reconnect. Without the retry a daemon restart leaves federation dead
+    /// for this worker's whole lifetime (S10).
+    fn dropS2sIpc(self: *Server, changes: *ChangeList) void {
+        // IpcClient.recv()/flush() clear .connected before returning, so this
+        // is keyed on holding a link, not on .connected (see dropIpcAuth).
+        if (self.s2s_ipc.fd < 0) return;
+        const dead_fd = self.s2s_ipc.fd;
+        log.warn("S2S daemon IPC lost (fd={d}), reconnect armed in {d}ms", .{ dead_fd, S2S_RECONNECT_MS });
+        self.s2s_ipc.close();
+        self.s2s_write_armed = false;
+        changes.purgeFd(dead_fd);
+        self.armS2sReconnect(changes);
+    }
+
     /// Configure the roster store (generic backend-backed).
     pub fn configureRoster(self: *Server, roster_store: *GenericRosterStore) void {
         self.roster = roster_store;
@@ -875,8 +943,14 @@ pub const Server = struct {
     }
 
     /// Connect to the S2S federation daemon IPC socket.
-    /// Optional — without this, stanzas to remote domains are bounced.
+    /// Optional: without this, stanzas to remote domains are bounced. The
+    /// path is retained so a daemon that dies mid-run is reconnected on a
+    /// one-shot timer instead of leaving federation dead for the worker's
+    /// whole lifetime (S10).
     pub fn configureS2s(self: *Server, socket_path: []const u8) !void {
+        if (socket_path.len > self.s2s_ipc_path_buf.len) return error.PathTooLong;
+        @memcpy(self.s2s_ipc_path_buf[0..socket_path.len], socket_path);
+        self.s2s_ipc_path_len = socket_path.len;
         self.s2s_ipc.connect(socket_path) catch |err| {
             log.err("failed to connect to S2S daemon at {s}: {}", .{ socket_path, err });
             return error.S2sConfigFailed;
@@ -1072,7 +1146,7 @@ pub const Server = struct {
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
     pub fn run(self: *Server) !void {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
-        var changes = ChangeList.init(&change_buf);
+        var changes = initLoopChangeList(&change_buf);
 
         // Initial registration: listener for read
         try changes.addRead(self.listener.fd, LISTENER_UDATA);
@@ -1102,6 +1176,12 @@ pub const Server = struct {
         // before we came up): arm the reconnect timer (T243).
         if (!self.ipc.connected and self.authIpcPath() != null) {
             self.armAuthReconnect(&changes);
+        }
+
+        // Same for federation: configured but down at boot means retry, not
+        // a permanent no-S2S worker (S10).
+        if (!self.s2s_ipc.connected and self.s2sIpcPath() != null) {
+            self.armS2sReconnect(&changes);
         }
 
         while (self.running) {
@@ -1165,12 +1245,16 @@ pub const Server = struct {
                             session_lifecycle.retryStalledOfflineDrains(self, &changes);
                         } else if (t.ident == AUTH_RECONNECT_TIMER_IDENT) {
                             self.tryAuthReconnect(&changes);
+                        } else if (t.ident == S2S_RECONNECT_TIMER_IDENT) {
+                            self.tryS2sReconnect(&changes);
                         }
                     },
                     .fd_error => |e| {
                         if (e.udata == IPC_AUTH_UDATA) {
                             self.dropIpcAuth(&changes);
-                        } else if (e.udata != LISTENER_UDATA and e.udata != IPC_S2S_UDATA and e.udata != WAKE_PIPE_UDATA) {
+                        } else if (e.udata == IPC_S2S_UDATA) {
+                            self.dropS2sIpc(&changes);
+                        } else if (e.udata != LISTENER_UDATA and e.udata != WAKE_PIPE_UDATA) {
                             session_lifecycle.closeSession(self, e.udata, &changes);
                         }
                     },
@@ -2230,6 +2314,13 @@ pub const Server = struct {
     /// persistent filter spun and hid it); disarming here keeps an idle
     /// link from re-firing writable every kevent.
     fn reconcileIpcWriteInterest(self: *Server, changes: *ChangeList) void {
+        // Spend the reserved tail: this runs last in every iteration, so a
+        // batch filled by event handling must not cost us an arm or a disarm.
+        // A lost arm strands pending frames; a lost disarm leaves a persistent
+        // filter firing writable every kevent.
+        changes.beginReserved();
+        defer changes.endReserved();
+
         if (self.ipc.connected and self.ipc.fd >= 0) {
             if (self.ipc.hasPendingSend()) {
                 if (!self.ipc_write_armed) {
@@ -2241,8 +2332,15 @@ pub const Server = struct {
                     self.ipc_write_armed = true;
                 }
             } else if (self.ipc_write_armed) {
-                changes.removeWrite(self.ipc.fd) catch {};
-                self.ipc_write_armed = false;
+                // Keep the flag set if the removal could not be staged, so the
+                // next iteration retries it instead of leaking a live filter.
+                // Falling through, not returning: the s2s link below still
+                // needs reconciling in this iteration.
+                if (changes.removeWrite(self.ipc.fd)) |_| {
+                    self.ipc_write_armed = false;
+                } else |err| {
+                    log.warn("auth IPC write disarm deferred ({})", .{err});
+                }
             }
         } else {
             self.ipc_write_armed = false;
@@ -2253,16 +2351,17 @@ pub const Server = struct {
                 if (!self.s2s_write_armed) {
                     changes.addWrite(self.s2s_ipc.fd, IPC_S2S_UDATA) catch |err| {
                         log.err("s2s IPC write arm failed ({}) — dropping link", .{err});
-                        const dead_fd = self.s2s_ipc.fd;
-                        self.s2s_ipc.close();
-                        changes.purgeFd(dead_fd);
+                        self.dropS2sIpc(changes);
                         return;
                     };
                     self.s2s_write_armed = true;
                 }
             } else if (self.s2s_write_armed) {
-                changes.removeWrite(self.s2s_ipc.fd) catch {};
-                self.s2s_write_armed = false;
+                if (changes.removeWrite(self.s2s_ipc.fd)) |_| {
+                    self.s2s_write_armed = false;
+                } else |err| {
+                    log.warn("s2s IPC write disarm deferred ({})", .{err});
+                }
             }
         } else {
             self.s2s_write_armed = false;
@@ -2595,10 +2694,7 @@ pub const Server = struct {
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.recv() catch {
             log.err("S2S daemon IPC recv error", .{});
-            const dead_fd = self.s2s_ipc.fd;
-            self.s2s_ipc.close();
-            changes.purgeFd(dead_fd);
-            self.s2s_write_armed = false;
+            self.dropS2sIpc(changes);
             return;
         };
 
@@ -2607,10 +2703,7 @@ pub const Server = struct {
                 // Same wedge class as the auth link (S10): an unconsumed
                 // bad frame would be retried forever.
                 log.warn("S2S daemon IPC decode error — dropping link", .{});
-                const dead_fd = self.s2s_ipc.fd;
-                self.s2s_ipc.close();
-                changes.purgeFd(dead_fd);
-                self.s2s_write_armed = false;
+                self.dropS2sIpc(changes);
                 return;
             };
             if (msg == null) break;
@@ -2621,10 +2714,7 @@ pub const Server = struct {
     fn flushS2sIpc(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.flush() catch {
             log.err("S2S daemon IPC flush error", .{});
-            const dead_fd = self.s2s_ipc.fd;
-            self.s2s_ipc.close();
-            changes.purgeFd(dead_fd);
-            self.s2s_write_armed = false;
+            self.dropS2sIpc(changes);
             return;
         };
         // Write interest: reconcileIpcWriteInterest (S10).
@@ -6273,6 +6363,256 @@ test "Server: S10 reconcile arms and disarms auth IPC write interest" {
     try std.testing.expect(!server.ipc_write_armed);
     try std.testing.expectEqual(@as(usize, 1), changes.slice().len);
     try std.testing.expectEqual(std.c.EV.DELETE, changes.slice()[0].flags);
+}
+
+test "S10: IPC write interest lives only in server.zig" {
+    // Write interest on either IPC link is armed and disarmed in exactly one
+    // place, reconcileIpcWriteInterest. A send site that arms it itself leaves
+    // a persistent EVFILT_WRITE with the *_write_armed flag still false, so no
+    // later reconcile removes it and the filter fires writable every kevent.
+    // The five such arms found in review 31 were deleted; this keeps them out.
+    // The patterns are split so this test does not match itself.
+    const auth_needle = "IPC_AUTH_" ++ "UDATA";
+    const s2s_needle = "IPC_S2S_" ++ "UDATA";
+    const cases = .{
+        .{ "iq_handler.zig", @embedFile("iq_handler.zig") },
+        .{ "router.zig", @embedFile("router.zig") },
+        .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig") },
+        .{ "presence_handler.zig", @embedFile("presence_handler.zig") },
+        .{ "muc_handler.zig", @embedFile("muc_handler.zig") },
+        .{ "message.zig", @embedFile("message.zig") },
+        .{ "fanout.zig", @embedFile("fanout.zig") },
+        .{ "caps.zig", @embedFile("caps.zig") },
+    };
+    inline for (cases) |case| {
+        const name = case[0];
+        const src = case[1];
+        var auth_hits: usize = 0;
+        var s2s_hits: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, auth_needle)) |hit| {
+            auth_hits += 1;
+            pos = hit + auth_needle.len;
+        }
+        pos = 0;
+        while (std.mem.indexOfPos(u8, src, pos, s2s_needle)) |hit| {
+            s2s_hits += 1;
+            pos = hit + s2s_needle.len;
+        }
+        if (auth_hits != 0 or s2s_hits != 0) {
+            log.err("S10: {s} references IPC write-interest udata (auth {d}, s2s {d}); " ++
+                "let reconcileIpcWriteInterest arm it", .{ name, auth_hits, s2s_hits });
+            return error.IpcWriteInterestOutsideReconciler;
+        }
+    }
+}
+
+test "Server: S10 reconcile arms IPC write interest from a full batch" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    server.ipc.fd = fds[0];
+    server.ipc.connected = true;
+
+    // Force a send backlog so the reconcile takes the arm path.
+    var fill_buf: [65536]u8 = undefined;
+    @memset(&fill_buf, 'x');
+    _ = posix.write(fds[0], &fill_buf) catch 0;
+    try server.ipc.send(.{ .auth_request = .{
+        .conn_id = 9,
+        .mechanism = .scram_sha_256,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "u",
+        .payload = "P" ** 3000,
+    } });
+    try std.testing.expect(server.ipc.hasPendingSend());
+
+    // A batch already at its ordinary limit: the changelist is built the way
+    // the event loop builds it, so its tail budget is production's, and the
+    // two slots below are all event handling gets this iteration.
+    var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
+    var changes = initLoopChangeList(&change_buf);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try std.testing.expectEqual(@as(usize, 2), changes.count());
+    try std.testing.expectError(error.ChangeListFull, changes.addRead(fds[1], 1));
+
+    // The reconcile still gets a reserved slot, so the arm is not lost and a
+    // full batch cannot cost the link.
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expect(server.ipc.connected);
+    try std.testing.expect(server.ipc_write_armed);
+    try std.testing.expectEqual(@as(usize, 3), changes.count());
+    try std.testing.expectEqual(IPC_AUTH_UDATA, changes.slice()[2].udata);
+}
+
+test "Server: S10 a deferred IPC disarm keeps the armed flag set" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    server.ipc.fd = fds[0];
+    server.ipc.connected = true;
+    // Idle link with interest believed armed: the reconcile must disarm it.
+    try std.testing.expect(!server.ipc.hasPendingSend());
+    server.ipc_write_armed = true;
+
+    // Every slot spent, reserved tail included, so the removal cannot stage.
+    // The filler idents are never submitted, only used to exhaust the budget.
+    var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
+    var changes = initLoopChangeList(&change_buf);
+    for (0..IPC_RECONCILE_RESERVED + 2) |i| {
+        // Spending the reserved tail too, which is the worst case: even the
+        // reconcile's own budget is gone, so nothing can be staged at all.
+        changes.beginReserved();
+        changes.addTimer(SM_EXPIRY_TIMER_IDENT, @intCast(i), false) catch {};
+        changes.endReserved();
+    }
+    try std.testing.expectEqual(change_buf.len, changes.count());
+
+    server.reconcileIpcWriteInterest(&changes);
+
+    // The filter is still live in the kernel, so the flag must stay set and the
+    // next iteration must retry. Clearing it here would strand a persistent
+    // writable filter that nothing ever removes.
+    try std.testing.expect(server.ipc_write_armed);
+    try std.testing.expectEqual(change_buf.len, changes.count());
+
+    // With room available the retry lands and the flag clears.
+    changes.reset();
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expect(!server.ipc_write_armed);
+    try std.testing.expectEqual(@as(usize, 1), changes.count());
+    try std.testing.expectEqual(std.c.EV.DELETE, changes.slice()[0].flags);
+}
+
+/// Listening AF_UNIX socket, for exercising a real IPC reconnect.
+const TestIpcListener = struct {
+    fd: posix.fd_t = -1,
+    path: []const u8,
+
+    fn init(path: []const u8) !TestIpcListener {
+        var self = TestIpcListener{ .path = path };
+        std.fs.cwd().deleteFile(path) catch {};
+
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+
+        var addr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+        addr.family = posix.AF.UNIX;
+        if (path.len >= addr.path.len) return error.PathTooLong;
+        @memcpy(addr.path[0..path.len], path);
+
+        posix.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) catch |err| {
+            posix.close(fd);
+            return err;
+        };
+        errdefer posix.close(fd);
+        try posix.listen(fd, 8);
+
+        self.fd = fd;
+        return self;
+    }
+
+    fn deinit(self: *TestIpcListener) void {
+        if (self.fd >= 0) posix.close(self.fd);
+        std.fs.cwd().deleteFile(self.path) catch {};
+    }
+};
+
+test "Server: S10 dropped S2S link arms a reconnect and recovers" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // A per-test directory: a fixed socket path under /tmp would collide if two
+    // workers ran this suite at once.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    // configureS2s retains the path, which is what makes a later retry possible.
+    try server.configureS2s(sock_path);
+    try std.testing.expect(server.s2s_ipc.connected);
+    const retained = server.s2sIpcPath();
+    try std.testing.expect(retained != null);
+    try std.testing.expectEqualStrings(sock_path, retained.?);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Link dies: dropped, fd purged, and a one-shot retry armed.
+    server.dropS2sIpc(&changes);
+    try std.testing.expect(!server.s2s_ipc.connected);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), server.s2s_ipc.fd);
+    try std.testing.expect(!server.s2s_write_armed);
+
+    var timer_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.TIMER) continue;
+        if (ev.ident != S2S_RECONNECT_TIMER_IDENT) continue;
+        try std.testing.expectEqual(@as(i64, S2S_RECONNECT_MS), ev.data);
+        try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+        timer_found = true;
+    }
+    try std.testing.expect(timer_found);
+
+    // A second drop is a no-op, not a second purge of a recycled fd number.
+    changes.reset();
+    server.dropS2sIpc(&changes);
+    try std.testing.expectEqual(@as(usize, 0), changes.count());
+
+    // The daemon is listening again: the retry reconnects and re-arms reads.
+    changes.reset();
+    server.tryS2sReconnect(&changes);
+    try std.testing.expect(server.s2s_ipc.connected);
+    try std.testing.expect(server.s2s_ipc.fd >= 0);
+
+    var read_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.READ) continue;
+        if (ev.udata != IPC_S2S_UDATA) continue;
+        read_found = true;
+    }
+    try std.testing.expect(read_found);
+}
+
+test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Nothing listening: the retry must re-arm rather than give up, and must
+    // not leave a half-open link that looks connected. The path is under a
+    // private temp dir and no socket file is created there.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [server.s2s_ipc_path_buf.len]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/absent.sock", .{dir});
+    @memcpy(server.s2s_ipc_path_buf[0..sock_path.len], sock_path);
+    server.s2s_ipc_path_len = sock_path.len;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.tryS2sReconnect(&changes);
+
+    try std.testing.expect(!server.s2s_ipc.connected);
+    var timer_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.TIMER and ev.ident == S2S_RECONNECT_TIMER_IDENT) timer_found = true;
+    }
+    try std.testing.expect(timer_found);
 }
 
 test "Server: S10 auth IPC decode error drops the link" {
