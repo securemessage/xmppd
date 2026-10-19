@@ -19,11 +19,43 @@ const protocol = @import("ipc_protocol");
 const log = std.log.scoped(.ipc_server);
 
 // FreeBSD: absent from zig's std.c for this version.
-extern "c" fn getpeereid(fd: c_int, euid: *std.c.uid_t, egid: *std.c.gid_t) c_int;
 /// FreeBSD 15 maps neither geteuid nor getegid in this zig's std.c; declare
-/// both locally next to getpeereid.
+/// both locally. getgroups backs the cr_groups test.
 extern "c" fn geteuid() std.c.uid_t;
 extern "c" fn getegid() std.c.gid_t;
+extern "c" fn getgroups(ngroups: c_int, grouplist: [*]std.c.gid_t) c_int;
+
+/// LOCAL_PEERCRED peer credentials (FreeBSD sys/un.h + sys/ucred.h):
+/// getpeereid exposes only the EFFECTIVE gid, so a peer carrying the
+/// daemon's group as a supplementary group passes the 0660 socket check
+/// yet fails the gate. cr_groups holds the effective gid first, then the
+/// supplementary groups (T258 review).
+const SOL_LOCAL: c_int = 0;
+const LOCAL_PEERCRED: c_int = 1;
+const XU_NGROUPS = 16;
+const Xucred = extern struct {
+    cr_version: c_uint,
+    cr_uid: std.c.uid_t,
+    cr_ngroups: c_short,
+    cr_groups: [XU_NGROUPS]std.c.gid_t,
+    cr_pid: std.c.pid_t,
+};
+
+/// Whether an IPC peer may connect: root, the daemon's own uid, or any
+/// peer group (effective or supplementary) equal to the daemon's gid.
+/// Fails closed when LOCAL_PEERCRED is unavailable.
+pub fn peerCredentialsAuthorized(fd: c_int, self_euid: std.c.uid_t, self_egid: std.c.gid_t) bool {
+    var cred: Xucred = undefined;
+    var len: posix.socklen_t = @sizeOf(Xucred);
+    if (std.c.getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, @ptrCast(&cred), &len) != 0) return false;
+    if (len < @sizeOf(Xucred)) return false;
+    if (cred.cr_uid == 0 or cred.cr_uid == self_euid) return true;
+    const n: usize = @intCast(@min(@max(cred.cr_ngroups, 0), XU_NGROUPS));
+    for (cred.cr_groups[0..n]) |g| {
+        if (g == self_egid) return true;
+    }
+    return false;
+}
 
 /// Maximum simultaneous IPC client connections.
 /// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
@@ -241,19 +273,13 @@ pub const IpcServer = struct {
         };
 
         // Peer credentials gate (T258 review): root, the daemon's own uid,
-        // OR the daemon's own group (uid-only or euid-only gating made the
-        // 0660 socket mode a silent no-op). The `ctl` sentinel for
-        // maintenance tooling remains for a follow-up.
-        var euid: std.c.uid_t = 0;
-        var egid: std.c.gid_t = 0;
-        // Only getpeereid is mapped for FreeBSD in this zig's std.c; both
-        // geteuid/getegid are declared as externs below.
-        const self_euid = geteuid();
-        const self_egid = getegid();
-        const ok_creds = getpeereid(client_fd, &euid, &egid) == 0 and
-            (euid == 0 or euid == self_euid or egid == self_egid);
-        if (!ok_creds) {
-            log.warn("IPC connection rejected: peer euid {d} is neither root nor daemon uid {d} (group {d} not {d})", .{ euid, self_euid, egid, self_egid });
+        // OR membership in the daemon's group through ANY of the peer's
+        // groups (LOCAL_PEERCRED cr_groups; getpeereid's effective gid made
+        // the 0660 socket mode a silent no-op for supplementary members).
+        // The `ctl` sentinel for maintenance tooling remains for a
+        // follow-up.
+        if (!peerCredentialsAuthorized(client_fd, geteuid(), getegid())) {
+            log.warn("IPC connection rejected: peer is neither root, the daemon uid, nor a member of the daemon group", .{});
             posix.close(client_fd);
             return null;
         }
@@ -473,6 +499,46 @@ test "IpcServer: socket file lands with mode 0660 (T258)" {
 
     const st = try std.fs.cwd().statFile(path);
     try std.testing.expectEqual(@as(u32, 0o660), @as(u32, @intCast(st.mode & 0o777)));
+}
+
+test "IpcServer: peer gate reads cr_groups, not just the effective gid (T258 review)" {
+    // AF_UNIX socketpair: both ends carry this process's credentials, so
+    // the gate sees our own uid and full group set.
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const euid = geteuid();
+    const egid = getegid();
+
+    // Same uid: authorized regardless of the daemon gid.
+    try std.testing.expect(peerCredentialsAuthorized(fds[0], euid, egid));
+
+    // The negative and supplementary-group cases need a non-root test
+    // process: root's uid short-circuits every check.
+    if (euid != 0) {
+        // Foreign uid AND foreign gid: rejected.
+        try std.testing.expect(!peerCredentialsAuthorized(fds[0], euid + 1, egid + 1));
+
+        // A daemon gid that is one of our SUPPLEMENTARY groups must
+        // authorize with a foreign uid: getpeereid's effective-gid view
+        // rejected exactly this peer, making the 0660 group bit useless.
+        var groups: [XU_NGROUPS]std.c.gid_t = undefined;
+        const ng = getgroups(XU_NGROUPS, &groups);
+        var supp: ?std.c.gid_t = null;
+        if (ng > 0) {
+            for (groups[0..@intCast(ng)]) |g| {
+                if (g != egid) {
+                    supp = g;
+                    break;
+                }
+            }
+        }
+        if (supp) |g| {
+            try std.testing.expect(peerCredentialsAuthorized(fds[0], euid + 1, g));
+        }
+    }
 }
 
 test "IpcServer: deinit cleans up socket file" {
