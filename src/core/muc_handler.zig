@@ -1017,7 +1017,11 @@ fn handleJoin(
         return;
     }
 
-    // Password-protected room check (T67) — require matching <password> in join presence
+    // Password-protected room check (T67): require a matching <password> in the
+    // join presence. stanza_buf holds escaped text, so the submitted password is
+    // decoded before the comparison: the stored secret is decoded (parseFormValue),
+    // and comparing the escaped form locks out any password containing &, <, >, '
+    // or ".
     if (r.config.password_protected and r.config.password_len > 0) {
         const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
         const expected = r.config.getPassword();
@@ -1027,7 +1031,15 @@ fn handleJoin(
             const gt = std.mem.indexOfScalarPos(u8, inner_xml, pw_start, '>') orelse break :blk false;
             const after = inner_xml[gt + 1 ..];
             const pw_end = std.mem.indexOf(u8, after, "</password>") orelse break :blk false;
-            break :blk std.mem.eql(u8, after[0..pw_end], expected);
+            var submitted_buf: [RoomConfig.password_max_len]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&submitted_buf);
+            xml.decodeWrite(fbs.writer(), after[0..pw_end]) catch break :blk false;
+            const submitted = fbs.getWritten();
+            if (submitted.len != expected.len) break :blk false;
+            // Constant time so the answer does not reveal a prefix match.
+            var diff: u8 = 0;
+            for (submitted, expected) |a, b| diff |= a ^ b;
+            break :blk diff == 0;
         };
         if (!has_correct_password) {
             sendPresenceError(server, session, room_local, muc_host, "not-authorized", changes);
@@ -2748,6 +2760,83 @@ test "S6: self-kick is rejected and the room survives actor processing" {
     _ = room.removeByRealJid("solo@localhost/x");
     cleanupEmptyRooms(&server);
     try std.testing.expect(reg.findByJid("room@conference.localhost") == null);
+}
+
+test "S1: room secret with XML specials is accepted on join" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    // The secret is stored decoded, the way parseFormValue stores a submitted
+    // room config form.
+    var config = RoomConfig{ .persistent = false };
+    config.setPassword("A&B");
+    const room = try reg.createRoom("secret@conference.localhost", config);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = alice; // owned by server.deinit from here on
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // stanza_buf holds the escaped form of what the client sent, which is what
+    // the join check reads.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'>" ++
+        "<password>A&amp;B</password></x>";
+    @memcpy(alice.stanza_buf[0..join.len], join);
+    alice.stanza_buf_len = join.len;
+
+    handleMucPresence(&server, alice, "secret", "alice", "", &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(room.findByRealJid("alice@localhost/desk") != null);
+}
+
+test "S1: a wrong room secret of the same decoded length is still refused" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    var config = RoomConfig{ .persistent = false };
+    config.setPassword("A&B");
+    const room = try reg.createRoom("secret@conference.localhost", config);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = bob;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // "X&Y" decodes to the same 3 bytes as the secret but is not it, so the
+    // comparison has to look at content and not just length.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'>" ++
+        "<password>X&amp;Y</password></x>";
+    @memcpy(bob.stanza_buf[0..join.len], join);
+    bob.stanza_buf_len = join.len;
+
+    handleMucPresence(&server, bob, "secret", "bob", "", &changes);
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
 test "S1: vcard update photo requires a hex hash" {

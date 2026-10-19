@@ -94,11 +94,15 @@ pub const Affiliation = enum(u8) {
 
 /// Persistent room configuration.
 pub const RoomConfig = struct {
+    /// Capacity of the stored room secret. setPassword truncates beyond this,
+    /// and the serialize format writes the field at this fixed width.
+    pub const password_max_len: usize = 64;
+
     persistent: bool = true,
     members_only: bool = false,
     moderated: bool = false,
     password_protected: bool = false,
-    password_buf: [64]u8 = [_]u8{0} ** 64,
+    password_buf: [password_max_len]u8 = [_]u8{0} ** password_max_len,
     password_len: u8 = 0,
     max_occupants: u16 = 0,
     public_room: bool = true,
@@ -144,10 +148,10 @@ pub const RoomConfig = struct {
 
     /// Serialize to binary format for storage.
     /// Format: flags(2) | max_occupants(2 BE) | history_length(2 BE) |
-    ///         created_at(8 BE) | password_len(1) | password(64) |
+    ///         created_at(8 BE) | password_len(1) | password(64 bytes) |
     ///         name_len(2 BE) | name | subject_len(2 BE) | subject
     pub fn serialize(self: *const RoomConfig, buf: []u8) ?usize {
-        const needed = 2 + 2 + 2 + 8 + 1 + 64 + 2 + self.name_len + 2 + self.subject_len;
+        const needed = 2 + 2 + 2 + 8 + 1 + password_max_len + 2 + self.name_len + 2 + self.subject_len;
         if (buf.len < needed) return null;
 
         var pos: usize = 0;
@@ -176,11 +180,11 @@ pub const RoomConfig = struct {
         std.mem.writeInt(u64, buf[pos..][0..8], self.created_at, .big);
         pos += 8;
 
-        // password_len (1) + password (64)
+        // password_len (1) + password (password_max_len)
         buf[pos] = self.password_len;
         pos += 1;
-        @memcpy(buf[pos..][0..64], &self.password_buf);
-        pos += 64;
+        @memcpy(buf[pos..][0..password_max_len], &self.password_buf);
+        pos += password_max_len;
 
         // name_len (2 BE) + name
         std.mem.writeInt(u16, buf[pos..][0..2], self.name_len, .big);
@@ -234,8 +238,8 @@ pub const RoomConfig = struct {
         // password
         config.password_len = data[pos];
         pos += 1;
-        @memcpy(&config.password_buf, data[pos..][0..64]);
-        pos += 64;
+        @memcpy(&config.password_buf, data[pos..][0..password_max_len]);
+        pos += password_max_len;
 
         // name
         if (pos + 2 > data.len) return null;
