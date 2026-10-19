@@ -1508,7 +1508,7 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         session.inbound_dialback.setValid();
         // S2: bind the authenticated identity to the VERIFIED origin, not to
         // whatever the header claimed at stream open.
-        session.addAuthenticatedDomain(origin);
+        _ = session.addAuthenticatedDomain(origin);
         session.stream.setAuthenticated();
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
@@ -3102,7 +3102,7 @@ test "S2sDaemon: stanza from unauthenticated domain on established session is re
     const in2 = try makeTestInbound(alloc, &daemon, 2);
     defer posix.close(in2.peer_fd);
     in2.session.stream.setAuthenticated();
-    in2.session.addAuthenticatedDomain("them.example");
+    _ = in2.session.addAuthenticatedDomain("them.example");
     var attrs2 = [_]xml.Attribute{ testAttr("from", "romeo@them.example/orchard"), testAttr("to", "juliet@us.example") };
     const elem2 = xml.Element{
         .name = "message",

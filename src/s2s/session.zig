@@ -22,6 +22,8 @@ const SslConn = ssl.SslConn;
 const SslContext = ssl.SslContext;
 const dialback_mod = @import("dialback.zig");
 
+const log = std.log.scoped(.s2s_session);
+
 /// TLS handshake state for non-blocking integration with kqueue.
 pub const TlsState = enum {
     handshake_want_read,
@@ -143,16 +145,22 @@ pub const S2sSession = struct {
     stanza_accum_overflowed: bool = false,
 
     /// Record a domain as authenticated for this session (dedup,
-    /// case-insensitive). A full set drops new entries: restart with it is
+    /// case-insensitive). Returns false when the set is full and the domain
+    /// was NOT recorded, loudly: a silent drop would let a peer believe
+    /// multiplexing succeeded. A restart with an unrecorded from= is
     /// rejected upstream by the from= check before FSM transitions.
-    pub fn addAuthenticatedDomain(self: *S2sSession, domain: []const u8) void {
-        if (domain.len == 0 or domain.len > 256) return;
-        if (self.isAuthenticatedDomain(domain)) return;
-        if (self.auth_domain_count >= 8) return;
+    pub fn addAuthenticatedDomain(self: *S2sSession, domain: []const u8) bool {
+        if (domain.len == 0 or domain.len > 256) return false;
+        if (self.isAuthenticatedDomain(domain)) return true;
+        if (self.auth_domain_count >= 8) {
+            log.warn("inbound S2S id={d}: authenticated-domain set full (8); {s} NOT recorded", .{ self.id, domain });
+            return false;
+        }
         const i = self.auth_domain_count;
         @memcpy(self.auth_domain_buf[i][0..domain.len], domain);
         self.auth_domain_len[i] = @intCast(domain.len);
         self.auth_domain_count += 1;
+        return true;
     }
 
     pub fn isAuthenticatedDomain(self: *const S2sSession, domain: []const u8) bool {
@@ -173,7 +181,7 @@ pub const S2sSession = struct {
     /// the SASL-EXTERNAL success action; a no-op without a candidate.
     pub fn promoteDaneCandidate(self: *S2sSession) void {
         if (self.dane_domain_len > 0) {
-            self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
+            _ = self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
         }
     }
 
@@ -1141,13 +1149,35 @@ test "S2sSession: authenticated-domain set (S2)" {
     try std.testing.expectEqual(@as(usize, 0), session.auth_domain_count);
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
 
-    session.addAuthenticatedDomain("them.example");
-    session.addAuthenticatedDomain("OTHER.example");
-    session.addAuthenticatedDomain("them.example"); // dedup
+    _ = session.addAuthenticatedDomain("them.example");
+    _ = session.addAuthenticatedDomain("OTHER.example");
+    try std.testing.expect(session.addAuthenticatedDomain("them.example")); // dedup: already recorded
     try std.testing.expectEqual(@as(usize, 2), session.auth_domain_count);
     try std.testing.expect(session.isAuthenticatedDomain("THEM.example")); // case-insensitive
     try std.testing.expect(session.isAuthenticatedDomain("other.example"));
     try std.testing.expect(!session.isAuthenticatedDomain("stranger.example"));
+}
+
+test "S2sSession: the 9th authenticated domain is refused loudly, not dropped silently" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true; // no real fd
+
+    var name: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const n = std.fmt.bufPrint(&name, "d{d}.example", .{i}) catch unreachable;
+        try std.testing.expect(session.addAuthenticatedDomain(n));
+    }
+    try std.testing.expectEqual(@as(usize, 8), session.auth_domain_count);
+
+    // The set is full: the 9th must report refusal (and log), never pretend
+    // to record.
+    try std.testing.expect(!session.addAuthenticatedDomain("ninth.example"));
+    try std.testing.expectEqual(@as(usize, 8), session.auth_domain_count);
+    try std.testing.expect(!session.isAuthenticatedDomain("ninth.example"));
+    // Already-recorded and invalid inputs keep their contracts.
+    try std.testing.expect(session.addAuthenticatedDomain("d0.example")); // dedup true
+    try std.testing.expect(!session.addAuthenticatedDomain("")); // invalid false
 }
 
 test "S2sSession: DANE candidate promotes only on demand (S2)" {
@@ -1170,7 +1200,7 @@ test "S2sSession: restart from= pins origin until auth, then uses the set (S2)" 
     try std.testing.expect(!session.restartFromAllowed("victim.example"));
 
     // Post-auth: only authenticated domains pass, including the victim one.
-    session.addAuthenticatedDomain("them.example");
+    _ = session.addAuthenticatedDomain("them.example");
     try std.testing.expect(session.restartFromAllowed("them.example"));
     try std.testing.expect(!session.restartFromAllowed("victim.example"));
     try std.testing.expect(!session.restartFromAllowed(""));
