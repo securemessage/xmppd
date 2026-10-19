@@ -293,6 +293,8 @@ pub const LmdbBackend = struct {
 
         pub fn commit(self: *WriteBatch) !void {
             try self.txn.commit();
+            // A batch can fill the map like any single put (S9 review).
+            self.backend.warnIfNearlyFull();
         }
 
         pub fn abort(self: *WriteBatch) void {
@@ -575,6 +577,33 @@ test "LmdbBackend: read-only open with create=false serves reads, refuses to wri
     if (db.put("locks", "bob", "x")) |_| {
         return error.ShouldHaveFailed;
     } else |_| {}
+}
+
+test "LmdbBackend: batch commit checks map usage and warns once (S9 review)" {
+    const allocator = std.testing.allocator;
+    const path = freshTestDir();
+    std.fs.cwd().makePath(path) catch {};
+    var db = try LmdbBackend.open(path, .{ .map_size = 512 * 1024 });
+    defer db.close();
+    try std.testing.expect(!db.usage_warned.load(.acquire));
+
+    var batch = try db.writeBatch();
+    // 3800-byte values keep each entry inside one 4 KiB page: 110 pages is
+    // ~88 percent of the 512 KiB map, over the warning line and well under
+    // MAP_FULL.
+    const chunk = try allocator.alloc(u8, 3800);
+    defer allocator.free(chunk);
+    @memset(chunk, 'x');
+    var kbuf: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 110) : (i += 1) {
+        const k = std.fmt.bufPrint(&kbuf, "key-{d}", .{i}) catch unreachable;
+        try batch.put("messages", k, chunk);
+    }
+    try batch.commit();
+    // The warning must come from the batch commit path (S9 review: it only
+    // ran on single puts before).
+    try std.testing.expect(db.usage_warned.load(.acquire));
 }
 
 test "LmdbBackend: read-only open needs only the locks namespace (S3 review N8)" {

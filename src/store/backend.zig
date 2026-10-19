@@ -281,6 +281,103 @@ pub const MemoryBackend = struct {
     }
 };
 
+/// Test-only backend: every WriteBatch operation fails as if the map were
+/// full, and commit/abort counts are exposed so a caller can prove its
+/// errdefer abort ran (S9 review). The iterator serves a fixed entry list.
+pub const FailBatchBackend = struct {
+    aborted: usize = 0,
+    committed: usize = 0,
+    iter_entries: []const Entry = &.{},
+
+    const Self = @This();
+
+    comptime {
+        assertBackend(Self);
+    }
+
+    pub fn open(path: []const u8, opts: OpenOptions) !Self {
+        _ = path;
+        _ = opts;
+        return .{};
+    }
+
+    pub fn close(self: *Self) void {
+        _ = self;
+    }
+
+    pub fn get(self: *Self, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+        _ = self;
+        _ = allocator;
+        _ = ns;
+        _ = key;
+        return null;
+    }
+
+    pub fn put(self: *Self, ns: []const u8, key: []const u8, value: []const u8) !void {
+        _ = self;
+        _ = ns;
+        _ = key;
+        _ = value;
+    }
+
+    pub fn delete(self: *Self, ns: []const u8, key: []const u8) !void {
+        _ = self;
+        _ = ns;
+        _ = key;
+    }
+
+    pub const Iterator = struct {
+        entries: []const Entry,
+        pos: usize = 0,
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.pos >= self.entries.len) return null;
+            const e = self.entries[self.pos];
+            self.pos += 1;
+            return e;
+        }
+
+        pub fn deinit(_: *Iterator) void {}
+    };
+
+    pub fn iterator(self: *Self, ns: []const u8, prefix: []const u8) !Iterator {
+        _ = ns;
+        _ = prefix;
+        return .{ .entries = self.iter_entries };
+    }
+
+    pub const WriteBatch = struct {
+        owner: *Self,
+
+        pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            _ = self;
+            _ = ns;
+            _ = key;
+            _ = value;
+            return error.MapFull;
+        }
+
+        pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
+            _ = self;
+            _ = ns;
+            _ = key;
+            return error.MapFull;
+        }
+
+        pub fn commit(self: *WriteBatch) !void {
+            self.owner.committed += 1;
+        }
+
+        pub fn abort(self: *WriteBatch) void {
+            self.owner.aborted += 1;
+        }
+    };
+
+    pub fn writeBatch(self: *Self) !WriteBatch {
+        return .{ .owner = self };
+    }
+};
+
 test "assertBackend accepts conforming type" {
     comptime assertBackend(MemoryBackend);
 }

@@ -149,6 +149,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             if (keys.items.len == 0) return;
 
             var batch = try self.db.writeBatch();
+            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9 review)
             for (keys.items) |k| {
                 try batch.delete(NS_OFFLINE, k);
             }
@@ -203,6 +204,22 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 // ============================================================================
 
 const MemoryBackend = backend.MemoryBackend;
+const FailBatchBackend = backend.FailBatchBackend;
+
+test "GenericOfflineStore: a failed clearAll batch aborts the write txn (S9 review)" {
+    const allocator = std.testing.allocator;
+    const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.iter_entries = &.{entry};
+    var store = GenericOfflineStore(FailBatchBackend).init(&db, allocator);
+
+    // The map-full failure must propagate AND the errdefer must end the
+    // batch: a leaked write txn pins the backend's writer lock.
+    try std.testing.expectError(error.MapFull, store.clearAll("bob@us.example"));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
 
 test "GenericOfflineStore: store and retrieve pointers" {
     var db = try MemoryBackend.open("", .{});

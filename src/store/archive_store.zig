@@ -88,8 +88,11 @@ pub fn ArchiveStore(comptime Backend: type) type {
             const contact_key = try self.buildContactKey(owner, with, timestamp);
             defer self.allocator.free(contact_key);
 
-            // Atomic write: message + contact index
+            // Atomic write: message + contact index. A failed put (MAP_FULL)
+            // must end the write txn: leaking it pins the writer lock (S9
+            // review).
             var batch = try self.db.writeBatch();
+            errdefer batch.abort();
             try batch.put(NS_MESSAGES, primary_key, stanza_xml);
             try batch.put(NS_BY_CONTACT, contact_key, stanza_id);
             try batch.commit();
@@ -152,6 +155,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
             if (keys_to_delete.items.len == 0) return 0;
 
             var batch = try self.db.writeBatch();
+            errdefer batch.abort(); // a failed delete must not leak the writer lock (S9 review)
             for (keys_to_delete.items) |k| {
                 try batch.delete(NS_MESSAGES, k);
             }
@@ -378,6 +382,45 @@ pub fn ArchiveStore(comptime Backend: type) type {
 // ============================================================================
 
 const MemoryBackend = backend.MemoryBackend;
+const FailBatchBackend = backend.FailBatchBackend;
+
+test "ArchiveStore: a failed batch put aborts the write txn (S9 review)" {
+    const allocator = std.testing.allocator;
+    var db = try FailBatchBackend.open("", .{});
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    // The map-full failure must propagate AND the errdefer must end the
+    // batch: a leaked write txn pins the backend's writer lock.
+    try std.testing.expectError(error.MapFull, store.store("alice@us.example", "bob@them.example", "msg-1", 1000, "<message/>"));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
+
+test "ArchiveStore: a failed retention batch aborts the write txn (S9 review)" {
+    const allocator = std.testing.allocator;
+
+    // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.
+    const owner = "alice@us.example";
+    var key_buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&key_buf);
+    const w = fbs.writer();
+    try w.writeAll(owner);
+    try w.writeByte(0);
+    var ts: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ts, 1000, .big);
+    try w.writeAll(&ts);
+    try w.writeByte(0);
+    try w.writeAll("msg-1");
+    const entry = backend.Entry{ .key = key_buf[0..fbs.pos], .value = "<message/>" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.iter_entries = &.{entry};
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    try std.testing.expectError(error.MapFull, store.deleteOlderThan(owner, 2000));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
 
 fn freeQueryResult(allocator: std.mem.Allocator, result: *QueryResult) void {
     for (result.messages) |msg| {
