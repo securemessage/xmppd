@@ -568,10 +568,16 @@ pub const Server = struct {
     /// leaf lookups (sendCarbons runs under dispatchStanza, so they
     /// cannot share a bank). Grown lazily to the session map's resource
     /// cap; chunk banks hold SCRATCH_CHUNK_JIDS * cap entries.
+    ///
+    /// A bank is handed out through `leaseScratch`, which marks it in use
+    /// until released so a nested lookup on the same bank fails an assert
+    /// instead of overwriting the outer iteration.
     scratch_entries_a: []SessionEntry = &.{},
     scratch_entries_b: []SessionEntry = &.{},
+    scratch_entries_c: []SessionEntry = &.{},
     scratch_ids_a: []usize = &.{},
     scratch_jid_idxs_a: []u16 = &.{},
+    scratch_bank_in_use: [3]bool = .{ false, false, false },
 
     /// T87 async archive writer queue. Null in dev/single-process setups
     /// without a writer thread — writers then fall back to inline store()
@@ -924,6 +930,7 @@ pub const Server = struct {
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
         if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
         if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
+        if (self.scratch_entries_c.len > 0) self.allocator.free(self.scratch_entries_c);
         if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
         if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
         self.sm_id_map.deinit(self.allocator);
@@ -940,61 +947,106 @@ pub const Server = struct {
     /// Presence batching resolves this many bare JIDs per lock hold.
     pub const SCRATCH_CHUNK_JIDS = 32;
 
-    pub fn scratchEntriesA(self: *Server) []SessionEntry {
-        self.growScratch();
-        return self.scratch_entries_a;
-    }
+    /// Scratch banks are layered by nesting depth so that a lookup made
+    /// inside another lookup's iteration cannot overwrite the outer results.
+    pub const ScratchBank = enum(u8) {
+        /// Stanza routing and the chunked batch lookups.
+        a = 0,
+        /// Handler-level lookups, nested under bank A.
+        b = 1,
+        /// Leaf delivery lookups, nested under bank B.
+        c = 2,
+    };
 
-    pub fn scratchEntriesB(self: *Server) []SessionEntry {
-        self.growScratch();
-        return self.scratch_entries_b;
+    /// An in-use claim on one scratch bank. Release with `release`, normally
+    /// through `defer`, before the entries slice is allowed to go stale.
+    pub const ScratchLease = struct {
+        server: *Server,
+        bank: ScratchBank,
+        entries: []SessionEntry,
+
+        pub fn release(self: *ScratchLease) void {
+            if (!self.server.scratch_bank_in_use[@intFromEnum(self.bank)]) return;
+            self.server.scratch_bank_in_use[@intFromEnum(self.bank)] = false;
+            self.entries = &.{};
+        }
+    };
+
+    /// Claim a scratch bank and return its entries. Safe builds assert when
+    /// the bank is already claimed, which is the S18 aliasing bug: the inner
+    /// lookup would overwrite the slice the outer loop is iterating.
+    pub fn leaseScratch(self: *Server, bank: ScratchBank) ScratchLease {
+        self.growScratch(bank);
+        const idx = @intFromEnum(bank);
+        std.debug.assert(!self.scratch_bank_in_use[idx]);
+        self.scratch_bank_in_use[idx] = true;
+        return .{
+            .server = self,
+            .bank = bank,
+            .entries = switch (bank) {
+                .a => self.scratch_entries_a,
+                .b => self.scratch_entries_b,
+                .c => self.scratch_entries_c,
+            },
+        };
     }
 
     pub fn scratchIdsA(self: *Server) []usize {
-        self.growScratch();
+        self.growScratch(.a);
         return self.scratch_ids_a;
     }
 
     pub fn scratchJidIdxsA(self: *Server) []u16 {
-        self.growScratch();
+        self.growScratch(.a);
         return self.scratch_jid_idxs_a;
     }
 
-    fn growScratch(self: *Server) void {
+    /// Grow only the arrays belonging to `bank`. Growing every bank here would
+    /// free and re-allocate the buffers behind an already-handed-out lease.
+    fn growScratch(self: *Server, bank: ScratchBank) void {
         const sm = self.session_map orelse return;
-        const chunk_need = SCRATCH_CHUNK_JIDS * sm.max_resources;
-        if (self.scratch_entries_a.len < chunk_need) {
-            if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
-            self.scratch_entries_a = self.allocator.alloc(SessionEntry, chunk_need) catch {
-                log.err("session-map scratch A alloc of {d} entries failed", .{chunk_need});
-                self.scratch_entries_a = &.{};
-                return;
-            };
+        const need: usize = switch (bank) {
+            .a => SCRATCH_CHUNK_JIDS * sm.max_resources,
+            .b, .c => sm.max_resources,
+        };
+
+        if (bank == .a) {
+            if (self.scratch_ids_a.len < need) {
+                if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
+                self.scratch_ids_a = self.allocator.alloc(usize, need) catch {
+                    log.err("session-map scratch ids alloc of {d} entries failed", .{need});
+                    self.scratch_ids_a = &.{};
+                    return;
+                };
+            }
+            if (self.scratch_jid_idxs_a.len < need) {
+                if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
+                self.scratch_jid_idxs_a = self.allocator.alloc(u16, need) catch {
+                    log.err("session-map scratch jid idxs alloc of {d} entries failed", .{need});
+                    self.scratch_jid_idxs_a = &.{};
+                    return;
+                };
+            }
         }
-        if (self.scratch_ids_a.len < chunk_need) {
-            if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
-            self.scratch_ids_a = self.allocator.alloc(usize, chunk_need) catch {
-                log.err("session-map scratch ids alloc of {d} failed", .{chunk_need});
-                self.scratch_ids_a = &.{};
-                return;
-            };
-        }
-        if (self.scratch_jid_idxs_a.len < chunk_need) {
-            if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
-            self.scratch_jid_idxs_a = self.allocator.alloc(u16, chunk_need) catch {
-                log.err("session-map scratch jid idxs alloc of {d} failed", .{chunk_need});
-                self.scratch_jid_idxs_a = &.{};
-                return;
-            };
-        }
-        if (self.scratch_entries_b.len < sm.max_resources) {
-            if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
-            self.scratch_entries_b = self.allocator.alloc(SessionEntry, sm.max_resources) catch {
-                log.err("session-map scratch B alloc of {d} entries failed", .{sm.max_resources});
-                self.scratch_entries_b = &.{};
-                return;
-            };
-        }
+
+        const target: *[]SessionEntry = switch (bank) {
+            .a => &self.scratch_entries_a,
+            .b => &self.scratch_entries_b,
+            .c => &self.scratch_entries_c,
+        };
+        const label: []const u8 = switch (bank) {
+            .a => "A",
+            .b => "B",
+            .c => "C",
+        };
+        if (target.len >= need) return;
+        if (target.len > 0) self.allocator.free(target.*);
+        const grown = self.allocator.alloc(SessionEntry, need) catch {
+            log.err("session-map scratch {s} alloc of {d} entries failed", .{ label, need });
+            target.* = &.{};
+            return;
+        };
+        target.* = grown;
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -2564,7 +2616,9 @@ pub const Server = struct {
                 };
 
                 const s2s_sm = self.session_map orelse return;
-                var s2s_entries = self.scratchEntriesB();
+                var lease_s2s = self.leaseScratch(.b);
+                defer lease_s2s.release();
+                const s2s_entries = lease_s2s.entries;
                 const target_count = if (to_jid.resource.len > 0) blk: {
                     if (s2s_sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
                         s2s_entries[0] = e;
@@ -2643,7 +2697,9 @@ pub const Server = struct {
                 const from_jid = xmpp.Jid.parse(m.from_jid) catch return;
 
                 const fail_sm = self.session_map orelse return;
-                var sender_entries = self.scratchEntriesB();
+                var lease_sender = self.leaseScratch(.b);
+                defer lease_sender.release();
+                const sender_entries = lease_sender.entries;
                 const sender_count = if (from_jid.resource.len > 0) blk: {
                     if (fail_sm.findByFullJid(from_jid.local, from_jid.domain, from_jid.resource)) |e| {
                         sender_entries[0] = e;
@@ -4634,15 +4690,27 @@ test "Server: S18 scratch banks size to the session map resource cap" {
     defer sm.deinit();
     server.session_map = &sm;
 
-    try std.testing.expectEqual(
-        Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES,
-        server.scratchEntriesA().len,
-    );
+    {
+        var lease = server.leaseScratch(.a);
+        defer lease.release();
+        try std.testing.expectEqual(
+            Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES,
+            lease.entries.len,
+        );
+    }
     try std.testing.expectEqual(Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchIdsA().len);
     try std.testing.expectEqual(Server.SCRATCH_CHUNK_JIDS * session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchJidIdxsA().len);
-    try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, server.scratchEntriesB().len);
+    {
+        var lease = server.leaseScratch(.b);
+        defer lease.release();
+        try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, lease.entries.len);
+    }
+    {
+        var lease = server.leaseScratch(.c);
+        defer lease.release();
+        try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, lease.entries.len);
+    }
 }
-
 
 test "Server: accept and close session" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
@@ -5869,7 +5937,6 @@ test "Server: S24 cross-worker handoff carries last_h" {
     try std.testing.expectEqual(@as(u32, 1), queue.count);
     try std.testing.expectEqual(@as(u32, 5), queue.last_h);
 }
-
 
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);

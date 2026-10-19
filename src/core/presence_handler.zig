@@ -481,7 +481,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             parts_len += 1;
         }
 
-        const entries = server.scratchEntriesA();
+        var lease_a = server.leaseScratch(.a);
+        defer lease_a.release();
+        const entries = lease_a.entries;
         const jid_idxs = server.scratchJidIdxsA();
         const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, jid_idxs);
 
@@ -529,7 +531,6 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
         contact_i = end;
     }
 }
-
 
 /// RFC 6120 4.9.3.10: a subscription stanza whose over-long `to` would
 /// overflow the 511-byte store key is rejected, not dropped (S4).
@@ -620,12 +621,15 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
             log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
             return;
         };
-        const target_entries = server.scratchEntriesB();
-        const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, target_entries);
+        const target_count = blk: {
+            var lease_b = server.leaseScratch(.b);
+            defer lease_b.release();
+            break :blk sm.findAvailableByBareJid(to_jid.local, to_jid.domain, lease_b.entries);
+        };
         if (target_count > 0) {
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
         } else {
-            // Target is offline — store for deferred delivery
+            // Target is offline: store for deferred delivery.
             storePendingSubscription(server, to_str, sub_pres_xml);
         }
     }
@@ -736,7 +740,9 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
     // The approver now has 'from' the contact = contact's presence should be visible.
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        const probe_entries = server.scratchEntriesB();
+        var lease_b = server.leaseScratch(.b);
+        defer lease_b.release();
+        const probe_entries = lease_b.entries;
         const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, probe_entries);
         for (probe_entries[0..probe_count]) |pentry| {
             // Look up the contact's session to retrieve their stored presence inner XML.
@@ -920,7 +926,9 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_jid = to_jid_parsed;
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
         const unsub_sm = server.session_map orelse return;
-        const owner_entries = server.scratchEntriesB();
+        var lease_b = server.leaseScratch(.b);
+        defer lease_b.release();
+        const owner_entries = lease_b.entries;
         const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, owner_entries);
         for (owner_entries[0..owner_count]) |oent| {
             var unavail_buf: [512]u8 = undefined;
@@ -1085,7 +1093,9 @@ fn broadcastToOwnResources(
     }
     const presence_xml = pres_fbs.getWritten();
 
-    var entries = server.scratchEntriesB();
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
     const count = sm.findByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
@@ -1120,7 +1130,9 @@ fn sendOtherResourcesPresence(
 ) void {
     const sm = server.session_map orelse return;
 
-    var entries = server.scratchEntriesB();
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
     const count = sm.findAvailableByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
@@ -1204,7 +1216,9 @@ pub fn dispatchDirectedPresenceToBareJid(
     const presence_xml = pres_fbs.getWritten();
 
     // Deliver to all available resources of the target bare JID
-    var entries = server.scratchEntriesB();
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
     const count = sm.findAvailableByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |entry| {
@@ -1266,7 +1280,9 @@ fn deliverPresenceToSubscribers(
         }
 
         // Resolve the whole chunk under one lock hold.
-        const entries = server.scratchEntriesA();
+        var lease_a = server.leaseScratch(.a);
+        defer lease_a.release();
+        const entries = lease_a.entries;
         const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, null);
 
         // Local targets deliver inline.
@@ -1305,7 +1321,10 @@ pub fn deliverPresenceToTarget(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries = server.scratchEntriesB();
+    // Leaf delivery: bank C so callers iterating bank B keep their results.
+    var lease_c = server.leaseScratch(.c);
+    defer lease_c.release();
+    const entries = lease_c.entries;
     const count = sm.findByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |ent| {
@@ -1350,4 +1369,78 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     const reply = buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
+}
+
+test "S18: unsubscribed fan-out keeps the owner's own resources" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    // Sender alice has two available resources. Only the sending one needs a
+    // live session; the fan-out targets the contact.
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = alice;
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/desk") catch null;
+    alice.stream.authenticated_jid = alice.stream.bound_jid;
+
+    // Contact bob has two available resources. The second one is what an
+    // aliased bank writes over alice's still-unread slot.
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    server.sessions[2] = bob;
+
+    _ = try sm.bind(0, 1, "alice", "localhost", "desk");
+    _ = try sm.bind(0, 4, "alice", "localhost", "mobile");
+    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
+    _ = try sm.bind(0, 5, "bob", "localhost", "tablet");
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "alice", "desk" }, .{ "alice", "mobile" },
+        .{ "bob", "laptop" }, .{ "bob", "tablet" },
+    }) |jid| {
+        sm.setPresenceAvailable(jid[0], "localhost", jid[1], true);
+    }
+
+    const to = "bob@localhost";
+    alice.stanza_to = to;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, alice, .unsubscribed, "", &changes);
+
+    _ = try bob.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+
+    // One unavailable stanza per available alice resource, each naming that
+    // resource. Reusing one bank for the outer iteration and the delivery
+    // lookup replaced the second resource with one of bob's.
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='alice@localhost/desk'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='alice@localhost/mobile'") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "type='unavailable'"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "laptop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "tablet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "type='unsubscribed'") != null);
 }
