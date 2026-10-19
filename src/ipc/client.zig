@@ -54,6 +54,15 @@ pub const IpcClient = struct {
     pub fn connect(self: *IpcClient, path: []const u8) !void {
         if (self.connected) return error.AlreadyConnected;
 
+        // The wire sees whole frames; the receive buffer must hold one.
+        // Allocate before the socket exists: an allocation error after
+        // adopting the fd would fire the errdefer close and leave self.fd
+        // naming a closed descriptor (dangling fd, double close later).
+        if (self.recv_buf.len == 0) {
+            const a = self.alloc orelse return error.NoAllocator;
+            self.recv_buf = try a.alloc(u8, RECV_BUF_SIZE);
+        }
+
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
 
@@ -77,12 +86,6 @@ pub const IpcClient = struct {
         self.recv_consumed = 0;
         self.send_start = 0;
         self.send_list.clearRetainingCapacity();
-
-        // The wire sees whole frames; the receive buffer must hold one.
-        if (self.recv_buf.len == 0) {
-            const a = self.alloc orelse return error.NoAllocator;
-            self.recv_buf = try a.alloc(u8, RECV_BUF_SIZE);
-        }
     }
 
     /// Close the IPC connection.
@@ -360,4 +363,28 @@ test "IpcClient: close resets state" {
     try std.testing.expect(!client.connected);
     try std.testing.expectEqual(@as(posix.fd_t, -1), client.fd);
     try std.testing.expectEqual(@as(usize, 0), client.recv_len);
+}
+
+test "IpcClient: connect failure before adoption leaves no dangling fd" {
+    // A live listener lets connect() succeed; the client has no allocator
+    // and no preset recv buffer, so the buffer allocation fails. The fd
+    // must not be adopted before that allocation: the old order left
+    // self.fd naming a descriptor the errdefer had already closed, and the
+    // next close() would double-close whatever reused the number.
+    const path = "/tmp/xmppd-test-ipc-noalloc.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    const lfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    var addr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+    addr.family = posix.AF.UNIX;
+    @memcpy(addr.path[0..path.len], path);
+    try posix.bind(lfd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un));
+    try posix.listen(lfd, 4);
+
+    var client = IpcClient{}; // alloc = null, recv_buf empty
+    try std.testing.expectError(error.NoAllocator, client.connect(path));
+    try std.testing.expectEqual(@as(posix.fd_t, -1), client.fd);
+    try std.testing.expect(!client.connected);
 }
