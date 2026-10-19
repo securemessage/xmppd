@@ -110,8 +110,15 @@ const SM_EXPIRY_TIMER_IDENT = LISTENER_UDATA - 4;
 /// Timer ident for auth-IPC reconnect retries.
 const AUTH_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 5;
 
+/// Timer ident for retrying offline drains stalled on a store error (S13).
+const OFFLINE_RETRY_TIMER_IDENT = LISTENER_UDATA - 6;
+
 /// Interval for SM detached session expiry sweep (milliseconds).
 const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
+
+/// Interval for retrying stalled offline drains (S13). Shorter than the SM
+/// sweep because a held tail is user-visible latency, not a reap deadline.
+const OFFLINE_RETRY_SWEEP_MS: u32 = 5_000;
 
 /// Auth-IPC reconnect backoff (milliseconds). One-shot timer, re-armed on
 /// failure — constant pacing is deliberate: the auth daemon restarts in
@@ -363,6 +370,12 @@ pub const Session = struct {
     /// messages to this session are held in the offline store so they
     /// cannot overtake the tail.
     offline_pending: bool = false,
+    /// S13: consecutive offline-drain stalls caused by a store error rather
+    /// than a full send buffer. A stalled drain with an empty write buffer
+    /// has no EVFILT_WRITE left to wake it, so it stages one prompt retry;
+    /// this bounds those retries so a persistently failing store cannot spin
+    /// the event loop. Past the cap the periodic sweep owns the retry.
+    offline_store_stalls: u8 = 0,
     /// T178: set when the unacked queue overflowed (oldest stanza evicted).
     /// XEP-0198 has no gap signaling, so the session must be failed —
     /// reaped by session_lifecycle.reapSmOverflow at the end of the event
@@ -523,6 +536,13 @@ pub const Server = struct {
     /// session. A real `upgradeToTls` failure needs `SSL_new` to run out of
     /// memory, so no test can arrange one otherwise. Never set in production.
     fail_next_tls_upgrade: bool = false,
+
+    /// Test seam (S13): when set, the next offline drain fails its archive
+    /// read instead of fetching, which exercises the stall path that must
+    /// re-arm the drain. A real archive read error needs a failing storage
+    /// backend, so no test can arrange one otherwise. Never set in
+    /// production.
+    fail_next_offline_archive_read: bool = false,
 
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
@@ -1075,6 +1095,9 @@ pub const Server = struct {
         // Register periodic timer for SM resume expiry sweep
         try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
 
+        // Register periodic retry for offline drains stalled on a store error
+        try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+
         // Auth daemon not connected at boot (standalone run or it crashed
         // before we came up): arm the reconnect timer (T243).
         if (!self.ipc.connected and self.authIpcPath() != null) {
@@ -1138,6 +1161,8 @@ pub const Server = struct {
                     .timer => |t| {
                         if (t.ident == SM_EXPIRY_TIMER_IDENT) {
                             session_lifecycle.expireDetachedSessions(self, &changes);
+                        } else if (t.ident == OFFLINE_RETRY_TIMER_IDENT) {
+                            session_lifecycle.retryStalledOfflineDrains(self, &changes);
                         } else if (t.ident == AUTH_RECONNECT_TIMER_IDENT) {
                             self.tryAuthReconnect(&changes);
                         }
@@ -5439,6 +5464,268 @@ test "Server: S13 message held behind a draining offline tail" {
     const held = try arch_store.getMessage(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
     try std.testing.expect(held != null);
     if (held) |h| allocator.free(h);
+}
+
+// S13: a message stored offline for an absent recipient points at an archive
+// row that may still be sitting in the async writer queue. The payload is
+// stored with the pointer, so the drain delivers it even when the archive row
+// was never committed.
+test "Server: S13 offline store delivers without a committed archive row" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // bob has no session at all, so alice's message goes to offline storage.
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "o1";
+    const body = "<body>for later</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+
+    // The pointer resolves from its own held payload, with no archive row.
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    try std.testing.expect(held != null);
+    if (held) |h| {
+        try std.testing.expect(std.mem.indexOf(u8, h, "<body>for later</body>") != null);
+        allocator.free(h);
+    }
+
+    // bob comes online: the drain delivers it and clears the queue.
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(fds[0], 7, "localhost", false, allocator);
+    bob.stream.state = .active;
+    bob.stream.authenticated = true;
+    bob.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[7] = bob;
+    server.free_count -= 1;
+
+    session_lifecycle.deliverOfflineMessages(&server, bob, "bob", "localhost", &changes);
+
+    _ = bob.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>for later</body>") != null);
+    try std.testing.expect(!bob.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
+// S13: the writable handler must resume a stalled offline drain once the
+// send buffer drops to the low-water mark. Without this the tail waits for
+// the next presence stanza or a reconnect.
+test "Server: S13 writable handler resumes the stalled offline drain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    // server.deinit() tears down every live session slot.
+
+    // The offline tail bob never received.
+    try arch_store.store("bob@localhost", "alice@localhost", "t1", 1001, "<message from='alice@localhost' to='bob@localhost' id='t1'><body>tail</body></message>");
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "t1", 1001);
+    session.offline_pending = true;
+
+    // Backlog already in the send buffer, above the low-water mark, so the
+    // first writable pass cannot yet resume the drain. Goes through the
+    // blessed stanza path so the S15 raw-send ratchet is unaffected.
+    var filler: [12000]u8 = undefined;
+    @memset(&filler, 'f');
+    try session.queueSendStanza(&filler);
+
+    // Collect every byte that reaches the peer across all writable passes so
+    // ordering can be checked at the end.
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+    var buf: [65536]u8 = undefined;
+
+    // Keep taking writable passes until the tail is actually on the wire: the
+    // drain queues it, but flushing a full send buffer takes several rounds.
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        changes.reset();
+        server.handleWritable(1, &changes);
+        while (true) {
+            const n = posix.read(fds[1], &buf) catch break;
+            if (n == 0) break;
+            try wire.appendSlice(allocator, buf[0..n]);
+        }
+        if (!session.offline_pending and !session.conn.hasPendingWrite()) break;
+    }
+
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+
+    // The tail goes out behind the backlog, never ahead of it.
+    const filler_at = std.mem.indexOf(u8, wire.items, "ffff");
+    const tail_at = std.mem.indexOf(u8, wire.items, "<body>tail</body>");
+    try std.testing.expect(filler_at != null);
+    try std.testing.expect(tail_at != null);
+    try std.testing.expect(filler_at.? < tail_at.?);
+}
+
+// S13: when the offline queue is at quota the held copy cannot be stored.
+// Dropping it silently lost the message, so the sender must be told.
+test "Server: S13 hold at quota bounces instead of dropping silently" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // Fill bob's offline queue to MAX_PER_USER so the hold is refused.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
+        const stored = try offline_store.storePointer("bob@localhost", "carol@localhost", sid, 100 + @as(u64, @intCast(i)));
+        try std.testing.expect(stored);
+    }
+
+    // bob is online but his offline tail is still draining.
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.offline_pending = true;
+    server.sessions[5] = target;
+
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>bounced</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // The sender gets a service-unavailable error rather than silence.
+    _ = alice.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(alice_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "id='m1'") != null);
+
+    // Nothing was held: the queue is still exactly at quota.
+    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
+
+    // bob got nothing out of order.
+    _ = target.conn.flushSend() catch {};
+    var tbuf: [4096]u8 = undefined;
+    const tn = posix.read(target_fds[1], &tbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), tn);
 }
 
 test "S14: failed cross-worker resource does not block local delivery" {

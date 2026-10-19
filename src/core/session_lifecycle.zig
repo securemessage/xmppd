@@ -486,32 +486,49 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     const count = store.countMessages(bare_jid) catch return;
     if (count == 0) return;
 
-    const pointers = store.getPointers(bare_jid) catch return;
+    const pointers = store.getPointers(bare_jid) catch |err| {
+        stallOnStoreError(session, bare_jid, err, changes);
+        return;
+    };
     defer store.freePointers(pointers);
 
     var delivered: usize = 0;
     var completed = true;
     for (pointers) |ptr| {
-        const stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
-            // Transient store failure: stop the drain and retry when the
-            // writable handler fires again. Continuing would deliver later
-            // messages ahead of this one, and the old code skipped it on
-            // every pass forever (S13).
-            log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(err) });
-            session.offline_pending = true;
-            completed = false;
-            break;
+        // The held copy comes first. A message parked behind a draining tail
+        // (S13) points at an archive row that the async writer queue may not
+        // have committed yet, and reading the archive alone would see a
+        // dangling pointer and destroy a stanza that is still on its way.
+        var stanza_xml = store.getHeldStanza(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+            log.warn("offline delivery to {s} stalled: getHeldStanza failed: {s}", .{ bare_jid, @errorName(err) });
+            stallOnStoreError(session, bare_jid, err, changes);
+            return;
         };
+        if (stanza_xml == null) {
+            if (server.fail_next_offline_archive_read) {
+                server.fail_next_offline_archive_read = false;
+                log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(error.StorageError) });
+                stallOnStoreError(session, bare_jid, error.StorageError, changes);
+                return;
+            }
+            stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+                // Transient store failure: stop the drain and retry. Continuing
+                // would deliver later messages ahead of this one, and skipping
+                // it would retry the same pointer on every pass forever.
+                log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(err) });
+                stallOnStoreError(session, bare_jid, err, changes);
+                return;
+            };
+        }
         if (stanza_xml) |xml_data| {
             defer server.allocator.free(xml_data);
             session.queueSendStanza(xml_data) catch {
                 // Send buffer full: stop here and let the writable handler
-                // drain the tail at the low-water mark (S13). This message
-                // and the rest stay in the store. Deleting them anyway
-                // used to lose the whole backlog past the first
-                // buffer-full.
+                // drain the tail at the low-water mark. This message and the
+                // rest stay in the store, so nothing is lost.
                 log.warn("offline delivery to {s} paused at {d}/{d} messages (send buffer full)", .{ bare_jid, delivered, pointers.len });
                 session.offline_pending = true;
+                session.offline_store_stalls = 0;
                 completed = false;
                 break;
             };
@@ -521,21 +538,75 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             };
             delivered += 1;
         } else {
-            // The archive entry is gone; a dangling pointer would stall
-            // every future drain, so drop it.
+            // Neither copy exists: the archive entry is genuinely gone. A
+            // dangling pointer would stall every future drain, so drop it.
             store.deletePointer(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
                 log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
             };
         }
     }
 
-    if (completed) session.offline_pending = false;
+    if (completed) {
+        session.offline_pending = false;
+        session.offline_store_stalls = 0;
+    }
 
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
+}
+
+/// Bounded prompt retries for an offline drain stalled on a store error.
+/// Beyond this the periodic sweep retries, so a persistently failing store
+/// cannot spin the event loop.
+const OFFLINE_STALL_RETRY_MAX: u8 = 8;
+
+/// Mark the drain stalled after a store error and make sure something will
+/// retry it. A buffer-full stall leaves data in the write buffer, so
+/// EVFILT_WRITE fires again; a store error with an empty buffer leaves
+/// nothing armed and the tail would sit undelivered until the next presence
+/// stanza or reconnect.
+fn stallOnStoreError(
+    session: *Session,
+    bare_jid: []const u8,
+    err: anyerror,
+    changes: *ChangeList,
+) void {
+    session.offline_pending = true;
+    if (session.offline_store_stalls < std.math.maxInt(u8)) {
+        session.offline_store_stalls += 1;
+    }
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        return;
+    }
+    if (session.offline_store_stalls > OFFLINE_STALL_RETRY_MAX) {
+        log.warn("offline delivery to {s} stalled {d} times on {s}; leaving it to the periodic retry", .{
+            bare_jid, session.offline_store_stalls, @errorName(err),
+        });
+        return;
+    }
+    // One-shot so the retry is a single prompt attempt, not a level-triggered
+    // wake that fires on every loop pass while the store stays broken.
+    changes.addWriteOnce(session.conn.fd, session.conn.id) catch {};
+}
+
+/// S13: retry offline drains that exhausted their prompt-retry budget. A
+/// drain stalled on a store error with an empty write buffer has no
+/// EVFILT_WRITE left to wake it, so this sweep is the only thing that can
+/// resume it without waiting for the next presence stanza or reconnect.
+pub fn retryStalledOfflineDrains(server: *Server, changes: *ChangeList) void {
+    if (server.offline == null) return;
+    for (server.sessions) |slot| {
+        const session = slot orelse continue;
+        if (!session.offline_pending) continue;
+        if (session.offline_store_stalls == 0) continue;
+        if (session.conn.isClosed()) continue;
+        session.offline_store_stalls = 0;
+        drainOfflinePending(server, session, changes);
+    }
 }
 
 /// S13: continue a stalled offline drain once the connection's write
@@ -598,7 +669,6 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
     server.sessions[id] = session;
     return session;
 }
-
 
 // T158 regression test: SM detach timer (300s) must expire sessions correctly —
 // not early (which would kill resumable sessions) and not late/never (memory leak).
@@ -1015,4 +1085,227 @@ test "S19: startup loader loads more than 256 persistent rooms" {
         const owned = room_registry_mod.roomOwner(jid, worker_count) == worker_id;
         try std.testing.expectEqual(owned, reg.findByJid(jid) != null);
     }
+}
+
+// S13: a message parked behind a draining tail points at an archive row the
+// async writer queue may not have committed yet. Reading the archive alone
+// saw a dangling pointer and deleted it, destroying the stanza. The held copy
+// is stored with the pointer, so the drain delivers it regardless.
+test "S13: held stanza is delivered before the archive row is committed" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so delivered bytes can be read back.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // The stanza exists only as a held copy: no archive row was ever written.
+    const held = "<message from='alice@localhost' to='bob@localhost' id='h1'><body>held</body></message>";
+    const ok = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "h1", 2000, held);
+    try std.testing.expect(ok);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const got = buf[0..n];
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "<body>held</body>") != null);
+    try std.testing.expect(!session.offline_pending);
+    // The held payload goes with the pointer, or the row leaks forever.
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    const still_held = try offline_store.getHeldStanza("bob@localhost", 2000, "h1");
+    try std.testing.expect(still_held == null);
+    if (still_held) |h| allocator.free(h);
+}
+
+// S13: a drain that stalls on a store error with an empty write buffer has no
+// EVFILT_WRITE left to wake it, so it must stage its own retry. Without this
+// the tail sat undelivered until the next presence stanza or reconnect.
+test "S13: store-error stall with an empty buffer re-arms the drain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so delivered bytes can be read back.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    try arch_store.store("bob@localhost", "alice@localhost", "s1", 1001, "<message from='alice@localhost' to='bob@localhost' id='s1'><body>hi</body></message>");
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
+
+    server.fail_next_offline_archive_read = true;
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // Still pending, and the pointer survives for the retry.
+    try std.testing.expect(session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // Nothing else can wake this session, so the drain armed its own retry.
+    var armed = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
+        if (ev.filter != std.c.EVFILT.WRITE) continue;
+        if ((ev.flags & std.c.EV.ONESHOT) == 0) continue;
+        if (ev.udata != 1) continue;
+        armed = true;
+    }
+    try std.testing.expect(armed);
+
+    // The retry delivers once the store recovers.
+    changes.reset();
+    drainOfflinePending(&server, session, &changes);
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>hi</body>") != null);
+}
+
+// S13: the prompt retries are bounded so a persistently failing store cannot
+// spin the event loop; the periodic sweep owns retries after that.
+test "S13: store-error retries are bounded, then the sweep resumes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so delivered bytes can be read back.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    try arch_store.store("bob@localhost", "alice@localhost", "s1", 1001, "<message from='alice@localhost' to='bob@localhost' id='s1'><body>hi</body></message>");
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
+
+    var stalls: usize = 0;
+    while (stalls < 40) : (stalls += 1) {
+        server.fail_next_offline_archive_read = true;
+        changes.reset();
+        deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+        var armed = false;
+        for (changes.slice()) |ev| {
+            if (ev.filter == std.c.EVFILT.WRITE and (ev.flags & std.c.EV.ONESHOT) != 0) armed = true;
+        }
+        if (!armed) break;
+    }
+
+    // Bounded: the retry budget ran out well before the loop cap.
+    try std.testing.expect(stalls == OFFLINE_STALL_RETRY_MAX);
+    try std.testing.expect(session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+
+    // The sweep clears the stall counter and delivers once the store works.
+    retryStalledOfflineDrains(&server, &changes);
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
 }

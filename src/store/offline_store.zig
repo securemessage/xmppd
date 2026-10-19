@@ -24,6 +24,12 @@ const MAX_KEY_LEN = 511;
 
 const NS_OFFLINE = "offline";
 
+/// Held stanza payloads, keyed exactly like an offline pointer. A message
+/// parked behind a draining tail (S13) stores its stanza here so the drain
+/// reads it back without depending on the archive row, which the async
+/// writer queue may not have committed yet.
+const NS_OFFLINE_HOLD = "offline_hold";
+
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;
 
@@ -74,6 +80,49 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             return true;
         }
 
+        /// Store a delivery pointer together with the stanza payload it
+        /// delivers. Use this when the payload may not be readable from the
+        /// archive yet: a message held behind a draining tail (S13) points at
+        /// a row the async writer queue has only been asked to commit.
+        /// Returns false if the user's queue is full, and then stores nothing.
+        pub fn storeHeldPointer(
+            self: *Self,
+            recipient: []const u8,
+            from_jid: []const u8,
+            stanza_id: []const u8,
+            timestamp: u64,
+            stanza_xml: []const u8,
+        ) !bool {
+            const count = try self.countMessages(recipient);
+            if (count >= MAX_PER_USER) return false;
+
+            const key = try self.buildKey(recipient, timestamp, stanza_id);
+            defer self.allocator.free(key);
+
+            // Payload first, pointer second: nothing reads a payload except
+            // through its pointer. If the pointer write fails the payload is
+            // removed again, so a failed store cannot leak an unreachable row.
+            try self.db.put(NS_OFFLINE_HOLD, key, stanza_xml);
+            self.db.put(NS_OFFLINE, key, from_jid) catch |err| {
+                self.db.delete(NS_OFFLINE_HOLD, key) catch {};
+                return err;
+            };
+            return true;
+        }
+
+        /// Read back a payload stored by `storeHeldPointer`. Null when this
+        /// pointer carries no held copy.
+        pub fn getHeldStanza(
+            self: *Self,
+            recipient: []const u8,
+            timestamp: u64,
+            stanza_id: []const u8,
+        ) !?[]u8 {
+            const key = try self.buildKey(recipient, timestamp, stanza_id);
+            defer self.allocator.free(key);
+            return self.db.get(self.allocator, NS_OFFLINE_HOLD, key);
+        }
+
         /// Count pending offline messages for a recipient.
         pub fn countMessages(self: *Self, recipient: []const u8) !usize {
             const prefix = try self.buildRecipientPrefix(recipient);
@@ -118,6 +167,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         }
 
         /// Delete a specific offline pointer after successful delivery.
+        /// Also drops any held payload stored with it.
         pub fn deletePointer(
             self: *Self,
             recipient: []const u8,
@@ -126,6 +176,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         ) !void {
             const key = try self.buildKey(recipient, timestamp, stanza_id);
             defer self.allocator.free(key);
+            try self.db.delete(NS_OFFLINE_HOLD, key);
             try self.db.delete(NS_OFFLINE, key);
         }
 
@@ -152,6 +203,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
             var batch = try self.db.writeBatch();
             for (keys.items) |k| {
+                try batch.delete(NS_OFFLINE_HOLD, k);
                 try batch.delete(NS_OFFLINE, k);
             }
             try batch.commit();
@@ -306,4 +358,86 @@ test "OfflineStore: S4 over-long recipient is rejected with KeyTooLong" {
     var long_recipient: [600]u8 = undefined;
     @memset(&long_recipient, 'a');
     try std.testing.expectError(error.KeyTooLong, store.storePointer(&long_recipient, "bob@localhost", "s1", 1));
+}
+
+// S13: the payload stored alongside a pointer is what the drain reads when
+// the archive row is not committed yet, so it must survive round-trips and be
+// removed with the pointer it belongs to.
+test "GenericOfflineStore: held payload round-trips and is deleted with its pointer" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    const stanza = "<message from='alice@example.com' to='bob@example.com'><body>held</body></message>";
+    try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "h1", 1000, stanza));
+
+    // The pointer and its payload are both readable.
+    try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@example.com"));
+    const got = try store.getHeldStanza("bob@example.com", 1000, "h1");
+    try std.testing.expect(got != null);
+    if (got) |g| {
+        try std.testing.expectEqualStrings(stanza, g);
+        allocator.free(g);
+    }
+
+    // Deleting the pointer deletes the payload with it.
+    try store.deletePointer("bob@example.com", 1000, "h1");
+    try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@example.com"));
+    try std.testing.expect(try store.getHeldStanza("bob@example.com", 1000, "h1") == null);
+
+    // clearAll drops held payloads too, or they leak unreachable rows.
+    try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "h2", 2000, stanza));
+    try std.testing.expect(try store.storeHeldPointer("bob@example.com", "carol@example.com/d", "h3", 3000, stanza));
+    try store.clearAll("bob@example.com");
+    try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@example.com"));
+    try std.testing.expect(try store.getHeldStanza("bob@example.com", 2000, "h2") == null);
+    try std.testing.expect(try store.getHeldStanza("bob@example.com", 3000, "h3") == null);
+}
+
+// S13: a pointer written by the older storePointer path carries no payload, so
+// getHeldStanza must report null and let the caller fall back to the archive.
+test "GenericOfflineStore: pointer-only entry has no held payload" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    try std.testing.expect(try store.storePointer("bob@example.com", "alice@example.com/d", "p1", 1000));
+    try std.testing.expect(try store.getHeldStanza("bob@example.com", 1000, "p1") == null);
+}
+
+// S13: the held pointer honors the same per-user quota as a plain pointer, and
+// stores nothing when it refuses. The caller bounces instead of dropping.
+test "GenericOfflineStore: held pointer honors the per-user quota" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
+        try std.testing.expect(try store.storePointer("bob@example.com", "alice@example.com/d", sid, 1000 + @as(u64, @intCast(i))));
+    }
+    try std.testing.expectEqual(@as(usize, 100), try store.countMessages("bob@example.com"));
+
+    // At quota: refused, and no payload is left behind.
+    try std.testing.expect(!(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "over", 9000, "<message/>")));
+    try std.testing.expectEqual(@as(usize, 100), try store.countMessages("bob@example.com"));
+    try std.testing.expect(try store.getHeldStanza("bob@example.com", 9000, "over") == null);
+}
+
+test "OfflineStore: S4 over-long recipient is rejected with KeyTooLong on the held path" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, std.testing.allocator);
+
+    var long_recipient: [600]u8 = undefined;
+    @memset(&long_recipient, 'a');
+    try std.testing.expectError(error.KeyTooLong, store.storeHeldPointer(&long_recipient, "bob@localhost", "s1", 1, "<message/>"));
 }
