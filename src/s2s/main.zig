@@ -121,6 +121,12 @@ pub const S2sDaemon = struct {
     /// served locally even though it is a different domain.
     muc_host: ?[]const u8 = null,
 
+    /// Test seam (T277 review regression): when set, performOutboundDane
+    /// applies this verdict without a TLSA query or chain verification, so
+    /// the DANE-failed teardown path can run without live DNS and TLS.
+    /// Always null in production.
+    dane_verdict_override: ?connector_mod.DaneStatus = null,
+
     /// Inbound listener port.
     listener_port: u16 = 5269,
 
@@ -2063,6 +2069,16 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 
 /// Perform DANE verification after outbound TLS handshake.
 fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
+    // Test seam: a forced verdict skips the live TLSA query and chain
+    // verification (T277 review regression rig); production leaves it null.
+    if (daemon.dane_verdict_override) |verdict| {
+        conn.setDaneResult(verdict);
+        if (conn.isFailed()) {
+            daemon.closeOutbound(batch, slot);
+        }
+        return;
+    }
+
     const dane_mod = @import("dane.zig");
 
     // Query TLSA records for the target host/port
@@ -2784,6 +2800,127 @@ fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeL
         .self_closing = true,
     };
     processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+// --- T277 review regression rig: real TLS handshake over loopback ----------
+
+/// Self-signed throwaway cert for "localhost" via the openssl CLI (no key
+/// material in the tree). error.SkipZigTest when the tool is missing.
+fn genS2sTestCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .cwd_dir = dir,
+        .max_output_bytes = 4096,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Connected non-blocking TCP loopback pair (AF_UNIX socketpairs do not
+/// enforce SO_SNDBUF on FreeBSD).
+fn makeS2sTestTcpPair() ![2]posix.fd_t {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return error.SocketFailed;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return error.BindFailed;
+    posix.listen(listen_fd, 1) catch return error.ListenFailed;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return error.GetSockNameFailed;
+
+    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch return error.SocketFailed;
+    errdefer posix.close(client_fd);
+    posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
+        error.WouldBlock => {},
+        else => return error.ConnectFailed,
+    };
+    const server_fd = posix.accept(listen_fd, null, null, posix.SOCK.NONBLOCK) catch return error.AcceptFailed;
+    errdefer posix.close(server_fd);
+    return .{ client_fd, server_fd };
+}
+
+test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277 review)" {
+    // Poison-on-free makes any post-closeOutbound read of the conn visible.
+    // The caller must consult the slot table (daemon.outbound[slot]); the
+    // pre-fix code read conn.isFailed() after performOutboundDane had freed
+    // it. The verdict override is the test seam; everything else is the
+    // real handshake-complete path.
+    var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
+    const alloc = pf.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genS2sTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    // kTLS stays off on both ends: two kTLS peers over lo0 hit FreeBSD
+    // PR 296498 (EBADMSG). This rig is entirely userland TLS.
+    var server_ctx = try SslContext.initServer(cert_path, key_path);
+    defer server_ctx.deinit();
+    server_ctx.disableKtls();
+    var client_ctx = try SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls();
+
+    const fds = try makeS2sTestTcpPair();
+    var peer = try SslConn.init(server_ctx, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+        posix.close(fds[1]);
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0]; // conn.deinit closes it via closeOutbound below
+    conn.tls_conn = try SslConn.initClient(client_ctx, fds[0], "localhost");
+    conn.tls_state = .handshake_want_read;
+    conn.state = .tls_handshake;
+
+    const reader = try alloc.create(XmlReader);
+    reader.* = XmlReader.init(alloc);
+    daemon.outbound_readers[7] = reader; // closeOutbound frees it
+    daemon.outbound[7] = conn;
+
+    // Complete the handshake on both ends, then run the real post-handshake
+    // path with the DANE verdict forced to failed.
+    var c_done = false;
+    var p_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while ((!c_done or !p_done) and std.time.milliTimestamp() < deadline) {
+        if (!c_done) c_done = try conn.continueHandshake();
+        if (!p_done) p_done = (try peer.doHandshake()) == .complete;
+    }
+    try std.testing.expect(c_done and p_done);
+    try std.testing.expect(conn.tls_state == .established);
+
+    daemon.dane_verdict_override = .failed;
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    continueOutboundTls(&daemon, &cl, 7, conn);
+
+    // Teardown went through the slot table, and the freed conn chunk is
+    // poison-filled: the pre-fix conn.isFailed() read would have touched
+    // 0xA5 memory (invalid enum) and buildStreamOpen a wild pointer.
+    try std.testing.expect(daemon.outbound[7] == null);
+    const state_byte: *const u8 = @ptrCast(&conn.state);
+    try std.testing.expectEqual(@as(u8, 0xA5), state_byte.*);
 }
 
 /// An established callback connection on a socketpair: db:verify is written
