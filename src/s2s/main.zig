@@ -1699,18 +1699,6 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 daemon.closeOutbound(batch, slot);
                 return;
             };
-            // A <proceed/>-response that was queued behind a partial flush:
-            // upgrade only now that the plaintext buffer is empty (T250).
-            if (conn.tls_upgrade_pending) {
-                if (!conn.hasPendingWrite()) {
-                    conn.tls_upgrade_pending = false;
-                    conn.state = .tls_handshake;
-                    startOutboundTls(daemon, batch, slot, conn);
-                } else {
-                    batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
-                }
-                return;
-            }
             // T275 review: resume a kept stanza tail on the writable edge
             // even when no new stanza arrives; an idle link stranded it.
             if (conn.state == .established and !conn.hasPendingWrite() and conn.pendingCount() > 0) {
@@ -1767,9 +1755,8 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
         // Connection may have been closed
         if (daemon.outbound[slot] == null) return;
 
-        // After STARTTLS, stop processing pre-TLS buffer — also while the
-        // upgrade pends behind an unflushed buffer (T250).
-        if (conn.isTlsHandshaking() or conn.tls_upgrade_pending) break;
+        // After STARTTLS, stop processing pre-TLS buffer (T250).
+        if (conn.isTlsHandshaking()) break;
     }
 
     // Mark consumed bytes
@@ -1777,7 +1764,7 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
 
     // STARTTLS read-ahead hygiene (T250): plaintext past <proceed/> means
     // the remote spoke before we started TLS — protocol violation, close.
-    if ((conn.isTlsHandshaking() or conn.tls_upgrade_pending) and conn.read_start < conn.read_end) {
+    if (conn.isTlsHandshaking() and conn.read_start < conn.read_end) {
         log.warn("outbound to {s}: {d} plaintext bytes after <proceed/> — policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
         conn.fail("policy-violation");
         daemon.closeOutbound(batch, slot);
@@ -2990,6 +2977,30 @@ test "S2sDaemon: stanza from unauthenticated domain on established session is re
     };
     processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
     try std.testing.expect(daemon.getInbound(2) != null);
+}
+
+test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the stream (T250 review)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // A <proceed/> is parked behind a partial flush; the peer speaks anyway.
+    // Well-formed XML on purpose: without the guard it parses as an ignored
+    // event and the session stays open.
+    in1.session.tls_upgrade_pending = true;
+    _ = try posix.write(in1.peer_fd, "<message to='juliet@us.example'/>");
+
+    handleInboundReadable(&daemon, &cl, 1);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "policy-violation") != null);
 }
 
 test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2 review)" {

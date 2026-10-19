@@ -136,10 +136,6 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
-    /// STARTTLS proceed received but our own write buffer had not drained:
-    /// the handshake starts when handleOutboundWritable finishes flushing
-    /// (T250).
-    tls_upgrade_pending: bool = false,
     /// Pending dialback callbacks awaiting a verdict (S2 review). One entry
     /// per (stream id, origin): a later db:result for the same origin no
     /// longer overwrites another session's callback.
@@ -837,13 +833,23 @@ test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the
     conn.tcpConnected();
     conn.state = .starttls_negotiation;
 
-    // Queue the <starttls/> request... under backpressure something lingers.
+    // Queue the <starttls/> request...
     var buf: [2048]u8 = undefined;
     const msg = try conn.buildStarttls(&buf);
     try conn.queueWrite(msg);
 
-    // And bytes that were queued AFTER <starttls/> (the protocol error).
-    try conn.queueWrite("<message to='them.example'><body>oops</body></message>");
+    // ...and a tail queued AFTER <starttls/> (the protocol error), big
+    // enough that the flush below cannot drain it into the tiny send
+    // buffer (T250 review: the old test never flushed, so the guard was
+    // only checked against bytes nothing had tried to send).
+    const tail = try alloc.alloc(u8, 8192);
+    defer alloc.free(tail);
+    @memset(tail, 'x');
+    try conn.queueWrite(tail);
+
+    // A real flush under backpressure: part goes out, the tail lingers.
+    const flushed_all = try conn.flushWrite();
+    try std.testing.expect(!flushed_all);
     try std.testing.expect(conn.hasPendingWrite());
 
     // <proceed/> arrives: the connection must fail, no upgrade begins.
