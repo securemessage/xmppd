@@ -681,17 +681,26 @@ fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
 /// Write a child PID file for orphan detection on restart. Contents: a
 /// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
 /// kinfo_proc. (T259 review: run_dir-scoped, failures are logged.)
+/// The child's kernel-reported start time in seconds, or null when the pid
+/// has no kinfo. writeChildPid records 0 for null; a stored 0 never matches
+/// a live process's ki_start, so the orphan-kill identity check spares it.
+fn childStartSec(pid: posix.pid_t) ?i64 {
+    var kp: KinfoProc = undefined;
+    if (!lookupKinfoProc(pid, &kp)) return null;
+    return kp.ki_start.tv_sec;
+}
+
 fn writeChildPid(path: []const u8, pid: posix.pid_t, base: []const u8) void {
     const file = std.fs.cwd().createFile(path, .{}) catch |err| {
         log.err("writeChildPid {s}: {}", .{ path, err });
         return;
     };
     defer file.close();
-    var start_sec: i64 = 0;
-    {
-        var kp: KinfoProc = undefined;
-        if (lookupKinfoProc(pid, &kp)) start_sec = kp.ki_start.tv_sec;
+    const start_opt = childStartSec(pid);
+    if (start_opt == null) {
+        log.warn("writeChildPid {s}: no kinfo for pid {d}; recording start 0", .{ path, pid });
     }
+    const start_sec = start_opt orelse 0;
     var buf: [80]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d} {d} {s}\n", .{ pid, start_sec, base }) catch return;
     file.writeAll(s) catch |err| log.err("writeChildPid write {s}: {}", .{ path, err });
@@ -945,6 +954,13 @@ fn lookupKinfoProcChecked(pid: posix.pid_t) bool {
 
 test "lookupKinfoProc returns false for a pid that does not exist" {
     try std.testing.expect(!lookupKinfoProcChecked(-1));
+}
+
+test "childStartSec: live pid has a start time; a dead pid returns null (T259 review)" {
+    // writeChildPid must not silently store start 0 for a pid it cannot
+    // look up; the null return is what makes the warn path reachable.
+    try std.testing.expect(childStartSec(std.c.getpid()) != null);
+    try std.testing.expect(childStartSec(-1) == null);
 }
 
 test "pidFilePath builds run_dir-relative path" {
