@@ -1082,7 +1082,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
         .element_start => |elem| {
             // If accumulating a stanza, serialize child elements into inner buffer
             if (session.stanza_active) {
-                session.accumulateElement(elem);
+                session.accumulateElement(elem, reader);
                 return;
             }
 

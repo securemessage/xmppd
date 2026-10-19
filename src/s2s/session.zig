@@ -618,9 +618,11 @@ pub const S2sSession = struct {
     /// Accumulate a child element opening tag into the stanza inner buffer.
     /// Namespace declarations carry peer-owned syntax like any other attr:
     /// they are re-emitted (S1 review: `<received xmlns='urn:xmpp:receipts'/>`
-    /// used to lose the xmlns entirely). The reader has already resolved the
-    /// binding by parse time; we just need to say it back out.
-    pub fn accumulateElement(self: *S2sSession, elem: xml.Element) void {
+    /// used to lose the xmlns entirely). A prefixed attribute re-emits its
+    /// prefix binding too, resolved through the reader's namespace stack;
+    /// without it the forwarded element references an undeclared prefix.
+    /// `reader` may be null in unit rigs, which then skips prefix bindings.
+    pub fn accumulateElement(self: *S2sSession, elem: xml.Element, reader: ?*const xml.Reader) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
         w.writeByte('<') catch return self.markOverflow();
@@ -636,7 +638,32 @@ pub const S2sSession = struct {
             xmlEscapeWrite(w, elem.namespace_uri) catch return self.markOverflow();
             w.writeByte('\'') catch return self.markOverflow();
         }
+        // Attribute prefixes declared once per element: duplicate xmlns:p on
+        // one tag would be a duplicate XML attribute.
+        var declared: [8][]const u8 = undefined;
+        var declared_n: usize = 0;
         for (elem.attributes) |attr| {
+            if (attr.prefix.len > 0 and
+                !std.mem.eql(u8, attr.prefix, "xml") and
+                !std.mem.eql(u8, attr.prefix, "xmlns"))
+            {
+                var seen = elem.prefix.len > 0 and std.mem.eql(u8, elem.prefix, attr.prefix);
+                for (declared[0..declared_n]) |p| {
+                    if (std.mem.eql(u8, p, attr.prefix)) seen = true;
+                }
+                const uri = if (reader) |r| r.resolveNamespace(attr.prefix) else "";
+                if (!seen and uri.len > 0) {
+                    if (declared_n < declared.len) {
+                        declared[declared_n] = attr.prefix;
+                        declared_n += 1;
+                    }
+                    w.writeAll(" xmlns:") catch return self.markOverflow();
+                    w.writeAll(attr.prefix) catch return self.markOverflow();
+                    w.writeAll("='") catch return self.markOverflow();
+                    xmlEscapeWrite(w, uri) catch return self.markOverflow();
+                    w.writeByte('\'') catch return self.markOverflow();
+                }
+            }
             w.writeByte(' ') catch return self.markOverflow();
             w.writeAll(attr.name) catch return self.markOverflow();
             w.writeAll("='") catch return self.markOverflow();
@@ -659,12 +686,14 @@ pub const S2sSession = struct {
     }
 
     /// Accumulate a child element close tag into the stanza inner buffer.
+    /// An overflow marks the stanza broken so it is dropped, never forwarded
+    /// unbalanced (S1 review).
     pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeAll("</") catch return;
-        w.writeAll(name) catch return;
-        w.writeByte('>') catch return;
+        w.writeAll("</") catch return self.markOverflow();
+        w.writeAll(name) catch return self.markOverflow();
+        w.writeByte('>') catch return self.markOverflow();
         self.stanza_inner_len += fbs.pos;
     }
 
@@ -1182,7 +1211,7 @@ test "S2sSession: xmlns declarations on nested elements are preserved (S1 review
         .namespace_uri = "urn:xmpp:receipts",
         .attributes = &.{},
         .self_closing = true,
-    });
+    }, null);
     session.accumulateClose("message");
     const inner = session.getStanzaInner();
     try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns='urn:xmpp:receipts'") != null);
@@ -1217,4 +1246,63 @@ test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1 r
 
     session.resetStanza();
     try std.testing.expect(!session.stanzaBroken());
+}
+
+test "S2sSession: accumulateClose overflow marks the stanza broken (S1 review)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{},
+        .self_closing = false,
+    });
+    // Fill the inner buffer so only one byte of headroom is left: the close
+    // tag cannot fit and must mark the stanza broken, not return silently
+    // (before the fix an unbalanced stanza forwarded). 'x' does not escape,
+    // so the fill is byte-exact.
+    const fill = session.stanza_inner_buf.len - session.stanza_inner_len - 1;
+    var body: [16384]u8 = undefined;
+    @memset(body[0..fill], 'x');
+    session.accumulateText(body[0..fill]);
+    try std.testing.expectEqual(fill, session.stanza_inner_len);
+    try std.testing.expect(!session.stanzaBroken());
+    session.accumulateClose("message");
+    try std.testing.expect(session.stanzaBroken());
+}
+
+test "S2sSession: prefixed attributes keep their prefix declaration (S1 review)" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // Drive a real reader so the namespace stack holds the binding.
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const input = "<message xmlns='jabber:server' xmlns:ext='urn:ext'><child ext:a='b' plain='c'/></message>";
+    var pos: usize = 0;
+
+    // Root element: the stanza start.
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    // Child with the prefixed attribute.
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    // The prefix declaration is re-emitted next to the prefixed attribute.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:ext'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:a='b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "plain='c'") != null);
+
+    var buf: [2048]u8 = undefined;
+    const out = try session.buildStanzaXml(&buf);
+    // The forwarded stanza is self-contained: the declaration is inside it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "xmlns:ext='urn:ext'") != null);
 }
