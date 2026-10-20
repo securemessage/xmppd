@@ -1497,7 +1497,12 @@ pub const Server = struct {
                 const event = session.reader.next(data, &pos) catch |err| {
                     // Client-side protocol violation, not a server fault.
                     log.warn("connection {d} XML parse error: {}", .{ id, err });
-                    self.sendStreamError(session, .not_well_formed);
+                    // An overlong token is a resource limit the peer hit, not
+                    // malformed XML (S11).
+                    self.sendStreamError(session, if (err == error.TokenTooLong)
+                        .policy_violation
+                    else
+                        .not_well_formed);
                     // Flush the error and closing tag before teardown.
                     session.conn.flushSync();
                     session_lifecycle.forceCloseSession(self, id, changes);

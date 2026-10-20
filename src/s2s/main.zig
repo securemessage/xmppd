@@ -838,7 +838,12 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     while (true) {
         const event = reader.next(data, &pos) catch |err| {
             log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            sendStreamError(session, .not_well_formed);
+            // An overlong token is a resource limit the peer hit, not malformed
+            // XML (S11).
+            sendStreamError(session, if (err == error.TokenTooLong)
+                .policy_violation
+            else
+                .not_well_formed);
             if (session.hasPendingWrite()) {
                 batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
             }

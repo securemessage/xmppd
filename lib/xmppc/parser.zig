@@ -779,7 +779,12 @@ pub const Parser = struct {
         // The span includes the opening '<' only when the scanner chained
         // from the previous tag in one read; after (possibly swallowed)
         // whitespace it starts at the tag name and the '<' is restored here.
-        if (self.cur_span) |s| {
+        // Inter-stanza whitespace the scanner skips still sits in this span
+        // ahead of the tag (pos advanced past it without a token), so trim it
+        // first: it is not part of the stanza's wire bytes.
+        if (self.cur_span) |span| {
+            var s = span;
+            while (s.len > 0 and (s[0] == ' ' or s[0] == '\t' or s[0] == '\n' or s[0] == '\r')) s = s[1..];
             if (s.len > 0 and s[0] != '<') self.st_raw.append(self.allocator, '<') catch {};
             self.st_raw.appendSlice(self.allocator, s) catch {};
         }

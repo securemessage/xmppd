@@ -913,7 +913,7 @@ test "reader: S11 stray close tag at stream level is not-well-formed" {
     }
 }
 
-test "reader: S11 inter-stanza whitespace is not copied into the arena" {
+test "reader: S11 inter-stanza whitespace is skipped, not accumulated" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);
     defer reader.deinit();
@@ -922,25 +922,103 @@ test "reader: S11 inter-stanza whitespace is not copied into the arena" {
     const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
         "<presence/>" ++ padding ++ "<presence/>";
     var pos: usize = 0;
-    var text_len: usize = 0;
-    while (true) {
-        const ev = reader.next(input, &pos) catch return error.UnexpectedError;
-        if (ev == null) return error.ExpectedText;
-        switch (ev.?) {
-            // Inter-stanza text is forwarded but never arena-copied (S11).
-            // Stop before the next element_open, which resets (and shrinks)
-            // the arena.
-            .text => |t| {
-                text_len += t.len;
-                break;
+    var presences: usize = 0;
+    // Whitespace between stanzas never becomes a token, so neither the reader
+    // arena nor the scanner's own token buffers grow with its length (S11).
+    while (reader.next(input, &pos) catch return error.UnexpectedError) |ev| {
+        switch (ev) {
+            .text => return error.ExpectedNoWhitespaceText,
+            .element_start => |el| {
+                if (std.mem.eql(u8, el.local_name, "presence")) presences += 1;
             },
             else => {},
         }
     }
-    try std.testing.expect(text_len >= padding.len);
+    try std.testing.expectEqual(@as(usize, 2), presences);
+    try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
+    try std.testing.expect(reader.scan.buf.capacity <= scanner.max_token_retain);
+    try std.testing.expect(reader.scan.token_arena.queryCapacity() <= scanner.max_token_arena_retain);
+}
+
+test "reader: S11 an overlong text run is a hard error, not unbounded growth" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    const head = "<message><body>";
+    const run = try allocator.alloc(u8, scanner.max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+    const input = try std.mem.concat(allocator, u8, &.{ head, run });
+    defer allocator.free(input);
+
+    pos = 0;
+    while (true) {
+        _ = reader.next(input, &pos) catch |err| {
+            try std.testing.expectEqual(error.TokenTooLong, err);
+            // Nothing above the cap was ever retained for the stream.
+            try std.testing.expect(reader.scan.buf.capacity <= scanner.max_token_retain);
+            return;
+        };
+        if (pos >= input.len) break;
+    }
+    return error.ExpectedTokenTooLong;
+}
+
+test "reader: S11 2 MiB of inter-stanza whitespace pins no buffer" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+    try drainAll(&reader, "<presence/>");
+
+    // The peer never sends the next '<', so no stanza boundary ever arrives to
+    // reset anything. This used to pin 2.87 MB on the connection.
+    const ws = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(ws);
+    @memset(ws, ' ');
+    pos = 0;
+    while (pos < ws.len) {
+        if (try reader.next(ws, &pos)) |ev| switch (ev) {
+            .text => return error.ExpectedNoWhitespaceText,
+            else => return error.ExpectedNoEvent,
+        };
+    }
+    try std.testing.expect(reader.scan.buf.capacity <= scanner.max_token_retain);
+    try std.testing.expect(reader.scan.token_arena.queryCapacity() <= scanner.max_token_arena_retain);
     try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
 }
 
+test "reader: S11 the scanner token arena stays flat over a long stream" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+    var pos: usize = 0;
+    _ = try reader.next(stream_open, &pos);
+
+    const stanza = "<message id='m1' from='a@b/c'><body>payload</body></message>";
+    pos = 0;
+    while (try reader.next(stanza, &pos)) |_| {}
+    const cap_after_first = reader.scan.token_arena.queryCapacity();
+    try std.testing.expect(cap_after_first > 0);
+
+    for (0..20_000) |_| {
+        pos = 0;
+        while (try reader.next(stanza, &pos)) |_| {}
+    }
+    // The reader arena already stays flat; the scanner arena behind it must too.
+    try std.testing.expectEqual(cap_after_first, reader.scan.token_arena.queryCapacity());
+    try std.testing.expect(cap_after_first <= scanner.max_token_arena_retain);
+}
 
 test "reader: S26 one giant stanza does not inflate the arena for the stream" {
     const allocator = std.testing.allocator;
@@ -982,7 +1060,6 @@ test "reader: S11 comments are rejected as restricted XML" {
         if (ev == null) return error.ExpectedError;
     }
 }
-
 
 test "reader: event spans never overshoot the segment end under adversarial splits" {
     const allocator = std.testing.allocator;

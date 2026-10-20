@@ -68,6 +68,20 @@ const State = enum {
     entity_attr,
 };
 
+/// Ceiling on one scanner token: an element or attribute name, an attribute
+/// value, or a text run. Without it a peer can make the server allocate
+/// without limit for a stanza it never finishes (S11). Overshoot is at most
+/// one decoded entity, which appends up to four bytes.
+pub const max_token_bytes = 512 * 1024;
+
+/// Capacity the token buffers keep after an oversized token is consumed, so
+/// one large stanza cannot pin its buffer for the life of the connection.
+pub const max_token_retain = 4 * 1024;
+
+/// Capacity the token arena keeps across a per-stanza reset, matching the
+/// reader's own retain limit (S26).
+pub const max_token_arena_retain = 64 * 1024;
+
 /// Streaming XML scanner for XMPP streams.
 ///
 /// Designed for XMPP's streaming model where `<stream:stream>` is opened
@@ -75,6 +89,11 @@ const State = enum {
 /// bytes are fed in.
 pub const Scanner = struct {
     state: State = .content,
+    /// Element nesting depth, counted the same way the reader counts it: 0
+    /// outside the stream root, 1 between stanzas, 2+ inside a stanza. It
+    /// exists so inter-stanza whitespace is never accumulated and so the
+    /// token arena can be reset at each stanza boundary (S11).
+    depth: u32 = 0,
     buf: std.ArrayList(u8) = .{},
     /// Secondary buffer for attribute values
     val_buf: std.ArrayList(u8) = .{},
@@ -109,14 +128,17 @@ pub const Scanner = struct {
     }
 
     /// Reset the arena between logical processing units to prevent unbounded growth.
+    /// Retained capacity is bounded so one oversized token cannot pin a large
+    /// buffer for the life of the connection (S11).
     pub fn resetArena(self: *Scanner) void {
-        _ = self.token_arena.reset(.retain_capacity);
+        _ = self.token_arena.reset(.{ .retain_with_limit = max_token_arena_retain });
     }
 
     /// Full reset for stream restart (e.g., after STARTTLS or SASL success).
     /// Clears all accumulated state so the scanner can parse a fresh XML stream.
     pub fn reset(self: *Scanner) void {
         self.state = .content;
+        self.depth = 0;
         self.buf.clearRetainingCapacity();
         self.val_buf.clearRetainingCapacity();
         self.ent_buf.clearRetainingCapacity();
@@ -134,7 +156,25 @@ pub const Scanner = struct {
 
     /// Feed bytes into the scanner and extract the next token.
     /// Returns null if more data is needed.
+    ///
+    /// Every token passes through here on its way out, which is the one place
+    /// `depth` is maintained (S11).
     pub fn next(self: *Scanner, input: []const u8, pos: *usize) !?Token {
+        const token = try self.nextToken(input, pos) orelse return null;
+        switch (token.type) {
+            .element_open_end => self.depth += 1,
+            // Opens and closes in one token, so the net depth change is zero,
+            // matching the reader's own bookkeeping.
+            .element_self_close => {},
+            .element_close => {
+                if (self.depth > 0) self.depth -= 1;
+            },
+            else => {},
+        }
+        return token;
+    }
+
+    fn nextToken(self: *Scanner, input: []const u8, pos: *usize) !?Token {
         // If we have pending tokens, return them first
         if (self.pending.items.len > 0) {
             const token = self.pending.orderedRemove(0);
@@ -150,6 +190,13 @@ pub const Scanner = struct {
             switch (self.state) {
                 .content => {
                     if (c == '<') {
+                        // Stanza boundary. Every token of the previous stanza
+                        // has been consumed by now: the reader dupes each one
+                        // into its own arena, and the one exception, forwarded
+                        // inter-stanza text, is consumed before the next call.
+                        // The token arena dies here with a bounded retain so a
+                        // long-lived stream does not accumulate tokens (S11).
+                        if (self.depth <= 1) self.resetArena();
                         if (self.buf.items.len > 0) {
                             // Emit text token
                             const text = try self.dupeAndClear(&self.buf);
@@ -164,7 +211,13 @@ pub const Scanner = struct {
                         // Entity reference in text content
                         self.state = .entity_content;
                     } else {
-                        try self.buf.append(a, c);
+                        // Whitespace between stanzas is never accumulated: a
+                        // peer must not be able to grow the buffer without
+                        // bound by never sending the next '<' (S11). A run
+                        // that already holds non-whitespace content keeps its
+                        // trailing spaces so text is not corrupted.
+                        if (self.depth <= 1 and self.buf.items.len == 0 and isSpace(c)) continue;
+                        try self.appendCapped(&self.buf, c);
                     }
                 },
                 .tag_start => {
@@ -177,7 +230,7 @@ pub const Scanner = struct {
                         // DOCTYPE, ENTITY, CDATA are forbidden in XMPP (RFC 6120 §11.1).
                         self.state = .bang_start;
                     } else {
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                         self.state = .tag_name;
                     }
                 },
@@ -216,10 +269,10 @@ pub const Scanner = struct {
                     } else {
                         if (self.saw_slash) {
                             // Wasn't a self-close, put slash back
-                            try self.buf.append(a, '/');
+                            try self.appendCapped(&self.buf, '/');
                             self.saw_slash = false;
                         }
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                     }
                 },
                 .tag_attributes => {
@@ -238,7 +291,7 @@ pub const Scanner = struct {
                     } else {
                         // Start of attribute name
                         self.saw_slash = false;
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                         self.state = .attr_name;
                     }
                 },
@@ -251,7 +304,7 @@ pub const Scanner = struct {
                         // into the attribute name.
                         self.state = .attr_name_ws;
                     } else {
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                     }
                 },
                 .attr_name_ws => {
@@ -311,7 +364,7 @@ pub const Scanner = struct {
                         // accumulated in ent_buf instead.
                         self.state = .entity_attr;
                     } else {
-                        try self.val_buf.append(a, c);
+                        try self.appendCapped(&self.val_buf, c);
                     }
                 },
                 .close_tag_name => {
@@ -327,7 +380,7 @@ pub const Scanner = struct {
                             .local_name = parsed.local,
                         };
                     } else {
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                     }
                 },
                 .xml_decl => {
@@ -341,13 +394,13 @@ pub const Scanner = struct {
                         return Token{ .type = .xml_declaration };
                     } else {
                         self.saw_slash = false;
-                        try self.buf.append(a, c);
+                        try self.appendCapped(&self.buf, c);
                     }
                 },
                 .bang_start => {
                     // After `<!`: comments, DOCTYPE, ENTITY and CDATA are all
                     // forbidden in XMPP (RFC 6120 §11.1 restricted XML).
-                    try self.buf.append(a, c);
+                    try self.appendCapped(&self.buf, c);
                     if (self.buf.items.len == 2) {
                         return error.ForbiddenXmlConstruct;
                     }
@@ -384,10 +437,37 @@ pub const Scanner = struct {
         return null; // Need more data
     }
 
+    /// Append one byte to a token buffer, enforcing max_token_bytes. The
+    /// ceiling bounds what a peer can make the server allocate for a token it
+    /// never terminates (S11).
+    fn appendCapped(self: *Scanner, list: *std.ArrayList(u8), byte: u8) !void {
+        if (list.items.len >= max_token_bytes) {
+            // Rejecting the token must not leave its bytes pinned either.
+            self.releaseTokenBuf(list);
+            return error.TokenTooLong;
+        }
+        try list.append(self.allocator, byte);
+    }
+
+    fn isSpace(c: u8) bool {
+        return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+    }
+
+    /// Drop the token's bytes and release capacity above max_token_retain, so
+    /// one oversized token does not pin its buffer for the life of the
+    /// connection. The shrink runs while the length still exceeds the limit:
+    /// shrinkAndFree requires the new length to fit the current one.
+    fn releaseTokenBuf(self: *Scanner, list: *std.ArrayList(u8)) void {
+        if (list.items.len > max_token_retain) {
+            list.shrinkAndFree(self.allocator, max_token_retain);
+        }
+        list.clearRetainingCapacity();
+    }
+
     fn dupeAndClear(self: *Scanner, list: *std.ArrayList(u8)) ![]const u8 {
         const arena_alloc = self.token_arena.allocator();
         const result = try arena_alloc.dupe(u8, list.items);
-        list.clearRetainingCapacity();
+        self.releaseTokenBuf(list);
         return result;
     }
 
@@ -865,3 +945,142 @@ test "S21: numeric char refs are strict digits, leading zeros allowed" {
     try std.testing.expectEqualStrings("AA", text.name);
 }
 
+// --- S11: token size cap and inter-stanza growth ---
+
+/// Feed `input` to a fresh scanner and return the first error, or null if it
+/// parsed cleanly.
+fn scanExpectingError(allocator: std.mem.Allocator, input: []const u8) ?anyerror {
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+    var pos: usize = 0;
+    while (pos < input.len) {
+        _ = scanner.next(input, &pos) catch |err| return err;
+    }
+    return null;
+}
+
+test "S11: an overlong text run is rejected instead of growing without limit" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    // Text sits inside an element so it is stanza content, not skippable
+    // inter-stanza whitespace.
+    const prefix = "<message><body>";
+    const input = try std.mem.concat(allocator, u8, &.{ prefix, run, "</body></message>" });
+    defer allocator.free(input);
+
+    try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
+}
+
+test "S11: a text run exactly at the cap still parses" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    const prefix = "<message><body>";
+    const input = try std.mem.concat(allocator, u8, &.{ prefix, run, "</body></message>" });
+    defer allocator.free(input);
+
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+    var pos: usize = 0;
+    var text: ?Token = null;
+    while (pos < input.len) {
+        const token = try scanner.next(input, &pos) orelse break;
+        if (token.type == .text) text = token;
+    }
+    try std.testing.expect(text != null);
+    try std.testing.expectEqual(@as(usize, max_token_bytes), text.?.name.len);
+}
+
+test "S11: an overlong attribute value is rejected" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    const input = try std.mem.concat(allocator, u8, &.{ "<message to='", run, "'/>" });
+    defer allocator.free(input);
+
+    try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
+}
+
+test "S11: an overlong element name is rejected" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    const input = try std.mem.concat(allocator, u8, &.{ "<", run, ">" });
+    defer allocator.free(input);
+
+    try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
+}
+
+test "S11: 2 MiB of inter-stanza whitespace does not grow the token buffers" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    var pos: usize = 0;
+    _ = try scanner.next("<stream:stream>", &pos);
+    _ = try scanner.next("<presence/>", &pos);
+    try std.testing.expectEqual(@as(u32, 1), scanner.depth);
+
+    // Whitespace a peer streams between stanzas without ever sending the next
+    // '<' used to accumulate in buf for the life of the connection.
+    const ws = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(ws);
+    @memset(ws, ' ');
+    pos = 0;
+    var saw_text = false;
+    while (pos < ws.len) {
+        const token = try scanner.next(ws, &pos) orelse continue;
+        if (token.type == .text) saw_text = true;
+    }
+    try std.testing.expect(!saw_text);
+    try std.testing.expect(scanner.buf.items.len == 0);
+    try std.testing.expect(scanner.buf.capacity <= max_token_retain);
+}
+
+test "S11: whitespace inside a stanza is preserved" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    // Skipping is scoped to the stanza level only; message content must keep
+    // its spaces or a stanza is silently rewritten.
+    const input = "<message><body> a b </body></message>";
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const token = try scanner.next(input, &pos) orelse break;
+        if (token.type == .text) {
+            try std.testing.expectEqualStrings(" a b ", token.name);
+            return;
+        }
+    }
+    return error.ExpectedText;
+}
+
+test "S11: the token arena stays bounded over many stanzas" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    var pos: usize = 0;
+    _ = try scanner.next("<stream:stream>", &pos);
+
+    const stanza = "<message id='m1'><body>payload</body></message>";
+    for (0..2_000) |_| {
+        pos = 0;
+        while (pos < stanza.len) {
+            _ = try scanner.next(stanza, &pos) orelse break;
+        }
+    }
+    // Every token of a stanza is duped out of this arena, so it dies at the
+    // next stanza boundary instead of growing for the life of the stream.
+    try std.testing.expect(scanner.token_arena.queryCapacity() <= max_token_arena_retain);
+}
