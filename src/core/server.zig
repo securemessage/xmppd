@@ -670,6 +670,11 @@ pub const Server = struct {
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
+    /// Stale per-session events skipped because the session was detached or
+    /// closed after kevent returned this batch (S28). Counted and logged at
+    /// debug so a regression here is visible instead of silent.
+    stale_event_skips: u64 = 0,
+
     /// SM-ID → session slot index map for O(1) resume lookup (T127, S17).
     /// AutoHashMapUnmanaged: the old fixed 64-entry open-addressing table
     /// silently failed inserts when full and broke probe chains on remove
@@ -1209,58 +1214,7 @@ pub const Server = struct {
                 }
             }
 
-            for (events) |ev| {
-                switch (ev) {
-                    .fd_readable => |e| {
-                        if (e.udata == LISTENER_UDATA) {
-                            session_lifecycle.acceptConnections(self, &changes);
-                        } else if (e.udata == IPC_AUTH_UDATA) {
-                            self.handleIpcReadable(&changes);
-                        } else if (e.udata == IPC_S2S_UDATA) {
-                            self.handleS2sIpcReadable(&changes);
-                        } else if (e.udata == WAKE_PIPE_UDATA) {
-                            // Already handled in first pass
-                        } else {
-                            self.handleReadableOrHandshake(e.udata, &changes);
-                        }
-                    },
-                    .fd_writable => |e| {
-                        if (e.udata == IPC_AUTH_UDATA) {
-                            self.flushIpc(&changes);
-                        } else if (e.udata == IPC_S2S_UDATA) {
-                            self.flushS2sIpc(&changes);
-                        } else {
-                            self.handleWritableOrHandshake(e.udata, &changes);
-                        }
-                    },
-                    .signal => |s| {
-                        if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
-                            self.running = false;
-                        }
-                    },
-                    .timer => |t| {
-                        if (t.ident == SM_EXPIRY_TIMER_IDENT) {
-                            session_lifecycle.expireDetachedSessions(self, &changes);
-                        } else if (t.ident == OFFLINE_RETRY_TIMER_IDENT) {
-                            session_lifecycle.retryStalledOfflineDrains(self, &changes);
-                        } else if (t.ident == AUTH_RECONNECT_TIMER_IDENT) {
-                            self.tryAuthReconnect(&changes);
-                        } else if (t.ident == S2S_RECONNECT_TIMER_IDENT) {
-                            self.tryS2sReconnect(&changes);
-                        }
-                    },
-                    .fd_error => |e| {
-                        if (e.udata == IPC_AUTH_UDATA) {
-                            self.dropIpcAuth(&changes);
-                        } else if (e.udata == IPC_S2S_UDATA) {
-                            self.dropS2sIpc(&changes);
-                        } else if (e.udata != LISTENER_UDATA and e.udata != WAKE_PIPE_UDATA) {
-                            session_lifecycle.closeSession(self, e.udata, &changes);
-                        }
-                    },
-                    else => {},
-                }
-            }
+            self.dispatchEvents(events, &changes);
 
             // Drain pending fan-outs (bounded continuation — one batch per slot per tick)
             if (self.fanout_queue.hasPending()) {
@@ -1337,6 +1291,86 @@ pub const Server = struct {
         self.handleWritable(id, changes);
     }
 
+    /// Route one batch of kqueue events to their handlers. The wake pipe is
+    /// drained before this, in a separate pass, so cross-thread deliveries
+    /// land ahead of any session-closing event in the same batch.
+    fn dispatchEvents(self: *Server, events: []const Event, changes: *ChangeList) void {
+        for (events) |ev| {
+            switch (ev) {
+                .fd_readable => |e| {
+                    if (e.udata == LISTENER_UDATA) {
+                        session_lifecycle.acceptConnections(self, changes);
+                    } else if (e.udata == IPC_AUTH_UDATA) {
+                        self.handleIpcReadable(changes);
+                    } else if (e.udata == IPC_S2S_UDATA) {
+                        self.handleS2sIpcReadable(changes);
+                    } else if (e.udata == WAKE_PIPE_UDATA) {
+                        // Already handled in the first pass
+                    } else {
+                        self.handleReadableOrHandshake(e.udata, changes);
+                    }
+                },
+                .fd_writable => |e| {
+                    if (e.udata == IPC_AUTH_UDATA) {
+                        self.flushIpc(changes);
+                    } else if (e.udata == IPC_S2S_UDATA) {
+                        self.flushS2sIpc(changes);
+                    } else {
+                        self.handleWritableOrHandshake(e.udata, changes);
+                    }
+                },
+                .signal => |s| {
+                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
+                        self.running = false;
+                    }
+                },
+                .timer => |t| {
+                    if (t.ident == SM_EXPIRY_TIMER_IDENT) {
+                        session_lifecycle.expireDetachedSessions(self, changes);
+                    } else if (t.ident == OFFLINE_RETRY_TIMER_IDENT) {
+                        session_lifecycle.retryStalledOfflineDrains(self, changes);
+                    } else if (t.ident == AUTH_RECONNECT_TIMER_IDENT) {
+                        self.tryAuthReconnect(changes);
+                    } else if (t.ident == S2S_RECONNECT_TIMER_IDENT) {
+                        self.tryS2sReconnect(changes);
+                    }
+                },
+                .fd_error => |e| {
+                    if (e.udata == IPC_AUTH_UDATA) {
+                        self.dropIpcAuth(changes);
+                    } else if (e.udata == IPC_S2S_UDATA) {
+                        self.dropS2sIpc(changes);
+                    } else if (e.udata != LISTENER_UDATA and e.udata != WAKE_PIPE_UDATA) {
+                        self.handleSessionError(e.udata, changes);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// True when a session's fd is gone but the session still exists: it was
+    /// detached for SM resume, or closed, after kevent returned this batch.
+    /// Such an event is stale; acting on it drives flushSend/recv against fd
+    /// -1, and the resulting error used to destroy a resumable session (S28).
+    fn isStaleSessionEvent(session: *Session) bool {
+        return session.sm_detached or session.conn.isClosed();
+    }
+
+    /// kqueue reported an error on a session fd (EV_ERROR / EV_EOF with an
+    /// error). Detached or already-closed sessions are skipped for the same
+    /// reason as a stale readable/writable event (S28).
+    fn handleSessionError(self: *Server, id: usize, changes: *ChangeList) void {
+        if (id >= self.sessions.len) return;
+        const session = self.sessions[id] orelse return;
+        if (isStaleSessionEvent(session)) {
+            self.stale_event_skips += 1;
+            log.debug("connection {d} stale error event on a detached or closed session, skipped", .{id});
+            return;
+        }
+        session_lifecycle.closeSession(self, id, changes);
+    }
+
     fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes: *ChangeList) void {
         const complete = session.conn.continueHandshake() catch {
             log.err("connection {d} TLS handshake failed", .{id});
@@ -1404,6 +1438,11 @@ pub const Server = struct {
     /// recv() produces at most 8KB of XML regardless of element count.
     fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+        if (isStaleSessionEvent(session)) {
+            self.stale_event_skips += 1;
+            log.debug("connection {d} stale readable event on a detached or closed session, skipped", .{id});
+            return;
+        }
 
         while (true) {
             // Read from socket (or OpenSSL's internal buffer via tls.read)
@@ -3223,10 +3262,19 @@ pub const Server = struct {
 
     fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+        if (isStaleSessionEvent(session)) {
+            self.stale_event_skips += 1;
+            log.debug("connection {d} stale writable event on a detached or closed session, skipped", .{id});
+            return;
+        }
 
         _ = session.conn.flushSend() catch |err| {
             switch (err) {
                 error.WouldBlock => return,
+                // The fd is already gone, so there is nothing to flush and
+                // nothing to close: tearing the session down here destroyed a
+                // resumable one (S28).
+                error.ConnectionClosed => return,
                 else => {
                     session_lifecycle.closeSession(self, id, changes);
                     return;
@@ -5030,6 +5078,158 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     try std.testing.expect(session.conn.isTlsHandshaking());
 }
 
+test "Server: S28 stale writable event does not destroy a detached session" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    defer {
+        if (server.sessions[1]) |s| {
+            server.sessions[1] = null;
+            s.deinit();
+            std.testing.allocator.destroy(s);
+        }
+    }
+
+    // Bytes still buffered: this is the state an SM detach leaves behind, and
+    // hasPendingWrite() reporting true here is what armed EVFILT_WRITE.
+    // fillWriteBuffer rather than a raw conn.queueSend, which the S15 ratchet
+    // deliberately rejects outside its allowlist.
+    try std.testing.expect(fillWriteBuffer(session));
+    try std.testing.expect(session.conn.write_end > session.conn.write_start);
+
+    // Detach for SM resume: purge the fd, close it, keep the session.
+    session.sm_resume_enabled = true;
+    session.sm_detached = true;
+    session.sm_detach_time = std.time.timestamp();
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const sm_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    @memcpy(&session.sm_id, sm_id);
+    server.detached_count = 1;
+    server.smIdMapInsert(&session.sm_id, 1);
+    session.conn.close();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), session.conn.fd);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // The stale event kevent already returned this batch, for the fd that no
+    // longer exists.
+    server.handleWritable(1, &changes);
+
+    // The resumable session survives, and the skip was counted rather than
+    // silently swallowed.
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(server.sessions[1].?.sm_detached);
+    try std.testing.expectEqual(@as(u64, 1), server.stale_event_skips);
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+
+    // Same for a stale readable event and a stale error event.
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expectEqual(@as(u64, 2), server.stale_event_skips);
+
+    server.handleSessionError(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(server.sessions[1].?.sm_detached);
+    try std.testing.expectEqual(@as(u64, 3), server.stale_event_skips);
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+}
+
+test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
+    // The real shape of the bug: kevent returns readable and writable for a
+    // session fd, the session detaches for SM resume before that batch is
+    // dispatched, and the stale events reach the handlers anyway.
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    defer {
+        if (server.sessions[1]) |s| {
+            server.sessions[1] = null;
+            s.deinit();
+            std.testing.allocator.destroy(s);
+        }
+    }
+
+    // Arm both filters on the production event loop.
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try changes.addRead(session.conn.fd, 1);
+    try changes.addWrite(session.conn.fd, 1);
+
+    // Peer data makes the fd readable; a full write buffer keeps it pending.
+    _ = try posix.write(fds[1], "<presence/>");
+    try std.testing.expect(fillWriteBuffer(session));
+
+    const events = try server.loop.submitAndPoll(changes.slice(), 1000);
+    changes.reset();
+    try std.testing.expect(events.len > 0);
+
+    // The race window: detach after kevent returned, before dispatch.
+    session.sm_resume_enabled = true;
+    session.sm_detached = true;
+    session.sm_detach_time = std.time.timestamp();
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const sm_id = "b2c3d4e5f60718293a4b5c6d7e8f9001";
+    @memcpy(&session.sm_id, sm_id);
+    server.detached_count = 1;
+    server.smIdMapInsert(&session.sm_id, 1);
+    changes.purgeFd(session.conn.fd);
+    session.conn.close();
+
+    server.dispatchEvents(events, &changes);
+
+    // The session is still there and still resumable, and the stale events
+    // were counted rather than acted on.
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(server.sessions[1].?.sm_detached);
+    try std.testing.expect(server.detached_count == 1);
+    try std.testing.expect(server.stale_event_skips > 0);
+    // A resume can still find it by SM-ID: the stale events left the map alone.
+    try std.testing.expectEqual(@as(?usize, 1), server.findDetachedSession(&session.sm_id));
+}
+
+test "Server: S28 a stale writable event on a closed live session is skipped" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    defer {
+        if (server.sessions[1]) |s| {
+            server.sessions[1] = null;
+            s.deinit();
+            std.testing.allocator.destroy(s);
+        }
+    }
+
+    // Not detached, but closed: the fd is already gone.
+    session.conn.close();
+    try std.testing.expect(!session.sm_detached);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleWritable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expectEqual(@as(u64, 1), server.stale_event_skips);
+}
+
 test "Server: T215 failed deferred upgrade does not touch the freed session" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -5452,7 +5652,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     // here. The pattern is split so this test does not match itself.
     const needle = "conn.queue" ++ "Send(";
     const cases = .{
-        .{ "connection.zig", @embedFile("connection.zig"), 13 }, // Connection layer self-tests; no Session.
+        .{ "connection.zig", @embedFile("connection.zig"), 14 }, // Connection layer self-tests; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.

@@ -259,11 +259,20 @@ pub const Connection = struct {
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {
+        // A closed connection has no writable fd, so any bytes still in the
+        // buffer are undeliverable, not pending. Callers arm EVFILT_WRITE on
+        // this, and an SM-detached session keeps its buffer while its fd is
+        // gone; reporting it as pending made a stale same-batch writable event
+        // reach flushSend(-1), whose error closed a session that was still
+        // resumable (S28).
+        if (self.closed) return false;
         return self.write_start < self.write_end;
     }
 
     /// Bytes currently buffered for writing (T110 backpressure thresholds).
+    /// Zero once closed: there is no fd left to drain them to (S28).
     pub fn pendingWriteBytes(self: *const Connection) usize {
+        if (self.closed) return 0;
         return self.write_end - self.write_start;
     }
 
@@ -275,7 +284,12 @@ pub const Connection = struct {
     /// ## Errors
     /// - `error.WouldBlock` — socket send buffer is full, try again later
     /// - `error.ConnectionReset` — peer reset the connection
+    /// - `error.ConnectionClosed` - the fd is already closed (S28)
     pub fn flushSend(self: *Connection) !usize {
+        // Nothing to do on a closed fd. posix.write(-1) would fail EBADF and
+        // be reported as ConnectionReset, which drives the caller to close a
+        // session that may still be resumable.
+        if (self.closed) return error.ConnectionClosed;
         if (!self.hasPendingWrite()) return 0;
 
         if (self.tls_conn) |*tls| {
@@ -591,6 +605,32 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
     // Critically, the rejected data must not leave the connection looking
     // writable — callers gate `changes.addWrite(conn.fd, ..)` on this.
     try std.testing.expect(!conn.hasPendingWrite());
+}
+
+test "Connection: a closed connection with a full buffer is not pending (S28)" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend("<message><body>still buffered</body></message>");
+    try std.testing.expect(conn.hasPendingWrite());
+    try std.testing.expect(conn.pendingWriteBytes() > 0);
+
+    // An SM-detached session keeps its write buffer while its fd is gone.
+    conn.close();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+
+    // There is no fd to drain those bytes to, so they are not pending.
+    // Reporting them as pending is what armed EVFILT_WRITE on fd -1 and drove
+    // flushSend to destroy a resumable session.
+    try std.testing.expect(!conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingWriteBytes());
+
+    // Flushing says so explicitly rather than surfacing EBADF as a reset.
+    try std.testing.expectError(error.ConnectionClosed, conn.flushSend());
+
+    // The buffered bytes are untouched: a resume still has them if it wants.
+    try std.testing.expect(conn.write_end > conn.write_start);
 }
 
 test "Connection: flushSync on a dead descriptor returns instead of spinning" {
