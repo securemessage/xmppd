@@ -166,16 +166,25 @@ pub fn handleMucGroupchat(
     fw.writeAll(sender.getNick()) catch return;
     const from_str = from_fbs.getWritten();
 
-    // Build pre-built stanza: prefix (before recipient JID) + suffix (after)
-    var prefix_buf: [512]u8 = undefined;
+    // Build pre-built stanza: prefix (before recipient JID) + suffix (after).
+    // The suffix is bounded to what the fan-out queue can park, so a stanza is
+    // never too long to queue after being delivered live.
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_buf: [16500]u8 = undefined;
-    const suffix_len = fanout.buildSuffix(&suffix_buf, id_str, inner_xml) orelse return;
+    var suffix_lease = server.leaseByteScratch() orelse return;
+    defer suffix_lease.release();
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], id_str, inner_xml) orelse return;
     const prefix = prefix_buf[0..prefix_len];
-    const suffix = suffix_buf[0..suffix_len];
+    const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast: one MPSC enqueue per remote worker (not per occupant)
     server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // One delivery buffer reused for every local occupant. Leased from the
+    // per-worker pool instead of taken per delivery so the fan-out loop does
+    // not add a 20 KiB frame per recipient (S18).
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
 
     // Local fan-out: deliver to occupants on this worker (bounded continuation)
     const batch_size = server.fanout_queue.batch_size;
@@ -190,7 +199,7 @@ pub fn handleMucGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -215,13 +224,13 @@ pub fn handleMucGroupchat(
             @memcpy(pf.room_jid_buf[0..room_jid.len], room_jid);
             pf.room_jid_len = @intCast(room_jid.len);
             @memcpy(pf.prefix_buf[0..prefix_len], prefix);
-            pf.prefix_len = prefix_len;
+            pf.prefix_len = @intCast(prefix_len);
             @memcpy(pf.suffix_buf[0..suffix_len], suffix);
-            pf.suffix_len = suffix_len;
+            pf.suffix_len = @intCast(suffix_len);
             pf.next_slot = resume_slot;
             log.debug("queued fan-out continuation for {s} from slot {d}", .{ room_jid, resume_slot });
         } else {
-            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+            deliverRemainingSync(server, room, resume_slot, deliver_lease.buf, prefix, suffix, changes);
         }
     }
 
@@ -230,8 +239,12 @@ pub fn handleMucGroupchat(
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (id_str.len > 0) id_str else "muc";
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
-        var arch_buf: [17200]u8 = undefined;
-        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        // The fan-out above has finished, so its buffer is given back first
+        // rather than held across the archive build.
+        deliver_lease.release();
+        var arch_lease = server.leaseByteScratch() orelse return;
+        defer arch_lease.release();
+        var arch_fbs = std.io.fixedBufferStream(arch_lease.buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
         xml.escapeWrite(aw, from_str) catch return;
@@ -272,6 +285,13 @@ pub fn drainPendingFanout(
     const suffix = pf.getSuffix();
     var delivered: u8 = 0;
 
+    // One delivery buffer reused across the batch (S18).
+    var deliver_lease = server.leaseByteScratch() orelse {
+        pf.complete();
+        return true;
+    };
+    defer deliver_lease.release();
+
     // Continuation only handles local occupants — multicast was sent in initial call
     var i: usize = pf.next_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
@@ -281,7 +301,7 @@ pub fn drainPendingFanout(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -308,6 +328,7 @@ fn deliverRemainingSync(
     server: *Server,
     room: *const Room,
     start_slot: u8,
+    buf: []u8,
     prefix: []const u8,
     suffix: []const u8,
     changes: *ChangeList,
@@ -321,7 +342,7 @@ fn deliverRemainingSync(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
     }
 }
 
@@ -1315,6 +1336,10 @@ fn broadcastOccupantJoin(
     s110w.writeAll("'/><status code='110'/></x></presence>") catch return;
     const suffix_110 = suffix_110_fbs.getWritten();
 
+    // One delivery buffer reused for every occupant (S18).
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
+
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
@@ -1322,7 +1347,7 @@ fn broadcastOccupantJoin(
         const target = server.sessions[occ.session_id] orelse continue;
 
         const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
     }
 }
 
@@ -1364,6 +1389,13 @@ fn broadcastOccupantLeave(
     // Multicast to remote workers
     server.deliverMulticastToWorkers(room, prefix, suffix);
 
+    // One delivery buffer reused for the whole function: each delivery copies,
+    // so the stanza built for one occupant is dead before the next is built
+    // (S18). The self-delivery below uses it too, and the suffixes it reads
+    // live in small stack buffers.
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
+
     // Local fan-out to remaining occupants on this worker
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
@@ -1371,7 +1403,7 @@ fn broadcastOccupantLeave(
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
@@ -1393,7 +1425,7 @@ fn broadcastOccupantLeave(
         }
         s110w.writeAll("</x></presence>") catch return;
 
-        fanout.deliverPrebuiltToSession(self_target, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
     }
 }
 
@@ -1512,6 +1544,11 @@ fn sendRoomHistory(
 
     if (result.messages.len == 0) return;
 
+    // One buffer reused per history message: queueSendStanza copies, so a
+    // message is dead before the next is built (S18).
+    var hist_lease = server.leaseByteScratch() orelse return;
+    defer hist_lease.release();
+
     // Deliver in chronological order (reverse of backward query)
     var i: usize = result.messages.len;
     while (i > 0) {
@@ -1531,8 +1568,7 @@ fn sendRoomHistory(
         const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
         const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
 
-        var buf: [20480]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var fbs = std.io.fixedBufferStream(hist_lease.buf);
         const w = fbs.writer();
 
         // Write up to first '>', injecting to='jid'
@@ -1977,15 +2013,21 @@ pub fn processRemoteGroupchat(
     fw.writeAll(sender.getNick()) catch return;
     const from_str = from_fbs.getWritten();
 
-    var prefix_buf: [512]u8 = undefined;
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_buf: [16500]u8 = undefined;
-    const suffix_len = fanout.buildSuffix(&suffix_buf, ev.stanza_id, ev.inner_xml) orelse return;
+    var suffix_lease = server.leaseByteScratch() orelse return;
+    defer suffix_lease.release();
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse return;
     const prefix = prefix_buf[0..prefix_len];
-    const suffix = suffix_buf[0..suffix_len];
+    const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast
     server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // One delivery buffer reused for every local occupant (S18), as in
+    // handleMucGroupchat.
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
 
     // Local fan-out (same bounded continuation as handleMucGroupchat)
     const batch_size = server.fanout_queue.batch_size;
@@ -2000,7 +2042,7 @@ pub fn processRemoteGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -2024,12 +2066,12 @@ pub fn processRemoteGroupchat(
             @memcpy(pf.room_jid_buf[0..ev.room_jid.len], ev.room_jid);
             pf.room_jid_len = @intCast(ev.room_jid.len);
             @memcpy(pf.prefix_buf[0..prefix_len], prefix);
-            pf.prefix_len = prefix_len;
+            pf.prefix_len = @intCast(prefix_len);
             @memcpy(pf.suffix_buf[0..suffix_len], suffix);
-            pf.suffix_len = suffix_len;
+            pf.suffix_len = @intCast(suffix_len);
             pf.next_slot = resume_slot;
         } else {
-            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+            deliverRemainingSync(server, room, resume_slot, deliver_lease.buf, prefix, suffix, changes);
         }
     }
 
@@ -2037,8 +2079,13 @@ pub fn processRemoteGroupchat(
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
-        var arch_buf: [17200]u8 = undefined;
-        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        // The fan-out above has finished and the stanza is rebuilt from
+        // ev.inner_xml, so both of its buffers are given back first.
+        deliver_lease.release();
+        suffix_lease.release();
+        var arch_lease = server.leaseByteScratch() orelse return;
+        defer arch_lease.release();
+        var arch_fbs = std.io.fixedBufferStream(arch_lease.buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
         xml.escapeWrite(aw, from_str) catch return;

@@ -35,6 +35,12 @@ pub const DEFAULT_BATCH_SIZE: u8 = 32;
 /// Maximum concurrent pending fan-out operations.
 pub const MAX_PENDING: usize = 4;
 
+/// Capacity of a queued pre-built stanza prefix and suffix. A suffix longer
+/// than this is rejected at build time rather than truncated, so the same
+/// limit applies to a stanza delivered live and to one parked in the queue.
+pub const PREFIX_CAPACITY: usize = 512;
+pub const SUFFIX_CAPACITY: usize = 16500;
+
 /// A pending fan-out operation that delivers a pre-built stanza to room
 /// occupants across multiple event loop ticks (bounded continuation).
 pub const PendingFanout = struct {
@@ -49,12 +55,12 @@ pub const PendingFanout = struct {
 
     /// Pre-built stanza prefix: everything up to and including " to='"
     /// Example: "<message from='room@conf/nick' to='"
-    prefix_buf: [512]u8 = undefined,
+    prefix_buf: [PREFIX_CAPACITY]u8 = undefined,
     prefix_len: u16 = 0,
 
     /// Pre-built stanza suffix: everything after the recipient JID value
     /// Example: "' type='groupchat' id='abc'><body>hello</body></message>"
-    suffix_buf: [16500]u8 = undefined,
+    suffix_buf: [SUFFIX_CAPACITY]u8 = undefined,
     suffix_len: u16 = 0,
 
     pub fn getRoomJid(self: *const PendingFanout) []const u8 {
@@ -107,15 +113,15 @@ pub const FanoutQueue = struct {
 ///
 /// Output: `<message from='room@conf/nick' to='`
 pub fn buildPrefix(
-    buf: *[512]u8,
+    buf: []u8,
     from_str: []const u8,
-) ?u16 {
+) ?usize {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("<message from='") catch return null;
     xml.escapeWrite(w, from_str) catch return null;
     w.writeAll("' to='") catch return null;
-    return @intCast(fbs.pos);
+    return fbs.pos;
 }
 
 /// Build a pre-built stanza suffix for a MUC groupchat message.
@@ -124,10 +130,10 @@ pub fn buildPrefix(
 /// Output: `' type='groupchat' id='abc'><body>hello</body></message>`
 ///     or: `' type='groupchat' id='abc'/>`  (no inner XML)
 pub fn buildSuffix(
-    buf: *[16500]u8,
+    buf: []u8,
     id_str: []const u8,
     inner_xml: []const u8,
-) ?u16 {
+) ?usize {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("' type='groupchat'") catch return null;
@@ -143,7 +149,7 @@ pub fn buildSuffix(
         w.writeAll(inner_xml) catch return null;
         w.writeAll("</message>") catch return null;
     }
-    return @intCast(fbs.pos);
+    return fbs.pos;
 }
 
 /// Build a complete stanza from pre-built prefix + recipient JID + suffix into a buffer.
@@ -203,19 +209,23 @@ pub fn deliverToSession(
 }
 
 /// Pre-built variant of `deliverToSession`: assembles `prefix + recipient_jid +
-/// suffix` into a scratch buffer, then delivers it. Replaces the
-/// `queueSend()` + `hasPendingWrite()`/`addWrite()` pair at fan-out sites.
+/// suffix` into `buf`, then delivers it. Replaces the `queueSend()` +
+/// `hasPendingWrite()`/`addWrite()` pair at fan-out sites.
+///
+/// `buf` is caller-supplied so a fan-out loop can lease one scratch bank and
+/// reuse it for every recipient instead of taking a 20 KiB stack frame per
+/// delivery (S18).
 pub fn deliverPrebuiltToSession(
     session: anytype,
+    buf: []u8,
     prefix: []const u8,
     recipient_jid: []const u8,
     suffix: []const u8,
     session_id: usize,
     changes: anytype,
 ) void {
-    var msg_buf: [20480]u8 = undefined;
-    const total = buildComplete(&msg_buf, prefix, recipient_jid, suffix) orelse return;
-    deliverToSession(session, msg_buf[0..total], session_id, changes);
+    const total = buildComplete(buf, prefix, recipient_jid, suffix) orelse return;
+    deliverToSession(session, buf[0..total], session_id, changes);
 }
 
 // ============================================================================
@@ -480,8 +490,9 @@ test "deliverToSession: detached session tracks for replay, never touches the fd
 test "deliverPrebuiltToSession: assembles prefix + JID + suffix" {
     var session = MockSession{};
     var changes = MockChanges{};
+    var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
 
     try std.testing.expectEqualStrings(
         "<message to='bob@example.com'/>",
@@ -495,8 +506,9 @@ test "deliverPrebuiltToSession: detached occupant is not delivered live" {
     session.conn.closed = true;
     session.conn.fd = -1;
     var changes = MockChanges{};
+    var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
 
     try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
     try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);

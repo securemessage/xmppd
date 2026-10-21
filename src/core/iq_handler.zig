@@ -1821,9 +1821,11 @@ fn sendPepNotification(
     const body_item_mid = "'>";
     const body_suffix = "</item></items></event></message>";
 
-    // Build the shared suffix (everything after the to='...' value) into a buffer
-    var notif_buf: [16384]u8 = undefined;
-    var nfbs = std.io.fixedBufferStream(&notif_buf);
+    // Build the shared suffix (everything after the to='...' value) into a
+    // leased bank: it is read while building every notification below (S18).
+    var notif_lease = server.leaseByteScratch() orelse return;
+    defer notif_lease.release();
+    var nfbs = std.io.fixedBufferStream(notif_lease.buf);
     const nw = nfbs.writer();
     nw.writeAll(body_mid) catch return;
     xml.escapeWrite(nw, node) catch return;
@@ -1841,13 +1843,18 @@ fn sendPepNotification(
         defer lease_self.release();
         const self_entries = lease_self.entries;
         const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, self_entries);
+
+        // One buffer reused per resource: deliverToSession and ds.deliver both
+        // copy, so a resource's stanza is dead before the next is built (S18).
+        var self_msg_lease = server.leaseByteScratch() orelse return;
+        defer self_msg_lease.release();
+
         for (self_entries[0..self_count]) |entry| {
             if (entry.worker_id == server.worker_id) {
                 const target = server.sessions[entry.local_session_id] orelse continue;
                 // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
 
-                var msg_buf: [16384]u8 = undefined;
-                var mfbs = std.io.fixedBufferStream(&msg_buf);
+                var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
                 const mw = mfbs.writer();
                 mw.writeAll(body_prefix_1) catch continue;
                 xml.escapeWrite(mw, publisher_bare) catch continue;
@@ -1863,8 +1870,7 @@ fn sendPepNotification(
             } else {
                 // Cross-thread: build full stanza and deliver via MPSC
                 if (server.delivery_system) |ds| {
-                    var msg_buf: [16384]u8 = undefined;
-                    var mfbs = std.io.fixedBufferStream(&msg_buf);
+                    var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
                     const mw = mfbs.writer();
                     mw.writeAll(body_prefix_1) catch continue;
                     xml.escapeWrite(mw, publisher_bare) catch continue;
@@ -1883,16 +1889,27 @@ fn sendPepNotification(
     }
 
     // Deliver to presence subscribers (contacts with "from" or "both" subscription) — cached (T129)
-    var pep_sub_buf: [16384]u8 = undefined;
+    // Subscriber JID pointers index into this buffer and stay live across the
+    // loop below, which also builds each notification into a third bank, so
+    // the shared suffix above, this list, and one notification are all live at
+    // once: three banks, which is BYTE_BANK_COUNT (S18).
+    var pep_sub_lease = server.leaseByteScratch() orelse return;
+    defer pep_sub_lease.release();
+    const pep_sub_buf = pep_sub_lease.buf;
     var pep_sub_ptrs: [256][]const u8 = undefined;
     const pep_hash = server_mod.sub_cache_mod.hashBareJid(publisher_bare);
     const pep_now = std.time.timestamp();
-    const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, &pep_sub_buf, &pep_sub_ptrs) orelse blk: {
-        const count = roster.getPresenceSubscribersFixed(publisher_bare, &pep_sub_buf, &pep_sub_ptrs) catch return;
+    const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, pep_sub_buf, &pep_sub_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(publisher_bare, pep_sub_buf, &pep_sub_ptrs) catch return;
         server.sub_cache.storeSubscribers(pep_hash, pep_now, pep_sub_ptrs[0..count]);
         break :blk count;
     };
     const subscriber_jids = pep_sub_ptrs[0..pep_sub_count];
+
+    // One buffer reused for every notification below: both delivery paths
+    // copy, so a stanza is dead before the next subscriber is built (S18).
+    var sub_msg_lease = server.leaseByteScratch() orelse return;
+    defer sub_msg_lease.release();
 
     for (subscriber_jids) |sub_bare_jid| {
         // Skip blocked contacts
@@ -1915,8 +1932,7 @@ fn sendPepNotification(
             if (entry.worker_id == server.worker_id) {
                 const target = server.sessions[entry.local_session_id] orelse continue;
 
-                var msg_buf: [16384]u8 = undefined;
-                var mfbs = std.io.fixedBufferStream(&msg_buf);
+                var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                 const mw = mfbs.writer();
                 mw.writeAll(body_prefix_1) catch continue;
                 xml.escapeWrite(mw, publisher_bare) catch continue;
@@ -1931,8 +1947,7 @@ fn sendPepNotification(
                 fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
             } else {
                 if (server.delivery_system) |ds| {
-                    var msg_buf: [16384]u8 = undefined;
-                    var mfbs = std.io.fixedBufferStream(&msg_buf);
+                    var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                     const mw = mfbs.writer();
                     mw.writeAll(body_prefix_1) catch continue;
                     xml.escapeWrite(mw, publisher_bare) catch continue;

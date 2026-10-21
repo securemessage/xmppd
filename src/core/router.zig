@@ -218,8 +218,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const archive_stanza_id: []const u8 = if (is_archivable) server.generateStanzaId(&sid_buf) else "";
 
     // Build augmented inner_xml with stanza-id appended (for delivery to recipients)
-    var aug_buf: [16512]u8 = undefined;
-    var aug_fbs = std.io.fixedBufferStream(&aug_buf);
+    var aug_lease = server.leaseByteScratch() orelse return;
+    defer aug_lease.release();
+    var aug_fbs = std.io.fixedBufferStream(aug_lease.buf);
     const delivery_inner_xml: []const u8 = if (archive_stanza_id.len > 0) blk: {
         const aw = aug_fbs.writer();
         aw.writeAll(inner_xml) catch break :blk inner_xml;
@@ -276,7 +277,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // and consumed (copied by the writer queue, or stored) before the
     // delivery form is built below, and the offline-store branch returns
     // before the delivery loop runs, so the lifetimes never overlap.
-    var out_buf: [20480]u8 = undefined;
+    var out_lease = server.leaseByteScratch() orelse return;
+    defer out_lease.release();
+    const out_buf = out_lease.buf;
 
     // Build the archived form of the stanza (includes the stanza-id element).
     var archive_stanza: []const u8 = "";
@@ -289,7 +292,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             recip_fbs.writer().writeAll(to_jid.domain) catch {};
             const recipient_bare = recip_fbs.getWritten();
 
-            var stanza_fbs = std.io.fixedBufferStream(&out_buf);
+            var stanza_fbs = std.io.fixedBufferStream(out_buf);
             const sw = stanza_fbs.writer();
             sw.writeAll("<message from='") catch {};
             xml.escapeWrite(sw, from_str) catch {};
@@ -366,7 +369,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     recip_fbs2.writer().writeAll(to_jid.domain) catch {};
                     const recipient_bare2 = recip_fbs2.getWritten();
 
-                    var stanza_fbs2 = std.io.fixedBufferStream(&out_buf);
+                    var stanza_fbs2 = std.io.fixedBufferStream(out_buf);
                     const sw2 = stanza_fbs2.writer();
                     sw2.writeAll("<message from='") catch {};
                     xml.escapeWrite(sw2, from_str) catch {};
@@ -426,7 +429,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // same bytes. RFC 6121 section 8.5.2.1.1 omits type='normal' on messages.
     const emit_type = type_str.len > 0 and
         !(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"));
-    const built = buildDeliveryStanza(&out_buf, tag_name, from_str, to_str, type_str, emit_type, id_str, delivery_inner_xml);
+    const built = buildDeliveryStanza(out_buf, tag_name, from_str, to_str, type_str, emit_type, id_str, delivery_inner_xml);
     if (built == null) {
         log.warn("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
     }
@@ -499,6 +502,11 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (session.stanza_kind == .message and !has_no_copy and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
     {
+        // The serialized stanza is dead now that the delivery loop above has
+        // consumed it; give the bank back so sendCarbons, which still reads
+        // delivery_inner_xml out of the augmented bank, can take it.
+        out_lease.release();
+
         sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
         sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
     }
@@ -568,8 +576,9 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
         .none => return,
     };
 
-    var stanza_buf: [20480]u8 = undefined;
-    var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
+    var stanza_lease = server.leaseByteScratch() orelse return;
+    defer stanza_lease.release();
+    var stanza_fbs = std.io.fixedBufferStream(stanza_lease.buf);
     const sw = stanza_fbs.writer();
 
     sw.writeByte('<') catch return;
@@ -712,14 +721,21 @@ fn sendCarbons(
     const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
+    // One serialization buffer reused across resources: each carbon is fully
+    // consumed (copied by queueSend / the MPSC deliver) before the next
+    // iteration builds into it. Leased from the pool rather than the stack so
+    // the per-resource 20 KiB frame is gone (S18).
+    var carbon_lease = server.leaseByteScratch() orelse return;
+    defer carbon_lease.release();
+    const cbuf = carbon_lease.buf;
+
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (&target.conn == &sender_session.conn) continue;
             if (!target.carbons_enabled) continue;
 
-            var cbuf: [20480]u8 = undefined;
-            var cfbs = std.io.fixedBufferStream(&cbuf);
+            var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;
@@ -771,8 +787,7 @@ fn sendCarbons(
             // T89: Cross-thread carbon delivery via MPSC
             const ds = server.delivery_system orelse continue;
 
-            var cbuf: [20480]u8 = undefined;
-            var cfbs = std.io.fixedBufferStream(&cbuf);
+            var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;

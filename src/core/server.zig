@@ -628,6 +628,17 @@ pub const Server = struct {
     scratch_jid_idxs_a: []u16 = &.{},
     scratch_bank_in_use: [3]bool = .{ false, false, false },
 
+    /// S18: per-worker heap scratch for stanza serialization, replacing the
+    /// 20 KiB stack buffers that held dispatchStanza, sendCarbons and
+    /// broadcastToOwnResources above a 16 KiB frame. BYTE_BANK_COUNT banks of
+    /// BYTE_BANK_SIZE are allocated lazily as one block and leased out, so a
+    /// function nesting inside another takes a distinct bank rather than
+    /// sharing the outer one's bytes. Allocated on the worker heap, not the
+    /// stack: a Server value is returned by value from init, so growing the
+    /// struct itself would move the cost to every caller's frame.
+    byte_scratch: []u8 = &.{},
+    byte_scratch_in_use: [BYTE_BANK_COUNT]bool = .{false} ** BYTE_BANK_COUNT,
+
     /// T87 async archive writer queue. Null in dev/single-process setups
     /// without a writer thread — writers then fall back to inline store()
     /// against `archive`.
@@ -1032,6 +1043,7 @@ pub const Server = struct {
         if (self.scratch_entries_c.len > 0) self.allocator.free(self.scratch_entries_c);
         if (self.scratch_ids_a.len > 0) self.allocator.free(self.scratch_ids_a);
         if (self.scratch_jid_idxs_a.len > 0) self.allocator.free(self.scratch_jid_idxs_a);
+        if (self.byte_scratch.len > 0) self.allocator.free(self.byte_scratch);
         self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
@@ -1045,6 +1057,18 @@ pub const Server = struct {
 
     /// Presence batching resolves this many bare JIDs per lock hold.
     pub const SCRATCH_CHUNK_JIDS = 32;
+
+    /// One stanza-serialization bank. Sized to the largest stanza buffer in
+    /// the tree: the 16384-byte accumulation limit plus room for the attributes
+    /// added on the way out.
+    pub const BYTE_BANK_SIZE: usize = 20480;
+
+    /// Byte banks cover the deepest live nesting of stanza serialization,
+    /// which is sendPepNotification: its shared suffix stays live across the
+    /// subscriber list, and each delivery builds one notification on top of
+    /// both. Nesting deeper than the pool takes a heap allocation instead of
+    /// dropping the stanza.
+    pub const BYTE_BANK_COUNT: usize = 3;
 
     /// Scratch banks are layered by nesting depth so that a lookup made
     /// inside another lookup's iteration cannot overwrite the outer results.
@@ -1146,6 +1170,72 @@ pub const Server = struct {
             return;
         };
         target.* = grown;
+    }
+
+    /// An in-use claim on one byte-scratch bank. Release with `release`,
+    /// normally through `defer`, before the buffer slice is allowed to go
+    /// stale. Releasing twice is a no-op, so a lease can be given back early
+    /// without also having to drop the `defer`.
+    pub const ByteLease = struct {
+        server: *Server,
+        bank: usize = 0,
+        /// Set when the buffer is heap-allocated rather than pooled.
+        owned: bool = false,
+        active: bool = true,
+        buf: []u8,
+
+        pub fn release(self: *ByteLease) void {
+            if (!self.active) return;
+            self.active = false;
+            if (self.owned) {
+                self.server.allocator.free(self.buf);
+            } else {
+                self.server.byte_scratch_in_use[self.bank] = false;
+            }
+            self.buf = &.{};
+        }
+    };
+
+    /// Claim a byte-scratch buffer and return it. Banks come from a pool so a
+    /// serializer running inside another one's live buffer takes a different
+    /// bank and cannot overwrite the outer stanza.
+    ///
+    /// When every bank is already out, the buffer is allocated instead, so a
+    /// deeper-than-expected call chain costs an allocation rather than dropping
+    /// the stanza. Returns null only if that allocation failed; callers then
+    /// drop the stanza, which is the same fail-closed behavior a fixed stack
+    /// buffer had when the stanza did not fit.
+    pub fn leaseByteScratch(self: *Server) ?ByteLease {
+        self.growByteScratch();
+        for (0..BYTE_BANK_COUNT) |bank| {
+            if (self.byte_scratch_in_use[bank]) continue;
+            const start = bank * BYTE_BANK_SIZE;
+            const end = start + BYTE_BANK_SIZE;
+            if (self.byte_scratch.len < end) {
+                log.err("byte scratch bank {d} unavailable ({d} bytes allocated)", .{ bank, self.byte_scratch.len });
+                return null;
+            }
+            self.byte_scratch_in_use[bank] = true;
+            return .{ .server = self, .bank = bank, .buf = self.byte_scratch[start..end] };
+        }
+        const buf = self.allocator.alloc(u8, BYTE_BANK_SIZE) catch {
+            log.err("all {d} byte scratch banks in use and the fallback allocation of {d} bytes failed", .{ BYTE_BANK_COUNT, BYTE_BANK_SIZE });
+            return null;
+        };
+        return .{ .server = self, .bank = 0, .owned = true, .buf = buf };
+    }
+
+    /// Allocate the byte-scratch block, backing every bank with one
+    /// allocation. Runs at most once per Server: no bank can be leased before
+    /// the block exists, so the allocation never moves a buffer that is
+    /// currently leased out.
+    fn growByteScratch(self: *Server) void {
+        if (self.byte_scratch.len > 0) return;
+        const total = BYTE_BANK_COUNT * BYTE_BANK_SIZE;
+        self.byte_scratch = self.allocator.alloc(u8, total) catch {
+            log.err("byte scratch alloc of {d} bytes failed", .{total});
+            return;
+        };
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -3452,13 +3542,18 @@ pub const Server = struct {
         const reg = self.room_registry orelse return;
         const room = reg.findByJid(decoded.room_jid) orelse return;
 
+        // One delivery buffer reused for every local occupant (S18). The
+        // prefix and suffix read here live in the decoded multicast payload.
+        var deliver_lease = self.leaseByteScratch() orelse return;
+        defer deliver_lease.release();
+
         for (&room.occupants) |*slot| {
             const occ = slot.* orelse continue;
             if (occ.worker_id != self.worker_id) continue;
             if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
 
             const target_session = self.sessions[occ.session_id] orelse continue;
-            fanout_mod.deliverPrebuiltToSession(target_session, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id, changes);
+            fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id, changes);
         }
     }
 
@@ -4878,6 +4973,85 @@ test "Server: S18 scratch banks size to the session map resource cap" {
         defer lease.release();
         try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, lease.entries.len);
     }
+}
+
+test "Server: S18 byte scratch banks are distinct and reusable" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Every bank is handed out separately, so a serializer nested inside
+    // another one's live buffer cannot overwrite the outer stanza.
+    var a = server.leaseByteScratch().?;
+    defer a.release();
+    var b = server.leaseByteScratch().?;
+    defer b.release();
+    var c = server.leaseByteScratch().?;
+    defer c.release();
+
+    for ([3]Server.ByteLease{ a, b, c }) |lease| {
+        try std.testing.expectEqual(Server.BYTE_BANK_SIZE, lease.buf.len);
+        try std.testing.expectEqual(false, lease.owned);
+    }
+    try std.testing.expect(!isOverlapping(a.buf, b.buf));
+    try std.testing.expect(!isOverlapping(a.buf, c.buf));
+    try std.testing.expect(!isOverlapping(b.buf, c.buf));
+
+    // The block is allocated once and banks are fixed offsets into it, so a
+    // lease taken earlier still points at the same bytes.
+    const a_ptr = a.buf.ptr;
+    const block = server.byte_scratch;
+    try std.testing.expectEqual(Server.BYTE_BANK_COUNT * Server.BYTE_BANK_SIZE, block.len);
+    try std.testing.expectEqual(@intFromPtr(block.ptr), @intFromPtr(a_ptr));
+
+    // Writes land in the bank that was written, never in a sibling.
+    @memset(c.buf, 'C');
+    @memset(a.buf, 'A');
+    @memset(b.buf, 'B');
+    try std.testing.expectEqual(@as(u8, 'C'), c.buf[0]);
+    try std.testing.expectEqual(@as(u8, 'A'), a.buf[0]);
+    try std.testing.expectEqual(@as(u8, 'B'), b.buf[0]);
+
+    // Exhausting the pool costs an allocation, not the stanza.
+    var d = server.leaseByteScratch().?;
+    defer d.release();
+    try std.testing.expectEqual(true, d.owned);
+    try std.testing.expectEqual(Server.BYTE_BANK_SIZE, d.buf.len);
+    @memset(d.buf, 'D');
+    try std.testing.expectEqual(@as(u8, 'A'), a.buf[1]);
+
+    // A lease released early must not disturb a bank that a later lease has
+    // taken over. Releasing `a` frees bank 0, `e` claims it, and `a`'s own
+    // deferred release then fires again: bank 0 belongs to `e` and stays
+    // claimed. Without the guard a stale release would hand the same bytes to
+    // the next lease while `e` is still writing its stanza.
+    a.release();
+    try std.testing.expectEqual(@as(usize, 0), a.buf.len);
+    try std.testing.expectEqual(false, server.byte_scratch_in_use[0]);
+
+    var e = server.leaseByteScratch().?;
+    defer e.release();
+    try std.testing.expectEqual(false, e.owned);
+    try std.testing.expectEqual(0, e.bank);
+    @memset(e.buf, 'E');
+
+    a.release();
+    try std.testing.expectEqual(true, server.byte_scratch_in_use[0]);
+    try std.testing.expectEqual(@as(u8, 'E'), e.buf[0]);
+
+    // The fallback lease is still out, so the reused bank is a pool bank.
+    try std.testing.expectEqual(@as(u8, 'D'), d.buf[0]);
+
+    // Releasing the heap fallback repeatedly stays a no-op as well.
+    d.release();
+    d.release();
+    try std.testing.expectEqual(@as(usize, 0), d.buf.len);
+}
+
+/// True when two buffers share any byte.
+fn isOverlapping(x: []const u8, y: []const u8) bool {
+    const xs = @intFromPtr(x.ptr);
+    const ys = @intFromPtr(y.ptr);
+    return xs < ys + y.len and ys < xs + x.len;
 }
 
 test "Server: accept and close session" {
