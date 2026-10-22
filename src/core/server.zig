@@ -5861,7 +5861,26 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
         .{ "message.zig", @embedFile("message.zig"), 0 },
         .{ "caps.zig", @embedFile("caps.zig"), 0 },
+        // Remaining core files (S15): a raw send added here must be caught
+        // like any other, not smuggled in outside the allowlist.
+        .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
+        .{ "delivery_queue.zig", @embedFile("delivery_queue.zig"), 0 },
+        .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
+        .{ "listener.zig", @embedFile("listener.zig"), 0 },
+        .{ "main.zig", @embedFile("main.zig"), 0 },
+        .{ "offline_store.zig", @embedFile("offline_store.zig"), 0 },
+        .{ "room_mailbox.zig", @embedFile("room_mailbox.zig"), 0 },
+        .{ "room_registry.zig", @embedFile("room_registry.zig"), 0 },
+        .{ "roster_store.zig", @embedFile("roster_store.zig"), 0 },
+        .{ "session_map.zig", @embedFile("session_map.zig"), 0 },
+        .{ "sm_handoff.zig", @embedFile("sm_handoff.zig"), 0 },
+        .{ "sm_state.zig", @embedFile("sm_state.zig"), 0 },
+        .{ "subscription_cache.zig", @embedFile("subscription_cache.zig"), 0 },
     };
+    if (cases.len != 23) {
+        log.err("S15 ratchet: covers {d} core files, expected 23", .{cases.len});
+        return error.RatchetCoverage;
+    }
     inline for (cases) |case| {
         const name = case[0];
         const src = case[1];
