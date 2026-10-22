@@ -719,8 +719,13 @@ test "Connection: flushSync on a blocking fd coalesces short writes to completio
     try conn.queueSend(&payload);
     conn.flushSync();
 
-    try std.testing.expect(!conn.hasPendingWrite());
+    // Signal end-of-payload so a writer that reports completion but
+    // under-delivers cannot leave the reader blocked forever; a short
+    // transfer fails the count below instead of hanging (ce03221).
+    std.posix.shutdown(fds[0], .send) catch {};
     t.join();
+
+    try std.testing.expect(!conn.hasPendingWrite());
     try std.testing.expectEqual(payload_len, got);
 }
 
