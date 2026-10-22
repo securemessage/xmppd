@@ -2492,6 +2492,24 @@ test "S2sDaemon: closeInbound" {
 /// visible by reading through the old pointer (S2, reject path).
 const PoisonOnFreeAllocator = struct {
     inner: std.mem.Allocator,
+    /// Freed chunks quarantined instead of handed back to the backing
+    /// allocator: the poison fill stays checkable while this allocator
+    /// still owns the bytes. Reading a chunk after the real free is
+    /// undefined, so tests check through here.
+    quarantine: [MAX_QUARANTINE]Quarantined = undefined,
+    quarantine_len: usize = 0,
+    /// Poison snapshot of the frees seen so far, captured at free time.
+    biggest_freed_len: usize = 0,
+    poisoned_prefix: [8]u8 = [_]u8{0} ** 8,
+    poisoned_bytes: usize = 0,
+
+    const MAX_QUARANTINE = 64;
+    const Quarantined = struct {
+        ptr: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    };
 
     fn allocator(self: *PoisonOnFreeAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{
@@ -2516,7 +2534,39 @@ const PoisonOnFreeAllocator = struct {
     fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
         @memset(memory, 0xA5);
-        self.inner.rawFree(memory, alignment, ret_addr);
+        self.poisoned_bytes += memory.len;
+        if (memory.len >= self.biggest_freed_len) {
+            self.biggest_freed_len = memory.len;
+            const n = @min(memory.len, self.poisoned_prefix.len);
+            @memcpy(self.poisoned_prefix[0..n], memory[0..n]);
+        }
+        if (self.quarantine_len == self.quarantine.len) {
+            self.inner.rawFree(memory, alignment, ret_addr);
+            return;
+        }
+        self.quarantine[self.quarantine_len] = .{
+            .ptr = memory.ptr,
+            .len = memory.len,
+            .alignment = alignment,
+            .ret_addr = ret_addr,
+        };
+        self.quarantine_len += 1;
+    }
+
+    /// Check every quarantined chunk is still poison-filled: a write
+    /// through a stale pointer after its free would show here.
+    fn checkQuarantine(self: *PoisonOnFreeAllocator) !void {
+        for (self.quarantine[0..self.quarantine_len]) |q| {
+            if (!std.mem.allEqual(u8, q.ptr[0..q.len], 0xA5)) return error.FreedMemoryWasWritten;
+        }
+    }
+
+    /// Return every quarantined chunk to the backing allocator.
+    fn releaseQuarantine(self: *PoisonOnFreeAllocator) void {
+        for (self.quarantine[0..self.quarantine_len]) |q| {
+            self.inner.rawFree(q.ptr[0..q.len], q.alignment, q.ret_addr);
+        }
+        self.quarantine_len = 0;
     }
 };
 
@@ -2527,7 +2577,10 @@ test "S2sDaemon: stanza reject path resets before closeInbound frees (S2)" {
     var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
     const alloc = pf.allocator();
     var daemon = try S2sDaemon.init(alloc, "us.example");
-    defer daemon.deinit();
+    defer {
+        daemon.deinit();
+        pf.releaseQuarantine();
+    }
 
     try daemon.listen("127.0.0.1", 0);
     var addr: std.c.sockaddr.in = undefined;
@@ -2562,11 +2615,11 @@ test "S2sDaemon: stanza reject path resets before closeInbound frees (S2)" {
     dispatchInboundStanza(&daemon, session, &cl);
     try std.testing.expect(daemon.getInbound(slot) == null); // rejected and closed
 
-    // The freed chunk is poison-filled; if resetStanza had run after the
-    // free it would have re-written stanza_active to false (UB captured).
-    // With the fix, the reset happened before free, so the marker survives.
-    const stanza_active_byte: *const u8 = @ptrCast(&session.stanza_active);
-    try std.testing.expectEqual(@as(u8, 0xA5), stanza_active_byte.*);
+    // The session chunk is still poison-filled: if resetStanza had run
+    // after the free it would have written stanza_active to false through
+    // the stale pointer, and the quarantined fill would show it.
+    try std.testing.expect(pf.biggest_freed_len >= @sizeOf(S2sSession));
+    try pf.checkQuarantine();
 }
 
 test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow tail (T275)" {
@@ -2933,7 +2986,10 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)
     var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
     const alloc = pf.allocator();
     var daemon = try S2sDaemon.init(alloc, "us.example");
-    defer daemon.deinit();
+    defer {
+        daemon.deinit();
+        pf.releaseQuarantine();
+    }
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2990,12 +3046,14 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)
     var cl = ChangeList.init(&scratch);
     continueOutboundTls(&daemon, &cl, 7, conn);
 
-    // Teardown went through the slot table, and the freed conn chunk is
-    // poison-filled: any conn read here would touch 0xA5 memory (invalid
-    // enum) or a wild remote_domain pointer.
+    // Teardown went through the slot table, and the conn chunk was freed
+    // poison-filled. The fill is checked inside the poisoning allocator
+    // while it still owns the bytes: reading a chunk after the real free
+    // is undefined.
     try std.testing.expect(daemon.outbound[7] == null);
-    const state_byte: *const u8 = @ptrCast(&conn.state);
-    try std.testing.expectEqual(@as(u8, 0xA5), state_byte.*);
+    try std.testing.expect(pf.biggest_freed_len >= @sizeOf(OutboundConnection));
+    try std.testing.expect(std.mem.allEqual(u8, &pf.poisoned_prefix, 0xA5));
+    try pf.checkQuarantine();
 }
 
 /// An established callback connection on a socketpair: db:verify is written
