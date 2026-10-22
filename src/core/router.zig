@@ -29,6 +29,40 @@ const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
 
+/// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so a
+/// build buffer of this size holds one in full and never truncates a valid key
+/// (S4). Oversized bare JIDs are rejected by the store's KeyTooLong check.
+pub const BARE_JID_MAX = 512;
+
+/// Build a bare JID "local@domain" into out and return it. The buffer is sized
+/// to a full store-key JID, so a valid key is never truncated (S4).
+fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) []const u8 {
+    var fbs = std.io.fixedBufferStream(out);
+    const w = fbs.writer();
+    w.writeAll(local) catch {};
+    w.writeByte('@') catch {};
+    w.writeAll(domain) catch {};
+    return fbs.getWritten();
+}
+
+test "router: bare JID buffers hold a full store-key JID without truncation" {
+    var out: [BARE_JID_MAX]u8 = undefined;
+    // A bare JID just under the store-key limit builds in full.
+    var local: [300]u8 = undefined;
+    @memset(&local, 'l');
+    var domain: [200]u8 = undefined;
+    @memset(&domain, 'd');
+    const jid = buildBareJid(&local, &domain, &out);
+    try std.testing.expectEqual(@as(usize, 300 + 1 + 200), jid.len);
+    // A full store-key-length bare JID (511) also fits.
+    var local2: [280]u8 = undefined;
+    @memset(&local2, 'l');
+    var domain2: [230]u8 = undefined;
+    @memset(&domain2, 'd');
+    const jid2 = buildBareJid(&local2, &domain2, &out);
+    try std.testing.expectEqual(@as(usize, 511), jid2.len);
+}
+
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
 /// appends the accumulated child XML, and closes the stanza.
@@ -263,12 +297,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     // Build sender bare JID for archive
-    var sender_bare_buf: [256]u8 = undefined;
-    var sender_bare_fbs = std.io.fixedBufferStream(&sender_bare_buf);
-    sender_bare_fbs.writer().writeAll(from_jid.local) catch {};
-    sender_bare_fbs.writer().writeByte('@') catch {};
-    sender_bare_fbs.writer().writeAll(from_jid.domain) catch {};
-    const sender_bare = sender_bare_fbs.getWritten();
+    var sender_bare_buf: [BARE_JID_MAX]u8 = undefined;
+    const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf);
 
     // Single timestamp for all archive operations in this dispatch (T123)
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
@@ -285,12 +315,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var archive_stanza: []const u8 = "";
     if (is_archivable) {
         if (server.archive != null) {
-            var recip_buf: [256]u8 = undefined;
-            var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-            recip_fbs.writer().writeAll(to_jid.local) catch {};
-            recip_fbs.writer().writeByte('@') catch {};
-            recip_fbs.writer().writeAll(to_jid.domain) catch {};
-            const recipient_bare = recip_fbs.getWritten();
+            var recip_buf: [BARE_JID_MAX]u8 = undefined;
+            const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
 
             var stanza_fbs = std.io.fixedBufferStream(out_buf);
             const sw = stanza_fbs.writer();
@@ -346,12 +372,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
                 if (is_archivable and archive_stanza_id.len > 0) {
-                    var recip_buf2: [256]u8 = undefined;
-                    var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                    recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                    recip_fbs2.writer().writeByte('@') catch {};
-                    recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                    const recipient_bare2 = recip_fbs2.getWritten();
+                    var recip_buf2: [BARE_JID_MAX]u8 = undefined;
+                    const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
                     // The payload is stored with the pointer. The archive row
                     // this stanza was also handed to may still be sitting in
                     // the async writer queue, and a drain that read the
@@ -362,12 +384,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                         return;
                     }
                 } else if (server.archive) |archive| {
-                    var recip_buf2: [256]u8 = undefined;
-                    var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                    recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                    recip_fbs2.writer().writeByte('@') catch {};
-                    recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                    const recipient_bare2 = recip_fbs2.getWritten();
+                    var recip_buf2: [BARE_JID_MAX]u8 = undefined;
+                    const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
 
                     var stanza_fbs2 = std.io.fixedBufferStream(out_buf);
                     const sw2 = stanza_fbs2.writer();

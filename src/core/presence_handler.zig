@@ -564,7 +564,13 @@ fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: 
     xml.escapeWrite(w, jid.domain) catch return;
     w.writeByte('/') catch return;
     xml.escapeWrite(w, jid.resource) catch return;
-    w.writeAll("' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+    w.writeAll("' type='error'") catch return;
+    if (session.stanza_id.len > 0) {
+        w.writeAll(" id='") catch return;
+        xml.escapeWrite(w, session.stanza_id) catch return;
+        w.writeByte('\'') catch return;
+    }
+    w.writeAll("><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
     session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
@@ -1381,6 +1387,7 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     @memset(&to_buf, 'a');
     @memcpy(to_buf[588..], "@example.org");
     session.stanza_to = &to_buf;
+    session.stanza_id = "sess-1";
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1392,6 +1399,8 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     const reply = buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
+    // The error reply echoes the original stanza id so the client can correlate.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-1'") != null);
 }
 
 test "S18: unsubscribed fan-out keeps the owner's own resources" {

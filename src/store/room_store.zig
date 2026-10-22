@@ -296,10 +296,9 @@ pub fn RoomStore(comptime Backend: type) type {
 
         /// Delete a room and all its affiliations.
         pub fn destroyRoom(self: *Self, room_jid: []const u8) !void {
-            // Delete config
-            try self.db.delete(NS_ROOMS, room_jid);
-
-            // Delete all affiliations for this room (prefix scan)
+            // Validate and build the affiliation prefix before deleting
+            // anything: failing on an over-long key must not leave the room
+            // row deleted and its affiliations behind.
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
             const prefix_len = room_jid.len + 1; // room_jid + \x00
             if (prefix_len > MAX_KEY_LEN) return error.KeyTooLong;
@@ -307,6 +306,10 @@ pub fn RoomStore(comptime Backend: type) type {
             key_buf[room_jid.len] = 0;
             const prefix = key_buf[0..prefix_len];
 
+            // Delete config
+            try self.db.delete(NS_ROOMS, room_jid);
+
+            // Delete all affiliations for this room (prefix scan)
             // Keys cannot be deleted during iteration and may be up to 511
             // bytes, so take one key per fresh iterator until none match.
             while (true) {
@@ -528,6 +531,27 @@ test "RoomStore: destroy room removes config" {
 
     const loaded = try store.loadRoom("temp@conference.localhost");
     try std.testing.expect(loaded == null);
+}
+
+test "RoomStore: destroyRoom rejects an over-long key before deleting" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestRoomStore.init(&db, std.testing.allocator);
+
+    // A room JID at the key limit: it is a valid rooms key, but its
+    // affiliation prefix (JID + \x00) overflows MAX_KEY_LEN.
+    var room_jid: [511]u8 = undefined;
+    @memset(&room_jid, 'a');
+
+    var config = RoomConfig{};
+    config.setName("Long Room");
+    try store.saveRoom(&room_jid, &config);
+
+    try std.testing.expectError(error.KeyTooLong, store.destroyRoom(&room_jid));
+
+    // The over-long key must be rejected before the room row is deleted.
+    const loaded = try store.loadRoom(&room_jid);
+    try std.testing.expect(loaded != null);
 }
 
 test "RoomStore: set and get affiliation" {

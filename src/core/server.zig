@@ -7206,4 +7206,5 @@ test "Server: S10 handshake write interest is one-shot" {
 // Force analysis of sibling files whose tests otherwise never run.
 test {
     _ = iq_handler;
+    _ = router;
 }
