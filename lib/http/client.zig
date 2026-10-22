@@ -428,9 +428,12 @@ fn serveTlsResponses(cert_path: [*:0]const u8, key_path: [*:0]const u8, n: *std.
     posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
     n.store(std.mem.nativeToBig(u16, addr.port), .release);
 
+    // Serve the two expected clients. Only an accepted connection counts
+    // against that budget: poll timeouts and transient accept errors retry
+    // within the deadline, so a pause between client requests is harmless.
     const deadline = std.time.milliTimestamp() + 10000;
     var served: usize = 0;
-    while (served < 2 and std.time.milliTimestamp() < deadline) : (served += 1) {
+    while (served < 2 and std.time.milliTimestamp() < deadline) {
         var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
         const pn = posix.poll(&fds, 500) catch 0;
         if (pn <= 0) continue;
@@ -439,6 +442,7 @@ fn serveTlsResponses(cert_path: [*:0]const u8, key_path: [*:0]const u8, n: *std.
         const ssl_ptr = c.SSL_new(ctx) orelse continue;
         defer c.SSL_free(ssl_ptr);
         _ = c.SSL_set_fd(ssl_ptr, conn);
+        served += 1;
         if (c.SSL_accept(ssl_ptr) != 1) continue; // mismatch case dies here
         var buf: [4096]u8 = undefined;
         var total: usize = 0;
@@ -453,7 +457,7 @@ fn serveTlsResponses(cert_path: [*:0]const u8, key_path: [*:0]const u8, n: *std.
     }
 }
 
-test "TLS: hostname check pins the certificate identity to the URL host (T357/S8)" {
+test "TLS: hostname check pins the certificate identity to the URL host (T357)" {
     // Throwaway cert/key generated at test time so no key material ever
     // sits in the tree.
     var tmp = std.testing.tmpDir(.{});
@@ -486,4 +490,41 @@ test "TLS: hostname check pins the certificate identity to the URL host (T357/S8
     // handshake must fail before S8 would have silently accepted it.
     const bad_url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{p});
     try std.testing.expectError(HttpError.TlsHandshakeFailed, client.get(std.testing.allocator, bad_url));
+}
+
+test "TLS: the in-process server keeps serving across a pause between requests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(.{}, serveTlsResponses, .{ cert_path.ptr, key_path.ptr, &port });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var first_buf: [128]u8 = undefined;
+    const first_url = try std.fmt.bufPrint(&first_buf, "https://localhost:{d}/", .{p});
+    var resp1 = try client.get(std.testing.allocator, first_url);
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+
+    // The pause outlasts one poll timeout in the server thread.
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+
+    var second_buf: [128]u8 = undefined;
+    const second_url = try std.fmt.bufPrint(&second_buf, "https://localhost:{d}/", .{p});
+    var resp2 = try client.get(std.testing.allocator, second_url);
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
 }
