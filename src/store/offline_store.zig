@@ -20,7 +20,7 @@
 const std = @import("std");
 const backend = @import("backend");
 
-const NS_OFFLINE = "offline";
+pub const NS_OFFLINE = backend.registered("offline");
 
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;

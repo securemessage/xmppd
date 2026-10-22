@@ -14,8 +14,8 @@
 const std = @import("std");
 const backend = @import("backend");
 
-const NS_MESSAGES = "messages";
-const NS_BY_CONTACT = "by_contact";
+pub const NS_MESSAGES = backend.registered("messages");
+pub const NS_BY_CONTACT = backend.registered("by_contact");
 
 /// A stored archive message with metadata.
 pub const ArchivedMessage = struct {

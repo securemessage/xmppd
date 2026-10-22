@@ -21,7 +21,7 @@ const backend_mod = @import("backend");
 
 const log = std.log.scoped(.lock_store);
 
-const NAMESPACE = "locks";
+pub const NAMESPACE = backend_mod.registered("locks");
 const LOCK_VALUE_SIZE = 5; // lock_type(1) + epoch(4)
 
 /// Lock keys are canonical ASCII-lowercase localparts: XMPP localparts are

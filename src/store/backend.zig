@@ -67,6 +67,16 @@ pub const canonical_namespaces = [_][]const u8{
     "room_affiliations", // MUC persistent affiliations
 };
 
+/// Bind a namespace constant to the registered set. Every store owner
+/// defines its constant through this, so a rename on either side is a
+/// compile error instead of a silently orphaned container.
+pub fn registered(comptime ns: []const u8) []const u8 {
+    for (canonical_namespaces) |candidate| {
+        if (std.mem.eql(u8, candidate, ns)) return candidate;
+    }
+    @compileError("namespace \"" ++ ns ++ "\" is not registered in canonical_namespaces");
+}
+
 /// A key-value entry returned by iterators.
 pub const Entry = struct {
     key: []const u8,
