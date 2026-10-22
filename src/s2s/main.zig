@@ -3602,8 +3602,11 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host (
     var reader = XmlReader.init(alloc);
     defer reader.deinit();
     feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "conference.us.example");
-    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
-    _ = try in1.session.flushWrite();
+    // The processing may close and free the session: reach it through the
+    // slot table, never the rig pointer.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
@@ -3613,7 +3616,8 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host (
 
     // A verdict addressed to the local domain matches no MUC-host entry.
     submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
 }
 
@@ -3642,8 +3646,12 @@ test "S2sDaemon: db:verify for the MUC host is answered as that host (S2)" {
         .self_closing = false,
     };
     processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = elem }, &cl);
-    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .text = &key }, &cl);
-    _ = try in1.session.flushWrite();
+    // The processing may close and free the session: everything after it
+    // reaches the session through the slot table, never the rig pointer.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    processInboundEvent(&daemon, daemon.getInbound(1).?, daemon.readers[1].?, .{ .text = &key }, &cl);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
