@@ -385,6 +385,30 @@ test "reader: namespace prefix bindings are element-scoped (T232)" {
     try std.testing.expectEqualStrings("urn:inner", uris.items[2]);
 }
 
+test "reader: a self-closing element's binding is retired before the next sibling is scanned" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // <p:a/> redeclares p on itself. Its scope pop is deferred to the next
+    // next() call: the element's own event still resolves its own binding,
+    // and the sibling's tokens are scanned after the pop, so the sibling
+    // resolves p to the outer URI again.
+    const input = "<r xmlns:p='urn:outer'><p:a xmlns:p='urn:inner'/><p:b/></r>";
+    var pos: usize = 0;
+
+    _ = (try reader.next(input, &pos)).?; // <r>
+    const a = (try reader.next(input, &pos)).?; // <p:a/> self-closing
+    try std.testing.expect(a == .element_start);
+    try std.testing.expectEqualStrings("urn:inner", a.element_start.namespace_uri);
+    try std.testing.expectEqualStrings("urn:inner", reader.resolveNamespace("p"));
+
+    const b = (try reader.next(input, &pos)).?; // <p:b/> self-closing
+    try std.testing.expect(b == .element_start);
+    try std.testing.expectEqualStrings("urn:outer", b.element_start.namespace_uri);
+    try std.testing.expectEqualStrings("urn:outer", reader.resolveNamespace("p"));
+}
+
 test "namespace resolution on master stream: redeclared prefix resolves newest-first" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);

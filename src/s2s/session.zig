@@ -1429,3 +1429,56 @@ test "S2sSession: any number of attribute prefixes re-emits each binding once" {
     // The repeated prefix's attribute is there too.
     try std.testing.expect(std.mem.indexOf(u8, inner, "ns9:b='again'") != null);
 }
+
+test "S2sSession: the element's own prefix is declared once for its prefixed attributes" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // The child carries prefix e and two attributes bound to e, plus one
+    // bound to f: exactly one xmlns:e and one xmlns:f may be written (a
+    // second xmlns:e on the same tag is a duplicate XML attribute).
+    const input = "<message xmlns='jabber:server' xmlns:e='urn:e' xmlns:f='urn:f'><e:child e:a='1' e:b='2' f:c='3'/></message>";
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, "xmlns:e="));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, "xmlns:f="));
+    try std.testing.expect(std.mem.indexOf(u8, inner, "e:a='1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "e:b='2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "f:c='3'") != null);
+}
+
+test "S2sSession: an attribute-prefix declaration escapes its URI" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // The resolved URI holds an apostrophe and the declaration quotes with
+    // single quotes: the URI must be escaped or it closes the value early.
+    const input = "<message xmlns='jabber:server' xmlns:ext=\"urn:a'b\"><child ext:x='1'/></message>";
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:a&apos;b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "urn:a'b'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:x='1'") != null);
+}
