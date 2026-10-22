@@ -179,10 +179,11 @@ pub const S2sSession = struct {
 
     /// Promote the DANE candidate into the authenticated set. Called from
     /// the SASL-EXTERNAL success action; a no-op without a candidate.
-    pub fn promoteDaneCandidate(self: *S2sSession) void {
-        if (self.dane_domain_len > 0) {
-            _ = self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
-        }
+    /// Returns false when a candidate exists but the domain set is full and
+    /// it was NOT recorded: the identity must not be accepted then.
+    pub fn promoteDaneCandidate(self: *S2sSession) bool {
+        if (self.dane_domain_len == 0) return true;
+        return self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
     }
 
     /// Whether a stream-restart from= is lawful: post-auth it must already
@@ -1182,8 +1183,24 @@ test "S2sSession: DANE candidate promotes only on demand (S2)" {
 
     session.setDaneCandidate("them.example");
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
-    session.promoteDaneCandidate();
+    try std.testing.expect(session.promoteDaneCandidate());
     try std.testing.expect(session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sSession: a full domain set rejects the DANE promotion (S2)" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    // The set holds 8 domains: the candidate is the 9th.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var buf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&buf, "d{d}.example", .{n});
+        try std.testing.expect(session.addAuthenticatedDomain(d));
+    }
+    session.setDaneCandidate("them.example");
+    try std.testing.expect(!session.promoteDaneCandidate());
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
 }
 
 test "S2sSession: restart from= pins origin until auth, then uses the set (S2)" {

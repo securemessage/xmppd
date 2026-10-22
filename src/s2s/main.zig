@@ -1490,6 +1490,13 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         return;
     }
 
+    // S2: bind the authenticated identity to the VERIFIED origin, not to
+    // whatever the header claimed at stream open. The record happens BEFORE
+    // the answer: a full domain set means the verdict cannot be honored and
+    // the answer must be invalid, never a valid the session will not accept.
+    var accepted = valid;
+    if (valid and !session.addAuthenticatedDomain(origin)) accepted = false;
+
     // Send db:result response on the original inbound connection, from the
     // host the db:result named and to the verified origin (not the
     // header-claimed remote domain).
@@ -1498,7 +1505,7 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         &resp_buf,
         if (target.len > 0) target else daemon.local_domain,
         origin,
-        valid,
+        accepted,
     ) catch return;
 
     session.queueWrite(resp) catch return;
@@ -1506,16 +1513,13 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + inbound_slot) catch {};
     }
 
-    if (valid) {
+    if (accepted) {
         session.inbound_dialback.setValid();
-        // S2: bind the authenticated identity to the VERIFIED origin, not to
-        // whatever the header claimed at stream open.
-        _ = session.addAuthenticatedDomain(origin);
         session.stream.setAuthenticated();
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
         session.inbound_dialback.setInvalid();
-        log.warn("dialback callback: {s} invalid, inbound session {d} rejected", .{ origin, inbound_slot });
+        log.warn("dialback callback: {s} rejected for inbound session {d}", .{ origin, inbound_slot });
     }
 }
 
@@ -1572,8 +1576,15 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
         },
         .send_sasl_success => {
             // S2: SASL EXTERNAL accepted (the FSM only reaches here after
-            // DANE verified): the verified domain joins the authenticated set.
-            session.promoteDaneCandidate();
+            // DANE verified): the verified domain joins the authenticated
+            // set. When the set is full the identity cannot be recorded and
+            // the exchange fails instead of succeeding unrecorded.
+            if (!session.promoteDaneCandidate()) {
+                log.warn("inbound S2S id={d}: authenticated-domain set full; SASL EXTERNAL rejected", .{session.id});
+                const failure = session.buildSaslFailure(&buf, "policy") catch return;
+                session.queueWrite(failure) catch {};
+                return;
+            }
             const success = session.buildSaslSuccess(&buf) catch return;
             session.queueWrite(success) catch {};
             _ = session.flushWrite() catch {};
@@ -3060,6 +3071,76 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2)" {
     var rbuf: [512]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+}
+
+test "S2sDaemon: a full domain set answers a valid dialback verdict invalid (S2)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The authenticated-domain set holds 8: fill it before the verdict.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+
+    // The verdict cannot be honored (the set has no room for the origin):
+    // the answer must be invalid, and nothing about the session turns
+    // authenticated.
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(in1.session.inbound_dialback.isFailed());
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") == null);
+}
+
+test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeeding (S2)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+    in1.session.setDaneCandidate("them.example");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+
+    // The identity cannot be recorded, so the exchange fails instead of
+    // succeeding unrecorded.
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
 }
 
 test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2)" {
