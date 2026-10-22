@@ -161,24 +161,27 @@ pub fn LockStore(comptime Backend: type) type {
             log.info("locked account: {s} (type={d})", .{ username, @intFromEnum(lock_type) });
         }
 
-        /// Unlock an account. No-op if not locked.
+        /// Unlock an account. No-op if not locked. A canonical row and a
+        /// fold-equal legacy row are one lock under two keys: unlock must
+        /// remove both, or the survivor still reads as locked (S3).
         pub fn unlock(self: *Self, allocator: std.mem.Allocator, username: []const u8) !void {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
             const key = try canonicalKey(username, &key_buf);
-            const existing = try self.backend.get(allocator, NAMESPACE, key);
-            if (existing) |v| {
+            var removed = false;
+            if (try self.backend.get(allocator, NAMESPACE, key)) |v| {
                 allocator.free(v);
                 try self.backend.delete(NAMESPACE, key);
-                log.info("unlocked account: {s}", .{username});
-                return;
+                removed = true;
             }
-            // A fold-equal legacy row is the same lock and must be removed
-            // too, or unlock cannot clear it (S3).
-            if (self.legacy_free) return;
-            const legacy_key = (try self.legacyFind(allocator, key)) orelse return;
-            defer allocator.free(legacy_key);
-            try self.backend.delete(NAMESPACE, legacy_key);
-            log.info("unlocked account: {s} (legacy key '{s}')", .{ username, legacy_key });
+            // A fold-equal legacy row is the same lock under a pre-fold key.
+            if (!self.legacy_free) {
+                if (try self.legacyFind(allocator, key)) |legacy_key| {
+                    defer allocator.free(legacy_key);
+                    try self.backend.delete(NAMESPACE, legacy_key);
+                    removed = true;
+                }
+            }
+            if (removed) log.info("unlocked account: {s}", .{username});
         }
 
         /// Re-key rows whose key is not canonical lowercase (written before
@@ -389,6 +392,28 @@ test "LockStore: legacy mixed-case rows are enforced and removable" {
     try store.unlock(allocator, "alice");
     try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
     try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
+}
+
+test "LockStore: unlock clears a canonical and a legacy row for the same name (D3)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // Both rows describe the same lock: the canonical one and one written
+    // before keys were case-folded. Removing either alone leaves the
+    // account locked (S3).
+    try store.lock("alice", .permanent);
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 7));
+
+    try store.unlock(allocator, "alice");
+
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "alice")) == null);
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+    try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
+    try std.testing.expect((try store.isLocked(allocator, "ALICE")) == null);
 }
 
 test "LockStore: migration re-keys legacy rows to canonical" {
