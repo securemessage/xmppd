@@ -256,7 +256,14 @@ pub const MemoryBackend = struct {
     pub const WriteBatch = struct {
         backend: *Self,
         ops: std.ArrayListUnmanaged(BatchOp),
-        ended: bool = false,
+        /// End attempts so far (commit or abort). abort() after a commit
+        /// attempt is a no-op (S9); the count keeps a guard violation
+        /// observable instead of a silent double free.
+        ends: u8 = 0,
+        /// Fault hook for tests: commit fails at this op index after the
+        /// earlier ops were applied (a partial failure), exercising the
+        /// failure cleanup.
+        fail_op_at: ?usize = null,
 
         const BatchOp = union(enum) {
             put_op: struct { ns: []const u8, key: []const u8, value: []const u8 },
@@ -279,20 +286,30 @@ pub const MemoryBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            for (self.ops.items) |op| {
+            // Ended whether the apply succeeds or not: a partial failure
+            // must not leave the op list allocated, and abort() after the
+            // commit attempt is a no-op (S9).
+            defer self.end();
+            for (self.ops.items, 0..) |op, i| {
+                if (self.fail_op_at) |n| {
+                    if (i == n) return error.MapFull;
+                }
                 switch (op) {
                     .put_op => |p| try self.backend.put(p.ns, p.key, p.value),
                     .delete_op => |d| try self.backend.delete(d.ns, d.key),
                 }
             }
-            self.ended = true;
-            self.ops.deinit(self.backend.backing);
         }
 
         pub fn abort(self: *WriteBatch) void {
-            if (self.ended) return;
-            self.ended = true;
+            if (self.ends > 0) return;
+            self.end();
+        }
+
+        fn end(self: *WriteBatch) void {
+            self.ends += 1;
             self.ops.deinit(self.backend.backing);
+            self.ops = .{};
         }
     };
 
@@ -502,6 +519,54 @@ test "MemoryBackend: writeBatch abort" {
 
     const val = try db.get(std.testing.allocator, "users", "alice");
     try std.testing.expect(val == null);
+}
+
+test "MemoryBackend: a partial commit failure frees the op list and ends the batch" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    try batch.put("users", "bob", "b");
+    try batch.put("users", "carol", "c");
+    // Fail the third op: two are applied before the failure.
+    batch.fail_op_at = 2;
+    try std.testing.expectError(error.MapFull, batch.commit());
+
+    // The batch is ended and the op list freed: a partial failure must not
+    // leak it (S9).
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expectEqual(@as(usize, 0), batch.ops.items.len);
+
+    // abort() after the commit attempt is a no-op.
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    // Ops before the failure were applied; the failed one was not.
+    const a = try db.get(std.testing.allocator, "users", "alice");
+    defer if (a) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("a", a.?);
+    const c = try db.get(std.testing.allocator, "users", "carol");
+    try std.testing.expect(c == null);
+}
+
+test "MemoryBackend: abort after a commit attempt is a no-op" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    try batch.commit();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    const a = try db.get(std.testing.allocator, "users", "alice");
+    defer if (a) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("a", a.?);
 }
 
 test "MemoryBackend: separate namespaces" {

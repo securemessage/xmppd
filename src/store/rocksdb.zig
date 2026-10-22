@@ -370,9 +370,15 @@ pub const RocksDbBackend = struct {
     // -- WriteBatch --
 
     pub const WriteBatch = struct {
-        batch: *c.rocksdb_writebatch_t,
+        batch: ?*c.rocksdb_writebatch_t,
         backend: *RocksDbBackend,
-        ended: bool = false,
+        /// End attempts so far (commit or abort). abort() after a commit
+        /// attempt is a no-op (S9); the count keeps a guard violation
+        /// observable instead of a silent double destroy.
+        ends: u8 = 0,
+        /// Test-only fault hook (S9): the commit fails the way a RocksDB
+        /// write error does, without driving the C layer.
+        fail_commit: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const cf = try self.backend.getOrCreateCf(ns);
@@ -397,9 +403,13 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            // A write is atomic and the batch is destroyed either way, so
-            // abort() after commit is a no-op (S9).
-            self.ended = true;
+            // A write is atomic and the C batch is destroyed once either
+            // way: abort() after a commit attempt is a no-op (S9).
+            self.ends += 1;
+            if (self.fail_commit) {
+                self.destroyBatch();
+                return error.RocksDbWriteFailed;
+            }
             var err: [*c]u8 = null;
             c.rocksdb_write(
                 self.backend.db,
@@ -407,7 +417,7 @@ pub const RocksDbBackend = struct {
                 self.batch,
                 &err,
             );
-            c.rocksdb_writebatch_destroy(self.batch);
+            self.destroyBatch();
 
             if (err != null) {
                 log.err("rocksdb_write: {s}", .{std.mem.span(err)});
@@ -417,9 +427,16 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn abort(self: *WriteBatch) void {
-            if (self.ended) return;
-            self.ended = true;
-            c.rocksdb_writebatch_destroy(self.batch);
+            if (self.ends > 0) return;
+            self.ends += 1;
+            self.destroyBatch();
+        }
+
+        fn destroyBatch(self: *WriteBatch) void {
+            if (self.batch) |b| {
+                c.rocksdb_writebatch_destroy(b);
+                self.batch = null;
+            }
         }
     };
 
@@ -620,6 +637,48 @@ test "RocksDbBackend: writeBatch abort" {
     batch.abort();
 
     const val = try db.get(std.testing.allocator, "users", "alice");
+    try std.testing.expect(val == null);
+}
+
+test "RocksDbBackend: abort after a commit attempt is a no-op" {
+    const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    try batch.commit();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+}
+
+test "RocksDbBackend: a failed write ends the batch" {
+    const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    // Fault hook: the commit fails the way a RocksDB write error does.
+    batch.fail_commit = true;
+    try std.testing.expectError(error.RocksDbWriteFailed, batch.commit());
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    // abort() after the commit attempt is a no-op.
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    // Nothing was written.
+    const val = try db.get(std.testing.allocator, "users", "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
     try std.testing.expect(val == null);
 }
 

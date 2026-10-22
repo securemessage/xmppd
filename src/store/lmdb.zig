@@ -600,6 +600,40 @@ test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358)" {
     try std.testing.expectEqual(@as(usize, 128 * 1024), db.map_size);
 }
 
+test "LmdbBackend: a commit that hits the map limit ends the batch and rolls back the DBI cache" {
+    const path = freshTestDir();
+    // A small map is the fault hook (S9): at the map boundary a put can
+    // succeed from the dirty page cache while the commit cannot allocate
+    // the pages to write the batch out (MDB_MAP_FULL).
+    var db = try LmdbBackend.open(path, .{ .map_size = 128 * 1024 });
+    defer db.close();
+
+    // Fill until a write fails: the map is at its limit and the map
+    // boundary is exactly where a put fits but its commit does not.
+    var big: [3000]u8 = @splat('x');
+    var kbuf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const k = std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i}) catch unreachable;
+        db.put("scratch", k, &big) catch break;
+    }
+
+    const dc0 = db.dbi_count.load(.acquire);
+    var batch = try db.writeBatch();
+    try batch.put("fresh", "a", "1");
+    try batch.put("scratch", "b", "2");
+    try std.testing.expectEqual(dc0 + 1, db.dbi_count.load(.acquire));
+    try std.testing.expectError(error.MDB_MAP_FULL, batch.commit());
+
+    // The batch is ended before the txn ran: abort() after the commit
+    // attempt is a no-op (S9).
+    try std.testing.expect(batch.ended);
+    // The DBI opened inside the failed txn is not usable later.
+    try std.testing.expectEqual(dc0, db.dbi_count.load(.acquire));
+    batch.abort();
+    try std.testing.expectEqual(dc0, db.dbi_count.load(.acquire));
+}
+
 test "LmdbBackend: read-only open with create=false serves reads, refuses to write" {
     const path = freshTestDir();
     // Seed with a writer open

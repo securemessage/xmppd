@@ -222,7 +222,7 @@ pub const SqliteBackend = struct {
 
     pub fn writeBatch(self: *SqliteBackend) !WriteBatch {
         _ = execSimple(self.db, "BEGIN IMMEDIATE");
-        return .{ .backend = self, .committed = false, .table_count_at_start = self.table_count };
+        return .{ .backend = self, .table_count_at_start = self.table_count };
     }
 
     // -- Iterator --
@@ -256,7 +256,11 @@ pub const SqliteBackend = struct {
 
     pub const WriteBatch = struct {
         backend: *SqliteBackend,
-        committed: bool,
+        /// Ended once commit was attempted (success or failure) or abort
+        /// ran: abort() after a commit attempt is a no-op (S9), and a
+        /// failed commit never leaves the shared connection in a txn a
+        /// later abort() would roll back.
+        ended: bool = false,
         table_count_at_start: u32,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
@@ -268,24 +272,26 @@ pub const SqliteBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
+            self.ended = true;
             if (execSimple(self.backend.db, "COMMIT") != 0) {
-                // A failed COMMIT leaves the txn open: end it here so
-                // abort() is never needed after commit (S9).
-                self.abort();
+                self.rollback();
                 return error.SqliteCommitFailed;
             }
-            self.committed = true;
         }
 
         pub fn abort(self: *WriteBatch) void {
-            if (!self.committed) {
-                _ = execSimple(self.backend.db, "ROLLBACK");
-                // Rollback may have undone CREATE TABLE statements made inside
-                // the transaction. Reset table cache to the state before BEGIN.
-                self.backend.table_lock.lock();
-                self.backend.table_count = self.table_count_at_start;
-                self.backend.table_lock.unlock();
-            }
+            if (self.ended) return;
+            self.ended = true;
+            self.rollback();
+        }
+
+        fn rollback(self: *WriteBatch) void {
+            _ = execSimple(self.backend.db, "ROLLBACK");
+            // Rollback may have undone CREATE TABLE statements made inside
+            // the transaction. Reset table cache to the state before BEGIN.
+            self.backend.table_lock.lock();
+            self.backend.table_count = self.table_count_at_start;
+            self.backend.table_lock.unlock();
         }
     };
 
@@ -494,6 +500,72 @@ test "SqliteBackend: writeBatch abort" {
 
     const val = try db.get(std.testing.allocator, "users", "alice");
     try std.testing.expect(val == null);
+}
+
+/// sqlite3_commit_hook callback that vetoes the commit: SQLite rolls the
+/// transaction back and the COMMIT statement fails, the way a busy or full
+/// database fails one. The fault hook for the commit-failure tests.
+fn vetoCommit(_: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+test "SqliteBackend: a failed COMMIT ends the batch: a later abort is a no-op" {
+    const path = "/tmp/xmppd-test-sqlite-commitfail.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    // Fault hook: every COMMIT fails while installed.
+    _ = c.sqlite3_commit_hook(db.db, vetoCommit, null);
+
+    var b1 = try db.writeBatch();
+    try b1.put("users", "alice", "a");
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    // The commit attempt ended the batch: abort() can never ROLLBACK the
+    // shared connection a second time (S9).
+    try std.testing.expect(b1.ended);
+
+    _ = c.sqlite3_commit_hook(db.db, null, null);
+
+    var b2 = try db.writeBatch();
+    try b2.put("users", "bob", "b");
+    b1.abort(); // no-op
+    try b2.commit();
+
+    const v = try db.get(std.testing.allocator, "users", "bob");
+    defer if (v) |x| std.testing.allocator.free(x);
+    try std.testing.expectEqualStrings("b", v.?);
+}
+
+test "SqliteBackend: a failed COMMIT rolls back and resets the table cache" {
+    const path = "/tmp/xmppd-test-sqlite-commitcache.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    _ = c.sqlite3_commit_hook(db.db, vetoCommit, null);
+
+    const tc0 = db.table_count;
+    var b1 = try db.writeBatch();
+    // A namespace outside the canonical set: its CREATE TABLE lives and
+    // dies with the failed transaction.
+    try b1.put("scratch", "k", "v");
+    try std.testing.expectEqual(tc0 + 1, db.table_count);
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    // The rolled-back CREATE TABLE must not leave a cache entry behind.
+    try std.testing.expectEqual(tc0, db.table_count);
+
+    _ = c.sqlite3_commit_hook(db.db, null, null);
+
+    // The namespace is usable again: the table is recreated on demand.
+    var b2 = try db.writeBatch();
+    try b2.put("scratch", "k2", "v2");
+    try b2.commit();
+    const v = try db.get(std.testing.allocator, "scratch", "k2");
+    defer if (v) |x| std.testing.allocator.free(x);
+    try std.testing.expectEqualStrings("v2", v.?);
 }
 
 test "SqliteBackend: reopen preserves data" {
