@@ -220,21 +220,19 @@ pub fn main() !void {
     var child_uid: posix.uid_t = 0;
     var child_gid: posix.gid_t = 0;
     if (run_user) |username| {
-        var user_buf: [256]u8 = undefined;
-        if (username.len < user_buf.len) {
-            @memcpy(user_buf[0..username.len], username);
-            user_buf[username.len] = 0;
-            const pw = std.c.getpwnam(@ptrCast(&user_buf));
-            if (pw) |entry| {
-                child_uid = entry.uid;
-                child_gid = entry.gid;
-                log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
+        const ids = resolveRunUser(username) catch |err| {
+            // A configured run user must never silently degrade to root
+            // (C5).
+            if (err == error.RunUserNotFound) {
+                log.err("user '{s}' not found: refusing to start; children must not run as root", .{username});
             } else {
-                log.err("user '{s}' not found — children will run as root", .{username});
+                log.err("user name too long: {s}", .{username});
             }
-        } else {
-            log.err("user name too long: {s}", .{username});
-        }
+            return err;
+        };
+        child_uid = ids.uid;
+        child_gid = ids.gid;
+        log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
     }
 
     // --- Daemonize if requested ---
@@ -671,6 +669,18 @@ pub fn main() !void {
     log.info("xmppd master shutdown complete", .{});
 }
 
+/// Resolve the run user's uid and gid. A missing user or an unusable name
+/// is a startup failure: falling back to uid 0 would run the children as
+/// root (C5). Logging belongs to the caller.
+fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong }!struct { uid: posix.uid_t, gid: posix.gid_t }) {
+    var user_buf: [256]u8 = undefined;
+    if (username.len >= user_buf.len) return error.RunUserTooLong;
+    @memcpy(user_buf[0..username.len], username);
+    user_buf[username.len] = 0;
+    const pw = std.c.getpwnam(@ptrCast(&user_buf)) orelse return error.RunUserNotFound;
+    return .{ .uid = pw.uid, .gid = pw.gid };
+}
+
 /// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
 /// (T259: nothing under /var/run/xmppd is hardcoded anymore).
 fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
@@ -966,4 +976,16 @@ test "pidFilePath builds run_dir-relative path" {
     var buf: [4096]u8 = undefined;
     const p = try pidFilePath(&buf, "/var/run/xmppd", "auth.pid");
     try std.testing.expectEqualStrings("/var/run/xmppd/auth.pid", p);
+}
+
+test "resolveRunUser: a missing user is a startup failure, not a root fallback (C5)" {
+    try std.testing.expectError(error.RunUserNotFound, resolveRunUser("xmppd-no-such-user"));
+    var too_long: [256]u8 = @splat('x');
+    try std.testing.expectError(error.RunUserTooLong, resolveRunUser(&too_long));
+}
+
+test "resolveRunUser: a configured user resolves to its passwd entry (C5)" {
+    const ids = try resolveRunUser("root");
+    try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
+    try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
 }
