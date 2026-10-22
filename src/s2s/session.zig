@@ -647,24 +647,20 @@ pub const S2sSession = struct {
             w.writeByte('\'') catch return self.markOverflow();
         }
         // Attribute prefixes declared once per element: duplicate xmlns:p on
-        // one tag would be a duplicate XML attribute.
-        var declared: [8][]const u8 = undefined;
-        var declared_n: usize = 0;
-        for (elem.attributes) |attr| {
+        // one tag would be a duplicate XML attribute. The dedupe scans the
+        // attributes already written on this tag, so any number of distinct
+        // prefixes re-emits its binding exactly once.
+        for (elem.attributes, 0..) |attr, ai| {
             if (attr.prefix.len > 0 and
                 !std.mem.eql(u8, attr.prefix, "xml") and
                 !std.mem.eql(u8, attr.prefix, "xmlns"))
             {
                 var seen = elem.prefix.len > 0 and std.mem.eql(u8, elem.prefix, attr.prefix);
-                for (declared[0..declared_n]) |p| {
-                    if (std.mem.eql(u8, p, attr.prefix)) seen = true;
+                for (elem.attributes[0..ai]) |prev| {
+                    if (std.mem.eql(u8, prev.prefix, attr.prefix)) seen = true;
                 }
                 const uri = if (reader) |r| r.resolveNamespace(attr.prefix) else "";
                 if (!seen and uri.len > 0) {
-                    if (declared_n < declared.len) {
-                        declared[declared_n] = attr.prefix;
-                        declared_n += 1;
-                    }
                     w.writeAll(" xmlns:") catch return self.markOverflow();
                     w.writeAll(attr.prefix) catch return self.markOverflow();
                     w.writeAll("='") catch return self.markOverflow();
@@ -1335,4 +1331,84 @@ test "S2sSession: prefixed attributes keep their prefix declaration (S1)" {
     const out = try session.buildStanzaXml(&buf);
     // The forwarded stanza is self-contained: the declaration is inside it.
     try std.testing.expect(std.mem.indexOf(u8, out, "xmlns:ext='urn:ext'") != null);
+}
+
+test "S2sSession: a self-closing child keeps the prefix it declares on itself (S1)" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const input = "<message xmlns='jabber:server'><child xmlns:ext='urn:ext' ext:a='b'/></message>";
+    var pos: usize = 0;
+
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    // The child declared its own prefix on itself: the binding must still
+    // resolve while its event is being handled.
+    try std.testing.expectEqualStrings("urn:ext", reader.resolveNamespace("ext"));
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    // The declaration is re-emitted before the attribute that uses it, so
+    // the forwarded fragment is well-formed on its own.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:ext'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:a='b'") != null);
+    const decl_at = std.mem.indexOf(u8, inner, "xmlns:ext=").?;
+    const use_at = std.mem.indexOf(u8, inner, "ext:a=").?;
+    try std.testing.expect(decl_at < use_at);
+
+    // The scope dies with the element: the next event retires it.
+    _ = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expectEqualStrings("", reader.resolveNamespace("ext"));
+}
+
+test "S2sSession: any number of attribute prefixes re-emits each binding once (S1)" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // Ten distinct attribute prefixes on one child, the tenth used twice:
+    // every binding must be written exactly once (a second xmlns:ns9 on the
+    // same tag would be a duplicate XML attribute).
+    var decl_buf: [512]u8 = undefined;
+    var decl_len: usize = 0;
+    var attrs_buf: [512]u8 = undefined;
+    var attrs_len: usize = 0;
+    var n: usize = 0;
+    while (n < 10) : (n += 1) {
+        decl_len += (std.fmt.bufPrint(decl_buf[decl_len..], " xmlns:ns{d}='urn:ns{d}'", .{ n, n }) catch return error.Buffer).len;
+        attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns{d}:a='v{d}'", .{ n, n }) catch return error.Buffer).len;
+    }
+    attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns9:b='again'", .{}) catch return error.Buffer).len;
+    const input = try std.fmt.allocPrint(alloc, "<message xmlns='jabber:server'{s}><child{s}/></message>", .{ decl_buf[0..decl_len], attrs_buf[0..attrs_len] });
+    defer alloc.free(input);
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, inner, "xmlns:ns"));
+    n = 0;
+    while (n < 10) : (n += 1) {
+        var decl: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&decl, "xmlns:ns{d}=", .{n});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, d));
+        var use: [32]u8 = undefined;
+        const u = try std.fmt.bufPrint(&use, "ns{d}:a=", .{n});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, u));
+    }
+    // The repeated prefix's attribute is there too.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ns9:b='again'") != null);
 }
