@@ -150,9 +150,7 @@ pub const Supervisor = struct {
         var result: ?*std.c.passwd = null;
         const rc = std.c.getpwuid_r(self.uid, &pw, &pw_buf, pw_buf.len, &result);
         if (rc != 0 or result == null) {
-            // warn, not err: the fail-closed path is exercised by tests and
-            // the runner fails a step on err-level logs.
-            log.warn("uid {d} has no passwd entry; refusing to spawn with root's groups", .{self.uid});
+            log.err("uid {d} has no passwd entry; refusing to spawn with root's groups", .{self.uid});
             return error.PasswdLookupFailed;
         }
         try self.adoptRunGid(result.?.gid);
@@ -163,7 +161,7 @@ pub const Supervisor = struct {
     /// refused rather than dropped into.
     pub fn adoptRunGid(self: *Supervisor, gid: posix.gid_t) !void {
         if (self.uid != 0 and gid == 0) {
-            log.warn("run user uid {d} has gid 0; refusing to drop into group root", .{self.uid});
+            log.err("run user uid {d} has gid 0; refusing to drop into group root", .{self.uid});
             return error.RunGidIsRoot;
         }
         self.gid = gid;
@@ -537,6 +535,64 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
     _ = try sup2.waitChild();
 }
 
+/// An expected refusal logs at err (D8) and an err log in the test
+/// process fails the test: the runner counts err-level logs. A refusal
+/// under test runs in a forked child with stderr captured, so the log
+/// cannot trip the runner while the captured line proves the level and
+/// the message. The child returns 0 when the error and the supervisor
+/// state match, and a distinct code naming the mismatch otherwise.
+const Captured = struct { status: u8, stderr: [4096]u8, len: usize };
+
+fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
+    const fds = try posix.pipe();
+    const pid = try posix.fork();
+    if (pid == 0) {
+        _ = posix.close(fds[0]);
+        _ = posix.dup2(fds[1], 2) catch std.c._exit(125);
+        _ = posix.close(fds[1]);
+        std.c._exit(child_fn());
+    }
+    _ = posix.close(fds[1]);
+    defer _ = posix.close(fds[0]);
+    var out = Captured{ .status = 0, .stderr = undefined, .len = 0 };
+    while (out.len < out.stderr.len) {
+        const n = posix.read(fds[0], out.stderr[out.len..]) catch break;
+        if (n == 0) break;
+        out.len += n;
+    }
+    var status: u32 = 0;
+    if (std.c.waitpid(pid, @ptrCast(&status), 0) != pid) return error.WaitFailed;
+    out.status = @intCast((status >> 8) & 0xFF);
+    return out;
+}
+
+fn childResolveUnknownUid() callconv(.c) u8 {
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 999999;
+    if (sup.resolveRunGid()) |_| return 1 else |err| {
+        return if (err == error.PasswdLookupFailed) 0 else 2;
+    }
+}
+
+fn childSpawnNoPasswd() callconv(.c) u8 {
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 999999;
+    if (sup.spawnChild()) |_| return 1 else |err| {
+        if (err != error.PasswdLookupFailed) return 2;
+        if (sup.child_pid != null) return 3;
+        return if (sup.state == .not_started) 0 else 4;
+    }
+}
+
+fn childAdoptGidZero() callconv(.c) u8 {
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 65534;
+    if (sup.adoptRunGid(0)) |_| return 1 else |err| {
+        if (err != error.RunGidIsRoot) return 2;
+        return if (sup.gid == 0) 0 else 3;
+    }
+}
+
 test "Supervisor: uid-only drop resolves the run user's gid" {
     // setgroups([0]) on a uid-only drop kept wheel; the gid must come from
     // the passwd entry of the run user.
@@ -557,20 +613,21 @@ test "Supervisor: uid-only drop resolves the run user's gid" {
     try sup3.resolveRunGid();
     try std.testing.expectEqual(@as(posix.gid_t, 4242), sup3.gid);
 
-    // Unknown uid fails closed instead of spawning with root's groups.
-    var sup4 = Supervisor.init("/unused", &.{});
-    sup4.uid = 999999;
-    try std.testing.expectError(error.PasswdLookupFailed, sup4.resolveRunGid());
+    // Unknown uid fails closed instead of spawning with root's groups,
+    // and logs the refusal at err (D8).
+    const captured = try runCaptured(childResolveUnknownUid);
+    try std.testing.expectEqual(@as(u8, 0), captured.status);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 test "Supervisor: spawnChild refuses to start when the run user has no passwd entry" {
     // spawnChild resolves the run gid before forking: without the lookup a
-    // uid-only drop would fork and then run with the parent's groups.
-    var sup = Supervisor.init("/unused", &.{});
-    sup.uid = 999999; // no passwd entry: the primary gid cannot be resolved
-    try std.testing.expectError(error.PasswdLookupFailed, sup.spawnChild());
-    try std.testing.expect(sup.child_pid == null);
-    try std.testing.expectEqual(ChildState.not_started, sup.state);
+    // uid-only drop would fork and then run with the parent's groups. The
+    // refusal logs at err (D8); the child encodes the error and the
+    // untouched state in its exit code.
+    const captured = try runCaptured(childSpawnNoPasswd);
+    try std.testing.expectEqual(@as(u8, 0), captured.status);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 /// The identity drop runs setgroups, which needs privilege: a non-root
@@ -653,13 +710,16 @@ test "Supervisor: spawnChild drops the child into the run user's primary group" 
 }
 
 test "Supervisor: a run gid of 0 is refused" {
-    // group root after the drop is still group root: refuse it.
-    var sup = Supervisor.init("/unused", &.{});
-    sup.uid = 65534;
-    try std.testing.expectError(error.RunGidIsRoot, sup.adoptRunGid(0));
-    try std.testing.expectEqual(@as(posix.gid_t, 0), sup.gid);
+    // group root after the drop is still group root: refuse it, logging at
+    // err (D8). The child encodes the error and the untouched gid in its
+    // exit code.
+    const captured = try runCaptured(childAdoptGidZero);
+    try std.testing.expectEqual(@as(u8, 0), captured.status);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
 
     // A real primary gid is adopted.
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 65534;
     try sup.adoptRunGid(65534);
     try std.testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
 
