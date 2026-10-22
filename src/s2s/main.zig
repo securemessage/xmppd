@@ -1424,7 +1424,9 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 
     if (conn.isEstablished()) {
         // Connection already established: send db:verify immediately
-        sendDbVerifyOnCallback(daemon, conn);
+        if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
+            if (daemon.findOutboundSlot(conn)) |slot| daemon.closeOutbound(batch, slot);
+        }
     } else if (conn.state == .connecting and conn.fd < 0) {
         // New connection: initiate DNS + TCP connect
         daemon.initiateOutbound(batch, conn, origin);
@@ -1433,8 +1435,13 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 }
 
 /// Send db:verify stanzas for every registered callback that has not been
-/// sent yet on this outbound connection.
-fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
+/// sent yet on this outbound connection. Returns false when the write
+/// failed: the exchanges the connection carried are answered invalid and
+/// the caller tears it down, so a submitting stream is never left waiting
+/// for a verdict that can no longer arrive. Verifies that could not be
+/// queued (full write buffer) stay unsent and go out from the writable
+/// edge.
+fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) bool {
     for (&conn.db_pending) |*p| {
         if (!p.in_use or p.verify_sent) continue;
         const key = p.key();
@@ -1451,15 +1458,30 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
         ) catch continue;
 
         conn.queueWrite(verify_xml) catch {
-            log.warn("dialback callback: cannot queue db:verify for stream {s}", .{sid});
+            log.warn("dialback callback: write buffer full, db:verify for stream {s} waits for the writable edge", .{sid});
             continue;
         };
         p.verify_sent = true;
         log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
     }
     if (conn.hasPendingWrite()) {
-        _ = conn.flushWrite() catch {};
+        _ = conn.flushWrite() catch {
+            log.warn("dialback callback: db:verify write to {s} failed; answering pending exchanges invalid", .{conn.remote_domain});
+            for (0..conn.db_pending.len) |idx| {
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            }
+            conn.fail("write-failed");
+            return false;
+        };
     }
+    // Buffered bytes under backpressure and verifies that could not be
+    // queued both resume from the writable edge.
+    if (conn.hasPendingWrite() or conn.hasUnsentVerify()) {
+        if (daemon.findOutboundSlot(conn)) |slot| {
+            batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+        }
+    }
+    return true;
 }
 
 /// Handle a db:verify verdict that matched a pending callback entry.
@@ -1717,6 +1739,12 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 daemon.closeOutbound(batch, slot);
                 return;
             };
+            // db:verify stanzas that could not be queued earlier go out on
+            // this writable edge.
+            if (conn.hasUnsentVerify() and !sendDbVerifyOnCallback(daemon, batch, conn)) {
+                daemon.closeOutbound(batch, slot);
+                return;
+            }
             // T275: resume a kept stanza tail on the writable edge
             // even when no new stanza arrives; an idle link stranded it.
             if (conn.state == .established and !conn.hasPendingWrite() and conn.pendingCount() > 0) {
@@ -1943,7 +1971,9 @@ fn processOutboundEvent(
 
                 // Dialback callback: after TLS+features, send db:verify instead of auth
                 if (conn.hasPendingVerify()) {
-                    sendDbVerifyOnCallback(daemon, conn);
+                    if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
+                        daemon.closeOutbound(batch, slot);
+                    }
                     return;
                 }
 
@@ -3169,6 +3199,79 @@ test "S2sDaemon: a typed db:result verdict answers the dialback key this connect
     // second exchange to answer.
     feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
     try std.testing.expect(!ob.conn.db_assertion_pending);
+}
+
+test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The callback connection is dead before its db:verify can go out: the
+    // write fails, and the exchange is answered instead of leaving the
+    // submitting stream to wait for a verdict that can never arrive.
+    posix.close(cb.conn.fd);
+    cb.conn.fd = -1;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    try std.testing.expect(cb.conn.isFailed());
+    try std.testing.expectEqualStrings("write-failed", cb.conn.error_msg);
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+
+    // The submitting stream is told the key did not verify.
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a db:verify that could not be queued goes out on the writable edge" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+    daemon.outbound[0] = cb.conn; // writable dispatch resolves the slot
+
+    // Room for the whole write buffer to drain in one flush.
+    const big: c_int = 1 << 20;
+    try posix.setsockopt(cb.conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&big));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // Fill the conn write buffer: the verify cannot be queued when the
+    // submission arrives and must survive until the writable edge.
+    var filler: [8192]u8 = undefined;
+    @memset(&filler, 'x');
+    while (true) cb.conn.queueWrite(&filler) catch break;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "5555555555555555555555555555555555555555555555555555555555555555";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(cb.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+
+    // The writable edge drains the buffer and queues the verify.
+    handleOutboundWritable(&daemon, &cl, 0);
+    try std.testing.expect(!cb.conn.hasUnsentVerify());
+
+    var vbuf: [32768]u8 = undefined;
+    const out = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, out, "<db:verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, key) != null);
 }
 
 test "S2sDaemon: a full domain set answers a valid dialback verdict invalid (S2)" {
