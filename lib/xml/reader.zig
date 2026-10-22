@@ -236,8 +236,11 @@ pub const Reader = struct {
                     const elem = self.buildElement(false);
                     // For non-self-closing elements, namespace is restored on element_close
 
-                    // The stream:stream element is special
-                    if (std.mem.eql(u8, self.current_element_prefix, "stream") and
+                    // The stream root is matched by namespace + local name, not
+                    // by the literal "stream" prefix, so a differently-prefixed
+                    // stream element is still recognized and any nested one is
+                    // rejected (S27).
+                    if (std.mem.eql(u8, elem.namespace_uri, "http://etherx.jabber.org/streams") and
                         std.mem.eql(u8, self.current_element_local, "stream"))
                     {
                         if (self.depth != 1) {
@@ -245,10 +248,6 @@ pub const Reader = struct {
                             // violation (S27).
                             return error.NestedStreamElement;
                         }
-                        self.stream_opened = true;
-                        return Event{ .stream_open = elem };
-                    }
-                    if (self.depth == 1 and std.mem.eql(u8, self.current_element_prefix, "stream")) {
                         self.stream_opened = true;
                         return Event{ .stream_open = elem };
                     }
@@ -310,10 +309,11 @@ pub const Reader = struct {
                         self.default_ns = self.ns_stack[self.ns_stack_depth];
                     }
 
-                    // Stream close
-                    if (std.mem.eql(u8, token.prefix, "stream") and
-                        std.mem.eql(u8, token.local_name, "stream"))
-                    {
+                    // Stream close: the validated root close (the name check
+                    // above matched elem_names[0]). Detected by closing the
+                    // root while a stream is open, not by the literal prefix,
+                    // so a differently-prefixed stream root closes cleanly (S27).
+                    if (self.elem_depth == 0 and self.stream_opened) {
                         self.stream_opened = false;
                         return Event.stream_close;
                     }
@@ -600,6 +600,59 @@ test "reader: S27 nested stream:stream is a protocol error" {
         _ = (try reader.next(nested, &pos)).?; // <message>
         try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
     }
+}
+
+test "reader: S27 nested stream element with a foreign prefix is rejected" {
+    const allocator = std.testing.allocator;
+    const stream = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>";
+
+    // Non-self-closing nested form with a different prefix bound to the streams namespace.
+    {
+        var reader = Reader.init(allocator);
+        defer reader.deinit();
+        var pos: usize = 0;
+        _ = try reader.next(stream, &pos);
+        const nested = "<x:stream xmlns:x='http://etherx.jabber.org/streams'>";
+        pos = 0;
+        try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
+    }
+
+    // Self-closing nested form with a different prefix.
+    {
+        var reader = Reader.init(allocator);
+        defer reader.deinit();
+        var pos: usize = 0;
+        _ = try reader.next(stream, &pos);
+        const nested = "<x:stream xmlns:x='http://etherx.jabber.org/streams'/>";
+        pos = 0;
+        try std.testing.expectError(error.NestedStreamElement, reader.next(nested, &pos));
+    }
+}
+
+test "reader: S27 stream root with a foreign prefix opens and closes cleanly" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<x:stream xmlns='jabber:client' xmlns:x='http://etherx.jabber.org/streams'>" ++
+        "<presence/>" ++
+        "</x:stream>";
+    var pos: usize = 0;
+
+    const ev1 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev1 == .stream_open);
+    try std.testing.expectEqualStrings("stream", ev1.stream_open.local_name);
+    try std.testing.expectEqualStrings("http://etherx.jabber.org/streams", ev1.stream_open.namespace_uri);
+    try std.testing.expect(reader.stream_opened);
+
+    const ev2 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev2 == .element_start);
+    try std.testing.expectEqualStrings("presence", ev2.element_start.local_name);
+
+    // The foreign-prefixed root close is still a stream close, not an element end.
+    const ev3 = (try reader.next(input, &pos)).?;
+    try std.testing.expect(ev3 == .stream_close);
+    try std.testing.expect(!reader.stream_opened);
 }
 
 test "reader: S27 self-closing stream child is an ordinary element" {
