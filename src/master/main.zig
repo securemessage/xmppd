@@ -678,9 +678,6 @@ fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ run_dir, file }) catch unreachable;
 }
 
-/// Write a child PID file for orphan detection on restart. Contents: a
-/// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
-/// kinfo_proc. (T259: run_dir-scoped, failures are logged.)
 /// The child's kernel-reported start time in seconds, or null when the pid
 /// has no kinfo. writeChildPid records 0 for null; a stored 0 never matches
 /// a live process's ki_start, so the orphan-kill identity check spares it.
@@ -690,6 +687,9 @@ fn childStartSec(pid: posix.pid_t) ?i64 {
     return kp.ki_start.tv_sec;
 }
 
+/// Write a child PID file for orphan detection on restart. Contents: a
+/// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
+/// kinfo_proc. (T259: run_dir-scoped, failures are logged.)
 fn writeChildPid(path: []const u8, pid: posix.pid_t, base: []const u8) void {
     const file = std.fs.cwd().createFile(path, .{}) catch |err| {
         log.err("writeChildPid {s}: {}", .{ path, err });
