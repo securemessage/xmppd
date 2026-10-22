@@ -140,6 +140,11 @@ pub const OutboundConnection = struct {
     /// per (stream id, origin, target): a later db:result for a different
     /// target must not overwrite another session's callback.
     db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
+    /// Our own outbound dialback key awaiting its verdict: set when the key
+    /// is written on this connection, cleared by the typed db:result that
+    /// answers it. A verdict can only authenticate this connection while
+    /// that exchange is outstanding.
+    db_assertion_pending: bool = false,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
@@ -558,6 +563,18 @@ pub const OutboundConnection = struct {
 
     pub fn clearPendingVerify(self: *OutboundConnection, idx: usize) void {
         if (idx < self.db_pending.len) self.db_pending[idx] = .{};
+    }
+
+    /// Complete the outstanding dialback key this connection sent, if the
+    /// verdict answers it. The responder echoes from and to swapped
+    /// (from=peer, to=us); a missing attribute is not a mismatch. Returns
+    /// false, leaving the exchange outstanding, for anything else.
+    pub fn takePendingAssertion(self: *OutboundConnection, from: []const u8, to: []const u8) bool {
+        if (!self.db_assertion_pending) return false;
+        if (from.len > 0 and !std.ascii.eqlIgnoreCase(from, self.remote_domain)) return false;
+        if (to.len > 0 and !std.ascii.eqlIgnoreCase(to, self.local_domain)) return false;
+        self.db_assertion_pending = false;
+        return true;
     }
 
     /// Any registered callback (sent or not).

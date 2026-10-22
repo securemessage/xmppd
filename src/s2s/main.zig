@@ -1887,15 +1887,22 @@ fn processOutboundEvent(
                         handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
                         return;
                     }
-                }
-                if (std.mem.eql(u8, result_type, "valid")) {
-                    log.info("outbound dialback verified by {s}", .{conn.remote_domain});
-                    conn.handleAuthSuccess();
-                    daemon.flushOutboundStanzas(batch, conn);
-                } else if (result_type.len > 0) {
-                    log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
-                    conn.handleAuthFailure();
-                    daemon.closeOutbound(batch, slot);
+                    // The verdict on the dialback key this connection sent:
+                    // it authenticates the connection only while that
+                    // exchange is outstanding.
+                    if (conn.takePendingAssertion(r_from, r_to)) {
+                        if (std.mem.eql(u8, result_type, "valid")) {
+                            log.info("outbound dialback verified by {s}", .{conn.remote_domain});
+                            conn.handleAuthSuccess();
+                            daemon.flushOutboundStanzas(batch, conn);
+                        } else {
+                            log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
+                            conn.handleAuthFailure();
+                            daemon.closeOutbound(batch, slot);
+                        }
+                        return;
+                    }
+                    log.warn("dialback: unmatched db:result verdict type={s} from {s} (id={s} from={s} to={s}); ignored", .{ result_type, conn.remote_domain, r_id, r_from, r_to });
                 }
             }
             // Handle db:verify response (dialback callback path)
@@ -1978,6 +1985,7 @@ fn processOutboundEvent(
                         ) catch return;
                         conn.queueWrite(db_result) catch return;
                         _ = conn.flushWrite() catch return;
+                        conn.db_assertion_pending = true;
                         log.info("outbound dialback key sent to {s}", .{conn.remote_domain});
                     },
                     .none => {},
@@ -3071,6 +3079,96 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2)" {
     var rbuf: [512]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+}
+
+/// A connected outbound connection on a socketpair, still unauthenticated:
+/// the test drives the dialback exchange directly, so no DNS happens. The
+/// conn fd is owned by the pool (daemon.deinit closes it).
+fn makeTestOutboundConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    errdefer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    return .{ .conn = conn, .peer_fd = fds[1] };
+}
+
+/// Feed a typed db:result verdict through processOutboundEvent: the answer
+/// either to our own dialback key (from/to echo) or, with an id, to our
+/// db:verify.
+fn feedDbResultVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, verdict: []const u8, from: []const u8, to: []const u8) void {
+    var attrs = [_]xml.Attribute{ testAttr("type", verdict), testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+test "S2sDaemon: a typed db:result verdict with no dialback key sent authenticates nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer posix.close(ob.peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // This connection never asserted a dialback key: no verdict, echoed
+    // from/to or bare, may stand in for one.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(!ob.conn.isEstablished());
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "", "");
+    try std.testing.expect(!ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.stream.authenticated);
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+}
+
+test "S2sDaemon: a typed db:result verdict answers the dialback key this connection sent" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer posix.close(ob.peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // Post-TLS stream restart: the features reply picks dialback (no DANE)
+    // and sends our key over this connection.
+    ob.conn.stream.state = .awaiting_stream_open_tls;
+    ob.conn.handleRemoteStreamOpen("them.example", "streamid-77");
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "features" });
+    try std.testing.expect(ob.conn.db_assertion_pending);
+
+    var kbuf: [1024]u8 = undefined;
+    const key_xml = kbuf[0..drainPeer(ob.peer_fd, &kbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "<db:result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "from='us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "to='them.example'") != null);
+
+    // The verdict answering that key authenticates the connection and
+    // completes the exchange.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+
+    // The completed exchange stays complete: a replayed verdict is not a
+    // second exchange to answer.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(!ob.conn.db_assertion_pending);
 }
 
 test "S2sDaemon: a full domain set answers a valid dialback verdict invalid (S2)" {
