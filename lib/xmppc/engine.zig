@@ -1573,9 +1573,14 @@ test "engine: loopOnce with a stale generation returns before the wait (T252)" {
     // The stop bump and its wake land before loopOnce drains: the drain
     // consumes the wake byte, so only the post-drain generation re-check
     // returns before kevent(). Without it the call waits out the timer and
-    // reports success instead of Stopping.
+    // reports success instead of Stopping. The wake read is the order
+    // proof: a re-check moved before the drain returns Stopping without
+    // consuming the byte, which reopens the race (a bump landing while
+    // the drain runs is then never seen).
+    const wakes_before = eng.stats.wakes_read.load(.monotonic);
     _ = eng.run_gen.fetchAdd(1, .acq_rel);
     eng.requestWake();
     try std.testing.expectError(error.Stopping, eng.loopOnce(gen));
+    try std.testing.expect(eng.stats.wakes_read.load(.monotonic) > wakes_before);
     try std.testing.expectEqual(@as(usize, 0), fired);
 }
