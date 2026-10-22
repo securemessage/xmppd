@@ -473,8 +473,8 @@ test "Supervisor: a pass_fd already at its target survives exec (S7)" {
 
 test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7)" {
     // The scratch F_DUPFD band sits right above the targets, so a small
-    // descriptor limit (10) does not break the remap. The old fixed
-    // TMP_BASE=8192 scratch failed here.
+    // descriptor limit (10) does not break the remap. A fixed high scratch
+    // base would fail here.
     var p1: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p1) != 0) return error.Socketpair;
     var p2: [2]posix.fd_t = undefined;
@@ -485,11 +485,17 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7)" {
 
     const pid = try posix.fork();
     if (pid == 0) {
-        // Deterministic child table: sources at 6 and 7, nothing else above
-        // stderr, then cap the descriptor space at 10.
-        if (std.c.dup2(p1[1], 6) < 0) std.c._exit(125);
-        if (std.c.dup2(p2[1], 7) < 0) std.c._exit(125);
-        var fd: c_int = 5;
+        // Deterministic child table: park both sources above the target
+        // zone first (raw ends inside 3..7 clobber each other under dup2),
+        // move the parked copies onto 6 and 7, then drop every other
+        // descriptor and cap the space at 10.
+        const parked1 = std.c.fcntl(p1[1], std.c.F.DUPFD, @as(c_int, 16));
+        if (parked1 < 0) std.c._exit(125);
+        const parked2 = std.c.fcntl(p2[1], std.c.F.DUPFD, @as(c_int, 16));
+        if (parked2 < 0) std.c._exit(125);
+        if (std.c.dup2(parked1, 6) < 0) std.c._exit(125);
+        if (std.c.dup2(parked2, 7) < 0) std.c._exit(125);
+        var fd: c_int = 3;
         while (fd < 64) : (fd += 1) {
             if (fd == 6 or fd == 7) continue;
             _ = std.c.close(fd);
