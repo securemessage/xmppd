@@ -1955,18 +1955,32 @@ pub const Server = struct {
                         const client_h = std.fmt.parseInt(u32, attr.value, 10) catch {
                             // A malformed handled-count cannot be trusted;
                             // parsing it as 0 would silently desync the ack
-                            // window (S24).
-                            self.sendSmHandledCountError(session, changes);
+                            // window (S24). It cannot be echoed back, so no h
+                            // is reported on the error.
+                            self.sendSmHandledCountError(session, null, changes);
                             return;
                         };
-                        session.sm_out_h = client_h;
-                        if (session.sm_unacked) |queue| {
-                            // XEP-0198 §3: h above the number of stanzas
-                            // sent fails the stream.
-                            if (queue.ack(client_h) == .too_high) {
-                                self.sendSmHandledCountError(session, changes);
+                        // S24: validate the report before recording it. With a
+                        // resume queue the queue is authoritative (it discards
+                        // on success); with SM and no resume there is no queue,
+                        // so the sent count is checked here. sm_out_h advances
+                        // only for an accepted report, so a duplicate or
+                        // backwards h cannot corrupt it.
+                        const verdict: sm_state.SmUnackedQueue.AckResult = if (session.sm_unacked) |queue|
+                            queue.ack(client_h)
+                        else
+                            sm_state.classifyAck(client_h, session.sm_out_h, session.sm_out_seq);
+                        switch (verdict) {
+                            .ok => session.sm_out_h = client_h,
+                            // XEP-0198 Example 17: h above the number of
+                            // stanzas sent fails the stream.
+                            .too_high => {
+                                self.sendSmHandledCountError(session, client_h, changes);
                                 return;
-                            }
+                            },
+                            // A duplicate or out-of-order report discards
+                            // nothing and must not move sm_out_h.
+                            .backwards => {},
                         }
                         break;
                     }
@@ -4626,12 +4640,18 @@ pub const Server = struct {
     }
 
     /// XEP-0198 §3: an <a/> whose handled-count is malformed or above the
-    /// number of stanzas sent fails the stream (S24).
-    fn sendSmHandledCountError(self: *Server, session: *Session, changes: *ChangeList) void {
+    /// number of stanzas sent fails the stream (S24). A parseable but too-high
+    /// `h` is echoed with the count sent (XEP-0198 Example 17); a malformed `h`
+    /// cannot be echoed, so the optional attributes are omitted.
+    fn sendSmHandledCountError(self: *Server, session: *Session, h: ?u32, changes: *ChangeList) void {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
         w.writeAll("<stream:error><undefined-condition xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>" ++
-            "<handled-count-too-high xmlns='urn:xmpp:sm:3'/></stream:error>") catch return;
+            "<handled-count-too-high xmlns='urn:xmpp:sm:3'") catch return;
+        if (h) |v| {
+            w.print(" h='{d}' send-count='{d}'", .{ v, session.sm_out_seq }) catch return;
+        }
+        w.writeAll("/></stream:error>") catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
         session.conn.flushSync();
         session_lifecycle.forceCloseSession(self, session.conn.id, changes);
@@ -6550,6 +6570,94 @@ test "Server: S24 malformed a h fails the stream" {
         total += n;
     } else |_| {}
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "handled-count-too-high") != null);
+}
+
+test "Server: S24 SM without resume rejects h above the sent count" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .active;
+    session.sm_enabled = true;
+    // SM without resume has no unacked queue, but the sent count is tracked.
+    // Five stanzas sent; the client claims ten handled.
+    session.sm_out_seq = 5;
+    session.sm_unacked = null;
+
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='10'/>");
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], buf[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "handled-count-too-high") != null);
+    // XEP-0198 Example 17: the error reports the offending h and the send count.
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "h='10'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "send-count='5'") != null);
+}
+
+test "Server: S24 a backwards or duplicate a h does not corrupt the accepted count" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .active;
+    session.sm_enabled = true;
+    session.sm_out_seq = 5;
+    session.sm_out_h = 3;
+    session.sm_unacked = null;
+
+    // A backwards report (h=2 below the accepted 3) must not move sm_out_h.
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='2'/>");
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expectEqual(@as(u32, 3), session.sm_out_h);
+
+    // A duplicate of the accepted count is a no-op as well.
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='3'/>");
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expectEqual(@as(u32, 3), session.sm_out_h);
+
+    // A forward report within the sent count is accepted and advances sm_out_h.
+    _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='4'/>");
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expectEqual(@as(u32, 4), session.sm_out_h);
 }
 
 test "Server: S24 backwards and too-high resume h fail without replay" {

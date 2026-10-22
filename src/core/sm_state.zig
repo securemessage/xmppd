@@ -241,6 +241,20 @@ pub fn workerIdFromSmId(sm_id: []const u8) ?u16 {
     return (@as(u16, high) << 8) | @as(u16, low);
 }
 
+/// Classify an outbound handled-count report when there is no unacked queue
+/// (SM enabled without resume) (S24). The sent count is still tracked, so a
+/// peer claiming more than was sent must fail the same way the queue path
+/// does. Wrap-aware at 2^32, matching `SmUnackedQueue.ack`.
+pub fn classifyAck(h: u32, last_h: u32, sent: u32) SmUnackedQueue.AckResult {
+    const from_last = h -% last_h;
+    if (from_last == 0) return .ok;
+    if (from_last >= 0x8000_0000) return .backwards;
+    // h is ahead of the last accepted count; it must not exceed what was sent.
+    const ahead = h -% sent;
+    if (ahead != 0 and ahead < 0x8000_0000) return .too_high;
+    return .ok;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -397,4 +411,18 @@ test "generateSmId: format and worker extraction" {
 test "workerIdFromSmId: invalid length" {
     try std.testing.expect(workerIdFromSmId("short") == null);
     try std.testing.expect(workerIdFromSmId("") == null);
+}
+
+test "classifyAck: reports too high and backwards without a queue (S24)" {
+    // SM without resume tracks only the sent count and last accepted h, so a
+    // report of more than was sent is too_high and a lower one is backwards.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(10, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(8, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(3, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(5, 5, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.backwards, classifyAck(2, 5, 8));
+
+    // Wrap-aware: a report near the 2^32 boundary still counts as forward.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFF0));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFFF));
 }
