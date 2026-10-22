@@ -137,8 +137,8 @@ pub const OutboundConnection = struct {
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
     /// Pending dialback callbacks awaiting a verdict (S2). One entry
-    /// per (stream id, origin): a later db:result for the same origin no
-    /// longer overwrites another session's callback.
+    /// per (stream id, origin, target): a later db:result for a different
+    /// target must not overwrite another session's callback.
     db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
@@ -490,8 +490,8 @@ pub const OutboundConnection = struct {
     }
 
     /// Register a dialback callback. A repeated db:result for the same
-    /// (stream id, origin) replaces that entry; returns null when the table
-    /// is full.
+    /// (stream id, origin, target) replaces that entry; returns null when
+    /// the table is full.
     pub fn addPendingVerify(
         self: *OutboundConnection,
         inbound_slot: usize,
@@ -505,7 +505,8 @@ pub const OutboundConnection = struct {
         for (&self.db_pending, 0..) |*p, i| {
             if (p.in_use) {
                 if (std.mem.eql(u8, p.streamId(), stream_id) and
-                    std.ascii.eqlIgnoreCase(p.origin(), origin))
+                    std.ascii.eqlIgnoreCase(p.origin(), origin) and
+                    std.ascii.eqlIgnoreCase(p.target(), target))
                 {
                     idx = i; // same exchange resubmitted: replace it
                     break;
@@ -914,6 +915,29 @@ test "OutboundConnection: queue and count pending stanzas" {
     try conn.queueStanza(alloc, "alice@a.example", "bob@b.example", "<message><body>hi</body></message>");
     try conn.queueStanza(alloc, "carol@a.example", "dave@b.example", "<message><body>hey</body></message>");
     try std.testing.expectEqual(@as(usize, 2), conn.pendingCount());
+}
+
+test "OutboundConnection: one pending verify per (stream id, origin, target)" {
+    const alloc = std.testing.allocator;
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    // One socket to the remote host carries verifies for several origin or
+    // target pairs sharing a stream id: each is its own entry.
+    const s1 = conn.addPendingVerify(1, 10, "stream1", "a.example", "one.example", "key1") orelse return error.NoSlot;
+    const s2 = conn.addPendingVerify(2, 11, "stream1", "a.example", "two.example", "key2") orelse return error.NoSlot;
+    try std.testing.expect(s1 != s2);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+
+    // A verdict correlates to its own entry (S2).
+    try std.testing.expectEqual(s1, conn.findPendingVerify("stream1", "a.example", "one.example").?);
+    try std.testing.expectEqual(s2, conn.findPendingVerify("stream1", "a.example", "two.example").?);
+
+    // The same triple resubmitted replaces its entry in place.
+    const s3 = conn.addPendingVerify(3, 12, "stream1", "a.example", "one.example", "key3") orelse return error.NoSlot;
+    try std.testing.expectEqual(s1, s3);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+    try std.testing.expectEqualStrings("key3", conn.db_pending[s1].key());
 }
 
 test "OutboundConnection: buildStreamOpen" {
