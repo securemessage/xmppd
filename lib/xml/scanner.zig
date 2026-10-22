@@ -370,8 +370,16 @@ pub const Scanner = struct {
                 .close_tag_name => {
                     if (c == '>') {
                         self.state = .content;
-                        if (!isValidXmlName(self.buf.items)) return error.InvalidName;
-                        const name = try self.dupeAndClear(&self.buf);
+                        // A close tag is "Name S?": trailing whitespace before
+                        // '>' is legal (</a >), so trim it before validating.
+                        // Anything else after the name (</a b>) stays in the
+                        // run and fails the name check.
+                        const raw = self.buf.items;
+                        var end = raw.len;
+                        while (end > 0 and isSpace(raw[end - 1])) : (end -= 1) {}
+                        if (!isValidXmlName(raw[0..end])) return error.InvalidName;
+                        const name = try self.token_arena.allocator().dupe(u8, raw[0..end]);
+                        self.releaseTokenBuf(&self.buf);
                         const parsed = splitPrefixLocal(name);
                         return Token{
                             .type = .element_close,
@@ -510,9 +518,10 @@ fn resolveEntityInto(name: []const u8, out: *std.ArrayList(u8), a: std.mem.Alloc
     // Numeric character reference: &#NNN; (decimal) or &#xHH; (hex). The
     // CharRef production is digits only: no sign, no separators. Leading
     // zeros are legal, so parse digit by digit with an overflow check
-    // instead of a length-limited parseInt.
+    // instead of a length-limited parseInt. The hex marker is a literal
+    // lowercase 'x' (XML 1.0 production 66), so &#XHH; is not a CharRef.
     if (name.len > 1 and name[0] == '#') {
-        const hex = name[1] == 'x' or name[1] == 'X';
+        const hex = name[1] == 'x';
         const digits = if (hex) name[2..] else name[1..];
         if (digits.len == 0) return error.InvalidEntityReference;
         var val: u32 = 0;
@@ -799,6 +808,48 @@ test "entity decoding: non-Char numeric refs rejected (S21)" {
         _ = (try scanner.next(input, &pos)).?; // element_open_end
         try std.testing.expectError(error.InvalidEntityReference, scanner.next(input, &pos));
     }
+}
+
+test "scanner: close tag allows trailing whitespace but not attributes" {
+    const allocator = std.testing.allocator;
+
+    // </a > is a legal close tag (Name S?); the name is "a".
+    {
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+        const input = "<x></a >";
+        var pos: usize = 0;
+        _ = (try scanner.next(input, &pos)).?; // element_open
+        _ = (try scanner.next(input, &pos)).?; // element_open_end
+        const close = (try scanner.next(input, &pos)).?;
+        try std.testing.expectEqual(TokenType.element_close, close.type);
+        try std.testing.expectEqualStrings("a", close.name);
+    }
+
+    // </a b> is not a legal close tag (attributes are not allowed).
+    {
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+        const input = "<x></a b>";
+        var pos: usize = 0;
+        _ = (try scanner.next(input, &pos)).?; // element_open
+        _ = (try scanner.next(input, &pos)).?; // element_open_end
+        try std.testing.expectError(error.InvalidName, scanner.next(input, &pos));
+    }
+}
+
+test "scanner: uppercase hex CharRef is rejected (&#X41;)" {
+    const allocator = std.testing.allocator;
+    var scanner = Scanner.init(allocator);
+    defer scanner.deinit();
+
+    // XML 1.0 production 66 spells the hex marker as a literal lowercase 'x',
+    // so &#X41; is not a CharRef even though &#x41; is.
+    const input = "<x>&#X41;</x>";
+    var pos: usize = 0;
+    _ = (try scanner.next(input, &pos)).?; // element_open
+    _ = (try scanner.next(input, &pos)).?; // element_open_end
+    try std.testing.expectError(error.InvalidEntityReference, scanner.next(input, &pos));
 }
 
 test "DOCTYPE rejected (RFC 6120 section 11.1)" {
