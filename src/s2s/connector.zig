@@ -398,6 +398,15 @@ pub const OutboundConnection = struct {
         return self.state == .failed;
     }
 
+    /// Whether a db:verify may be written on this connection. Only the
+    /// post-TLS auth phase or an established stream may carry the dialback
+    /// key: earlier the key would go out in cleartext.
+    pub fn canSendDbVerify(self: *const OutboundConnection) bool {
+        return self.state == .authenticating or
+            self.state == .established or
+            self.stream.state == .features_auth;
+    }
+
     /// Transition to the TLS handshake phase after TCP connect completes.
     pub fn tcpConnected(self: *OutboundConnection) void {
         if (self.is_direct_tls) {

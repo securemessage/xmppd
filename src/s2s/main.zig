@@ -1422,8 +1422,8 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         return;
     }
 
-    if (conn.isEstablished()) {
-        // Connection already established: send db:verify immediately
+    if (conn.canSendDbVerify()) {
+        // Post-TLS auth phase already reached: send db:verify immediately
         if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
             if (daemon.findOutboundSlot(conn)) |slot| daemon.closeOutbound(batch, slot);
         }
@@ -1431,7 +1431,8 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         // New connection: initiate DNS + TCP connect
         daemon.initiateOutbound(batch, conn, origin);
     }
-    // else: connection is in progress; db:verify is sent when established
+    // else: connection is in progress; db:verify goes out at the post-TLS
+    // features edge
 }
 
 /// Send db:verify stanzas for every registered callback that has not been
@@ -1740,8 +1741,11 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 return;
             };
             // db:verify stanzas that could not be queued earlier go out on
-            // this writable edge.
-            if (conn.hasUnsentVerify() and !sendDbVerifyOnCallback(daemon, batch, conn)) {
+            // this writable edge, but only once the stream is past the
+            // post-TLS features: earlier the key would travel in cleartext.
+            if (conn.hasUnsentVerify() and conn.canSendDbVerify() and
+                !sendDbVerifyOnCallback(daemon, batch, conn))
+            {
                 daemon.closeOutbound(batch, slot);
                 return;
             }
@@ -1969,8 +1973,10 @@ fn processOutboundEvent(
                     return;
                 }
 
-                // Dialback callback: after TLS+features, send db:verify instead of auth
-                if (conn.hasPendingVerify()) {
+                // Dialback callback: after TLS+features, send db:verify
+                // instead of auth. Pre-TLS features must fall through to
+                // STARTTLS first: the key never travels in cleartext.
+                if (conn.hasPendingVerify() and conn.canSendDbVerify()) {
                     if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
                         daemon.closeOutbound(batch, slot);
                     }
@@ -3330,6 +3336,70 @@ test "S2sDaemon: a db:verify that could not be queued goes out on the writable e
     const out = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
     try std.testing.expect(std.mem.indexOf(u8, out, "<db:verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, key) != null);
+}
+
+test "S2sDaemon: a db:verify registered while connecting stays off the wire until the post-TLS features" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Callback conn with no protocol state yet: connecting, no TLS, no
+    // stream, no features.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    daemon.outbound[0] = conn;
+    try std.testing.expectEqual(connector_mod.OutboundState.connecting, conn.state);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "7777777777777777777777777777777777777777777777777777777777777777";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingVerifyCount());
+
+    var wire: [32768]u8 = undefined;
+    var total: usize = 0;
+
+    // Registered while connecting: nothing may be written yet. The key
+    // would travel in cleartext.
+    total += drainPeer(fds[1], wire[total..]);
+
+    // TCP completes and the stream opens in the clear. The writable edge
+    // here must not carry the verify either.
+    conn.tcpConnected();
+    handleOutboundWritable(&daemon, &cl, 0);
+    total += drainPeer(fds[1], wire[total..]);
+    try std.testing.expectEqual(@as(usize, 0), total);
+    try std.testing.expect(conn.hasUnsentVerify());
+
+    // Pre-TLS features: still no verify. STARTTLS is offered instead, so
+    // the exchange is not stalled waiting for an edge that never comes.
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    total += drainPeer(fds[1], wire[total..]);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<starttls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") == null);
+    try std.testing.expect(conn.hasUnsentVerify());
+
+    // Post-TLS stream restart reaches the auth phase; the features edge
+    // sends the verify.
+    conn.tlsHandshakeComplete();
+    conn.setDaneResult(.no_records);
+    conn.handleRemoteStreamOpen("them.example", "remote-sid-1");
+    try std.testing.expectEqual(connector_mod.OutboundState.authenticating, conn.state);
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    total += drainPeer(fds[1], wire[total..]);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], key) != null);
+    try std.testing.expect(!conn.hasUnsentVerify());
 }
 
 test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
