@@ -315,7 +315,7 @@ test "LockStore: multiple users independent" {
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
 }
 
-test "LockStore: a corrupt lock record reads as an error, not unlocked (S3)" {
+test "LockStore: a corrupt lock record reads as an error, not unlocked" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -323,14 +323,14 @@ test "LockStore: a corrupt lock record reads as an error, not unlocked (S3)" {
     defer db.close();
     var store = LockStore(MemoryBackend).init(&db);
 
-    // Write a truncated record straight into the namespace: before the S3
-    // review fix, isLocked returned null (unlocked) for it.
+    // Write a truncated record straight into the namespace: it is corrupt,
+    // and isLocked fails closed on it.
     try db.put(NAMESPACE, "alice", "x");
 
     try std.testing.expectError(error.CorruptLockRecord, store.isLocked(allocator, "alice"));
 }
 
-test "LockStore: keys are case-folded on write and check (S3)" {
+test "LockStore: keys are case-folded on write and check" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -352,7 +352,7 @@ test "LockStore: keys are case-folded on write and check (S3)" {
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
 }
 
-test "LockStore: empty and overlong names fail closed (S3)" {
+test "LockStore: empty and overlong names fail closed" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -369,7 +369,7 @@ test "LockStore: empty and overlong names fail closed (S3)" {
     try std.testing.expectError(error.KeyTooLong, store.lock("", .permanent));
 }
 
-test "LockStore: legacy mixed-case rows are enforced and removable (S3)" {
+test "LockStore: legacy mixed-case rows are enforced and removable" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -391,7 +391,7 @@ test "LockStore: legacy mixed-case rows are enforced and removable (S3)" {
     try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
 }
 
-test "LockStore: migration re-keys legacy rows to canonical (S3)" {
+test "LockStore: migration re-keys legacy rows to canonical" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -413,7 +413,7 @@ test "LockStore: migration re-keys legacy rows to canonical (S3)" {
     try std.testing.expect(store.legacy_free);
 }
 
-test "LockStore: migration keeps the canonical row over a legacy duplicate (S3)" {
+test "LockStore: migration keeps the canonical row over a legacy duplicate" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -457,7 +457,7 @@ const OpenProbe = struct {
     pub fn close(_: *OpenProbe) void {}
 };
 
-test "lock store open: only a missing store is provisioned (S3)" {
+test "lock store open: only a missing store is provisioned" {
     // Missing environment (fresh install): provision once, reopen read-only.
     OpenProbe.reset(error.NOENT);
     _ = try openReadOnlyProvisioned(OpenProbe, "ignored", .{});

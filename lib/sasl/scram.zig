@@ -1068,8 +1068,8 @@ test "ScramServer: unknown gs2 channel-binding flag is rejected (T260)" {
     const alloc = std.testing.allocator;
     var server = ScramServer.init(alloc);
     defer server.deinit();
-    // 'x' is not in {n, y, p}: previously this flag silently skipped all
-    // channel-binding checks in validateChannelBinding.
+    // 'x' is not in {n, y, p}: an unknown gs2 flag is a channel-binding
+    // mismatch, never a skip.
     try std.testing.expectError(
         error.ChannelBindingMismatch,
         server.handleClientFirst("x,,n=alice,r=AAAAAAAAAAAAAAAAAAAAAAAA"),

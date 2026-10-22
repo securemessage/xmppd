@@ -448,7 +448,7 @@ test "buildDbResult: correct XML format" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "</db:result>") != null);
 }
 
-test "buildDbResult: from/to attrs escaped (S1)" {
+test "buildDbResult: from/to attrs escaped" {
     var buf: [512]u8 = undefined;
     const key = [_]u8{'a'} ** KEY_HEX_LEN;
     const xml = try buildDbResult(&buf, "a'&\"<>.example", "b.example", &key);
@@ -634,11 +634,11 @@ test "isValidKeyHex: exactly 64 lowercase hex" {
     upper[i] = std.ascii.toUpper(upper[i]);
     try std.testing.expect(!isValidKeyHex(&upper));
 
-    // The S1-review case: entity-decoded markup in a captured key.
+    // Entity-decoded markup in a captured key.
     try std.testing.expect(!isValidKeyHex("</db:result><message from='victim.example' to='x@us.example'><body/padding padding padding padd</"));
 }
 
-test "buildDbVerify escapes even a hostile captured key (S1)" {
+test "buildDbVerify escapes even a hostile captured key" {
     var buf: [2048]u8 = undefined;
     const out = try buildDbVerify(&buf, "us.example", "them.example", "s2s-1", "</db:verify><message/>");
     try std.testing.expect(std.mem.indexOf(u8, out, "</db:verify><message/>") == null);

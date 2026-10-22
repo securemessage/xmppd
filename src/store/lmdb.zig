@@ -45,8 +45,8 @@ pub const LmdbBackend = struct {
     dbi_count: std.atomic.Value(u32) = .init(0),
     map_size: usize,
     /// Guards dbi_cache appends only. Never held across a call that begins
-    /// an LMDB write txn (the old shape deadlocked: txn begin takes the
-    /// LMDB writer lock while a WriteBatch holder waits for dbi_lock).
+    /// an LMDB write txn (txn begin takes the LMDB writer lock while a
+    /// WriteBatch holder waits for dbi_lock).
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
@@ -548,7 +548,7 @@ test "LmdbBackend: writeBatch abort" {
     try std.testing.expect(val == null);
 }
 
-test "LmdbBackend: abort after commit does not end the txn again (S9)" {
+test "LmdbBackend: abort after commit does not end the txn again" {
     const path = freshTestDir();
     var db = try LmdbBackend.open(path, .{});
     defer db.close();
@@ -576,7 +576,7 @@ test "LmdbBackend: abort after commit does not end the txn again (S9)" {
     try std.testing.expectEqualStrings("b", val.?);
 }
 
-test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358/S9)" {
+test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358)" {
     const path = freshTestDir();
     var db = try LmdbBackend.open(path, .{ .map_size = 128 * 1024 });
     defer db.close();
@@ -600,7 +600,7 @@ test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358/S9)" {
     try std.testing.expectEqual(@as(usize, 128 * 1024), db.map_size);
 }
 
-test "LmdbBackend: read-only open with create=false serves reads, refuses to write (S3)" {
+test "LmdbBackend: read-only open with create=false serves reads, refuses to write" {
     const path = freshTestDir();
     // Seed with a writer open
     {
@@ -623,7 +623,7 @@ test "LmdbBackend: read-only open with create=false serves reads, refuses to wri
     } else |_| {}
 }
 
-test "LmdbBackend: batch commit checks map usage and warns once (S9)" {
+test "LmdbBackend: batch commit checks map usage and warns once" {
     const allocator = std.testing.allocator;
     const path = freshTestDir();
     std.fs.cwd().makePath(path) catch {};
@@ -650,7 +650,7 @@ test "LmdbBackend: batch commit checks map usage and warns once (S9)" {
     try std.testing.expect(db.usage_warned.load(.acquire));
 }
 
-test "LmdbBackend: read-only open needs only the locks namespace (S3 N8)" {
+test "LmdbBackend: read-only open needs only the locks namespace" {
     const allocator = std.testing.allocator;
 
     // Env provisioned with ONLY the "locks" DBI (a store written by an

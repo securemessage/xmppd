@@ -736,9 +736,8 @@ comptime {
 
 /// Live-process identity via kern.proc.pid.X (T259). Handles the
 /// `/usr/include/sys/user.h` ABI directly rather than kern.proc.pathname:
-/// after a pkg upgrade replaces the binary, PATHNAME returns ENOENT and
-/// the old implementation would skip the orphan kill *and* still delete
-/// the pid file. ki_comm survives; ki_start distinguishes pid recycling.
+/// PATHNAME returns ENOENT once a pkg upgrade has replaced the binary,
+/// while ki_comm survives. ki_start distinguishes pid recycling.
 fn lookupKinfoProc(pid: posix.pid_t, out: *KinfoProc) bool {
     // { CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1, pid }
     const mib = [_]c_int{ 1, 14, 1, pid };

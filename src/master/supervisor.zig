@@ -95,11 +95,10 @@ pub const Supervisor = struct {
     /// and truncate the rest of the table. Failures exit the child (125);
     /// only valid between fork and exec.
     ///
-    /// Zed's guidance: dup each source once through fcntl(F_DUPFD) so the
-    /// kernel allocates free descriptors above the target zone FIRST (with
-    /// no clobber and no RLIMIT_NOFILE-8192 dependency), then move into
-    /// place with dup2 (closes target atomically before copying). The old
-    /// TMP_BASE=8192 scratch broke under any lowered RLIMIT_NOFILE.
+    /// Each source is dup'd once through fcntl(F_DUPFD) so the kernel
+    /// allocates free descriptors above the target zone first (no clobber,
+    /// no fixed scratch base), then moved into place with dup2 (closes the
+    /// target atomically before copying).
     pub fn applyFdPass(self: *Supervisor) void {
         const scratch_max = 64; // Supervisor.pass_fds has no more entries than MAX_WORKERS
         var scratch: [scratch_max]i32 = @splat(-1);
@@ -402,7 +401,7 @@ test "Supervisor: fork and wait" {
     try std.testing.expectEqual(@as(u32, 0), exit_code);
 }
 
-test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356/S7)" {
+test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356)" {
     // Three socketpairs: the first two are the pass_fds (child must see them
     // remapped to 3 and 4); the third is a stray the child must NOT have
     // after closefrom. The child reports over fd4.
@@ -444,7 +443,7 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: a pass_fd already at its target survives exec (S7)" {
+test "Supervisor: a pass_fd already at its target survives exec" {
     // SOCK_CLOEXEC shape: the listener fd is already 3 and carries
     // FD_CLOEXEC. applyFdPass must clear the flag, or execve closes the
     // socket and the child loses the listener.
@@ -482,10 +481,9 @@ test "Supervisor: a pass_fd already at its target survives exec (S7)" {
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7)" {
+test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
     // The scratch F_DUPFD band sits right above the targets, so a small
-    // descriptor limit (10) does not break the remap. A fixed high scratch
-    // base would fail here.
+    // descriptor limit (10) does not break the remap.
     var p1: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p1) != 0) return error.Socketpair;
     var p2: [2]posix.fd_t = undefined;
@@ -539,7 +537,7 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE (S7)" {
     _ = try sup2.waitChild();
 }
 
-test "Supervisor: uid-only drop resolves the run user's gid (S7)" {
+test "Supervisor: uid-only drop resolves the run user's gid" {
     // setgroups([0]) on a uid-only drop kept wheel; the gid must come from
     // the passwd entry of the run user.
     var sup = Supervisor.init("/unused", &.{});

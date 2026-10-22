@@ -654,7 +654,7 @@ test "extractLocalpart: empty" {
 
 // --- S3 tests: claim identity and the ROPC identity path ------------
 
-test "OidcStore: claim identity enforces user_domain and keeps the localpart (S3)" {
+test "OidcStore: claim identity enforces user_domain and keeps the localpart" {
     const allocator = std.testing.allocator;
     var store = OidcStore.init(allocator, .{
         .issuer = "https://idp.example/",
@@ -768,7 +768,7 @@ fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, body: 
     }
 }
 
-test "OidcStore: ROPC identity comes from token claims, never the typed name (S3)" {
+test "OidcStore: ROPC identity comes from token claims, never the typed name" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

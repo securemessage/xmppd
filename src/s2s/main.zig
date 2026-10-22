@@ -2570,7 +2570,7 @@ const PoisonOnFreeAllocator = struct {
     }
 };
 
-test "S2sDaemon: stanza reject path resets before closeInbound frees (S2)" {
+test "S2sDaemon: stanza reject path resets before closeInbound frees" {
     // resetStanza must run BEFORE closeInbound destroys the session here:
     // DebugAllocator re-poisons with its own magic, so wrap c_allocator to
     // observe the right order on the chunk.
@@ -2768,7 +2768,7 @@ test "S2sDaemon: stop" {
     try std.testing.expect(!daemon.running);
 }
 
-test "S2sDaemon: inbound address validation enforces authenticated domain and served host (T351/S2)" {
+test "S2sDaemon: inbound address validation enforces authenticated domain and served host (T351)" {
     const local = "us.example";
     const muc = "conference.us.example";
 
@@ -2799,7 +2799,7 @@ test "S2sDaemon: inbound address validation enforces authenticated domain and se
     try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "juliet@US.example") == null);
 }
 
-test "S2sDaemon: jidDomain cuts at the resource separator before the localpart (S2)" {
+test "S2sDaemon: jidDomain cuts at the resource separator before the localpart" {
     try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example"));
     try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example/orchard"));
     try std.testing.expectEqualStrings("them.example", jidDomain("them.example"));
@@ -3069,7 +3069,7 @@ fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: 
     return .{ .conn = conn, .peer_fd = fds[1] };
 }
 
-test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2)" {
+test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3134,7 +3134,7 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin (S2)" {
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
 
-test "S2sDaemon: dialback verdict for a reused inbound slot is discarded (S2)" {
+test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3332,7 +3332,7 @@ test "S2sDaemon: a db:verify that could not be queued goes out on the writable e
     try std.testing.expect(std.mem.indexOf(u8, out, key) != null);
 }
 
-test "S2sDaemon: a full domain set answers a valid dialback verdict invalid (S2)" {
+test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3372,7 +3372,7 @@ test "S2sDaemon: a full domain set answers a valid dialback verdict invalid (S2)
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") == null);
 }
 
-test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeeding (S2)" {
+test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeeding" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3402,7 +3402,7 @@ test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeedin
     try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
 }
 
-test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2)" {
+test "S2sDaemon: stream restart with unauthenticated from= is rejected" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3436,7 +3436,7 @@ test "S2sDaemon: stream restart with unauthenticated from= is rejected (S2)" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "</stream:stream>") != null);
 }
 
-test "S2sDaemon: stanza from unauthenticated domain on established session is rejected (S2)" {
+test "S2sDaemon: stanza from unauthenticated domain on established session is rejected" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3506,7 +3506,7 @@ test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the st
     try std.testing.expect(std.mem.indexOf(u8, resp, "policy-violation") != null);
 }
 
-test "S2sDaemon: db:result addressed to a host we do not serve is rejected (S2)" {
+test "S2sDaemon: db:result addressed to a host we do not serve is rejected" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3540,7 +3540,7 @@ fn testStreamOpenElem(from: []const u8, to: []const u8, attrs: []xml.Attribute) 
     };
 }
 
-test "S2sDaemon: MUC host is served on stream open; replies echo the requested host (S2)" {
+test "S2sDaemon: MUC host is served on stream open; replies echo the requested host" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3574,7 +3574,7 @@ test "S2sDaemon: MUC host is served on stream open; replies echo the requested h
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
 }
 
-test "S2sDaemon: db:result for the MUC host completes and answers as that host (S2)" {
+test "S2sDaemon: db:result for the MUC host completes and answers as that host" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -3589,7 +3589,7 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host (
 
     const key = "5555555555555555555555555555555555555555555555555555555555555555";
     submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
-    // Accepted (the old code closed it with invalid-from) and pending.
+    // Accepted and pending.
     try std.testing.expect(daemon.getInbound(1) != null);
 
     // The db:verify speaks as the MUC host.
@@ -3621,7 +3621,7 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host (
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
 }
 
-test "S2sDaemon: db:verify for the MUC host is answered as that host (S2)" {
+test "S2sDaemon: db:verify for the MUC host is answered as that host" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();

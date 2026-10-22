@@ -1200,7 +1200,7 @@ test "AuthHandler: PLAIN auth wrong password" {
     try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
 }
 
-test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T352/S3)" {
+test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T352)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1237,7 +1237,7 @@ test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T
     try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
 }
 
-test "AuthHandler: locked account rejected at SCRAM before the challenge is issued (T352/S3)" {
+test "AuthHandler: locked account rejected at SCRAM before the challenge is issued (T352)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1273,7 +1273,7 @@ test "AuthHandler: locked account rejected at SCRAM before the challenge is issu
     try std.testing.expect(handler.findScramSlot(0, 7) == null);
 }
 
-test "AuthHandler: lock store error fails closed (T352/S3)" {
+test "AuthHandler: lock store error fails closed (T352)" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1310,7 +1310,7 @@ test "AuthHandler: lock store error fails closed (T352/S3)" {
     try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
 }
 
-test "AuthHandler: locks catch case and domain variants of the typed name (S3)" {
+test "AuthHandler: locks catch case and domain variants of the typed name" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1369,7 +1369,7 @@ test "AuthHandler: locks catch case and domain variants of the typed name (S3)" 
     }
 }
 
-test "AuthHandler: IdP PLAIN admits the localpart of the returned identity (S3)" {
+test "AuthHandler: IdP PLAIN admits the localpart of the returned identity" {
     const allocator = std.testing.allocator;
 
     var store = TestIdpStore{ .password_user = "alice@idp.example" };
@@ -1397,7 +1397,7 @@ test "AuthHandler: IdP PLAIN admits the localpart of the returned identity (S3)"
     try std.testing.expectEqualStrings("alice", result.auth_success.username);
 }
 
-test "AuthHandler: a lock on the IdP identity rejects PLAIN (S3)" {
+test "AuthHandler: a lock on the IdP identity rejects PLAIN" {
     const allocator = std.testing.allocator;
 
     var lock_db = try MemoryBackend.open("", .{});
@@ -1434,7 +1434,7 @@ test "AuthHandler: a lock on the IdP identity rejects PLAIN (S3)" {
     try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
 }
 
-test "AuthHandler: OAUTHBEARER admits the identity the IdP returns (S3)" {
+test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
     const allocator = std.testing.allocator;
 
     var store = TestIdpStore{ .token_user = "bob@idp.example" };
@@ -1454,7 +1454,7 @@ test "AuthHandler: OAUTHBEARER admits the identity the IdP returns (S3)" {
     try std.testing.expectEqualStrings("bob@idp.example", result.auth_success.username);
 }
 
-test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER (S3)" {
+test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER" {
     const allocator = std.testing.allocator;
 
     var lock_db = try MemoryBackend.open("", .{});
@@ -1481,7 +1481,7 @@ test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER (S3)" {
     try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
 }
 
-test "AuthHandler: a lock landing between challenge and client-final rejects (S3)" {
+test "AuthHandler: a lock landing between challenge and client-final rejects" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});

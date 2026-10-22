@@ -210,7 +210,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 const MemoryBackend = backend.MemoryBackend;
 const FailBatchBackend = backend.FailBatchBackend;
 
-test "GenericOfflineStore: a failed clearAll batch aborts the write txn (S9)" {
+test "GenericOfflineStore: a failed clearAll batch aborts the write txn" {
     const allocator = std.testing.allocator;
     const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
 
@@ -225,7 +225,7 @@ test "GenericOfflineStore: a failed clearAll batch aborts the write txn (S9)" {
     try std.testing.expectEqual(@as(usize, 0), db.committed);
 }
 
-test "GenericOfflineStore: a failed clearAll commit is not aborted again (S9)" {
+test "GenericOfflineStore: a failed clearAll commit is not aborted again" {
     const allocator = std.testing.allocator;
     const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
 

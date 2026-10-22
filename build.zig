@@ -1212,7 +1212,7 @@ pub fn build(b: *std.Build) void {
 
     const run_jwt_tests = b.addRunArtifact(jwt_tests);
 
-    // --- OIDC store tests (S3 review: the OIDC identity path had no step) ---
+    // --- OIDC store tests ---
     const oidc_store_test_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/oidc.zig"),
         .target = target,
@@ -1306,7 +1306,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(master_exe);
 
-    // xmppd master tests (same module instance — Zig forbids re-rooting)
+    // xmppd master tests (same module instance; Zig forbids re-rooting)
     const master_tests = b.addTest(.{
         .name = "master-tests",
         .root_module = master_mod,

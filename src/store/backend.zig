@@ -520,7 +520,7 @@ test "OpenOptions defaults" {
     try std.testing.expect(!opts.read_only);
 }
 
-test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted (S9)" {
+test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted" {
     // Real invariants instead of a list re-checking itself: a duplicate
     // name would collide in the DBI cache lookups, and a name over 64
     // bytes fails mdb_dbi_open (name_buf is [64]u8 plus NUL). The count

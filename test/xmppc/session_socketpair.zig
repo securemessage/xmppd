@@ -905,7 +905,7 @@ fn scriptResume(rig: *Rig, previd: []const u8) !void {
     // Client sends <resume .../> once bind is skipped? The FSM resumes
     // INSTEAD of bind when it has a resume id and features advertise SM.
     try rig.expect(previd, 2000);
-    try rig.expect("h='1'", 2000); // review B: carried count, not hard-coded 0
+    try rig.expect("h='1'", 2000); // carried count, not a hard-coded 0
     try rig.send("<resumed xmlns='urn:xmpp:sm:3' previd='sm-test-42' h='0'/>");
 }
 

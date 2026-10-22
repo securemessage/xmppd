@@ -1108,7 +1108,7 @@ fn makeTestTcpPair() ![2]posix.fd_t {
     return .{ client_fd, server_fd };
 }
 
-test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive (S23)" {
+test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -893,9 +893,9 @@ pub const Session = struct {
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
                 // per-stanza arena reset later frees; consumers hold these
-                // across the session, so copy them (PR #4 review A). OOM
-                // here fails the session (T233): a silently empty sm_id
-                // would make the next resume replay everything.
+                // across the session, so copy them. OOM here fails the
+                // session (T233): a silently empty sm_id would make the
+                // next resume replay everything.
                 self.sm_enabled = self.fsm.sm_enabled;
                 self.sm_resumed = self.fsm.sm_resumed;
                 self.sm_id = a.dupe(u8, self.fsm.sm_id) catch {
@@ -917,8 +917,8 @@ pub const Session = struct {
                 // 'h' counts stanzas handled since SM enablement. A resume
                 // keeps counting from where the previous session left it
                 // (resume_h); only a fresh .enabled starts at zero
-                // (PR #4 review B: resetting h on resume wraps xmppd's
-                // unacked queue into discardAll and silently loses mail).
+                // (resetting h on resume wraps xmppd's unacked queue into
+                // discardAll and silently loses mail).
                 if (self.parser) |pr| {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;

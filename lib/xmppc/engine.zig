@@ -1422,8 +1422,8 @@ test "engine: deinit with one live session never hangs (T252)" {
     try eng.run();
     std.Thread.sleep(20 * std.time.ns_per_ms); // let the loop park
 
-    // Before T252-review fix this never returned: deinit wakes the loop,
-    // which rechecked run_gen == its snapshot and re-parked forever.
+    // deinit wakes the loop and joins it; the wake re-checks run_gen
+    // against the loop's snapshot, so the loop exits instead of re-parking.
     eng.deinit();
     std.posix.close(fds[1]);
 }

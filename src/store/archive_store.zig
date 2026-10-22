@@ -391,7 +391,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
 const MemoryBackend = backend.MemoryBackend;
 const FailBatchBackend = backend.FailBatchBackend;
 
-test "ArchiveStore: a failed batch put aborts the write txn (S9)" {
+test "ArchiveStore: a failed batch put aborts the write txn" {
     const allocator = std.testing.allocator;
     var db = try FailBatchBackend.open("", .{});
     var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
@@ -403,7 +403,7 @@ test "ArchiveStore: a failed batch put aborts the write txn (S9)" {
     try std.testing.expectEqual(@as(usize, 0), db.committed);
 }
 
-test "ArchiveStore: a failed retention batch aborts the write txn (S9)" {
+test "ArchiveStore: a failed retention batch aborts the write txn" {
     const allocator = std.testing.allocator;
 
     // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.
@@ -429,7 +429,7 @@ test "ArchiveStore: a failed retention batch aborts the write txn (S9)" {
     try std.testing.expectEqual(@as(usize, 0), db.committed);
 }
 
-test "ArchiveStore: a failed batch commit is not aborted again (S9)" {
+test "ArchiveStore: a failed batch commit is not aborted again" {
     const allocator = std.testing.allocator;
     var db = try FailBatchBackend.open("", .{});
     db.fail_ops = false;
@@ -445,7 +445,7 @@ test "ArchiveStore: a failed batch commit is not aborted again (S9)" {
     try std.testing.expectEqual(@as(usize, 0), db.abort_after_commit);
 }
 
-test "ArchiveStore: a failed retention batch commit is not aborted again (S9)" {
+test "ArchiveStore: a failed retention batch commit is not aborted again" {
     const allocator = std.testing.allocator;
 
     // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.

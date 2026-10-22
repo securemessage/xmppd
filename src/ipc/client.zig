@@ -22,9 +22,8 @@ const log = std.log.scoped(.ipc_client);
 /// allocated at connect.
 const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
 
-/// Hard cap on unsent frames to the daemon (heap-grown past the old 16 KiB
-/// fixed buffer, which died in bursts: T32 measured ~50 in-flight auth
-/// requests overflowing it and lying "not-authorized" to clients).
+/// Hard cap on unsent frames to the daemon. The send queue is heap-grown
+/// up to this cap (T32 measured ~50 in-flight auth requests in bursts).
 const SEND_CAP: usize = 4 << 20;
 
 pub const IpcClient = struct {
@@ -368,9 +367,9 @@ test "IpcClient: close resets state" {
 test "IpcClient: connect failure before adoption leaves no dangling fd" {
     // A live listener lets connect() succeed; the client has no allocator
     // and no preset recv buffer, so the buffer allocation fails. The fd
-    // must not be adopted before that allocation: the old order left
-    // self.fd naming a descriptor the errdefer had already closed, and the
-    // next close() would double-close whatever reused the number.
+    // must not be adopted before that allocation: self.fd would name a
+    // descriptor the errdefer already closed, and the next close() would
+    // double-close whatever reused the number.
     const path = "/tmp/xmppd-test-ipc-noalloc.sock";
     std.fs.cwd().deleteFile(path) catch {};
     defer std.fs.cwd().deleteFile(path) catch {};

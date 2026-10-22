@@ -911,7 +911,7 @@ test "S2sSession: buildTlsProceed" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<proceed") != null);
 }
 
-test "S2sSession: stream-open response escapes peer-controlled and local attrs (S1)" {
+test "S2sSession: stream-open response escapes peer-controlled and local attrs" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true; // no real fd: nothing to close on teardown
     session.setRemoteDomain("bad' to='injected.attacker.example' x='");
@@ -921,7 +921,7 @@ test "S2sSession: stream-open response escapes peer-controlled and local attrs (
     try std.testing.expect(std.mem.indexOf(u8, out, "injected.attacker.example' x='") == null);
 }
 
-test "S2sSession: stanza from/to/type/id attrs are re-escaped (S1)" {
+test "S2sSession: stanza from/to/type/id attrs are re-escaped" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true; // no real fd
     session.startStanza(.{
@@ -1049,7 +1049,7 @@ fn makeTestTcpPair() ![2]posix.fd_t {
     return .{ client_fd, server_fd };
 }
 
-test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still arrive (S23)" {
+test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still arrive" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     genTestTlsCert(tmp.dir) catch return error.SkipZigTest;
@@ -1139,7 +1139,7 @@ test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still
     try std.testing.expect(!session.hasPendingWrite());
 }
 
-test "S2sSession: authenticated-domain set (S2)" {
+test "S2sSession: authenticated-domain set" {
     var session = S2sSession.init(-1, 1, "us.example");
     session.closed = true; // no real fd
 
@@ -1177,7 +1177,7 @@ test "S2sSession: the 9th authenticated domain is refused loudly, not dropped si
     try std.testing.expect(!session.addAuthenticatedDomain("")); // invalid false
 }
 
-test "S2sSession: DANE candidate promotes only on demand (S2)" {
+test "S2sSession: DANE candidate promotes only on demand" {
     var session = S2sSession.init(-1, 1, "us.example");
     session.closed = true;
 
@@ -1187,7 +1187,7 @@ test "S2sSession: DANE candidate promotes only on demand (S2)" {
     try std.testing.expect(session.isAuthenticatedDomain("them.example"));
 }
 
-test "S2sSession: a full domain set rejects the DANE promotion (S2)" {
+test "S2sSession: a full domain set rejects the DANE promotion" {
     var session = S2sSession.init(-1, 1, "us.example");
     session.closed = true;
 
@@ -1203,7 +1203,7 @@ test "S2sSession: a full domain set rejects the DANE promotion (S2)" {
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
 }
 
-test "S2sSession: restart from= pins origin until auth, then uses the set (S2)" {
+test "S2sSession: restart from= pins origin until auth, then uses the set" {
     var session = S2sSession.init(-1, 1, "us.example");
     session.closed = true;
 
@@ -1231,7 +1231,7 @@ test "S2sSession: isTlsHandshaking" {
     try std.testing.expect(!session.isTlsHandshaking());
 }
 
-test "S2sSession: xmlns declarations on nested elements are preserved (S1)" {
+test "S2sSession: xmlns declarations on nested elements are preserved" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1266,7 +1266,7 @@ test "S2sSession: xmlns declarations on nested elements are preserved (S1)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<received xmlns='urn:xmpp:receipts'/>") != null);
 }
 
-test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1)" {
+test "S2sSession: inner buffer overflow marks stanza broken, not truncated" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1291,7 +1291,7 @@ test "S2sSession: inner buffer overflow marks stanza broken, not truncated (S1)"
     try std.testing.expect(!session.stanzaBroken());
 }
 
-test "S2sSession: accumulateClose overflow marks the stanza broken (S1)" {
+test "S2sSession: accumulateClose overflow marks the stanza broken" {
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
     session.closed = true; // no real fd
@@ -1318,7 +1318,7 @@ test "S2sSession: accumulateClose overflow marks the stanza broken (S1)" {
     try std.testing.expect(session.stanzaBroken());
 }
 
-test "S2sSession: prefixed attributes keep their prefix declaration (S1)" {
+test "S2sSession: prefixed attributes keep their prefix declaration" {
     const alloc = std.testing.allocator;
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
@@ -1350,7 +1350,7 @@ test "S2sSession: prefixed attributes keep their prefix declaration (S1)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "xmlns:ext='urn:ext'") != null);
 }
 
-test "S2sSession: a self-closing child keeps the prefix it declares on itself (S1)" {
+test "S2sSession: a self-closing child keeps the prefix it declares on itself" {
     const alloc = std.testing.allocator;
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
@@ -1384,7 +1384,7 @@ test "S2sSession: a self-closing child keeps the prefix it declares on itself (S
     try std.testing.expectEqualStrings("", reader.resolveNamespace("ext"));
 }
 
-test "S2sSession: any number of attribute prefixes re-emits each binding once (S1)" {
+test "S2sSession: any number of attribute prefixes re-emits each binding once" {
     const alloc = std.testing.allocator;
     var session = S2sSession.init(-1, 1, "us.example");
     defer session.close();
