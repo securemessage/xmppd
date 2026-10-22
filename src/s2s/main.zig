@@ -469,8 +469,16 @@ pub const S2sDaemon = struct {
 
     /// Close an outbound connection slot. Purges its staged kevent entries
     /// first: a same-iteration accept can reuse the fd number (T238/T277).
+    /// Every exchange the conn still carries is answered before teardown,
+    /// so a read error, EOF, parse error or write failure never leaves the
+    /// submitting stream waiting for a verdict that can no longer arrive.
     fn closeOutbound(self: *S2sDaemon, batch: *ChangeList, slot: usize) void {
         if (slot >= MAX_OUTBOUND_CONNS) return;
+        if (self.outbound[slot]) |conn| {
+            for (0..conn.db_pending.len) |idx| {
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+            }
+        }
         if (self.outbound[slot]) |conn| {
             batch.purgeFd(conn.fd);
         }
@@ -1443,11 +1451,17 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 /// queued (full write buffer) stay unsent and go out from the writable
 /// edge.
 fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) bool {
-    for (&conn.db_pending) |*p| {
+    for (&conn.db_pending, 0..) |*p, idx| {
         if (!p.in_use or p.verify_sent) continue;
         const key = p.key();
         const sid = p.streamId();
-        if (key.len == 0 or sid.len == 0) continue;
+        if (key.len == 0 or sid.len == 0) {
+            // An exchange without key or stream id can never produce a
+            // db:verify; leaving it would spin the writable re-arm.
+            log.warn("dialback callback: exchange without key or stream id; answering invalid", .{});
+            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            continue;
+        }
 
         var buf: [512]u8 = undefined;
         const verify_xml = dialback.buildDbVerify(
@@ -1456,7 +1470,14 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
             conn.remote_domain,
             sid,
             key,
-        ) catch continue;
+        ) catch {
+            // Unbuildable exchange: answered invalid and cleared like a
+            // write failure. An unsent entry would stay forever and re-arm
+            // the one-shot write on every edge.
+            log.warn("dialback callback: db:verify for stream {s} cannot be built; answering invalid", .{sid});
+            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            continue;
+        };
 
         conn.queueWrite(verify_xml) catch {
             log.warn("dialback callback: write buffer full, db:verify for stream {s} waits for the writable edge", .{sid});
@@ -3400,6 +3421,84 @@ test "S2sDaemon: a db:verify registered while connecting stays off the wire unti
     try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, wire[0..total], key) != null);
     try std.testing.expect(!conn.hasUnsentVerify());
+}
+
+test "S2sDaemon: a callback conn torn down with pending exchanges answers them invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "8888888888888888888888888888888888888888888888888888888888888888";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    var wire: [4096]u8 = undefined;
+    const sent = wire[0..drainPeer(cb.peer_fd, &wire)];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<db:verify") != null);
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+
+    // The peer goes away while the verdict is still in flight: the conn is
+    // torn down and the exchange must be answered, not left waiting.
+    posix.close(cb.peer_fd);
+    cb.peer_fd = -1;
+    handleOutboundReadable(&daemon, &cl, 0);
+    try std.testing.expect(daemon.outbound[0] == null);
+
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid and cleared" {
+    // A long served host and a long origin overflow the fixed db:verify
+    // buffer: the exchange can never be sent, and must die immediately
+    // instead of spinning the writable re-arm forever.
+    var host_buf: [225]u8 = undefined;
+    @memset(host_buf[0..220], 'a');
+    @memcpy(host_buf[220..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [185]u8 = undefined;
+    @memset(origin_buf[0..180], 'b');
+    @memcpy(origin_buf[180..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, long_origin);
+    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "9999999999999999999999999999999999999999999999999999999999999999";
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, key);
+
+    // The entry is answered invalid and cleared: nothing waits and nothing
+    // re-arms.
+    try std.testing.expect(!cb.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain(long_origin));
 }
 
 test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
