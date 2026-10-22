@@ -1500,7 +1500,16 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     // queued both resume from the writable edge.
     if (conn.hasPendingWrite() or conn.hasUnsentVerify()) {
         if (daemon.findOutboundSlot(conn)) |slot| {
-            batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+            batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {
+                // Nothing is armed: the queued verifies would never go
+                // out. Fail the exchanges instead of losing them.
+                log.warn("dialback callback: cannot arm the writable edge for {s}; answering pending exchanges invalid", .{conn.remote_domain});
+                for (0..conn.db_pending.len) |i| {
+                    if (conn.db_pending[i].in_use) handleDbVerifyResponse(daemon, batch, conn, i, false);
+                }
+                conn.fail("write-failed");
+                return false;
+            };
         }
     }
     return true;
@@ -3320,6 +3329,80 @@ test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
 }
 
+test "S2sDaemon: a failed db:verify write tears the outbound conn out of its slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    posix.close(cb.conn.fd);
+    cb.conn.fd = -1;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "abababababababababababababababababababababababababababababababab";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // The conn failed AND left its slot: a stale pointer there would be
+    // freed by the next getOrCreate and read again by the next dispatch.
+    try std.testing.expect(daemon.outbound[0] == null);
+
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a full changelist fails the pending exchanges instead of losing them" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer posix.close(cb.peer_fd);
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // Room for the whole write buffer to drain in one flush.
+    const big: c_int = 1 << 20;
+    try posix.setsockopt(cb.conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&big));
+
+    // Fill the conn write buffer: the verify cannot be queued when the
+    // submission arrives and needs the writable edge.
+    var filler: [8192]u8 = undefined;
+    @memset(&filler, 'x');
+    while (true) cb.conn.queueWrite(&filler) catch break;
+
+    // Fill the changelist too: the writable edge cannot be armed, and the
+    // exchange must fail loudly instead of waiting for an edge that never
+    // gets staged.
+    var scratch: [2]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try cl.addRead(9001, 0);
+    try cl.addRead(9002, 0);
+
+    const key = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // The exchange is answered and the conn leaves its slot.
+    try std.testing.expect(daemon.outbound[0] == null);
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+}
+
 test "S2sDaemon: a db:verify that could not be queued goes out on the writable edge" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
@@ -3348,6 +3431,16 @@ test "S2sDaemon: a db:verify that could not be queued goes out on the writable e
     submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
     try std.testing.expect(cb.conn.hasUnsentVerify());
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+
+    // The one-shot writable edge is armed for the conn, so the resume
+    // actually arrives even with nothing else to trigger it.
+    var armed = false;
+    for (cl.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.WRITE and
+            ev.ident == @as(@TypeOf(ev.ident), @intCast(cb.conn.fd)) and
+            (ev.flags & std.c.EV.ONESHOT) != 0) armed = true;
+    }
+    try std.testing.expect(armed);
 
     // The writable edge drains the buffer and queues the verify.
     handleOutboundWritable(&daemon, &cl, 0);
