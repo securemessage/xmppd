@@ -611,6 +611,217 @@ test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted
     try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
 }
 
+const TokenKind = enum { str, chr, comment };
+const Token = struct { end: usize, kind: TokenKind };
+
+/// Skip a string, char or line-comment token starting at `i`, or return
+/// null when a plain token starts there. Call shapes quoted inside
+/// strings and comments are not call sites.
+fn skipToken(text: []const u8, i: usize) ?Token {
+    if (i + 2 <= text.len and text[i] == '/' and text[i + 1] == '/') {
+        var j = i + 2;
+        while (j < text.len and text[j] != '\n') : (j += 1) {}
+        return .{ .end = j, .kind = .comment };
+    }
+    if (i + 2 <= text.len and text[i] == '\\' and text[i + 1] == '\\') {
+        var j = i + 2;
+        while (j < text.len and text[j] != '\n') : (j += 1) {}
+        return .{ .end = j, .kind = .str };
+    }
+    if (text[i] == '"' or text[i] == '\'') {
+        const quote = text[i];
+        var j = i + 1;
+        while (j < text.len) : (j += 1) {
+            if (text[j] == '\\') {
+                j += 1;
+                continue;
+            }
+            if (text[j] == quote) return .{ .end = j + 1, .kind = if (quote == '"') .str else .chr };
+        }
+        return .{ .end = text.len, .kind = .str };
+    }
+    return null;
+}
+
+const CallArgs = struct { count: usize, ns_literal: bool };
+
+/// Parse the top-level argument list of a call starting just after its
+/// open paren: the argument count and whether the namespace slot is a
+/// string literal. Null on an unbalanced call.
+fn nsArgIsLiteral(text: []const u8, start: usize, ns_index: usize) ?CallArgs {
+    var depth: usize = 0;
+    var i: usize = start;
+    var count: usize = 0;
+    var arg_index: usize = 0;
+    var saw = false;
+    var first_seen = false;
+    var ns_literal = false;
+    while (i < text.len) : (i += 1) {
+        if (skipToken(text, i)) |tok| {
+            if (!first_seen and arg_index == ns_index and tok.kind == .str) ns_literal = true;
+            if (tok.kind != .comment) {
+                first_seen = true;
+                saw = true;
+            }
+            i = tok.end - 1;
+            continue;
+        }
+        switch (text[i]) {
+            '(', '[', '{' => {
+                depth += 1;
+                first_seen = true;
+                saw = true;
+            },
+            ')', ']', '}' => {
+                if (text[i] == ')' and depth == 0) {
+                    if (saw) count += 1;
+                    return .{ .count = count, .ns_literal = ns_literal };
+                }
+                if (depth == 0) return null;
+                depth -= 1;
+                saw = true;
+            },
+            ',' => {
+                if (depth == 0) {
+                    if (saw) count += 1;
+                    arg_index += 1;
+                    saw = false;
+                    first_seen = false;
+                }
+            },
+            else => {
+                if (!std.ascii.isWhitespace(text[i])) {
+                    if (!first_seen) {
+                        first_seen = true;
+                        if (arg_index == ns_index) ns_literal = text[i] == '"';
+                    }
+                    saw = true;
+                }
+            },
+        }
+    }
+    return null;
+}
+
+const ScanResult = struct { count: usize, first_line: usize };
+
+/// Count call sites whose namespace argument is a string literal. The
+/// backend signatures fix both the arity and the namespace slot
+/// (put(ns, key, value), delete(ns, key), iterator(ns, prefix),
+/// get(allocator, ns, key)), so map, config and pool calls do not match.
+fn countNsLiterals(text: []const u8) ScanResult {
+    const calls = [_]struct { name: []const u8, args: usize, ns: usize }{
+        .{ .name = "pu" ++ "t", .args = 3, .ns = 0 },
+        .{ .name = "del" ++ "ete", .args = 2, .ns = 0 },
+        .{ .name = "it" ++ "erator", .args = 2, .ns = 0 },
+        .{ .name = "g" ++ "et", .args = 3, .ns = 1 },
+    };
+    var result = ScanResult{ .count = 0, .first_line = 0 };
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (skipToken(text, i)) |tok| {
+            i = tok.end - 1;
+            continue;
+        }
+        if (text[i] != '.') continue;
+        var j = i + 1;
+        while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_')) : (j += 1) {}
+        for (calls) |call| {
+            if (!std.mem.eql(u8, text[i + 1 .. j], call.name)) continue;
+            if (j >= text.len or text[j] != '(') break;
+            if (nsArgIsLiteral(text, j + 1, call.ns)) |parsed| {
+                if (parsed.count == call.args and parsed.ns_literal) {
+                    result.count += 1;
+                    if (result.first_line == 0) {
+                        result.first_line = std.mem.count(u8, text[0..i], "\n") + 1;
+                    }
+                }
+            }
+            break;
+        }
+        i = j - 1;
+    }
+    return result;
+}
+
+/// Locate the src tree for the scan. @src().file is a basename under Zig
+/// 0.15, so the tree is found relative to the invocation directory.
+/// Never skips: a tree that cannot be found fails the test.
+fn openSrcDir() !std.fs.Dir {
+    const candidates = [_][]const u8{ "src", "../src", "../../src", "../../../src" };
+    for (candidates) |candidate| {
+        var dir = std.fs.cwd().openDir(candidate, .{ .iterate = true }) catch continue;
+        dir.access("store/backend.zig", .{}) catch {
+            dir.close();
+            continue;
+        };
+        return dir;
+    }
+    return error.SourceTreeNotFound;
+}
+
+test "D7: source ratchet, no string-literal namespace arguments in src/" {
+    // The backend API takes a runtime namespace string, so a call site
+    // passing a literal skips the registered() binding to
+    // canonical_namespaces: a renamed owner can drift from its call sites
+    // while the suite stays green (B7). Every backend call whose
+    // namespace argument is a string literal is counted per file and
+    // pinned here. Counts may only shrink; a new literal must be
+    // justified in this table. The four backend conformance test files
+    // seed fixture rows under unregistered names ("scratch",
+    // "nonexistent") and carry their fixture counts; every other file in
+    // src/ is zero.
+    const expected = [_]struct { []const u8, usize }{
+        .{ "store/backend.zig", 29 },
+        .{ "store/lmdb.zig", 39 },
+        .{ "store/rocksdb.zig", 32 },
+        .{ "store/sqlite.zig", 35 },
+    };
+    var seen = [_]bool{false} ** expected.len;
+
+    const allocator = std.testing.allocator;
+    var src_dir = try openSrcDir();
+    defer src_dir.close();
+    var walker = try src_dir.walk(allocator);
+    defer walker.deinit();
+
+    var files: usize = 0;
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const text = try entry.dir.readFileAlloc(allocator, entry.basename, 16 * 1024 * 1024);
+        defer allocator.free(text);
+        files += 1;
+
+        var want: usize = 0;
+        for (expected, 0..) |row, idx| {
+            if (std.mem.eql(u8, row[0], entry.path)) {
+                want = row[1];
+                seen[idx] = true;
+            }
+        }
+        const result = countNsLiterals(text);
+        if (result.count != want) {
+            std.log.err("D7 ratchet: {s} has {d} string-literal namespace arguments (first at line {d}), table pins {d}", .{ entry.path, result.count, result.first_line, want });
+            return error.RatchetMismatch;
+        }
+    }
+
+    // A pinned file that moved or vanished must not leave the table.
+    for (expected, 0..) |row, idx| {
+        if (!seen[idx]) {
+            std.log.err("D7 ratchet: {s} was not scanned, table pins {d} literal namespace arguments", .{ row[0], row[1] });
+            return error.RatchetCoverage;
+        }
+    }
+    // The walk must keep covering the tree; lower this deliberately when
+    // source files go away.
+    if (files < 60) {
+        std.log.err("D7 ratchet: scanned {d} source files under src/, expected at least 60", .{files});
+        return error.RatchetCoverage;
+    }
+}
+
 test "Entry struct" {
     const e = Entry{ .key = "foo", .value = "bar" };
     try std.testing.expectEqualStrings("foo", e.key);
