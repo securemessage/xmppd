@@ -412,9 +412,12 @@ pub const S2sDaemon = struct {
     /// Flush queued stanzas on an established outbound connection.
     /// Every flushed PendingStanza frees all three owned slices; a full
     /// write buffer keeps the unconsumed tail queued and arms a one-shot
-    /// write event so the writable edge resumes it (T275: an idle
-    /// link stranded the tail before). A stanza that can never fit the
-    /// write buffer is failed to the sender instead of wedging the queue.
+    /// write event so the writable edge resumes it. The event is armed for
+    /// a kept tail OR unsent buffered bytes: a drain that empties the
+    /// write buffer into kernel sendspace leaves hasPendingWrite() false
+    /// and would strand the tail until the next stanza (T275). A stanza
+    /// that can never fit the write buffer is failed to the sender instead
+    /// of wedging the queue.
     fn flushOutboundStanzas(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
         const items = conn.pending_stanzas.items;
         var i: usize = 0;
@@ -447,7 +450,7 @@ pub const S2sDaemon = struct {
         _ = conn.flushWrite() catch {
             log.err("outbound write failed for {s}", .{conn.remote_domain});
         };
-        if (conn.hasPendingWrite()) {
+        if (kept > 0 or conn.hasPendingWrite()) {
             if (self.findOutboundSlot(conn)) |slot| {
                 batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
             }
@@ -2582,6 +2585,17 @@ test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275)
     daemon.flushOutboundStanzas(&cl, conn);
     try std.testing.expectEqual(@as(usize, 1), conn.pendingCount()); // tail kept
 
+    // The drained socket left hasPendingWrite() false, so the kept tail
+    // must arm its own one-shot write event: without the event the tail is
+    // stranded until the next stanza arrives (T275).
+    try std.testing.expect(!conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 1), cl.count());
+    const ev = cl.slice()[0];
+    try std.testing.expect(ev.filter == std.c.EVFILT.WRITE);
+    try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+    try std.testing.expectEqual(@as(@TypeOf(ev.ident), @intCast(fds[0])), ev.ident);
+    try std.testing.expectEqual(@as(@TypeOf(ev.udata), OUTBOUND_UDATA_BASE), ev.udata);
+
     // Drain the peer so the next flush has room, then fire the writable
     // edge with NO new stanza arriving: the tail must resume by itself.
     var rbuf: [20480]u8 = undefined;
@@ -2617,6 +2631,13 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     try conn.queueStanza(alloc, "a@us.example", "b@them.example", huge);
     try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>after</body></message>");
 
+    // A connected core client makes the delivery-failure notice observable.
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
     daemon.flushOutboundStanzas(&cl, conn);
@@ -2626,6 +2647,13 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     var rbuf: [4096]u8 = undefined;
     const got = rbuf[0..drainPeer(fds[1], &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, got, "after") != null);
+
+    // The bounce reached the core client as a delivery-failed notice.
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("stanza-too-large", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
 }
 
 test "S2sDaemon: stop" {
