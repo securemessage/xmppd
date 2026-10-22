@@ -372,6 +372,7 @@ pub const RocksDbBackend = struct {
     pub const WriteBatch = struct {
         batch: *c.rocksdb_writebatch_t,
         backend: *RocksDbBackend,
+        ended: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const cf = try self.backend.getOrCreateCf(ns);
@@ -396,6 +397,9 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
+            // A write is atomic and the batch is destroyed either way, so
+            // abort() after commit is a no-op (S9).
+            self.ended = true;
             var err: [*c]u8 = null;
             c.rocksdb_write(
                 self.backend.db,
@@ -413,6 +417,8 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn abort(self: *WriteBatch) void {
+            if (self.ended) return;
+            self.ended = true;
             c.rocksdb_writebatch_destroy(self.batch);
         }
     };

@@ -104,6 +104,12 @@ pub const Entry = struct {
 ///   fn commit(self: *WriteBatch) !void
 ///   fn abort(self: *WriteBatch) void
 ///
+/// commit() leaves the batch ended whether it succeeds or fails (a failed
+/// LMDB commit already aborts its txn internally; a failed RocksDB write
+/// is atomic and a failed SQLite COMMIT is rolled back). abort() after a
+/// commit attempt is therefore a no-op: calling it anyway double-ends the
+/// batch (the mdb_txn_abort that frees env->me_txn0, S9).
+///
 pub fn assertBackend(comptime B: type) void {
     comptime {
         if (!@hasDecl(B, "open"))
@@ -240,6 +246,7 @@ pub const MemoryBackend = struct {
     pub const WriteBatch = struct {
         backend: *Self,
         ops: std.ArrayListUnmanaged(BatchOp),
+        ended: bool = false,
 
         const BatchOp = union(enum) {
             put_op: struct { ns: []const u8, key: []const u8, value: []const u8 },
@@ -268,10 +275,13 @@ pub const MemoryBackend = struct {
                     .delete_op => |d| try self.backend.delete(d.ns, d.key),
                 }
             }
+            self.ended = true;
             self.ops.deinit(self.backend.backing);
         }
 
         pub fn abort(self: *WriteBatch) void {
+            if (self.ended) return;
+            self.ended = true;
             self.ops.deinit(self.backend.backing);
         }
     };
@@ -282,11 +292,19 @@ pub const MemoryBackend = struct {
 };
 
 /// Test-only backend: every WriteBatch operation fails as if the map were
-/// full, and commit/abort counts are exposed so a caller can prove its
-/// errdefer abort ran (S9). The iterator serves a fixed entry list.
+/// full (set `fail_ops = false` to let a batch reach commit) and commit/
+/// abort counts are exposed so a caller can prove its errdefer abort ran
+/// (S9). With `fail_commit` set, commit fails the same way and
+/// `abort_after_commit` counts any abort() arriving after a commit attempt
+/// (contract misuse: the batch is already ended). The iterator serves a
+/// fixed entry list.
 pub const FailBatchBackend = struct {
     aborted: usize = 0,
     committed: usize = 0,
+    commit_attempts: usize = 0,
+    abort_after_commit: usize = 0,
+    fail_ops: bool = true,
+    fail_commit: bool = false,
     iter_entries: []const Entry = &.{},
 
     const Self = @This();
@@ -348,27 +366,37 @@ pub const FailBatchBackend = struct {
 
     pub const WriteBatch = struct {
         owner: *Self,
+        commit_attempted: bool = false,
+        ended: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
-            _ = self;
             _ = ns;
             _ = key;
             _ = value;
-            return error.MapFull;
+            if (self.owner.fail_ops) return error.MapFull;
         }
 
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
-            _ = self;
             _ = ns;
             _ = key;
-            return error.MapFull;
+            if (self.owner.fail_ops) return error.MapFull;
         }
 
         pub fn commit(self: *WriteBatch) !void {
+            self.commit_attempted = true;
+            self.owner.commit_attempts += 1;
+            if (self.owner.fail_commit) return error.MapFull;
+            self.ended = true;
             self.owner.committed += 1;
         }
 
         pub fn abort(self: *WriteBatch) void {
+            if (self.commit_attempted) {
+                self.owner.abort_after_commit += 1;
+                return;
+            }
+            if (self.ended) return;
+            self.ended = true;
             self.owner.aborted += 1;
         }
     };

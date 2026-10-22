@@ -268,7 +268,12 @@ pub const SqliteBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            _ = execSimple(self.backend.db, "COMMIT");
+            if (execSimple(self.backend.db, "COMMIT") != 0) {
+                // A failed COMMIT leaves the txn open: end it here so
+                // abort() is never needed after commit (S9).
+                self.abort();
+                return error.SqliteCommitFailed;
+            }
             self.committed = true;
         }
 

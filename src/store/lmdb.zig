@@ -275,6 +275,7 @@ pub const LmdbBackend = struct {
         txn: lmdb.Transaction,
         backend: *LmdbBackend,
         dbi_count_at_start: u32,
+        ended: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const dbi = try self.resolveDbi(ns);
@@ -292,14 +293,29 @@ pub const LmdbBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            try self.txn.commit();
+            // mdb_txn_commit ends the txn on failure as well (it aborts it
+            // internally), so the batch is finished either way and abort()
+            // must never end it again: a second mdb_txn_abort on the write
+            // txn frees env->me_txn0 (S9).
+            self.ended = true;
+            self.txn.commit() catch |err| {
+                self.rollbackDbiCache();
+                return err;
+            };
             // A batch can fill the map like any single put (S9).
             self.backend.warnIfNearlyFull();
         }
 
         pub fn abort(self: *WriteBatch) void {
+            if (self.ended) return;
+            self.ended = true;
             self.txn.abort();
-            // Roll back DBI cache entries created during this batch
+            self.rollbackDbiCache();
+        }
+
+        /// Roll back DBI cache entries created during this batch: handles
+        /// opened in a txn that never committed are not usable later.
+        fn rollbackDbiCache(self: *WriteBatch) void {
             self.backend.dbi_lock.lock();
             self.backend.dbi_count.store(self.dbi_count_at_start, .release);
             self.backend.dbi_lock.unlock();
@@ -530,6 +546,34 @@ test "LmdbBackend: writeBatch abort" {
 
     const val = try db.get(std.testing.allocator, "users", "alice");
     try std.testing.expect(val == null);
+}
+
+test "LmdbBackend: abort after commit does not end the txn again (S9)" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+
+    // A namespace outside the canonical set: the put appends a DBI cache
+    // entry whose lifetime the test can observe.
+    var batch = try db.writeBatch();
+    try batch.put("scratch", "alice", "a");
+    const dc_committed = db.dbi_count.load(.acquire);
+    try batch.commit();
+    // The commit ended the txn (a failed commit would have aborted it
+    // internally): abort() must be a no-op, not a second mdb_txn_abort
+    // freeing env->me_txn0 nor a DBI cache rollback.
+    batch.abort();
+
+    try std.testing.expectEqual(dc_committed, db.dbi_count.load(.acquire));
+
+    // The env must still accept and hold a write.
+    var batch2 = try db.writeBatch();
+    try batch2.put("scratch", "bob", "b");
+    try batch2.commit();
+
+    const val = try db.get(std.testing.allocator, "scratch", "bob");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", val.?);
 }
 
 test "LmdbBackend: MAP_FULL is a hard error: no runtime env resize (T358/S9)" {
