@@ -36,6 +36,41 @@ fn canonicalKey(username: []const u8, buf: *[MAX_KEY_LEN]u8) error{KeyTooLong}![
     return buf[0..username.len];
 }
 
+/// Whether a failed backend open means "nothing is stored there yet" (a
+/// missing environment or missing namespace). Every other failure
+/// (permissions, corruption, map limits) is a real fault, not emptiness.
+pub fn isMissingStoreError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.PathNotFound,
+        error.NOENT,
+        error.MDB_NOTFOUND,
+        => true,
+        else => false,
+    };
+}
+
+/// Open the shared op-storage backend read-only for a lock-checking daemon.
+/// The open never creates; when it fails because the environment or the
+/// namespaces do not exist yet (fresh install), the store is provisioned
+/// once read-write and reopened read-only. Any other failure is returned
+/// untouched: a fault must never be papered over with a provisioning write.
+pub fn openReadOnlyProvisioned(comptime Backend: type, path: []const u8, opts: backend_mod.OpenOptions) !Backend {
+    var ro = opts;
+    ro.read_only = true;
+    ro.create = false;
+    return Backend.open(path, ro) catch |first_err| blk: {
+        if (!isMissingStoreError(first_err)) return first_err;
+        log.warn("lock store at {s} not created yet ({}); provisioning read-write once", .{ path, first_err });
+        var rw = opts;
+        rw.read_only = false;
+        rw.create = true;
+        var provision = try Backend.open(path, rw);
+        provision.close();
+        break :blk Backend.open(path, ro);
+    };
+}
+
 /// Lock type identifiers.
 pub const LockType = enum(u8) {
     permanent = 0x01,
@@ -54,10 +89,38 @@ pub fn LockStore(comptime Backend: type) type {
     return struct {
         backend: *Backend,
 
+        /// Set once the namespace is known to hold only canonical keys
+        /// (after migration or a clean legacy scan): misses then skip the
+        /// legacy scan entirely.
+        legacy_free: bool = false,
+
         const Self = @This();
 
         pub fn init(b: *Backend) Self {
             return .{ .backend = b };
+        }
+
+        /// Find a non-canonical row that folds to `canon`: rows written
+        /// before keys were case-folded carry the name as typed ("Alice")
+        /// and miss the canonical lookup. Returns the row's actual key
+        /// (caller frees), or null. Records in `legacy_free` when the whole
+        /// namespace is canonical so later misses skip this scan.
+        fn legacyFind(self: *Self, allocator: std.mem.Allocator, canon: []const u8) !?[]u8 {
+            var found: ?[]u8 = null;
+            var legacy_any = false;
+            var it = try self.backend.iterator(NAMESPACE, "");
+            defer it.deinit();
+            while (it.next()) |entry| {
+                var canon_buf: [MAX_KEY_LEN]u8 = undefined;
+                const fold = canonicalKey(entry.key, &canon_buf) catch continue;
+                if (std.mem.eql(u8, fold, entry.key)) continue;
+                legacy_any = true;
+                if (found == null and std.mem.eql(u8, fold, canon)) {
+                    found = try allocator.dupe(u8, entry.key);
+                }
+            }
+            if (!legacy_any) self.legacy_free = true;
+            return found;
         }
 
         /// Check if a username is locked. Returns the lock record if locked, null otherwise.
@@ -68,7 +131,18 @@ pub fn LockStore(comptime Backend: type) type {
                 log.err("lock_store lookup failed for '{s}': {}", .{ username, err });
                 return err;
             };
-            const data = raw orelse return null;
+            const data = raw orelse {
+                // A fold-equal legacy row is the same lock; without this
+                // lookup it reads as unlocked (S3).
+                if (self.legacy_free) return null;
+                const legacy_key = (try self.legacyFind(allocator, key)) orelse return null;
+                defer allocator.free(legacy_key);
+                const legacy_raw = try self.backend.get(allocator, NAMESPACE, legacy_key);
+                const legacy_data = legacy_raw orelse return null;
+                defer allocator.free(legacy_data);
+                if (legacy_data.len < LOCK_VALUE_SIZE) return error.CorruptLockRecord;
+                return deserialize(legacy_data[0..LOCK_VALUE_SIZE]);
+            };
             defer allocator.free(data);
 
             // Corrupt entry: treat as locked, never silently unlocked
@@ -96,7 +170,55 @@ pub fn LockStore(comptime Backend: type) type {
                 allocator.free(v);
                 try self.backend.delete(NAMESPACE, key);
                 log.info("unlocked account: {s}", .{username});
+                return;
             }
+            // A fold-equal legacy row is the same lock and must be removed
+            // too, or unlock cannot clear it (S3).
+            if (self.legacy_free) return;
+            const legacy_key = (try self.legacyFind(allocator, key)) orelse return;
+            defer allocator.free(legacy_key);
+            try self.backend.delete(NAMESPACE, legacy_key);
+            log.info("unlocked account: {s} (legacy key '{s}')", .{ username, legacy_key });
+        }
+
+        /// Re-key rows whose key is not canonical lowercase (written before
+        /// keys were case-folded). The write daemon runs this on open so the
+        /// set is canonical before the first check; a reader that cannot
+        /// write still enforces such rows through the legacy lookup. When a
+        /// canonical and a legacy row collide, the canonical row stays.
+        pub fn migrateLegacyKeys(self: *Self, allocator: std.mem.Allocator) !void {
+            var legacy: std.ArrayListUnmanaged([]const u8) = .{};
+            defer {
+                for (legacy.items) |k| allocator.free(k);
+                legacy.deinit(allocator);
+            }
+            {
+                var it = try self.backend.iterator(NAMESPACE, "");
+                defer it.deinit();
+                while (it.next()) |entry| {
+                    var canon_buf: [MAX_KEY_LEN]u8 = undefined;
+                    const canon = canonicalKey(entry.key, &canon_buf) catch continue;
+                    if (std.mem.eql(u8, canon, entry.key)) continue;
+                    try legacy.append(allocator, try allocator.dupe(u8, entry.key));
+                }
+            }
+            for (legacy.items) |k| {
+                var canon_buf: [MAX_KEY_LEN]u8 = undefined;
+                const canon = try canonicalKey(k, &canon_buf);
+                const taken = try self.backend.get(allocator, NAMESPACE, canon);
+                if (taken) |v| {
+                    allocator.free(v);
+                    log.warn("lock_store: legacy row '{s}' dropped; canonical '{s}' exists", .{ k, canon });
+                } else {
+                    const value_raw = try self.backend.get(allocator, NAMESPACE, k);
+                    const value = value_raw orelse continue;
+                    defer allocator.free(value);
+                    try self.backend.put(NAMESPACE, canon, value);
+                    log.info("lock_store: legacy row '{s}' re-keyed to '{s}'", .{ k, canon });
+                }
+                try self.backend.delete(NAMESPACE, k);
+            }
+            self.legacy_free = true;
         }
 
         /// Remove lock entry (used during account deletion cascade).
@@ -245,4 +367,111 @@ test "LockStore: empty and overlong names fail closed (S3)" {
     @memset(&big, 'a');
     try std.testing.expectError(error.KeyTooLong, store.isLocked(allocator, &big));
     try std.testing.expectError(error.KeyTooLong, store.lock("", .permanent));
+}
+
+test "LockStore: legacy mixed-case rows are enforced and removable (S3)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // A row written before keys were case-folded: stored as typed.
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 7));
+
+    // The fold-equal row is the same lock and must hold for every case.
+    const hit = (try store.isLocked(allocator, "alice")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 7), hit.locked_epoch);
+    try std.testing.expect((try store.isLocked(allocator, "ALICE")) != null);
+
+    // unlock reaches the row it could not before.
+    try store.unlock(allocator, "alice");
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+    try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
+}
+
+test "LockStore: migration re-keys legacy rows to canonical (S3)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 1));
+    try db.put(NAMESPACE, "bOB", &serialize(.permanent, 2));
+    try store.migrateLegacyKeys(allocator);
+
+    const a = (try store.isLocked(allocator, "alice")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 1), a.locked_epoch);
+    const b = (try store.isLocked(allocator, "BOB")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 2), b.locked_epoch);
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "bOB")) == null);
+    // The set is canonical now: later misses skip the legacy scan.
+    try std.testing.expect(store.legacy_free);
+}
+
+test "LockStore: migration keeps the canonical row over a legacy duplicate (S3)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 1));
+    try db.put(NAMESPACE, "alice", &serialize(.permanent, 2));
+    try store.migrateLegacyKeys(allocator);
+
+    const a = (try store.isLocked(allocator, "alice")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 2), a.locked_epoch);
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+}
+
+/// Test double for openReadOnlyProvisioned: an open that fails with a
+/// scripted error on the first attempt, then succeeds, recording whether
+/// the provisioning (create, read-write) pass ran.
+const OpenProbe = struct {
+    var attempts: usize = 0;
+    var provisioned: bool = false;
+    var first_error: ?anyerror = null;
+
+    fn reset(err: ?anyerror) void {
+        attempts = 0;
+        provisioned = false;
+        first_error = err;
+    }
+
+    pub fn open(_: []const u8, opts: backend_mod.OpenOptions) !OpenProbe {
+        attempts += 1;
+        if (attempts == 1) {
+            if (first_error) |e| return e;
+        } else if (opts.create and !opts.read_only) {
+            provisioned = true;
+        }
+        return .{};
+    }
+
+    pub fn close(_: *OpenProbe) void {}
+};
+
+test "lock store open: only a missing store is provisioned (S3)" {
+    // Missing environment (fresh install): provision once, reopen read-only.
+    OpenProbe.reset(error.NOENT);
+    _ = try openReadOnlyProvisioned(OpenProbe, "ignored", .{});
+    try std.testing.expectEqual(@as(usize, 3), OpenProbe.attempts); // fail, provision, reopen
+    try std.testing.expect(OpenProbe.provisioned);
+
+    // Missing namespace: same fresh-install path.
+    OpenProbe.reset(error.MDB_NOTFOUND);
+    _ = try openReadOnlyProvisioned(OpenProbe, "ignored", .{});
+    try std.testing.expect(OpenProbe.provisioned);
+
+    // A real fault propagates untouched: no provisioning write over it.
+    OpenProbe.reset(error.ACCES);
+    try std.testing.expectError(error.ACCES, openReadOnlyProvisioned(OpenProbe, "ignored", .{}));
+    try std.testing.expect(!OpenProbe.provisioned);
+    try std.testing.expectEqual(@as(usize, 1), OpenProbe.attempts);
 }

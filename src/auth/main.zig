@@ -213,6 +213,9 @@ pub fn main() !void {
     defer backend.close();
     var store = UserStore.init(&backend);
     var lock_store = LockStore.init(&backend);
+    // Rows written before keys were case-folded carry the name as typed and
+    // must not survive into service (S3).
+    try lock_store.migrateLegacyKeys(allocator);
     var invite_store = InviteStore.init(&backend);
 
     // Initialize rate limiter

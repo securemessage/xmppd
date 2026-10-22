@@ -976,12 +976,35 @@ const TestHandler = AuthHandler(TestUserStore);
 const TestCryptoPool = crypto_pool_mod.CryptoPool;
 
 /// Test helper: drive the synchronous variant of handleMessage.
-fn handleSync(handler: *TestHandler, msg: protocol.Message) ?protocol.Message {
+fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
     return switch (handler.handleMessage(msg, 0, 1)) {
         .reply => |m| m,
         .deferred, .none => null,
     };
 }
+
+/// IdP-delegating test store: credentials and tokens are answered by the
+/// identity provider instead of a local user table, so the
+/// @hasDecl(Store, "validatePassword"/"validateToken") admit paths compile
+/// and run (the local UserStore never reaches them).
+const TestIdpStore = struct {
+    password_user: ?[]const u8 = null,
+    token_user: ?[]const u8 = null,
+
+    pub fn validatePassword(self: *const @This(), allocator: std.mem.Allocator, username: []const u8, password: []const u8) !?[]const u8 {
+        _ = allocator;
+        _ = username;
+        _ = password;
+        return self.password_user;
+    }
+
+    pub fn validateToken(self: *const @This(), allocator: std.mem.Allocator, token: []const u8) !?[]const u8 {
+        _ = allocator;
+        _ = token;
+        return self.token_user;
+    }
+};
+const TestIdpHandler = AuthHandler(TestIdpStore);
 
 test "AuthHandler: SCRAM slot table probes past conn_id home-slot collisions" {
     const allocator = std.testing.allocator;
@@ -1344,6 +1367,118 @@ test "AuthHandler: locks catch case and domain variants of the typed name (S3)" 
         } }) orelse return error.NoResponse;
         try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
     }
+}
+
+test "AuthHandler: IdP PLAIN admits the localpart of the returned identity (S3)" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .password_user = "alice@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const user = "alice";
+    const pass = "anypassword";
+    var payload: [64]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1 .. 1 + user.len], user);
+    payload[1 + user.len] = 0;
+    @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 41,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0 .. 2 + user.len + pass.len],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("alice", result.auth_success.username);
+}
+
+test "AuthHandler: a lock on the IdP identity rejects PLAIN (S3)" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    // The IdP hands the identity back with a domain and mixed case: the
+    // admission check runs on its localpart, not on the requested name.
+    var store = TestIdpStore{ .password_user = "Alice@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    const user = "alicework";
+    const pass = "anypassword";
+    var payload: [64]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1 .. 1 + user.len], user);
+    payload[1 + user.len] = 0;
+    @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 42,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0 .. 2 + user.len + pass.len],
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+}
+
+test "AuthHandler: OAUTHBEARER admits the identity the IdP returns (S3)" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "bob@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 43,
+        .mechanism = .oauthbearer,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("bob@idp.example", result.auth_success.username);
+}
+
+test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER (S3)" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("bob", .permanent);
+
+    var store = TestIdpStore{ .token_user = "Bob@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 44,
+        .mechanism = .oauthbearer,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok456\x01\x01",
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
 }
 
 test "AuthHandler: a lock landing between challenge and client-final rejects (S3)" {
