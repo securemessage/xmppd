@@ -228,18 +228,26 @@ pub const S2sStream = struct {
         self.dane_verified = verified;
     }
 
-    /// Handle SASL EXTERNAL auth from peer (receiving role).
+    /// Handle SASL EXTERNAL auth from peer (receiving role). The stream
+    /// state moves only in completeSaslExternal, after the caller records
+    /// the verified domain: an exchange that cannot be recorded must not
+    /// leave the stream authenticated (C6).
     pub fn handleSaslExternal(self: *S2sStream) S2sStreamAction {
         if (self.state != .features_auth) return .{ .send_error = .not_well_formed };
 
         if (self.dane_verified) {
-            self.authenticated = true;
-            // After SASL success, remote will restart the stream
-            self.state = .awaiting_stream_open_tls; // Reuse: expects stream restart
             return .send_sasl_success;
         } else {
             return .{ .send_sasl_failure = "not-authorized" };
         }
+    }
+
+    /// Record a completed SASL EXTERNAL: the stream is authenticated and
+    /// awaits the peer's stream restart.
+    pub fn completeSaslExternal(self: *S2sStream) void {
+        self.authenticated = true;
+        // After SASL success, remote will restart the stream
+        self.state = .awaiting_stream_open_tls; // Reuse: expects stream restart
     }
 
     /// For initiating role: after features received, decide auth method.
@@ -329,9 +337,13 @@ test "S2sStream: receiving role — full lifecycle" {
     try std.testing.expect(auth_features.sasl_external);
     try std.testing.expect(!auth_features.dialback);
 
-    // SASL EXTERNAL auth
+    // SASL EXTERNAL auth: the action is decided first, and the stream
+    // turns authenticated only once the caller records the verified
+    // domain (completeSaslExternal).
     const auth_action = s.handleSaslExternal();
     try std.testing.expectEqual(S2sStreamAction.send_sasl_success, auth_action);
+    try std.testing.expect(!s.authenticated);
+    s.completeSaslExternal();
     try std.testing.expect(s.authenticated);
     try std.testing.expectEqual(S2sStreamState.awaiting_stream_open_tls, s.state);
 

@@ -1397,8 +1397,14 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     if (!dialback.isValidKeyHex(key)) {
         log.warn("dialback callback: invalid key shape from {s} ({d} bytes); answering type=invalid", .{ origin, key.len });
         var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch return;
-        session.queueWrite(resp) catch {};
+        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
+            failDbResultAnswer(daemon, batch, session, session.id, origin);
+            return;
+        };
+        session.queueWrite(resp) catch {
+            failDbResultAnswer(daemon, batch, session, session.id, origin);
+            return;
+        };
         if (session.hasPendingWrite()) {
             batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
         }
@@ -1422,8 +1428,14 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, target, key) == null) {
         log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
         var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch return;
-        session.queueWrite(resp) catch {};
+        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
+            failDbResultAnswer(daemon, batch, session, session.id, origin);
+            return;
+        };
+        session.queueWrite(resp) catch {
+            failDbResultAnswer(daemon, batch, session, session.id, origin);
+            return;
+        };
         if (session.hasPendingWrite()) {
             batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
         }
@@ -1515,6 +1527,19 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     return true;
 }
 
+/// A db:result submission must always be answered: when the answer cannot
+/// be built or queued, fail and close the submitting stream instead of
+/// leaving the peer waiting for a verdict forever (C6).
+fn failDbResultAnswer(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, slot: usize, origin: []const u8) void {
+    log.warn("dialback callback: cannot answer the db:result verdict for {s}; failing inbound session {d}", .{ origin, slot });
+    // Flush first to make room for the stream error when the queue was
+    // what failed.
+    _ = session.flushWrite() catch {};
+    sendStreamError(session, .internal_server_error);
+    _ = session.flushWrite() catch {};
+    daemon.closeInbound(batch, slot);
+}
+
 /// Handle a db:verify verdict that matched a pending callback entry.
 /// Answers db:result on the original inbound session, addressed to the
 /// verified origin, and only while the slot still holds the session that
@@ -1559,9 +1584,15 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         if (target.len > 0) target else daemon.local_domain,
         origin,
         accepted,
-    ) catch return;
+    ) catch {
+        failDbResultAnswer(daemon, batch, session, inbound_slot, origin);
+        return;
+    };
 
-    session.queueWrite(resp) catch return;
+    session.queueWrite(resp) catch {
+        failDbResultAnswer(daemon, batch, session, inbound_slot, origin);
+        return;
+    };
     if (session.hasPendingWrite()) {
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + inbound_slot) catch {};
     }
@@ -1638,6 +1669,9 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
                 session.queueWrite(failure) catch {};
                 return;
             }
+            // The stream turns authenticated only once the domain is
+            // recorded (C6).
+            session.stream.completeSaslExternal();
             const success = session.buildSaslSuccess(&buf) catch return;
             session.queueWrite(success) catch {};
             _ = session.flushWrite() catch {};
@@ -3594,6 +3628,101 @@ test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid
     try std.testing.expect(!session.isAuthenticatedDomain(long_origin));
 }
 
+test "S2sDaemon: a db:result verdict whose answer cannot be built fails the inbound stream" {
+    // Origin and target at the buffer limit overflow the fixed db:result
+    // response buffer too: the verdict can never be answered, and the peer
+    // must not be left waiting for it forever (C6).
+    var host_buf: [256]u8 = undefined;
+    @memset(host_buf[0..251], 'a');
+    @memcpy(host_buf[251..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [256]u8 = undefined;
+    @memset(origin_buf[0..251], 'b');
+    @memcpy(origin_buf[251..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, long_origin);
+    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "9999999999999999999999999999999999999999999999999999999999999999";
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, key);
+
+    // The submitting stream is failed and closed instead of stalling.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "internal-server-error") != null);
+}
+
+test "S2sDaemon: an invalid-key rejection whose answer cannot be built fails the submitting stream" {
+    // The same failure class at the invalid-key path: a huge origin and
+    // target overflow the rejection's answer buffer too, and the peer
+    // must not be left waiting for it forever (C6).
+    var host_buf: [256]u8 = undefined;
+    @memset(host_buf[0..251], 'a');
+    @memcpy(host_buf[251..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [256]u8 = undefined;
+    @memset(origin_buf[0..251], 'b');
+    @memcpy(origin_buf[251..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // Not 64 lowercase hex: the submission is rejected before any
+    // callback exists.
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, "zz");
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "internal-server-error") != null);
+}
+
+test "S2sDaemon: a db:result verdict whose answer cannot be queued fails the inbound stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "8888888888888888888888888888888888888888888888888888888888888888";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // Fill the inbound write buffer: the verdict answer no longer fits.
+    var filler: [16384]u8 = @splat(' ');
+    try in1.session.queueWrite(filler[0 .. 16384 - 64]);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+
+    // The submitting stream is failed and closed instead of stalling.
+    try std.testing.expect(daemon.getInbound(1) == null);
+}
+
 test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
@@ -3662,6 +3791,42 @@ test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeedin
     try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
     try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream unauthenticated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The authenticated-domain set is full: the identity cannot be
+    // recorded and the exchange answers <failure/>.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+    in1.session.setDaneCandidate("them.example");
+    in1.session.stream.setDaneVerified(true);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    _ = in1.session.stream.handleSaslExternal();
+    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+
+    // A failed exchange leaves nothing behind: the stream is not
+    // authenticated and not waiting for a post-auth restart.
+    try std.testing.expect(!in1.session.stream.authenticated);
+    try std.testing.expect(in1.session.stream.state != .awaiting_stream_open_tls);
+
+    // The stream restart after the failed exchange must not reach
+    // established.
+    _ = in1.session.stream.handleStreamOpen("them.example", "us.example", "1.0");
+    try std.testing.expect(!in1.session.stream.isEstablished());
 }
 
 test "S2sDaemon: stream restart with unauthenticated from= is rejected" {
