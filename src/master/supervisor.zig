@@ -156,7 +156,18 @@ pub const Supervisor = struct {
             log.warn("uid {d} has no passwd entry; refusing to spawn with root's groups", .{self.uid});
             return error.PasswdLookupFailed;
         }
-        self.gid = result.?.gid;
+        try self.adoptRunGid(result.?.gid);
+    }
+
+    /// Adopt a resolved primary gid for the privilege drop. A run user in
+    /// group root would keep the child in group root after setgid; that is
+    /// refused rather than dropped into.
+    pub fn adoptRunGid(self: *Supervisor, gid: posix.gid_t) !void {
+        if (self.uid != 0 and gid == 0) {
+            log.warn("run user uid {d} has gid 0; refusing to drop into group root", .{self.uid});
+            return error.RunGidIsRoot;
+        }
+        self.gid = gid;
     }
 
     /// Spawn the child process using fork+execve.
@@ -552,4 +563,69 @@ test "Supervisor: uid-only drop resolves the run user's gid (S7)" {
     var sup4 = Supervisor.init("/unused", &.{});
     sup4.uid = 999999;
     try std.testing.expectError(error.PasswdLookupFailed, sup4.resolveRunGid());
+}
+
+test "Supervisor: spawnChild refuses to start when the run user has no passwd entry" {
+    // spawnChild resolves the run gid before forking: without the lookup a
+    // uid-only drop would fork and then run with the parent's groups.
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 999999; // no passwd entry: the primary gid cannot be resolved
+    try std.testing.expectError(error.PasswdLookupFailed, sup.spawnChild());
+    try std.testing.expect(sup.child_pid == null);
+    try std.testing.expectEqual(ChildState.not_started, sup.state);
+}
+
+test "Supervisor: spawnChild drops the child into the run user's primary group" {
+    // The child reports its kernel group list from inside the dropped
+    // identity: exactly the primary gid of the run user's passwd entry,
+    // never the parent's supplementary groups (wheel, operator).
+    const uid = posix.getuid();
+    var pw: std.c.passwd = undefined;
+    var pw_buf: [1024]u8 = undefined;
+    var result: ?*std.c.passwd = null;
+    const rc = std.c.getpwuid_r(uid, &pw, &pw_buf, pw_buf.len, &result);
+    if (rc != 0 or result == null) return error.PasswdLookupFailed;
+    const expected_gid = result.?.gid;
+
+    var p: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p) != 0) return error.Socketpair;
+    defer posix.close(p[0]);
+    var w_open = true;
+    errdefer if (w_open) posix.close(p[1]);
+
+    var sup = Supervisor.init("/bin/sh", &.{ "-c", "exec /usr/bin/id -G >&3" });
+    sup.uid = uid; // uid-only drop: the gid comes from the passwd lookup
+    sup.pass_fds = &.{p[1]};
+
+    const pid = try sup.spawnChild();
+    posix.close(p[1]);
+    w_open = false;
+
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(p[0], &buf);
+    const reported = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    var expected_buf: [16]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "{d}", .{expected_gid});
+    try std.testing.expectEqualStrings(expected, reported);
+
+    try std.testing.expectEqual(pid, sup.child_pid.?);
+    const status = try sup.waitChild();
+    try std.testing.expectEqual(@as(u32, 0), (status >> 8) & 0xFF);
+}
+
+test "Supervisor: a run gid of 0 is refused" {
+    // group root after the drop is still group root: refuse it.
+    var sup = Supervisor.init("/unused", &.{});
+    sup.uid = 65534;
+    try std.testing.expectError(error.RunGidIsRoot, sup.adoptRunGid(0));
+    try std.testing.expectEqual(@as(posix.gid_t, 0), sup.gid);
+
+    // A real primary gid is adopted.
+    try sup.adoptRunGid(65534);
+    try std.testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
+
+    // uid 0 means no drop; gid 0 stays.
+    var sup2 = Supervisor.init("/unused", &.{});
+    try sup2.adoptRunGid(0);
+    try std.testing.expectEqual(@as(posix.gid_t, 0), sup2.gid);
 }
