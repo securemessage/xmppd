@@ -1159,13 +1159,16 @@ pub const Engine = struct {
     pub fn runSync(self: *Engine) !void {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
+        const gen = self.run_gen.load(.acquire);
         while (self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) {
-            self.loopOnce() catch {
-                // kevent error — fail every session and stop rather than spin.
-                var i: usize = 0;
-                while (i < self.hi.load(.monotonic)) : (i += 1) {
-                    const slot = self.slotAt(@intCast(i)) orelse continue;
-                    if (slot.live) slot.session.fail(self.allocator, "kqueue-error");
+            self.loopOnce(gen) catch |e| {
+                if (e != error.Stopping) {
+                    // kevent error: fail every session and stop rather than spin.
+                    var i: usize = 0;
+                    while (i < self.hi.load(.monotonic)) : (i += 1) {
+                        const slot = self.slotAt(@intCast(i)) orelse continue;
+                        if (slot.live) slot.session.fail(self.allocator, "kqueue-error");
+                    }
                 }
                 self.reapDead();
                 break;
@@ -1178,12 +1181,12 @@ pub const Engine = struct {
         self.loop_tid.store(std.Thread.getCurrentId(), .release);
         defer self.loop_tid.store(0, .release);
         while ((self.live_count.load(.monotonic) > 0 or self.timersPending() > 0) and self.run_gen.load(.acquire) == gen) {
-            self.loopOnce() catch break;
+            self.loopOnce(gen) catch break;
             self.reapDead();
         }
     }
 
-    fn loopOnce(self: *Engine) !void {
+    fn loopOnce(self: *Engine, gen: u32) !void {
         const t_iter_start = std.time.nanoTimestamp();
         // Drain the self-pipe first: a wake is a "re-examine" request, not
         // data. Clear the coalescing flag BEFORE reading so a concurrent
@@ -1198,6 +1201,11 @@ pub const Engine = struct {
                 _ = self.stats.wakes_read.fetchAdd(@intCast(r), .monotonic);
             }
         }
+        // A run/deinit generation bump whose wake landed while the drain
+        // above ran is consumed here, so re-check before waiting: without
+        // this the loop parks in kevent() past the stop and the join on it
+        // hangs until some unrelated event fires (T252).
+        if (self.run_gen.load(.acquire) != gen) return error.Stopping;
         self.drainCommands();
 
         // Resume sessions whose off-loop SaltedPassword derivation finished.
@@ -1536,11 +1544,38 @@ test "engine: a generation bump right after run stops the loop (T252)" {
         std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     if (!ctx.done.load(.acquire)) {
-        jt.detach();
+        // The loop consumed the wake above and re-parked. One more wake
+        // always releases it (level-triggered READ on the wake pipe) and
+        // the generation bump is seen at the next loop condition, so the
+        // joiner is joined and the engine torn down before the test fails;
+        // detaching would strand the joiner on this stack frame.
+        eng.requestWake();
+        jt.join();
+        eng.deinit();
         return error.WatchdogLoopDidNotExit;
     }
     jt.join();
 
     eng.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fired);
+}
+
+test "engine: loopOnce with a stale generation returns before the wait (T252)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    // A pending timer keeps the call eligible to wait.
+    var fired: usize = 0;
+    _ = try eng.schedule(250, countingTimerCb, &fired);
+
+    const gen = eng.run_gen.fetchAdd(1, .acq_rel) +% 1; // run()'s snapshot
+    // The stop bump and its wake land before loopOnce drains: the drain
+    // consumes the wake byte, so only the post-drain generation re-check
+    // returns before kevent(). Without it the call waits out the timer and
+    // reports success instead of Stopping.
+    _ = eng.run_gen.fetchAdd(1, .acq_rel);
+    eng.requestWake();
+    try std.testing.expectError(error.Stopping, eng.loopOnce(gen));
     try std.testing.expectEqual(@as(usize, 0), fired);
 }
