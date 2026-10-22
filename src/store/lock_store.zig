@@ -71,6 +71,29 @@ pub fn openReadOnlyProvisioned(comptime Backend: type, path: []const u8, opts: b
     };
 }
 
+/// Bring the `locks` namespace to canonical keys on a short-lived
+/// read-write handle and report whether the namespace is now canonical.
+/// A lock-checking daemon runs this at start: production serves its
+/// checks from a read-only handle (xmppd-auth-oidc), and while legacy
+/// rows remain every check miss scans the whole namespace on the auth
+/// loop thread (S3). The open never creates, so a missing store keeps
+/// its fail-open guard and stays with the provisioning path; a
+/// deployment that cannot open the store read-write keeps its rows and
+/// the read-only path learns `legacy_free` from its scans instead.
+pub fn migrateIfWritable(comptime Backend: type, allocator: std.mem.Allocator, path: []const u8, opts: backend_mod.OpenOptions) !bool {
+    var rw = opts;
+    rw.read_only = false;
+    rw.create = false;
+    var handle = Backend.open(path, rw) catch |err| {
+        log.warn("lock store at {s} not writable for migration ({}); lock checks keep their legacy scan", .{ path, err });
+        return false;
+    };
+    defer handle.close();
+    var store = LockStore(Backend).init(&handle);
+    try store.migrateLegacyKeys(allocator);
+    return true;
+}
+
 /// Lock type identifiers.
 pub const LockType = enum(u8) {
     permanent = 0x01,
@@ -221,6 +244,13 @@ pub fn LockStore(comptime Backend: type) type {
                 }
                 try self.backend.delete(NAMESPACE, k);
             }
+            self.legacy_free = true;
+        }
+
+        /// Record that the namespace is known canonical (a migration ran
+        /// on a read-write handle at daemon start): misses then skip the
+        /// legacy scan from the first check on.
+        pub fn learnLegacyFree(self: *Self) void {
             self.legacy_free = true;
         }
 
@@ -499,4 +529,130 @@ test "lock store open: only a missing store is provisioned" {
     try std.testing.expectError(error.ACCES, openReadOnlyProvisioned(OpenProbe, "ignored", .{}));
     try std.testing.expect(!OpenProbe.provisioned);
     try std.testing.expectEqual(@as(usize, 1), OpenProbe.attempts);
+}
+
+/// Test double for migrateIfWritable: records the open it makes and
+/// shares one in-memory store across handles, like an on-disk backend
+/// (MemoryBackend.open is fresh per call).
+const MigrateProbe = struct {
+    var attempts: usize = 0;
+    var last_read_only: ?bool = null;
+    var last_create: ?bool = null;
+    var open_err: ?anyerror = null;
+    var shared: ?backend_mod.MemoryBackend = null;
+
+    mem: *backend_mod.MemoryBackend,
+
+    fn reset(err: ?anyerror) void {
+        done();
+        attempts = 0;
+        last_read_only = null;
+        last_create = null;
+        open_err = err;
+    }
+
+    /// Close the shared store: the per-test leak check runs while the
+    /// probe's statics outlive the test body.
+    fn done() void {
+        if (shared) |*s| {
+            s.close();
+            shared = null;
+        }
+    }
+
+    fn seed(key: []const u8) !void {
+        if (shared == null) shared = try backend_mod.MemoryBackend.open("", .{});
+        try shared.?.put(NAMESPACE, key, &serialize(.permanent, 3));
+    }
+
+    pub fn open(_: []const u8, opts: backend_mod.OpenOptions) !MigrateProbe {
+        attempts += 1;
+        last_read_only = opts.read_only;
+        last_create = opts.create;
+        if (open_err) |e| return e;
+        if (shared == null) shared = try backend_mod.MemoryBackend.open("", .{});
+        return .{ .mem = &shared.? };
+    }
+
+    pub fn close(_: *MigrateProbe) void {}
+
+    pub fn get(self: *MigrateProbe, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+        return self.mem.get(allocator, ns, key);
+    }
+
+    pub fn put(self: *MigrateProbe, ns: []const u8, key: []const u8, value: []const u8) !void {
+        return self.mem.put(ns, key, value);
+    }
+
+    pub fn delete(self: *MigrateProbe, ns: []const u8, key: []const u8) !void {
+        return self.mem.delete(ns, key);
+    }
+
+    pub const Iterator = backend_mod.MemoryBackend.Iterator;
+    pub fn iterator(self: *MigrateProbe, ns: []const u8, prefix: []const u8) !Iterator {
+        return self.mem.iterator(ns, prefix);
+    }
+
+    pub const WriteBatch = backend_mod.MemoryBackend.WriteBatch;
+    pub fn writeBatch(self: *MigrateProbe) !WriteBatch {
+        return self.mem.writeBatch();
+    }
+};
+
+test "lock store open: the migration pass opens read-write and never creates" {
+    defer MigrateProbe.done();
+    MigrateProbe.reset(null);
+    try MigrateProbe.seed("Alice");
+
+    const migrated = try migrateIfWritable(MigrateProbe, std.testing.allocator, "ignored", .{});
+    try std.testing.expect(migrated);
+    try std.testing.expectEqual(@as(?bool, false), MigrateProbe.last_read_only);
+    try std.testing.expectEqual(@as(?bool, false), MigrateProbe.last_create);
+
+    // The legacy row was re-keyed on that handle: canonical present,
+    // pre-fold key gone.
+    const canon = try MigrateProbe.shared.?.get(std.testing.allocator, NAMESPACE, "alice");
+    try std.testing.expect(canon != null);
+    if (canon) |v| std.testing.allocator.free(v);
+    const legacy = try MigrateProbe.shared.?.get(std.testing.allocator, NAMESPACE, "Alice");
+    try std.testing.expect(legacy == null);
+    if (legacy) |v| std.testing.allocator.free(v);
+}
+
+test "lock store open: a missing store is not created by the migration pass" {
+    defer MigrateProbe.done();
+    // The fail-open guard stays with the provisioning path (S3): the
+    // migration open must never create.
+    MigrateProbe.reset(error.NOENT);
+    const migrated = try migrateIfWritable(MigrateProbe, std.testing.allocator, "ignored", .{});
+    try std.testing.expect(!migrated);
+    try std.testing.expectEqual(@as(?bool, false), MigrateProbe.last_create);
+    try std.testing.expectEqual(@as(usize, 1), MigrateProbe.attempts);
+}
+
+test "lock store open: a store that will not open read-write keeps the read-only path" {
+    defer MigrateProbe.done();
+    // A read-only deployment cannot migrate; the daemon keeps serving
+    // checks and their misses learn legacy_free from their scans.
+    MigrateProbe.reset(error.EROFS);
+    const migrated = try migrateIfWritable(MigrateProbe, std.testing.allocator, "ignored", .{});
+    try std.testing.expect(!migrated);
+    try std.testing.expectEqual(@as(?bool, false), MigrateProbe.last_read_only);
+    try std.testing.expectEqual(@as(?bool, false), MigrateProbe.last_create);
+}
+
+test "LockStore: a learned canonical namespace skips the legacy scan (D4)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // A pre-fold row that the migration pass proved away: the read-only
+    // path learned the namespace is canonical, so a miss does not scan.
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 7));
+    store.learnLegacyFree();
+
+    try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
 }

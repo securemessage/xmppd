@@ -177,6 +177,13 @@ pub fn main() !void {
     // daemon instead of being provisioned over.
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
+    // This daemon is the writer of record for the locks namespace in an
+    // OIDC deployment: run the legacy-key migration here, on a short-lived
+    // read-write handle, or legacy rows stay in place and every lock-check
+    // miss scans the whole namespace on the auth loop thread (S3).
+    const locks_canonical = try lock_store_mod.migrateIfWritable(OpBackendType, allocator, auth_path, .{
+        .map_size = map_size_mb * 1024 * 1024,
+    });
     var backend = lock_store_mod.openReadOnlyProvisioned(OpBackendType, auth_path, .{
         .map_size = map_size_mb * 1024 * 1024,
     }) catch |err| {
@@ -185,6 +192,9 @@ pub fn main() !void {
     };
     defer backend.close();
     var lock_store = LockStore.init(&backend);
+    // The read-only path learns from the migration pass: its misses then
+    // skip the legacy scan from the first check on.
+    if (locks_canonical) lock_store.learnLegacyFree();
     handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
