@@ -76,6 +76,11 @@ pub const LmdbBackend = struct {
                 .read_only = opts.read_only,
             },
         );
+        // A failed namespace open must not leave the env behind: a leaked
+        // handle keeps the data/lock fds open, and the provisioning pass
+        // that follows the failure then runs a second env on the same
+        // files, where LMDB drops the process's lock-file locks (D5).
+        errdefer env.deinit();
 
         var self: LmdbBackend = .{
             .env = env,
@@ -728,4 +733,45 @@ test "LmdbBackend: read-only open needs only the locks namespace" {
         m.close();
         return error.ShouldHaveFailed;
     } else |_| {}
+}
+
+/// Count the open file descriptors of this process: a failed
+/// LmdbBackend.open that leaks its env keeps the data/lock fds open (D5).
+fn countOpenFds() usize {
+    var count: usize = 0;
+    var fd: std.c.fd_t = 0;
+    while (fd < 4096) : (fd += 1) {
+        if (std.c.fcntl(fd, std.posix.F.GETFD, @as(c_int, 0)) < 0) continue;
+        count += 1;
+    }
+    return count;
+}
+
+test "LmdbBackend: a failed read-only open closes the env it created (D5)" {
+    // The env initializes, then the missing "locks" DBI fails the open
+    // (S3 N8). The env must close before the error returns: the
+    // provisioning pass that follows the failure would otherwise run a
+    // second env on the same files while the first is still open, where
+    // LMDB drops the process's lock-file locks.
+    const path = "/tmp/xmppd-test-lmdb-d5";
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+    {
+        var path_buf: [256:0]u8 = undefined;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const env = try lmdb.Environment.init(&path_buf, .{ .map_size = 1024 * 1024, .max_dbs = MAX_DBS });
+        defer env.deinit();
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        try txn.commit();
+    }
+
+    const before = countOpenFds();
+    if (LmdbBackend.open(path, .{ .create = false, .read_only = true })) |opened| {
+        var m = opened;
+        m.close();
+        return error.ShouldHaveFailed;
+    } else |_| {}
+    try std.testing.expectEqual(before, countOpenFds());
 }
