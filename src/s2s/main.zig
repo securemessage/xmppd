@@ -2568,9 +2568,11 @@ const PoisonOnFreeAllocator = struct {
     /// undefined, so tests check through here.
     quarantine: [MAX_QUARANTINE]Quarantined = undefined,
     quarantine_len: usize = 0,
-    /// Poison snapshot of the frees seen so far, captured at free time.
+    /// Free-time snapshot of the frees seen so far: the first bytes of the
+    /// biggest chunk exactly as freeFn received them, copied before the
+    /// poison fill.
     biggest_freed_len: usize = 0,
-    poisoned_prefix: [8]u8 = [_]u8{0} ** 8,
+    freed_prefix: [8]u8 = [_]u8{0} ** 8,
     poisoned_bytes: usize = 0,
 
     const MAX_QUARANTINE = 64;
@@ -2603,13 +2605,13 @@ const PoisonOnFreeAllocator = struct {
     }
     fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
-        @memset(memory, 0xA5);
-        self.poisoned_bytes += memory.len;
         if (memory.len >= self.biggest_freed_len) {
             self.biggest_freed_len = memory.len;
-            const n = @min(memory.len, self.poisoned_prefix.len);
-            @memcpy(self.poisoned_prefix[0..n], memory[0..n]);
+            const n = @min(memory.len, self.freed_prefix.len);
+            @memcpy(self.freed_prefix[0..n], memory[0..n]);
         }
+        @memset(memory, 0xA5);
+        self.poisoned_bytes += memory.len;
         if (self.quarantine_len == self.quarantine.len) {
             self.inner.rawFree(memory, alignment, ret_addr);
             return;
@@ -3119,10 +3121,11 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)
     // Teardown went through the slot table, and the conn chunk was freed
     // poison-filled. The fill is checked inside the poisoning allocator
     // while it still owns the bytes: reading a chunk after the real free
-    // is undefined.
+    // is undefined. The free-time snapshot is the live object, not the
+    // fill read back: freeFn copies the prefix before it poisons (D9).
     try std.testing.expect(daemon.outbound[7] == null);
     try std.testing.expect(pf.biggest_freed_len >= @sizeOf(OutboundConnection));
-    try std.testing.expect(std.mem.allEqual(u8, &pf.poisoned_prefix, 0xA5));
+    try std.testing.expect(!std.mem.allEqual(u8, &pf.freed_prefix, 0xA5));
     try pf.checkQuarantine();
 }
 
@@ -3167,30 +3170,42 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
     var vbuf: [2048]u8 = undefined;
     const verifies = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, verifies, "<db:verify"));
-    try std.testing.expect(std.mem.indexOf(u8, verifies, in1.session.getStreamId()) != null);
-    try std.testing.expect(std.mem.indexOf(u8, verifies, in2.session.getStreamId()) != null);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, daemon.getInbound(1).?.getStreamId()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, daemon.getInbound(2).?.getStreamId()) != null);
 
     var reader = XmlReader.init(alloc);
     defer reader.deinit();
 
-    // A verdict naming no pending entry authenticates nobody.
+    // A verdict naming no pending entry authenticates nobody. The verdict
+    // handling may close and free a session: everything after it reaches
+    // the sessions through the slot table, never the rig pointers (B5).
     feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", "no-such-stream", "them.example", "us.example");
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
-    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
 
     // Right id, wrong from=: still no match.
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in2.session.getStreamId(), "other.example", "us.example");
-    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(2) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(2).?.getStreamId(), "other.example", "us.example");
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(!daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
 
     // Right id/from/to for session 2: only session 2 authenticates.
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in2.session.getStreamId(), "them.example", "us.example");
-    try std.testing.expect(in2.session.isAuthenticatedDomain("them.example"));
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(2) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(2).?.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
 
     // The db:result answer goes to session 2, addressed to the verified
     // origin; session 1's socket stays silent. The rig has no kqueue, so
     // flush the queued write like handleInboundWritable would.
-    _ = try in2.session.flushWrite();
+    try std.testing.expect(daemon.getInbound(2) != null);
+    _ = try daemon.getInbound(2).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in2.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
@@ -3198,9 +3213,11 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
     try std.testing.expectEqual(@as(usize, 0), drainPeer(in1.peer_fd, &rbuf));
 
     // Session 1's entry survived the other verdict and still resolves.
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "invalid", in1.session.getStreamId(), "them.example", "us.example");
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
-    try std.testing.expect(in1.session.inbound_dialback.isFailed());
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "invalid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(1).?.inbound_dialback.isFailed());
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
 
@@ -3354,10 +3371,13 @@ test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
     try std.testing.expect(cb.conn.isFailed());
     try std.testing.expectEqualStrings("write-failed", cb.conn.error_msg);
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    // The failed exchange may close and free the submitting stream: reach
+    // it through the slot table, never the rig pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
 
     // The submitting stream is told the key did not verify.
-    _ = try in1.session.flushWrite();
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
@@ -3749,14 +3769,19 @@ test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
 
     var reader = XmlReader.init(alloc);
     defer reader.deinit();
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+    // The verdict handling may close and free the session: everything
+    // after it reaches the session through the slot table, never the rig
+    // pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
 
     // The verdict cannot be honored (the set has no room for the origin):
     // the answer must be invalid, and nothing about the session turns
     // authenticated.
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
-    try std.testing.expect(in1.session.inbound_dialback.isFailed());
-    _ = try in1.session.flushWrite();
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(1).?.inbound_dialback.isFailed());
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
@@ -3781,16 +3806,20 @@ test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeedin
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+    // The action may close and free the session: reach it through the
+    // slot table, never the rig pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    executeAction(&daemon, daemon.getInbound(1).?, .send_sasl_success, &cl);
 
     // The identity cannot be recorded, so the exchange fails instead of
     // succeeding unrecorded.
-    _ = try in1.session.flushWrite();
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
-    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
 }
 
 test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream unauthenticated" {
@@ -3816,17 +3845,22 @@ test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
     _ = in1.session.stream.handleSaslExternal();
-    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+    // The action may close and free the session: everything after it
+    // reaches the session through the slot table, never the rig pointer
+    // (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    executeAction(&daemon, daemon.getInbound(1).?, .send_sasl_success, &cl);
 
     // A failed exchange leaves nothing behind: the stream is not
     // authenticated and not waiting for a post-auth restart.
-    try std.testing.expect(!in1.session.stream.authenticated);
-    try std.testing.expect(in1.session.stream.state != .awaiting_stream_open_tls);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.stream.authenticated);
+    try std.testing.expect(daemon.getInbound(1).?.stream.state != .awaiting_stream_open_tls);
 
     // The stream restart after the failed exchange must not reach
     // established.
-    _ = in1.session.stream.handleStreamOpen("them.example", "us.example", "1.0");
-    try std.testing.expect(!in1.session.stream.isEstablished());
+    _ = daemon.getInbound(1).?.stream.handleStreamOpen("them.example", "us.example", "1.0");
+    try std.testing.expect(!daemon.getInbound(1).?.stream.isEstablished());
 }
 
 test "S2sDaemon: stream restart with unauthenticated from= is rejected" {
