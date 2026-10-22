@@ -573,6 +573,44 @@ test "Supervisor: spawnChild refuses to start when the run user has no passwd en
     try std.testing.expectEqual(ChildState.not_started, sup.state);
 }
 
+/// The identity drop runs setgroups, which needs privilege: a non-root
+/// caller on a stock host gets EPERM and the child dies at 125 (this
+/// tree's host grants the call through mac_do_auto). The probe runs the
+/// call in a forked child so the runner's own group list is never
+/// touched. The call is injectable to test the probe itself (D6).
+const SetgroupsCall = *const fn (c_int, *const posix.gid_t) callconv(.c) c_int;
+
+fn probeDropPrivilege(gid: posix.gid_t, call: SetgroupsCall) bool {
+    const pid = posix.fork() catch return false;
+    if (pid == 0) {
+        var groups: [1]posix.gid_t = .{gid};
+        std.c._exit(if (call(1, &groups[0]) == 0) 0 else 1);
+    }
+    var status: u32 = 0;
+    const ret = std.c.waitpid(pid, @ptrCast(&status), 0);
+    if (ret < 0) return false;
+    return ((status >> 8) & 0xFF) == 0;
+}
+
+/// Run a test only where the drop privilege exists: without it the child
+/// cannot enter the run user's primary group and the spawn dies at 125.
+fn requireDropPrivilege(gid: posix.gid_t, call: SetgroupsCall) !void {
+    if (!probeDropPrivilege(gid, call)) return error.SkipZigTest;
+}
+
+fn probeSetgroupsOk(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
+    return 0;
+}
+
+fn probeSetgroupsDenied(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
+    return -1;
+}
+
+test "Supervisor: the drop-privilege probe skips without the setgroups privilege (D6)" {
+    try requireDropPrivilege(0, probeSetgroupsOk);
+    try std.testing.expectError(error.SkipZigTest, requireDropPrivilege(0, probeSetgroupsDenied));
+}
+
 test "Supervisor: spawnChild drops the child into the run user's primary group" {
     // The child reports its kernel group list from inside the dropped
     // identity: exactly the primary gid of the run user's passwd entry,
@@ -584,6 +622,9 @@ test "Supervisor: spawnChild drops the child into the run user's primary group" 
     const rc = std.c.getpwuid_r(uid, &pw, &pw_buf, pw_buf.len, &result);
     if (rc != 0 or result == null) return error.PasswdLookupFailed;
     const expected_gid = result.?.gid;
+
+    // Without the setgroups privilege the drop cannot happen (D6).
+    try requireDropPrivilege(expected_gid, setgroups);
 
     var p: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p) != 0) return error.Socketpair;
