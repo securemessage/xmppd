@@ -2839,6 +2839,42 @@ pub const Server = struct {
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
+    /// Return a service-unavailable error to a remote sender whose stanza
+    /// could not be delivered or stored locally. The error goes back out over
+    /// the same S2S link the stanza arrived on, so the remote server can
+    /// bounce it to the original sender (E2b).
+    fn bounceS2sInbound(self: *Server, remote_from: []const u8, local_to: []const u8, msg_id: []const u8) void {
+        if (!self.s2s_ipc.connected) {
+            log.warn("S2S bounce for {s} dropped: no S2S daemon", .{remote_from});
+            return;
+        }
+
+        var lease = self.leaseByteScratch() orelse return;
+        defer lease.release();
+        var fbs = std.io.fixedBufferStream(lease.buf);
+        const w = fbs.writer();
+        w.writeAll("<message type='error' from='") catch return;
+        xml.escapeWrite(w, local_to) catch return;
+        w.writeAll("' to='") catch return;
+        xml.escapeWrite(w, remote_from) catch return;
+        w.writeByte('\'') catch return;
+        if (msg_id.len > 0) {
+            w.writeAll(" id='") catch return;
+            xml.escapeWrite(w, msg_id) catch return;
+            w.writeByte('\'') catch return;
+        }
+        w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+
+        self.s2s_ipc.send(.{ .s2s_deliver = .{
+            .from_jid = local_to,
+            .to_jid = remote_from,
+            .stanza_xml = fbs.getWritten(),
+        } }) catch {
+            log.err("failed to bounce S2S inbound for {s}", .{remote_from});
+        };
+        // Write interest: reconcileIpcWriteInterest (S10).
+    }
+
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         _ = self.s2s_ipc.recv() catch {
             log.err("S2S daemon IPC recv error", .{});
@@ -2894,35 +2930,37 @@ pub const Server = struct {
                 const s2s_archive_ts: u64 = @intCast(std.time.timestamp());
 
                 if (target_count == 0) {
-                    // Try offline storage for messages — only if this is a <message> stanza
-                    if (self.offline) |store| {
-                        if (self.archive) |archive| {
-                            const parts = extractStanzaParts(m.stanza_xml);
-                            if (parts.is_message) {
-                                var recip_buf: [256]u8 = undefined;
-                                var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                                recip_fbs.writer().writeAll(to_jid.local) catch {};
-                                recip_fbs.writer().writeByte('@') catch {};
-                                recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                                const recipient_bare = recip_fbs.getWritten();
+                    const parts = extractStanzaParts(m.stanza_xml);
+                    // An error stanza is never stored and never bounced back, or
+                    // two servers could bounce it at each other.
+                    if (parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
+                        if (self.offline) |store| {
+                            var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
+                            const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
 
-                                const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
+                            const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
 
-                                // Store full stanza in archive, pointer in offline.
-                                // Inline store (NOT the T87 queue): the offline
-                                // pointer goes down right after, and offline fetch
-                                // reads the archive row via getMessage.
+                            // Payload goes down with the pointer. The archive row is
+                            // also written here, but a failed write must not leave a
+                            // pointer behind: the drain would find neither copy, drop
+                            // the pointer, and the message would vanish (E2b).
+                            if (self.archive) |archive| {
                                 archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch |err| {
                                     log.warn("S2S offline archive store failed for {s}: {s}", .{ recipient_bare, @errorName(err) });
                                 };
-                                if (store.storePointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts) catch false) {
-                                    log.info("S2S inbound to {s} stored offline", .{m.to_jid});
-                                    return;
-                                }
+                            }
+                            if (store.storeHeldPointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch false) {
+                                log.info("S2S inbound to {s} stored offline", .{m.to_jid});
+                                return;
                             }
                         }
+                        // Quota reached, or no offline store at all: tell the remote
+                        // sender instead of dropping the stanza on the floor (E2b).
+                        log.warn("S2S inbound to {s}: recipient offline and not storable, bouncing", .{m.to_jid});
+                        self.bounceS2sInbound(m.from_jid, m.to_jid, parts.msg_id);
+                        return;
                     }
-                    log.info("S2S inbound to {s} — recipient unavailable, no offline", .{m.to_jid});
+                    log.info("S2S inbound to {s}: recipient unavailable, nothing stored", .{m.to_jid});
                     return;
                 }
 
@@ -6218,6 +6256,236 @@ test "Server: E2d an oversized archive form is not stored offline" {
     // Nothing was stored: a truncated form would have been archived and
     // replayed to bob when he next connects.
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
+// E2b: an inbound S2S stanza for an offline local user is stored with its
+// payload, and a full offline queue bounces back over the same link instead of
+// dropping the stanza silently.
+test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+    try server.configureS2s(sock_path);
+    try std.testing.expect(server.s2s_ipc.connected);
+
+    // Accept the daemon side so the bounce frame can be read back. Non-blocking:
+    // this test asserts that nothing was sent.
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    // bob is offline: no session bound anywhere.
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r1' type='chat'><body>federated</body></message>";
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &changes);
+
+    // The pointer carries the payload, so a drain cannot depend on the archive
+    // row landing first.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+
+    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    try std.testing.expect(held != null);
+    defer if (held) |h| allocator.free(h);
+    try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>federated</body>") != null);
+
+    // Nothing was bounced back to the remote sender.
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), got);
+}
+
+test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+    try server.configureS2s(sock_path);
+
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    // Fill bob's offline queue to the per-user maximum.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
+        const stored = try offline_store.storePointer("bob@localhost", "carol@example.com", sid, 100 + @as(u64, @intCast(i)));
+        try std.testing.expect(stored);
+    }
+
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r2' type='chat'><body>too much</body></message>";
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &changes);
+
+    // The queue stayed exactly at quota: nothing new was accepted.
+    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
+
+    // The remote sender learns the stanza was dropped rather than being told
+    // it was delivered.
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(got > 0);
+    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    try std.testing.expect(frame != null);
+    const msg = try ipc_protocol.decode(frame.?.payload);
+    const delivered = switch (msg) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("carol@example.com/res", delivered.to_jid);
+    try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "id='r2'") != null);
+}
+
+// E2b: with no offline store the inbound message still bounces rather than
+// vanishing, and an inbound error stanza is never bounced back (two servers
+// would otherwise trade bounces forever).
+test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza does not" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    // No offline store, no archive: nothing here can hold the stanza.
+    try server.configureS2s(sock_path);
+
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r3' type='chat'><body>hello</body></message>",
+    } }, &changes);
+
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(got > 0);
+    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    try std.testing.expect(frame != null);
+    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='r3'") != null);
+
+    // An error stanza for the same offline recipient is dropped without a
+    // reply, so the bounce cannot come back as another bounce.
+    changes.reset();
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r4' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>",
+    } }, &changes);
+
+    _ = server.s2s_ipc.flush() catch {};
+    const second = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), second);
 }
 
 // E2c: the stanza ID is the key tiebreaker within a timestamp

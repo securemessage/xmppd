@@ -36,7 +36,7 @@ pub const BARE_JID_MAX = 512;
 
 /// Build a bare JID "local@domain" into out and return it. The buffer is sized
 /// to a full store-key JID, so a valid key is never truncated (S4).
-fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) []const u8 {
+pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) []const u8 {
     var fbs = std.io.fixedBufferStream(out);
     const w = fbs.writer();
     w.writeAll(local) catch {};
