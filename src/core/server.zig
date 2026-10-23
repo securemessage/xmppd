@@ -6037,14 +6037,18 @@ test "Server: S13 message held behind a draining offline tail" {
     const n = posix.read(target_fds[1], &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
 
-    // Parked behind the tail instead: one offline pointer referencing the
-    // archived stanza.
+    // Parked behind the tail instead: one offline pointer whose held copy
+    // carries the stanza itself, so the drain does not depend on an archive
+    // row the async writer queue may not have committed yet (E2a).
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     const ptrs = try offline_store.getPointers("bob@localhost");
     defer offline_store.freePointers(ptrs);
-    const held = try arch_store.getMessage(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
     try std.testing.expect(held != null);
-    if (held) |h| allocator.free(h);
+    if (held) |h| {
+        defer allocator.free(h);
+        try std.testing.expect(std.mem.indexOf(u8, h, "<body>held</body>") != null);
+    }
 }
 
 // S13: a message stored offline for an absent recipient points at an archive
