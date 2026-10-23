@@ -5585,6 +5585,79 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "not-well-formed") != null);
 }
 
+/// Feed a bad stream root, then keep feeding stanzas. The connection must die
+/// on the root and the reader arena must stay bounded: before E1 the session
+/// survived and every later stanza accumulated in the arena.
+fn expectBadRootBounded(root: []const u8) !void {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var drain_buf: [8192]u8 = undefined;
+
+    _ = try posix.write(fds[1], root);
+    server.handleReadable(1, &changes);
+    var err_buf: [4096]u8 = undefined;
+    var err_total: usize = 0;
+    while (posix.read(fds[1], err_buf[err_total..])) |n| {
+        if (n == 0) break;
+        err_total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, err_buf[0..err_total], "not-well-formed") != null);
+
+    var cap_max: usize = 0;
+    var chunk_buf: [4096]u8 = undefined;
+    var fed: usize = 0;
+    while (fed < 20000) {
+        const s = server.sessions[1] orelse break;
+        const cap = s.reader.arena.queryCapacity();
+        if (cap > cap_max) cap_max = cap;
+
+        var fbs = std.io.fixedBufferStream(&chunk_buf);
+        for (0..100) |_| {
+            fbs.writer().writeAll("<presence><show>away</show></presence>") catch break;
+        }
+        const chunk = fbs.getWritten();
+        var off: usize = 0;
+        while (off < chunk.len) {
+            const n = posix.write(fds[1], chunk[off..]) catch break;
+            if (n == 0) break;
+            off += n;
+        }
+        server.handleReadable(1, &changes);
+        while (posix.read(fds[1], &drain_buf)) |n| {
+            if (n == 0) break;
+        } else |_| break;
+        fed += 100;
+    }
+
+    // The root is a stream error, so the connection is gone and nothing can
+    // keep growing. Both halves matter: a live session with a bounded arena
+    // would still be a peer-controlled resource leak.
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(cap_max < 256 * 1024);
+}
+
+test "Server: E1 a self-closing stream header closes with not-well-formed" {
+    try expectBadRootBounded("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'/>");
+}
+
+test "Server: E1 a stream root with an unbound prefix closes with not-well-formed" {
+    try expectBadRootBounded("<stream:stream xmlns='jabber:client'>");
+}
+
+test "Server: E1 a non-stream root closes with not-well-formed" {
+    try expectBadRootBounded("<foo xmlns='jabber:client'>");
+}
+
 test "Server: direct TLS skips STARTTLS features" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();

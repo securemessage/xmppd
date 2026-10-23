@@ -174,13 +174,16 @@ pub const Reader = struct {
                     return Event.xml_declaration;
                 },
                 .element_open => {
-                    if (self.stream_opened and self.depth == 1) {
-                        // New top-level stanza: everything the reader
-                        // produced for the previous stanza dies here. The
-                        // stream-level namespace context lives in ns_arena
-                        // and survives (S11). Retained capacity is bounded
-                        // so one giant stanza does not inflate the arena
-                        // for the life of the stream (S26).
+                    if (self.depth <= 1) {
+                        // A new item starts here: a root (depth 0) or a new
+                        // top-level stanza (depth 1) means everything the
+                        // reader produced for the previous item dies here.
+                        // The condition is the depth alone, not stream_opened,
+                        // so a root that is not a stream open cannot accumulate
+                        // tokens forever (E1). The stream-level namespace
+                        // context lives in ns_arena and survives (S11).
+                        // Retained capacity is bounded so one giant stanza does
+                        // not inflate the arena for the life of the stream (S26).
                         _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
                     }
                     self.current_element_name = try self.arenaDupe(token.name);
@@ -222,6 +225,13 @@ pub const Reader = struct {
                     });
                 },
                 .element_open_end => {
+                    const elem = self.buildElement(false);
+                    const is_stream_elem = std.mem.eql(u8, elem.namespace_uri, "http://etherx.jabber.org/streams") and
+                        std.mem.eql(u8, self.current_element_local, "stream");
+                    // A root must be an open stream element: a non-stream
+                    // root, or a stream root whose prefix is unbound, is not
+                    // an XMPP stream and is a stream error (E1).
+                    if (self.depth == 0 and !is_stream_elem) return error.InvalidStreamRoot;
                     self.depth += 1;
                     if (self.elem_depth >= self.elem_names.len) return error.TooDeep;
                     // The root name is matched again at its close, which comes
@@ -233,16 +243,13 @@ pub const Reader = struct {
                     else
                         self.current_element_name;
                     self.elem_depth += 1;
-                    const elem = self.buildElement(false);
                     // For non-self-closing elements, namespace is restored on element_close
 
                     // The stream root is matched by namespace + local name, not
                     // by the literal "stream" prefix, so a differently-prefixed
                     // stream element is still recognized and any nested one is
                     // rejected (S27).
-                    if (std.mem.eql(u8, elem.namespace_uri, "http://etherx.jabber.org/streams") and
-                        std.mem.eql(u8, self.current_element_local, "stream"))
-                    {
+                    if (is_stream_elem) {
                         if (self.depth != 1) {
                             // Nested inside an open stream: protocol
                             // violation (S27).
@@ -255,6 +262,8 @@ pub const Reader = struct {
                     return Event{ .element_start = elem };
                 },
                 .element_self_close => {
+                    // A self-closing root is never a valid stream open (E1).
+                    if (self.depth == 0) return error.InvalidStreamRoot;
                     self.depth += 1;
                     const elem = self.buildElement(true);
 
@@ -264,12 +273,8 @@ pub const Reader = struct {
                     if (std.mem.eql(u8, elem.namespace_uri, "http://etherx.jabber.org/streams") and
                         std.mem.eql(u8, self.current_element_local, "stream"))
                     {
-                        if (self.depth != 1) {
-                            // Nested inside an open stream: protocol violation (S27).
-                            return error.NestedStreamElement;
-                        }
-                        // Self-closing at depth 1 would be unusual for stream but handle it
-                        return Event{ .stream_open = elem };
+                        // Nested inside an open stream: protocol violation (S27).
+                        return error.NestedStreamElement;
                     }
 
                     self.depth -= 1;
@@ -471,18 +476,21 @@ test "reader: stream restart mid-buffer after reset" {
     defer reader.deinit();
 
     // SUCCESS + post-auth stream open in ONE input buffer — what lands on the
-    // wire when a server batches them. The XMPP flow is: success parsed,
-    // reset() called (stream restart), scan continues from the cursor.
+    // wire when a server batches them. The XMPP flow is: stream open, success
+    // parsed, reset() called (stream restart), scan continues from the cursor.
     const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' id='s1' version='1.0'>" ++
         "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>" ++
         "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' from='localhost' id='s2' version='1.0'>" ++
         "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
     var pos: usize = 0;
 
+    const e0 = (try reader.next(input, &pos)).?; // <stream:stream>
+    try std.testing.expect(e0 == .stream_open);
     const e1 = (try reader.next(input, &pos)).?; // <success/>
     try std.testing.expect(e1 == .element_start);
-    // A reader-level stream was never opened here; reset() models the XMPP
-    // stream-restart the Session performs right after consuming the success.
+    // reset() models the XMPP stream-restart the Session performs right after
+    // consuming the success: depth, scope and stream_opened all start over.
     reader.reset();
     const pos_after_success = pos;
 
@@ -503,19 +511,25 @@ test "reader: namespace prefix bindings are element-scoped (T232)" {
     // URI — and a redeclaration nested inside an element must not leak past
     // that element's close.
     const input =
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>" ++
         "<message xmlns:x='urn:first'><x:a/></message>" ++
         "<message xmlns:x='urn:second'><x:a/></message>" ++
         "<message><outer xmlns:y='urn:inner'><y:b/></outer><c/></message>";
     var pos: usize = 0;
 
     var uris = std.ArrayList([]const u8){};
-    defer uris.deinit(allocator);
+    defer {
+        for (uris.items) |u| allocator.free(u);
+        uris.deinit(allocator);
+    }
     while (true) {
         const ev = (try reader.next(input, &pos)) orelse break;
         switch (ev) {
             .element_start => |el| {
                 if (std.mem.eql(u8, el.prefix, "x") or std.mem.eql(u8, el.prefix, "y")) {
-                    try uris.append(allocator, el.namespace_uri);
+                    // The uri borrows the stanza arena, which dies at the next
+                    // stanza's open, so copy it.
+                    try uris.append(allocator, try allocator.dupe(u8, el.namespace_uri));
                 }
             },
             else => {},
@@ -532,16 +546,20 @@ test "namespace resolution on master stream: redeclared prefix resolves newest-f
     var reader = Reader.init(allocator);
     defer reader.deinit();
 
-    const input = "<a xmlns:p='urn:one'><p:b xmlns:p='urn:two'/></a>";
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>" ++
+        "<a xmlns:p='urn:one'><p:b xmlns:p='urn:two'/></a>";
     var pos: usize = 0;
+    _ = (try reader.next(input, &pos)).?; // <stream:stream>
     _ = (try reader.next(input, &pos)).?; // <a ...>
     const b = (try reader.next(input, &pos)).?; // <p:b/> self-closing
     try std.testing.expect(b == .element_start);
     try std.testing.expectEqualStrings("urn:two", b.element_start.namespace_uri);
     _ = (try reader.next(input, &pos)).?; // </a>
 
-    // Stack unwound: post-scope the prefix is gone.
-    try std.testing.expectEqual(@as(u32, 0), reader.ns_binding_count);
+    // Stack unwound: post-scope the prefix is gone, so it resolves to no
+    // namespace again. The root's own bindings stay for the life of the stream.
+    try std.testing.expectEqualStrings("", reader.resolveNamespace("p"));
+    try std.testing.expectEqual(@as(u32, 1), reader.ns_binding_count);
 }
 
 test "reader: parse stream opening" {
@@ -680,6 +698,43 @@ test "reader: S27 self-closing stream child is an ordinary element" {
     try std.testing.expect(ev3 == .element_start);
     try std.testing.expectEqualStrings("presence", ev3.element_start.local_name);
     try std.testing.expectEqual(@as(usize, 1), reader.depth);
+}
+
+test "reader: E1 a self-closing stream header is a stream error" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // A stream element cannot be empty: it wraps every stanza. Treating it as
+    // an ordinary element leaves the reader at depth 0 with the rest of the
+    // feed accumulating in the arena (E1).
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'/>";
+    var pos: usize = 0;
+    try std.testing.expectError(error.InvalidStreamRoot, reader.next(input, &pos));
+}
+
+test "reader: E1 a stream root with an unbound prefix is a stream error" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // The prefix resolves to no namespace, so the root is not the streams
+    // root and must not open the stream (E1).
+    const input = "<stream:stream xmlns='jabber:client'>";
+    var pos: usize = 0;
+    try std.testing.expectError(error.InvalidStreamRoot, reader.next(input, &pos));
+    try std.testing.expect(!reader.stream_opened);
+}
+
+test "reader: E1 a non-stream root is a stream error" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<foo xmlns='jabber:client'><bar/></foo>";
+    var pos: usize = 0;
+    try std.testing.expectError(error.InvalidStreamRoot, reader.next(input, &pos));
+    try std.testing.expect(!reader.stream_opened);
 }
 
 test "reader: parse message stanza" {
