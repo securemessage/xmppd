@@ -312,41 +312,23 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const out_buf = out_lease.buf;
 
     // Build the archived form of the stanza (includes the stanza-id element).
+    // A form that does not fit the scratch bank is not archived at all: the
+    // truncated bytes would otherwise be written to the archive and replayed
+    // to the recipient on the next drain (E2d).
     var archive_stanza: []const u8 = "";
     if (is_archivable) {
         if (server.archive != null) {
-            var recip_buf: [BARE_JID_MAX]u8 = undefined;
-            const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
+            archive_stanza = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, archive_stanza_id, server.server_host) orelse blk: {
+                log.warn("connection {d} archive form for {s} exceeds the serialization buffer, not archived", .{ session.conn.id, to_str });
+                break :blk "";
+            };
 
-            var stanza_fbs = std.io.fixedBufferStream(out_buf);
-            const sw = stanza_fbs.writer();
-            sw.writeAll("<message from='") catch {};
-            xml.escapeWrite(sw, from_str) catch {};
-            sw.writeAll("' to='") catch {};
-            xml.escapeWrite(sw, to_str) catch {};
-            sw.writeByte('\'') catch {};
-            if (type_str.len > 0) {
-                sw.writeAll(" type='") catch {};
-                xml.escapeWrite(sw, type_str) catch {};
-                sw.writeByte('\'') catch {};
+            if (archive_stanza.len > 0) {
+                var recip_buf: [BARE_JID_MAX]u8 = undefined;
+                const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
+                server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, archive_stanza);
+                server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
             }
-            if (id_str.len > 0) {
-                sw.writeAll(" id='") catch {};
-                xml.escapeWrite(sw, id_str) catch {};
-                sw.writeByte('\'') catch {};
-            }
-            sw.writeByte('>') catch {};
-            sw.writeAll(inner_xml) catch {};
-            sw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch {};
-            xml.escapeWrite(sw, archive_stanza_id) catch {};
-            sw.writeAll("' by='") catch {};
-            xml.escapeWrite(sw, server.server_host) catch {};
-            sw.writeAll("'/>") catch {};
-            sw.writeAll("</message>") catch {};
-            archive_stanza = stanza_fbs.getWritten();
-
-            server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, archive_stanza);
-            server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
         }
     }
 
@@ -371,55 +353,41 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // Offline storage for messages
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
-                if (is_archivable and archive_stanza_id.len > 0) {
-                    var recip_buf2: [BARE_JID_MAX]u8 = undefined;
-                    const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
-                    // The payload is stored with the pointer. The archive row
-                    // this stanza was also handed to may still be sitting in
-                    // the async writer queue, and a drain that read the
-                    // archive alone would see a dangling pointer and delete a
-                    // message that is merely in flight (S13).
-                    if (store.storeHeldPointer(recipient_bare2, sender_bare, archive_stanza_id, archive_timestamp, archive_stanza) catch false) {
-                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                        return;
-                    }
-                } else if (server.archive) |archive| {
-                    var recip_buf2: [BARE_JID_MAX]u8 = undefined;
-                    const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
+                var recip_buf2: [BARE_JID_MAX]u8 = undefined;
+                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
 
-                    var stanza_fbs2 = std.io.fixedBufferStream(out_buf);
-                    const sw2 = stanza_fbs2.writer();
-                    sw2.writeAll("<message from='") catch {};
-                    xml.escapeWrite(sw2, from_str) catch {};
-                    sw2.writeAll("' to='") catch {};
-                    xml.escapeWrite(sw2, to_str) catch {};
-                    sw2.writeByte('\'') catch {};
-                    if (type_str.len > 0) {
-                        sw2.writeAll(" type='") catch {};
-                        xml.escapeWrite(sw2, type_str) catch {};
-                        sw2.writeByte('\'') catch {};
+                // The payload goes down with the pointer: the archive row this
+                // stanza was also handed to may still be sitting in the async
+                // writer queue, and a drain that read the archive alone would
+                // see a dangling pointer and delete a message that is merely
+                // in flight (S13).
+                var stored_form: []const u8 = "";
+                var stored_id: []const u8 = "";
+                if (is_archivable and archive_stanza_id.len > 0) {
+                    // Empty here means the archived form did not fit the
+                    // scratch bank, and a payloadless pointer would replay
+                    // nothing (E2d).
+                    stored_form = archive_stanza;
+                    stored_id = archive_stanza_id;
+                } else if (server.archive) |archive| {
+                    // Not archivable, so no stanza-id was minted and the
+                    // stored form carries none.
+                    stored_form = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, "", server.server_host) orelse "";
+                    stored_id = if (id_str.len > 0) id_str else "offline";
+                    if (stored_form.len > 0) {
+                        archive.store(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form) catch |err| {
+                            log.warn("offline archive store failed for {s}: {s}", .{ recipient_bare2, @errorName(err) });
+                        };
                     }
-                    if (id_str.len > 0) {
-                        sw2.writeAll(" id='") catch {};
-                        xml.escapeWrite(sw2, id_str) catch {};
-                        sw2.writeByte('\'') catch {};
-                    }
-                    if (inner_xml.len == 0) {
-                        sw2.writeAll("/>") catch {};
-                    } else {
-                        sw2.writeByte('>') catch {};
-                        sw2.writeAll(inner_xml) catch {};
-                        sw2.writeAll("</message>") catch {};
-                    }
-                    const full_stanza2 = stanza_fbs2.getWritten();
-                    const offline_id = if (id_str.len > 0) id_str else "offline";
-                    archive.store(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch |err| {
-                        log.warn("offline archive store failed for {s}: {s}", .{ recipient_bare2, @errorName(err) });
-                    };
-                    if (store.storeHeldPointer(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch false) {
+                }
+
+                if (stored_form.len > 0) {
+                    if (store.storeHeldPointer(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form) catch false) {
                         log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
                         return;
                     }
+                } else {
+                    log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
                 }
             }
         }
@@ -528,6 +496,56 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
         sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
     }
+}
+
+/// Build the form that is written to the archive and held for offline replay:
+/// the message with its attributes, its body, and (when one was minted) the
+/// XEP-0359 stanza-id element. Returns null when the result does not fit
+/// `buf`, so a caller can skip the store rather than persist and later replay
+/// a truncated stanza (E2d). Pass an empty stanza_id to omit the element.
+fn buildStoredStanza(
+    buf: []u8,
+    from_str: []const u8,
+    to_str: []const u8,
+    type_str: []const u8,
+    id_str: []const u8,
+    inner_xml: []const u8,
+    stanza_id: []const u8,
+    server_host: []const u8,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+
+    w.writeAll("<message from='") catch return null;
+    xml.escapeWrite(w, from_str) catch return null;
+    w.writeAll("' to='") catch return null;
+    xml.escapeWrite(w, to_str) catch return null;
+    w.writeByte('\'') catch return null;
+    if (type_str.len > 0) {
+        w.writeAll(" type='") catch return null;
+        xml.escapeWrite(w, type_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (inner_xml.len == 0) {
+        w.writeAll("/>") catch return null;
+        return fbs.getWritten();
+    }
+    w.writeByte('>') catch return null;
+    w.writeAll(inner_xml) catch return null;
+    if (stanza_id.len > 0) {
+        w.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch return null;
+        xml.escapeWrite(w, stanza_id) catch return null;
+        w.writeAll("' by='") catch return null;
+        xml.escapeWrite(w, server_host) catch return null;
+        w.writeAll("'/>") catch return null;
+    }
+    w.writeAll("</message>") catch return null;
+    return fbs.getWritten();
 }
 
 /// Serialize a stanza for delivery to a local target into `buf`, returning the

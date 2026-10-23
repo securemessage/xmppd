@@ -6139,6 +6139,78 @@ test "Server: S13 offline store delivers without a committed archive row" {
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
 }
 
+// E2d: a stanza whose archived form does not fit the serialization buffer must
+// not be stored. The builder used to swallow every write error, so the
+// truncated bytes were archived and held for offline replay, and the recipient
+// would later be handed a stanza missing its close tag.
+test "Server: E2d an oversized archive form is not stored offline" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // bob is offline: the stanza takes the offline-store path.
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+
+    // A near-full body plus an id long enough to push the serialized archive
+    // form past BYTE_BANK_SIZE. The id comes off the wire, and the scanner
+    // allows an attribute token far larger than the bank.
+    const body_prefix = "<body>";
+    const body_suffix = "</body>";
+    const filler_len = alice.stanza_buf.len - body_prefix.len - body_suffix.len;
+    @memcpy(alice.stanza_buf[0..body_prefix.len], body_prefix);
+    @memset(alice.stanza_buf[body_prefix.len..][0..filler_len], 'A');
+    @memcpy(alice.stanza_buf[body_prefix.len + filler_len ..][0..body_suffix.len], body_suffix);
+    alice.stanza_buf_len = alice.stanza_buf.len;
+
+    const id_len = 5000;
+    const long_id = try allocator.alloc(u8, id_len);
+    defer allocator.free(long_id);
+    @memset(long_id, 'x');
+    alice.stanza_id = long_id;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Nothing was stored: a truncated form would have been archived and
+    // replayed to bob when he next connects.
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
 // S13: the writable handler must resume a stalled offline drain once the
 // send buffer drops to the low-water mark. Without this the tail waits for
 // the next presence stanza or a reconnect.
