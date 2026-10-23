@@ -148,9 +148,13 @@ fn initLoopChangeList(buf: []posix.Kevent) ChangeList {
 const CHANGE_BUF_SIZE = 1024;
 
 /// Tail of the changelist held back for reconcileIpcWriteInterest (S10). The
-/// reconcile stages at most two writes and two removals, one pair per IPC
-/// link; holding that back means a batch filled by event handling can no
-/// longer cost an arm, and a failed arm is what dropped the auth link.
+/// reconcile stages at most two reconnect timers and two writes or removals,
+/// one of each kind per IPC link, so four of the eight are ever spent; holding
+/// that back means a batch filled by event handling can no longer cost an arm,
+/// and a failed arm is what dropped the auth link. The timers are staged on
+/// every exit, including the drop path, since nothing else would ever retry a
+/// link dropped there. A timer that still cannot be staged leaves its pending
+/// flag set for the next iteration.
 /// dropIpcAuth's per-session writes stay best-effort as before, since one
 /// entry per mid-SASL session cannot be bounded by a fixed tail.
 const IPC_RECONCILE_RESERVED = 8;
@@ -573,6 +577,11 @@ pub const Server = struct {
     /// Whether EVFILT_WRITE is armed for the auth/S2S IPC fds. Reconciled
     /// once per loop iteration; see reconcileIpcWriteInterest (S10).
     ipc_write_armed: bool = false,
+    /// S10: a reconnect attempt is owed for this link. Set at drop and by a
+    /// failed attempt, cleared once the timer is staged. reconcileIpcWrite-
+    /// Interest stages it inside its reserved tail, so a batch filled by event
+    /// handling cannot cost the only thing that would ever retry the link.
+    auth_reconnect_pending: bool = false,
 
     /// Auth daemon socket path copy (for reconnects, T243). Empty = no
     /// reconnect configured (e.g. configureAuth never ran).
@@ -582,6 +591,8 @@ pub const Server = struct {
     /// IPC client for S2S daemon communication (federation).
     s2s_ipc: IpcClient = .{},
     s2s_write_armed: bool = false,
+    /// S10: see auth_reconnect_pending.
+    s2s_reconnect_pending: bool = false,
 
     /// S2S daemon socket path copy (for reconnects, S10). Empty = no
     /// reconnect configured (e.g. configureS2s never ran).
@@ -864,9 +875,12 @@ pub const Server = struct {
         return self.auth_ipc_path_buf[0..self.auth_ipc_path_len];
     }
 
-    fn armAuthReconnect(self: *Server, changes: *ChangeList) void {
-        _ = self;
-        changes.addTimer(AUTH_RECONNECT_TIMER_IDENT, AUTH_RECONNECT_MS, true) catch {};
+    /// S10: record that a reconnect attempt is owed. The timer itself is
+    /// staged by reconcileIpcWriteInterest out of its reserved tail, so a
+    /// changelist filled by event handling cannot drop the only thing that
+    /// would ever retry the link.
+    fn armAuthReconnect(self: *Server) void {
+        self.auth_reconnect_pending = true;
     }
 
     /// Auth-IPC link died (EOF, reset, or churn-failure receipt): drop it,
@@ -897,19 +911,31 @@ pub const Server = struct {
         // The mechanism list is re-sent by the daemon on connect; don't
         // advertise a dead daemon's set meanwhile.
         self.auth_mechanism_count = 0;
-        self.armAuthReconnect(changes);
+        self.armAuthReconnect();
     }
 
     fn tryAuthReconnect(self: *Server, changes: *ChangeList) void {
         if (self.ipc.connected) return;
         const path = self.authIpcPath() orelse return;
         self.ipc.connect(path) catch |err| {
-            log.warn("auth daemon reconnect failed: {} — retrying in {d}ms", .{ err, AUTH_RECONNECT_MS });
-            self.armAuthReconnect(changes);
+            log.warn("auth daemon reconnect failed: {}, retrying in {d}ms", .{ err, AUTH_RECONNECT_MS });
+            self.armAuthReconnect();
+            return;
+        };
+        // Read interest is what drives the handshake reply; without it a
+        // connected link never delivers anything and the retry timer is gone,
+        // so the failure is invisible and permanent. Treat it as a failed
+        // connect: drop the link and owe another attempt (S10).
+        changes.addRead(self.ipc.fd, IPC_AUTH_UDATA) catch |err| {
+            log.warn("auth daemon reconnect read arm failed ({}), retrying in {d}ms", .{ err, AUTH_RECONNECT_MS });
+            const dead_fd = self.ipc.fd;
+            self.ipc.close();
+            self.ipc_write_armed = false;
+            changes.purgeFd(dead_fd);
+            self.armAuthReconnect();
             return;
         };
         log.info("auth daemon IPC reconnected ({s})", .{path});
-        changes.addRead(self.ipc.fd, IPC_AUTH_UDATA) catch {};
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
@@ -918,9 +944,9 @@ pub const Server = struct {
         return self.s2s_ipc_path_buf[0..self.s2s_ipc_path_len];
     }
 
-    fn armS2sReconnect(self: *Server, changes: *ChangeList) void {
-        _ = self;
-        changes.addTimer(S2S_RECONNECT_TIMER_IDENT, S2S_RECONNECT_MS, true) catch {};
+    /// S10: see armAuthReconnect.
+    fn armS2sReconnect(self: *Server) void {
+        self.s2s_reconnect_pending = true;
     }
 
     fn tryS2sReconnect(self: *Server, changes: *ChangeList) void {
@@ -928,11 +954,21 @@ pub const Server = struct {
         const path = self.s2sIpcPath() orelse return;
         self.s2s_ipc.connect(path) catch |err| {
             log.warn("S2S daemon reconnect failed: {}, retrying in {d}ms", .{ err, S2S_RECONNECT_MS });
-            self.armS2sReconnect(changes);
+            self.armS2sReconnect();
+            return;
+        };
+        // See tryAuthReconnect: an unarmed link is a dead one, and the retry
+        // timer that would have noticed it is already spent (S10).
+        changes.addRead(self.s2s_ipc.fd, IPC_S2S_UDATA) catch |err| {
+            log.warn("S2S daemon reconnect read arm failed ({}), retrying in {d}ms", .{ err, S2S_RECONNECT_MS });
+            const dead_fd = self.s2s_ipc.fd;
+            self.s2s_ipc.close();
+            self.s2s_write_armed = false;
+            changes.purgeFd(dead_fd);
+            self.armS2sReconnect();
             return;
         };
         log.info("S2S daemon IPC reconnected ({s})", .{path});
-        changes.addRead(self.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
@@ -949,7 +985,7 @@ pub const Server = struct {
         self.s2s_ipc.close();
         self.s2s_write_armed = false;
         changes.purgeFd(dead_fd);
-        self.armS2sReconnect(changes);
+        self.armS2sReconnect();
     }
 
     /// Configure the roster store (generic backend-backed).
@@ -1268,16 +1304,21 @@ pub const Server = struct {
         try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
 
         // Auth daemon not connected at boot (standalone run or it crashed
-        // before we came up): arm the reconnect timer (T243).
+        // before we came up): owe a reconnect attempt (T243).
         if (!self.ipc.connected and self.authIpcPath() != null) {
-            self.armAuthReconnect(&changes);
+            self.armAuthReconnect();
         }
 
         // Same for federation: configured but down at boot means retry, not
         // a permanent no-S2S worker (S10).
         if (!self.s2s_ipc.connected and self.s2sIpcPath() != null) {
-            self.armS2sReconnect(&changes);
+            self.armS2sReconnect();
         }
+
+        // The first submitAndPoll below blocks until something happens, so a
+        // reconnect timer owed right now has to be staged before it, not left
+        // for the end of an iteration that may never start (S10).
+        self.reconcileIpcWriteInterest(&changes);
 
         while (self.running) {
             // Mark active before processing events (coalesced signaling)
@@ -2456,18 +2497,47 @@ pub const Server = struct {
         // once per loop iteration; see reconcileIpcWriteInterest (S10).
     }
 
+    /// S10: stage the IPC reconnect timers owed this iteration. Called on
+    /// every exit of reconcileIpcWriteInterest, including the drop path, since
+    /// a link dropped there sets a pending flag that nothing else would stage
+    /// and the next submitAndPoll blocks until a timer fires.
+    fn stageReconnectTimers(self: *Server, changes: *ChangeList) void {
+        if (self.auth_reconnect_pending) {
+            // Keep the flag set if the arm could not be staged, so the next
+            // iteration retries it rather than losing the only trigger.
+            if (changes.addTimer(AUTH_RECONNECT_TIMER_IDENT, AUTH_RECONNECT_MS, true)) |_| {
+                self.auth_reconnect_pending = false;
+            } else |err| {
+                log.warn("auth IPC reconnect timer deferred ({})", .{err});
+            }
+        }
+        if (self.s2s_reconnect_pending) {
+            if (changes.addTimer(S2S_RECONNECT_TIMER_IDENT, S2S_RECONNECT_MS, true)) |_| {
+                self.s2s_reconnect_pending = false;
+            } else |err| {
+                log.warn("s2s IPC reconnect timer deferred ({})", .{err});
+            }
+        }
+    }
+
     /// S10: sole owner of IPC write interest, called once per loop
     /// iteration. Arming scattered across send sites could lose a re-arm
     /// to a full changelist and strand pending frames (the pre-S10
     /// persistent filter spun and hid it); disarming here keeps an idle
-    /// link from re-firing writable every kevent.
+    /// link from re-firing writable every kevent. Also the sole owner of the
+    /// IPC reconnect timers.
     fn reconcileIpcWriteInterest(self: *Server, changes: *ChangeList) void {
         // Spend the reserved tail: this runs last in every iteration, so a
         // batch filled by event handling must not cost us an arm or a disarm.
         // A lost arm strands pending frames; a lost disarm leaves a persistent
         // filter firing writable every kevent.
         changes.beginReserved();
+        // Deferred, LIFO: stageReconnectTimers runs first so a link dropped on
+        // the write-arm path below still gets its timer, then endReserved.
+        // Both run inside the reserved tail, so a full batch cannot cost the
+        // only thing that would ever retry the link.
         defer changes.endReserved();
+        defer self.stageReconnectTimers(changes);
 
         if (self.ipc.connected and self.ipc.fd >= 0) {
             if (self.ipc.hasPendingSend()) {
@@ -7415,6 +7485,197 @@ test "S10: IPC write interest lives only in server.zig" {
     }
 }
 
+test "S10: server.zig arms IPC write interest in exactly one place" {
+    // The ratchet above cannot cover this file, which legitimately names the
+    // IPC udata constants for read arms and event dispatch. Arming write
+    // interest anywhere but reconcileIpcWriteInterest leaves a persistent
+    // EVFILT_WRITE with the *_write_armed flag false, so nothing ever removes
+    // it and the filter fires writable every kevent. Counting the exact arm
+    // expression keeps the five deleted review-31 arms out of this file too.
+    // The patterns are split so this test does not match itself.
+    const src = @embedFile("server.zig");
+    const cases = .{
+        .{ "addWrite(self.ipc.fd, IPC_AUTH_" ++ "UDATA)", @as(usize, 1) },
+        .{ "addWrite(self.s2s_ipc.fd, IPC_S2S_" ++ "UDATA)", @as(usize, 1) },
+    };
+    inline for (cases) |case| {
+        const needle = case[0];
+        const expected = case[1];
+        var hits: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, needle)) |hit| {
+            hits += 1;
+            pos = hit + needle.len;
+        }
+        if (hits != expected) {
+            log.err("S10: server.zig arms {s} {d} times, expected {d}; " ++
+                "let reconcileIpcWriteInterest own it", .{ needle, hits, expected });
+            return error.IpcWriteArmOutsideReconciler;
+        }
+    }
+}
+
+test "S10: the IPC reconnect timers are armed in exactly one place" {
+    // The one-shot reconnect timer is the only thing that retries a dead IPC
+    // link, so an arm staged outside the reconciler's reserved tail can be
+    // lost to a batch that event handling filled, and the link stays down for
+    // the worker's lifetime. Counting the arm sites keeps a second one out.
+    // The patterns are split so this test does not match itself.
+    const auth_needle = "addTimer(AUTH_RECONNECT_" ++ "TIMER_IDENT";
+    const s2s_needle = "addTimer(S2S_RECONNECT_" ++ "TIMER_IDENT";
+    const cases = .{
+        .{ "server.zig", @embedFile("server.zig"), @as(usize, 1), @as(usize, 1) },
+        .{ "connection.zig", @embedFile("connection.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "iq_handler.zig", @embedFile("iq_handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "router.zig", @embedFile("router.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence_handler.zig", @embedFile("presence_handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc_handler.zig", @embedFile("muc_handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "message.zig", @embedFile("message.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "fanout.zig", @embedFile("fanout.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "caps.zig", @embedFile("caps.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "event_loop.zig", @embedFile("event_loop.zig"), @as(usize, 0), @as(usize, 0) },
+    };
+    inline for (cases) |case| {
+        const name = case[0];
+        const src = case[1];
+        const auth_expected = case[2];
+        const s2s_expected = case[3];
+        var auth_hits: usize = 0;
+        var s2s_hits: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, src, pos, auth_needle)) |hit| {
+            auth_hits += 1;
+            pos = hit + auth_needle.len;
+        }
+        pos = 0;
+        while (std.mem.indexOfPos(u8, src, pos, s2s_needle)) |hit| {
+            s2s_hits += 1;
+            pos = hit + s2s_needle.len;
+        }
+        if (auth_hits != auth_expected or s2s_hits != s2s_expected) {
+            log.err("S10: {s} arms the reconnect timer {d}/{d} times, expected {d}/{d}; " ++
+                "let stageReconnectTimers own it", .{ name, auth_hits, s2s_hits, auth_expected, s2s_expected });
+            return error.ReconnectTimerArmOutsideReconciler;
+        }
+    }
+}
+
+test "Server: S10 a reconnect owed by a full batch still gets its timer" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [server.s2s_ipc_path_buf.len]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/absent.sock", .{dir});
+    @memcpy(server.s2s_ipc_path_buf[0..sock_path.len], sock_path);
+    server.s2s_ipc_path_len = sock_path.len;
+
+    // A batch already at its ordinary limit, built the way the event loop
+    // builds it so the tail budget is production's. Two timers are all event
+    // handling gets this iteration; the third slot below is reserved.
+    var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
+    var changes = initLoopChangeList(&change_buf);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
+
+    // The link dies while the batch is full: the drop stages nothing and owes
+    // a retry, then the reconciler spends a reserved slot on the timer.
+    server.armS2sReconnect();
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expectEqual(@as(usize, 3), changes.count());
+    try std.testing.expect(!server.s2s_reconnect_pending);
+
+    var timer_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.TIMER) continue;
+        if (ev.ident != S2S_RECONNECT_TIMER_IDENT) continue;
+        try std.testing.expectEqual(@as(i64, S2S_RECONNECT_MS), ev.data);
+        try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+        timer_found = true;
+    }
+    try std.testing.expect(timer_found);
+}
+
+test "Server: S10 a reconnect that cannot arm reads drops the link and owes a retry" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+    try server.configureS2s(sock_path);
+    try std.testing.expect(server.s2s_ipc.connected);
+
+    // Take the link down so the retry below has something to reconnect.
+    var drop_buf: [4]posix.Kevent = undefined;
+    var drop_changes = ChangeList.init(&drop_buf);
+    server.dropS2sIpc(&drop_changes);
+    try std.testing.expect(!server.s2s_ipc.connected);
+    server.s2s_reconnect_pending = false;
+
+    // A changelist with no room left at all: connect() succeeds, so the link
+    // looks up, but the read arm that would ever deliver a frame cannot be
+    // staged. Leaving it connected strands federation silently, and the
+    // one-shot timer that would have retried is already spent.
+    var change_buf: [1]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try changes.addRead(3, 1);
+    try std.testing.expectEqual(@as(usize, 1), changes.count());
+
+    server.tryS2sReconnect(&changes);
+    try std.testing.expect(!server.s2s_ipc.connected);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), server.s2s_ipc.fd);
+    try std.testing.expect(!server.s2s_write_armed);
+    try std.testing.expect(server.s2s_reconnect_pending);
+}
+
+test "Server: S10 an auth reconnect that cannot arm reads drops the link and owes a retry" {
+    // tryAuthReconnect and tryS2sReconnect each carry their own copy of the
+    // fail-closed handling, so the auth one needs its own gate: a revert that
+    // only touches it would otherwise pass the suite.
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/auth.sock", .{dir});
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+    try server.configureAuth(sock_path);
+    try std.testing.expect(server.ipc.connected);
+
+    var drop_buf: [4]posix.Kevent = undefined;
+    var drop_changes = ChangeList.init(&drop_buf);
+    server.dropIpcAuth(&drop_changes);
+    try std.testing.expect(!server.ipc.connected);
+    server.auth_reconnect_pending = false;
+
+    var change_buf: [1]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try changes.addRead(3, 1);
+
+    server.tryAuthReconnect(&changes);
+    try std.testing.expect(!server.ipc.connected);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), server.ipc.fd);
+    try std.testing.expect(!server.ipc_write_armed);
+    try std.testing.expect(server.auth_reconnect_pending);
+}
+
 test "Server: S10 reconcile arms IPC write interest from a full batch" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -7559,12 +7820,18 @@ test "Server: S10 dropped S2S link arms a reconnect and recovers" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
 
-    // Link dies: dropped, fd purged, and a one-shot retry armed.
+    // Link dies: dropped, fd purged, and a retry owed. The timer is staged by
+    // the reconciler out of its reserved tail, not at the drop site, so a drop
+    // landing on an already-full batch cannot lose the only retry trigger.
     server.dropS2sIpc(&changes);
     try std.testing.expect(!server.s2s_ipc.connected);
     try std.testing.expectEqual(@as(posix.fd_t, -1), server.s2s_ipc.fd);
     try std.testing.expect(!server.s2s_write_armed);
+    try std.testing.expect(server.s2s_reconnect_pending);
+    try std.testing.expectEqual(@as(usize, 0), changes.count());
 
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expect(!server.s2s_reconnect_pending);
     var timer_found = false;
     for (changes.slice()) |ev| {
         if (ev.filter != std.c.EVFILT.TIMER) continue;
@@ -7615,12 +7882,16 @@ test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
     var changes = ChangeList.init(&change_buf);
     server.tryS2sReconnect(&changes);
 
+    // The attempt owes another one; the reconciler turns that into a timer.
     try std.testing.expect(!server.s2s_ipc.connected);
+    try std.testing.expect(server.s2s_reconnect_pending);
+    server.reconcileIpcWriteInterest(&changes);
     var timer_found = false;
     for (changes.slice()) |ev| {
         if (ev.filter == std.c.EVFILT.TIMER and ev.ident == S2S_RECONNECT_TIMER_IDENT) timer_found = true;
     }
     try std.testing.expect(timer_found);
+    try std.testing.expect(!server.s2s_reconnect_pending);
 }
 
 test "Server: S10 auth IPC decode error drops the link" {
