@@ -3221,9 +3221,18 @@ pub const Server = struct {
         router.dispatchStanza(self, session, changes);
     }
 
-    /// Generate a unique stanza ID for XEP-0359. Format: hex(timestamp)-hex(worker_id)-hex(counter).
-    /// The ID is unique per server instance (worker_id disambiguates threads, counter disambiguates
-    /// within the same second). Written into the provided buffer, returns the slice.
+    /// Generate a unique stanza ID for XEP-0359. Format:
+    /// hex(timestamp)-hex(worker_id)-hex(counter), every field zero-padded to a
+    /// fixed width.
+    ///
+    /// The ID is unique per server instance (worker_id disambiguates threads,
+    /// counter disambiguates within the same second). The padding is not
+    /// cosmetic: the archive and offline keys are
+    /// owner\x00timestamp_be(8)\x00stanza_id, so within one second the
+    /// lexicographic order of the ID is the only thing that orders the rows.
+    /// Unpadded hex sorted counter 15 ("f") after counter 16 ("10"), because
+    /// 'f' > '1'. That reordered an offline queue at every counter boundary and
+    /// every hex-digit rollover (E2c).
     pub fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
         const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         const counter = self.stanza_id_counter;
@@ -3231,7 +3240,7 @@ pub const Server = struct {
 
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
-        std.fmt.format(w, "{x}-{x}-{x}", .{ timestamp, self.worker_id, counter }) catch {};
+        std.fmt.format(w, "{x:0>8}-{x:0>4}-{x:0>8}", .{ timestamp, self.worker_id, counter }) catch {};
         return fbs.getWritten();
     }
 
@@ -6209,6 +6218,82 @@ test "Server: E2d an oversized archive form is not stored offline" {
     // Nothing was stored: a truncated form would have been archived and
     // replayed to bob when he next connects.
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
+// E2c: the stanza ID is the key tiebreaker within a timestamp
+// (owner\x00timestamp_be\x00stanza_id), so its lexicographic order has to match
+// the order the IDs were minted in. Unpadded hex broke that at every counter
+// boundary, which reordered an offline queue. The counter field is compared
+// directly so the test does not depend on the wall clock staying within one
+// second.
+test "Server: E2c stanza ids sort in generation order across counter boundaries" {
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, std.testing.allocator, 4);
+    defer server.deinit();
+    server.worker_id = 1;
+
+    // Counters straddling every hex-digit rollover: 9->10, 15->16, 255->256.
+    var buf_pool: [6][32]u8 = undefined;
+    const counters = [_]u32{ 0, 9, 10, 15, 16, 256 };
+    var ids: [6][]const u8 = undefined;
+
+    for (counters, 0..) |counter, i| {
+        server.stanza_id_counter = counter;
+        ids[i] = server.generateStanzaId(&buf_pool[i]);
+
+        // Fixed shape: 8 hex timestamp, 4 hex worker, 8 hex counter. Every
+        // field padded, so lexicographic order tracks numeric order.
+        try std.testing.expectEqual(@as(usize, 22), ids[i].len);
+        try std.testing.expectEqual(@as(u8, '-'), ids[i][8]);
+        try std.testing.expectEqual(@as(u8, '-'), ids[i][13]);
+    }
+
+    // The trailing counter field must sort in the order it was minted.
+    for (ids[0 .. ids.len - 1], ids[1..]) |earlier, later| {
+        const e_counter = earlier[14..];
+        const l_counter = later[14..];
+        try std.testing.expectEqual(std.math.Order.lt, std.mem.order(u8, e_counter, l_counter));
+    }
+}
+
+// E2c: the consequence of that ordering. Rows stored under one timestamp are
+// keyed owner\x00timestamp_be\x00stanza_id, so the offline queue a drain walks
+// is sorted by stanza ID. IDs minted across a counter boundary must come back
+// in the order they went in, or the recipient is handed a reordered queue.
+test "Server: E2c an offline queue drains in the order it was filled" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
+    defer server.deinit();
+    server.worker_id = 1;
+
+    // Nine rows at one timestamp, IDs minted across the f->10 boundary where
+    // an unpadded counter stops sorting by value.
+    const timestamp: u64 = 1_700_000_000;
+    var buf_pool: [9][32]u8 = undefined;
+    var stored_ids: [9][]const u8 = undefined;
+    server.stanza_id_counter = 12;
+    for (0..9) |i| {
+        stored_ids[i] = server.generateStanzaId(&buf_pool[i]);
+        const ok = try offline_store.storePointer("bob@localhost", "alice@localhost/desk", stored_ids[i], timestamp);
+        try std.testing.expect(ok);
+    }
+
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 9), ptrs.len);
+
+    for (stored_ids, ptrs) |want, got| {
+        try std.testing.expectEqualStrings(want, got.stanza_id);
+    }
 }
 
 // S13: the writable handler must resume a stalled offline drain once the
