@@ -425,4 +425,38 @@ test "classifyAck: reports too high and backwards without a queue (S24)" {
     // Wrap-aware: a report near the 2^32 boundary still counts as forward.
     try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFF0));
     try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFFF));
+
+    // A report that has passed 2^32 is numerically BELOW the sent count but
+    // ahead of last_h. A plain `h > sent` comparison accepts it and the peer
+    // gets credit for stanzas that were never sent; only the wrap-aware
+    // subtraction reports too_high.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(1, 0xFFFF_FFFD, 0xFFFF_FFFF));
+    // Same shape at the low end of the wrap window, and the exact match.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(3, 0xFFFF_FFFE, 2));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(2, 0xFFFF_FFFE, 2));
+    // Backwards across the boundary is still backwards, not a huge forward jump.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.backwards, classifyAck(0xFFFF_FFFC, 0xFFFF_FFFE, 0xFFFF_FFFE));
+}
+
+test "SmUnackedQueue: ack above the sent count across the u32 wrap (S24)" {
+    const allocator = std.testing.allocator;
+    var queue = SmUnackedQueue.init(allocator);
+    defer queue.deinit();
+
+    // One stanza outstanding at the top of the sequence space, client already
+    // acked up to just below it. An h that has wrapped past 2^32 lands above
+    // the sent count while reading as numerically smaller than base_seq.
+    queue.base_seq = 0xFFFF_FFFF;
+    queue.last_h = 0xFFFF_FFFD;
+    _ = queue.push("s");
+
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, queue.ack(1));
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFD), queue.last_h);
+
+    // The honest report still acks, so the rejection above is not a blanket
+    // refusal of every wrapped h.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, queue.ack(0xFFFF_FFFF));
+    try std.testing.expectEqual(@as(u32, 0), queue.count);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), queue.last_h);
 }

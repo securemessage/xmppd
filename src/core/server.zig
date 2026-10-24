@@ -7393,6 +7393,180 @@ test "Server: S24 cross-worker handoff carries last_h" {
     try std.testing.expectEqual(@as(u32, 5), queue.last_h);
 }
 
+/// Test helper: the <resume/> reply status drained off a requesting worker's
+/// SM actor queue. The status slice points into the transient MPSC payload, so
+/// it is copied out before the drain handler returns.
+const CapturedResumeStatus = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const CapturedResumeStatus) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+fn captureSmResumeStatus(ds: *DeliverySystem, req_worker: u16, out: *CapturedResumeStatus) void {
+    const Ctx = struct { dst: *CapturedResumeStatus };
+    _ = ds.getQueue(req_worker).drain(Ctx{ .dst = out }, struct {
+        fn handle(c: Ctx, _: u32, _: u32, payload: []const u8) void {
+            const msg = actor_message.decode(payload) orelse return;
+            switch (msg) {
+                .sm_resume_reply => |r| {
+                    const n = @min(r.status.len, c.dst.buf.len);
+                    @memcpy(c.dst.buf[0..n], r.status[0..n]);
+                    c.dst.len = n;
+                },
+                else => {},
+            }
+        }
+    }.handle);
+}
+
+/// Build a detached session on `slot` (acked up to `last_h`, `unacked` stanzas
+/// outstanding from `base_seq`) registered under `previd`, ready for a
+/// cross-worker resume request. The caller owns the session; on a rejected
+/// request it is still there and `server.deinit` frees it.
+fn makeDetachedForResume(
+    server: *Server,
+    slot: usize,
+    previd: []const u8,
+    base_seq: u32,
+    last_h: u32,
+    unacked: u32,
+    fd: posix.fd_t,
+) !*Session {
+    const detached = try std.testing.allocator.create(Session);
+    detached.* = Session.init(fd, slot, "localhost", false, std.testing.allocator);
+    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.sm_detached = true;
+    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_resume_enabled = true;
+    @memcpy(&detached.sm_id, previd[0..sm_state.SM_ID_HEX_LEN]);
+    detached.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    queue.base_seq = base_seq;
+    queue.last_h = last_h;
+    var i: u32 = 0;
+    while (i < unacked) : (i += 1) _ = queue.push("<message/>");
+    detached.sm_unacked = queue;
+    server.sessions[slot] = detached;
+    server.smIdMapInsert(previd, slot);
+    return detached;
+}
+
+test "Server: S24 cross-worker resume validates the reported h before handoff" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    server.worker_id = 1;
+    var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    sm_handoff.resetForTesting();
+
+    const previd = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    const detached = try makeDetachedForResume(&server, 2, previd, 6, 5, 3, det_fds[0]);
+    const det_queue = detached.sm_unacked.?;
+
+    var status = CapturedResumeStatus{};
+
+    // A backwards h must fail the handoff and leave the queue untouched.
+    server.handleSmResumeRequest(.{
+        .previd = previd,
+        .h = 3,
+        .req_worker = 1,
+        .req_session = 1,
+        .req_epoch = 0,
+        .auth_local = "alice",
+        .auth_domain = "localhost",
+        .hops = 0,
+    });
+    captureSmResumeStatus(&delivery_sys, 1, &status);
+    try std.testing.expectEqualStrings("unexpected-request", status.slice());
+    try std.testing.expectEqual(@as(usize, 0), sm_handoff.count());
+    try std.testing.expect(server.sessions[2] != null);
+    try std.testing.expectEqual(@as(u32, 3), det_queue.count);
+    try std.testing.expectEqual(@as(u32, 5), det_queue.last_h);
+
+    // An h above the sent count must fail the same way. Only the wrap-aware
+    // subtraction catches a report that has passed 2^32 (see the sm_state
+    // wrap tests); here the plain overshoot is rejected.
+    server.handleSmResumeRequest(.{
+        .previd = previd,
+        .h = 100,
+        .req_worker = 1,
+        .req_session = 1,
+        .req_epoch = 0,
+        .auth_local = "alice",
+        .auth_domain = "localhost",
+        .hops = 0,
+    });
+    captureSmResumeStatus(&delivery_sys, 1, &status);
+    try std.testing.expectEqualStrings("handled-count-too-high", status.slice());
+    try std.testing.expectEqual(@as(usize, 0), sm_handoff.count());
+    try std.testing.expectEqual(@as(u32, 3), det_queue.count);
+    try std.testing.expectEqual(@as(u32, 5), det_queue.last_h);
+
+    // A valid forward h is the only one that parks a bundle and tears the
+    // detached slot down; its last_h carries into the bundle.
+    server.handleSmResumeRequest(.{
+        .previd = previd,
+        .h = 5,
+        .req_worker = 1,
+        .req_session = 1,
+        .req_epoch = 0,
+        .auth_local = "alice",
+        .auth_domain = "localhost",
+        .hops = 0,
+    });
+    captureSmResumeStatus(&delivery_sys, 1, &status);
+    try std.testing.expectEqualStrings("ok", status.slice());
+    try std.testing.expect(server.sessions[2] == null);
+    const bundle = sm_handoff.take(previd) orelse return error.Missing;
+    defer sm_handoff.release(bundle);
+    try std.testing.expectEqual(@as(u32, 5), bundle.last_h);
+    try std.testing.expectEqual(@as(u32, 6), bundle.base_seq);
+    try std.testing.expectEqual(@as(usize, 3), bundle.stanzas.items.len);
+}
+
+test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    server.worker_id = 1;
+    var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    sm_handoff.resetForTesting();
+
+    // sent=2 (one stanza outstanding at sequence 2), last_h=0xFFFFFFFE. The
+    // client reports h=3: numerically 3 is above the 2 sent but below
+    // 0xFFFFFFFE, so a plain `h > sent` check reads it as small and accepts
+    // credit for a stanza that was never sent. Only the wrap-aware check
+    // (h -% last_h is forward, h -% sent overshoots) rejects it.
+    const previd = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    _ = try makeDetachedForResume(&server, 2, previd, 2, 0xFFFF_FFFE, 1, det_fds[0]);
+
+    var status = CapturedResumeStatus{};
+    server.handleSmResumeRequest(.{
+        .previd = previd,
+        .h = 3,
+        .req_worker = 1,
+        .req_session = 1,
+        .req_epoch = 0,
+        .auth_local = "alice",
+        .auth_domain = "localhost",
+        .hops = 0,
+    });
+    captureSmResumeStatus(&delivery_sys, 1, &status);
+    try std.testing.expectEqualStrings("handled-count-too-high", status.slice());
+    try std.testing.expectEqual(@as(usize, 0), sm_handoff.count());
+    try std.testing.expect(server.sessions[2] != null);
+}
+
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
