@@ -8434,6 +8434,68 @@ test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
     try std.testing.expect(!server.s2s_reconnect_pending);
 }
 
+// G6: the auth half of the reconnect-timer guarantee needs its own gates, or a
+// revert that only touches the auth staging or the auth re-arm would pass the
+// suite on the strength of the S2S tests alone.
+test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // A batch already at its ordinary limit, built the way the event loop
+    // builds it so the tail budget is production's. The third slot is reserved.
+    var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
+    var changes = initLoopChangeList(&change_buf);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
+
+    server.armAuthReconnect();
+    server.reconcileIpcWriteInterest(&changes);
+    try std.testing.expectEqual(@as(usize, 3), changes.count());
+    try std.testing.expect(!server.auth_reconnect_pending);
+
+    var timer_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.TIMER) continue;
+        if (ev.ident != AUTH_RECONNECT_TIMER_IDENT) continue;
+        try std.testing.expectEqual(@as(i64, AUTH_RECONNECT_MS), ev.data);
+        try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+        timer_found = true;
+    }
+    try std.testing.expect(timer_found);
+}
+
+test "Server: G6 auth reconnect with no daemon re-arms and stays down" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Nothing listening: the retry must re-arm rather than give up, and must
+    // not leave a half-open link that looks connected. No socket file exists.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [server.auth_ipc_path_buf.len]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/absent.sock", .{dir});
+    @memcpy(server.auth_ipc_path_buf[0..sock_path.len], sock_path);
+    server.auth_ipc_path_len = sock_path.len;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.tryAuthReconnect(&changes);
+
+    // The failed connect owes another attempt; the reconciler makes it a timer.
+    try std.testing.expect(!server.ipc.connected);
+    try std.testing.expect(server.auth_reconnect_pending);
+    server.reconcileIpcWriteInterest(&changes);
+    var timer_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.TIMER and ev.ident == AUTH_RECONNECT_TIMER_IDENT) timer_found = true;
+    }
+    try std.testing.expect(timer_found);
+    try std.testing.expect(!server.auth_reconnect_pending);
+}
+
 test "Server: S10 auth IPC decode error drops the link" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
