@@ -2939,18 +2939,10 @@ pub const Server = struct {
         var lease = self.leaseByteScratch() orelse return;
         defer lease.release();
         var fbs = std.io.fixedBufferStream(lease.buf);
-        const w = fbs.writer();
-        w.writeAll("<message type='error' from='") catch return;
-        xml.escapeWrite(w, local_to) catch return;
-        w.writeAll("' to='") catch return;
-        xml.escapeWrite(w, remote_from) catch return;
-        w.writeByte('\'') catch return;
-        if (msg_id.len > 0) {
-            w.writeAll(" id='") catch return;
-            xml.escapeWrite(w, msg_id) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+        writeS2sBounce(fbs.writer(), local_to, remote_from, msg_id) catch {
+            log.warn("S2S bounce for {s} dropped: serialization failed", .{remote_from});
+            return;
+        };
 
         self.s2s_ipc.send(.{ .s2s_deliver = .{
             .from_jid = local_to,
@@ -3036,7 +3028,13 @@ pub const Server = struct {
                                     log.warn("S2S offline archive store failed for {s}: {s}", .{ recipient_bare, @errorName(err) });
                                 };
                             }
-                            if (store.storeHeldPointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch false) {
+                            const held = store.storeHeldPointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch |err| blk: {
+                                // A storage error is logged with its name and still
+                                // bounces below, never a silent drop (G7).
+                                log.warn("S2S offline hold failed for {s}: {s}", .{ recipient_bare, @errorName(err) });
+                                break :blk false;
+                            };
+                            if (held) {
                                 log.info("S2S inbound to {s} stored offline", .{m.to_jid});
                                 return;
                             }
@@ -5059,6 +5057,28 @@ fn extractStanzaParts(stanza: []const u8) StanzaParts {
     return result;
 }
 
+/// Serialize an S2S service-unavailable bounce. msg_id is the raw on-wire
+/// attribute value from extractAttrValue: it is decoded and then escaped once,
+/// so an entity in the id is not double-escaped and a quote cannot break the
+/// attribute (G7). from/to are plain JIDs and are escaped once. Serialization
+/// errors propagate so the caller can log them.
+fn writeS2sBounce(w: anytype, local_to: []const u8, remote_from: []const u8, msg_id: []const u8) !void {
+    try w.writeAll("<message type='error' from='");
+    try xml.escapeWrite(w, local_to);
+    try w.writeAll("' to='");
+    try xml.escapeWrite(w, remote_from);
+    try w.writeByte('\'');
+    if (msg_id.len > 0) {
+        try w.writeAll(" id='");
+        var id_buf: [1024]u8 = undefined;
+        var id_fbs = std.io.fixedBufferStream(&id_buf);
+        try xml.decodeWrite(id_fbs.writer(), msg_id);
+        try xml.escapeWrite(w, id_fbs.getWritten());
+        try w.writeByte('\'');
+    }
+    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>");
+}
+
 /// Extract the value of an attribute from an XML opening tag string.
 /// Returns an empty slice if the attribute is not found.
 fn extractAttrValue(tag: []const u8, attr_name: []const u8) []const u8 {
@@ -6593,6 +6613,144 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     _ = server.s2s_ipc.flush() catch {};
     const second = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), second);
+}
+
+test "G7: the S2S bounce escapes the id once and from/to once" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // msg_id is the raw on-wire form: an entity is decoded then escaped once,
+    // not double-escaped. from/to are plain JIDs, escaped once.
+    try writeS2sBounce(fbs.writer(), "b&b@localhost", "carol@example.com/res", "a&amp;b");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "id='a&amp;b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a&amp;amp;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "from='b&amp;b@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "to='carol@example.com/res'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "service-unavailable") != null);
+}
+
+test "G7: a single quote in the id cannot break the bounce attribute" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeS2sBounce(fbs.writer(), "bob@localhost", "carol@example.com", "x'y");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "id='x&apos;y'") != null);
+}
+
+// G7: an inbound id carrying an XML entity is bounced with the entity escaped
+// exactly once, through the real parse and bounce path (not a double escape).
+test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    // No offline store: the stanza bounces.
+    try server.configureS2s(sock_path);
+
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='a&amp;b' type='chat'><body>hello</body></message>",
+    } }, &changes);
+
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(got > 0);
+    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    try std.testing.expect(frame != null);
+    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='a&amp;b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "a&amp;amp;") == null);
+}
+
+// G7: a storage error (not just a full queue) still bounces the inbound stanza
+// instead of returning silently. An over-long recipient makes the offline hold
+// fail with KeyTooLong.
+test "Server: G7 a storage error on the offline hold still bounces" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    try server.configureS2s(sock_path);
+
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const long_to = "bob@" ++ ("d" ** 520);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = long_to,
+        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r9' type='chat'><body>hello</body></message>",
+    } }, &changes);
+
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(got > 0);
+    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    try std.testing.expect(frame != null);
+    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
 }
 
 // E2c: the stanza ID is the key tiebreaker within a timestamp
