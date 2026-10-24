@@ -94,8 +94,9 @@ pub const Affiliation = enum(u8) {
 
 /// Persistent room configuration.
 pub const RoomConfig = struct {
-    /// Capacity of the stored room secret. setPassword truncates beyond this,
-    /// and the serialize format writes the field at this fixed width.
+    /// Capacity of the stored room secret. setPassword rejects a secret wider
+    /// than this rather than truncating, and the serialize format writes the
+    /// field at this fixed width.
     pub const password_max_len: usize = 64;
 
     persistent: bool = true,
@@ -139,8 +140,9 @@ pub const RoomConfig = struct {
         self.subject_len = len;
     }
 
-    pub fn setPassword(self: *RoomConfig, password: []const u8) void {
-        const len: u8 = @intCast(@min(password.len, self.password_buf.len));
+    pub fn setPassword(self: *RoomConfig, password: []const u8) !void {
+        if (password.len > password_max_len) return error.PasswordTooLong;
+        const len: u8 = @intCast(password.len);
         @memcpy(self.password_buf[0..len], password[0..len]);
         self.password_len = len;
         self.password_protected = len > 0;
@@ -416,7 +418,7 @@ test "RoomConfig: serialize and deserialize roundtrip" {
     config.created_at = 1717632000;
     config.setName("Test Room");
     config.setSubject("Welcome!");
-    config.setPassword("secret");
+    try config.setPassword("secret");
 
     var buf: [1024]u8 = undefined;
     const len = config.serialize(&buf).?;
@@ -433,6 +435,19 @@ test "RoomConfig: serialize and deserialize roundtrip" {
     try std.testing.expectEqualStrings("Test Room", restored.getName());
     try std.testing.expectEqualStrings("Welcome!", restored.getSubject());
     try std.testing.expectEqualStrings("secret", restored.getPassword());
+}
+
+test "RoomConfig: setPassword rejects a secret wider than the field" {
+    var config = RoomConfig{};
+    const over = "x" ** 65;
+    try std.testing.expectError(error.PasswordTooLong, config.setPassword(over));
+    // The rejected secret is not stored and the room is not marked protected.
+    try std.testing.expectEqual(@as(u8, 0), config.password_len);
+    try std.testing.expect(!config.password_protected);
+    // A secret exactly at the field width is accepted.
+    const exact = "y" ** 64;
+    try config.setPassword(exact);
+    try std.testing.expectEqualStrings(exact, config.getPassword());
 }
 
 test "RoomConfig: empty config roundtrip" {

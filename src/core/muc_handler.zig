@@ -840,7 +840,14 @@ pub fn handleMucOwnerSet(
     var text_buf: [512]u8 = undefined;
     if (parseFormValue(form_xml, "muc#roomconfig_roomname", &text_buf)) |name| config.setName(name);
     if (parseFormValue(form_xml, "muc#roomconfig_roomdesc", &text_buf)) |desc| config.setSubject(desc);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| config.setPassword(pw);
+    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| {
+        // A secret wider than the field is rejected, not truncated (S16);
+        // reject the whole form so the room is not left half-configured.
+        config.setPassword(pw) catch {
+            sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-acceptable", changes);
+            return;
+        };
+    }
 
     // Apply config to the in-memory room
     room.config = config;
@@ -2822,7 +2829,7 @@ test "S1: room secret with XML specials is accepted on join" {
     // The secret is stored decoded, the way parseFormValue stores a submitted
     // room config form.
     var config = RoomConfig{ .persistent = false };
-    config.setPassword("A&B");
+    try config.setPassword("A&B");
     const room = try reg.createRoom("secret@conference.localhost", config);
 
     var fds: [2]posix.fd_t = undefined;
@@ -2859,7 +2866,7 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
     server.muc_host = "conference.localhost";
 
     var config = RoomConfig{ .persistent = false };
-    config.setPassword("A&B");
+    try config.setPassword("A&B");
     const room = try reg.createRoom("secret@conference.localhost", config);
 
     var fds: [2]posix.fd_t = undefined;
