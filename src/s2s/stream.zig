@@ -112,6 +112,18 @@ pub const StreamError = enum {
     }
 };
 
+/// Map an XML parse error to a stream error. An overlong token is a resource
+/// limit the peer hit (policy-violation), not malformed XML (S11).
+pub fn streamErrorForXmlError(err: anyerror) StreamError {
+    return if (err == error.TokenTooLong) .policy_violation else .not_well_formed;
+}
+
+test "S2S: an over-long token maps to policy-violation, not not-well-formed" {
+    try std.testing.expectEqual(StreamError.policy_violation, streamErrorForXmlError(error.TokenTooLong));
+    try std.testing.expectEqual(StreamError.not_well_formed, streamErrorForXmlError(error.MismatchedCloseTag));
+    try std.testing.expectEqual(StreamError.not_well_formed, streamErrorForXmlError(error.InvalidName));
+}
+
 pub const S2sFeatureSet = struct {
     starttls_required: bool = false,
     sasl_external: bool = false,

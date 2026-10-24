@@ -7729,6 +7729,52 @@ test "Server: E6 non-whitespace between stanzas closes the stream" {
     try std.testing.expect(server.sessions[1] == null);
 }
 
+// E6 (S11): an over-long token is a resource limit the peer hit, not malformed
+// XML, so it maps to a policy-violation stream error (not not-well-formed).
+// The scanner cap is 512 KiB, so the name is driven past it in chunks through
+// the real parse path.
+test "Server: E6 an over-long token is a policy-violation" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A stream open, then an element name longer than the 512 KiB scanner cap.
+    const prefix = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'><";
+    const name_len = 512 * 1024 + 1;
+    const data = try allocator.alloc(u8, prefix.len + name_len);
+    defer allocator.free(data);
+    @memcpy(data[0..prefix.len], prefix);
+    @memset(data[prefix.len..], 'a');
+
+    // Feed in chunks. handleReadable performs one recv (8 KiB) per call and
+    // the socketpair is non-blocking with a 64 KiB buffer, so write less than
+    // one recv's worth and parse after each, letting the scanner accumulate the
+    // name across passes until it is rejected.
+    var written: usize = 0;
+    while (written < data.len and server.sessions[1] != null) {
+        const chunk = @min(@as(usize, 4096), data.len - written);
+        const n = posix.write(fds[1], data[written..][0..chunk]) catch break;
+        if (n == 0) break;
+        written += n;
+        server.handleReadable(1, &changes);
+    }
+
+    // A policy-violation (not not-well-formed) closed the stream.
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "policy-violation") != null);
+    try std.testing.expect(server.sessions[1] == null);
+}
+
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
