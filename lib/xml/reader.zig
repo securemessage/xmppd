@@ -334,6 +334,15 @@ pub const Reader = struct {
                         if (self.depth >= 2) {
                             return Event{ .text = try self.arenaDupe(token.name) };
                         }
+                        // Only whitespace is allowed at the stream level
+                        // (RFC 6120 4.6.1). Non-whitespace between stanzas is
+                        // rejected here so the stream closes with an error
+                        // instead of the server dropping it (S11).
+                        for (token.name) |c| {
+                            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
+                                return error.StreamLevelText;
+                            }
+                        }
                         return Event{ .text = token.name };
                     }
                 },

@@ -1071,6 +1071,30 @@ test "S11: an overlong element name is rejected" {
     try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
 }
 
+test "S11: an overlong close-tag name is rejected" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    const input = try std.mem.concat(allocator, u8, &.{ "</", run, ">" });
+    defer allocator.free(input);
+
+    try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
+}
+
+test "S11: an overlong attribute name is rejected" {
+    const allocator = std.testing.allocator;
+    const run = try allocator.alloc(u8, max_token_bytes + 1);
+    defer allocator.free(run);
+    @memset(run, 'a');
+
+    const input = try std.mem.concat(allocator, u8, &.{ "<message ", run, "='v'/>" });
+    defer allocator.free(input);
+
+    try std.testing.expectEqual(@as(?anyerror, error.TokenTooLong), scanExpectingError(allocator, input));
+}
+
 test "S11: 2 MiB of inter-stanza whitespace does not grow the token buffers" {
     const allocator = std.testing.allocator;
     var scanner = Scanner.init(allocator);

@@ -7698,6 +7698,37 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     try std.testing.expect(server.sessions[9] == null);
 }
 
+// E6 (S11): only whitespace is allowed at the stream level between stanzas.
+// Non-whitespace there is a stream error (RFC 6120 4.6.1). Before E6 the
+// reader passed it up and the server dropped it silently.
+test "Server: E6 non-whitespace between stanzas closes the stream" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A stream open, then non-whitespace text before any stanza. The text is
+    // terminated by the stream close so the scanner emits it as a token.
+    const payload = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>GARBAGE</stream:stream>";
+    _ = try posix.write(fds[1], payload);
+    server.handleReadable(1, &changes);
+
+    // The stream is failed closed with a not-well-formed stream error and the
+    // session is gone.
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not-well-formed") != null);
+    try std.testing.expect(server.sessions[1] == null);
+}
+
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
