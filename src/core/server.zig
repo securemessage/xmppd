@@ -240,6 +240,11 @@ pub const Session = struct {
     stanza_kind: StanzaKind = .none,
     stanza_buf: [16384]u8 = undefined,
     stanza_buf_len: usize = 0,
+    /// Set when stanza accumulation overflowed stanza_buf. The buffered XML is
+    /// then a partial stanza and must never be delivered (E5); the stanza is
+    /// failed closed at dispatch instead. Reset with the rest of the stanza
+    /// state, so it never carries across stanzas.
+    stanza_overflow: bool = false,
     stanza_to: []const u8 = "",
     stanza_id: []const u8 = "",
     stanza_type: []const u8 = "",
@@ -472,6 +477,7 @@ pub const Session = struct {
     pub fn resetStanza(self: *Session) void {
         self.stanza_kind = .none;
         self.stanza_buf_len = 0;
+        self.stanza_overflow = false;
         self.stanza_to = "";
         self.stanza_id = "";
         self.stanza_type = "";
@@ -2196,7 +2202,18 @@ pub const Server = struct {
                     session.pres_priority_collecting = false;
                 }
             } else {
-                // Stanza complete (depth back to stream level) — route to targets
+                // Stanza complete (depth back to stream level): route to targets.
+                // Fail closed on an oversized stanza (E5). The accumulation
+                // buffer overflowed, so what is buffered is a partial stanza;
+                // never deliver it. The reader cap (512 KiB) is the hard limit,
+                // this buffer is the per-stanza limit.
+                if (session.stanza_overflow) {
+                    log.warn("connection {d} stanza exceeds {d} bytes: policy-violation", .{ session.conn.id, session.stanza_buf.len });
+                    self.sendStreamError(session, .policy_violation);
+                    session.conn.flushSync();
+                    session_lifecycle.forceCloseSession(self, session.conn.id, changes);
+                    return;
+                }
                 if (session.stanza_kind == .presence and session.stanza_to.len == 0) {
                     // Own presence (no 'to') — update availability + broadcast
                     presence_handler.dispatchPresence(self, session, changes);
@@ -3143,64 +3160,39 @@ pub const Server = struct {
     // ========================================================================
 
     /// Serialize a child element opening tag into the stanza accumulation buffer.
+    /// On overflow the whole stanza is marked bad and never dispatched (E5).
     fn accumulateStanzaElement(self: *Server, session: *Session, elem: xml.Element) void {
         _ = self;
+        if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        const w = fbs.writer();
-
-        w.writeByte('<') catch return;
-        w.writeAll(elem.name) catch return;
-
-        // Reconstruct namespace declaration if element uses a non-default namespace.
-        // The reader resolves xmlns declarations into namespace_uri but doesn't
-        // include them in the attributes array — we must re-emit them.
-        if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client)) {
-            if (elem.prefix.len > 0) {
-                w.writeAll(" xmlns:") catch return;
-                w.writeAll(elem.prefix) catch return;
-                w.writeAll("='") catch return;
-                xml.escapeWrite(w, elem.namespace_uri) catch return;
-                w.writeByte('\'') catch return;
-            } else {
-                w.writeAll(" xmlns='") catch return;
-                xml.escapeWrite(w, elem.namespace_uri) catch return;
-                w.writeByte('\'') catch return;
-            }
-        }
-
-        for (elem.attributes) |attr| {
-            w.writeByte(' ') catch return;
-            w.writeAll(attr.name) catch return;
-            w.writeAll("='") catch return;
-            xmlEscapeWrite(w, attr.value) catch return;
-            w.writeByte('\'') catch return;
-        }
-
-        if (elem.self_closing) {
-            w.writeAll("/>") catch return;
-        } else {
-            w.writeByte('>') catch return;
-        }
-
+        writeStanzaOpenTag(fbs.writer(), elem) catch {
+            session.stanza_overflow = true;
+            return;
+        };
         session.stanza_buf_len += fbs.pos;
     }
 
     /// Serialize text content (XML-escaped) into the stanza accumulation buffer.
     fn accumulateStanzaText(self: *Server, session: *Session, text: []const u8) void {
         _ = self;
+        if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch return;
+        xmlEscapeWrite(fbs.writer(), text) catch {
+            session.stanza_overflow = true;
+            return;
+        };
         session.stanza_buf_len += fbs.pos;
     }
 
     /// Serialize a child element close tag into the stanza accumulation buffer.
     fn accumulateStanzaClose(self: *Server, session: *Session, name: []const u8) void {
         _ = self;
+        if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        const w = fbs.writer();
-        w.writeAll("</") catch return;
-        w.writeAll(name) catch return;
-        w.writeByte('>') catch return;
+        writeStanzaCloseTag(fbs.writer(), name) catch {
+            session.stanza_overflow = true;
+            return;
+        };
         session.stanza_buf_len += fbs.pos;
     }
 
@@ -4915,6 +4907,51 @@ pub const Server = struct {
 /// so when serializing parsed content back to XML we must re-encode them.
 fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
     return xml.escapeWrite(writer, text);
+}
+
+/// Write a child element opening tag, re-emitting namespace declarations the
+/// reader resolved away. Fills the writer until it is out of space, returning
+/// the fixed-buffer error so the caller can mark the stanza bad.
+fn writeStanzaOpenTag(w: anytype, elem: xml.Element) !void {
+    try w.writeByte('<');
+    try w.writeAll(elem.name);
+
+    // Reconstruct namespace declaration if element uses a non-default namespace.
+    // The reader resolves xmlns declarations into namespace_uri but doesn't
+    // include them in the attributes array, so we must re-emit them.
+    if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client)) {
+        if (elem.prefix.len > 0) {
+            try w.writeAll(" xmlns:");
+            try w.writeAll(elem.prefix);
+            try w.writeAll("='");
+            try xml.escapeWrite(w, elem.namespace_uri);
+            try w.writeByte('\'');
+        } else {
+            try w.writeAll(" xmlns='");
+            try xml.escapeWrite(w, elem.namespace_uri);
+            try w.writeByte('\'');
+        }
+    }
+
+    for (elem.attributes) |attr| {
+        try w.writeByte(' ');
+        try w.writeAll(attr.name);
+        try w.writeAll("='");
+        try xmlEscapeWrite(w, attr.value);
+        try w.writeByte('\'');
+    }
+
+    if (elem.self_closing) {
+        try w.writeAll("/>");
+    } else {
+        try w.writeByte('>');
+    }
+}
+
+fn writeStanzaCloseTag(w: anytype, name: []const u8) !void {
+    try w.writeAll("</");
+    try w.writeAll(name);
+    try w.writeByte('>');
 }
 
 /// Decode base64 into a fixed buffer. Returns the decoded slice or null on error.
@@ -7565,6 +7602,100 @@ test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" 
     try std.testing.expectEqualStrings("handled-count-too-high", status.slice());
     try std.testing.expectEqual(@as(usize, 0), sm_handoff.count());
     try std.testing.expect(server.sessions[2] != null);
+}
+
+test "Server: E5 an oversized body is not delivered and fails the stream" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // bob is online, so anything routed to him reaches his socket.
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = bob;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    // alice sends a message whose body exceeds the accumulation buffer.
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    server.sessions[9] = alice;
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // <body> with 20 KiB of text: the accumulation buffer overflows partway, so
+    // what is buffered is a partial stanza (before E5 it collapsed to
+    // <body></body> and was delivered as if it were the whole message).
+    const body_elem = xml.Element{
+        .name = "body",
+        .prefix = "",
+        .local_name = "body",
+        .namespace_uri = "",
+        .attributes = &[_]xml.Attribute{},
+        .self_closing = false,
+    };
+    server.accumulateStanzaElement(alice, body_elem);
+    var big: [20000]u8 = undefined;
+    @memset(&big, 'A');
+    server.accumulateStanzaText(alice, &big);
+    server.accumulateStanzaClose(alice, "body");
+    try std.testing.expect(alice.stanza_overflow);
+
+    // The stanza completes: the partial is not routed, the stream is failed
+    // closed, and the session is torn down.
+    server.handleElementEnd(alice, "message", &changes);
+
+    // Nothing reached bob.
+    _ = bob.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    // The sender saw a policy-violation (so this is not a silent drop).
+    // alice's session is already destroyed; only the socket end is read here.
+    var abuf: [4096]u8 = undefined;
+    const an = posix.read(alice_fds[1], &abuf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, abuf[0..an], "policy-violation") != null);
+    try std.testing.expect(server.sessions[9] == null);
 }
 
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
