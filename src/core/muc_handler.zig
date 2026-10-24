@@ -688,6 +688,18 @@ fn sendIqErrorFromRoom(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    sendIqErrorFromRoomTyped(server, session, room_jid, iq_id, condition, "cancel", changes);
+}
+
+fn sendIqErrorFromRoomTyped(
+    server: *Server,
+    session: *Session,
+    room_jid: []const u8,
+    iq_id: []const u8,
+    condition: []const u8,
+    err_type: []const u8,
+    changes: *ChangeList,
+) void {
     _ = server;
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -699,7 +711,9 @@ fn sendIqErrorFromRoom(
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
     xml.escapeWrite(w, iq_id) catch return;
-    w.writeAll("'><error type='cancel'><") catch return;
+    w.writeAll("'><error type='") catch return;
+    w.writeAll(err_type) catch return;
+    w.writeAll("'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
 
@@ -821,33 +835,18 @@ pub fn handleMucOwnerSet(
         return;
     }
 
-    // Parse form fields from accumulated stanza buffer.
-    // The form XML is in session.stanza_buf — parse key/value pairs from <field var='...'><value>...</value></field>
+    // Parse form fields from accumulated stanza buffer. The form XML is in
+    // session.stanza_buf. Any overflowing or malformed value, or a secret
+    // wider than the field, rejects the whole form with type='modify'
+    // (XEP-0045): never apply a partially parsed config (G1).
     const form_xml = session.stanza_buf[0..session.stanza_buf_len];
     var config = room.config;
     const was_persistent = config.persistent;
 
-    // Parse each field we recognize
-    config.persistent = parseFormBool(form_xml, "muc#roomconfig_persistentroom") orelse config.persistent;
-    config.public_room = parseFormBool(form_xml, "muc#roomconfig_publicroom") orelse config.public_room;
-    config.members_only = parseFormBool(form_xml, "muc#roomconfig_membersonly") orelse config.members_only;
-    config.moderated = parseFormBool(form_xml, "muc#roomconfig_moderatedroom") orelse config.moderated;
-    config.password_protected = parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom") orelse config.password_protected;
-    config.allow_invites = parseFormBool(form_xml, "muc#roomconfig_allowinvites") orelse config.allow_invites;
-
-    // Text fields (stored decoded; output escapes, so values do not grow
-    // on each round trip)
-    var text_buf: [512]u8 = undefined;
-    if (parseFormValue(form_xml, "muc#roomconfig_roomname", &text_buf)) |name| config.setName(name);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomdesc", &text_buf)) |desc| config.setSubject(desc);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| {
-        // A secret wider than the field is rejected, not truncated (S16);
-        // reject the whole form so the room is not left half-configured.
-        config.setPassword(pw) catch {
-            sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-acceptable", changes);
-            return;
-        };
-    }
+    applyConfigForm(&config, form_xml) catch {
+        sendIqErrorFromRoomTyped(server, session, room_jid, iq_id, "not-acceptable", "modify", changes);
+        return;
+    };
 
     // Apply config to the in-memory room
     room.config = config;
@@ -897,19 +896,39 @@ fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, val
 }
 
 /// Parse a boolean value from a form field in XML.
-fn parseFormBool(xml_data: []const u8, field_var: []const u8) ?bool {
+fn parseFormBool(xml_data: []const u8, field_var: []const u8) !?bool {
     var buf: [16]u8 = undefined;
-    const value = parseFormValue(xml_data, field_var, &buf) orelse return null;
+    const value = (try parseFormValue(xml_data, field_var, &buf)) orelse return null;
     if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
     return null;
 }
 
+/// Apply a submitted room config form to `config`. Any overflowing or
+/// malformed field value, and any room secret wider than the field, is an
+/// error for the whole form: the caller must reject it rather than apply a
+/// partially parsed config (G1). Values are stored decoded; output escapes.
+fn applyConfigForm(config: *RoomConfig, form_xml: []const u8) !void {
+    config.persistent = (try parseFormBool(form_xml, "muc#roomconfig_persistentroom")) orelse config.persistent;
+    config.public_room = (try parseFormBool(form_xml, "muc#roomconfig_publicroom")) orelse config.public_room;
+    config.members_only = (try parseFormBool(form_xml, "muc#roomconfig_membersonly")) orelse config.members_only;
+    config.moderated = (try parseFormBool(form_xml, "muc#roomconfig_moderatedroom")) orelse config.moderated;
+    config.password_protected = (try parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom")) orelse config.password_protected;
+    config.allow_invites = (try parseFormBool(form_xml, "muc#roomconfig_allowinvites")) orelse config.allow_invites;
+
+    var text_buf: [512]u8 = undefined;
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomname", &text_buf)) |name| config.setName(name);
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomdesc", &text_buf)) |desc| config.setSubject(desc);
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| try config.setPassword(pw);
+}
+
 /// Parse the <value>...</value> content for a given field var from form XML,
 /// decoded into `buf` (the form buffer holds escaped XML; storing it raw
 /// would double-escape on every output round trip). Returns null when the
-/// field is absent, the value does not fit, or the entities are malformed.
-fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) ?[]const u8 {
+/// field is absent. Returns error.FormValueInvalid when the value does not
+/// fit or the entities are malformed, so the caller rejects the whole form
+/// rather than silently skipping the field (G1).
+fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) !?[]const u8 {
     // Find field_var in the XML
     const var_pos = std.mem.indexOf(u8, xml_data, field_var) orelse return null;
     // Find the next <value> after this field
@@ -919,7 +938,7 @@ fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) ?[]con
     const remaining = after_var[content_start..];
     const value_end = std.mem.indexOf(u8, remaining, "</value>") orelse return null;
     var fbs = std.io.fixedBufferStream(buf);
-    xml.decodeWrite(fbs.writer(), remaining[0..value_end]) catch return null;
+    xml.decodeWrite(fbs.writer(), remaining[0..value_end]) catch return error.FormValueInvalid;
     return fbs.getWritten();
 }
 
@@ -1042,6 +1061,13 @@ fn handleJoin(
     // Members-only check
     if (r.config.members_only and affiliation == .none) {
         sendPresenceError(server, session, room_local, muc_host, "registration-required", changes);
+        return;
+    }
+
+    // A protected room with no stored secret must not be joinable (G1):
+    // fail closed rather than letting anyone in without a password.
+    if (r.config.password_protected and r.config.password_len == 0) {
+        sendPresenceError(server, session, room_local, muc_host, "not-authorized", changes);
         return;
     }
 
@@ -2955,6 +2981,96 @@ test "S1: room config form values are stored decoded, escaped once on output" {
     const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
     try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
+}
+
+test "G1: applyConfigForm rejects an overflowing or over-wide secret" {
+    var config = RoomConfig{};
+    const overflow_form = "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 600) ++ "</value></field>";
+    try std.testing.expectError(error.FormValueInvalid, applyConfigForm(&config, overflow_form));
+    const wide_form = "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 65) ++ "</value></field>";
+    try std.testing.expectError(error.PasswordTooLong, applyConfigForm(&config, wide_form));
+    // A valid secret is applied and stored decoded.
+    const ok_form = "<field var='muc#roomconfig_roomsecret'><value>s&amp;cr</value></field>";
+    try applyConfigForm(&config, ok_form);
+    try std.testing.expectEqualStrings("s&cr", config.getPassword());
+}
+
+test "G1: an overflowing room secret rejects the whole config form" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = session;
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+
+    // passwordprotectedroom=1 with a secret too wide for the form buffer:
+    // the whole form must be rejected, not applied with an empty secret.
+    const form = "<query xmlns='http://jabber.org/protocol/muc#owner'><x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='muc#roomconfig_passwordprotectedroom'><value>1</value></field>" ++
+        "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 600) ++ "</value></field>" ++
+        "</x></query>";
+    @memcpy(session.stanza_buf[0..form.len], form);
+    session.stanza_buf_len = form.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
+
+    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-acceptable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "type='modify'") != null);
+    // The rejected form is not applied: no protected room with an empty secret.
+    try std.testing.expect(!room.config.password_protected);
+    try std.testing.expectEqual(@as(u8, 0), room.config.password_len);
+}
+
+test "G1: a protected room with no stored secret refuses the join" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    // Protected but with no stored secret: this state must not be joinable.
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false, .password_protected = true });
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = bob;
+
+    // A MUC join with no password element.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'/>";
+    @memcpy(bob.stanza_buf[0..join.len], join);
+    bob.stanza_buf_len = join.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucPresence(&server, bob, "room", "bob", "", &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
 test "S16: mailbox-full bounce goes to the sender's real JID, not a nick twin" {
