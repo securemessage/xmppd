@@ -17,7 +17,7 @@ const backend_mod = @import("backend");
 
 const log = std.log.scoped(.user_store);
 
-const NAMESPACE = "users";
+pub const NAMESPACE = backend_mod.registered("users");
 const CRED_SIZE = 32 + 32 + 32 + 4; // 100 bytes
 
 pub fn UserStore(comptime Backend: type) type {
