@@ -1280,15 +1280,12 @@ pub const Server = struct {
             if (self.byte_scratch_in_use[bank]) continue;
             const start = bank * BYTE_BANK_SIZE;
             const end = start + BYTE_BANK_SIZE;
-            if (self.byte_scratch.len < end) {
-                log.err("byte scratch bank {d} unavailable ({d} bytes allocated)", .{ bank, self.byte_scratch.len });
-                return null;
-            }
+            if (self.byte_scratch.len < end) break;
             self.byte_scratch_in_use[bank] = true;
             return .{ .server = self, .bank = bank, .buf = self.byte_scratch[start..end] };
         }
         const buf = self.allocator.alloc(u8, BYTE_BANK_SIZE) catch {
-            log.err("all {d} byte scratch banks in use and the fallback allocation of {d} bytes failed", .{ BYTE_BANK_COUNT, BYTE_BANK_SIZE });
+            log.err("byte scratch fallback allocation of {d} bytes failed", .{BYTE_BANK_SIZE});
             return null;
         };
         return .{ .server = self, .bank = 0, .owned = true, .buf = buf };
@@ -1302,7 +1299,7 @@ pub const Server = struct {
         if (self.byte_scratch.len > 0) return;
         const total = BYTE_BANK_COUNT * BYTE_BANK_SIZE;
         self.byte_scratch = self.allocator.alloc(u8, total) catch {
-            log.err("byte scratch alloc of {d} bytes failed", .{total});
+            log.warn("byte scratch pool alloc of {d} bytes failed; using heap fallback", .{total});
             return;
         };
     }
@@ -5258,6 +5255,24 @@ test "Server: S18 scratch banks size to the session map resource cap" {
         defer lease.release();
         try std.testing.expectEqual(session_map_mod.DEFAULT_MAX_RESOURCES, lease.entries.len);
     }
+}
+
+test "Server: S18 byte scratch pool failure uses the heap fallback" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer {
+        server.allocator = std.testing.allocator;
+        server.deinit();
+    }
+
+    var backing: [Server.BYTE_BANK_SIZE * 2]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    server.allocator = fixed.allocator();
+
+    var lease = server.leaseByteScratch() orelse return error.ExpectedScratchFallback;
+    defer lease.release();
+    try std.testing.expect(lease.owned);
+    try std.testing.expectEqual(Server.BYTE_BANK_SIZE, lease.buf.len);
+    for (server.byte_scratch_in_use) |in_use| try std.testing.expect(!in_use);
 }
 
 test "Server: S18 scratch lease release is scoped to the lease" {
