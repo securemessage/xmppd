@@ -81,7 +81,10 @@ pub const RecordResult = struct {
     }
 };
 
-pub const Status = enum { resolved, nxdomain, failed };
+/// service_unavailable: every SRV target was ".", RFC 2782's way of
+/// publishing "no such service on this domain" — distinct from the
+/// domain itself being missing (nxdomain).
+pub const Status = enum { resolved, nxdomain, service_unavailable, failed };
 
 pub const Cb = struct {
     ctx: ?*anyopaque,
@@ -1018,7 +1021,13 @@ pub const Resolver = struct {
             job.srv_pos += 1;
         }
         if (job.srv_pos >= job.srv_list.items.len) {
-            if (job.targets.items.len == 0) return self.dropJob(job, .nxdomain);
+            if (job.targets.items.len == 0) {
+                var all_dot = job.srv_list.items.len > 0;
+                for (job.srv_list.items) |e| {
+                    if (!e.unavailable) all_dot = false;
+                }
+                return self.dropJob(job, if (all_dot) .service_unavailable else .nxdomain);
+            }
             return self.complete(job);
         }
         job.cur_addr4 = null;
@@ -1240,6 +1249,9 @@ const FakeDns = struct {
     /// When set, every SRV answer is NODATA, pushing resolve() onto
     /// the fallback address path.
     empty_srv: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, SRV answers carry a single "." target: RFC 2782's
+    /// "service unavailable on this domain".
+    srv_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
@@ -1317,6 +1329,17 @@ const FakeDns = struct {
             if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
                 // NODATA for the direct-TLS prefix, or everywhere when
                 // the test wants the fallback path.
+            } else if (self.srv_dot.load(.monotonic)) {
+                ancount = 1;
+                appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 7);
+                var v: u16 = 0;
+                v = 10;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                v = 100;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                v = 0;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                answers.append(alloc, 0) catch {}; // "." root target
             } else {
                 ancount = 1;
                 appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 6 + encLen("srv.test"));
@@ -1730,6 +1753,24 @@ const FreeingCtx = struct {
         }
     }
 };
+
+test "dns-async: an all-'.' SRV answer reports service_unavailable, not nxdomain" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_dot.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.service_unavailable, ctx.status.?);
+}
 
 test "dns-async: identical resolves merge into one job (J6)" {
     const srv = try startFakeDns(false, "");

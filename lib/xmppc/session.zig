@@ -472,7 +472,7 @@ pub const Session = struct {
                 self.target_index = 0;
                 self.connectNextTarget(true);
             },
-            .nxdomain, .failed => self.fail(self.engine.allocator, "resolve-failed"),
+            .nxdomain, .service_unavailable, .failed => self.fail(self.engine.allocator, "resolve-failed"),
         }
     }
 
