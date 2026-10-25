@@ -1,27 +1,29 @@
-//! # Archive Write Queue — decouple storage I/O from the event loops (T87)
+//! # Archive Write Queue - decouple storage I/O from the event loops (T87)
 //!
-//! Every core worker used to call archive.store() inline; a backend
-//! compaction stall (50-500ms) froze every session on that worker. Now
-//! producers enqueue deep-copied jobs into a bounded ring guarded by a
-//! mutex, and ONE writer thread drains it, calling store() on the shared
-//! archive backend. Stalls cost the writer thread only; the event loops
-//! never touch the write path. A side benefit: archive writes are now
-//! single-threaded (they were N-writer concurrent before).
+//! Producers enqueue deep-copied jobs into a bounded ring guarded by a
+//! mutex; one writer thread drains it and calls the shared archive
+//! backend. Backend stalls (compaction, fsync) cost the writer thread
+//! only; the event loops never touch the write path. Archive writes are
+//! single-threaded, so the backend sees one writer.
 //!
 //! ## Discipline
 //!
 //! - Job payloads are deep-copied with the C allocator: producers and the
 //!   writer share no allocator state (same rule as sm_handoff.zig).
-//! - Bounded ring (MAX_JOBS). At 75% a warning logs once; full jobs are
-//!   dropped with an error — message delivery is never delayed by archival.
-//! - The writer wakes via the classic 1-byte pipe: its read end sits in the
-//!   writer thread's own kqueue; producers write a byte only when an
+//! - Bounded ring (MAX_JOBS). At 75% a warning logs once; when full, jobs
+//!   are dropped with an error - message delivery is never delayed by
+//!   archival.
+//! - The writer wakes via a 1-byte pipe whose read end sits in the
+//!   writer thread's own kqueue. Producers write a byte only when an
 //!   enqueue takes the ring from empty to non-empty, and the writer
 //!   re-checks the count before sleeping so no wakeup can be lost.
 //! - Job payloads live in one allocation per job; the writer commits a
 //!   storeAll batch per DRAIN_CAP chunk instead of one commit per job.
-//! - MAM/history reads stay inline on the workers (eventually consistent by
-//!   design: a MAM query may miss a message archived milliseconds ago).
+//!   A failed chunk is retried job by job so one bad job drops only
+//!   itself.
+//! - MAM/history reads stay inline on the workers (eventually consistent
+//!   by design: a MAM query may miss a message archived milliseconds
+//!   ago).
 
 const std = @import("std");
 const posix = std.posix;
@@ -91,13 +93,13 @@ pub const ArchiveWriteQueue = struct {
     /// Total dropped jobs (queue full) since start — for ops visibility.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Job payload copies that failed on allocation — dropped before enqueue.
+    /// Job payload copies that failed on allocation - dropped before enqueue.
     copy_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Jobs the store call rejected inside the writer — logged per job.
+    /// Jobs the store call rejected inside the writer - logged per job.
     store_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Wake-pipe writes that failed after an empty-to-non-empty enqueue —
+    /// Wake-pipe writes that failed after an empty-to-non-empty enqueue;
     /// the writer may sleep while work is pending.
     wake_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -129,7 +131,7 @@ pub const ArchiveWriteQueue = struct {
         return self.tail - self.head;
     }
 
-    /// Deep-copy and enqueue. Full: drop, log, count — delivery unaffected.
+    /// Deep-copy and enqueue. Full: drop, log, count - delivery unaffected.
     pub fn enqueue(
         self: *ArchiveWriteQueue,
         owner: []const u8,
@@ -140,7 +142,7 @@ pub const ArchiveWriteQueue = struct {
     ) void {
         var job = copyJob(owner, with, stanza_id, timestamp, stanza_xml) catch {
             _ = self.copy_failed.fetchAdd(1, .monotonic);
-            log.err("archive write queue: job copy alloc failed — dropping", .{});
+            log.err("archive write queue: job copy alloc failed - dropping", .{});
             return;
         };
 

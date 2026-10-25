@@ -1557,7 +1557,7 @@ pub fn build(b: *std.Build) void {
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
     // T87: archive write queue tests. A separate module on the same root
-    // file carries the store/backend imports — archive_queue_mod itself
+    // file carries the store/backend imports; archive_queue_mod itself
     // stays dependency-free for the production binaries.
     const archive_queue_test_mod = b.createModule(.{
         .root_source_file = b.path("src/core/archive_queue.zig"),
