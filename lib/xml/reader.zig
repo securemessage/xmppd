@@ -335,24 +335,14 @@ pub const Reader = struct {
                     return Event{ .element_end = try self.arenaDupe(token.name) };
                 },
                 .text => {
-                    // Text outside a stanza (inter-stanza whitespace) is
-                    // forwarded without an arena copy so a peer cannot grow
-                    // the arena between stanzas (S11); its payload is
-                    // scanner-owned and dies at the next next() call.
                     if (token.name.len > 0) {
                         if (self.depth >= 2) {
                             return Event{ .text = try self.arenaDupe(token.name) };
                         }
-                        // Only whitespace is allowed at the stream level
-                        // (RFC 6120 4.6.1). Non-whitespace between stanzas is
-                        // rejected here so the stream closes with an error
-                        // instead of the server dropping it (S11).
-                        for (token.name) |c| {
-                            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
-                                return error.StreamLevelText;
-                            }
-                        }
-                        return Event{ .text = token.name };
+                        // The scanner drops depth-1 whitespace. Any text token
+                        // emitted here contains non-whitespace, which RFC 6120
+                        // 4.6.1 forbids at stream level.
+                        return error.StreamLevelText;
                     }
                 },
                 .eof => return null,

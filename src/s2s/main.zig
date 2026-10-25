@@ -2060,6 +2060,34 @@ test "S2sDaemon: G5 an XML error is flushed once and closes the session" {
     try std.testing.expectEqual(@as(usize, 0), try posix.read(client_fd, &response));
 }
 
+test "S2sDaemon: E6 an over-long token maps to policy-violation at the call site" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
+
+    const payload = try alloc.alloc(u8, xml.scanner.max_token_bytes + 2);
+    defer alloc.free(payload);
+    payload[0] = '<';
+    @memset(payload[1..], 'a');
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") == null);
+}
+
 test "S2sDaemon: G5 a small pre-auth item cap closes an unterminated stanza" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "a.example");
