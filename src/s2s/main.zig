@@ -1717,7 +1717,11 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
                 }
                 return;
             };
-            session.queueWrite(success) catch {};
+            session.queueWrite(success) catch {
+                log.warn("inbound S2S id={d}: SASL success does not fit the write buffer; closing", .{session.id});
+                if (batch) |b| daemon.closeInbound(b, session.id);
+                return;
+            };
             _ = session.flushWrite() catch {};
             log.info("inbound S2S authenticated: remote={s}", .{session.getRemoteDomain()});
         },
@@ -4648,6 +4652,33 @@ test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream
     // established.
     _ = daemon.getInbound(1).?.stream.handleStreamOpen("them.example", "us.example", "1.0");
     try std.testing.expect(!daemon.getInbound(1).?.stream.isEstablished());
+}
+
+test "S2sDaemon: a SASL success that cannot be queued closes the inbound session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.setDaneCandidate("them.example");
+
+    // Leave fewer bytes than the success answer needs: the domain is
+    // recorded and the stream is marked authenticated before the queue
+    // attempt, which then fails.
+    var filler: [16384 - 8]u8 = undefined;
+    @memset(filler[0..], ' ');
+    try in1.session.queueWrite(filler[0..]);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+
+    // The reply never reached the peer, so the authenticated stream must
+    // not survive without it.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in1.peer_fd, &rbuf));
 }
 
 test "S2sDaemon: stream restart with unauthenticated from= is rejected" {
