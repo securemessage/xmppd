@@ -23,8 +23,8 @@
 const std = @import("std");
 const backend = @import("backend");
 
-const NS_ROOMS = "rooms";
-const NS_AFFILIATIONS = "room_affiliations";
+pub const NS_ROOMS = backend.registered("rooms");
+pub const NS_AFFILIATIONS = backend.registered("room_affiliations");
 
 /// MUC role — runtime only, not persisted.
 pub const Role = enum(u8) {

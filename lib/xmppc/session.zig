@@ -225,6 +225,11 @@ pub const Session = struct {
     /// Bytes queued while write_buf is pinned by a pending TLS write and
     /// full, in order; moved into write_buf once the pending write completes.
     overflow: std.ArrayListUnmanaged(u8) = .{},
+    /// Bumped every time the parse state restarts mid-stream (TLS upgrade
+    /// completion, stream restart after SASL). parseAll snapshots it before
+    /// each handler call so a reset detected afterwards can drop the stale
+    /// read-buffer cursor instead of compacting past it (T-41BBBA06).
+    stream_epoch: u32 = 0,
 
     /// Bound full JID (set when the bind result is parsed).
     bound_jid: ?Jid = null,
@@ -397,6 +402,7 @@ pub const Session = struct {
                     self.reader.reset();
                     self.read_len = 0;
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                     self.handleAction(engine, self.fsm.feed(.tls_established));
                     return;
                 },
@@ -611,6 +617,7 @@ pub const Session = struct {
         const allocator = engine.allocator;
         const parser = self.parser orelse return;
         var pos: usize = 0;
+        var epoch = self.stream_epoch;
         while (true) {
             const ev_start = pos;
             const ev = self.reader.next(self.read_buf[0..self.read_len], &pos) catch {
@@ -651,8 +658,25 @@ pub const Session = struct {
             }
             if (parser.pending) |sev| {
                 parser.pending = null;
+                // STARTTLS hygiene (T215/T250 class): anything buffered past
+                // <proceed/> arrived before our ClientHello could: the peer
+                // spoke out of turn. Reject rather than let the upgrade path
+                // silently discard it.
+                if (sev == .starttls_proceed and pos < self.read_len) {
+                    self.fail(allocator, "protocol-error");
+                    return;
+                }
                 self.handleServerEvent(engine, sev);
                 if (self.failed) return;
+                // A handler that restarts the stream (TLS upgrade zeroed the
+                // read buffer; SASL success reset the reader) invalidates the
+                // cursor: a stale pos must never reach the compaction below
+                // (T-41BBBA06: copyForwards read_buf[50..0] panic).
+                if (self.stream_epoch != epoch) {
+                    if (pos > self.read_len) return;
+                    epoch = self.stream_epoch;
+                    continue;
+                }
             }
         }
         if (pos > 0) {
@@ -724,14 +748,16 @@ pub const Session = struct {
             try self.overflow.appendSlice(self.engine.allocator, data);
             return;
         }
+        // While a TLS write is pinned, EVERY new byte goes to overflow -
+        // even when it would fit: an in-place append would stretch the
+        // pending retry slice, violating the identical-length retry rule
+        // (T253). consumeWritten merges overflow back once the pin clears.
+        const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
+        if (tls_pinned) {
+            try self.overflow.appendSlice(self.engine.allocator, data);
+            return;
+        }
         if (self.write_len + data.len > self.write_buf.len) {
-            // Growing would move write_buf under a pending TLS retry.
-            const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
-            if (tls_pinned) {
-                try self.overflow.appendSlice(self.engine.allocator, data);
-                return;
-            }
-            // Compact the consumed prefix first — growth is the last resort.
             if (self.write_start > 0) {
                 std.mem.copyForwards(u8, self.write_buf, self.write_buf[self.write_start..self.write_len]);
                 self.write_len -= self.write_start;
@@ -806,7 +832,11 @@ pub const Session = struct {
 
     fn sendSome(self: *Session) !usize {
         const tp = if (self.tport) |*t| t else return error.NoTransport;
-        return switch (try tp.write(self.write_buf[self.write_start..self.write_len])) {
+        // A pending TLS retry must be re-driven with the identical slice
+        // (pointer and length): never with later-appended bytes folded in
+        // (T253; AGENTS.md kTLS rule; SSL_MODE_ENABLE_PARTIAL_WRITE is not set).
+        const end = if (tp.hasPendingWrite()) @min(self.write_start + tp.pinnedLen(), self.write_len) else self.write_len;
+        return switch (try tp.write(self.write_buf[self.write_start..end])) {
             .data => |n| n,
             .would_block => 0,
             .closed => error.ConnectionClosed,
@@ -866,9 +896,9 @@ pub const Session = struct {
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
                 // per-stanza arena reset later frees; consumers hold these
-                // across the session, so copy them (PR #4 review A). OOM
-                // here fails the session (T233): a silently empty sm_id
-                // would make the next resume replay everything.
+                // across the session, so copy them. OOM here fails the
+                // session (T233): a silently empty sm_id would make the
+                // next resume replay everything.
                 self.sm_enabled = self.fsm.sm_enabled;
                 self.sm_resumed = self.fsm.sm_resumed;
                 self.sm_id = a.dupe(u8, self.fsm.sm_id) catch {
@@ -890,8 +920,8 @@ pub const Session = struct {
                 // 'h' counts stanzas handled since SM enablement. A resume
                 // keeps counting from where the previous session left it
                 // (resume_h); only a fresh .enabled starts at zero
-                // (PR #4 review B: resetting h on resume wraps xmppd's
-                // unacked queue into discardAll and silently loses mail).
+                // (resetting h on resume wraps xmppd's unacked queue into
+                // discardAll and silently loses mail).
                 if (self.parser) |pr| {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;
@@ -955,6 +985,7 @@ pub const Session = struct {
                 if (have_tls or self.fsm.state == .awaiting_stream_header_auth) {
                     self.reader.reset();
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                 }
                 self.queuef("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='{s}' version='1.0'>", .{self.domain}) catch return error.QueueFailed;
                 self.writeAfter(engine);
@@ -1197,11 +1228,12 @@ test "write path: appending in place during a pending TLS write keeps the buffer
     s.tport = Transport.initPlain(-1); // only the pin bookkeeping is used
     s.tport.?.tls_pending = s.write_len;
     const pinned = s.write_buf.ptr;
-    // Fits: the retry may legally pass a longer length from the same address.
+    // Fits, but must STILL go to overflow: the pinned retry slice may not
+    // grow (T253; what the retry sees must equal the pinned call exactly).
     try s.queue("<message/>");
     try std.testing.expect(s.write_buf.ptr == pinned);
-    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
-    try std.testing.expectEqualStrings("<presence/><message/>", s.write_buf[0..s.write_len]);
+    try std.testing.expectEqualStrings("<message/>", s.overflow.items);
+    try std.testing.expectEqualStrings("<presence/>", s.write_buf[0..s.write_len]);
 }
 
 test "write path: buffer grows normally when no TLS write is pending" {
