@@ -458,6 +458,13 @@ pub fn AuthHandler(comptime Store: type) type {
                 return authFailure(req.conn_id, "mechanism-not-supported");
             }
 
+            // Count the IP attempt before the IdP call: a locked IP must not
+            // spend token-validation work.
+            if (self.policy.admitIp(req.client_ip)) |reason| {
+                log.info("OAUTHBEARER rejected before token validation: {s}", .{reason});
+                return authFailure(req.conn_id, reason);
+            }
+
             // Extract bearer token from RFC 7628 OAUTHBEARER initial response
             const payload = req.payload;
             if (payload.len == 0) {
@@ -487,11 +494,12 @@ pub fn AuthHandler(comptime Store: type) type {
 
             if (result) |validated_user| {
                 // Lock check on the IdP-verified identity (S3).
-                if (self.policy.admit(validated_user, req.client_ip)) |reason| {
+                const identity = localpartOf(validated_user);
+                if (self.policy.admitAccount(identity)) |reason| {
                     return authFailure(req.conn_id, reason);
                 }
                 log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
-                self.policy.recordOutcome(validated_user, req.client_ip, .success);
+                self.policy.recordOutcome(identity, req.client_ip, .success);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
                     self.store.getPhotoUrl()
                 else
@@ -912,6 +920,9 @@ fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
 const TestIdpStore = struct {
     password_user: ?[]const u8 = null,
     token_user: ?[]const u8 = null,
+    /// Number of validateToken calls, so a test can prove a locked IP is
+    /// rejected before any IdP work.
+    token_calls: u32 = 0,
 
     pub fn validatePassword(self: *const @This(), allocator: std.mem.Allocator, username: []const u8, password: []const u8) !?[]const u8 {
         _ = allocator;
@@ -920,9 +931,10 @@ const TestIdpStore = struct {
         return self.password_user;
     }
 
-    pub fn validateToken(self: *const @This(), allocator: std.mem.Allocator, token: []const u8) !?[]const u8 {
+    pub fn validateToken(self: *@This(), allocator: std.mem.Allocator, token: []const u8) !?[]const u8 {
         _ = allocator;
         _ = token;
+        self.token_calls += 1;
         return self.token_user;
     }
 };
@@ -2122,4 +2134,38 @@ test "AuthHandler: denied registrations do not count as auth failures" {
     const success = handleSync(&handler, plainRequest(152, "10.0.0.9", plainPayload(&buf, "alice", "secret123"))) orelse return error.NoResponse;
     if (success != .auth_success) return error.ExpectedAuthSuccess;
     try std.testing.expectEqualStrings("alice", success.auth_success.username);
+}
+
+test "AuthHandler: OAUTHBEARER denies a locked IP before validating the token" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "bob@idp.example" };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    limiter.recordOutcome("anyone", "10.0.0.7", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 130,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.7",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok\x01\x01",
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", result.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.token_calls);
 }
