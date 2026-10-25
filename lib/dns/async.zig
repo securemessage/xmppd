@@ -200,8 +200,9 @@ pub const Resolver = struct {
     /// kevent batch is never touched (C3 pattern).
     slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
     slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
-    /// Seeded from the CSPRNG; drives query ids and RFC 2782 weighted
-    /// picks. Tests reseed it for deterministic draws.
+    /// Seeded from the CSPRNG; drives only the RFC 2782 weighted picks
+    /// so tests can reseed for deterministic draws. Query ids come from
+    /// the CSPRNG per send, never from a seeded PRNG sequence.
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     cb: Cb = .{ .ctx = null, .fun = noopCallback },
     qcb: QueryCb = .{ .ctx = null, .fun = noopQueryCallback },
@@ -518,7 +519,7 @@ pub const Resolver = struct {
     /// space of 65536 ids is never crowded.
     fn nextId(self: *Resolver) !u16 {
         for (0..16) |_| {
-            const id = self.prng.random().int(u16);
+            const id = std.crypto.random.int(u16);
             var in_flight = false;
             for (self.jobs.items) |j| {
                 if (j.dns_id == id) {
@@ -1916,6 +1917,28 @@ test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
         if (r.jobs.items[i].dns_id != r.jobs.items[i - 1].dns_id +% 1) sequential = false;
     }
     try std.testing.expect(!sequential);
+}
+
+test "dns-async: identically seeded resolvers still draw different ids (J4)" {
+    var r1 = Resolver.init(std.testing.allocator);
+    defer r1.deinit();
+    r1.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    var r2 = Resolver.init(std.testing.allocator);
+    defer r2.deinit();
+    r2.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    r1.prng = std.Random.DefaultPrng.init(0xBEEF);
+    r2.prng = std.Random.DefaultPrng.init(0xBEEF);
+
+    // A seeded-PRNG id source would emit the same sequence in both
+    // resolvers; the CSPRNG source makes the draws independent.
+    const names: [4][]const u8 = .{ "a.test", "b.test", "c.test", "d.test" };
+    var same: usize = 0;
+    for (names, 0..) |n, i| {
+        try r1.query(n, .a, i + 1);
+        try r2.query(n, .a, i + 1);
+        if (r1.jobs.items[i].dns_id == r2.jobs.items[i].dns_id) same += 1;
+    }
+    try std.testing.expect(same < 4);
 }
 
 test "dns-async: authority and additional records are dropped, not cached (J5)" {
