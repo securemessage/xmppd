@@ -541,11 +541,17 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
 /// cannot trip the runner while the captured line proves the level and
 /// the message. The child returns 0 when the error and the supervisor
 /// state match, and a distinct code naming the mismatch otherwise.
-const Captured = struct { status: u8, stderr: [4096]u8, len: usize };
+const captured_stderr_cap = 64 * 1024;
+
+const Captured = struct { status: u8, stderr: [captured_stderr_cap]u8, len: usize };
 
 fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
     const fds = try posix.pipe();
-    const pid = try posix.fork();
+    const pid = posix.fork() catch |err| {
+        _ = posix.close(fds[0]);
+        _ = posix.close(fds[1]);
+        return err;
+    };
     if (pid == 0) {
         _ = posix.close(fds[0]);
         _ = posix.dup2(fds[1], 2) catch std.c._exit(125);
@@ -554,15 +560,25 @@ fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
     }
     _ = posix.close(fds[1]);
     defer _ = posix.close(fds[0]);
+
+    // Drain to EOF so a child that writes more than the cap never blocks on
+    // a full pipe; the excess is discarded.
     var out = Captured{ .status = 0, .stderr = undefined, .len = 0 };
-    while (out.len < out.stderr.len) {
-        const n = posix.read(fds[0], out.stderr[out.len..]) catch break;
+    var scratch: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(fds[0], &scratch) catch break;
         if (n == 0) break;
-        out.len += n;
+        const take = @min(out.stderr.len - out.len, n);
+        @memcpy(out.stderr[out.len..][0..take], scratch[0..take]);
+        out.len += take;
     }
-    var status: u32 = 0;
-    if (std.c.waitpid(pid, @ptrCast(&status), 0) != pid) return error.WaitFailed;
-    out.status = @intCast((status >> 8) & 0xFF);
+
+    // waitpid retries EINTR itself, so the child is always reaped.
+    const res = posix.waitpid(pid, 0);
+    // A child killed by a signal has an empty exit status; reporting it as 0
+    // would read as success.
+    if (!posix.W.IFEXITED(res.status)) return error.ChildSignaled;
+    out.status = posix.W.EXITSTATUS(res.status);
     return out;
 }
 
@@ -628,6 +644,37 @@ test "Supervisor: spawnChild refuses to start when the run user has no passwd en
     const captured = try runCaptured(childSpawnNoPasswd);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
     try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+}
+
+fn childKillSelf() callconv(.c) u8 {
+    posix.raise(posix.SIG.KILL) catch return 1;
+    return 0;
+}
+
+fn childWriteLongStderr() callconv(.c) u8 {
+    var line: [1024]u8 = undefined;
+    @memset(line[0..], 'x');
+    var written: usize = 0;
+    while (written < 16 * 1024) {
+        const n = posix.write(2, &line) catch return 1;
+        written += n;
+    }
+    return 0;
+}
+
+test "Supervisor: a captured child killed by a signal is not reported as success" {
+    // A signal death leaves an empty exit status; reading it as exit 0 would
+    // let a crashed refusal child pass as a matching one.
+    try std.testing.expectError(error.ChildSignaled, runCaptured(childKillSelf));
+}
+
+test "Supervisor: captured stderr keeps a child's long output" {
+    // The parent drains the pipe to EOF, so the child always finishes, and
+    // the capture holds more than a single 4 KiB read.
+    const captured = try runCaptured(childWriteLongStderr);
+    try std.testing.expectEqual(@as(u8, 0), captured.status);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), captured.len);
+    try std.testing.expect(std.mem.allEqual(u8, captured.stderr[0..captured.len], 'x'));
 }
 
 /// The identity drop runs setgroups, which needs privilege: a non-root
