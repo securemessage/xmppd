@@ -2950,6 +2950,43 @@ test "S2sDaemon: a dialback callback that cannot open its conn answers the submi
     try std.testing.expect(daemon.getInbound(1) != null);
 }
 
+test "S2sDaemon: a full pending-verify table answers the submission invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The callback reuses the pooled conn to the origin: fill every
+    // pending-verify slot with other exchanges first.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var n: usize = 0;
+    while (n < conn.db_pending.len) : (n += 1) {
+        var sid_buf: [32]u8 = undefined;
+        const sid = try std.fmt.bufPrint(&sid_buf, "filler-{d}", .{n});
+        try std.testing.expect(conn.addPendingVerify(9, 0, sid, "other.example", "us.example", "aaaa") != null);
+    }
+    try std.testing.expect(conn.addPendingVerify(9, 0, "overflow", "other.example", "us.example", "aaaa") == null);
+
+    const key = "abababababababababababababababababababababababababababababababab";
+    in1.session.startDbResult("them.example", "us.example");
+    @memcpy(in1.session.db_result_key_buf[0..key.len], key);
+    in1.session.db_result_key_len = key.len;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    initiateDialbackCallback(&daemon, &cl, in1.session);
+
+    // No exchange can be registered, so the submission is answered invalid
+    // instead of waiting for a verdict that no slot can carry.
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(daemon.getInbound(1) != null);
+}
+
 test "S2sDaemon: stop" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "a.example");
