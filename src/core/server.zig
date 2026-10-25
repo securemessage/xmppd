@@ -1344,9 +1344,8 @@ pub const Server = struct {
             self.armS2sReconnect();
         }
 
-        // The first submitAndPoll below blocks until something happens, so a
-        // reconnect timer owed right now has to be staged before it, not left
-        // for the end of an iteration that may never start (S10).
+        // Start owed reconnect deadlines before the first wait rather than
+        // delaying them until after the first unrelated event.
         self.reconcileIpcWriteInterest(&changes);
 
         while (self.running) {
@@ -8652,6 +8651,38 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
             return error.ReconnectTimerArmOutsideReconciler;
         }
     }
+
+    // An alias must not hide an additional timer arm from the exact-name
+    // checks above. Split the needle so this test does not count itself.
+    const any_timer_needle = "add" ++ "Timer(";
+    const src = @embedFile("server.zig");
+    var total: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, any_timer_needle)) |hit| {
+        total += 1;
+        pos = hit + any_timer_needle.len;
+    }
+    if (total != 13) {
+        log.err("S10: server.zig has {d} timer arms, expected 13", .{total});
+        return error.ReconnectTimerAliasOutsideReconciler;
+    }
+}
+
+test "Server: S10 failed reconnect timer staging keeps retries pending" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var change_buf: [1]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try changes.addRead(3, 1);
+    server.auth_reconnect_pending = true;
+    server.s2s_reconnect_pending = true;
+
+    server.reconcileIpcWriteInterest(&changes);
+
+    try std.testing.expectEqual(@as(usize, 1), changes.count());
+    try std.testing.expect(server.auth_reconnect_pending);
+    try std.testing.expect(server.s2s_reconnect_pending);
 }
 
 test "Server: S10 a reconnect owed by a full batch still gets its timer" {
