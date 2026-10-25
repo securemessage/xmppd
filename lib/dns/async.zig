@@ -2411,7 +2411,11 @@ test "dns-async: a deadline event batched with the reply does not touch a freed 
     _ = try posix.sendto(sink.fd, resp[0..rlen], 0, &local, llen);
     armStaleTimer(&r, (@as(usize, job.gen) << 8) | job.slot);
 
-    r.step(0);
+    // The events may land in one batch or a few; keep pumping until
+    // the reply frees the job - whichever order the kernel picks, the
+    // stale timer must never touch the freed job.
+    var spins2: usize = 0;
+    while (ctx.status == null and spins2 < 1000) : (spins2 += 1) r.step(0);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.raw.?;
     defer res.deinitOn(std.testing.allocator);
@@ -3255,9 +3259,10 @@ test "dns-async: a stale deadline cannot hit a re-used slot (Q6)" {
     const job_b = r.jobs.items[0];
     try std.testing.expectEqual(slot_a, job_b.slot);
 
-    r.step(0);
-    // The generation check must drop the stale event instead of
-    // charging job B a retry (tries would be 2).
+    // Drain every queued event; the generation check must drop the
+    // stale deadline instead of charging job B a retry (tries would
+    // become 2).
+    for (0..16) |_| r.step(0);
     try std.testing.expectEqual(@as(u8, 1), job_b.tries);
     try std.testing.expect(ctx.status == null);
 }
