@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns="http://usefulinc.com/ns/doap#"
+         xmlns:xmpp="https://linkmauve.fr/ns/xmpp-doap#"
+         xmlns:schema="https://schema.org/">
+  <Project>
+    <name>xmppd</name>
+
+    <created>2026-06-01</created>
+
+    <shortdesc xml:lang="en">Carrier-grade XMPP server written in Zig</shortdesc>
+    <description xml:lang="en">xmppd is a from-scratch XMPP server written in Zig, inspired by Postfix's multi-process architecture. It targets FreeBSD first with kqueue-based async I/O, DANE-first federation, and thread-per-core scaling. Built for operators who want a fast, auditable, and dependency-minimal messaging server that they fully control.</description>
+
+    <homepage rdf:resource="https://www.xmppd.org/"/>
+    <download-page rdf:resource="https://github.com/securemessage/xmppd/tags"/>
+    <download-mirror rdf:resource="https://pacyworld.dev/securemessage/xmppd/tags"/>
+    <bug-database rdf:resource="https://pacyworld.dev/securemessage/xmppd/issues"/>
+
+    <license rdf:resource="https://raw.githubusercontent.com/securemessage/xmppd/master/LICENSE"/>
+
+    <schema:logo rdf:resource="https://www.xmppd.org/media/clear.svg"/>
+    <mascot rdf:resource="https://www.xmppd.org/media/clear.svg"/>
+
+    <developer>
+      <Person>
+        <name>Daniel Morante</name>
+      </Person>
+    </developer>
+    <maintainer>
+      <Person>
+        <name>Daniel Morante</name>
+      </Person>
+    </maintainer>
+
+    <programming-language>Zig</programming-language>
+
+    <os>FreeBSD</os>
+
+    <category rdf:resource="https://linkmauve.fr/ns/xmpp-doap#category-server"/>
+
+    <repository>
+      <GitRepository>
+        <browse rdf:resource="https://github.com/securemessage/xmppd"/>
+        <location rdf:resource="https://github.com/securemessage/xmppd.git"/>
+      </GitRepository>
+    </repository>
+    <repository>
+      <GitRepository>
+        <browse rdf:resource="https://codeberg.org/xmppd/xmppd"/>
+        <location rdf:resource="https://codeberg.org/xmppd/xmppd.git"/>
+      </GitRepository>
+    </repository>
+    <repository>
+      <GitRepository>
+        <browse rdf:resource="https://pacyworld.dev/securemessage/xmppd"/>
+        <location rdf:resource="https://pacyworld.dev/securemessage/xmppd.git"/>
+      </GitRepository>
+    </repository>
+
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc6120"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc6121"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc6122"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc5802"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc7677"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc6698"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc7671"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc7590"/>
+
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0004.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">jabber:x:data forms for MUC room configuration and in-band registration.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0012.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:since>0.9.0</xmpp:since>
+        <xmpp:note xml:lang="en">Domain queries return server uptime; bare-JID queries are server-answered while the account is online and gated to presence-sharing contacts; full-JID queries forward to the addressed resource.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0030.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">disco#info and disco#items.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0045.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:note xml:lang="en">Join, part, groupchat, kick, ban, history, MAM, disco, persistent rooms, owner configuration forms, password-protected rooms and outcast enforcement. Missing: invitations (section 7.8) and occupant voice requests (section 7.13).</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0054.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Anti-harvesting: other-user misses are indistinguishable.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0077.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Optional invite-gated registration with max-uses, change-password and account deletion cascade.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0084.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Served via PEP (XEP-0163), data and metadata nodes.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0085.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Typing-only states honour Client State Indication suppression.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0092.html"/>
+        <xmpp:status>complete</xmpp:status>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0115.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Pre-built caps hash (SHA-1) injected into presence.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0160.html"/>
+        <xmpp:status>complete</xmpp:status>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0163.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:note xml:lang="en">Publish, subscribe, auto-subscribe, auto-create, persistent items and avatar metadata notifications. Not a full XEP-0060 PubSub service.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0184.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Receipts are relayed through routing unchanged; the spec defines no server-side logic.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0191.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Blocklists enforced at routing.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0198.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:since>0.6.0</xmpp:since>
+        <xmpp:note xml:lang="en">Enable, ack requests, ack responses and full session resume with detached-session replay of unacked stanzas. Cross-worker resume shipped in 0.9.0.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0199.html"/>
+        <xmpp:status>complete</xmpp:status>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0220.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:note xml:lang="en">Fallback federated auth where SASL EXTERNAL or DANE is unavailable; DANE/TLSA is the primary S2S trust path.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0280.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Multi-resource sync including cross-worker delivery.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0308.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">replace payloads are relayed through routing unchanged; the spec defines no server-side logic.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0313.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">C2S archives (1:1 and MUC participant view) with RocksDB-backed store and RSM paging; MUC MAM queries route to the room's owning worker.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0333.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Markers are relayed through routing unchanged; the spec defines no server-side logic.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0334.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">store and no-store hints honoured at the archive decision.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0352.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Active/inactive queue suppression for mobile clients.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0359.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Server assigns stanza-id on delivery; origin-id preserved.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0402.html"/>
+        <xmpp:status>complete</xmpp:status>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0440.html"/>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Channel binding announced over tls-server-end-point.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+
+    <release>
+      <Version>
+        <revision>0.9.0</revision>
+        <created>2026-10-04</created>
+        <file-release rdf:resource="https://github.com/securemessage/xmppd/archive/refs/tags/v0.9.0.tar.gz"/>
+      </Version>
+    </release>
+    <release>
+      <Version>
+        <revision>0.8.11</revision>
+        <created>2026-09-30</created>
+        <file-release rdf:resource="https://github.com/securemessage/xmppd/archive/refs/tags/v0.8.11.tar.gz"/>
+      </Version>
+    </release>
+  </Project>
+</rdf:RDF>
