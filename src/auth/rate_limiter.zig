@@ -3,8 +3,9 @@
 //! Fixed-size open-addressed tables (one per account, one per IP). Each
 //! entry stores the key bytes (not just a hash), a tumbling window counter
 //! and a consecutive-failure lockout. Expired entries become tombstones on
-//! the probe path and are reused; a table full of live entries rejects new
-//! keys instead of admitting them (fail closed).
+//! the probe path and are reused; when a table is full of live entries the
+//! oldest unlocked entry is evicted, and a table where every entry is
+//! locked still rejects new keys (fail closed).
 //!
 //! Attempts are counted at admission, so work already in flight is bounded.
 //! The outcome updates only the failure counter and lockout. Windows are
@@ -82,6 +83,9 @@ pub const RateLimiter = struct {
     ip_table: []RateEntry,
     policy: RatePolicy,
     allocator: std.mem.Allocator,
+    /// Last second the full-table warning was logged; keeps a flood of
+    /// untrackable keys from flooding the log.
+    last_unavailable_log: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, policy: RatePolicy) !RateLimiter {
         var p = policy;
@@ -229,7 +233,10 @@ pub const RateLimiter = struct {
             return .allowed;
         }
 
-        const entry = self.findOrCreate(table, key, now) orelse return .unavailable;
+        const entry = self.findOrCreate(table, key, now) orelse {
+            self.noteFull(now);
+            return .unavailable;
+        };
         if (entry.locked_until > now) return .locked;
         self.rollWindow(entry, now);
         entry.count +|= 1;
@@ -252,7 +259,7 @@ pub const RateLimiter = struct {
             return;
         }
         const entry = self.findOrCreate(table, key, now) orelse {
-            log.warn("rate table full of live entries; new key cannot be tracked", .{});
+            self.noteFull(now);
             return;
         };
         self.rollWindow(entry, now);
@@ -275,6 +282,13 @@ pub const RateLimiter = struct {
             entry.window_start = now;
             entry.count = 0;
         }
+    }
+
+    fn noteFull(self: *RateLimiter, now: u32) void {
+        if (self.last_unavailable_log != 0 and now >= self.last_unavailable_log and
+            now - self.last_unavailable_log < self.policy.window_seconds) return;
+        self.last_unavailable_log = now;
+        log.warn("rate table full of live entries and every entry is locked; new key cannot be tracked", .{});
     }
 
     fn evictAfter(self: *RateLimiter) u32 {
@@ -333,6 +347,24 @@ pub const RateLimiter = struct {
             idx = (idx + 1) & (table_size - 1);
         }
         if (first_tombstone) |slot| return self.insertAt(table, slot, key, hash, now);
+
+        // The table is full of live entries. Reclaim the oldest entry that is
+        // not locked; a lock must survive the flood that created it. If every
+        // entry is locked the key is untrackable and admission fails closed.
+        var victim: ?usize = null;
+        var oldest: u32 = std.math.maxInt(u32);
+        for (table, 0..) |*entry, i| {
+            if (entry.state != .occupied) continue;
+            if (entry.locked_until > now) continue;
+            if (entry.last_seen <= oldest) {
+                oldest = entry.last_seen;
+                victim = i;
+            }
+        }
+        if (victim) |slot| {
+            table[slot].state = .tombstone;
+            return self.insertAt(table, slot, key, hash, now);
+        }
         return null;
     }
 
@@ -574,10 +606,10 @@ test "RateLimiter: a re-check does not count a second attempt" {
     try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "", 100));
 }
 
-test "RateLimiter: an expired entry is reused on probe" {
+test "RateLimiter: a full table evicts the oldest unlocked entry" {
     var limiter = try testLimiter(.{
-        .max_per_account = 1,
-        .max_per_ip = 1,
+        .max_per_account = 1000,
+        .max_per_ip = 1000,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
@@ -589,21 +621,25 @@ test "RateLimiter: an expired entry is reused on probe" {
     var i: usize = 0;
     while (i < table_size) : (i += 1) {
         const key = try std.fmt.bufPrint(&buf, "user-{d}", .{i});
-        limiter.recordOutcomeAt(key, "", true, 1000);
+        try std.testing.expectEqual(Decision.allowed, limiter.admitAt(key, "", 1000));
     }
-    try std.testing.expectEqual(Decision.unavailable, limiter.admitAt("new", "", 1000));
 
-    // Past the eviction horizon every entry is reclaimable.
-    const later = 1000 + limiter.evictAfter() + 1;
-    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("new", "", later));
-    limiter.recordOutcomeAt("new", "", true, later);
+    // Keep every entry inside the eviction horizon, with user-0 oldest.
+    for (limiter.account_table) |*entry| {
+        if (entry.state == .occupied) entry.last_seen = 1100;
+    }
+    limiter.find(limiter.account_table, "user-0").?.last_seen = 1000;
+    limiter.find(limiter.account_table, "user-1").?.last_seen = 1001;
+
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("new", "", 1100));
+    try std.testing.expect(limiter.find(limiter.account_table, "user-0") == null);
     try std.testing.expect(limiter.find(limiter.account_table, "new") != null);
 }
 
-test "RateLimiter: a full table of live entries fails closed" {
+test "RateLimiter: a full table where every entry is locked fails closed" {
     var limiter = try testLimiter(.{
-        .max_per_account = 1,
-        .max_per_ip = 1,
+        .max_per_account = 1000,
+        .max_per_ip = 1000,
         .window_seconds = 60,
         .lockout_duration = 300,
         .lockout_threshold = 100,
@@ -615,12 +651,75 @@ test "RateLimiter: a full table of live entries fails closed" {
     var i: usize = 0;
     while (i < table_size) : (i += 1) {
         const key = try std.fmt.bufPrint(&buf, "user-{d}", .{i});
-        limiter.recordOutcomeAt(key, "", true, 1000);
+        _ = limiter.admitAt(key, "", 1000);
+    }
+    for (limiter.account_table) |*entry| {
+        if (entry.state == .occupied) entry.locked_until = 1200;
     }
 
-    // The table is full of live entries. A new key must be denied, never
-    // admitted after a full probe.
-    try std.testing.expectEqual(Decision.unavailable, limiter.admitAt("new", "", 1000));
+    try std.testing.expectEqual(Decision.unavailable, limiter.admitAt("new", "", 1100));
+}
+
+test "RateLimiter: a lock outlives plain counters during eviction" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 1000,
+        .max_per_ip = 1000,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < table_size) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "user-{d}", .{i});
+        _ = limiter.admitAt(key, "", 1000);
+    }
+    for (limiter.account_table) |*entry| {
+        if (entry.state == .occupied) entry.last_seen = 1100;
+    }
+    // user-0 is the oldest, but it is locked. user-1 is the oldest entry
+    // that may be reclaimed.
+    const locked = limiter.find(limiter.account_table, "user-0").?;
+    locked.last_seen = 1000;
+    locked.locked_until = 1200;
+    limiter.find(limiter.account_table, "user-1").?.last_seen = 1001;
+
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("new", "", 1100));
+    try std.testing.expect(limiter.find(limiter.account_table, "user-0") != null);
+    try std.testing.expect(limiter.find(limiter.account_table, "user-1") == null);
+    try std.testing.expect(limiter.find(limiter.account_table, "new") != null);
+}
+
+test "RateLimiter: the full-table warning is rate limited" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 1000,
+        .max_per_ip = 1000,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < table_size) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "user-{d}", .{i});
+        _ = limiter.admitAt(key, "", 1000);
+    }
+    for (limiter.account_table) |*entry| {
+        if (entry.state == .occupied) entry.locked_until = 5000;
+    }
+
+    limiter.recordOutcomeAt("x", "", true, 2000);
+    try std.testing.expectEqual(@as(u32, 2000), limiter.last_unavailable_log);
+    limiter.recordOutcomeAt("y", "", true, 2010);
+    try std.testing.expectEqual(@as(u32, 2000), limiter.last_unavailable_log);
+    limiter.recordOutcomeAt("z", "", true, 2060);
+    try std.testing.expectEqual(@as(u32, 2060), limiter.last_unavailable_log);
 }
 
 test "RateLimiter: key bytes distinguish equal hashes" {
