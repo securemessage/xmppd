@@ -239,6 +239,17 @@ pub const Resolver = struct {
     /// Requests rejected because the wait queue was full; observability
     /// for a queue that silently dropping would otherwise hide.
     too_many_jobs: usize = 0,
+    /// Wire observability: replies too short to demux, replies that
+    /// match no in-flight job (late or mismatched), stale ICMP refusals
+    /// charged to a later send, and unexpected socket errors.
+    malformed_replies: usize = 0,
+    unmatched_replies: usize = 0,
+    stale_icmp: usize = 0,
+    udp_errors: usize = 0,
+    /// Real events harvested while applying changelists in
+    /// keventApply; dispatched by step() so registration never steals
+    /// socket progress from the event pump.
+    pending_events: std.ArrayListUnmanaged(posix.Kevent) = .{},
     /// The job currently firing completion callbacks, or null. Only
     /// set inside a dropJob/complete/completeRaw waiter loop, after the
     /// job is already off `jobs`, so a cancel() issued from inside a
@@ -259,6 +270,7 @@ pub const Resolver = struct {
         self.wait_queue.deinit(self.alloc);
         for (self.cache.items) |e| self.freeCacheEnt(e);
         self.cache.deinit(self.alloc);
+        self.pending_events.deinit(self.alloc);
         if (self.fd >= 0) posix.close(self.fd);
         if (self.kq >= 0) posix.close(self.kq);
     }
@@ -382,7 +394,7 @@ pub const Resolver = struct {
             self.cb.fun(self.cb.ctx, e.session_key, .failed, null);
             return;
         };
-        self.armChainDeadline(job);
+        self.armChainDeadline(job) catch return self.dropJob(job, .failed);
         self.sendSrv(job, SRV_TLS[job.service_idx]) catch self.dropJob(job, .failed);
     }
 
@@ -478,7 +490,10 @@ pub const Resolver = struct {
             errdefer self.freeJob(job);
             try self.jobs.append(self.alloc, job);
         }
-        self.armChainDeadline(job);
+        self.armChainDeadline(job) catch |err| {
+            self.dropJob(job, .failed);
+            return err;
+        };
         self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
             self.dropJob(job, .failed);
             return err;
@@ -502,20 +517,26 @@ pub const Resolver = struct {
         try posix.connect(fd, &self.server.any, self.server.getOsSockLen());
         self.fd = fd;
         var ch = [1]posix.Kevent{.{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 }};
-        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+        try self.keventApply(&ch);
     }
 
     /// One kevent turn on the resolver's kqueue. `timeout_ms` may be 0
     /// (pump only) — callers pass their next-loop deadline, not a sleep.
     pub fn step(self: *Resolver, timeout_ms: i32) void {
         if (self.kq < 0) return;
+        self.drainStash();
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
         const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
-        // Socket progress before deadlines: a reply that frees a job
-        // makes the same batch's deadline event for it correctly stale
-        // under the (gen, slot) check, in either harvest order.
-        for (events[0..n]) |ev| {
+        self.dispatchEvents(events[0..n]);
+        self.drainStash();
+    }
+
+    /// Dispatch one event batch: socket progress first, deadlines
+    /// second, so a reply that frees a job makes the same batch's
+    /// deadline event for it correctly stale under (gen, slot).
+    fn dispatchEvents(self: *Resolver, events: []const posix.Kevent) void {
+        for (events) |ev| {
             if (ev.filter == std.c.EVFILT.READ) {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
@@ -524,7 +545,7 @@ pub const Resolver = struct {
                     self.onTcpReadable(fd);
                 }
             } else if (ev.filter == std.c.EVFILT.WRITE) {
-                // TCP connect finished — a refused connect also reports
+                // TCP connect finished - a refused connect also reports
                 // writable, so check SO_ERROR before sending.
                 const fd: posix.fd_t = @intCast(ev.ident);
                 for (self.jobs.items) |job| {
@@ -539,7 +560,7 @@ pub const Resolver = struct {
                 }
             }
         }
-        for (events[0..n]) |ev| {
+        for (events) |ev| {
             if (ev.filter != std.c.EVFILT.TIMER) continue;
             // The event may have been queued before the job was freed
             // by an earlier event in this same batch. udata bit 6 marks
@@ -547,6 +568,17 @@ pub const Resolver = struct {
             if (self.jobFromUdata(ev.udata)) |job| {
                 if (ev.udata & 0x40 != 0) self.onChainDeadline(job) else self.onDeadline(job);
             }
+        }
+    }
+
+    /// Dispatch events stashed by keventApply until the stash is empty;
+    /// dispatch itself can stash again when callbacks arm timers.
+    fn drainStash(self: *Resolver) void {
+        while (self.pending_events.items.len > 0) {
+            var stash = self.pending_events;
+            self.pending_events = .empty;
+            self.dispatchEvents(stash.items);
+            stash.deinit(self.alloc);
         }
     }
 
@@ -604,7 +636,7 @@ pub const Resolver = struct {
 
     /// Arm the job's one-shot deadline; udata carries (gen, slot) so an
     /// event queued before the job's free is recognized as stale.
-    fn armDeadline(self: *Resolver, job: *Job, ms: i64) void {
+    fn armDeadline(self: *Resolver, job: *Job, ms: i64) !void {
         var ch = [1]posix.Kevent{.{
             .ident = @intFromPtr(job),
             .filter = std.c.EVFILT.TIMER,
@@ -613,7 +645,7 @@ pub const Resolver = struct {
             .data = @intCast(ms),
             .udata = (@as(usize, job.gen) << 8) | job.slot,
         }};
-        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+        try self.keventApply(&ch);
     }
 
     /// Whole-chain bound, armed once per resolve() job beside the
@@ -622,7 +654,7 @@ pub const Resolver = struct {
     /// knote ident is the job pointer ORed low (Job is aligned, so a
     /// set low bit never aliases the retry timer's ident), and udata
     /// carries the kind bit next to (gen, slot).
-    fn armChainDeadline(self: *Resolver, job: *Job) void {
+    fn armChainDeadline(self: *Resolver, job: *Job) !void {
         var ch = [1]posix.Kevent{.{
             .ident = @intFromPtr(job) | 1,
             .filter = std.c.EVFILT.TIMER,
@@ -631,7 +663,7 @@ pub const Resolver = struct {
             .data = @intCast(self.chain_deadline_ms),
             .udata = (@as(usize, job.gen) << 8) | 0x40 | job.slot,
         }};
-        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+        try self.keventApply(&ch);
     }
 
     fn disarmDeadline(self: *Resolver, job: *Job) void {
@@ -651,6 +683,40 @@ pub const Resolver = struct {
         const job = self.slots[slot] orelse return null;
         if (self.slot_gen[slot] != gen) return null;
         return job;
+    }
+
+    /// Connected-UDP send. An ICMP port-unreachable queued from an
+    /// earlier datagram surfaces as ECONNREFUSED on a later send; that
+    /// error belongs to the earlier packet, so it is consumed and the
+    /// send retried once instead of failing the wrong job.
+    fn sendUdp(self: *Resolver, pkt: []const u8) !void {
+        _ = posix.send(self.fd, pkt, 0) catch |err| switch (err) {
+            error.ConnectionRefused => {
+                self.stale_icmp += 1;
+                _ = posix.send(self.fd, pkt, 0) catch return error.SendFailed;
+                return;
+            },
+            else => return error.SendFailed,
+        };
+    }
+
+    /// Apply changelist entries and surface per-entry failures, which
+    /// come back as EV_ERROR events rather than a kevent() error. The
+    /// harvest is non-blocking; any real events it picks up are
+    /// stashed for step() so registration cannot steal or reorder
+    /// socket progress.
+    fn keventApply(self: *Resolver, ch: []const posix.Kevent) !void {
+        const nonblock = std.c.timespec{ .sec = 0, .nsec = 0 };
+        var evbuf: [64]posix.Kevent = undefined;
+        // One non-blocking harvest: the changelist's per-entry errors
+        // come back here alongside anything already pending. Draining
+        // further is wrong: a READ on an unread socket stays pending
+        // and would loop forever; leftovers still reach step().
+        const n = try posix.kevent(self.kq, ch, &evbuf, &nonblock);
+        for (evbuf[0..n]) |ev| {
+            if (ev.flags & std.c.EV.ERROR != 0) return error.KeventChange;
+            self.pending_events.append(self.alloc, ev) catch return error.KeventChange;
+        }
     }
 
     fn sendQuery(self: *Resolver, job: *Job, qname: []const u8, qtype: u16) !void {
@@ -686,9 +752,9 @@ pub const Resolver = struct {
         if (job.use_tcp) {
             try self.tcpSend(job);
         } else {
-            _ = posix.send(self.fd, pkt, 0) catch return error.SendFailed;
+            try self.sendUdp(pkt);
         }
-        self.armDeadline(job, TIMEOUT_MS);
+        self.armDeadline(job, TIMEOUT_MS) catch return error.SendFailed;
     }
 
     fn onDeadline(self: *Resolver, job: *Job) void {
@@ -700,9 +766,14 @@ pub const Resolver = struct {
                     return;
                 };
             } else {
-                _ = posix.send(self.fd, job.request, 0) catch {};
+                self.sendUdp(job.request) catch {
+                    self.dropJob(job, .failed);
+                    return;
+                };
             }
-            self.armDeadline(job, TIMEOUT_MS);
+            self.armDeadline(job, TIMEOUT_MS) catch {
+                self.dropJob(job, .failed);
+            };
             return;
         }
         log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
@@ -762,7 +833,7 @@ pub const Resolver = struct {
         };
         ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 };
         ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = 0 };
-        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+        try self.keventApply(&ch);
         job.tcp_fd = fd;
         if (connected) return self.tcpWrite(job);
     }
@@ -816,7 +887,13 @@ pub const Resolver = struct {
         for (self.jobs.items) |job| {
             if (job.tcp_fd != fd) continue;
             var buf: [8192]u8 = undefined;
-            const n = posix.recv(fd, &buf, 0) catch return;
+            const n = posix.recv(fd, &buf, 0) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    self.dropJob(job, .failed);
+                    return;
+                },
+            };
             if (n == 0) {
                 self.dropJob(job, .failed);
                 return;
@@ -852,9 +929,29 @@ pub const Resolver = struct {
     pub fn onReadable(self: *Resolver) void {
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = posix.recv(self.fd, &buf, 0) catch return;
-            if (n < 12) continue;
-            if (self.matchJob(buf[0..n])) |job| self.handleResponse(job, buf[0..n]);
+            const n = posix.recv(self.fd, &buf, 0) catch |err| switch (err) {
+                error.WouldBlock => return,
+                // A refusal queued by an earlier datagram is consumed,
+                // not charged to whichever job receives next.
+                error.ConnectionRefused => {
+                    self.stale_icmp += 1;
+                    continue;
+                },
+                else => {
+                    self.udp_errors += 1;
+                    log.warn("dns: udp recv error: {}", .{err});
+                    return;
+                },
+            };
+            if (n < 12) {
+                self.malformed_replies += 1;
+                continue;
+            }
+            if (self.matchJob(buf[0..n])) |job| {
+                self.handleResponse(job, buf[0..n]);
+            } else {
+                self.unmatched_replies += 1;
+            }
         }
     }
 
@@ -867,7 +964,7 @@ pub const Resolver = struct {
             job.use_tcp = true;
             job.tries = 0;
             self.tcpSend(job) catch return self.dropJob(job, .failed);
-            self.armDeadline(job, TCP_TIMEOUT_MS);
+            self.armDeadline(job, TCP_TIMEOUT_MS) catch return self.dropJob(job, .failed);
             return;
         }
 
