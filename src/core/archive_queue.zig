@@ -466,11 +466,13 @@ test "ArchiveWriteQueue: a burst larger than one drain all lands (V15)" {
     defer q.deinit();
 
     var store = MockStore{};
+    var writer_done = std.atomic.Value(bool).init(false);
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(queue: *ArchiveWriteQueue, st: *MockStore) void {
+        fn run(queue: *ArchiveWriteQueue, st: *MockStore, done: *std.atomic.Value(bool)) void {
             queue.writerLoop(st, 64);
+            done.store(true, .release);
         }
-    }.run, .{ &q, &store });
+    }.run, .{ &q, &store, &writer_done });
 
     for (0..200) |_| {
         q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
@@ -484,7 +486,14 @@ test "ArchiveWriteQueue: a burst larger than one drain all lands (V15)" {
     }
     const stored_before_stop = store.stored.load(.monotonic);
     q.stopping.store(true, .release);
-    _ = posix.write(q.pipe_wr, "\x00") catch {};
+    // Nudge until the writer exits: a lost wakeup parks it in kevent with
+    // jobs still queued, and join() would otherwise hang the suite.
+    const exit_deadline = std.time.milliTimestamp() + 5000;
+    while (!writer_done.load(.acquire) and std.time.milliTimestamp() < exit_deadline) {
+        _ = posix.write(q.pipe_wr, "\x00") catch {};
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(writer_done.load(.acquire));
     t.join();
     try std.testing.expectEqual(@as(u32, 200), stored_before_stop);
 }
@@ -501,7 +510,8 @@ const GatedStore = struct {
 
     pub fn storeAll(self: *GatedStore, items: anytype) !void {
         if (self.entered.fetchAdd(1, .monotonic) == 0) {
-            while (!self.release.load(.acquire)) {
+            const gate_deadline = std.time.milliTimestamp() + 10000;
+            while (!self.release.load(.acquire) and std.time.milliTimestamp() < gate_deadline) {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
@@ -518,18 +528,25 @@ test "ArchiveWriteQueue: a job enqueued during a blocked drain is not stranded (
     defer q.deinit();
 
     var store = GatedStore{};
+    var writer_done = std.atomic.Value(bool).init(false);
+    // batch=1: one job per drainInto, so the s1 drain returns before s2
+    // lands. With a larger batch the same drain would keep popping and
+    // the lost wakeup would go unnoticed.
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(queue: *ArchiveWriteQueue, st: *GatedStore) void {
-            queue.writerLoop(st, 64);
+        fn run(queue: *ArchiveWriteQueue, st: *GatedStore, done: *std.atomic.Value(bool)) void {
+            queue.writerLoop(st, 1);
+            done.store(true, .release);
         }
-    }.run, .{ &q, &store });
+    }.run, .{ &q, &store, &writer_done });
 
     q.enqueue("a@localhost", "b@localhost", "s1", 1, "<m/>");
     // Wait until the writer holds s1 inside storeAll and the ring reads
     // empty, then land s2 in the drain-to-drainPipe window.
-    while (store.entered.load(.monotonic) == 0) {
+    const enter_deadline = std.time.milliTimestamp() + 5000;
+    while (store.entered.load(.monotonic) == 0 and std.time.milliTimestamp() < enter_deadline) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
+    try std.testing.expect(store.entered.load(.monotonic) > 0);
     q.enqueue("a@localhost", "b@localhost", "s2", 2, "<m/>");
     store.release.store(true, .release);
 
@@ -540,7 +557,15 @@ test "ArchiveWriteQueue: a job enqueued during a blocked drain is not stranded (
     }
     const stored_before_stop = store.stored.load(.monotonic);
     q.stopping.store(true, .release);
-    _ = posix.write(q.pipe_wr, "\x00") catch {};
+    // Nudge until the writer exits: if the s2 wakeup was lost the writer
+    // is asleep in kevent with the ring non-empty, and a byte consumed
+    // by drainPipe before kevent arms would hang join() forever.
+    const exit_deadline = std.time.milliTimestamp() + 5000;
+    while (!writer_done.load(.acquire) and std.time.milliTimestamp() < exit_deadline) {
+        _ = posix.write(q.pipe_wr, "\x00") catch {};
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(writer_done.load(.acquire));
     t.join();
     try std.testing.expectEqual(@as(u32, 2), stored_before_stop);
 }
