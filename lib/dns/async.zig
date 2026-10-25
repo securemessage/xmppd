@@ -1445,6 +1445,11 @@ const FakeDns = struct {
     nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, NODATA answers carry the same authority SOA record.
     soa_nodata: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, SRV queries are received but never answered.
+    srv_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When non-zero, the decoy's question carries this qtype instead
+    /// of echoing the asked type (T296 qtype decoy).
+    decoy_qtype: u16 = 0,
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1520,6 +1525,7 @@ const FakeDns = struct {
         var answers: std.ArrayListUnmanaged(u8) = .{};
         var ancount: u16 = 0;
         if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
+        if (q.qtype == wire.TYPE_SRV and self.srv_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV) {
             if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
                 // NODATA for the direct-TLS prefix, or everywhere when
@@ -1634,7 +1640,8 @@ const FakeDns = struct {
         @memset(out[8..12], 0);
         var off: usize = 12;
         appendEncodedNameTo(out, &off, self.decoy_qname);
-        std.mem.writeInt(u16, out[off..][0..2], q.qtype, .big);
+        const decoy_qt = if (self.decoy_qtype != 0) self.decoy_qtype else q.qtype;
+        std.mem.writeInt(u16, out[off..][0..2], decoy_qt, .big);
         std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
         off += 4;
         // Bogus answer: A record pointing at 10.9.9.9.
@@ -2302,4 +2309,150 @@ test "dns-async: a shared job notifies only its remaining waiters (J6)" {
     while (ctx.calls < 1 and spins < 200) : (spins += 1) r.step(50);
     try std.testing.expectEqual(@as(usize, 1), ctx.calls);
     try std.testing.expectEqual(@as(usize, 2), ctx.keys[0]);
+}
+
+test "dns-async: a silent server exhausts per-query retries into failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    // 2 s per try x MAX_TRIES; give the deadline room to fire twice.
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    // The retry timer retransmitted at least once before dropping.
+    try std.testing.expect(srv.udp_recvd.load(.monotonic) >= 2);
+}
+
+test "dns-async: the 65th cache entry evicts the oldest, forcing wire" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+
+    // Every query resolves the same canned A record; the cache only
+    // cares about distinct (qname, qtype) keys.
+    var name_buf: [32]u8 = undefined;
+    for (0..65) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "c{d}.test", .{i}) catch unreachable;
+        var ctx = TestCtx{};
+        r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+        try r.query(n, .a, i + 1);
+        var spins: usize = 0;
+        while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
+        try std.testing.expectEqual(Status.resolved, ctx.status.?);
+        if (ctx.raw) |*res| {
+            var v = res.*;
+            v.deinitOn(std.testing.allocator);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, CACHE_CAP), r.cache.items.len);
+
+    // c0 was evicted FIFO: asking for it again costs a wire round trip.
+    const wired = srv.udp_recvd.load(.monotonic);
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("c0.test", .a, 999);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    if (ctx.raw) |*res| {
+        var v = res.*;
+        v.deinitOn(std.testing.allocator);
+    }
+    try std.testing.expect(srv.udp_recvd.load(.monotonic) > wired);
+}
+
+test "dns-async: RFC 2782 draws follow weight; weight-0 still gets picked" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.prng = std.Random.DefaultPrng.init(0x5EED);
+
+    // Three same-priority targets weighted 3:1:0. Over 400 draws the
+    // heavyweight must lead far more often than the 1-weight, and the
+    // weightless record must win at least once (inclusive draw).
+    var heavy_first: usize = 0;
+    var light_first: usize = 0;
+    var zero_first: usize = 0;
+    for (0..400) |_| {
+        var list = [_]SrvEnt{
+            .{ .host = "heavy", .weight = 3, .priority = 10 },
+            .{ .host = "light", .weight = 1, .priority = 10 },
+            .{ .host = "zero", .weight = 0, .priority = 10 },
+            .{ .host = "prio5", .weight = 100, .priority = 5 },
+        };
+        orderSrvRfc2782(&list, r.prng.random());
+        // Priority dominates weight: the lone priority-5 record leads.
+        try std.testing.expectEqualStrings("prio5", list[0].host);
+        if (std.mem.eql(u8, list[1].host, "heavy")) heavy_first += 1;
+        if (std.mem.eql(u8, list[1].host, "light")) light_first += 1;
+        if (std.mem.eql(u8, list[1].host, "zero")) zero_first += 1;
+    }
+    try std.testing.expect(heavy_first > light_first * 2);
+    try std.testing.expect(zero_first > 0);
+}
+
+test "dns-async: a wrong-qtype decoy cannot steer the chain" {
+    const srv = try startFakeDns(false, "_xmpp-decoy._tcp.svc.test");
+    defer stopFakeDns(srv);
+    srv.decoy_qtype = wire.TYPE_AAAA;
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The decoy named a service prefix we never asked about AND a
+    // qtype we never asked for; the real chain still completes.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+}
+
+test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    const job = r.jobs.items[0];
+
+    // A non-blocking connect to a closed port reports writable with
+    // SO_ERROR set; the engine's EVFILT.WRITE path must drop the job.
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    var ch = [1]posix.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.WRITE,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = posix.kevent(r.kq, &ch, &.{}, null) catch {};
+    posix.connect(fd, &r.server.any, r.server.getOsSockLen()) catch {};
+    job.tcp_fd = fd;
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
