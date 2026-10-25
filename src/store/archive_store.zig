@@ -101,14 +101,20 @@ pub fn ArchiveStore(comptime Backend: type) type {
         pub fn storeAll(self: *Self, items: anytype) !void {
             if (items.len == 0) return;
             var batch = try self.db.writeBatch();
-            errdefer batch.abort();
-            for (items) |it| {
-                const primary_key = try self.buildPrimaryKey(it.owner, it.timestamp, it.stanza_id);
-                defer self.allocator.free(primary_key);
-                const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp);
-                defer self.allocator.free(contact_key);
-                try batch.put(NS_MESSAGES, primary_key, it.stanza_xml);
-                try batch.put(NS_BY_CONTACT, contact_key, it.stanza_id);
+            {
+                // The abort covers the put loop only: commit destroys the
+                // batch on success and on failure (rocksdb_writebatch_destroy
+                // runs before the error return; mdb_txn_commit frees the
+                // txn), so aborting after a failed commit double-frees.
+                errdefer batch.abort();
+                for (items) |it| {
+                    const primary_key = try self.buildPrimaryKey(it.owner, it.timestamp, it.stanza_id);
+                    defer self.allocator.free(primary_key);
+                    const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp);
+                    defer self.allocator.free(contact_key);
+                    try batch.put(NS_MESSAGES, primary_key, it.stanza_xml);
+                    try batch.put(NS_BY_CONTACT, contact_key, it.stanza_id);
+                }
             }
             try batch.commit();
         }
@@ -525,4 +531,79 @@ test "ArchiveStore: separate owners" {
     var result_bob = try store.query("bob@example.com", .{});
     defer freeQueryResult(std.testing.allocator, &result_bob);
     try std.testing.expectEqual(@as(usize, 1), result_bob.messages.len);
+}
+
+/// Test backend whose write batch always fails inside commit. Counts
+/// abort calls so the test can prove a failed commit is never followed
+/// by abort: the real backends destroy the batch inside commit, so a
+/// second destroy would be a double free.
+const FailCommitBackend = struct {
+    const Self = @This();
+
+    abort_calls: usize = 0,
+
+    pub fn open(_: []const u8, _: backend.OpenOptions) !Self {
+        return .{};
+    }
+
+    pub fn close(_: *Self) void {}
+
+    pub fn get(_: *Self, _: std.mem.Allocator, _: []const u8, _: []const u8) !?[]u8 {
+        return null;
+    }
+
+    pub fn put(_: *Self, _: []const u8, _: []const u8, _: []const u8) !void {}
+
+    pub fn delete(_: *Self, _: []const u8, _: []const u8) !void {}
+
+    pub const Iterator = struct {
+        pub fn next(_: *Iterator) ?backend.Entry {
+            return null;
+        }
+
+        pub fn deinit(_: *Iterator) void {}
+    };
+
+    pub fn iterator(_: *Self, _: []const u8, _: []const u8) !Iterator {
+        return .{};
+    }
+
+    pub const WriteBatch = struct {
+        backend: *Self,
+
+        pub fn put(_: *WriteBatch, _: []const u8, _: []const u8, _: []const u8) !void {}
+
+        pub fn delete(_: *WriteBatch, _: []const u8, _: []const u8) !void {}
+
+        pub fn commit(_: *WriteBatch) !void {
+            return error.CommitFailed;
+        }
+
+        pub fn abort(self: *WriteBatch) void {
+            self.backend.abort_calls += 1;
+        }
+    };
+
+    pub fn writeBatch(self: *Self) !WriteBatch {
+        return .{ .backend = self };
+    }
+};
+
+test "ArchiveStore: storeAll never aborts after a failed commit" {
+    var db = try FailCommitBackend.open("", .{});
+    defer db.close();
+
+    var store = ArchiveStore(FailCommitBackend).init(&db, std.testing.allocator);
+    const jobs = [_]struct {
+        owner: []const u8,
+        with: []const u8,
+        stanza_id: []const u8,
+        timestamp: u64,
+        stanza_xml: []const u8,
+    }{
+        .{ .owner = "a@x.test", .with = "b@x.test", .stanza_id = "m-1", .timestamp = 1, .stanza_xml = "<m/>" },
+    };
+
+    try std.testing.expectError(error.CommitFailed, store.storeAll(&jobs));
+    try std.testing.expectEqual(@as(usize, 0), db.abort_calls);
 }
