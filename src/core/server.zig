@@ -1059,7 +1059,7 @@ pub const Server = struct {
         if (!target.offline_pending) return false;
         const store = self.offline orelse return false;
         var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
-        const recipient = router.buildBareJid(local, domain, &recipient_buf);
+        const recipient = router.buildBareJid(local, domain, &recipient_buf) catch return false;
         return store.storeHeldPointer(recipient, from_jid, stanza_id, timestamp, stanza_xml) catch |err| {
             log.warn("message to {s} could not be held behind the offline tail: {s}", .{ recipient, @errorName(err) });
             return false;
@@ -3048,7 +3048,11 @@ pub const Server = struct {
                     if (parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
                         if (self.offline) |store| {
                             var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
-                            const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
+                            const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch |err| {
+                                log.warn("S2S message to {s} has an invalid offline key: {s}", .{ m.to_jid, @errorName(err) });
+                                self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
+                                return;
+                            };
 
                             const stanza_id = if (parts.msg_id.len > 0) parts.msg_id else "s2s-offline";
 

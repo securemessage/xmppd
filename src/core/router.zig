@@ -29,19 +29,18 @@ const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
 
-/// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so a
-/// build buffer of this size holds one in full and never truncates a valid key
-/// (S4). Oversized bare JIDs are rejected by the store's KeyTooLong check.
+/// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so
+/// this buffer holds every valid key in full (S4).
 pub const BARE_JID_MAX = 512;
 
-/// Build a bare JID "local@domain" into out and return it. The buffer is sized
-/// to a full store-key JID, so a valid key is never truncated (S4).
-pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) []const u8 {
+/// Build a bare JID "local@domain" into out. A JID that does not fit returns
+/// NoSpaceLeft rather than a truncated prefix (S4).
+pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) ![]const u8 {
     var fbs = std.io.fixedBufferStream(out);
     const w = fbs.writer();
-    w.writeAll(local) catch {};
-    w.writeByte('@') catch {};
-    w.writeAll(domain) catch {};
+    try w.writeAll(local);
+    try w.writeByte('@');
+    try w.writeAll(domain);
     return fbs.getWritten();
 }
 
@@ -52,15 +51,21 @@ test "router: bare JID buffers hold a full store-key JID without truncation" {
     @memset(&local, 'l');
     var domain: [200]u8 = undefined;
     @memset(&domain, 'd');
-    const jid = buildBareJid(&local, &domain, &out);
+    const jid = try buildBareJid(&local, &domain, &out);
     try std.testing.expectEqual(@as(usize, 300 + 1 + 200), jid.len);
     // A full store-key-length bare JID (511) also fits.
     var local2: [280]u8 = undefined;
     @memset(&local2, 'l');
     var domain2: [230]u8 = undefined;
     @memset(&domain2, 'd');
-    const jid2 = buildBareJid(&local2, &domain2, &out);
+    const jid2 = try buildBareJid(&local2, &domain2, &out);
     try std.testing.expectEqual(@as(usize, 511), jid2.len);
+
+    var local3: [300]u8 = undefined;
+    @memset(&local3, 'l');
+    var domain3: [300]u8 = undefined;
+    @memset(&domain3, 'd');
+    try std.testing.expectError(error.NoSpaceLeft, buildBareJid(&local3, &domain3, &out));
 }
 
 /// Route a fully accumulated stanza to target session(s).
@@ -298,7 +303,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Build sender bare JID for archive
     var sender_bare_buf: [BARE_JID_MAX]u8 = undefined;
-    const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf);
+    const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf) catch return;
 
     // Single timestamp for all archive operations in this dispatch (T123)
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
@@ -325,7 +330,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
             if (archive_stanza.len > 0) {
                 var recip_buf: [BARE_JID_MAX]u8 = undefined;
-                const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf);
+                const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch return;
                 server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, archive_stanza);
                 server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
             }
@@ -354,7 +359,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
                 var recip_buf2: [BARE_JID_MAX]u8 = undefined;
-                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2);
+                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2) catch return;
 
                 // The payload goes down with the pointer: the archive row this
                 // stanza was also handed to may still be sitting in the async
