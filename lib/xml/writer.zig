@@ -29,6 +29,9 @@ pub const Error = error{
     /// Value contains bytes outside the XML Char production: NUL, C0
     /// controls other than tab/LF/CR, or the noncharacters U+FFFE/U+FFFF.
     InvalidCharacter,
+    /// rawSpan input is not well-formed XML, or is forbidden inside an
+    /// XMPP stream (comments, PIs, declarations, DTDs: RFC 6120 11.1).
+    NotWellFormed,
 };
 
 /// finish() reports the latched output failure once.
@@ -51,53 +54,172 @@ const v_quot: ByteVec = @splat('"');
 const v_ctrl: ByteVec = @splat(0x20);
 const v_ef: ByteVec = @splat(0xEF);
 
+/// Per-tag bound on attributes and on namespace declarations; a span
+/// that needs more is hostile, not real.
+const span_max_attrs = 32;
+const span_max_decls = 64;
+
+const SpanAttr = struct { name: []const u8, prefix: []const u8 };
+const SpanDecl = struct { depth: usize, prefix: []const u8 };
+
+/// A prefix is usable when it is declared in scope or is the
+/// always-bound xml: prefix.
+fn spanPrefixOk(prefix: []const u8, decls: []const SpanDecl) bool {
+    if (std.mem.eql(u8, prefix, "xml")) return true;
+    for (decls) |d| {
+        if (std.mem.eql(u8, d.prefix, prefix)) return true;
+    }
+    return false;
+}
+
+fn isXmlChar(c: u21) bool {
+    return c == 0x9 or c == 0xA or c == 0xD or
+        (c >= 0x20 and c <= 0xD7FF) or
+        (c >= 0xE000 and c <= 0xFFFD) or
+        (c >= 0x10000 and c <= 0x10FFFF);
+}
+
+/// Every &#...; reference in the raw span must name a legal XML Char
+/// and end in ';'. Checked on the raw bytes because the scanner's u8
+/// decode cannot express references above U+00FF; those still error
+/// downstream until S21 lands a u21 decode.
+fn spanCheckCharrefs(bytes: []const u8) Error!void {
+    var i: usize = 0;
+    while (i + 2 < bytes.len) : (i += 1) {
+        if (bytes[i] != '&' or bytes[i + 1] != '#') continue;
+        var j = i + 2;
+        var value: u21 = 0;
+        var digits: usize = 0;
+        if (j < bytes.len and (bytes[j] == 'x' or bytes[j] == 'X')) {
+            j += 1;
+            while (j < bytes.len and std.ascii.isHex(bytes[j])) : (j += 1) {
+                const c = std.ascii.toLower(bytes[j]);
+                const digit: u21 = if (std.ascii.isDigit(c)) c - '0' else c - 'a' + 10;
+                value = std.math.mul(u21, value, 16) catch return error.NotWellFormed;
+                value = std.math.add(u21, value, digit) catch return error.NotWellFormed;
+                digits += 1;
+            }
+        } else {
+            while (j < bytes.len and std.ascii.isDigit(bytes[j])) : (j += 1) {
+                value = std.math.mul(u21, value, 10) catch return error.NotWellFormed;
+                value = std.math.add(u21, value, bytes[j] - '0') catch return error.NotWellFormed;
+                digits += 1;
+            }
+        }
+        if (digits == 0 or j >= bytes.len or bytes[j] != ';') return error.NotWellFormed;
+        if (!isXmlChar(value)) return error.NotWellFormed;
+    }
+}
+
+/// Stream-level elements must never ride inside a stanza-level span.
+fn isStreamElement(name: []const u8) bool {
+    return std.mem.eql(u8, name, "stream:stream") or
+        std.mem.eql(u8, name, "stream:error") or
+        std.mem.eql(u8, name, "stream:features");
+}
+
+/// Element and attribute prefixes are only resolved once the start
+/// tag ends: an xmlns on the same tag is already in scope for its own
+/// tag name and every attribute on it.
+fn spanCheckPrefixes(elem_prefix: []const u8, attrs: []const SpanAttr, decls: []const SpanDecl) Error!void {
+    if (elem_prefix.len > 0 and !spanPrefixOk(elem_prefix, decls)) return error.NotWellFormed;
+    for (attrs) |a| {
+        if (std.mem.eql(u8, a.prefix, "xmlns")) continue;
+        if (a.prefix.len > 0 and !spanPrefixOk(a.prefix, decls)) return error.NotWellFormed;
+    }
+}
+
 /// Markup bytes proven valid by the validating reader (XML Char, UTF-8,
 /// balanced elements). rawSpan emits them verbatim; the type exists so
 /// that raw bytes cannot reach the output without that validation.
 pub const ValidatedSpan = struct {
     bytes: []const u8,
 
-    /// The only constructor, and it validates: XML Char plus a
-    /// well-formedness pass through lib/xml/scanner requiring balanced
-    /// elements with matching close names. A dedicated zero-cost
-    /// reader-produced constructor arrives with C5; until then callers
-    /// pay one scan per span.
+    /// The only constructor, and it validates: XML Char plus a full
+    /// well-formedness pass through lib/xml/scanner. Beyond balanced
+    /// elements it rejects everything RFC 6120 section 11.1 forbids in
+    /// a stream (comments, PIs, declarations, DOCTYPE/CDATA), the
+    /// stream-level elements, invalid names, duplicate attributes, a
+    /// '<' inside an attribute value, non-Char character references,
+    /// undeclared prefixes other than xml:, and truncated input. A
+    /// dedicated zero-cost reader-produced constructor arrives with
+    /// C5; until then callers pay one scan per span.
     pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
         try validateChars(bytes);
+        try spanCheckCharrefs(bytes);
+        // '<!' can only begin a comment or a forbidden construct: '<'
+        // is already illegal inside attribute values and text, so the
+        // raw scan is exact.
+        if (std.mem.indexOf(u8, bytes, "<!") != null) return error.NotWellFormed;
         var sc = scanner_mod.Scanner.init(alloc);
         defer sc.deinit();
         var pos: usize = 0;
         var depth: usize = 0;
         var names: [max_depth][]const u8 = undefined;
-        var steps: usize = 0;
+        var attrs: [span_max_attrs]SpanAttr = undefined;
+        var attr_count: usize = 0;
+        var decls: [span_max_decls]SpanDecl = undefined;
+        var decl_count: usize = 0;
+        var pending_name: []const u8 = "";
+        var pending_prefix: []const u8 = "";
         while (true) {
-            steps += 1;
-            if (steps > bytes.len + 64) return error.InvalidCharacter;
-            const tok = sc.next(bytes, &pos) catch return error.InvalidCharacter;
-            if (tok == null) {
-                if (pos >= bytes.len) break;
-                continue;
-            }
+            const tok = sc.next(bytes, &pos) catch return error.NotWellFormed;
+            if (tok == null) break;
             switch (tok.?.type) {
                 .element_open => {
-                    if (depth >= max_depth) return error.InvalidCharacter;
-                    names[depth] = tok.?.name;
+                    if (depth >= max_depth) return error.NotWellFormed;
+                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
+                    if (isStreamElement(tok.?.name)) return error.NotWellFormed;
+                    pending_name = tok.?.name;
+                    pending_prefix = tok.?.prefix;
+                    attr_count = 0;
+                },
+                .attribute => {
+                    if (attr_count >= span_max_attrs) return error.NotWellFormed;
+                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
+                    // A '<' may never sit inside an attribute value.
+                    if (std.mem.indexOfScalar(u8, tok.?.value, '<') != null) return error.NotWellFormed;
+                    for (attrs[0..attr_count]) |p| {
+                        if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
+                    }
+                    attrs[attr_count] = .{ .name = tok.?.name, .prefix = tok.?.prefix };
+                    attr_count += 1;
+                },
+                .namespace_decl => {
+                    if (attr_count >= span_max_attrs or decl_count >= span_max_decls) return error.NotWellFormed;
+                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
+                    for (attrs[0..attr_count]) |p| {
+                        if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
+                    }
+                    attrs[attr_count] = .{ .name = tok.?.name, .prefix = "xmlns" };
+                    attr_count += 1;
+                    decls[decl_count] = .{ .depth = depth, .prefix = tok.?.prefix };
+                    decl_count += 1;
+                },
+                .element_open_end => {
+                    try spanCheckPrefixes(pending_prefix, attrs[0..attr_count], decls[0..decl_count]);
+                    names[depth] = pending_name;
                     depth += 1;
                 },
                 .element_self_close => {
-                    if (depth == 0) return error.InvalidCharacter;
-                    depth -= 1;
+                    try spanCheckPrefixes(pending_prefix, attrs[0..attr_count], decls[0..decl_count]);
+                    // Declarations inside this tag die with it.
+                    while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
                 },
                 .element_close => {
-                    if (depth == 0) return error.InvalidCharacter;
+                    if (depth == 0) return error.NotWellFormed;
+                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
                     depth -= 1;
-                    if (!std.mem.eql(u8, names[depth], tok.?.name)) return error.InvalidCharacter;
+                    if (!std.mem.eql(u8, names[depth], tok.?.name)) return error.NotWellFormed;
+                    while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
                 },
-                .eof => break,
-                else => {},
+                .text => {},
+                .xml_declaration, .eof => return error.NotWellFormed,
             }
         }
-        if (depth != 0) return error.InvalidCharacter;
+        // A clean stop means the scanner sits in content state with no
+        // open element; anything else is a truncated construct.
+        if (sc.state != .content or depth != 0) return error.NotWellFormed;
         return .{ .bytes = bytes };
     }
 };
@@ -232,9 +354,12 @@ pub const StanzaWriter = struct {
     }
 
     /// Reader-validated markup emitted verbatim, escaping nothing. The
-    /// ValidatedSpan type is the enforcement: no plain slice may be passed.
+    /// ValidatedSpan type is the enforcement: no plain slice may be
+    /// passed, and a span must ride inside an element, never stand
+    /// alone at the top level where it could pose as a second stanza.
     pub fn rawSpan(self: *StanzaWriter, span: ValidatedSpan) void {
         assert(!self.in_start_tag);
+        assert(self.depth > 0);
         self.emit(span.bytes);
     }
 
@@ -770,9 +895,9 @@ test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
     // Rejected: control byte smuggled inside markup, unbalanced tags,
     // mismatched close name, truncated element.
     try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
-    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
-    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "<a>"));
-    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "</a>"));
 
     // Accepted: balanced elements and bare text both scan cleanly.
     _ = try ValidatedSpan.fromReader(testing.allocator, "<c><d t='1'/>x</c>");
@@ -946,4 +1071,43 @@ test "a name at the 256-byte limit writes; one over is rejected (L5)" {
     @memset(&over_name, 'n');
     try testing.expectError(error.InvalidName, y.elementOpen(&over_name));
     try testing.expectError(error.Overflow, y.finish());
+}
+
+test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
+    const bad = [_][]const u8{
+        "<a", // truncated element
+        "<a/><", // truncated after a complete element
+        "<!-- c --><a/>", // comment before the element
+        "<a/><!-- c -->", // trailing comment
+        "<?xml version='1.0'?><a/>", // xml declaration
+        "<a><?pi data?></a>", // processing instruction
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'></stream:stream>",
+        "<stream:error/>",
+        "<a>&#0;</a>", // character reference to a non-Char
+        "<a>&#x1;</a>",
+        "<a x='1<'/>", // '<' inside an attribute value
+        "<a x='1' x='2'/>", // duplicate attribute
+        "<1a/>", // invalid element name
+        "<a 1b='v'/>", // invalid attribute name
+        "<u:a xmlns:v='urn:v'/>", // undeclared element prefix
+        "<a u:b='1'/>", // undeclared attribute prefix
+        "<a></b>", // mismatched close
+        "</a>", // stray close
+        "<a>", // unbalanced element
+        "<a xmlns:u='urn:u' xmlns:u='urn:v'/>", // duplicate declaration
+    };
+    for (bad) |probe| {
+        try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, probe));
+    }
+
+    const good = [_][]const u8{
+        "<c><d t='1'/>x</c>",
+        "plain text &amp; entities",
+        "<u:a xmlns:u='urn:u' u:b='1' xml:lang='en'><u:c/></u:a>",
+        "<e xmlns='urn:d' x='v'/>",
+        "<a>text &amp; &#233;tities</a>",
+    };
+    for (good) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
 }
