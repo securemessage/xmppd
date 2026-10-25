@@ -1476,3 +1476,53 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     try std.testing.expect(std.mem.indexOf(u8, got, "tablet") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "type='unsubscribed'") != null);
 }
+
+test "S1: subscription presence escapes the owner bare JID" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    var owner_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &owner_fds));
+    defer posix.close(owner_fds[1]);
+    const owner = try allocator.create(Session);
+    owner.* = Session.init(owner_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = owner;
+    owner.stream.bound_jid = .{ .local = "o'wner", .domain = "localhost", .resource = "desk" };
+    owner.stanza_to = "bob@localhost";
+
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    server.sessions[2] = bob;
+    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
+    sm.setPresenceAvailable("bob", "localhost", "laptop", true);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, owner, .subscribe, "", &changes);
+
+    _ = try bob.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='o&apos;wner@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='o'wner@localhost'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "type='subscribe'") != null);
+}
