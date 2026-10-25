@@ -505,12 +505,6 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             return;
         };
         if (stanza_xml == null) {
-            if (server.fail_next_offline_archive_read) {
-                server.fail_next_offline_archive_read = false;
-                log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(error.StorageError) });
-                stallOnStoreError(session, bare_jid, error.StorageError, changes);
-                return;
-            }
             stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
                 // Transient store failure: stop the drain and retry. Continuing
                 // would deliver later messages ahead of this one, and skipping
@@ -654,6 +648,27 @@ fn testSocketPair() ![2]posix.fd_t {
     const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
     return fds;
+}
+
+fn repairFirstOfflinePointerForTest(db: *op_backend.Backend) !void {
+    const recipient = "bob@localhost";
+    const stanza_id = "s1";
+    const from_jid = "alice@localhost";
+    var key: [recipient.len + 1 + 8]u8 = undefined;
+    @memcpy(key[0..recipient.len], recipient);
+    key[recipient.len] = 0;
+    std.mem.writeInt(u64, key[recipient.len + 1 ..][0..8], 1, .big);
+
+    var value: [12 + stanza_id.len + from_jid.len]u8 = undefined;
+    std.mem.writeInt(u64, value[0..8], 1001, .big);
+    std.mem.writeInt(u32, value[8..12], stanza_id.len, .big);
+    @memcpy(value[12..][0..stanza_id.len], stanza_id);
+    @memcpy(value[12 + stanza_id.len ..][0..from_jid.len], from_jid);
+
+    var batch = try db.writeBatch();
+    errdefer batch.abort();
+    try batch.put("offline_v2", &key, &value);
+    try batch.commit();
 }
 
 /// Puts a session's stream into an authenticated, features_bind-ready state
@@ -1281,9 +1296,9 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     }
 
     try arch_store.store("bob@localhost", "alice@localhost", "s1", 1001, "<message from='alice@localhost' to='bob@localhost' id='s1'><body>hi</body></message>");
-    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
+    const oversized_id = [_]u8{'x'} ** 600;
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", &oversized_id, 1001);
 
-    server.fail_next_offline_archive_read = true;
     deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
 
     // Still pending, and the pointer survives for the retry.
@@ -1302,7 +1317,8 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     }
     try std.testing.expect(armed);
 
-    // The retry delivers once the store recovers.
+    // Repair the pointer metadata, then the retry finds the archived stanza.
+    try repairFirstOfflinePointerForTest(&op_db);
     changes.reset();
     drainOfflinePending(&server, session, &changes);
     try std.testing.expect(!session.offline_pending);
@@ -1361,11 +1377,11 @@ test "S13: store-error retries are bounded, then the sweep resumes" {
     }
 
     try arch_store.store("bob@localhost", "alice@localhost", "s1", 1001, "<message from='alice@localhost' to='bob@localhost' id='s1'><body>hi</body></message>");
-    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
+    const oversized_id = [_]u8{'x'} ** 600;
+    _ = try offline_store.storePointer("bob@localhost", "alice@localhost", &oversized_id, 1001);
 
     var stalls: usize = 0;
     while (stalls < 40) : (stalls += 1) {
-        server.fail_next_offline_archive_read = true;
         changes.reset();
         deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
 
@@ -1381,7 +1397,8 @@ test "S13: store-error retries are bounded, then the sweep resumes" {
     try std.testing.expect(session.offline_pending);
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 
-    // The sweep clears the stall counter and delivers once the store works.
+    // Repair the pointer metadata, then the sweep delivers the archived stanza.
+    try repairFirstOfflinePointerForTest(&op_db);
     retryStalledOfflineDrains(&server, &changes);
     try std.testing.expect(!session.offline_pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));

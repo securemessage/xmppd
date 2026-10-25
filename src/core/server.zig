@@ -572,13 +572,6 @@ pub const Server = struct {
     /// memory, so no test can arrange one otherwise. Never set in production.
     fail_next_tls_upgrade: bool = false,
 
-    /// Test seam (S13): when set, the next offline drain fails its archive
-    /// read instead of fetching, which exercises the stall path that must
-    /// re-arm the drain. A real archive read error needs a failing storage
-    /// backend, so no test can arrange one otherwise. Never set in
-    /// production.
-    fail_next_offline_archive_read: bool = false,
-
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
     /// Whether EVFILT_WRITE is armed for the auth/S2S IPC fds. Reconciled
@@ -9314,10 +9307,17 @@ test "Server: S4 jid-malformed subscription escapes the stanza id" {
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-'&<'") == null);
 }
 
+test "S13: offline archive failure injection stays out of production" {
+    const hook_name = "fail_next_offline" ++ "_archive_read";
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("server.zig"), hook_name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("session_lifecycle.zig"), hook_name) == null);
+}
+
 // Force analysis of sibling files whose tests otherwise never run.
 test {
     _ = iq_handler;
     _ = router;
     _ = muc_handler;
     _ = presence_handler;
+    _ = session_lifecycle;
 }
