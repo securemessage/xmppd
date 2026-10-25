@@ -221,7 +221,10 @@ pub const SqliteBackend = struct {
     }
 
     pub fn writeBatch(self: *SqliteBackend) !WriteBatch {
-        _ = execSimple(self.db, "BEGIN IMMEDIATE");
+        // A batch owns the shared connection's write transaction. A BEGIN
+        // that fails (already in a transaction, or the database is busy)
+        // must be reported, not silently folded into the open transaction.
+        if (execSimple(self.db, "BEGIN IMMEDIATE") != 0) return error.SqliteBeginFailed;
         return .{ .backend = self, .table_count_at_start = self.table_count };
     }
 
@@ -500,6 +503,21 @@ test "SqliteBackend: writeBatch abort" {
 
     const val = try db.get(std.testing.allocator, "users", "alice");
     try std.testing.expect(val == null);
+}
+
+test "SqliteBackend: a second batch cannot begin on a busy connection" {
+    const path = "/tmp/xmppd-test-sqlite-batchbusy.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    defer b1.abort();
+
+    // The connection already holds a write transaction: a second batch must
+    // be refused instead of silently joining it.
+    try std.testing.expectError(error.SqliteBeginFailed, db.writeBatch());
 }
 
 /// sqlite3_commit_hook callback that vetoes the commit: SQLite rolls the
