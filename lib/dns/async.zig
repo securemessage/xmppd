@@ -92,7 +92,7 @@ pub const RecordResult = struct {
 };
 
 /// service_unavailable: every SRV target was ".", RFC 2782's way of
-/// publishing "no such service on this domain" — distinct from the
+/// publishing "no such service on this domain" - distinct from the
 /// domain itself being missing (nxdomain).
 pub const Status = enum { resolved, nxdomain, service_unavailable, failed };
 
@@ -1433,7 +1433,7 @@ const FakeDns = struct {
     /// t1.test, ...) to exercise the flattened-target cap.
     srv_many: u8 = 0,
     /// When set, every answer is NXDOMAIN with an authority SOA whose
-    /// minimum is 120 s — feeds the negative cache.
+    /// minimum is 120 s - feeds the negative cache.
     nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, NODATA answers carry the same authority SOA record.
     soa_nodata: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1614,7 +1614,6 @@ const FakeDns = struct {
     /// Same id and a real answer, but the question section names a
     /// different owner — a T296 decoy.
     fn buildDecoy(self: *FakeDns, out: []u8, pkt: []const u8) usize {
-        
         var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const alloc = arena_state.allocator();
@@ -1637,7 +1636,10 @@ const FakeDns = struct {
         std.mem.writeInt(u16, out[off + 4 ..][0..2], 1, .big);
         std.mem.writeInt(u32, out[off + 6 ..][0..4], 60, .big);
         std.mem.writeInt(u16, out[off + 10 ..][0..2], 4, .big);
-        out[off + 12] = 10; out[off + 13] = 9; out[off + 14] = 9; out[off + 15] = 9;
+        out[off + 12] = 10;
+        out[off + 13] = 9;
+        out[off + 14] = 9;
+        out[off + 15] = 9;
         return off + 16;
     }
 };
