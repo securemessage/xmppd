@@ -6617,6 +6617,15 @@ test "Server: E2d an oversized archive form is not stored offline" {
     // Nothing was stored: a truncated form would have been archived and
     // replayed to bob when he next connects.
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    const archived = try arch_store.query("bob@localhost", .{});
+    defer {
+        for (archived.messages) |msg| {
+            allocator.free(msg.stanza_id);
+            if (msg.stanza_xml.len > 0) allocator.free(@constCast(msg.stanza_xml));
+        }
+        allocator.free(archived.messages);
+    }
+    try std.testing.expectEqual(@as(usize, 0), archived.messages.len);
 }
 
 // E2b: an inbound S2S stanza for an offline local user is stored with its
