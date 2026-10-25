@@ -243,18 +243,20 @@ pub const ArchiveWriteQueue = struct {
         while (true) {
             self.drainInto(store, batch);
 
+            self.drainPipe();
+            // The flags are checked after drainPipe on purpose: a stop or
+            // wake byte consumed there is not re-deliverable, so its
+            // effect must be observed before kevent arms.
             if (self.stopping.load(.acquire) and self.countIsEmpty()) {
                 return;
             }
-
-            self.drainPipe();
             // Sleep only when the ring is empty: jobs pushed between the
             // drain and this point must not wait for a later wakeup (V15).
             // A job pushed after this check is an empty-to-non-empty
             // transition, so its wake byte lands in the pipe before kevent.
             if (!self.countIsEmpty()) continue;
             _ = posix.kevent(kq, &.{}, &events, null) catch |err| {
-                log.err("writer kevent failed: {} — exiting writer thread", .{err});
+                log.err("writer kevent failed: {} - exiting writer thread", .{err});
                 return;
             };
         }
