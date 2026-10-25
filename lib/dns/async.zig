@@ -355,7 +355,7 @@ pub const Resolver = struct {
         // A cache hit inside sendQuery can complete and free the job
         // synchronously; after this call `job` may not be touched.
         self.sendQuery(job, name, qt) catch |err| {
-            self.dropJob(job, .failed);
+            self.abortJob(job);
             return err;
         };
     }
@@ -513,11 +513,11 @@ pub const Resolver = struct {
             try self.jobs.append(self.alloc, job);
         }
         self.armChainDeadline(job) catch |err| {
-            self.dropJob(job, .failed);
+            self.abortJob(job);
             return err;
         };
         self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
-            self.dropJob(job, .failed);
+            self.abortJob(job);
             return err;
         };
     }
@@ -1079,6 +1079,20 @@ pub const Resolver = struct {
             out.append(alloc, rr) catch return error.OutOfMemory;
         }
         return out.items;
+    }
+
+    /// Remove a job without answering its waiters: for callers that
+    /// already get the failure as an error return, where firing the
+    /// callback too would answer the request twice.
+    fn abortJob(self: *Resolver, job: *Job) void {
+        for (self.jobs.items, 0..) |j, i| {
+            if (j == job) {
+                _ = self.jobs.orderedRemove(i);
+                break;
+            }
+        }
+        self.freeJob(job);
+        self.promoteWait();
     }
 
     fn dropJob(self: *Resolver, job: *Job, status: Status) void {
