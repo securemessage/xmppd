@@ -317,8 +317,8 @@ pub const S2sDaemon = struct {
     fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
         // DNS SRV resolution (blocking — acceptable for initial impl)
         const targets = dns.resolver.resolveXmpp(self.allocator, domain, true) catch {
-            log.err("DNS SRV resolution failed for {s}", .{domain});
-            conn.fail("dns-resolution-failed");
+            log.warn("DNS SRV resolution failed for {s}", .{domain});
+            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
         };
         defer {
@@ -329,7 +329,7 @@ pub const S2sDaemon = struct {
 
         if (targets.len == 0) {
             log.warn("no SRV targets for {s}", .{domain});
-            conn.fail("no-srv-records");
+            self.failOutboundInitiation(batch, conn, "no-srv-records");
             return;
         }
 
@@ -345,7 +345,7 @@ pub const S2sDaemon = struct {
 
         // Non-blocking TCP connect
         const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
-            conn.fail("socket-creation-failed");
+            self.failOutboundInitiation(batch, conn, "socket-creation-failed");
             return;
         };
 
@@ -362,7 +362,7 @@ pub const S2sDaemon = struct {
             // Use getaddrinfo for hostname resolution
             const ip = resolveHostnameIPv4(target.host) catch {
                 posix.close(sock);
-                conn.fail("hostname-resolution-failed");
+                self.failOutboundInitiation(batch, conn, "hostname-resolution-failed");
                 return;
             };
             addr.addr = ip;
@@ -379,7 +379,7 @@ pub const S2sDaemon = struct {
                 error.WouldBlock => {}, // Expected — connect in progress
                 else => {
                     posix.close(sock);
-                    conn.fail("tcp-connect-failed");
+                    self.failOutboundInitiation(batch, conn, "tcp-connect-failed");
                     return;
                 },
             }
@@ -391,7 +391,7 @@ pub const S2sDaemon = struct {
         const slot = self.allocateOutboundSlot() orelse {
             posix.close(sock);
             conn.fd = -1;
-            conn.fail("outbound-slots-exhausted");
+            self.failOutboundInitiation(batch, conn, "outbound-slots-exhausted");
             return;
         };
         self.outbound[slot] = conn;
@@ -401,7 +401,7 @@ pub const S2sDaemon = struct {
             self.outbound[slot] = null;
             posix.close(sock);
             conn.fd = -1;
-            conn.fail("internal-error");
+            self.failOutboundInitiation(batch, conn, "internal-error");
             return;
         };
         reader.* = XmlReader.init(self.allocator);
@@ -500,6 +500,22 @@ pub const S2sDaemon = struct {
             self.pool.remove(conn.remote_domain);
         }
         self.outbound[slot] = null;
+    }
+
+    /// Fail an outbound connection that never reached the wire. Every
+    /// stanza queued on it is failed back to the core with `reason`, every
+    /// pending db:verify is answered invalid, and the conn leaves the pool
+    /// so the next delivery starts a fresh attempt.
+    fn failOutboundInitiation(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        conn.fail(reason);
+        for (conn.pending_stanzas.items) |*stanza| {
+            self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, reason);
+        }
+        for (0..conn.db_pending.len) |idx| {
+            if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+        }
+        if (conn.fd >= 0) batch.purgeFd(conn.fd);
+        self.pool.remove(conn.remote_domain);
     }
 
     fn allocateOutboundSlot(self: *S2sDaemon) ?usize {
@@ -1404,18 +1420,7 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     // db:result is rejected, not forwarded).
     if (!dialback.isValidKeyHex(key)) {
         log.warn("dialback callback: invalid key shape from {s} ({d} bytes); answering type=invalid", .{ origin, key.len });
-        var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
-            failDbResultAnswer(daemon, batch, session, session.id, origin);
-            return;
-        };
-        session.queueWrite(resp) catch {
-            failDbResultAnswer(daemon, batch, session, session.id, origin);
-            return;
-        };
-        if (session.hasPendingWrite()) {
-            batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
-        }
+        answerDbResultInvalid(daemon, batch, session, target, origin);
         return;
     }
 
@@ -1426,7 +1431,8 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 
     // Get or create an outbound connection to the origin domain
     const conn = daemon.pool.getOrCreate(daemon.local_domain, origin) catch {
-        log.err("dialback callback: failed to create outbound connection to {s}", .{origin});
+        log.warn("dialback callback: failed to create outbound connection to {s}; answering type=invalid", .{origin});
+        answerDbResultInvalid(daemon, batch, session, target, origin);
         return;
     };
 
@@ -1435,18 +1441,7 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
     // own pending verify (S2).
     if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, target, key) == null) {
         log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
-        var resp_buf: [512]u8 = undefined;
-        const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
-            failDbResultAnswer(daemon, batch, session, session.id, origin);
-            return;
-        };
-        session.queueWrite(resp) catch {
-            failDbResultAnswer(daemon, batch, session, session.id, origin);
-            return;
-        };
-        if (session.hasPendingWrite()) {
-            batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
-        }
+        answerDbResultInvalid(daemon, batch, session, target, origin);
         return;
     }
 
@@ -1533,6 +1528,24 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         }
     }
     return true;
+}
+
+/// Answer a db:result submission with type=invalid. A response that cannot
+/// be built or queued fails the inbound session instead, so the submitter
+/// is never left waiting for a verdict (C6).
+fn answerDbResultInvalid(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, target: []const u8, origin: []const u8) void {
+    var resp_buf: [512]u8 = undefined;
+    const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
+        failDbResultAnswer(daemon, batch, session, session.id, origin);
+        return;
+    };
+    session.queueWrite(resp) catch {
+        failDbResultAnswer(daemon, batch, session, session.id, origin);
+        return;
+    };
+    if (session.hasPendingWrite()) {
+        batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
+    }
 }
 
 /// A db:result submission must always be answered: when the answer cannot
@@ -2867,6 +2880,74 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     try std.testing.expectEqualStrings("stanza-too-large", notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
     try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
+}
+
+test "S2sDaemon: an initiation failure answers every queued stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A domain longer than the SRV query-name buffer fails resolution
+    // before any socket or network activity: a deterministic initiation
+    // failure.
+    const domain = try alloc.alloc(u8, 300);
+    defer alloc.free(domain);
+    @memset(domain, 'd');
+    const to = try std.fmt.allocPrint(alloc, "b@{s}.example", .{domain});
+    defer alloc.free(to);
+
+    // A connected core client makes the delivery-failure notice observable.
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.handleDelivery(&cl, "a@us.example", to, "<message to='b@them.example'><body>x</body></message>");
+
+    // The queued stanza is failed back to its sender instead of vanishing
+    // with the connection.
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("dns-resolution-failed", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings(to, notice.s2s_delivery_failed.to_jid);
+
+    // The failed conn leaves the pool so the next delivery starts fresh.
+    try std.testing.expect(daemon.pool.connections.get(domain) == null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pool.count());
+}
+
+test "S2sDaemon: a dialback callback that cannot open its conn answers the submission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    const key = "abababababababababababababababababababababababababababababababab";
+    in1.session.startDbResult("them.example", "us.example");
+    @memcpy(in1.session.db_result_key_buf[0..key.len], key);
+    in1.session.db_result_key_len = key.len;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // The next allocation is the pool's connection object: fail it.
+    failing.fail_index = failing.alloc_index;
+    initiateDialbackCallback(&daemon, &cl, in1.session);
+
+    // The submission is answered invalid instead of waiting for a verdict
+    // that no connection will ever produce.
+    _ = try in1.session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(daemon.getInbound(1) != null);
 }
 
 test "S2sDaemon: stop" {
