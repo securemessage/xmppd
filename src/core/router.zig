@@ -430,32 +430,20 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             delivery_failed = true;
             continue;
         };
-        // S13: a session whose offline tail is still draining must not be
-        // overtaken by newer messages. Park this copy behind the tail, with
-        // its payload, so the drain delivers it in order without depending on
-        // an archive row the async writer may not have committed yet.
+        // A session whose offline tail is still draining must not be overtaken.
         if (target_session.offline_pending and session.stanza_kind == .message and
-            is_archivable and server.archive != null)
+            !std.mem.eql(u8, type_str, "error"))
         {
-            if (server.offline) |store| {
-                var recip_hold_buf: [256]u8 = undefined;
-                var recip_hold_fbs = std.io.fixedBufferStream(&recip_hold_buf);
-                recip_hold_fbs.writer().writeAll(to_jid.local) catch {};
-                recip_hold_fbs.writer().writeByte('@') catch {};
-                recip_hold_fbs.writer().writeAll(to_jid.domain) catch {};
-                const recipient_hold = recip_hold_fbs.getWritten();
-
-                var held = false;
-                if (store.storeHeldPointer(recipient_hold, sender_bare, archive_stanza_id, archive_timestamp, sent_data)) |ok| {
-                    held = ok;
-                } else |err| {
-                    log.warn("message to {s} could not be held behind the offline tail: {s}", .{ to_str, @errorName(err) });
-                }
-                if (held) {
-                    local_delivery_succeeded = true;
-                    log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
-                    continue;
-                }
+            const hold_id = if (is_archivable)
+                archive_stanza_id
+            else if (id_str.len > 0)
+                id_str
+            else
+                "offline";
+            if (server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare, hold_id, archive_timestamp, sent_data)) {
+                local_delivery_succeeded = true;
+                log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
+                continue;
             }
             // No offline store, or the recipient's queue is at quota. The
             // stanza can neither be held nor sent without overtaking the
