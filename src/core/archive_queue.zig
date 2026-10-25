@@ -97,7 +97,7 @@ pub const ArchiveWriteQueue = struct {
     /// latch for the 75% warning so it logs once per surge, not per job
     high_water_warned: bool = false,
 
-    /// Total dropped jobs (queue full) since start — for ops visibility.
+    /// Total dropped jobs (queue full) since start, for ops visibility.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Job payload copies that failed on allocation - dropped before enqueue.
@@ -217,13 +217,15 @@ pub const ArchiveWriteQueue = struct {
 
     /// Writer-thread main loop: kqueue-wait on the pipe, drain up to
     /// `batch` jobs per iteration into the store, exit when stopping and
-    /// empty. The store type only needs
-    /// `store(owner, with, stanza_id, timestamp, stanza_xml) !void`.
+    /// empty. The store type needs
+    /// `storeAll(items) !void` for the chunk write and
+    /// `store(owner, with, stanza_id, timestamp, stanza_xml) !void` for
+    /// the per-job retry after a batch failure.
     pub fn writerLoop(self: *ArchiveWriteQueue, store: anytype, batch: usize) void {
         const kq = posix.kqueue() catch {
             // No kqueue means no event-driven wait; drain what's queued and
-            // give up — the process is mid-shutdown if this ever fires.
-            log.err("writer kqueue failed — draining queue and exiting writer thread", .{});
+            // give up; the process is mid-shutdown if this ever fires.
+            log.err("writer kqueue failed - draining queue and exiting writer thread", .{});
             self.drainInto(store, std.math.maxInt(usize));
             return;
         };

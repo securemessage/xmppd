@@ -842,7 +842,7 @@ pub const Server = struct {
 
     /// T87: archive a stanza. Enqueues onto the writer thread's queue when
     /// wired (never blocks the event loop on storage); otherwise falls back
-    /// to an inline store() (unchanged legacy behavior).
+    /// to an inline store().
     pub fn archiveStore(self: *Server, owner: []const u8, with: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) void {
         if (self.archive_writer) |q| {
             q.enqueue(owner, with, stanza_id, timestamp, stanza_xml);
