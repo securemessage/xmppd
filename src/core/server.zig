@@ -4620,3 +4620,45 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     // No session at slot 3, so nothing should crash or write
     try std.testing.expect(server.sessions[3] == null);
 }
+
+test "every store namespace constant is registered and every registry entry is owned" {
+    // Owner constants bind through backend.registered, so one-sided
+    // renames are compile errors; this pins the reverse side (a registry
+    // entry no owner uses) across the whole set.
+    const user_store = @import("user_store");
+    const lock_store = @import("lock_store");
+    const invite_store = @import("invite_store");
+    const last_activity_store = @import("last_activity_store");
+    const owners = [_][]const u8{
+        user_store.NAMESPACE,
+        generic_roster.NAMESPACE,
+        vcard_store_mod.NAMESPACE,
+        pep_store_mod.NAMESPACE,
+        lock_store.NAMESPACE,
+        last_activity_store.NAMESPACE,
+        invite_store.NAMESPACE,
+        block_store_mod.NAMESPACE,
+        generic_offline.NS_OFFLINE,
+        room_store_mod.NS_ROOMS,
+        room_store_mod.NS_AFFILIATIONS,
+        archive_store_mod.NS_MESSAGES,
+        archive_store_mod.NS_BY_CONTACT,
+        presence_handler.PENDING_SUB_NS,
+    };
+    const registry = backend_mod.canonical_namespaces;
+    try std.testing.expectEqual(registry.len, owners.len);
+    for (owners) |owned| {
+        var seen = false;
+        for (registry) |entry| {
+            if (std.mem.eql(u8, owned, entry)) seen = true;
+        }
+        try std.testing.expect(seen);
+    }
+    for (registry) |entry| {
+        var seen = false;
+        for (owners) |owned| {
+            if (std.mem.eql(u8, owned, entry)) seen = true;
+        }
+        try std.testing.expect(seen);
+    }
+}
