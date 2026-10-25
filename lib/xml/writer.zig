@@ -1,8 +1,9 @@
 //! StanzaWriter: streaming XMPP stanza serializer over std.Io.Writer.
 //!
 //! One StanzaWriter emits one stanza into a caller-provided writer. Element
-//! and attribute names are checked against the XML Name production (ASCII
-//! subset; XMPP uses no non-ASCII names). Attribute values and text are
+//! and attribute names are checked against the XML QName production
+//! (NCName with an optional 'prefix:'; ASCII subset). Attribute values
+//! and text are
 //! validated against the XML Char production and always escaped for the five
 //! escapables (`& < > ' "`). Only reader-validated markup may pass through
 //! rawSpan; the ValidatedSpan type carries that proof.
@@ -121,7 +122,11 @@ fn isStreamElement(name: []const u8) bool {
 /// Element and attribute prefixes are only resolved once the start
 /// tag ends: an xmlns on the same tag is already in scope for its own
 /// tag name and every attribute on it.
-fn spanCheckPrefixes(elem_prefix: []const u8, attrs: []const SpanAttr, decls: []const SpanDecl) Error!void {
+fn spanCheckPrefixes(
+    elem_prefix: []const u8,
+    attrs: []const SpanAttr,
+    decls: []const SpanDecl,
+) Error!void {
     if (elem_prefix.len > 0 and !spanPrefixOk(elem_prefix, decls)) return error.NotWellFormed;
     for (attrs) |a| {
         if (std.mem.eql(u8, a.prefix, "xmlns")) continue;
@@ -178,7 +183,8 @@ pub const ValidatedSpan = struct {
                     if (attr_count >= span_max_attrs) return error.NotWellFormed;
                     if (!isValidName(tok.?.name)) return error.NotWellFormed;
                     // A '<' may never sit inside an attribute value.
-                    if (std.mem.indexOfScalar(u8, tok.?.value, '<') != null) return error.NotWellFormed;
+                    if (std.mem.indexOfScalar(u8, tok.?.value, '<') != null)
+                        return error.NotWellFormed;
                     for (attrs[0..attr_count]) |p| {
                         if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
                     }
@@ -186,7 +192,8 @@ pub const ValidatedSpan = struct {
                     attr_count += 1;
                 },
                 .namespace_decl => {
-                    if (attr_count >= span_max_attrs or decl_count >= span_max_decls) return error.NotWellFormed;
+                    if (attr_count >= span_max_attrs or decl_count >= span_max_decls)
+                        return error.NotWellFormed;
                     if (!isValidName(tok.?.name)) return error.NotWellFormed;
                     for (attrs[0..attr_count]) |p| {
                         if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
@@ -197,12 +204,20 @@ pub const ValidatedSpan = struct {
                     decl_count += 1;
                 },
                 .element_open_end => {
-                    try spanCheckPrefixes(pending_prefix, attrs[0..attr_count], decls[0..decl_count]);
+                    try spanCheckPrefixes(
+                        pending_prefix,
+                        attrs[0..attr_count],
+                        decls[0..decl_count],
+                    );
                     names[depth] = pending_name;
                     depth += 1;
                 },
                 .element_self_close => {
-                    try spanCheckPrefixes(pending_prefix, attrs[0..attr_count], decls[0..decl_count]);
+                    try spanCheckPrefixes(
+                        pending_prefix,
+                        attrs[0..attr_count],
+                        decls[0..decl_count],
+                    );
                     // Declarations inside this tag die with it.
                     while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
                 },
@@ -431,9 +446,8 @@ pub const StanzaWriter = struct {
             .bool => self.emit(if (value) "true" else "false"),
             .int, .comptime_int => self.emitFmt("{d}", .{value}),
             .@"enum" => {
-                const tag = @tagName(value);
-                try validateChars(tag);
-                self.emitEscaped(tag, self.escape_mode);
+                // validateValue already ran before any byte was emitted.
+                self.emitEscaped(@tagName(value), self.escape_mode);
             },
             .pointer => {
                 comptime {
@@ -441,9 +455,7 @@ pub const StanzaWriter = struct {
                         @compileError("StanzaWriter: unsupported value type " ++ @typeName(T));
                     }
                 }
-                const s: []const u8 = value;
-                try validateChars(s);
-                self.emitEscaped(s, self.escape_mode);
+                self.emitEscaped(value, self.escape_mode);
             },
             else => @compileError("StanzaWriter: unsupported value type " ++ @typeName(T)),
         }
@@ -761,7 +773,10 @@ test "rawSpan emits reader-validated bytes verbatim" {
 
     try x.elementOpen("iq");
     x.elementOpenEnd();
-    const span = try ValidatedSpan.fromReader(testing.allocator, "<child a='&amp;'>raw &amp; text</child>");
+    const span = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<child a='&amp;'>raw &amp; text</child>",
+    );
     x.rawSpan(span);
     try x.elementClose("iq");
     try x.finish();
@@ -893,10 +908,22 @@ test "a rejected attribute emits nothing and latches finish() (L1)" {
 test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
     // Rejected: control byte smuggled inside markup, unbalanced tags,
     // mismatched close name, truncated element.
-    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
-    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
-    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a>"));
-    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "</a>"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(
+        testing.allocator,
+        "</m><iq type='set'>\x00",
+    ));
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a></b>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "</a>"),
+    );
 
     // Accepted: balanced elements and bare text both scan cleanly.
     _ = try ValidatedSpan.fromReader(testing.allocator, "<c><d t='1'/>x</c>");
@@ -908,7 +935,10 @@ test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
     var x = StanzaWriter.init(&w);
     try x.elementOpen("iq");
     x.elementOpenEnd();
-    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(
+        testing.allocator,
+        "</m><iq type='set'>\x00",
+    ));
     try x.elementClose("iq");
     try x.finish();
     try testing.expectEqualStrings("<iq></iq>", w.buffered());
@@ -1096,7 +1126,10 @@ test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
         "<a xmlns:u='urn:u' xmlns:u='urn:v'/>", // duplicate declaration
     };
     for (bad) |probe| {
-        try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, probe));
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
     }
 
     const good = [_][]const u8{
