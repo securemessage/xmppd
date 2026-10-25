@@ -127,6 +127,11 @@ pub const S2sDaemon = struct {
     /// Always null in production.
     dane_verdict_override: ?connector_mod.DaneStatus = null,
 
+    /// Test seam: when set, initiateOutbound resolves its targets through
+    /// this function instead of live DNS SRV/A lookups, so the initiation
+    /// failure paths run deterministically. Always null in production.
+    resolve_targets_override: ?*const fn (std.mem.Allocator, []const u8) anyerror![]dns.ConnectionTarget = null,
+
     /// Inbound listener port.
     listener_port: u16 = 5269,
 
@@ -316,7 +321,8 @@ pub const S2sDaemon = struct {
     /// Initiate an outbound connection: DNS SRV → TCP connect → kqueue registration.
     fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
         // DNS SRV resolution (blocking — acceptable for initial impl)
-        const targets = dns.resolver.resolveXmpp(self.allocator, domain, true) catch {
+        const resolve = self.resolve_targets_override orelse &resolveServerTargets;
+        const targets = resolve(self.allocator, domain) catch {
             log.warn("DNS SRV resolution failed for {s}", .{domain});
             self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
@@ -644,6 +650,11 @@ fn extractDomain(jid: []const u8) []const u8 {
     }
 
     return jid[domain_start..domain_end];
+}
+
+/// Resolve server-to-server connection targets through live DNS.
+fn resolveServerTargets(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
+    return dns.resolver.resolveXmpp(allocator, domain, true);
 }
 
 /// Parse an IPv4 address string to network-order u32.
@@ -2997,6 +3008,163 @@ test "S2sDaemon: a full pending-verify table answers the submission invalid" {
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
     try std.testing.expect(daemon.getInbound(1) != null);
+}
+
+/// A resolver override that answers one loopback target: initiation reaches
+/// the socket and slot paths without a live DNS lookup. The returned slice
+/// and host are allocator-owned, exactly like a DNS answer.
+fn testResolveLoopback(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
+    _ = domain;
+    const targets = try allocator.alloc(dns.ConnectionTarget, 1);
+    errdefer allocator.free(targets);
+    targets[0] = .{
+        .host = try allocator.dupe(u8, "127.0.0.1"),
+        .port = 5269,
+        .is_direct_tls = false,
+    };
+    return targets;
+}
+
+/// The same shape with the IPv4 broadcast address, whose connect(2) fails
+/// synchronously (EACCES on FreeBSD): the connect-failure path runs without
+/// waiting for a socket event.
+fn testResolveBroadcast(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
+    _ = domain;
+    const targets = try allocator.alloc(dns.ConnectionTarget, 1);
+    errdefer allocator.free(targets);
+    targets[0] = .{
+        .host = try allocator.dupe(u8, "255.255.255.255"),
+        .port = 5269,
+        .is_direct_tls = false,
+    };
+    return targets;
+}
+
+/// Two inbound sessions plus one pooled outbound conn carrying a pending
+/// dialback exchange. The submission is on slot 1; slot 2 must stay silent.
+fn makeVerifyRig(alloc: std.mem.Allocator, daemon: *S2sDaemon, origin: []const u8) !struct {
+    submitter: *S2sSession,
+    submitter_peer: posix.fd_t,
+    other_peer: posix.fd_t,
+    conn: *OutboundConnection,
+} {
+    const in1 = try makeTestInbound(alloc, daemon, 1);
+    errdefer posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, daemon, 2);
+    errdefer posix.close(in2.peer_fd);
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    if (conn.addPendingVerify(1, daemon.inbound_gens[1], "sid-1", origin, daemon.local_domain, "aaaa") == null)
+        return error.PendingVerifyNotRegistered;
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>x</body></message>");
+
+    return .{
+        .submitter = in1.session,
+        .submitter_peer = in1.peer_fd,
+        .other_peer = in2.peer_fd,
+        .conn = conn,
+    };
+}
+
+/// The failed initiation answered exactly one invalid db:result on the
+/// submitting peer, nothing on any other session, and the delivery-failed
+/// notice carries the failure reason.
+fn expectInitiationFailure(daemon: *S2sDaemon, rig: anytype, expected_to: ?[]const u8, reason: []const u8) !void {
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(rig.submitter_peer, &rbuf)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='us.example'") != null);
+    if (expected_to) |to| {
+        try std.testing.expect(std.mem.indexOf(u8, resp, to) != null);
+    }
+
+    var other: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.other_peer, &other));
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings(reason, notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
+}
+
+/// A connected core client makes the delivery-failure notice observable.
+fn makeBufferOnlyClient(daemon: *S2sDaemon, alloc: std.mem.Allocator) void {
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+}
+
+test "S2sDaemon: an exhausted outbound slot table answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Every outbound slot is taken: the loopback connect succeeds but the
+    // conn cannot be registered, so initiation fails after the connect.
+    var taken: OutboundConnection = undefined;
+    for (&daemon.outbound) |*slot| slot.* = &taken;
+    daemon.resolve_targets_override = &testResolveLoopback;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, rig.conn, "them.example");
+
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted");
+    // The failed conn leaves the pool so the next delivery starts fresh.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a connect failure answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+    daemon.resolve_targets_override = &testResolveBroadcast;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, rig.conn, "them.example");
+
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "tcp-connect-failed");
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a DNS failure answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A domain longer than the SRV query-name buffer fails resolution
+    // before any socket or network activity.
+    const domain = try alloc.alloc(u8, 300);
+    defer alloc.free(domain);
+    @memset(domain, 'd');
+
+    const rig = try makeVerifyRig(alloc, &daemon, domain);
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, rig.conn, domain);
+
+    try expectInitiationFailure(&daemon, rig, null, "dns-resolution-failed");
+    try std.testing.expect(daemon.pool.connections.get(domain) == null);
 }
 
 test "S2sDaemon: stop" {
