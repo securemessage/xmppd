@@ -253,6 +253,14 @@ pub const Resolver = struct {
         return self.fd;
     }
 
+    /// The resolver's own kqueue. A kqueue fd is itself EVFILT_READ-
+    /// able on a parent kqueue (it reports when events are pending),
+    /// so an embedding loop can watch this single fd and call step(0)
+    /// instead of shadow-registering the UDP socket and a tick.
+    pub fn kqFd(self: *const Resolver) posix.fd_t {
+        return self.kq;
+    }
+
     /// Raw record query: A, AAAA, SRV or TLSA answered via the query
     /// callback with owned RRs.
     pub fn query(self: *Resolver, name: []const u8, rtype: RType, session_key: usize) !void {

@@ -92,7 +92,6 @@ fn resolveHost(host: []const u8) !std.c.sockaddr.in {
 pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
-    const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
     /// Consumer-timer udata range base: token N rides as TIMER_UDATA - N.
     /// The range sits below the reserved sentinels and far above any Handle
     /// encode, so loopOnce routes it to onTimerEvent before Handle decode.
@@ -315,9 +314,8 @@ pub const Engine = struct {
     trace: bool,
     /// Async DNS engine (lazy-open on first resolve).
     resolver: ?Resolver = null,
-    /// One-second housekeeping tick (resolver retransmits/timeouts). The
-    /// single allowed periodic timer on this loop.
-    resolver_tick_armed: bool = false,
+    /// Set once the resolver's kqueue fd is registered on this loop.
+    resolver_watch_armed: bool = false,
 
     tls_ctx: ?ssl.SslContext = null,
     /// PKIX-verifying client context (lazy): system CA store, per-connection
@@ -1033,7 +1031,7 @@ pub const Engine = struct {
             s.fail(self.allocator, "resolve-error");
             return;
         };
-        self.armResolverTick();
+        self.armResolverWatch();
     }
 
     /// Wire a connected fd into an already-slotted session (engine thread):
@@ -1074,21 +1072,18 @@ pub const Engine = struct {
 
     // ---- DNS completion ---------------------------------------------------
 
-    fn armResolverTick(self: *Engine) void {
-        if (self.resolver == null or self.resolver_tick_armed) return;
-        self.resolver_tick_armed = true;
-        // Register the resolver socket + a 1 s housekeeping tick.
-        const dns_fd = self.resolver.?.sockFd();
-        if (dns_fd >= 0) {
-            const dev = kev(@intCast(dns_fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, DNS_UDATA);
+    /// Register the resolver's kqueue on this loop: the child kqueue
+    /// reports readable while it has pending knotes, covering the DNS
+    /// socket, TCP fallbacks and every resolver deadline in one fd.
+    /// That replaces the old 1 s housekeeping tick entirely.
+    fn armResolverWatch(self: *Engine) void {
+        if (self.resolver == null or self.resolver_watch_armed) return;
+        self.resolver_watch_armed = true;
+        const kq_fd = self.resolver.?.kqFd();
+        if (kq_fd >= 0) {
+            const dev = kev(@intCast(kq_fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, DNS_UDATA);
             self.stage(dev);
         }
-        const tick = kev(1, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ENABLE, TICK_UDATA);
-        // NOTE: kev() here carries data=0; EVFILT_TIMER's interval must go in
-        // `data` (ms). kev() doesn't expose it — write the record directly.
-        var tev = tick;
-        tev.data = 1000;
-        self.stage(tev);
     }
 
     /// Completion callback for the resolver (engine thread). static per Cb.
@@ -1260,10 +1255,6 @@ pub const Engine = struct {
         for (evbuf[0..n]) |ev| {
             if (ev.udata == WAKE_UDATA) continue;
             if (ev.udata == DNS_UDATA) {
-                if (self.resolver) |*r| r.step(0);
-                continue;
-            }
-            if (ev.udata == TICK_UDATA) {
                 if (self.resolver) |*r| r.step(0);
                 continue;
             }
@@ -1487,4 +1478,37 @@ test "engine: timer EV_ERROR receipt drops the timer without firing it" {
     eng.onTimerEvent(expiry);
     try std.testing.expectEqual(@as(usize, 1), fired);
     try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
+}
+
+test "engine: the resolver watch registers its kqueue, not a tick (J8)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "watchme.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    try std.testing.expect(eng.resolver_watch_armed);
+
+    const kq_fd = eng.resolver.?.kqFd();
+    var saw_kq = false;
+    var saw_timer = false;
+    for (eng.changes.items) |ch| {
+        if (ch.filter == std.c.EVFILT.TIMER) saw_timer = true;
+        if (ch.filter == std.c.EVFILT.READ and ch.ident == @as(usize, @intCast(kq_fd))) saw_kq = true;
+    }
+    try std.testing.expect(saw_kq);
+    try std.testing.expect(!saw_timer);
+
+    eng.sessionAt(h).?.fail(alloc, "test-done");
+    eng.reapDead();
 }
