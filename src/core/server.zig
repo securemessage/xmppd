@@ -9318,4 +9318,6 @@ test "Server: S4 jid-malformed subscription escapes the stanza id" {
 test {
     _ = iq_handler;
     _ = router;
+    _ = muc_handler;
+    _ = presence_handler;
 }

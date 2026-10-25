@@ -1523,7 +1523,10 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 
     if (before.worker_id != server.worker_id) {
         const ds = server.delivery_system orelse return;
-        ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch {};
+        ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch |err| {
+            log.warn("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.session_id, @errorName(err) });
+            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        };
         return;
     }
     const target = server.sessions[before.session_id] orelse return;
@@ -1546,7 +1549,10 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
     w.writeAll("' type='error'><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-    ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
+    ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch |err| {
+        log.warn("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+    };
 }
 
 /// Replay recent room history to a joining occupant (XEP-0045 §7.2.14).
@@ -3296,4 +3302,65 @@ test "S1: remote presence error escapes the room and target JIDs" {
     try std.testing.expect(std.mem.indexOf(u8, stanza, "from='r'@") == null);
     try std.testing.expect(std.mem.indexOf(u8, stanza, "to='eve@localhost/x'y'") == null);
     try std.testing.expect(std.mem.indexOf(u8, stanza, "resource-constraint") != null);
+}
+
+test "T413: replaced-resource delivery drops are counted" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    var initial = StanzaCollector{ .allocator = allocator };
+    defer initial.deinit();
+    const queue = delivery_sys.getQueue(1);
+    _ = queue.drain(&initial, StanzaCollector.onDelivery);
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+
+    const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/laptop",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+}
+
+test "T413: remote presence error delivery drops are counted" {
+    const allocator = std.testing.allocator;
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    const queue = delivery_sys.getQueue(1);
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+
+    const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
+    sendRemotePresenceError(&delivery_sys, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, "resource-constraint");
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
 }
