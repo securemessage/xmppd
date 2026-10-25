@@ -11,6 +11,7 @@
 const std = @import("std");
 
 pub const TYPE_A: u16 = 1;
+pub const TYPE_CNAME: u16 = 5;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
 pub const TYPE_TLSA: u16 = 52;
@@ -22,6 +23,9 @@ pub const RCODE_NXDOMAIN: u8 = 3;
 
 pub const FLAG_TC: u16 = 0x0200;
 
+/// Which section of a DNS message a record came from.
+pub const Section = enum { answer, authority, additional };
+
 /// A single resource record from the answer/authority/additional sections.
 /// `name` is decompressed (arena-allocated); `rdata` borrows the packet.
 pub const Rr = struct {
@@ -30,6 +34,11 @@ pub const Rr = struct {
     class: u16,
     ttl: u32,
     rdata: []const u8,
+    /// Message section this record was read from.
+    section: Section = .answer,
+    /// Offset of `rdata` inside the original packet (for decoding
+    /// compressed names embedded in rdata, e.g. CNAME targets).
+    rdata_off: usize = 0,
 };
 
 pub const Message = struct {
@@ -38,6 +47,8 @@ pub const Message = struct {
     truncated: bool,
     /// answers + additional (additional carry inline A/AAAA for SRV targets)
     rrs: []Rr,
+    /// The parsed packet; `rdata` slices and compressed names point into it.
+    raw: []const u8 = &.{},
 };
 
 /// Encode a standard query for `qname`/`qtype` (rd set) into `buf`.
@@ -140,6 +151,12 @@ pub fn parse(alloc: std.mem.Allocator, msg: []const u8) !Message {
 
     var i: usize = 0;
     while (i < total) : (i += 1) {
+        const section: Section = if (i < ancount)
+            .answer
+        else if (i < @as(usize, ancount) + nscount)
+            .authority
+        else
+            .additional;
         const nm = try decompressName(msg, cursor, alloc);
         cursor = nm.next;
         if (cursor + 10 > msg.len) return error.Truncated;
@@ -155,6 +172,8 @@ pub fn parse(alloc: std.mem.Allocator, msg: []const u8) !Message {
             .class = class,
             .ttl = ttl,
             .rdata = msg[cursor .. cursor + rdlen],
+            .section = section,
+            .rdata_off = cursor,
         }) catch return error.OutOfMemory;
         cursor += rdlen;
     }
@@ -164,6 +183,7 @@ pub fn parse(alloc: std.mem.Allocator, msg: []const u8) !Message {
         .rcode = @intCast(flags & 0xF),
         .truncated = flags & FLAG_TC != 0,
         .rrs = rrs.items,
+        .raw = msg,
     };
 }
 

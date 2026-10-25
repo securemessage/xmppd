@@ -525,11 +525,46 @@ pub const Resolver = struct {
             else => return self.dropJob(job, .failed),
         }
 
-        if (job.is_raw) return self.completeRaw(job, msg);
+        // Only answer-section records that actually answer the
+        // outstanding query may reach a phase or the cache.
+        const valid = self.filterAnswers(arena_state.allocator(), msg, job) catch
+            return self.dropJob(job, .failed);
+        var filtered = msg;
+        filtered.rrs = valid;
+
+        if (job.is_raw) return self.completeRaw(job, filtered);
         switch (job.phase) {
-            .srv_tls, .srv_plain, .addr, .tlsa, .fallback_addr, .fallback_tlsa => self.advance(job, msg),
+            .srv_tls, .srv_plain, .addr, .tlsa, .fallback_addr, .fallback_tlsa => self.advance(job, filtered),
             .raw, .done => {},
         }
+    }
+
+    /// Answer-section records answering the outstanding query: the
+    /// owner must equal the asked name or a CNAME target it resolved
+    /// to, the type must be the asked type (or the CNAME record
+    /// itself), and the class must be IN. Authority and additional
+    /// records are dropped before they can reach a caller or the
+    /// cache.
+    fn filterAnswers(self: *Resolver, alloc: std.mem.Allocator, msg: wire.Message, job: *Job) ![]wire.Rr {
+        _ = self;
+        var out = try std.ArrayList(wire.Rr).initCapacity(alloc, msg.rrs.len);
+        var expected = job.pending_qname;
+        for (msg.rrs) |rr| {
+            if (rr.section != .answer) continue;
+            if (rr.class != wire.CLASS_IN) continue;
+            if (!std.ascii.eqlIgnoreCase(rr.name, expected)) continue;
+            if (rr.rtype == wire.TYPE_CNAME and rr.rtype != job.pending_qtype) {
+                // The chain retargets the expected owner for the
+                // records that follow.
+                const target = wire.decompressName(msg.raw, rr.rdata_off, alloc) catch continue;
+                out.append(alloc, rr) catch return error.OutOfMemory;
+                expected = target.name;
+                continue;
+            }
+            if (rr.rtype != job.pending_qtype) continue;
+            out.append(alloc, rr) catch return error.OutOfMemory;
+        }
+        return out.items;
     }
 
     fn dropJob(self: *Resolver, job: *Job, status: Status) void {
@@ -948,6 +983,9 @@ const FakeDns = struct {
     alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     truncate_udp: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     decoy_qname: []const u8 = "",
+    /// When set, A answers also carry an authority SOA and an
+    /// additional-section A for an unrelated owner (J5 probe).
+    poison_sections: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
@@ -1046,16 +1084,36 @@ const FakeDns = struct {
             answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
         }
 
+        var nscount: u16 = 0;
+        var arcount: u16 = 0;
+        var extra: std.ArrayListUnmanaged(u8) = .{};
+        if (q.qtype == wire.TYPE_A and self.poison_sections.load(.monotonic)) {
+            // Authority SOA whose rdata is opaque to the filter, plus an
+            // additional A record for an owner the query never asked
+            // about.
+            nscount = 1;
+            extra.appendSlice(alloc, &.{ 0xC0, 0x0C }) catch {};
+            appendAnswerTail(alloc, &extra, 6, 60, 20);
+            extra.appendSlice(alloc, &[_]u8{0} ** 20) catch {};
+            arcount = 1;
+            appendEncodedName(alloc, &extra, "evil.test");
+            appendAnswerTail(alloc, &extra, wire.TYPE_A, 60, 4);
+            extra.appendSlice(alloc, &.{ 10, 9, 9, 9 }) catch {};
+        }
+
         std.mem.writeInt(u16, out[0..2], id, .big);
         std.mem.writeInt(u16, out[2..4], 0x8180, .big);
         std.mem.writeInt(u16, out[4..6], 1, .big);
         std.mem.writeInt(u16, out[6..8], ancount, .big);
-        @memset(out[8..12], 0);
+        std.mem.writeInt(u16, out[8..10], nscount, .big);
+        std.mem.writeInt(u16, out[10..12], arcount, .big);
         const qlen = pkt.len - 12;
         @memcpy(out[12 .. 12 + qlen], pkt[12..]);
         var off = 12 + qlen;
         @memcpy(out[off .. off + answers.items.len], answers.items);
         off += answers.items.len;
+        @memcpy(out[off .. off + extra.items.len], extra.items);
+        off += extra.items.len;
         return off;
     }
 
@@ -1130,6 +1188,12 @@ fn appendEncodedNameTo(out: []u8, off: *usize, name: []const u8) void {
 
 fn appendAnswerHdr(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), rtype: u16, ttl: u32, rdlen: usize) void {
     list.appendSlice(a, &.{ 0xC0, 0x0C }) catch return;
+    appendAnswerTail(a, list, rtype, ttl, rdlen);
+}
+
+/// The type/class/ttl/rdlen tail of a resource record, when the owner
+/// name was already emitted (a pointer or an encoded name).
+fn appendAnswerTail(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), rtype: u16, ttl: u32, rdlen: usize) void {
     list.appendSlice(a, std.mem.asBytes(&std.mem.nativeToBig(u16, rtype))) catch return;
     list.appendSlice(a, std.mem.asBytes(&std.mem.nativeToBig(u16, 1))) catch return;
     list.appendSlice(a, std.mem.asBytes(&std.mem.nativeToBig(u32, ttl))) catch return;
@@ -1341,4 +1405,37 @@ test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
         if (r.jobs.items[i].dns_id != r.jobs.items[i - 1].dns_id +% 1) sequential = false;
     }
     try std.testing.expect(!sequential);
+}
+
+test "dns-async: authority and additional records are dropped, not cached (J5)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.poison_sections.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.rrs.len);
+    try std.testing.expectEqual(wire.TYPE_A, res.rrs[0].rtype);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, res.rrs[0].rdata);
+
+    // The poisoned sections never reached the cache either: a query for
+    // the planted owner must go to the wire.
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("evil.test", .a, 8);
+    spins = 0;
+    while (ctx2.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expect(ctx2.status.? == .resolved or ctx2.status.? == .failed);
+    if (ctx2.raw) |*res2| res2.deinitOn(std.testing.allocator);
 }
