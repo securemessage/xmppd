@@ -1029,7 +1029,7 @@ pub const Engine = struct {
             self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         }
         s.phase = .resolving;
-        self.resolver.?.resolve(s.host, .client, s.port, h.encode()) catch {
+        self.resolver.?.resolve(s.host, .client, s.port, h.encode(), true) catch {
             s.fail(self.allocator, "resolve-error");
             return;
         };

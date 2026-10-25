@@ -114,6 +114,9 @@ const Job = struct {
     /// Port used when the SRV chain yields nothing and the fallback
     /// address path runs.
     default_port: u16 = 0,
+    /// TLSA lookups cost one round trip per target; callers that
+    /// cannot use DANE (plain transports) skip them entirely.
+    want_tlsa: bool = false,
 
     srv_list: std.ArrayListUnmanaged(SrvEnt) = .{},
     srv_pos: usize = 0,
@@ -159,6 +162,7 @@ const WaitEnt = struct {
     kind: enum { resolve, query },
     service_idx: u8 = 0,
     default_port: u16 = 0,
+    want_tlsa: bool = false,
     rtype: u16 = 0,
 };
 
@@ -286,6 +290,7 @@ pub const Resolver = struct {
         job.phase = .srv_tls;
         job.service_idx = e.service_idx;
         job.default_port = e.default_port;
+        job.want_tlsa = e.want_tlsa;
         errdefer self.freeJob(job);
         try self.sendSrv(job, SRV_TLS[job.service_idx]);
         try self.jobs.append(self.alloc, job);
@@ -325,7 +330,10 @@ pub const Resolver = struct {
 
     /// SRV chain resolve. Literal IPs complete synchronously with one
     /// target (no UDP traffic).
-    pub fn resolve(self: *Resolver, name: []const u8, service: Service, default_port: u16, session_key: usize) !void {
+    /// want_tlsa: fetch TLSA records per target (_port._tcp.<target>)
+    /// when the caller can authenticate with them; false callers get
+    /// the same addresses without the extra round trips.
+    pub fn resolve(self: *Resolver, name: []const u8, service: Service, default_port: u16, session_key: usize, want_tlsa: bool) !void {
         if (net.Address.parseIp(name, default_port)) |addr| {
             const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, name), .tlsa = &.{}, .is_direct_tls = false };
             const list = try self.alloc.alloc(Target, 1);
@@ -336,23 +344,26 @@ pub const Resolver = struct {
 
         try self.ensureOpen();
         // An identical in-flight lookup takes another waiter instead of
-        // a second job on the wire.
+        // a second job on the wire. want_tlsa joins the merge key: a
+        // TLSA-less job would starve a DANE caller of its records.
         for (self.jobs.items) |job| {
             if (job.is_raw) continue;
             if (job.service_idx != @intFromEnum(service)) continue;
             if (job.default_port != default_port) continue;
+            if (job.want_tlsa != want_tlsa) continue;
             if (!std.ascii.eqlIgnoreCase(job.name, name)) continue;
             try job.waiters.append(self.alloc, session_key);
             return;
         }
         if (self.jobs.items.len >= MAX_JOBS) {
-            try self.enqueueWait(session_key, name, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port });
+            try self.enqueueWait(session_key, name, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
             return;
         }
         const job = try self.allocJob(session_key, name);
         job.phase = .srv_tls;
         job.service_idx = @intFromEnum(service);
         job.default_port = default_port;
+        job.want_tlsa = want_tlsa;
         errdefer self.freeJob(job);
         try self.sendSrv(job, SRV_TLS[job.service_idx]);
         try self.jobs.append(self.alloc, job);
@@ -940,8 +951,13 @@ pub const Resolver = struct {
                     self.nextTarget(job) catch return self.dropJob(job, .failed);
                     return;
                 }
-                job.phase = .tlsa;
-                self.sendTlsa(job) catch return self.dropJob(job, .failed);
+                if (job.want_tlsa) {
+                    job.phase = .tlsa;
+                    self.sendTlsa(job) catch return self.dropJob(job, .failed);
+                    return;
+                }
+                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+                self.nextTarget(job) catch return self.dropJob(job, .failed);
             },
             .tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
@@ -988,6 +1004,10 @@ pub const Resolver = struct {
                     .tlsa = &.{},
                     .is_direct_tls = false,
                 }) catch return self.dropJob(job, .failed);
+                if (!job.want_tlsa) {
+                    self.complete(job);
+                    return;
+                }
                 job.phase = .fallback_tlsa;
                 var buf: [280]u8 = undefined;
                 const qname = dns.tlsaQueryName(&buf, defport, job.name) catch return self.dropJob(job, .failed);
@@ -1254,6 +1274,7 @@ const FakeDns = struct {
     srv_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
 
     fn run(self: *FakeDns) void {
@@ -1357,6 +1378,7 @@ const FakeDns = struct {
             appendAnswerHdr(alloc, &answers, wire.TYPE_A, 60, 4);
             answers.appendSlice(alloc, &.{ 127, 0, 0, 1 }) catch {};
         } else if (q.qtype == wire.TYPE_TLSA) {
+            _ = self.tlsa_recvd.fetchAdd(1, .monotonic);
             ancount = 1;
             appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 7);
             answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
@@ -1562,7 +1584,7 @@ test "dns-async: resolve() runs the SRV chain and the TTL cache serves repeats" 
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    try r.resolve("svc.test", .client, 5222, 3);
+    try r.resolve("svc.test", .client, 5222, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
 
@@ -1600,7 +1622,7 @@ test "dns-async: a failed query build leaves no freed job in the list (J1)" {
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
 
-    try std.testing.expectError(error.InvalidName, r.resolve("bad..name", .client, 5222, 1));
+    try std.testing.expectError(error.InvalidName, r.resolve("bad..name", .client, 5222, 1, true));
     try std.testing.expectError(error.InvalidName, r.query("bad..name", .a, 2));
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
@@ -1729,7 +1751,7 @@ test "dns-async: the fallback address path honors the requested port (J7)" {
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    try r.resolve("host.test", .server, 5269, 3);
+    try r.resolve("host.test", .server, 5269, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
@@ -1765,11 +1787,56 @@ test "dns-async: an all-'.' SRV answer reports service_unavailable, not nxdomain
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    try r.resolve("svc.test", .client, 5222, 3);
+    try r.resolve("svc.test", .client, 5222, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
 
     try std.testing.expectEqual(Status.service_unavailable, ctx.status.?);
+}
+
+test "dns-async: want_tlsa=false skips the TLSA round trip entirely" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    // No TLSA query ever touched the wire, and targets carry no records.
+    try std.testing.expectEqual(@as(u32, 0), srv.tlsa_recvd.load(.monotonic));
+    for (res.targets) |t| try std.testing.expectEqual(@as(usize, 0), t.tlsa.len);
+}
+
+test "dns-async: want_tlsa=true attaches the fetched records per target" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    try std.testing.expect(srv.tlsa_recvd.load(.monotonic) > 0);
+    try std.testing.expect(res.targets[0].tlsa.len >= 1);
 }
 
 test "dns-async: identical resolves merge into one job (J6)" {
@@ -1782,8 +1849,8 @@ test "dns-async: identical resolves merge into one job (J6)" {
     var ctx = FreeingCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
 
-    try r.resolve("svc.test", .client, 5222, 1);
-    try r.resolve("svc.test", .client, 5222, 2);
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    try r.resolve("svc.test", .client, 5222, 2, true);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiters.items.len);
 
@@ -1802,7 +1869,7 @@ test "dns-async: over-cap requests queue and cancel detaches (J6)" {
     var name_buf: [32]u8 = undefined;
     for (0..65) |i| {
         const n = std.fmt.bufPrint(&name_buf, "h{d}.test", .{i}) catch unreachable;
-        try r.resolve(n, .client, 5222, i + 1);
+        try r.resolve(n, .client, 5222, i + 1, true);
     }
     try std.testing.expectEqual(@as(usize, 64), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 1), r.wait_queue.items.len);
@@ -1826,8 +1893,8 @@ test "dns-async: a shared job notifies only its remaining waiters (J6)" {
     var ctx = FreeingCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
 
-    try r.resolve("svc.test", .client, 5222, 1);
-    try r.resolve("svc.test", .client, 5222, 2);
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    try r.resolve("svc.test", .client, 5222, 2, true);
     r.cancel(1);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
 
