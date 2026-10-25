@@ -39,6 +39,9 @@ const TCP_TIMEOUT_MS: i64 = 4000;
 const CHAIN_DEADLINE_MS: i64 = 10_000;
 const MAX_JOBS: usize = 64;
 const CACHE_CAP: usize = 64;
+/// Flattened connect targets per resolution; a hostile SRV answer
+/// cannot grow a job's target list past this.
+const TARGET_CAP: usize = 16;
 
 pub const Service = enum(u8) { client = 0, server = 1 };
 
@@ -1096,6 +1099,7 @@ pub const Resolver = struct {
     /// Begin (or continue) the per-target chain: a target marked "." is
     /// skipped; the first live target gets an A query.
     fn stepTargetAddr(self: *Resolver, job: *Job) !void {
+        if (job.targets.items.len >= TARGET_CAP) return self.complete(job);
         while (job.srv_pos < job.srv_list.items.len and
             job.srv_list.items[job.srv_pos].unavailable)
         {
@@ -1135,6 +1139,7 @@ pub const Resolver = struct {
     }
 
     fn emitTarget(self: *Resolver, job: *Job, ent: *const SrvEnt, addr: net.Address, tlsa_recs: []dns.TlsaRecord) !void {
+        if (job.targets.items.len >= TARGET_CAP) return;
         const host = try self.alloc.dupe(u8, ent.host);
         errdefer self.alloc.free(host);
         var tlsa: []dns.TlsaRecord = &.{};
@@ -1336,6 +1341,9 @@ const FakeDns = struct {
     /// When set, address queries are received but never answered,
     /// exercising per-query retries and the whole-chain deadline.
     a_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When non-zero, SRV answers carry this many targets (t0.test,
+    /// t1.test, ...) to exercise the flattened-target cap.
+    srv_many: u8 = 0,
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1415,6 +1423,22 @@ const FakeDns = struct {
             if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
                 // NODATA for the direct-TLS prefix, or everywhere when
                 // the test wants the fallback path.
+            } else if (self.srv_many > 0) {
+                var i: u8 = 0;
+                while (i < self.srv_many) : (i += 1) {
+                    ancount += 1;
+                    var tbuf: [32]u8 = undefined;
+                    const tname = std.fmt.bufPrint(&tbuf, "t{d}.test", .{i}) catch unreachable;
+                    appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 6 + encLen(tname));
+                    var v: u16 = 0;
+                    v = 10;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    v = 1;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    v = 15222;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    appendEncodedName(alloc, &answers, tname);
+                }
             } else if (self.srv_dot.load(.monotonic)) {
                 ancount = 1;
                 appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 7);
@@ -1881,6 +1905,29 @@ test "dns-async: the whole-chain deadline bounds a silent target list" {
     // The chain bound fired long before two 2 s per-query retries
     // plus a 10 s fallback tail could.
     try std.testing.expect(elapsed < 3000);
+}
+
+test "dns-async: a hostile SRV answer is capped at 16 emitted targets" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 20;
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 400) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 16), res.targets.len);
+    // The walk stopped at the cap instead of querying all 20 targets.
+    try std.testing.expect(srv.udp_recvd.load(.monotonic) < 20 * 3);
 }
 
 test "dns-async: want_tlsa=false skips the TLSA round trip entirely" {
