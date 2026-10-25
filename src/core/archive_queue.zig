@@ -84,6 +84,12 @@ pub const ArchiveWriteQueue = struct {
     /// Total dropped jobs (queue full) since start — for ops visibility.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Job payload copies that failed on allocation — dropped before enqueue.
+    copy_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Jobs the store call rejected inside the writer — logged per job.
+    store_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     pub fn init() !ArchiveWriteQueue {
         const fds = try posix.pipe();
         errdefer posix.close(fds[0]);
@@ -119,6 +125,7 @@ pub const ArchiveWriteQueue = struct {
         stanza_xml: []const u8,
     ) void {
         var job = copyJob(owner, with, stanza_id, timestamp, stanza_xml) catch {
+            _ = self.copy_failed.fetchAdd(1, .monotonic);
             log.err("archive write queue: job copy alloc failed — dropping", .{});
             return;
         };
@@ -213,7 +220,8 @@ pub const ArchiveWriteQueue = struct {
         while (processed < batch) : (processed += 1) {
             var job = self.pop() orelse break;
             store.store(job.owner, job.with, job.stanza_id, job.timestamp, job.stanza_xml) catch |err| {
-                log.err("archive store failed: {}", .{err});
+                _ = self.store_failed.fetchAdd(1, .monotonic);
+                log.warn("archive store failed ({d} total): {}", .{ self.store_failed.load(.monotonic), err });
             };
             job.deinit();
         }
@@ -298,4 +306,77 @@ test "ArchiveWriteQueue: writerLoop drains into store and exits on stop" {
     // Wake the writer so it notices the flag
     _ = posix.write(q.pipe_wr, "\x00") catch {};
     t.join();
+}
+
+test "ArchiveWriteQueue: store failures are counted, not silent (S31)" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var store = MockStore{ .fail_next = true };
+    q.enqueue("a@localhost", "b@localhost", "s1", 1, "<m/>");
+    q.enqueue("a@localhost", "b@localhost", "s2", 2, "<m/>");
+    q.drainInto(&store, 64);
+
+    try std.testing.expectEqual(@as(u64, 1), q.store_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), store.stored.load(.monotonic));
+}
+
+// S31 regression: jobs pushed through the queue must land in the backend
+// and still be there after the backend is closed and reopened.
+test "ArchiveWriteQueue: 1:1 and groupchat jobs reach the store and survive a reopen (S31)" {
+    try reopenSurvival(@import("rocksdb_backend"));
+    try reopenSurvival(@import("lmdb_backend"));
+}
+
+fn reopenSurvival(comptime BackendMod: type) !void {
+    const archive_store_mod = @import("archive_store");
+    const Backend = BackendMod.Backend;
+    const Store = archive_store_mod.ArchiveStore(Backend);
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("archive");
+    const path = try tmp.dir.realpathAlloc(alloc, "archive");
+    defer alloc.free(path);
+
+    var be = try Backend.open(path, .{});
+    var store = Store.init(&be, alloc);
+    var q = try ArchiveWriteQueue.init();
+
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *ArchiveWriteQueue, st: *Store) void {
+            queue.writerLoop(st, 128);
+        }
+    }.run, .{ &q, &store });
+
+    q.enqueue("alice@test.dev", "bob@test.dev", "m-1", 1700000000, "<message from='alice@test.dev/r' to='bob@test.dev' type='chat' id='m-1'><body>1:1</body></message>");
+    q.enqueue("room@conf.test.dev", "room@conf.test.dev/alice", "g-1", 1700000001, "<message from='room@conf.test.dev/alice' type='groupchat' id='g-1'><body>gc</body></message>");
+
+    // Stopping drains the queue fully before the writer exits.
+    q.stopping.store(true, .release);
+    _ = posix.write(q.pipe_wr, "\x00") catch {};
+    t.join();
+    q.deinit();
+
+    const m1 = try store.getMessage("alice@test.dev", 1700000000, "m-1");
+    try std.testing.expect(m1 != null);
+    try std.testing.expect(std.mem.indexOf(u8, m1.?, "type='chat'") != null);
+    alloc.free(m1.?);
+    const g1 = try store.getMessage("room@conf.test.dev", 1700000001, "g-1");
+    try std.testing.expect(g1 != null);
+    try std.testing.expect(std.mem.indexOf(u8, g1.?, "type='groupchat'") != null);
+    alloc.free(g1.?);
+
+    be.close();
+
+    var be2 = try Backend.open(path, .{});
+    defer be2.close();
+    var store2 = Store.init(&be2, alloc);
+    const m1b = try store2.getMessage("alice@test.dev", 1700000000, "m-1");
+    try std.testing.expect(m1b != null);
+    alloc.free(m1b.?);
+    const g1b = try store2.getMessage("room@conf.test.dev", 1700000001, "g-1");
+    try std.testing.expect(g1b != null);
+    alloc.free(g1b.?);
 }

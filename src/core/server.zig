@@ -545,6 +545,10 @@ pub const Server = struct {
     /// against `archive`.
     archive_writer: ?*archive_queue_mod.ArchiveWriteQueue = null,
 
+    /// Inline archive store failures (no writer thread wired) — for ops
+    /// visibility; queue-mode failures are counted on the queue instead.
+    archive_store_failed: u64 = 0,
+
     /// VCard store — per-user vCard XML blobs (XEP-0054).
     vcard: ?*GenericVCardStore = null,
 
@@ -845,7 +849,10 @@ pub const Server = struct {
             return;
         }
         if (self.archive) |archive| {
-            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch {};
+            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch |err| {
+                self.archive_store_failed += 1;
+                log.warn("inline archive store failed ({d} total): {}", .{ self.archive_store_failed, err });
+            };
         }
     }
 
