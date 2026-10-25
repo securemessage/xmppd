@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const xml_writer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -216,6 +222,11 @@ pub fn build(b: *std.Build) void {
         .root_module = xml_test_mod,
     });
 
+    const xml_writer_tests = b.addTest(.{
+        .name = "xml-writer-tests",
+        .root_module = xml_writer_mod,
+    });
+
     const xmpp_tests = b.addTest(.{
         .name = "xmpp-tests",
         .root_module = xmpp_test_mod,
@@ -267,6 +278,7 @@ pub fn build(b: *std.Build) void {
     const run_socketpair_tests = b.addRunArtifact(socketpair_tests);
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
+    const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
@@ -1567,6 +1579,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
+    test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
