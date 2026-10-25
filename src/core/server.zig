@@ -2949,11 +2949,8 @@ pub const Server = struct {
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
-    /// Return a service-unavailable error to a remote sender whose stanza
-    /// could not be delivered or stored locally. The error goes back out over
-    /// the same S2S link the stanza arrived on, so the remote server can
-    /// bounce it to the original sender (E2b).
-    fn bounceS2sInbound(self: *Server, remote_from: []const u8, local_to: []const u8, msg_id: []const u8) void {
+    /// Return a service-unavailable error over the inbound S2S link.
+    fn bounceS2sInbound(self: *Server, remote_from: []const u8, local_to: []const u8, tag_name: []const u8, stanza_id: []const u8) void {
         if (!self.s2s_ipc.connected) {
             log.warn("S2S bounce for {s} dropped: no S2S daemon", .{remote_from});
             return;
@@ -2962,7 +2959,7 @@ pub const Server = struct {
         var lease = self.leaseByteScratch() orelse return;
         defer lease.release();
         var fbs = std.io.fixedBufferStream(lease.buf);
-        writeS2sBounce(fbs.writer(), local_to, remote_from, msg_id) catch {
+        writeS2sError(fbs.writer(), tag_name, local_to, remote_from, stanza_id) catch {
             log.warn("S2S bounce for {s} dropped: serialization failed", .{remote_from});
             return;
         };
@@ -3035,6 +3032,18 @@ pub const Server = struct {
 
                 if (target_count == 0) {
                     const parts = extractStanzaParts(m.stanza_xml);
+                    if (parts.is_message and std.mem.eql(u8, parts.msg_type, "groupchat")) {
+                        log.warn("S2S groupchat to {s}: recipient unavailable, bouncing", .{m.to_jid});
+                        self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
+                        return;
+                    }
+                    if (parts.is_iq) {
+                        if (std.mem.eql(u8, parts.msg_type, "get") or std.mem.eql(u8, parts.msg_type, "set")) {
+                            log.warn("S2S IQ to {s}: recipient unavailable, bouncing", .{m.to_jid});
+                            self.bounceS2sInbound(m.from_jid, m.to_jid, "iq", parts.msg_id);
+                        }
+                        return;
+                    }
                     // An error stanza is never stored and never bounced back, or
                     // two servers could bounce it at each other.
                     if (parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
@@ -3067,7 +3076,7 @@ pub const Server = struct {
                         // Quota reached, or no offline store at all: tell the remote
                         // sender instead of dropping the stanza on the floor (E2b).
                         log.warn("S2S inbound to {s}: recipient offline and not storable, bouncing", .{m.to_jid});
-                        self.bounceS2sInbound(m.from_jid, m.to_jid, parts.msg_id);
+                        self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
                         return;
                     }
                     log.info("S2S inbound to {s}: recipient unavailable, nothing stored", .{m.to_jid});
@@ -5042,6 +5051,7 @@ fn b64EncodeWrite(writer: anytype, data: []const u8) !void {
 
 const StanzaParts = struct {
     is_message: bool,
+    is_iq: bool,
     msg_type: []const u8,
     msg_id: []const u8,
     inner_xml: []const u8,
@@ -5054,6 +5064,7 @@ const StanzaParts = struct {
 fn extractStanzaParts(stanza: []const u8) StanzaParts {
     var result = StanzaParts{
         .is_message = false,
+        .is_iq = false,
         .msg_type = "",
         .msg_id = "",
         .inner_xml = "",
@@ -5066,6 +5077,7 @@ fn extractStanzaParts(stanza: []const u8) StanzaParts {
     while (i < stanza.len and stanza[i] != ' ' and stanza[i] != '>' and stanza[i] != '/') : (i += 1) {}
     const tag_name = stanza[1..i];
     result.is_message = std.mem.eql(u8, tag_name, "message");
+    result.is_iq = std.mem.eql(u8, tag_name, "iq");
 
     // Find end of opening tag — scan for first '>' that's not inside an attr value
     var in_quote: bool = false;
@@ -5122,20 +5134,28 @@ fn extractStanzaParts(stanza: []const u8) StanzaParts {
 /// attribute (G7). from/to are plain JIDs and are escaped once. Serialization
 /// errors propagate so the caller can log them.
 fn writeS2sBounce(w: anytype, local_to: []const u8, remote_from: []const u8, msg_id: []const u8) !void {
-    try w.writeAll("<message type='error' from='");
+    return writeS2sError(w, "message", local_to, remote_from, msg_id);
+}
+
+fn writeS2sError(w: anytype, tag_name: []const u8, local_to: []const u8, remote_from: []const u8, stanza_id: []const u8) !void {
+    try w.writeByte('<');
+    try w.writeAll(tag_name);
+    try w.writeAll(" type='error' from='");
     try xml.escapeWrite(w, local_to);
     try w.writeAll("' to='");
     try xml.escapeWrite(w, remote_from);
     try w.writeByte('\'');
-    if (msg_id.len > 0) {
+    if (stanza_id.len > 0) {
         try w.writeAll(" id='");
         var id_buf: [1024]u8 = undefined;
         var id_fbs = std.io.fixedBufferStream(&id_buf);
-        try xml.decodeWrite(id_fbs.writer(), msg_id);
+        try xml.decodeWrite(id_fbs.writer(), stanza_id);
         try xml.escapeWrite(w, id_fbs.getWritten());
         try w.writeByte('\'');
     }
-    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>");
+    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></");
+    try w.writeAll(tag_name);
+    try w.writeByte('>');
 }
 
 /// Extract the value of an attribute from an XML opening tag string.
@@ -6702,6 +6722,25 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), got);
+
+    changes.reset();
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='gc1' type='groupchat'><body>not offline</body></message>",
+    } }, &changes);
+    _ = server.s2s_ipc.flush() catch {};
+    const groupchat_n = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(groupchat_n > 0);
+    const groupchat_frame = ipc_protocol.readFrame(frame_buf[0..groupchat_n]);
+    try std.testing.expect(groupchat_frame != null);
+    const groupchat_bounce = switch (try ipc_protocol.decode(groupchat_frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "id='gc1'") != null);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 }
 
 test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
@@ -6855,6 +6894,35 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     _ = server.s2s_ipc.flush() catch {};
     const second = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), second);
+
+    changes.reset();
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<iq from='carol@example.com/res' to='bob@localhost' id='q1' type='get'><query xmlns='jabber:iq:version'/></iq>",
+    } }, &changes);
+    _ = server.s2s_ipc.flush() catch {};
+    const iq_n = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(iq_n > 0);
+    const iq_frame = ipc_protocol.readFrame(frame_buf[0..iq_n]);
+    try std.testing.expect(iq_frame != null);
+    const iq_bounce = switch (try ipc_protocol.decode(iq_frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, iq_bounce.stanza_xml, "<iq type='error'"));
+    try std.testing.expect(std.mem.indexOf(u8, iq_bounce.stanza_xml, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, iq_bounce.stanza_xml, "id='q1'") != null);
+
+    changes.reset();
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = "<iq from='carol@example.com/res' to='bob@localhost' id='q2' type='result'><query xmlns='jabber:iq:version'/></iq>",
+    } }, &changes);
+    _ = server.s2s_ipc.flush() catch {};
+    const iq_result_n = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), iq_result_n);
 }
 
 test "G7: the S2S bounce escapes the id once and from/to once" {
