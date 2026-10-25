@@ -2026,7 +2026,7 @@ test "dns-async: the whole-chain deadline bounds a silent target list" {
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     // The chain bound fired long before two 2 s per-query retries
     // plus a 10 s fallback tail could.
-    try std.testing.expect(elapsed < 3000);
+    try std.testing.expect(elapsed < 1500);
 }
 
 test "dns-async: a hostile SRV answer is capped at 16 emitted targets" {
@@ -2455,4 +2455,36 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
     while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a repeat resolve is served by the RR cache without wire" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.soa_nodata.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+
+    // Every chain step of the identical resolve now consults the RR
+    // cache: no SRV, A or TLSA query may touch the wire again.
+    const wired = srv.udp_recvd.load(.monotonic);
+    var ctx2 = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx2, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 4, true);
+    spins = 0;
+    while (ctx2.status == null and spins < 50) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx2.status.?);
+    var res2 = ctx2.res.?;
+    defer res2.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(wired, srv.udp_recvd.load(.monotonic));
 }
