@@ -1498,12 +1498,16 @@ fn collapseOccupant(
     return true;
 }
 
+const REPLACED_NOTICE_BUF_LEN = 6 * (256 + 64 + 256) + 256;
+
 /// Tells a resource replaced by a takeover that it is no longer in the room.
 /// A local target is checked against its bound JID so a reused session slot
 /// never receives it; a target on another worker goes through the
 /// generation-checked unicast.
 fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
-    var buf: [1024]u8 = undefined;
+    // Every variable byte may become a six-byte XML entity; the remaining
+    // 256 bytes cover the literal markup and affiliation name.
+    var buf: [REPLACED_NOTICE_BUF_LEN]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;

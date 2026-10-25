@@ -7488,6 +7488,70 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.cross_worker_drops.load(.monotonic));
 }
 
+test "Server: replaced-resource notice fits worst-case XML escaping" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var room_jid: [256]u8 = undefined;
+    @memset(&room_jid, '\'');
+    var nick: [64]u8 = undefined;
+    @memset(&nick, '\'');
+    var first_jid: [256]u8 = undefined;
+    @memset(&first_jid, '\'');
+    @memcpy(first_jid[200..211], "@localhost/");
+    var second_jid = first_jid;
+    second_jid[second_jid.len - 1] = 'x';
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    muc_handler.processRemoteJoin(&server, .{
+        .room_jid = &room_jid,
+        .real_jid = &first_jid,
+        .nick = &nick,
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+    muc_handler.processRemoteJoin(&server, .{
+        .room_jid = &room_jid,
+        .real_jid = &second_jid,
+        .nick = &nick,
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+
+    const NoticeCheck = struct {
+        seen: bool = false,
+        len: usize = 0,
+        complete: bool = false,
+
+        fn onDelivery(self: *@This(), session_id: u32, generation: u32, payload: []const u8) void {
+            _ = session_id;
+            _ = generation;
+            if (std.mem.indexOf(u8, payload, "type='unavailable'") == null) return;
+            self.seen = true;
+            self.len = payload.len;
+            self.complete = std.mem.endsWith(u8, payload, "</presence>") and
+                std.mem.indexOf(u8, payload, "&apos;") != null;
+        }
+    };
+    var check = NoticeCheck{};
+    _ = delivery_sys.getQueue(1).drain(&check, NoticeCheck.onDelivery);
+    try std.testing.expect(check.seen);
+    try std.testing.expect(check.complete);
+    try std.testing.expect(check.len > 1024);
+}
+
 test "S14: failed cross-worker resource does not block local delivery" {
     const allocator = std.testing.allocator;
 
