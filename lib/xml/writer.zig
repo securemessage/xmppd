@@ -13,6 +13,7 @@
 //! once, so partial output can never count as success.
 
 const std = @import("std");
+const scanner_mod = @import("scanner.zig");
 
 /// Errors for malformed caller input (operating errors, not asserts).
 pub const Error = error{
@@ -43,15 +44,53 @@ const v_quot: ByteVec = @splat('"');
 const v_ctrl: ByteVec = @splat(0x20);
 const v_ef: ByteVec = @splat(0xEF);
 
-/// Markup bytes the stream reader has already validated (XML Char, UTF-8,
-/// well-formedness). rawSpan emits them verbatim; the type exists so that
-/// raw bytes cannot reach the output without that validation.
+/// Markup bytes proven valid by the validating reader (XML Char, UTF-8,
+/// balanced elements). rawSpan emits them verbatim; the type exists so
+/// that raw bytes cannot reach the output without that validation.
 pub const ValidatedSpan = struct {
     bytes: []const u8,
 
-    /// Constructed by the validating reader only. Any other caller is
-    /// bypassing the guarantee this type exists to enforce.
-    pub fn fromReader(bytes: []const u8) ValidatedSpan {
+    /// The only constructor, and it validates: XML Char plus a
+    /// well-formedness pass through lib/xml/scanner requiring balanced
+    /// elements with matching close names. A dedicated zero-cost
+    /// reader-produced constructor arrives with C5; until then callers
+    /// pay one scan per span.
+    pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
+        try validateChars(bytes);
+        var sc = scanner_mod.Scanner.init(alloc);
+        defer sc.deinit();
+        var pos: usize = 0;
+        var depth: usize = 0;
+        var names: [max_depth][]const u8 = undefined;
+        var steps: usize = 0;
+        while (true) {
+            steps += 1;
+            if (steps > bytes.len + 64) return error.InvalidCharacter;
+            const tok = sc.next(bytes, &pos) catch return error.InvalidCharacter;
+            if (tok == null) {
+                if (pos >= bytes.len) break;
+                continue;
+            }
+            switch (tok.?.type) {
+                .element_open => {
+                    if (depth >= max_depth) return error.InvalidCharacter;
+                    names[depth] = tok.?.name;
+                    depth += 1;
+                },
+                .element_self_close => {
+                    if (depth == 0) return error.InvalidCharacter;
+                    depth -= 1;
+                },
+                .element_close => {
+                    if (depth == 0) return error.InvalidCharacter;
+                    depth -= 1;
+                    if (!std.mem.eql(u8, names[depth], tok.?.name)) return error.InvalidCharacter;
+                },
+                .eof => break,
+                else => {},
+            }
+        }
+        if (depth != 0) return error.InvalidCharacter;
         return .{ .bytes = bytes };
     }
 };
@@ -524,7 +563,7 @@ test "rawSpan emits reader-validated bytes verbatim" {
 
     try x.elementOpen("iq");
     x.elementOpenEnd();
-    const span = ValidatedSpan.fromReader("<child a='&amp;'>raw &amp; text</child>");
+    const span = try ValidatedSpan.fromReader(testing.allocator, "<child a='&amp;'>raw &amp; text</child>");
     x.rawSpan(span);
     try x.elementClose("iq");
     try x.finish();
@@ -646,4 +685,33 @@ test "a rejected attribute emits nothing and latches finish() (L1)" {
     try testing.expectError(error.InvalidName, y.elementClose("bad name"));
     try testing.expectEqualStrings("<m>", w2.buffered());
     try testing.expectError(error.Overflow, y.finish());
+}
+
+test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
+    // Rejected: control byte smuggled inside markup, unbalanced tags,
+    // mismatched close name, truncated element.
+    try testing.expectError(error.InvalidCharacter,
+        ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
+    try testing.expectError(error.InvalidCharacter,
+        ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
+    try testing.expectError(error.InvalidCharacter,
+        ValidatedSpan.fromReader(testing.allocator, "<a>"));
+    try testing.expectError(error.InvalidCharacter,
+        ValidatedSpan.fromReader(testing.allocator, "</a>"));
+
+    // Accepted: balanced elements and bare text both scan cleanly.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<c><d t='1'/>x</c>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "plain text &amp; entities");
+
+    // And a rejected span cannot reach the output at all.
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+    try x.elementOpen("iq");
+    x.elementOpenEnd();
+    try testing.expectError(error.InvalidCharacter,
+        ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
+    try x.elementClose("iq");
+    try x.finish();
+    try testing.expectEqualStrings("<iq></iq>", w.buffered());
 }
