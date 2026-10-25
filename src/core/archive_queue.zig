@@ -145,10 +145,10 @@ pub const ArchiveWriteQueue = struct {
         };
 
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         const n = self.countLocked();
         if (n >= MAX_JOBS) {
+            self.mutex.unlock();
             const total = self.dropped.fetchAdd(1, .monotonic) + 1;
             job.deinit();
             // Log the first drop and every power of two after it: a full
@@ -168,13 +168,17 @@ pub const ArchiveWriteQueue = struct {
 
         self.slots[self.tail % MAX_JOBS] = job;
         self.tail += 1;
+        const wake = n == 0;
+        self.mutex.unlock();
 
         // Wake the writer only on the empty-to-non-empty transition; it
-        // re-checks the count before sleeping, so further bytes buy nothing.
-        if (n == 0) {
+        // re-checks the count before sleeping, so further bytes buy
+        // nothing. The write runs after the mutex is released so the
+        // lock is never held across a syscall.
+        if (wake) {
             _ = posix.write(self.pipe_wr, "\x00") catch {
                 _ = self.wake_failed.fetchAdd(1, .monotonic);
-                log.err("archive write queue: wake write failed — writer may stall until next enqueue", .{});
+                log.err("archive write queue: wake write failed - writer may stall until next enqueue", .{});
             };
         }
     }
