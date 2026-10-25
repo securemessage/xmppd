@@ -2214,3 +2214,122 @@ test "AuthHandler: SCRAM unknown user records a failure" {
         }
     }
 }
+
+test "AuthHandler: SCRAM abandoned client-firsts count against the IP" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 2,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const names = [_][]const u8{ "ghost1", "ghost2", "ghost3" };
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        var client = sasl.ScramClient.init(allocator, names[i], "whatever");
+        defer client.deinit();
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 160 + i,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.10",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        if (reply != .auth_failure) return error.ExpectedAuthFailure;
+        if (i < 2) {
+            try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+        } else {
+            // The third abandoned exchange is denied by the IP window before
+            // the unknown-user lookup.
+            try std.testing.expectEqualStrings("policy-violation", reply.auth_failure.reason);
+        }
+    }
+}
+
+test "AuthHandler: PLAIN counts the IP before the lookup" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "alice", "secret123");
+
+    const first = handleSync(&handler, plainRequest(170, "10.0.0.11", payload)) orelse return error.NoResponse;
+    if (first != .auth_success) return error.ExpectedAuthSuccess;
+
+    const second = handleSync(&handler, plainRequest(171, "10.0.0.11", payload)) orelse return error.NoResponse;
+    if (second != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", second.auth_failure.reason);
+}
+
+test "AuthHandler: registration counts the IP before adding a user" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    const first = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 180,
+        .username = "new1",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.12",
+    } }) orelse return error.NoResponse;
+    if (first != .register_result or !first.register_result.success) return error.ExpectedRegisterSuccess;
+
+    const second = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 181,
+        .username = "new2",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.12",
+    } }) orelse return error.NoResponse;
+    if (second != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!second.register_result.success);
+    try std.testing.expectEqualStrings("policy-violation", second.register_result.reason);
+}
