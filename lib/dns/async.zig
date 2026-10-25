@@ -34,6 +34,9 @@ const KIND_TLSA = wire.TYPE_TLSA;
 const TIMEOUT_MS: i64 = 2000;
 const MAX_TRIES: u8 = 2;
 const TCP_TIMEOUT_MS: i64 = 4000;
+/// Bound on a whole resolve() chain across every SRV target; the
+/// per-query deadline still applies inside it.
+const CHAIN_DEADLINE_MS: i64 = 10_000;
 const MAX_JOBS: usize = 64;
 const CACHE_CAP: usize = 64;
 
@@ -189,6 +192,9 @@ pub const Resolver = struct {
     /// Requests queued behind a full in-flight set; promoted FIFO as
     /// jobs complete.
     wait_queue: std.ArrayListUnmanaged(WaitEnt) = .{},
+    /// Whole-chain deadline for resolve() jobs; a field so tests can
+    /// shrink it instead of sleeping ten seconds.
+    chain_deadline_ms: i64 = CHAIN_DEADLINE_MS,
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
@@ -307,6 +313,7 @@ pub const Resolver = struct {
             errdefer self.freeJob(job);
             try self.jobs.append(self.alloc, job);
         }
+        self.armChainDeadline(job);
         self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
             self.dropJob(job, .failed);
             return err;
@@ -385,6 +392,7 @@ pub const Resolver = struct {
             errdefer self.freeJob(job);
             try self.jobs.append(self.alloc, job);
         }
+        self.armChainDeadline(job);
         self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
             self.dropJob(job, .failed);
             return err;
@@ -421,8 +429,11 @@ pub const Resolver = struct {
         for (events[0..n]) |ev| {
             if (ev.filter == std.c.EVFILT.TIMER) {
                 // The event may have been queued before the job was
-                // freed by an earlier event in this same batch.
-                if (self.jobFromUdata(ev.udata)) |job| self.onDeadline(job);
+                // freed by an earlier event in this same batch. udata
+                // bit 6 marks the whole-chain deadline vs a retry.
+                if (self.jobFromUdata(ev.udata)) |job| {
+                    if (ev.udata & 0x40 != 0) self.onChainDeadline(job) else self.onDeadline(job);
+                }
             } else if (ev.filter == std.c.EVFILT.READ) {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
@@ -514,15 +525,36 @@ pub const Resolver = struct {
         _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
     }
 
+    /// Whole-chain bound, armed once per resolve() job beside the
+    /// per-query deadline: a long or hostile SRV list must not hold a
+    /// session past chain_deadline_ms of total resolution time. The
+    /// knote ident is the job pointer ORed low (Job is aligned, so a
+    /// set low bit never aliases the retry timer's ident), and udata
+    /// carries the kind bit next to (gen, slot).
+    fn armChainDeadline(self: *Resolver, job: *Job) void {
+        var ch = [1]posix.Kevent{.{
+            .ident = @intFromPtr(job) | 1,
+            .filter = std.c.EVFILT.TIMER,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = @intCast(self.chain_deadline_ms),
+            .udata = (@as(usize, job.gen) << 8) | 0x40 | job.slot,
+        }};
+        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+    }
+
     fn disarmDeadline(self: *Resolver, job: *Job) void {
-        var ch = [1]posix.Kevent{.{ .ident = @intFromPtr(job), .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 }};
+        var ch = [2]posix.Kevent{
+            .{ .ident = @intFromPtr(job), .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
+            .{ .ident = @intFromPtr(job) | 1, .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
+        };
         _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
     }
 
     /// Resolve a timer event's (gen, slot) udata back to a live job;
     /// null when the job was freed or its slot was re-used.
     fn jobFromUdata(self: *Resolver, udata: usize) ?*Job {
-        const slot: usize = udata & 0xFF;
+        const slot: usize = udata & 0x3F;
         const gen: u16 = @intCast(udata >> 8);
         if (slot >= MAX_JOBS) return null;
         const job = self.slots[slot] orelse return null;
@@ -572,6 +604,13 @@ pub const Resolver = struct {
             return;
         }
         log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
+        self.dropJob(job, .failed);
+    }
+
+    /// The whole-chain bound fired: regardless of which phase the job
+    /// sits in, the resolution is over.
+    fn onChainDeadline(self: *Resolver, job: *Job) void {
+        log.warn("dns: chain deadline exceeded for {s}", .{job.name});
         self.dropJob(job, .failed);
     }
 
@@ -1294,6 +1333,9 @@ const FakeDns = struct {
     /// When set, SRV answers carry a single "." target: RFC 2782's
     /// "service unavailable on this domain".
     srv_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, address queries are received but never answered,
+    /// exercising per-query retries and the whole-chain deadline.
+    a_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1321,7 +1363,7 @@ const FakeDns = struct {
                     const dn = self.buildDecoy(&decoy, qbuf[0..n]);
                     _ = posix.sendto(self.udp_fd, decoy[0..dn], 0, &peer, plen) catch {};
                 }
-                _ = posix.sendto(self.udp_fd, buf[0..resp_len], 0, &peer, plen) catch {};
+                if (resp_len > 0) _ = posix.sendto(self.udp_fd, buf[0..resp_len], 0, &peer, plen) catch {};
             }
             if (pfd[1].revents != 0) {
                 const cfd = posix.accept(self.tcp_fd, null, null, 0) catch continue;
@@ -1338,7 +1380,7 @@ const FakeDns = struct {
                 var out: [2]u8 = undefined;
                 std.mem.writeInt(u16, &out, @intCast(resp_len), .big);
                 _ = posix.send(cfd, &out, 0) catch {};
-                _ = posix.send(cfd, buf[0..resp_len], 0) catch {};
+                if (resp_len > 0) _ = posix.send(cfd, buf[0..resp_len], 0) catch {};
             }
         }
     }
@@ -1368,6 +1410,7 @@ const FakeDns = struct {
 
         var answers: std.ArrayListUnmanaged(u8) = .{};
         var ancount: u16 = 0;
+        if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV) {
             if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
                 // NODATA for the direct-TLS prefix, or everywhere when
@@ -1814,6 +1857,30 @@ test "dns-async: an all-'.' SRV answer reports service_unavailable, not nxdomain
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
 
     try std.testing.expectEqual(Status.service_unavailable, ctx.status.?);
+}
+
+test "dns-async: the whole-chain deadline bounds a silent target list" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.chain_deadline_ms = 200;
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    const start = std.time.milliTimestamp();
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 400) : (spins += 1) r.step(50);
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    // The chain bound fired long before two 2 s per-query retries
+    // plus a 10 s fallback tail could.
+    try std.testing.expect(elapsed < 3000);
 }
 
 test "dns-async: want_tlsa=false skips the TLSA round trip entirely" {
