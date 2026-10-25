@@ -1086,11 +1086,32 @@ pub const Engine = struct {
         }
     }
 
+    /// Drop a dead session's resolve interest so its job is freed
+    /// instead of completing into a reaped slot.
+    pub fn cancelResolve(self: *Engine, h: Handle) void {
+        if (self.resolver) |*r| r.cancel(h.encode());
+    }
+
     /// Completion callback for the resolver (engine thread). static per Cb.
     fn onDnsResult(ctx: ?*anyopaque, session_key: usize, status: DnsStatus, res: ?Resolution) void {
         const self: *Engine = @ptrCast(@alignCast(ctx orelse return));
         const h = Handle.decode(session_key);
-        const s = self.sessionAt(h) orelse return;
+        const s = self.sessionAt(h) orelse {
+            // The session was reaped before the answer landed; the
+            // resolver still delivers it, so the orphan is freed here.
+            if (res) |*r| {
+                var v = r.*;
+                v.deinitOn(self.allocator);
+            }
+            return;
+        };
+        if (s.isDead()) {
+            if (res) |*r| {
+                var v = r.*;
+                v.deinitOn(self.allocator);
+            }
+            return;
+        }
         s.onResolution(res, status);
     }
 
@@ -1511,4 +1532,63 @@ test "engine: the resolver watch registers its kqueue, not a tick (J8)" {
 
     eng.sessionAt(h).?.fail(alloc, "test-done");
     eng.reapDead();
+}
+test "engine: a session that dies mid-resolve frees the resolver job (J8)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "resolveme.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    const s = eng.sessionAt(h).?;
+    try std.testing.expect(s.phase == .resolving);
+    try std.testing.expectEqual(@as(usize, 1), eng.resolver.?.jobs.items.len);
+
+    s.fail(alloc, "test-stop");
+    try std.testing.expectEqual(@as(usize, 0), eng.resolver.?.jobs.items.len);
+    eng.reapDead();
+}
+
+test "engine: a DNS answer for a reaped session is freed, not leaked (J8)" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "gone.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    eng.sessionAt(h).?.fail(alloc, "test-stop");
+    eng.reapDead();
+
+    // The slot is reaped and its generation advanced; a late answer
+    // decodes to no session. If the orphan path forgot deinitOn the
+    // testing allocator reports the leaked host and slice.
+    const host = try alloc.dupe(u8, "gone.invalid");
+    const targets = try alloc.alloc(@import("dns_async").Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = host,
+        .tlsa = &.{},
+        .is_direct_tls = false,
+    };
+    Engine.onDnsResult(&eng, h.encode(), .resolved, .{ .targets = targets });
 }

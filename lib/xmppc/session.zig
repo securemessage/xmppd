@@ -306,6 +306,9 @@ pub const Session = struct {
     pub fn fail(self: *Session, allocator: std.mem.Allocator, reason: []const u8) void {
         _ = allocator;
         if (self.failed) return;
+        // A death mid-resolve releases the resolver job before the
+        // phase flag flips; no DNS callback may land afterwards.
+        if (self.phase == .resolving) self.engine.cancelResolve(self.handle);
         self.failed = true;
         self.alive = false;
         self.phase = .dead;
