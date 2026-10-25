@@ -431,10 +431,73 @@ test "ArchiveWriteQueue: a burst larger than one drain all lands (V15)" {
         q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
     }
 
+    // No stop flag and no spare wake byte: every job must arrive through
+    // the queue's own wakeup path inside the deadline.
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (store.stored.load(.monotonic) < 200 and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    const stored_before_stop = store.stored.load(.monotonic);
     q.stopping.store(true, .release);
     _ = posix.write(q.pipe_wr, "\x00") catch {};
     t.join();
-    try std.testing.expectEqual(@as(u32, 200), store.stored.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 200), stored_before_stop);
+}
+
+/// Store mock whose first storeAll call blocks until released. Holding
+/// the writer inside a drain leaves the ring empty so the next enqueue
+/// is an empty-to-non-empty transition whose byte the writer's own
+/// drainPipe consumes: only the non-empty recheck before kevent keeps
+/// that job from stranding.
+const GatedStore = struct {
+    stored: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    entered: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn storeAll(self: *GatedStore, items: anytype) !void {
+        if (self.entered.fetchAdd(1, .monotonic) == 0) {
+            while (!self.release.load(.acquire)) {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+        _ = self.stored.fetchAdd(@intCast(items.len), .monotonic);
+    }
+
+    pub fn store(self: *GatedStore, _: []const u8, _: []const u8, _: []const u8, _: u64, _: []const u8) !void {
+        _ = self.stored.fetchAdd(1, .monotonic);
+    }
+};
+
+test "ArchiveWriteQueue: a job enqueued during a blocked drain is not stranded (V15)" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var store = GatedStore{};
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *ArchiveWriteQueue, st: *GatedStore) void {
+            queue.writerLoop(st, 64);
+        }
+    }.run, .{ &q, &store });
+
+    q.enqueue("a@localhost", "b@localhost", "s1", 1, "<m/>");
+    // Wait until the writer holds s1 inside storeAll and the ring reads
+    // empty, then land s2 in the drain-to-drainPipe window.
+    while (store.entered.load(.monotonic) == 0) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    q.enqueue("a@localhost", "b@localhost", "s2", 2, "<m/>");
+    store.release.store(true, .release);
+
+    // s2 must be stored without any further producer activity.
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (store.stored.load(.monotonic) < 2 and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    const stored_before_stop = store.stored.load(.monotonic);
+    q.stopping.store(true, .release);
+    _ = posix.write(q.pipe_wr, "\x00") catch {};
+    t.join();
+    try std.testing.expectEqual(@as(u32, 2), stored_before_stop);
 }
 
 // S31 regression: jobs pushed through the queue must land in the backend
