@@ -99,10 +99,22 @@ pub const IpcConn = struct {
     /// Queue a response message for sending. Grows the backlog buffer on
     /// demand; returns SendBufferFull only past CLIENT_SEND_CAP.
     pub fn queueSend(self: *IpcConn, msg: protocol.Message) !void {
-        var frame_buf: [4096]u8 = undefined;
-        const frame_len = try protocol.encode(msg, &frame_buf);
-
         const alloc = self.alloc orelse return error.NoAllocator;
+        var frame_buf: [4096]u8 = undefined;
+        var large_frame: ?[]u8 = null;
+        defer if (large_frame) |buf| alloc.free(buf);
+
+        const frame_len = protocol.encode(msg, &frame_buf) catch |err| switch (err) {
+            error.BufferTooSmall => blk: {
+                const max_frame_len: usize = @as(usize, protocol.MAX_PAYLOAD_SIZE) + protocol.HEADER_SIZE;
+                const buf = try alloc.alloc(u8, max_frame_len);
+                large_frame = buf;
+                break :blk try protocol.encode(msg, buf);
+            },
+            else => return err,
+        };
+        const encoded = if (large_frame) |buf| buf[0..frame_len] else frame_buf[0..frame_len];
+
         const unsent = self.send_list.items.len - self.send_start;
         if (unsent + frame_len > CLIENT_SEND_CAP) return error.SendBufferFull;
         // Reclaim the consumed prefix before growing.
@@ -111,7 +123,7 @@ pub const IpcConn = struct {
             self.send_list.items.len = unsent;
             self.send_start = 0;
         }
-        try self.send_list.appendSlice(alloc, frame_buf[0..frame_len]);
+        try self.send_list.appendSlice(alloc, encoded);
     }
 
     /// Flush the send buffer. Returns bytes written.

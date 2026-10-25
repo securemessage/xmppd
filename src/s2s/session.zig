@@ -101,6 +101,7 @@ pub const S2sSession = struct {
     stanza_id_len: usize = 0,
     stanza_inner_buf: [16384]u8 = undefined,
     stanza_inner_len: usize = 0,
+    stanza_overflow: bool = false,
 
     pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
         var session = S2sSession{
@@ -443,6 +444,7 @@ pub const S2sSession = struct {
     pub fn startStanza(self: *S2sSession, elem: xml.Element) void {
         self.stanza_active = true;
         self.stanza_inner_len = 0;
+        self.stanza_overflow = false;
         // Tag name
         const tl = @min(elem.local_name.len, self.stanza_tag_buf.len);
         @memcpy(self.stanza_tag_buf[0..tl], elem.local_name[0..tl]);
@@ -475,39 +477,81 @@ pub const S2sSession = struct {
 
     /// Accumulate a child element opening tag into the stanza inner buffer.
     pub fn accumulateElement(self: *S2sSession, elem: xml.Element) void {
+        if (self.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeByte('<') catch return;
-        w.writeAll(elem.name) catch return;
+        w.writeByte('<') catch {
+            self.stanza_overflow = true;
+            return;
+        };
+        w.writeAll(elem.name) catch {
+            self.stanza_overflow = true;
+            return;
+        };
         for (elem.attributes) |attr| {
-            w.writeByte(' ') catch return;
-            w.writeAll(attr.name) catch return;
-            w.writeAll("='") catch return;
-            xmlEscapeWrite(w, attr.value) catch return;
-            w.writeByte('\'') catch return;
+            w.writeByte(' ') catch {
+                self.stanza_overflow = true;
+                return;
+            };
+            w.writeAll(attr.name) catch {
+                self.stanza_overflow = true;
+                return;
+            };
+            w.writeAll("='") catch {
+                self.stanza_overflow = true;
+                return;
+            };
+            xmlEscapeWrite(w, attr.value) catch {
+                self.stanza_overflow = true;
+                return;
+            };
+            w.writeByte('\'') catch {
+                self.stanza_overflow = true;
+                return;
+            };
         }
         if (elem.self_closing) {
-            w.writeAll("/>") catch return;
+            w.writeAll("/>") catch {
+                self.stanza_overflow = true;
+                return;
+            };
         } else {
-            w.writeByte('>') catch return;
+            w.writeByte('>') catch {
+                self.stanza_overflow = true;
+                return;
+            };
         }
         self.stanza_inner_len += fbs.pos;
     }
 
     /// Accumulate text content (XML-escaped) into the stanza inner buffer.
     pub fn accumulateText(self: *S2sSession, text: []const u8) void {
+        if (self.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch return;
+        xmlEscapeWrite(fbs.writer(), text) catch {
+            self.stanza_overflow = true;
+            return;
+        };
         self.stanza_inner_len += fbs.pos;
     }
 
     /// Accumulate a child element close tag into the stanza inner buffer.
     pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
+        if (self.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeAll("</") catch return;
-        w.writeAll(name) catch return;
-        w.writeByte('>') catch return;
+        w.writeAll("</") catch {
+            self.stanza_overflow = true;
+            return;
+        };
+        w.writeAll(name) catch {
+            self.stanza_overflow = true;
+            return;
+        };
+        w.writeByte('>') catch {
+            self.stanza_overflow = true;
+            return;
+        };
         self.stanza_inner_len += fbs.pos;
     }
 
@@ -520,6 +564,7 @@ pub const S2sSession = struct {
         self.stanza_to_len = 0;
         self.stanza_type_len = 0;
         self.stanza_id_len = 0;
+        self.stanza_overflow = false;
     }
 
     /// Get the accumulated stanza tag name.

@@ -325,6 +325,7 @@ pub const Session = struct {
     vcard_collecting: bool = false,
     vcard_buf: [4096]u8 = undefined,
     vcard_buf_len: usize = 0,
+    vcard_overflow: bool = false,
     /// Depth at which vcard_collecting was started (to detect the matching close tag).
     vcard_collect_depth: u8 = 0,
 
@@ -3198,48 +3199,56 @@ pub const Server = struct {
     // vCard XML accumulation (for IQ set vcard-temp)
     // ========================================================================
 
-    fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Element) void {
-        if (session.pep_collecting) {
-            self.accumulatePepElement(session, elem);
-            return;
-        }
+    fn writeVcardElement(session: *Session, elem: xml.Element) !usize {
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
         const w = fbs.writer();
 
-        w.writeByte('<') catch return;
-        w.writeAll(elem.name) catch return;
+        try w.writeByte('<');
+        try w.writeAll(elem.name);
 
         if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client) and
             !std.mem.eql(u8, elem.namespace_uri, "vcard-temp"))
         {
             if (elem.prefix.len > 0) {
-                w.writeAll(" xmlns:") catch return;
-                w.writeAll(elem.prefix) catch return;
-                w.writeAll("='") catch return;
-                xml.escapeWrite(w, elem.namespace_uri) catch return;
-                w.writeByte('\'') catch return;
+                try w.writeAll(" xmlns:");
+                try w.writeAll(elem.prefix);
+                try w.writeAll("='");
+                try xml.escapeWrite(w, elem.namespace_uri);
+                try w.writeByte('\'');
             } else {
-                w.writeAll(" xmlns='") catch return;
-                xml.escapeWrite(w, elem.namespace_uri) catch return;
-                w.writeByte('\'') catch return;
+                try w.writeAll(" xmlns='");
+                try xml.escapeWrite(w, elem.namespace_uri);
+                try w.writeByte('\'');
             }
         }
 
         for (elem.attributes) |attr| {
-            w.writeByte(' ') catch return;
-            w.writeAll(attr.name) catch return;
-            w.writeAll("='") catch return;
-            xmlEscapeWrite(w, attr.value) catch return;
-            w.writeByte('\'') catch return;
+            try w.writeByte(' ');
+            try w.writeAll(attr.name);
+            try w.writeAll("='");
+            try xmlEscapeWrite(w, attr.value);
+            try w.writeByte('\'');
         }
 
         if (elem.self_closing) {
-            w.writeAll("/>") catch return;
+            try w.writeAll("/>");
         } else {
-            w.writeByte('>') catch return;
+            try w.writeByte('>');
         }
+        return fbs.pos;
+    }
 
-        session.vcard_buf_len += fbs.pos;
+    fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Element) void {
+        if (session.pep_collecting) {
+            self.accumulatePepElement(session, elem);
+            return;
+        }
+        if (session.vcard_overflow) return;
+        const written = writeVcardElement(session, elem) catch {
+            session.vcard_overflow = true;
+            return;
+        };
+        session.vcard_buf_len += written;
     }
 
     fn accumulateVcardText(self: *Server, session: *Session, text: []const u8) void {
@@ -3247,8 +3256,12 @@ pub const Server = struct {
             self.accumulatePepText(session, text);
             return;
         }
+        if (session.vcard_overflow) return;
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch return;
+        xmlEscapeWrite(fbs.writer(), text) catch {
+            session.vcard_overflow = true;
+            return;
+        };
         session.vcard_buf_len += fbs.pos;
     }
 
@@ -3257,11 +3270,21 @@ pub const Server = struct {
             self.accumulatePepClose(session, name);
             return;
         }
+        if (session.vcard_overflow) return;
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
         const w = fbs.writer();
-        w.writeAll("</") catch return;
-        w.writeAll(name) catch return;
-        w.writeByte('>') catch return;
+        w.writeAll("</") catch {
+            session.vcard_overflow = true;
+            return;
+        };
+        w.writeAll(name) catch {
+            session.vcard_overflow = true;
+            return;
+        };
+        w.writeByte('>') catch {
+            session.vcard_overflow = true;
+            return;
+        };
         session.vcard_buf_len += fbs.pos;
     }
 
@@ -7854,6 +7877,111 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, abuf[0..an], "policy-violation") != null);
     try std.testing.expect(server.sessions[9] == null);
+}
+
+test "Server: G4 a near-limit online stanza is bounced when delivery cannot queue it" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = bob;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    server.sessions[9] = alice;
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+
+    const body_prefix = "<body>";
+    const body_suffix = "</body>";
+    const filler_len = alice.stanza_buf.len - body_prefix.len - body_suffix.len;
+    @memcpy(alice.stanza_buf[0..body_prefix.len], body_prefix);
+    @memset(alice.stanza_buf[body_prefix.len..][0..filler_len], 'A');
+    @memcpy(alice.stanza_buf[body_prefix.len + filler_len ..][0..body_suffix.len], body_suffix);
+    alice.stanza_buf_len = alice.stanza_buf.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, alice, &changes);
+
+    _ = bob.conn.flushSend() catch {};
+    var bob_buf: [4096]u8 = undefined;
+    const bob_n = posix.read(bob_fds[1], &bob_buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), bob_n);
+
+    _ = alice.conn.flushSend() catch {};
+    var alice_buf: [4096]u8 = undefined;
+    const alice_n = posix.read(alice_fds[1], &alice_buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, alice_buf[0..alice_n], "service-unavailable") != null);
+}
+
+test "Server: G4 an oversized vCard is rejected without replacing the stored value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var vcard_store = GenericVCardStore.init(&op_db);
+    const old_vcard = "<vCard xmlns='vcard-temp'><FN>Old</FN></vCard>";
+    try vcard_store.set("alice@localhost", old_vcard);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.vcard = &vcard_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    try std.testing.expectEqual(stream_open.len, try posix.write(fds[1], stream_open));
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+
+    const prefix = "<iq type='set' id='v1'><vCard xmlns='vcard-temp'><FN>";
+    const suffix = "</FN></vCard></iq>";
+    const payload = try allocator.alloc(u8, 6000);
+    defer allocator.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0 .. payload.len - prefix.len - suffix.len], 'N');
+    @memcpy(payload[payload.len - suffix.len ..], suffix);
+    try std.testing.expectEqual(payload.len, try posix.write(fds[1], payload));
+    for (0..2) |_| server.handleReadable(1, &changes);
+
+    _ = session.conn.flushSend() catch {};
+    var response: [8192]u8 = undefined;
+    const n = posix.read(fds[1], &response) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-acceptable") != null);
+
+    const stored = try vcard_store.get(allocator, "alice@localhost");
+    defer if (stored) |value| allocator.free(value);
+    try std.testing.expectEqualStrings(old_vcard, stored.?);
 }
 
 // E6 (S11): only whitespace is allowed at the stream level between stanzas.

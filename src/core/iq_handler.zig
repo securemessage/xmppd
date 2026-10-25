@@ -268,6 +268,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         if (std.mem.eql(u8, session.iq_type, "set")) {
             session.vcard_collecting = true;
             session.vcard_buf_len = 0;
+            session.vcard_overflow = false;
             session.vcard_collect_depth = 2; // <iq><vCard>
             // Write the opening <vCard xmlns='vcard-temp'> tag
             var fbs = std.io.fixedBufferStream(&session.vcard_buf);
@@ -374,6 +375,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // Reset vCard/PEP accumulation
         session.vcard_collecting = false;
         session.vcard_buf_len = 0;
+        session.vcard_overflow = false;
         session.pep_collecting = false;
         // Reset XEP-0115 caps disco accumulation
         session.disco_node = "";
@@ -1561,6 +1563,11 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
 fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     const bound = session.stream.bound_jid orelse return;
+    if (session.vcard_overflow) {
+        log.warn("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
+        sendIqErrorWithType(server, session, iq_id, "modify", "not-acceptable");
+        return;
+    }
 
     // Build bare JID
     var bare_buf: [256]u8 = undefined;

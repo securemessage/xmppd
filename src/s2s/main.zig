@@ -1116,6 +1116,13 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
 
 /// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
 fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
+    if (session.stanza_overflow) {
+        const slot = session.id;
+        log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
+        session.resetStanza();
+        closeInboundWithStreamError(daemon, slot, .policy_violation);
+        return;
+    }
     defer session.resetStanza();
 
     const from = session.getStanzaFrom();
@@ -2001,6 +2008,38 @@ fn connectInboundForTest(daemon: *S2sDaemon) !posix.fd_t {
     return client_fd;
 }
 
+fn attachInboundSocketpairForTest(daemon: *S2sDaemon, slot: usize) !posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    var daemon_owns_fd = false;
+    errdefer if (!daemon_owns_fd) posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+
+    const session = try daemon.allocator.create(S2sSession);
+    session.* = S2sSession.init(fds[0], slot, daemon.local_domain);
+    daemon.inbound[slot] = session;
+    daemon_owns_fd = true;
+    const reader = try daemon.allocator.create(XmlReader);
+    reader.* = XmlReader.init(daemon.allocator);
+    reader.setMaxItemBytes(PRE_AUTH_ITEM_MAX_BYTES);
+    daemon.readers[slot] = reader;
+    return fds[1];
+}
+
+fn feedInboundForTest(daemon: *S2sDaemon, batch: *ChangeList, peer_fd: posix.fd_t, payload: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const end = @min(offset + 2048, payload.len);
+        try std.testing.expectEqual(end - offset, try posix.write(peer_fd, payload[offset..end]));
+        batch.reset();
+        handleInboundReadable(daemon, batch, 0);
+        offset = end;
+        if (daemon.getInbound(0) == null) break;
+    }
+}
+
 test "S2sDaemon: G5 an XML error is flushed once and closes the session" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "a.example");
@@ -2085,6 +2124,76 @@ test "S2sDaemon: G5 the pre-auth cap covers an unterminated stream header" {
     var response: [2048]u8 = undefined;
     const n = try posix.read(client_fd, &response);
     try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 an oversized accumulated stanza is rejected whole" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, prefix.len + 20_000 + suffix.len);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0..20_000], 'x');
+    @memcpy(payload[prefix.len + 20_000 ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, 16_384);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0 .. payload.len - prefix.len - suffix.len], 'x');
+    @memcpy(payload[payload.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings(payload, msg.s2s_inbound.stanza_xml);
 }
 
 test "extractDomain: user@domain" {

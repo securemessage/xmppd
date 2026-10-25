@@ -266,6 +266,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         break :blk aug_fbs.getWritten();
     } else inner_xml;
 
+    var delivery_failed = false;
     for (entries_buf[0..route_count]) |entry| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
         if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
@@ -288,10 +289,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             )) {
                 remote_delivered = true;
             } else {
-                // S14: stanza did not fit a delivery slot (or the queue
-                // failed). This one resource goes undelivered; local and
-                // other remote resources still get their copies below, and
-                // offline-store/bounce happens only when nothing succeeded.
+                // Other local and remote resources still get their copies;
+                // the sender gets an error if no resource accepts the stanza.
+                delivery_failed = true;
             }
         }
     }
@@ -421,11 +421,15 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     var hold_bounced = false;
+    var local_delivery_succeeded = false;
     // Forward to each local target session
     for (local_ids[0..target_count]) |tid| {
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
-        const sent_data = built orelse continue;
+        const sent_data = built orelse {
+            delivery_failed = true;
+            continue;
+        };
         // S13: a session whose offline tail is still draining must not be
         // overtaken by newer messages. Park this copy behind the tail, with
         // its payload, so the drain delivers it in order without depending on
@@ -448,6 +452,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     log.warn("message to {s} could not be held behind the offline tail: {s}", .{ to_str, @errorName(err) });
                 }
                 if (held) {
+                    local_delivery_succeeded = true;
                     log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
                     continue;
                 }
@@ -474,12 +479,28 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // attempting live delivery.
         if (target_session.sm_detached) {
             target_session.smTrackOutbound(sent_data);
+            local_delivery_succeeded = true;
             continue;
         }
-        target_session.conn.queueSend(sent_data) catch continue;
+        target_session.conn.queueSend(sent_data) catch |err| {
+            delivery_failed = true;
+            log.warn("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
+            continue;
+        };
         target_session.smTrackOutbound(sent_data);
+        local_delivery_succeeded = true;
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, tid) catch {};
+        }
+    }
+
+    const bounceable = (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) or
+        (session.stanza_kind == .iq and (std.mem.eql(u8, type_str, "get") or std.mem.eql(u8, type_str, "set")));
+    if (delivery_failed and !local_delivery_succeeded and !remote_delivered and !hold_bounced and bounceable) {
+        log.info("connection {d} stanza to {s} could not be delivered to any resource", .{ session.conn.id, to_str });
+        sendServiceUnavailable(session, id_str, to_str, from_str);
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     }
 
