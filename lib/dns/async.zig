@@ -3059,3 +3059,104 @@ test "dns-async: the fallback path asks AAAA too and emits v6 first (Q4)" {
     try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[1].addr.any.family);
     try std.testing.expectEqual(@as(u16, 5222), res.targets[0].addr.getPort());
 }
+
+test "dns-async: a stale deadline cannot hit a re-used slot (Q6)" {
+    const sink = try startUdpSink();
+    defer posix.close(sink.fd);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", sink.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    // Queue an expired deadline for job A, free A, and let job B take
+    // the same slot at a new generation.
+    try r.query("a.test", .a, 7);
+    const job_a = r.jobs.items[0];
+    const slot_a = job_a.slot;
+    armStaleTimer(&r, (@as(usize, job_a.gen) << 8) | slot_a);
+    r.cancel(7);
+    try r.query("b.test", .a, 8);
+    const job_b = r.jobs.items[0];
+    try std.testing.expectEqual(slot_a, job_b.slot);
+
+    r.step(0);
+    // The generation check must drop the stale event instead of
+    // charging job B a retry (tries would be 2).
+    try std.testing.expectEqual(@as(u8, 1), job_b.tries);
+    try std.testing.expect(ctx.status == null);
+}
+
+var fake_now: i64 = 0;
+fn fakeNow() i64 {
+    return fake_now;
+}
+
+test "dns-async: a cache entry past its TTL is a miss (Q6)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "ttl.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    r.cachePut("ttl.test", KIND_A, &rrs);
+    try std.testing.expect(r.cacheGet("ttl.test", KIND_A) != null);
+    fake_now += 59_000;
+    try std.testing.expect(r.cacheGet("ttl.test", KIND_A) != null);
+    fake_now += 2_000;
+    try std.testing.expect(r.cacheGet("ttl.test", KIND_A) == null);
+}
+
+test "dns-async: SRV targets come back in RFC 2782 priority order (Q6)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_prio_mix.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // Wire order is hi(30), lo(10), mid(20); the resolver must emit
+    // lowest priority first regardless of the wire draw.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), res.targets.len);
+    try std.testing.expectEqualStrings("t_lo.test", res.targets[0].host);
+    try std.testing.expectEqualStrings("t_mid.test", res.targets[1].host);
+    try std.testing.expectEqualStrings("t_hi.test", res.targets[2].host);
+}
+
+test "dns-async: a client resolve asks only the client SRV prefixes (Q6)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.client_srv_only.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // Had the resolver asked the server prefixes, every SRV answer
+    // would be NODATA and only the A fallback target would come back.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+}
