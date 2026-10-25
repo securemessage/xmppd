@@ -6,8 +6,9 @@
 //! counting, for the SCRAM client-final. `recordOutcome` records only the
 //! result of an attempt already counted at admission.
 //!
-//! Account keys are the identity localpart. Store errors and an untrackable
-//! key fail closed; a denied admission always carries a SASL failure reason.
+//! Account keys are the case-folded identity localpart, the same key the
+//! permanent lock store uses. Store errors and an untrackable key fail
+//! closed; a denied admission always carries a SASL failure reason.
 
 const std = @import("std");
 const rate_limiter = @import("rate_limiter");
@@ -70,7 +71,7 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
 fn canonicalAccount(identity: []const u8, buf: *[rate_limiter.max_key_len]u8) []const u8 {
     const local = localpartOf(identity);
     if (local.len > buf.len) return local;
-    for (local, 0..) |c, i| buf[i] = c;
+    for (local, 0..) |c, i| buf[i] = std.ascii.toLower(c);
     return buf[0..local.len];
 }
 
@@ -275,4 +276,23 @@ test "Policy: a re-check does not count a second account attempt" {
     try std.testing.expect(policy.admitAccount("alice") == null);
     try std.testing.expect(policy.check("alice", "") == null);
     try std.testing.expectEqualStrings("policy-violation", policy.admitAccount("alice") orelse return error.ExpectedDenial);
+}
+
+test "Policy: account keys fold case and domain to one localpart" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordOutcome("Alice@example", "10.0.0.1", .failure);
+    policy.recordOutcome("ALICE", "10.0.0.2", .failure);
+
+    // Both failures keyed the same folded localpart: alice is locked.
+    try std.testing.expectEqualStrings("account-disabled", policy.admit("alice", "10.0.0.3") orelse return error.ExpectedDenial);
 }
