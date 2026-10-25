@@ -731,7 +731,6 @@ test "NUL, control characters and invalid UTF-8 are rejected" {
     // U+FFFE and U+FFFF are valid UTF-8 but outside the XML Char production.
     try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbe"));
     try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbf"));
-    // Tab, LF, CR and a supplementary-plane character are legal.
     // A rejected input latches the writer: the stanza can no longer
     // report success at finish().
     try testing.expectError(error.Overflow, x.finish());
@@ -1110,4 +1109,23 @@ test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
     for (good) |probe| {
         _ = try ValidatedSpan.fromReader(testing.allocator, probe);
     }
+}
+
+test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
+    // At least vec_len bytes so the SIMD path proves it does not
+    // reject the whitespace characters it scans as suspects.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    x.elementOpenEnd();
+    try x.text("tab\there line\nfeed cr\r and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars");
+    try x.elementClose("m");
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<m>tab\there line\nfeed cr&#13; and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars</m>",
+        w.buffered(),
+    );
 }
