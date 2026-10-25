@@ -118,6 +118,10 @@ const Job = struct {
     /// share one job and every waiter still gets its own callback.
     waiters: [MAX_WAITERS]usize = undefined,
     waiter_count: usize = 0,
+    /// Bit per waiter slot, set by cancel() while this job's callbacks
+    /// are already firing: the completion loop skips marked waiters.
+    /// Only meaningful on the job under in_callback; never survives.
+    waiter_cancelled: u16 = 0,
     name: []const u8, // owned
     phase: Phase,
     service_idx: u8 = 0,
@@ -216,6 +220,11 @@ pub const Resolver = struct {
     /// Requests rejected because the wait queue was full; observability
     /// for a queue that silently dropping would otherwise hide.
     too_many_jobs: usize = 0,
+    /// The job currently firing completion callbacks, or null. Only
+    /// set inside a dropJob/complete/completeRaw waiter loop, after the
+    /// job is already off `jobs`, so a cancel() issued from inside a
+    /// callback can still mark the job's remaining waiters.
+    in_callback: ?*Job = null,
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
@@ -312,50 +321,50 @@ pub const Resolver = struct {
     }
 
     /// Launch the head of the wait queue now that a job slot opened.
+    /// A launch that fails answers the waiter's callback with .failed;
+    /// there is no error return this deep in the pump.
     fn promoteWait(self: *Resolver) void {
         while (self.jobs.items.len < MAX_JOBS and self.wait_queue.items.len > 0) {
             const e = self.wait_queue.orderedRemove(0);
             defer self.alloc.free(e.name);
             switch (e.kind) {
-                .query => self.launchQuery(e) catch |err| {
-                    log.warn("dns: queued query failed to launch: {}", .{err});
-                },
-                .resolve => self.launchResolve(e) catch |err| {
-                    log.warn("dns: queued resolve failed to launch: {}", .{err});
-                },
+                .query => self.launchQuery(e),
+                .resolve => self.launchResolve(e),
             }
         }
     }
 
-    fn launchQuery(self: *Resolver, e: WaitEnt) !void {
-        const job = try self.allocJob(e.session_key, e.name);
+    fn launchQuery(self: *Resolver, e: WaitEnt) void {
+        const job = self.allocJob(e.session_key, e.name) catch {
+            self.qcb.fun(self.qcb.ctx, e.session_key, .failed, null);
+            return;
+        };
         job.phase = .raw;
         job.is_raw = true;
-        {
-            errdefer self.freeJob(job);
-            try self.jobs.append(self.alloc, job);
-        }
-        self.sendQuery(job, e.name, e.rtype) catch |err| {
-            self.dropJob(job, .failed);
-            return err;
+        self.jobs.append(self.alloc, job) catch {
+            self.freeJob(job);
+            self.qcb.fun(self.qcb.ctx, e.session_key, .failed, null);
+            return;
         };
+        self.sendQuery(job, e.name, e.rtype) catch self.dropJob(job, .failed);
     }
 
-    fn launchResolve(self: *Resolver, e: WaitEnt) !void {
-        const job = try self.allocJob(e.session_key, e.name);
+    fn launchResolve(self: *Resolver, e: WaitEnt) void {
+        const job = self.allocJob(e.session_key, e.name) catch {
+            self.cb.fun(self.cb.ctx, e.session_key, .failed, null);
+            return;
+        };
         job.phase = .srv_tls;
         job.service_idx = e.service_idx;
         job.default_port = e.default_port;
         job.want_tlsa = e.want_tlsa;
-        {
-            errdefer self.freeJob(job);
-            try self.jobs.append(self.alloc, job);
-        }
-        self.armChainDeadline(job);
-        self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
-            self.dropJob(job, .failed);
-            return err;
+        self.jobs.append(self.alloc, job) catch {
+            self.freeJob(job);
+            self.cb.fun(self.cb.ctx, e.session_key, .failed, null);
+            return;
         };
+        self.armChainDeadline(job);
+        self.sendSrv(job, SRV_TLS[job.service_idx]) catch self.dropJob(job, .failed);
     }
 
     /// Release a session's interest: detach the waiter from every job
@@ -364,6 +373,27 @@ pub const Resolver = struct {
     /// stale) and drop any not-yet-launched queue entries. No
     /// callback fires for the key afterwards.
     pub fn cancel(self: *Resolver, session_key: usize) void {
+        // A callback already in flight may cancel a sibling waiter of
+        // the job being completed; that job is off `jobs` already, so
+        // mark its waiter bits and let the completion loop skip them.
+        if (self.in_callback) |job| {
+            for (job.waiters[0..job.waiter_count], 0..) |k, w| {
+                if (k == session_key) job.waiter_cancelled |= @as(u16, 1) << @intCast(w);
+            }
+        }
+
+        // Purge the wait queue first: freeing a job below promotes its
+        // head, and a queued entry of the cancelled key must never be
+        // launched (its callback could otherwise fire from the cache).
+        var qi: usize = 0;
+        while (qi < self.wait_queue.items.len) {
+            if (self.wait_queue.items[qi].session_key == session_key) {
+                const removed = self.wait_queue.orderedRemove(qi);
+                self.alloc.free(removed.name);
+                continue;
+            }
+            qi += 1;
+        }
         var i: usize = 0;
         while (i < self.jobs.items.len) {
             const job = self.jobs.items[i];
@@ -382,15 +412,6 @@ pub const Resolver = struct {
                 continue; // the list shifted; re-examine slot i
             }
             i += 1;
-        }
-        var qi: usize = 0;
-        while (qi < self.wait_queue.items.len) {
-            if (self.wait_queue.items[qi].session_key == session_key) {
-                const removed = self.wait_queue.orderedRemove(qi);
-                self.alloc.free(removed.name);
-                continue;
-            }
-            qi += 1;
         }
     }
 
@@ -863,9 +884,19 @@ pub const Resolver = struct {
             }
         }
         if (job.is_raw) {
-            for (job.waiters[0..job.waiter_count]) |key| self.qcb.fun(self.qcb.ctx, key, status, null);
+            self.in_callback = job;
+            for (job.waiters[0..job.waiter_count], 0..) |key, w| {
+                if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
+                self.qcb.fun(self.qcb.ctx, key, status, null);
+            }
+            self.in_callback = null;
         } else {
-            for (job.waiters[0..job.waiter_count]) |key| self.cb.fun(self.cb.ctx, key, status, null);
+            self.in_callback = job;
+            for (job.waiters[0..job.waiter_count], 0..) |key, w| {
+                if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
+                self.cb.fun(self.cb.ctx, key, status, null);
+            }
+            self.in_callback = null;
         }
         self.freeJob(job);
         self.promoteWait();
@@ -880,13 +911,16 @@ pub const Resolver = struct {
         }
         // Every waiter gets its own deep copy of the target set; the
         // callback owns what it receives.
-        for (job.waiters[0..job.waiter_count]) |key| {
+        self.in_callback = job;
+        for (job.waiters[0..job.waiter_count], 0..) |key, w| {
+            if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
             const targets = self.dupTargets(job.targets.items) catch {
                 self.cb.fun(self.cb.ctx, key, .failed, null);
                 continue;
             };
             self.cb.fun(self.cb.ctx, key, .resolved, .{ .targets = targets });
         }
+        self.in_callback = null;
         self.freeJob(job);
         self.promoteWait();
     }
@@ -937,13 +971,16 @@ pub const Resolver = struct {
         }
         self.cachePut(job.pending_qname, job.pending_qtype, msg.rrs);
         const ttl = minTtl(msg.rrs);
-        for (job.waiters[0..job.waiter_count]) |key| {
+        self.in_callback = job;
+        for (job.waiters[0..job.waiter_count], 0..) |key, w| {
+            if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
             const detached = self.dupRrs(msg.rrs) catch {
                 self.qcb.fun(self.qcb.ctx, key, .failed, null);
                 continue;
             };
             self.qcb.fun(self.qcb.ctx, key, .resolved, .{ .rrs = detached, .ttl = ttl });
         }
+        self.in_callback = null;
         self.freeJob(job);
         self.promoteWait();
     }
@@ -2387,6 +2424,102 @@ test "dns-async: a shared job notifies only its remaining waiters (J6)" {
     while (ctx.calls < 1 and spins < 200) : (spins += 1) r.step(50);
     try std.testing.expectEqual(@as(usize, 1), ctx.calls);
     try std.testing.expectEqual(@as(usize, 2), ctx.keys[0]);
+}
+
+const CancelSiblingCtx = struct {
+    r: *Resolver,
+    calls: [8]usize = .{0} ** 8,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+        const self: *CancelSiblingCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.calls[key] += 1;
+        if (res) |*v| {
+            var x = v.*;
+            x.deinitOn(std.testing.allocator);
+        }
+        if (key == 1) self.r.cancel(2);
+    }
+};
+
+test "dns-async: cancel inside a sibling callback suppresses its callback (Q2)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = CancelSiblingCtx{ .r = &r };
+    r.setCallback(.{ .ctx = &ctx, .fun = CancelSiblingCtx.onResolve });
+
+    // Keys 1 and 2 share one job; key 1's callback cancels key 2, whose
+    // callback must never fire even though the job completes.
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    try r.resolve("svc.test", .client, 5222, 2, true);
+    var spins: usize = 0;
+    while (ctx.calls[1] == 0 and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls[1]);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
+}
+
+test "dns-async: cancel purges the key's queued entry before promoting (Q2)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+
+    // Key 1 waits on an in-flight job and also owns a queued request.
+    try r.resolve("held.test", .client, 5222, 1, true);
+    var name_buf: [32]u8 = undefined;
+    for (2..65) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "h{d}.test", .{i}) catch unreachable;
+        try r.resolve(n, .client, 5222, i, true);
+    }
+    try std.testing.expectEqual(@as(usize, 64), r.jobs.items.len);
+    try r.query("queued.test", .a, 1);
+    try std.testing.expectEqual(@as(usize, 1), r.wait_queue.items.len);
+
+    // Seed the RR cache so a launch of the queued query would complete
+    // synchronously; cancelled, it must never run at all.
+    const owned_name = try std.testing.allocator.dupe(u8, "queued.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    r.cachePut("queued.test", KIND_A, &rrs);
+
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    r.cancel(1);
+
+    try std.testing.expect(ctx.status == null);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+    for (r.jobs.items) |j| try std.testing.expect(!std.ascii.eqlIgnoreCase(j.name, "queued.test"));
+}
+
+test "dns-async: a failed launch inside promoteWait answers .failed (Q2)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+
+    // A queued query whose job allocation fails still owes its waiter
+    // an answer; swallowed, the waiter would hang forever.
+    const name = try std.testing.allocator.dupe(u8, "queued.test");
+    try r.wait_queue.append(std.testing.allocator, .{
+        .session_key = 7,
+        .name = name,
+        .kind = .query,
+        .rtype = KIND_A,
+    });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    r.alloc = failing.allocator();
+
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    r.promoteWait();
+
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
 }
 
 test "dns-async: a silent server exhausts per-query retries into failed" {
