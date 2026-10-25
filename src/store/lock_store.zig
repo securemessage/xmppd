@@ -123,13 +123,11 @@ pub fn LockStore(comptime Backend: type) type {
             return .{ .backend = b };
         }
 
-        /// Find a non-canonical row that folds to `canon`: rows written
-        /// before keys were case-folded carry the name as typed ("Alice")
-        /// and miss the canonical lookup. Returns the row's actual key
-        /// (caller frees), or null. Records in `legacy_free` when the whole
-        /// namespace is canonical so later misses skip this scan.
-        fn legacyFind(self: *Self, allocator: std.mem.Allocator, canon: []const u8) !?[]u8 {
-            var found: ?[]u8 = null;
+        /// Collect every non-canonical row that folds to `canon` into
+        /// `out` (caller frees each key and the list). Records
+        /// `legacy_free` when the whole namespace is canonical so later
+        /// misses skip this scan.
+        fn legacyFindAll(self: *Self, allocator: std.mem.Allocator, canon: []const u8, out: *std.ArrayListUnmanaged([]u8)) !void {
             var legacy_any = false;
             var it = try self.backend.iterator(NAMESPACE, "");
             defer it.deinit();
@@ -138,12 +136,11 @@ pub fn LockStore(comptime Backend: type) type {
                 const fold = canonicalKey(entry.key, &canon_buf) catch continue;
                 if (std.mem.eql(u8, fold, entry.key)) continue;
                 legacy_any = true;
-                if (found == null and std.mem.eql(u8, fold, canon)) {
-                    found = try allocator.dupe(u8, entry.key);
+                if (std.mem.eql(u8, fold, canon)) {
+                    try out.append(allocator, try allocator.dupe(u8, entry.key));
                 }
             }
             if (!legacy_any) self.legacy_free = true;
-            return found;
         }
 
         /// Check if a username is locked. Returns the lock record if locked, null otherwise.
@@ -158,9 +155,14 @@ pub fn LockStore(comptime Backend: type) type {
                 // A fold-equal legacy row is the same lock; without this
                 // lookup it reads as unlocked (S3).
                 if (self.legacy_free) return null;
-                const legacy_key = (try self.legacyFind(allocator, key)) orelse return null;
-                defer allocator.free(legacy_key);
-                const legacy_raw = try self.backend.get(allocator, NAMESPACE, legacy_key);
+                var legacy_keys: std.ArrayListUnmanaged([]u8) = .{};
+                defer {
+                    for (legacy_keys.items) |k| allocator.free(k);
+                    legacy_keys.deinit(allocator);
+                }
+                try self.legacyFindAll(allocator, key, &legacy_keys);
+                if (legacy_keys.items.len == 0) return null;
+                const legacy_raw = try self.backend.get(allocator, NAMESPACE, legacy_keys.items[0]);
                 const legacy_data = legacy_raw orelse return null;
                 defer allocator.free(legacy_data);
                 if (legacy_data.len < LOCK_VALUE_SIZE) return error.CorruptLockRecord;
@@ -196,10 +198,16 @@ pub fn LockStore(comptime Backend: type) type {
                 try self.backend.delete(NAMESPACE, key);
                 removed = true;
             }
-            // A fold-equal legacy row is the same lock under a pre-fold key.
+            // Every fold-equal legacy row is the same lock under a pre-fold
+            // key: remove all of them, or a survivor still reads as locked.
             if (!self.legacy_free) {
-                if (try self.legacyFind(allocator, key)) |legacy_key| {
-                    defer allocator.free(legacy_key);
+                var legacy_keys: std.ArrayListUnmanaged([]u8) = .{};
+                defer {
+                    for (legacy_keys.items) |k| allocator.free(k);
+                    legacy_keys.deinit(allocator);
+                }
+                try self.legacyFindAll(allocator, key, &legacy_keys);
+                for (legacy_keys.items) |legacy_key| {
                     try self.backend.delete(NAMESPACE, legacy_key);
                     removed = true;
                 }
@@ -442,6 +450,27 @@ test "LockStore: unlock clears a canonical and a legacy row for the same name (D
 
     try std.testing.expect((try db.get(allocator, NAMESPACE, "alice")) == null);
     try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+    try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
+    try std.testing.expect((try store.isLocked(allocator, "ALICE")) == null);
+}
+
+test "LockStore: unlock clears every fold-equal legacy row (D3)" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // Two pre-fold rows for one account. Removing only the first leaves the
+    // second enforcing the lock.
+    try db.put(NAMESPACE, "Alice", &serialize(.permanent, 7));
+    try db.put(NAMESPACE, "ALICE", &serialize(.permanent, 8));
+
+    try store.unlock(allocator, "alice");
+
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "Alice")) == null);
+    try std.testing.expect((try db.get(allocator, NAMESPACE, "ALICE")) == null);
     try std.testing.expect((try store.isLocked(allocator, "alice")) == null);
     try std.testing.expect((try store.isLocked(allocator, "ALICE")) == null);
 }
