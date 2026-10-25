@@ -406,10 +406,10 @@ pub const Session = struct {
     /// Whether the session's one-shot offline retry timer is armed. The flag
     /// rejects a stale timer after the session slot has been reused.
     offline_retry_timer_armed: bool = false,
-    /// T178: set when the unacked queue overflowed (oldest stanza evicted).
-    /// XEP-0198 has no gap signaling, so the session must be failed —
-    /// reaped by session_lifecycle.reapSmOverflow at the end of the event
-    /// batch (live: resource-constraint stream error; detached: destroy).
+    /// Set when outbound delivery cannot preserve integrity, either because
+    /// the SM unacked queue overflowed or a live write buffer is full. Reaped
+    /// at batch end: live sessions get resource-constraint; detached sessions
+    /// are destroyed because they cannot be resumed safely.
     sm_overflow: bool = false,
     /// T178: an <r/> ack request is in flight (sent when the unacked queue
     /// crossed the threshold, cleared on <a/>). Prevents <r/> spam while
@@ -495,7 +495,7 @@ pub const Session = struct {
     /// Increments sm_out_seq and buffers the stanza in the unacked queue (if resume enabled).
     /// Call this after successfully queueing a complete stanza (message/presence/iq) to the client.
     /// On queue overflow the session is flagged for failure (T178) and reaped
-    /// by session_lifecycle.reapSmOverflow at the end of the event batch.
+    /// by session_lifecycle.reapOutboundOverflow at the end of the event batch.
     pub fn smTrackOutbound(self: *Session, stanza_data: []const u8) void {
         if (!self.sm_enabled) return;
         self.sm_out_seq +%= 1;
@@ -1395,9 +1395,8 @@ pub const Server = struct {
                 }
             }
 
-            // T178: fail sessions whose SM unacked queue overflowed during
-            // this batch (any delivery path may have set the flag).
-            session_lifecycle.reapSmOverflow(self, &changes);
+            // Fail sessions whose outbound delivery overflowed in this batch.
+            session_lifecycle.reapOutboundOverflow(self, &changes);
 
             // S10: single point of truth for IPC write interest; heals
             // any re-arm lost while handling this batch.
@@ -4093,7 +4092,7 @@ pub const Server = struct {
 
         // T178: the detached session's unacked queue overflowed in this event
         // batch — its replay queue is corrupt. Fail the resume as if the
-        // session were already gone; reapSmOverflow destroys it at batch end.
+        // session were already gone; reapOutboundOverflow destroys it at batch end.
         if (detached.sm_overflow) {
             self.sendSmFailed(session, "item-not-found", changes);
             return;

@@ -421,29 +421,23 @@ fn recordLastOffline(roster: anytype, bound: anytype) void {
     };
 }
 
-/// Reap sessions whose SM unacked queue overflowed (T178). XEP-0198 has no
-/// gap signaling, so silently evicting the oldest stanza would break the
-/// at-least-once promise invisibly — fail the session instead, like
-/// ejabberd/Prosody:
-/// - Live session: close the stream with resource-constraint; the client
-///   reconnects and resyncs (MAM covers message history).
-/// - Detached session: destroy it via the normal path (which also emits the
-///   unavailable-presence broadcast — correct semantics for a session that
-///   is really gone). A later <resume/> then fails with item-not-found and
-///   the client does a full bind + MAM catch-up.
-/// Called once per event batch from the worker event loop. Destroying is
-/// self-limiting: the queue is freed with the session, so this fires once.
-pub fn reapSmOverflow(server: *Server, changes: *ChangeList) void {
+/// Reap sessions whose outbound delivery overflowed. Such a gap must not be
+/// left for the client to discover as inconsistent stream or room state.
+/// Live sessions close with resource-constraint so they reconnect and resync.
+/// Detached sessions are destroyed; a later resume fails with item-not-found
+/// and the client performs a full bind and MAM catch-up.
+/// Called once per event batch from the worker event loop.
+pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
     for (server.sessions, 0..) |slot, i| {
         const session = slot orelse continue;
         if (!session.sm_overflow) continue;
         session.sm_overflow = false;
         if (session.sm_detached) {
-            log.warn("session {d} SM unacked queue overflowed while detached — destroying (resume will fail item-not-found)", .{i});
+            log.warn("session {d} outbound queue overflowed while detached — destroying (resume will fail item-not-found)", .{i});
             session.sm_resume_enabled = false; // Prevent re-detach
             destroySession(server, i, session, changes);
         } else {
-            log.warn("connection {d} SM unacked queue overflowed — closing stream (resource-constraint)", .{i});
+            log.warn("connection {d} outbound queue overflowed — closing stream (resource-constraint)", .{i});
             server.sendStreamError(session, .resource_constraint);
             // Flush the stream error before teardown so the client sees it.
             session.conn.flushSync();

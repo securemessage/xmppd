@@ -201,7 +201,13 @@ pub fn deliverToSession(
         session.smTrackOutbound(data);
         return;
     }
-    session.conn.queueSend(data) catch return;
+    session.conn.queueSend(data) catch |err| {
+        if (err == error.WriteBufferFull) {
+            session.sm_overflow = true;
+            log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+        }
+        return;
+    };
     session.smTrackOutbound(data);
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session_id) catch {};
@@ -435,6 +441,7 @@ const MockConn = struct {
 
 const MockSession = struct {
     sm_detached: bool = false,
+    sm_overflow: bool = false,
     conn: MockConn = .{},
     tracked: [1024]u8 = undefined,
     tracked_len: usize = 0,

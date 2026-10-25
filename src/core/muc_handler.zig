@@ -2607,7 +2607,13 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         const sm = server.session_map orelse return;
         if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
-        session.queueSendStanza(stanza) catch return;
+        session.queueSendStanza(stanza) catch |err| {
+            if (err == error.WriteBufferFull) {
+                session.sm_overflow = true;
+                log.warn("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+            }
+            return;
+        };
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
@@ -3083,7 +3089,7 @@ test "G1: a protected room with no stored secret refuses the join" {
     try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
-test "S16: mailbox-full bounce goes to the sender's real JID, not a nick twin" {
+test "S16: mailbox-full bounce targets the sender and fails closed on overflow" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
     const sm_mod = @import("session_map");
@@ -3139,6 +3145,10 @@ test "S16: mailbox-full bounce goes to the sender's real JID, not a nick twin" {
     var cbuf: [1024]u8 = undefined;
     const cn = posix.read(carol_fds[1], &cbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), cn);
+
+    bob.conn.write_end = bob.conn.write_buf.len;
+    bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
+    try std.testing.expect(bob.sm_overflow);
 }
 
 test "T256: remote-join twin collapses onto the existing occupant" {
@@ -3363,4 +3373,35 @@ test "T413: remote presence error delivery drops are counted" {
         .generation = 1,
     }, "resource-constraint");
     try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+}
+
+test "S16: local replaced-resource notice overflow fails the session" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try registry.createRoom("room@conference.localhost", .{});
+    _ = try room.addOccupant("eve", "eve@localhost/phone", "eve@localhost", 0, 0, 1, .moderator, .owner);
+    const before = room.occupants[0].?;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
+    server.sessions[0] = target;
+
+    target.conn.write_end = target.conn.write_buf.len;
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    notifyReplacedResource(&server, room, &before, &changes);
+
+    try std.testing.expect(target.sm_overflow);
 }
