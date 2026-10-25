@@ -35,7 +35,9 @@ pub const Error = error{
 pub const FinishError = error{Overflow};
 
 pub const max_name_len = 256;
-pub const max_depth = 512;
+/// Open-element depth bound: far beyond any real stanza, small enough
+/// that the name stack stays cheap to return by value.
+pub const max_depth = 64;
 
 const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
 const ByteVec = @Vector(vec_len, u8);
@@ -108,8 +110,9 @@ pub const StanzaWriter = struct {
     /// True between elementOpen and elementOpenEnd/elementSelfClose.
     in_start_tag: bool = false,
     /// Open element names, so elementClose can refuse a mismatched
-    /// `</other>` instead of emitting it.
-    name_stack: [max_depth][max_name_len]u8 = undefined,
+    /// `</other>` instead of emitting it. Callers' names outlive the
+    /// writer, so the stack borrows slices instead of copying bytes.
+    name_stack: [max_depth][]const u8 = undefined,
     /// Escaping context for the current typed value: attribute values
     /// also escape tab/LF/CR as char refs so a parser cannot turn them
     /// into spaces; text escapes CR so it does not normalize to LF.
@@ -133,9 +136,7 @@ pub const StanzaWriter = struct {
         self.emitByte('<');
         self.emit(name);
         self.in_start_tag = true;
-        const ns = &self.name_stack[self.depth];
-        ns[0] = @intCast(name.len);
-        @memcpy(ns[1 .. 1 + name.len], name);
+        self.name_stack[self.depth] = name;
         self.depth += 1;
     }
 
@@ -205,8 +206,7 @@ pub const StanzaWriter = struct {
             self.failed = true;
             return e;
         };
-        const ns = &self.name_stack[self.depth - 1];
-        const open = ns[1 .. 1 + ns[0]];
+        const open = self.name_stack[self.depth - 1];
         if (!std.mem.eql(u8, open, name)) {
             self.failed = true;
             return error.MismatchedClose;
@@ -925,4 +925,25 @@ test "names must be QName: at most one colon, NCName on each side" {
         "<stream:stream id='s1' xmlns='jabber:client'/>",
         w2.buffered(),
     );
+}
+
+test "a name at the 256-byte limit writes; one over is rejected (L5)" {
+    var buf: [600]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    // 256 bytes is the largest legal name: it must round-trip without
+    // crashing the name stack (the old fixed-byte stack overflowed).
+    var long_name: [256]u8 = undefined;
+    @memset(&long_name, 'n');
+    try x.elementOpen(&long_name);
+    x.elementSelfClose();
+    try x.finish();
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    var over_name: [257]u8 = undefined;
+    @memset(&over_name, 'n');
+    try testing.expectError(error.InvalidName, y.elementOpen(&over_name));
+    try testing.expectError(error.Overflow, y.finish());
 }
