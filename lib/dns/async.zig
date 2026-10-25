@@ -219,6 +219,9 @@ pub const Resolver = struct {
     kq: posix.fd_t = -1,
     server: net.Address = undefined,
     server_configured: bool = false,
+    /// Path read once at init; a field so tests can point at a fixture
+    /// instead of the host resolver configuration.
+    resolv_conf_path: []const u8 = "/etc/resolv.conf",
     jobs: std.ArrayListUnmanaged(*Job) = .{},
     /// Slot table for timer udata: a queued deadline event carries
     /// (gen, slot) so a job freed by an earlier event in the same
@@ -265,7 +268,21 @@ pub const Resolver = struct {
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
 
     pub fn init(alloc: std.mem.Allocator) Resolver {
-        return .{ .alloc = alloc, .prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64)) };
+        var r = Resolver{ .alloc = alloc, .prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64)) };
+        // Nameserver configuration is loaded here, off the event loop;
+        // after init, ensureOpen only ever fails fast.
+        r.loadResolvConf();
+        return r;
+    }
+
+    /// Read the configured resolv.conf into `server`; a missing or
+    /// unparseable file leaves the resolver unconfigured, which
+    /// ensureOpen reports as error.NoResolver.
+    pub fn loadResolvConf(self: *Resolver) void {
+        if (readResolvConf(self.resolv_conf_path)) |addr| {
+            self.server = addr;
+            self.server_configured = true;
+        } else |_| {}
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -511,11 +528,8 @@ pub const Resolver = struct {
         if (self.kq < 0) self.kq = try posix.kqueue();
         if (self.fd >= 0) return;
         if (!self.server_configured) {
-            self.server = readResolvConf() catch {
-                log.warn("dns: no /etc/resolv.conf nameserver found", .{});
-                return error.NoResolver;
-            };
-            self.server_configured = true;
+            log.warn("dns: no nameserver configured", .{});
+            return error.NoResolver;
         }
         const fd = try posix.socket(self.server.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
@@ -1693,9 +1707,9 @@ fn nowMs() i64 {
     return std.time.milliTimestamp();
 }
 
-fn readResolvConf() !net.Address {
+fn readResolvConf(path: []const u8) !net.Address {
     var buf: [1024]u8 = undefined;
-    const f = try std.fs.openFileAbsolute("/etc/resolv.conf", .{});
+    const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
     const n = try f.read(&buf);
     var it = std.mem.tokenizeAny(u8, buf[0..n], " \t\n");
@@ -3349,4 +3363,19 @@ test "dns-async: TCP sends the frame exactly once across connect" {
     r.step(10);
     const extra = posix.recv(cfd, fbuf[0..1], posix.MSG.DONTWAIT) catch 0;
     try std.testing.expectEqual(@as(usize, 0), extra);
+}
+
+test "dns-async: resolv.conf is read into the resolver, not on the loop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "nameserver 127.0.0.99\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expectEqual(@as(u16, 53), r.server.getPort());
 }
