@@ -146,7 +146,7 @@
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0163.html"/>
         <xmpp:status>partial</xmpp:status>
-        <xmpp:note xml:lang="en">Publish, subscribe, auto-subscribe, auto-create, persistent items and avatar metadata notifications. Not a full XEP-0060 PubSub service.</xmpp:note>
+        <xmpp:note xml:lang="en">Publish, item retrieval, auto-create, persistent items, and notifications to presence subscribers (auto-subscribe model). No explicit subscribe/unsubscribe elements; not a full XEP-0060 PubSub service.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -179,9 +179,16 @@
     </implements>
     <implements>
       <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0203.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:note xml:lang="en">urn:xmpp:delay stamps on MAM replay and MUC history; offline-delivered messages are not yet stamped.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0220.html"/>
         <xmpp:status>partial</xmpp:status>
-        <xmpp:note xml:lang="en">Fallback federated auth where SASL EXTERNAL or DANE is unavailable; DANE/TLSA is the primary S2S trust path.</xmpp:note>
+        <xmpp:note xml:lang="en">Fallback federated auth where SASL EXTERNAL or DANE is unavailable; core result/verify exchange complete, graceful dialback errors (type='error') not implemented.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
