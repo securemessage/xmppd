@@ -545,6 +545,10 @@ pub const Server = struct {
     /// against `archive`.
     archive_writer: ?*archive_queue_mod.ArchiveWriteQueue = null,
 
+    /// Inline archive store failures (no writer thread wired) - for ops
+    /// visibility; queue-mode failures are counted on the queue instead.
+    archive_store_failed: u64 = 0,
+
     /// VCard store — per-user vCard XML blobs (XEP-0054).
     vcard: ?*GenericVCardStore = null,
 
@@ -838,14 +842,20 @@ pub const Server = struct {
 
     /// T87: archive a stanza. Enqueues onto the writer thread's queue when
     /// wired (never blocks the event loop on storage); otherwise falls back
-    /// to an inline store() (unchanged legacy behavior).
+    /// to an inline store().
     pub fn archiveStore(self: *Server, owner: []const u8, with: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) void {
         if (self.archive_writer) |q| {
             q.enqueue(owner, with, stanza_id, timestamp, stanza_xml);
             return;
         }
         if (self.archive) |archive| {
-            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch {};
+            archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch |err| {
+                self.archive_store_failed += 1;
+                // Log the first failure and every power of two after it.
+                if (archive_queue_mod.logEveryPowerOfTwo(self.archive_store_failed)) {
+                    log.warn("inline archive store failed ({d} total): {}", .{ self.archive_store_failed, err });
+                }
+            };
         }
     }
 
@@ -4619,6 +4629,33 @@ test "cross-thread delivery: generation mismatch drops stanza" {
 
     // No session at slot 3, so nothing should crash or write
     try std.testing.expect(server.sessions[3] == null);
+}
+
+test "Server: inline archiveStore failure increments archive_store_failed (S31)" {
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("archive");
+    const path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(path);
+
+    var be = try ArchiveBackendType.open(path, .{});
+    defer be.close();
+
+    // An allocator that always fails makes ArchiveStore.store() return
+    // OutOfMemory while building the key: the inline path must count it.
+    var empty_buf: [0]u8 = .{};
+    var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
+    var store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&be, fba.allocator());
+    server.archive = &store;
+
+    server.archiveStore("a@localhost", "b@localhost", "s1", 1, "<m/>");
+    server.archiveStore("a@localhost", "b@localhost", "s2", 2, "<m/>");
+    try std.testing.expectEqual(@as(u64, 2), server.archive_store_failed);
 }
 
 test "every store namespace constant is registered and every registry entry is owned" {

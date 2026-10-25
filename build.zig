@@ -1628,10 +1628,21 @@ pub fn build(b: *std.Build) void {
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
-    // T87: archive write queue tests (module defined next to core_mod)
+    // T87: archive write queue tests. A separate module on the same root
+    // file carries the store/backend imports; archive_queue_mod itself
+    // stays dependency-free for the production binaries.
+    const archive_queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/archive_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    archive_queue_test_mod.addImport("archive_store", archive_store_test_mod);
+    archive_queue_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+    archive_queue_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
     const archive_queue_tests = b.addTest(.{
         .name = "archive-queue-tests",
-        .root_module = archive_queue_mod,
+        .root_module = archive_queue_test_mod,
     });
     const run_archive_queue_tests = b.addRunArtifact(archive_queue_tests);
 
