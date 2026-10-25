@@ -216,22 +216,21 @@ pub fn main() !void {
     }
     defer if (cfg) |*c| c.deinit();
 
-    // Resolve unprivileged user for child processes
-    var child_uid: posix.uid_t = 0;
-    var child_gid: posix.gid_t = 0;
+    // Resolve the unprivileged user for child processes. A root master
+    // without a run user would start every child as root, and a run user
+    // that resolves to uid 0 does not drop privileges: refuse both.
+    const ids = decideRunUser(run_user, posix.geteuid()) catch |err| {
+        switch (err) {
+            error.RunUserRequired => log.err("running as root requires a run user; refusing to start", .{}),
+            error.RunUserIsRoot => log.err("run user '{s}' resolves to root; refusing to start", .{run_user orelse ""}),
+            error.RunUserNotFound => log.err("user '{s}' not found: refusing to start; children must not run as root", .{run_user orelse ""}),
+            error.RunUserTooLong => log.err("user name too long: {s}", .{run_user orelse ""}),
+        }
+        return err;
+    };
+    const child_uid = ids.uid;
+    const child_gid = ids.gid;
     if (run_user) |username| {
-        const ids = resolveRunUser(username) catch |err| {
-            // A configured run user must never silently degrade to root
-            // (C5).
-            if (err == error.RunUserNotFound) {
-                log.err("user '{s}' not found: refusing to start; children must not run as root", .{username});
-            } else {
-                log.err("user name too long: {s}", .{username});
-            }
-            return err;
-        };
-        child_uid = ids.uid;
-        child_gid = ids.gid;
         log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
     }
 
@@ -681,6 +680,21 @@ fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong 
     return .{ .uid = pw.uid, .gid = pw.gid };
 }
 
+/// Decide the uid/gid child processes run as. A master started as root
+/// must name an unprivileged run user; a run user that resolves to uid 0
+/// does not drop privileges and is refused. Without root and without a
+/// run user the children inherit the master's identity (0/0 means
+/// "inherit" at the supervisor call sites).
+fn decideRunUser(username: ?[]const u8, euid: posix.uid_t) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!struct { uid: posix.uid_t, gid: posix.gid_t }) {
+    const name = username orelse {
+        if (euid == 0) return error.RunUserRequired;
+        return .{ .uid = 0, .gid = 0 };
+    };
+    const ids = try resolveRunUser(name);
+    if (ids.uid == 0) return error.RunUserIsRoot;
+    return .{ .uid = ids.uid, .gid = ids.gid };
+}
+
 /// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
 /// (T259: nothing under /var/run/xmppd is hardcoded anymore).
 fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
@@ -988,4 +1002,26 @@ test "resolveRunUser: a configured user resolves to its passwd entry (C5)" {
     const ids = try resolveRunUser("root");
     try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
     try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
+}
+
+test "decideRunUser: root without a run user is refused" {
+    try std.testing.expectError(error.RunUserRequired, decideRunUser(null, 0));
+}
+
+test "decideRunUser: a run user that resolves to root is refused" {
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUser("root", 0));
+}
+
+test "decideRunUser: non-root without a run user inherits" {
+    const ids = try decideRunUser(null, @as(posix.uid_t, 1001));
+    try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
+    try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
+}
+
+test "decideRunUser: an unprivileged run user resolves to its passwd entry" {
+    const expected = try resolveRunUser("nobody");
+    const ids = try decideRunUser("nobody", 0);
+    try std.testing.expectEqual(expected.uid, ids.uid);
+    try std.testing.expectEqual(expected.gid, ids.gid);
+    try std.testing.expect(ids.uid != 0);
 }
