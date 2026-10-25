@@ -233,6 +233,9 @@ pub const Resolver = struct {
     /// Whole-chain deadline for resolve() jobs; a field so tests can
     /// shrink it instead of sleeping ten seconds.
     chain_deadline_ms: i64 = CHAIN_DEADLINE_MS,
+    /// Wall clock for cache expiry; a field so tests can pin time
+    /// instead of sleeping on real TTLs.
+    now_ms: *const fn () i64 = nowMs,
     /// Requests rejected because the wait queue was full; observability
     /// for a queue that silently dropping would otherwise hide.
     too_many_jobs: usize = 0,
@@ -297,7 +300,7 @@ pub const Resolver = struct {
                 .nodata => self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = &.{}, .ttl = 0 }),
                 .none => {
                     const rrs = try self.dupRrs(ent.rrs);
-                    const ttl_ms = @max(0, ent.expires_ms - nowMs());
+                    const ttl_ms = @max(0, ent.expires_ms - self.now_ms());
                     self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = rrs, .ttl = @intCast(ttl_ms / 1000) });
                 },
             }
@@ -509,15 +512,11 @@ pub const Resolver = struct {
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
         const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
+        // Socket progress before deadlines: a reply that frees a job
+        // makes the same batch's deadline event for it correctly stale
+        // under the (gen, slot) check, in either harvest order.
         for (events[0..n]) |ev| {
-            if (ev.filter == std.c.EVFILT.TIMER) {
-                // The event may have been queued before the job was
-                // freed by an earlier event in this same batch. udata
-                // bit 6 marks the whole-chain deadline vs a retry.
-                if (self.jobFromUdata(ev.udata)) |job| {
-                    if (ev.udata & 0x40 != 0) self.onChainDeadline(job) else self.onDeadline(job);
-                }
-            } else if (ev.filter == std.c.EVFILT.READ) {
+            if (ev.filter == std.c.EVFILT.READ) {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
                     self.onReadable();
@@ -538,6 +537,15 @@ pub const Resolver = struct {
                         break;
                     }
                 }
+            }
+        }
+        for (events[0..n]) |ev| {
+            if (ev.filter != std.c.EVFILT.TIMER) continue;
+            // The event may have been queued before the job was freed
+            // by an earlier event in this same batch. udata bit 6 marks
+            // the whole-chain deadline vs a retry.
+            if (self.jobFromUdata(ev.udata)) |job| {
+                if (ev.udata & 0x40 != 0) self.onChainDeadline(job) else self.onDeadline(job);
             }
         }
     }
@@ -1081,7 +1089,7 @@ pub const Resolver = struct {
     fn cacheGet(self: *Resolver, qname: []const u8, qtype: u16) ?*CacheEnt {
         var key_buf: [280]u8 = undefined;
         const key = cacheKey(&key_buf, qname, qtype) orelse return null;
-        const now = nowMs();
+        const now = self.now_ms();
         for (self.cache.items) |*e| {
             if (std.mem.eql(u8, e.key, key) and e.expires_ms > now) return e;
         }
@@ -1101,7 +1109,7 @@ pub const Resolver = struct {
             const e = self.cache.orderedRemove(0);
             self.freeCacheEnt(e);
         }
-        self.cache.append(self.alloc, .{ .key = key, .rrs = dup, .neg = neg, .expires_ms = nowMs() + @as(i64, ttl_s) * 1000 }) catch {
+        self.cache.append(self.alloc, .{ .key = key, .rrs = dup, .neg = neg, .expires_ms = self.now_ms() + @as(i64, ttl_s) * 1000 }) catch {
             self.alloc.free(key);
             self.freeRrs(dup);
         };
@@ -1619,6 +1627,12 @@ const FakeDns = struct {
     /// When set, AAAA queries are answered with ::1 so dual-stack
     /// paths have real data.
     a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, SRV answers carry three targets with wire-order
+    /// priorities 30, 10, 20; RFC 2782 must emit t_lo first.
+    srv_prio_mix: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, SRV answers exist only for the _xmpps-client and
+    /// _xmpp-client prefixes; anything else is NODATA.
+    client_srv_only: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, every answer is NXDOMAIN with an authority SOA whose
     /// minimum is 120 s - feeds the negative cache.
     nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1719,7 +1733,10 @@ const FakeDns = struct {
             }
         }
         if (q.qtype == wire.TYPE_SRV) {
-            if (self.srv_tls_dot.load(.monotonic) and std.mem.startsWith(u8, q.qname, "_xmpps")) {
+            const client_prefix = std.mem.startsWith(u8, q.qname, "_xmpps-client") or std.mem.startsWith(u8, q.qname, "_xmpp-client");
+            if (self.client_srv_only.load(.monotonic) and !client_prefix) {
+                // NODATA for anything but the client prefixes.
+            } else if (self.srv_tls_dot.load(.monotonic) and std.mem.startsWith(u8, q.qname, "_xmpps")) {
                 ancount = 1;
                 appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 7);
                 var v: u16 = 0;
@@ -1748,6 +1765,23 @@ const FakeDns = struct {
                     v = 15222;
                     answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
                     appendEncodedName(alloc, &answers, tname);
+                }
+            } else if (self.srv_prio_mix.load(.monotonic)) {
+                const entries = [3]struct { n: []const u8, p: u16 }{
+                    .{ .n = "t_hi.test", .p = 30 },
+                    .{ .n = "t_lo.test", .p = 10 },
+                    .{ .n = "t_mid.test", .p = 20 },
+                };
+                for (entries) |ent| {
+                    ancount += 1;
+                    appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 6 + encLen(ent.n));
+                    var v: u16 = ent.p;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    v = 100;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    v = 15222;
+                    answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                    appendEncodedName(alloc, &answers, ent.n);
                 }
             } else if (self.srv_dot.load(.monotonic)) {
                 ancount = 1;
@@ -1927,15 +1961,29 @@ fn startFakeDns(truncate: bool, decoy: []const u8) !*FakeDns {
         .tcp_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0),
         .port = 0,
     };
-    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
-    try posix.bind(srv.udp_fd, &bind_addr.any, bind_addr.getOsSockLen());
-    var actual: posix.sockaddr = undefined;
-    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
-    try posix.getsockname(srv.udp_fd, &actual, &slen);
-    srv.port = net.Address.initPosix(@alignCast(&actual)).getPort();
-    // TCP answers must arrive on the same port the query addressed.
-    const tcp_addr = try net.Address.parseIp("127.0.0.1", srv.port);
-    try posix.bind(srv.tcp_fd, &tcp_addr.any, tcp_addr.getOsSockLen());
+    // TCP answers must arrive on the same port the query addressed:
+    // take a TCP port, then hold the UDP half of the same number,
+    // retrying the pair on collision instead of racing the OS.
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        if (attempts == 256) return error.AddressInUse;
+        const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+        try posix.bind(srv.tcp_fd, &bind_addr.any, bind_addr.getOsSockLen());
+        var actual: posix.sockaddr = undefined;
+        var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+        try posix.getsockname(srv.tcp_fd, &actual, &slen);
+        srv.port = net.Address.initPosix(@alignCast(&actual)).getPort();
+        const udp_addr = try net.Address.parseIp("127.0.0.1", srv.port);
+        posix.bind(srv.udp_fd, &udp_addr.any, udp_addr.getOsSockLen()) catch |err| switch (err) {
+            error.AddressInUse => {
+                posix.close(srv.tcp_fd);
+                srv.tcp_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
     try posix.listen(srv.tcp_fd, 8);
     srv.truncate_udp.store(truncate, .monotonic);
     srv.decoy_qname = decoy;
@@ -2126,29 +2174,76 @@ test "dns-async: a maximal frame ahead of the answer is consumed, not fatal (Q1)
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
+const UdpSink = struct { fd: posix.fd_t, port: u16 };
+
+/// A nameserver that is only a bound UDP socket: the test receives
+/// queries and sends answers itself, so nothing ever waits.
+fn startUdpSink() !UdpSink {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    errdefer posix.close(fd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &actual, &slen);
+    return .{ .fd = fd, .port = net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+/// Arm an already-expired one-shot deadline carrying `udata`: pending
+/// at the next step() with no sleeping on real time.
+fn armStaleTimer(r: *Resolver, udata: usize) void {
+    var ch = [1]posix.Kevent{.{
+        .ident = 0xDEAD,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+        .fflags = std.c.NOTE.ABSTIME,
+        .data = 1,
+        .udata = udata,
+    }};
+    _ = posix.kevent(r.kq, &ch, &.{}, null) catch {};
+}
+
 test "dns-async: a deadline event batched with the reply does not touch a freed job (J3)" {
-    const srv = try startFakeDns(false, "");
-    defer stopFakeDns(srv);
+    const sink = try startUdpSink();
+    defer posix.close(sink.fd);
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.setServer(try net.Address.parseIp("127.0.0.1", sink.port));
     var ctx = TestCtx{};
     r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
 
     try r.query("host.test", .a, 7);
     const job = r.jobs.items[0];
-    r.armDeadline(job, 1);
-    // The reply and the expired deadline are harvested in one kevent
-    // batch; the reply frees the job first, so the timer event must be
-    // recognized as stale.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
-    r.step(50);
+
+    // Drain the query; loopback delivery is synchronous, so a bounded
+    // recv spin is enough with no sleeping.
+    var qbuf: [512]u8 = undefined;
+    var qn: usize = 0;
+    var spins: usize = 0;
+    while (qn == 0 and spins < 100_000) : (spins += 1) {
+        qn = posix.recv(sink.fd, &qbuf, 0) catch 0;
+    }
+    try std.testing.expect(qn > 0);
+
+    // Answer it, then queue the expired deadline: both events sit
+    // pending for one kevent batch. The read frees the job first, so
+    // the timer event must be recognized as stale.
+    var resp: [512]u8 = undefined;
+    const rlen = buildAResponse(&resp, qbuf[0..qn]);
+    var local: posix.sockaddr = undefined;
+    var llen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(r.fd, &local, &llen);
+    _ = try posix.sendto(sink.fd, resp[0..rlen], 0, &local, llen);
+    armStaleTimer(&r, (@as(usize, job.gen) << 8) | job.slot);
+
+    r.step(0);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.raw.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
+
 
 test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
     var r = Resolver.init(std.testing.allocator);
@@ -2348,48 +2443,55 @@ test "dns-async: a hostile SRV answer is capped at 16 emitted targets" {
     try std.testing.expect(srv.udp_recvd.load(.monotonic) < 20 * 3);
 }
 
-test "dns-async: want_tlsa=false skips the TLSA round trip entirely" {
-    const srv = try startFakeDns(false, "");
-    defer stopFakeDns(srv);
+/// Pre-seed the RR cache for every step of the "svc.test" chain so a
+/// resolve completes synchronously without a single datagram.
+fn seedSvcChain(r: *Resolver, with_tlsa: bool) void {
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var srv_rdata = [_]u8{ 0, 10, 0, 100, 0x3B, 0x76, 3, 's', 'r', 'v', 4, 't', 'e', 's', 't', 0 };
+    var srv_rrs = [1]wire.Rr{.{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = &srv_rdata }};
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+    var a_rrs = [1]wire.Rr{.{ .name = "srv.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cacheInsert("srv.test", KIND_A, &a_rrs, .none, 60);
+    r.cacheInsert("srv.test", KIND_AAAA, &.{}, .nodata, 60);
+    if (with_tlsa) {
+        var t_rrs = [1]wire.Rr{.{ .name = "_15222._tcp.srv.test", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF } }};
+        r.cacheInsert("_15222._tcp.srv.test", KIND_TLSA, &t_rrs, .none, 60);
+    }
+}
 
+test "dns-async: want_tlsa=false skips the TLSA round trip entirely" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
+    seedSvcChain(&r, false);
     try r.resolve("svc.test", .client, 5222, 3, false);
-    var spins: usize = 0;
-    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
-
+    // The whole chain is served from the RR cache: the callback fires
+    // inside resolve() and a stray TLSA query would have hit the wire.
+    try std.testing.expect(ctx.status != null);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expect(res.targets.len >= 1);
-    // No TLSA query ever touched the wire, and targets carry no records.
-    try std.testing.expectEqual(@as(u32, 0), srv.tlsa_recvd.load(.monotonic));
     for (res.targets) |t| try std.testing.expectEqual(@as(usize, 0), t.tlsa.len);
 }
 
 test "dns-async: want_tlsa=true attaches the fetched records per target" {
-    const srv = try startFakeDns(false, "");
-    defer stopFakeDns(srv);
-
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
+    seedSvcChain(&r, true);
     try r.resolve("svc.test", .client, 5222, 3, true);
-    var spins: usize = 0;
-    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
-
+    try std.testing.expect(ctx.status != null);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expect(res.targets.len >= 1);
-    try std.testing.expect(srv.tlsa_recvd.load(.monotonic) > 0);
     try std.testing.expect(res.targets[0].tlsa.len >= 1);
 }
 
@@ -2732,23 +2834,21 @@ test "dns-async: the 65th cache entry evicts the oldest, forcing wire" {
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
 
-    // Every query resolves the same canned A record; the cache only
-    // cares about distinct (qname, qtype) keys.
+    // Fill the cache directly: eviction order is what matters, not
+    // how the entries arrived, and the wire stays out of it.
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
     var name_buf: [32]u8 = undefined;
-    for (0..65) |i| {
+    for (0..CACHE_CAP + 1) |i| {
         const n = std.fmt.bufPrint(&name_buf, "c{d}.test", .{i}) catch unreachable;
-        var ctx = TestCtx{};
-        r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
-        try r.query(n, .a, i + 1);
-        var spins: usize = 0;
-        while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
-        try std.testing.expectEqual(Status.resolved, ctx.status.?);
-        if (ctx.raw) |*res| {
-            var v = res.*;
-            v.deinitOn(std.testing.allocator);
-        }
+        r.cachePut(n, KIND_A, &rrs);
     }
     try std.testing.expectEqual(@as(usize, CACHE_CAP), r.cache.items.len);
+    try std.testing.expect(r.cacheGet("c0.test", KIND_A) == null);
+    try std.testing.expect(r.cacheGet("c64.test", KIND_A) != null);
 
     // c0 was evicted FIFO: asking for it again costs a wire round trip.
     const wired = srv.udp_recvd.load(.monotonic);
