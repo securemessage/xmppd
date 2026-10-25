@@ -2955,7 +2955,7 @@ test "S2sDaemon: a dialback callback that cannot open its conn answers the submi
 
     // The submission is answered invalid instead of waiting for a verdict
     // that no connection will ever produce.
-    _ = try in1.session.flushWrite();
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
@@ -2992,7 +2992,7 @@ test "S2sDaemon: a full pending-verify table answers the submission invalid" {
 
     // No exchange can be registered, so the submission is answered invalid
     // instead of waiting for a verdict that no slot can carry.
-    _ = try in1.session.flushWrite();
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
@@ -3153,9 +3153,11 @@ fn testAttr(name: []const u8, value: []const u8) xml.Attribute {
 }
 
 /// Feed a db:result key submission through processInboundEvent the way the
-/// reader loop would (element_start, text, element_end).
+/// reader loop would (element_start, text, element_end). Every event can
+/// close and free the session, so each one reaches it and its reader
+/// through the slot table (B5).
 fn submitDbResult(daemon: *S2sDaemon, session: *S2sSession, cl: *ChangeList, from: []const u8, to: []const u8, key: []const u8) void {
-    const reader = daemon.readers[session.id].?;
+    const slot = session.id;
     var attrs = [_]xml.Attribute{ testAttr("from", from), testAttr("to", to) };
     const elem = xml.Element{
         .name = "db:result",
@@ -3165,9 +3167,12 @@ fn submitDbResult(daemon: *S2sDaemon, session: *S2sSession, cl: *ChangeList, fro
         .attributes = &attrs,
         .self_closing = false,
     };
-    processInboundEvent(daemon, session, reader, .{ .element_start = elem }, cl);
-    processInboundEvent(daemon, session, reader, .{ .text = key }, cl);
-    processInboundEvent(daemon, session, reader, .{ .element_end = "db:result" }, cl);
+    const s1 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s1, daemon.readers[slot].?, .{ .element_start = elem }, cl);
+    const s2 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s2, daemon.readers[slot].?, .{ .text = key }, cl);
+    const s3 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s3, daemon.readers[slot].?, .{ .element_end = "db:result" }, cl);
 }
 
 /// Feed a db:verify verdict through processOutboundEvent on a callback conn.
@@ -3603,7 +3608,8 @@ test "S2sDaemon: a db:result verdict for a verify that never went out authentica
     submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
     try std.testing.expect(t.conn.hasUnsentVerify());
     try std.testing.expectEqual(@as(usize, 1), t.conn.pendingVerifyCount());
-    const sid = try alloc.dupe(u8, in1.session.getStreamId());
+    try std.testing.expect(daemon.getInbound(1) != null);
+    const sid = try alloc.dupe(u8, daemon.getInbound(1).?.getStreamId());
     defer alloc.free(sid);
 
     var reader = XmlReader.init(alloc);
@@ -3821,7 +3827,8 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
 
     const key = "3333333333333333333333333333333333333333333333333333333333333333";
     submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
-    const old_sid = try alloc.dupe(u8, in1.session.getStreamId());
+    try std.testing.expect(daemon.getInbound(1) != null);
+    const old_sid = try alloc.dupe(u8, daemon.getInbound(1).?.getStreamId());
     defer alloc.free(old_sid);
 
     // The submitter disconnects; its slot is reused by a different peer.
@@ -3835,8 +3842,11 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
 
     // The stale verdict must not land on the new occupant of slot 1.
     feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", old_sid, "them.example", "us.example");
-    try std.testing.expect(!in2.session.isAuthenticatedDomain("them.example"));
-    try std.testing.expect(!in2.session.isEstablished());
+    // The stale verdict may close the new occupant: reach it through the
+    // slot table.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(1).?.isEstablished());
     var rbuf: [512]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
@@ -4315,12 +4325,13 @@ test "S2sDaemon: a db:result verdict whose answer cannot be queued fails the inb
     submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
 
     // Fill the inbound write buffer: the verdict answer no longer fits.
+    try std.testing.expect(daemon.getInbound(1) != null);
     var filler: [16384]u8 = @splat(' ');
-    try in1.session.queueWrite(filler[0 .. 16384 - 64]);
+    try daemon.getInbound(1).?.queueWrite(filler[0 .. 16384 - 64]);
 
     var reader = XmlReader.init(alloc);
     defer reader.deinit();
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "us.example");
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
 
     // The submitting stream is failed and closed instead of stalling.
     try std.testing.expect(daemon.getInbound(1) == null);
@@ -4623,9 +4634,10 @@ test "S2sDaemon: MUC host is served on stream open; replies echo the requested h
     defer posix.close(in1.peer_fd);
     var attrs1 = [_]xml.Attribute{ testAttr("from", ""), testAttr("to", ""), testAttr("version", "") };
     const open1 = testStreamOpenElem("them.example", "conference.us.example", &attrs1);
-    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .stream_open = open1 }, &cl);
+    const s1 = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, s1, daemon.readers[1].?, .{ .stream_open = open1 }, &cl);
     try std.testing.expect(daemon.getInbound(1) != null);
-    _ = try in1.session.flushWrite();
+    _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [2048]u8 = undefined;
     const resp1 = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp1, "from='conference.us.example'") != null);
@@ -4670,7 +4682,7 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host" 
     // The verdict echoes the MUC host as to= and completes the exchange.
     var reader = XmlReader.init(alloc);
     defer reader.deinit();
-    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", in1.session.getStreamId(), "them.example", "conference.us.example");
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "conference.us.example");
     // The processing may close and free the session: reach it through the
     // slot table, never the rig pointer.
     try std.testing.expect(daemon.getInbound(1) != null);
@@ -4684,7 +4696,8 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host" 
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 
     // A verdict addressed to the local domain matches no MUC-host entry.
-    submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    submitDbResult(&daemon, daemon.getInbound(1).?, &cl, "them.example", "conference.us.example", key);
     try std.testing.expect(daemon.getInbound(1) != null);
     feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
@@ -4714,7 +4727,8 @@ test "S2sDaemon: db:verify for the MUC host is answered as that host" {
         .attributes = &attrs,
         .self_closing = false,
     };
-    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = elem }, &cl);
+    const v1 = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, v1, daemon.readers[1].?, .{ .element_start = elem }, &cl);
     // The processing may close and free the session: everything after it
     // reaches the session through the slot table, never the rig pointer.
     try std.testing.expect(daemon.getInbound(1) != null);
@@ -4739,8 +4753,13 @@ test "S2sDaemon: db:verify for the MUC host is answered as that host" {
         .attributes = &attrs2,
         .self_closing = false,
     };
-    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
-    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .text = "6666666666666666666666666666666666666666666666666666666666666666" }, &cl);
+    const v2 = daemon.getInbound(2) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, v2, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
+    // The key text fails the stream and frees the session: re-fetch it from
+    // the slot table before feeding the text.
+    if (daemon.getInbound(2)) |live| {
+        processInboundEvent(&daemon, live, daemon.readers[2].?, .{ .text = "6666666666666666666666666666666666666666666666666666666666666666" }, &cl);
+    }
     try std.testing.expect(daemon.getInbound(2) == null);
     var rbuf2: [1024]u8 = undefined;
     const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
