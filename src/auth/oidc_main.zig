@@ -177,24 +177,12 @@ pub fn main() !void {
     // daemon instead of being provisioned over.
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
-    // This daemon is the writer of record for the locks namespace in an
-    // OIDC deployment: run the legacy-key migration here, on a short-lived
-    // read-write handle, or legacy rows stay in place and every lock-check
-    // miss scans the whole namespace on the auth loop thread (S3).
-    const locks_canonical = try lock_store_mod.migrateIfWritable(OpBackendType, allocator, auth_path, .{
-        .map_size = map_size_mb * 1024 * 1024,
-    });
-    var backend = lock_store_mod.openReadOnlyProvisioned(OpBackendType, auth_path, .{
-        .map_size = map_size_mb * 1024 * 1024,
-    }) catch |err| {
+    var lock_backend: OpBackendType = undefined;
+    var lock_store = openLockStore(OpBackendType, allocator, auth_path, map_size_mb * 1024 * 1024, &lock_backend) catch |err| {
         log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
         return err;
     };
-    defer backend.close();
-    var lock_store = LockStore.init(&backend);
-    // The read-only path learns from the migration pass: its misses then
-    // skip the legacy scan from the first check on.
-    if (locks_canonical) lock_store.learnLegacyFree();
+    defer lock_backend.close();
     handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
@@ -345,6 +333,31 @@ fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize) void {
     }
 }
 
+/// Open the lock store the handler checks against. This daemon is the writer
+/// of record for the locks namespace in an OIDC deployment, so the legacy-key
+/// migration runs here on a short-lived read-write handle: legacy rows would
+/// otherwise stay in place and every lock-check miss would scan the whole
+/// namespace on the auth loop thread (S3). The store is then opened read-only
+/// and told the namespace is canonical when the migration ran, so its misses
+/// skip the legacy scan from the first check on.
+fn openLockStore(
+    comptime Backend: type,
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+    map_size: usize,
+    backend: *Backend,
+) !lock_store_mod.LockStore(Backend) {
+    const canonical = try lock_store_mod.migrateIfWritable(Backend, allocator, auth_path, .{
+        .map_size = map_size,
+    });
+    backend.* = try lock_store_mod.openReadOnlyProvisioned(Backend, auth_path, .{
+        .map_size = map_size,
+    });
+    var store = lock_store_mod.LockStore(Backend).init(backend);
+    if (canonical) store.learnLegacyFree();
+    return store;
+}
+
 fn printUsage() void {
     const usage =
         \\Usage: xmppd-auth-oidc [OPTIONS]
@@ -371,4 +384,39 @@ fn printUsage() void {
     var buf: [0]u8 = .{};
     var stdout = std.fs.File.stdout().writer(&buf);
     stdout.interface.writeAll(usage) catch {};
+}
+
+test "oidc daemon: the start path migrates legacy lock keys before the read-only open" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(store_path);
+
+    // One canonical row and one written before keys were case-folded.
+    {
+        var rw = try OpBackendType.open(store_path, .{ .map_size = 1024 * 1024 });
+        defer rw.close();
+        var seed = LockStore.init(&rw);
+        try seed.lock("bob", .permanent);
+        try rw.put(lock_store_mod.NAMESPACE, "Alice", &[_]u8{ 0x01, 0, 0, 0, 7 });
+    }
+
+    var backend: OpBackendType = undefined;
+    var store = try openLockStore(OpBackendType, allocator, store_path, 1024 * 1024, &backend);
+    defer backend.close();
+
+    // The migration ran before the read-only open: the pre-fold row is gone
+    // and its canonical key carries the record.
+    const legacy = try store.backend.get(allocator, lock_store_mod.NAMESPACE, "Alice");
+    defer if (legacy) |v| allocator.free(v);
+    try std.testing.expect(legacy == null);
+    const canon = try store.backend.get(allocator, lock_store_mod.NAMESPACE, "alice");
+    defer if (canon) |v| allocator.free(v);
+    try std.testing.expect(canon != null);
+
+    // The read-only handle serves both accounts.
+    const alice = (try store.isLocked(allocator, "ALICE")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 7), alice.locked_epoch);
+    try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
 }

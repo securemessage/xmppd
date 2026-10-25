@@ -1507,6 +1507,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(oidc_exe);
 
+    // The OIDC daemon's start path is only under test when the daemon source
+    // is compiled by the test step.
+    const oidc_main_tests = b.addTest(.{
+        .name = "auth-oidc-tests",
+        .root_module = oidc_main_mod,
+    });
+    const run_oidc_main_tests = b.addRunArtifact(oidc_main_tests);
+
     // xmppd-s2s: the S2S federation daemon
     const s2s_ipc_protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),
@@ -1688,6 +1696,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
     test_step.dependOn(&run_oidc_store_tests.step);
+    test_step.dependOn(&run_oidc_main_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
 }
