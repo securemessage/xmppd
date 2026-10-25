@@ -584,7 +584,6 @@ fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
         std.c._exit(child_fn());
     }
     _ = posix.close(fds[1]);
-    defer _ = posix.close(fds[0]);
 
     // Drain to EOF so a child that writes more than the cap never blocks on
     // a full pipe; the excess is discarded.
@@ -598,7 +597,10 @@ fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
         out.len += take;
     }
 
-    // waitpid retries EINTR itself, so the child is always reaped.
+    // Close the read end before reaping: a mutated drain that stops at the
+    // cap then fails the test by name instead of blocking until the outer
+    // timeout.
+    _ = posix.close(fds[0]);
     const res = posix.waitpid(pid, 0);
     // A child killed by a signal has an empty exit status; reporting it as 0
     // would read as success.
