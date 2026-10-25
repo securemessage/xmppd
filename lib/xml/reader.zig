@@ -80,12 +80,11 @@ pub const Event = union(enum) {
 /// Wraps the low-level scanner to produce higher-level events suitable
 /// for XMPP stream processing. Tracks namespace context and element depth.
 ///
-/// Event payload lifetime: `element_start`, `element_end` and `text`
-/// payloads are borrowed from the stanza arena and stay valid until the
-/// next top-level stanza begins (depth-1 `element_open`), which resets the
-/// arena (S11). Consumers must copy anything they keep across stanzas.
-/// Namespace context declared on the stream element itself lives in the
-/// separate `ns_arena` and survives stanza resets until `reset()`.
+/// Event payload lifetime: `element_start`, `element_end` and `text` payloads
+/// are borrowed from the stanza arena and stay valid until the next root or
+/// top-level `element_open` resets it. Consumers must copy anything retained
+/// across items. The stream root name and namespace context live in `ns_arena`
+/// and survive stanza resets until `reset()`.
 /// Maximum number of namespace prefix bindings (XMPP uses very few)
 const max_ns_bindings = 16;
 
@@ -181,15 +180,10 @@ pub const Reader = struct {
                 },
                 .element_open => {
                     if (self.depth <= 1) {
-                        // A new item starts here: a root (depth 0) or a new
-                        // top-level stanza (depth 1) means everything the
-                        // reader produced for the previous item dies here.
-                        // The condition is the depth alone, not stream_opened,
-                        // so a root that is not a stream open cannot accumulate
-                        // tokens forever (E1). The stream-level namespace
-                        // context lives in ns_arena and survives (S11).
-                        // Retained capacity is bounded so one giant stanza does
-                        // not inflate the arena for the life of the stream (S26).
+                        // Every root or top-level stanza starts a new item.
+                        // Reset by depth even for a rejected root; the stream
+                        // root name and namespace context remain in ns_arena.
+                        // Bound retained capacity independently of stanza size.
                         _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
                     }
                     self.current_element_name = try self.arenaDupe(token.name);

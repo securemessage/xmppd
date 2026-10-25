@@ -5843,9 +5843,8 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, buf[0..total], "<stream:stream"));
 }
 
-/// Feed a bad stream root, then keep feeding stanzas. The connection must die
-/// on the root and the reader arena must stay bounded: before E1 the session
-/// survived and every later stanza accumulated in the arena.
+/// Feed a bad stream root, then keep feeding stanzas. The connection must
+/// close on the root and the reader arena must stay bounded.
 fn expectBadRootBounded(root: []const u8) !void {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -6570,10 +6569,8 @@ test "Server: S13 offline store delivers without a committed archive row" {
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
 }
 
-// E2d: a stanza whose archived form does not fit the serialization buffer must
-// not be stored. The builder used to swallow every write error, so the
-// truncated bytes were archived and held for offline replay, and the recipient
-// would later be handed a stanza missing its close tag.
+// E2d: a stanza whose archived form exceeds the serialization buffer is
+// rejected before archive or held storage, never replayed with a missing close.
 test "Server: E2d an oversized archive form is not stored offline" {
     const allocator = std.testing.allocator;
 
@@ -8267,9 +8264,8 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
 
-    // <body> with 20 KiB of text: the accumulation buffer overflows partway, so
-    // what is buffered is a partial stanza (before E5 it collapsed to
-    // <body></body> and was delivered as if it were the whole message).
+    // A 20 KiB body overflows accumulation and must reject the whole stanza
+    // without routing or storing partial content.
     const body_elem = xml.Element{
         .name = "body",
         .prefix = "",
@@ -8409,8 +8405,7 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
 }
 
 // E6 (S11): only whitespace is allowed at the stream level between stanzas.
-// Non-whitespace there is a stream error (RFC 6120 4.6.1). Before E6 the
-// reader passed it up and the server dropped it silently.
+// Non-whitespace there is a stream error (RFC 6120 4.6.1).
 test "Server: E6 non-whitespace between stanzas closes the stream" {
     const allocator = std.testing.allocator;
     var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
@@ -8583,7 +8578,7 @@ test "S10: server.zig arms IPC write interest in exactly one place" {
     // interest anywhere but reconcileIpcWriteInterest leaves a persistent
     // EVFILT_WRITE with the *_write_armed flag false, so nothing ever removes
     // it and the filter fires writable every kevent. Counting the exact arm
-    // expression keeps the five deleted review-31 arms out of this file too.
+    // expressions confines both write arms to the reconciler.
     // The patterns are split so this test does not match itself.
     const src = @embedFile("server.zig");
     const cases = .{
