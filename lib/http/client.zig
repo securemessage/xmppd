@@ -385,12 +385,14 @@ test "parseStatusLine: invalid" {
 
 /// Write a fresh self-signed cert+key for "localhost" into `dir` via the
 /// system OpenSSL CLI. Returns error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
 fn genTestCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
         .cwd_dir = dir,
-        .max_output_bytes = 4096,
+        .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
     defer std.testing.allocator.free(r.stdout);
     defer std.testing.allocator.free(r.stderr);
