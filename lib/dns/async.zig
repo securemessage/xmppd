@@ -245,9 +245,16 @@ pub const Resolver = struct {
         const job = try self.allocJob(session_key, name);
         job.phase = .raw;
         job.is_raw = true;
-        errdefer self.freeJob(job);
-        try self.sendQuery(job, name, qt);
-        try self.jobs.append(self.alloc, job);
+        {
+            errdefer self.freeJob(job);
+            try self.jobs.append(self.alloc, job);
+        }
+        // A cache hit inside sendQuery can complete and free the job
+        // synchronously; after this call `job` may not be touched.
+        self.sendQuery(job, name, qt) catch |err| {
+            self.dropJob(job, .failed);
+            return err;
+        };
     }
 
     /// Queue a request behind the in-flight cap; promoted FIFO by
@@ -280,9 +287,14 @@ pub const Resolver = struct {
         const job = try self.allocJob(e.session_key, e.name);
         job.phase = .raw;
         job.is_raw = true;
-        errdefer self.freeJob(job);
-        try self.sendQuery(job, e.name, e.rtype);
-        try self.jobs.append(self.alloc, job);
+        {
+            errdefer self.freeJob(job);
+            try self.jobs.append(self.alloc, job);
+        }
+        self.sendQuery(job, e.name, e.rtype) catch |err| {
+            self.dropJob(job, .failed);
+            return err;
+        };
     }
 
     fn launchResolve(self: *Resolver, e: WaitEnt) !void {
@@ -291,9 +303,14 @@ pub const Resolver = struct {
         job.service_idx = e.service_idx;
         job.default_port = e.default_port;
         job.want_tlsa = e.want_tlsa;
-        errdefer self.freeJob(job);
-        try self.sendSrv(job, SRV_TLS[job.service_idx]);
-        try self.jobs.append(self.alloc, job);
+        {
+            errdefer self.freeJob(job);
+            try self.jobs.append(self.alloc, job);
+        }
+        self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
+            self.dropJob(job, .failed);
+            return err;
+        };
     }
 
     /// Release a session's interest: detach the waiter from its job
@@ -364,9 +381,14 @@ pub const Resolver = struct {
         job.service_idx = @intFromEnum(service);
         job.default_port = default_port;
         job.want_tlsa = want_tlsa;
-        errdefer self.freeJob(job);
-        try self.sendSrv(job, SRV_TLS[job.service_idx]);
-        try self.jobs.append(self.alloc, job);
+        {
+            errdefer self.freeJob(job);
+            try self.jobs.append(self.alloc, job);
+        }
+        self.sendSrv(job, SRV_TLS[job.service_idx]) catch |err| {
+            self.dropJob(job, .failed);
+            return err;
+        };
     }
 
     // -- kqueue pump -----------------------------------------------------
