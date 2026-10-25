@@ -30,6 +30,13 @@ const posix = std.posix;
 
 const log = std.log.scoped(.archive_writer);
 
+/// Counter-based log throttle: fires on the first event and on every
+/// power-of-two-th after it, so a flood logs a handful of lines instead
+/// of one per event. Call with the post-increment total (>= 1).
+pub fn logEveryPowerOfTwo(total: u64) bool {
+    return total != 0 and std.math.isPowerOfTwo(total);
+}
+
 /// One archive write: owner bare JID, conversation partner, stanza-id,
 /// timestamp, full stanza XML. All slices point into `block`, the single
 /// allocation the queue owns.
@@ -103,6 +110,10 @@ pub const ArchiveWriteQueue = struct {
     /// the writer may sleep while work is pending.
     wake_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// storeAll chunks that failed as a batch but landed on the per-job
+    /// retry. Only the writer thread increments it.
+    retry_recovered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     /// Chunk of jobs popped per storeAll call inside a drain.
     drain_jobs: [DRAIN_CAP]Job = undefined,
 
@@ -155,7 +166,7 @@ pub const ArchiveWriteQueue = struct {
             job.deinit();
             // Log the first drop and every power of two after it: a full
             // queue would otherwise log per job on the event loop.
-            if (total == 1 or std.math.isPowerOfTwo(total)) {
+            if (logEveryPowerOfTwo(total)) {
                 log.warn("archive write queue full ({d}) - dropping job ({d} dropped total)", .{ n, total });
             }
             return;
@@ -275,11 +286,14 @@ pub const ArchiveWriteQueue = struct {
                 }
                 if (failed > 0) {
                     const total = self.store_failed.fetchAdd(@intCast(failed), .monotonic) + failed;
-                    if (total == failed or std.math.isPowerOfTwo(total)) {
+                    if (total == failed or logEveryPowerOfTwo(total)) {
                         log.warn("archive store: {d} of {d} jobs failed after retry ({d} failed total): {}", .{ failed, n, total, last_err });
                     }
                 } else {
-                    log.warn("archive store batch failed; all {d} jobs landed on retry: {}", .{ n, batch_err });
+                    const total = self.retry_recovered.fetchAdd(1, .monotonic) + 1;
+                    if (logEveryPowerOfTwo(total)) {
+                        log.warn("archive store batch failed; all {d} jobs landed on retry: {}", .{ n, batch_err });
+                    }
                 }
             };
             for (items) |*job| job.deinit();
@@ -319,6 +333,23 @@ const MockStore = struct {
         _ = self.stored.fetchAdd(1, .monotonic);
     }
 };
+
+test "logEveryPowerOfTwo fires on the first event and powers of two only" {
+    var fired: u64 = 0;
+    var last: u64 = 0;
+    for (1..1025) |n| {
+        if (logEveryPowerOfTwo(n)) {
+            fired += 1;
+            last = n;
+        }
+    }
+    // 1, 2, 4, ..., 1024: eleven hits in the first 1024 events.
+    try std.testing.expectEqual(@as(u64, 11), fired);
+    try std.testing.expectEqual(@as(u64, 1024), last);
+    try std.testing.expect(logEveryPowerOfTwo(1));
+    try std.testing.expect(!logEveryPowerOfTwo(0));
+    try std.testing.expect(!logEveryPowerOfTwo(3));
+}
 
 test "ArchiveWriteQueue: enqueue/pop roundtrip with C-owned deep copy" {
     var q = try ArchiveWriteQueue.init();
