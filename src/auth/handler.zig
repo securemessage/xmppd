@@ -732,12 +732,6 @@ pub fn AuthHandler(comptime Store: type) type {
             // so only root or the daemon uid may even open it.
             const is_admin = std.mem.eql(u8, req.client_ip, "ctl");
 
-            // One IP outcome per registration request, success or failure.
-            var registered = false;
-            defer {
-                if (!is_admin) self.policy.recordOutcome("", req.client_ip, if (registered) .success else .failure);
-            }
-
             // Check if registration is enabled (skip for admin)
             if (!is_admin and !self.reg_config.enabled) {
                 return protocol.Message{ .register_result = regResult{
@@ -747,9 +741,10 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Rate limit registration attempts (skip for admin).
+            // Count and rate limit registration attempts (skip for admin).
+            // Registration outcomes are not authentication outcomes.
             if (!is_admin) {
-                if (self.policy.admit("", req.client_ip)) |reason| {
+                if (self.policy.admitIp(req.client_ip)) |reason| {
                     return protocol.Message{ .register_result = regResult{
                         .conn_id = req.conn_id,
                         .success = false,
@@ -810,7 +805,6 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             log.info("user registered: '{s}'", .{req.username});
-            registered = true;
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -2085,4 +2079,47 @@ test "AuthHandler: PLAIN crypto-pool admission counts before the job" {
     const fourth = handleSync(&handler, plainRequest(123, "10.0.0.9", payload)) orelse return error.NoResponse;
     if (fourth != .auth_failure) return error.ExpectedAuthFailure;
     try std.testing.expectEqualStrings("policy-violation", fourth.auth_failure.reason);
+}
+
+test "AuthHandler: denied registrations do not count as auth failures" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    // Registration is disabled (the default): two denied registrations from
+    // the same IP must not count as authentication failures.
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        const reply = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 150 + i,
+            .username = "newuser",
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.9",
+        } }) orelse return error.NoResponse;
+        if (reply != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!reply.register_result.success);
+        try std.testing.expectEqualStrings("not-allowed", reply.register_result.reason);
+    }
+
+    var buf: [24]u8 = undefined;
+    const success = handleSync(&handler, plainRequest(152, "10.0.0.9", plainPayload(&buf, "alice", "secret123"))) orelse return error.NoResponse;
+    if (success != .auth_success) return error.ExpectedAuthSuccess;
+    try std.testing.expectEqualStrings("alice", success.auth_success.username);
 }

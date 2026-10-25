@@ -188,7 +188,8 @@ pub const RateLimiter = struct {
     }
 
     /// Record the outcome of an attempt already counted at admission.
-    /// Success clears both failure counters; failure advances both lockouts.
+    /// Success clears only the account failure counter; the IP failure
+    /// counter is never cleared by a success.
     pub fn recordOutcome(self: *RateLimiter, username: []const u8, client_ip: []const u8, success: bool) void {
         self.recordOutcomeAt(username, client_ip, success, currentEpoch());
     }
@@ -201,6 +202,7 @@ pub const RateLimiter = struct {
                 success,
                 self.policy.lockout_threshold,
                 now,
+                true,
             );
         }
         if (client_ip.len > 0) {
@@ -210,6 +212,7 @@ pub const RateLimiter = struct {
                 success,
                 self.policy.ip_lockout_threshold,
                 now,
+                false,
             );
         }
     }
@@ -242,6 +245,7 @@ pub const RateLimiter = struct {
         success: bool,
         threshold: u16,
         now: u32,
+        clear_on_success: bool,
     ) void {
         if (key.len > max_key_len) {
             log.warn("rate key is {d} bytes, above the {d}-byte bound; denying admission separately", .{ key.len, max_key_len });
@@ -254,8 +258,10 @@ pub const RateLimiter = struct {
         self.rollWindow(entry, now);
         entry.last_seen = now;
         if (success) {
-            entry.failures = 0;
-            entry.locked_until = 0;
+            if (clear_on_success) {
+                entry.failures = 0;
+                entry.locked_until = 0;
+            }
         } else {
             entry.failures +|= 1;
             if (entry.failures >= threshold) {
@@ -450,23 +456,45 @@ test "RateLimiter: per-IP lockout engages" {
     try std.testing.expectEqual(Decision.ip_locked, limiter.admitAt("user4", "10.0.0.1", 100));
 }
 
-test "RateLimiter: success resets failure counters" {
+test "RateLimiter: a success clears the account failure counter" {
     var limiter = try testLimiter(.{
         .max_per_account = 100,
         .max_per_ip = 100,
         .window_seconds = 60,
         .lockout_duration = 300,
-        .lockout_threshold = 5,
-        .ip_lockout_threshold = 5,
+        .lockout_threshold = 3,
+        .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
 
-    limiter.recordOutcomeAt("bob", "10.0.0.1", false, 100);
-    limiter.recordOutcomeAt("bob", "10.0.0.2", false, 100);
-    limiter.recordOutcomeAt("bob", "10.0.0.3", false, 100);
-    limiter.recordOutcomeAt("bob", "10.0.0.3", true, 100);
+    limiter.recordOutcomeAt("alice", "10.0.0.1", false, 100);
+    limiter.recordOutcomeAt("alice", "10.0.0.2", false, 100);
+    limiter.recordOutcomeAt("alice", "10.0.0.3", true, 100);
+    limiter.recordOutcomeAt("alice", "10.0.0.4", false, 100);
+    limiter.recordOutcomeAt("alice", "10.0.0.5", false, 100);
 
-    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("bob", "10.0.0.5", 100));
+    // Two failures since the success stay below the threshold of three.
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.9", 100));
+}
+
+test "RateLimiter: a success never clears the IP failure counter" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+
+    limiter.recordOutcomeAt("alice", "10.0.0.1", false, 100);
+    // A successful account login from the same IP must not erase the IP's
+    // failure history.
+    limiter.recordOutcomeAt("alice", "10.0.0.1", true, 100);
+    limiter.recordOutcomeAt("bob", "10.0.0.1", false, 100);
+
+    try std.testing.expectEqual(Decision.ip_locked, limiter.admitAt("carol", "10.0.0.1", 100));
 }
 
 test "RateLimiter: different accounts are independent" {
