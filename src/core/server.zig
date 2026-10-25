@@ -1147,14 +1147,17 @@ pub const Server = struct {
     };
 
     /// An in-use claim on one scratch bank. Release with `release`, normally
-    /// through `defer`, before the entries slice is allowed to go stale.
+    /// through `defer`, before the entries slice is allowed to go stale. Do
+    /// not copy a lease after acquisition; only its owner may release it.
     pub const ScratchLease = struct {
         server: *Server,
         bank: ScratchBank,
+        active: bool = true,
         entries: []SessionEntry,
 
         pub fn release(self: *ScratchLease) void {
-            if (!self.server.scratch_bank_in_use[@intFromEnum(self.bank)]) return;
+            if (!self.active) return;
+            self.active = false;
             self.server.scratch_bank_in_use[@intFromEnum(self.bank)] = false;
             self.entries = &.{};
         }
@@ -1240,7 +1243,8 @@ pub const Server = struct {
     /// An in-use claim on one byte-scratch bank. Release with `release`,
     /// normally through `defer`, before the buffer slice is allowed to go
     /// stale. Releasing twice is a no-op, so a lease can be given back early
-    /// without also having to drop the `defer`.
+    /// without also having to drop the `defer`. Do not copy a lease after
+    /// acquisition; only its owner may release it.
     pub const ByteLease = struct {
         server: *Server,
         bank: usize = 0,
@@ -5256,6 +5260,24 @@ test "Server: S18 scratch banks size to the session map resource cap" {
     }
 }
 
+test "Server: S18 scratch lease release is scoped to the lease" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var first = server.leaseScratch(.a);
+    defer first.release();
+    first.release();
+    try std.testing.expect(!server.scratch_bank_in_use[0]);
+
+    var second = server.leaseScratch(.a);
+    defer second.release();
+    try std.testing.expect(server.scratch_bank_in_use[0]);
+
+    first.release();
+    try std.testing.expect(server.scratch_bank_in_use[0]);
+    try std.testing.expectEqual(@as(usize, 0), first.entries.len);
+}
+
 test "Server: S18 byte scratch banks are distinct and reusable" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -5269,7 +5291,7 @@ test "Server: S18 byte scratch banks are distinct and reusable" {
     var c = server.leaseByteScratch().?;
     defer c.release();
 
-    for ([3]Server.ByteLease{ a, b, c }) |lease| {
+    for ([3]*const Server.ByteLease{ &a, &b, &c }) |lease| {
         try std.testing.expectEqual(Server.BYTE_BANK_SIZE, lease.buf.len);
         try std.testing.expectEqual(false, lease.owned);
     }
