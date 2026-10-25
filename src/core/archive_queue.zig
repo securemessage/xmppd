@@ -571,3 +571,51 @@ fn reopenSurvival(comptime BackendMod: type) !void {
     try std.testing.expect(g1b != null);
     alloc.free(g1b.?);
 }
+
+// N1 regression on real LMDB: a put that fails inside a write txn must
+// end that txn. A leaked txn makes every later write fail with
+// MDB_UNKNOWN_ERROR, so the job after the bad one and every job in the
+// next drain would be lost until restart.
+test "ArchiveWriteQueue: a rejected LMDB put does not break later writes (N1)" {
+    const archive_store_mod = @import("archive_store");
+    const Backend = @import("lmdb_backend").Backend;
+    const Store = archive_store_mod.ArchiveStore(Backend);
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("archive");
+    const path = try tmp.dir.realpathAlloc(alloc, "archive");
+    defer alloc.free(path);
+
+    var be = try Backend.open(path, .{});
+    defer be.close();
+    var store = Store.init(&be, alloc);
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    // A 600-byte partner JID pushes the by_contact key past LMDB's
+    // 511-byte key limit: the second put fails inside the write txn.
+    const big_with = [_]u8{'b'} ** 600;
+    q.enqueue("a@localhost", "b@localhost", "m-1", 1, "<m1/>");
+    q.enqueue("a@localhost", &big_with, "m-2", 2, "<m2/>");
+    q.enqueue("a@localhost", "b@localhost", "m-3", 3, "<m3/>");
+    q.drainInto(&store, 64);
+
+    // A fourth job in a second drain: only reachable if the rejected
+    // put's txn was aborted instead of leaked.
+    q.enqueue("a@localhost", "b@localhost", "m-4", 4, "<m4/>");
+    q.drainInto(&store, 64);
+
+    try std.testing.expectEqual(@as(u64, 1), q.store_failed.load(.monotonic));
+    const landed = [_]struct { id: []const u8, ts: u64 }{
+        .{ .id = "m-1", .ts = 1 },
+        .{ .id = "m-3", .ts = 3 },
+        .{ .id = "m-4", .ts = 4 },
+    };
+    for (landed) |m| {
+        const got = try store.getMessage("a@localhost", m.ts, m.id);
+        try std.testing.expect(got != null);
+        alloc.free(got.?);
+    }
+}
