@@ -106,6 +106,9 @@ const Job = struct {
     /// queued timer event can be told apart from a live job.
     slot: u8 = 0,
     gen: u16 = 0,
+    /// Port used when the SRV chain yields nothing and the fallback
+    /// address path runs.
+    default_port: u16 = 0,
 
     srv_list: std.ArrayListUnmanaged(SrvEnt) = .{},
     srv_pos: usize = 0,
@@ -228,6 +231,7 @@ pub const Resolver = struct {
         const job = try self.allocJob(session_key, name);
         job.phase = .srv_tls;
         job.service_idx = @intFromEnum(service);
+        job.default_port = default_port;
         errdefer self.freeJob(job);
         try self.sendSrv(job, SRV_TLS[job.service_idx]);
         try self.jobs.append(self.alloc, job);
@@ -771,7 +775,7 @@ pub const Resolver = struct {
             .fallback_addr => {
                 var addr6: ?net.Address = null;
                 var addr4: ?net.Address = null;
-                const defport: u16 = 5222;
+                const defport: u16 = job.default_port;
                 for (msg.rrs) |rr| {
                     if (rr.rtype == KIND_AAAA and addr6 == null) addr6 = addrFromRdata(rr, defport) catch null;
                     if (rr.rtype == KIND_A and addr4 == null) addr4 = addrFromRdata(rr, defport) catch null;
@@ -986,6 +990,9 @@ const FakeDns = struct {
     /// When set, A answers also carry an authority SOA and an
     /// additional-section A for an unrelated owner (J5 probe).
     poison_sections: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, every SRV answer is NODATA, pushing resolve() onto
+    /// the fallback address path.
+    empty_srv: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
@@ -1060,8 +1067,9 @@ const FakeDns = struct {
         var answers: std.ArrayListUnmanaged(u8) = .{};
         var ancount: u16 = 0;
         if (q.qtype == wire.TYPE_SRV) {
-            if (std.mem.startsWith(u8, q.qname, "_xmpps")) {
-                // NODATA for the direct-TLS prefix.
+            if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
+                // NODATA for the direct-TLS prefix, or everywhere when
+                // the test wants the fallback path.
             } else {
                 ancount = 1;
                 appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 6 + encLen("srv.test"));
@@ -1438,4 +1446,25 @@ test "dns-async: authority and additional records are dropped, not cached (J5)" 
     while (ctx2.status == null and spins < 200) : (spins += 1) r.step(50);
     try std.testing.expect(ctx2.status.? == .resolved or ctx2.status.? == .failed);
     if (ctx2.raw) |*res2| res2.deinitOn(std.testing.allocator);
+}
+
+test "dns-async: the fallback address path honors the requested port (J7)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("host.test", .server, 5269, 3);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    try std.testing.expectEqual(@as(u16, 5269), res.targets[0].addr.getPort());
 }
