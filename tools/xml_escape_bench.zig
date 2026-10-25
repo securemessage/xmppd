@@ -46,6 +46,11 @@ fn fillCorpus(buf: []u8, escape_ppm: u32) void {
     }
 }
 
+/// writeEscaped now takes an EscapeMode; the bench runs the text mode.
+fn simdEscape(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    return xml_writer.writeEscaped(w, s, .text);
+}
+
 /// Time `iters` calls of `esc` over `corpus`; returns ns per iteration.
 fn timeOne(
     esc: *const fn (w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void,
@@ -102,7 +107,7 @@ pub fn main() !void {
         var r: usize = 0;
         while (r < runs) : (r += 1) {
             scalar_ns[r] = timeOne(scalarEscape, &corpus, &out_buf, iters);
-            simd_ns[r] = timeOne(xml_writer.writeEscaped, &corpus, &out_buf, iters);
+            simd_ns[r] = timeOne(simdEscape, &corpus, &out_buf, iters);
         }
         const s = median3(&scalar_ns);
         const v = median3(&simd_ns);

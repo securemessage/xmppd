@@ -102,6 +102,10 @@ pub const StanzaWriter = struct {
     failed: bool = false,
     /// True between elementOpen and elementOpenEnd/elementSelfClose.
     in_start_tag: bool = false,
+    /// Escaping context for the current typed value: attribute values
+    /// also escape tab/LF/CR as char refs so a parser cannot turn them
+    /// into spaces; text escapes CR so it does not normalize to LF.
+    escape_mode: EscapeMode = .text,
     /// Open element depth.
     depth: u16 = 0,
 
@@ -141,6 +145,8 @@ pub const StanzaWriter = struct {
         self.emitByte(' ');
         self.emit(name);
         self.emit("='");
+        self.escape_mode = .attr;
+        defer self.escape_mode = .text;
         self.emitTyped(value) catch |e| {
             self.failed = true;
             return e;
@@ -228,9 +234,9 @@ pub const StanzaWriter = struct {
         };
     }
 
-    fn emitEscaped(self: *StanzaWriter, s: []const u8) void {
+    fn emitEscaped(self: *StanzaWriter, s: []const u8, mode: EscapeMode) void {
         if (self.failed) return;
-        writeEscaped(self.out, s) catch {
+        writeEscaped(self.out, s, mode) catch {
             self.failed = true;
         };
     }
@@ -269,7 +275,7 @@ pub const StanzaWriter = struct {
             .@"enum" => {
                 const tag = @tagName(value);
                 try validateChars(tag);
-                self.emitEscaped(tag);
+                self.emitEscaped(tag, self.escape_mode);
             },
             .pointer => {
                 comptime {
@@ -279,7 +285,7 @@ pub const StanzaWriter = struct {
                 }
                 const s: []const u8 = value;
                 try validateChars(s);
-                self.emitEscaped(s);
+                self.emitEscaped(s, self.escape_mode);
             },
             else => @compileError("StanzaWriter: unsupported value type " ++ @typeName(T)),
         }
@@ -361,15 +367,21 @@ pub fn validateChars(s: []const u8) Error!void {
     }
 }
 
-/// Writes `s` to `w` with the five XML escapables replaced by entities.
-/// SIMD run-copy: each vector locates escapable bytes and the clean run
-/// before each is copied in a single writeAll.
-pub fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+/// Escaping context: inside a start-tag attribute, tab/LF/CR would be
+/// normalized to spaces by any conformant parser, so they are escaped as
+/// numeric references; in text only CR needs that protection.
+pub const EscapeMode = enum { attr, text };
+
+/// Writes `s` to `w` with the XML escapables replaced by entities (plus
+/// the mode's whitespace references). SIMD run-copy: each vector locates
+/// escapable bytes and the clean run before each is copied in a single
+/// writeAll.
+pub fn writeEscaped(w: *std.Io.Writer, s: []const u8, mode: EscapeMode) std.Io.Writer.Error!void {
     var run_start: usize = 0;
     var i: usize = 0;
     while (i + vec_len <= s.len) : (i += vec_len) {
         const chunk: ByteVec = s[i..][0..vec_len].*;
-        var mask = escapeMask(chunk);
+        var mask = escapeMask(chunk, mode);
         while (mask != 0) {
             const idx: usize = @ctz(mask);
             const hit = i + idx;
@@ -380,7 +392,7 @@ pub fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
         }
     }
     while (i < s.len) : (i += 1) {
-        if (isEscapable(s[i])) {
+        if (isEscapable(s[i], mode)) {
             try w.writeAll(s[run_start..i]);
             try w.writeAll(entityFor(s[i]));
             run_start = i + 1;
@@ -389,14 +401,25 @@ pub fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     try w.writeAll(s[run_start..]);
 }
 
-fn escapeMask(chunk: ByteVec) BitMask {
-    const hits = (chunk == v_amp) | (chunk == v_lt) | (chunk == v_gt) |
+const v_tab: ByteVec = @splat('\t');
+const v_lf: ByteVec = @splat('\n');
+const v_cr: ByteVec = @splat('\r');
+
+fn escapeMask(chunk: ByteVec, mode: EscapeMode) BitMask {
+    var hits = (chunk == v_amp) | (chunk == v_lt) | (chunk == v_gt) |
         (chunk == v_apos) | (chunk == v_quot);
+    if (mode == .attr) {
+        hits = hits | (chunk == v_tab) | (chunk == v_lf) | (chunk == v_cr);
+    } else {
+        hits = hits | (chunk == v_cr);
+    }
     return @bitCast(hits);
 }
 
-fn isEscapable(c: u8) bool {
-    return c == '&' or c == '<' or c == '>' or c == '\'' or c == '"';
+fn isEscapable(c: u8, mode: EscapeMode) bool {
+    if (c == '&' or c == '<' or c == '>' or c == '\'' or c == '"') return true;
+    if (mode == .attr) return c == '\t' or c == '\n' or c == '\r';
+    return c == '\r';
 }
 
 fn entityFor(c: u8) []const u8 {
@@ -406,6 +429,9 @@ fn entityFor(c: u8) []const u8 {
         '>' => "&gt;",
         '\'' => "&apos;",
         '"' => "&quot;",
+        '\t' => "&#9;",
+        '\n' => "&#10;",
+        '\r' => "&#13;",
         else => unreachable,
     };
 }
@@ -419,7 +445,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 
 /// Scalar reference escaper: the differential oracle for writeEscaped.
-fn refEscape(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+fn refEscape(w: *std.Io.Writer, s: []const u8, mode: EscapeMode) std.Io.Writer.Error!void {
     for (s) |c| {
         switch (c) {
             '&' => try w.writeAll("&amp;"),
@@ -427,6 +453,9 @@ fn refEscape(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             '>' => try w.writeAll("&gt;"),
             '\'' => try w.writeAll("&apos;"),
             '"' => try w.writeAll("&quot;"),
+            '\t' => if (mode == .attr) try w.writeAll("&#9;") else try w.writeByte(c),
+            '\n' => if (mode == .attr) try w.writeAll("&#10;") else try w.writeByte(c),
+            '\r' => try w.writeAll("&#13;"),
             else => try w.writeByte(c),
         }
     }
@@ -581,7 +610,7 @@ test "SIMD escaper matches scalar reference, 100000 random inputs" {
     var prng = std.Random.DefaultPrng.init(0xF4_1001);
     const rand = prng.random();
     // Alphabet biased toward escapables so hits are dense.
-    const alphabet = "ab&<>'\"cd\n\t&<>'\"ef&<>'\"gh&<>'\"";
+    const alphabet = "ab&<>'\"cd\n\t\r&<>'\"ef&<>'\"gh&<>'\"";
     var input_buf: [300]u8 = undefined;
     var want_buf: [2048]u8 = undefined;
     var got_buf: [2048]u8 = undefined;
@@ -595,11 +624,16 @@ test "SIMD escaper matches scalar reference, 100000 random inputs" {
         const input = input_buf[0..len];
 
         var wwant: std.Io.Writer = .fixed(&want_buf);
-        try refEscape(&wwant, input);
+        try refEscape(&wwant, input, .text);
         var wgot: std.Io.Writer = .fixed(&got_buf);
-        try writeEscaped(&wgot, input);
-
+        try writeEscaped(&wgot, input, .text);
         try testing.expectEqualStrings(wwant.buffered(), wgot.buffered());
+
+        var wwant2: std.Io.Writer = .fixed(&want_buf);
+        try refEscape(&wwant2, input, .attr);
+        var wgot2: std.Io.Writer = .fixed(&got_buf);
+        try writeEscaped(&wgot2, input, .attr);
+        try testing.expectEqualStrings(wwant2.buffered(), wgot2.buffered());
     }
 }
 
@@ -690,14 +724,10 @@ test "a rejected attribute emits nothing and latches finish() (L1)" {
 test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
     // Rejected: control byte smuggled inside markup, unbalanced tags,
     // mismatched close name, truncated element.
-    try testing.expectError(error.InvalidCharacter,
-        ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
-    try testing.expectError(error.InvalidCharacter,
-        ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
-    try testing.expectError(error.InvalidCharacter,
-        ValidatedSpan.fromReader(testing.allocator, "<a>"));
-    try testing.expectError(error.InvalidCharacter,
-        ValidatedSpan.fromReader(testing.allocator, "</a>"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "<a>"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</a>"));
 
     // Accepted: balanced elements and bare text both scan cleanly.
     _ = try ValidatedSpan.fromReader(testing.allocator, "<c><d t='1'/>x</c>");
@@ -709,9 +739,26 @@ test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
     var x = StanzaWriter.init(&w);
     try x.elementOpen("iq");
     x.elementOpenEnd();
-    try testing.expectError(error.InvalidCharacter,
-        ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(testing.allocator, "</m><iq type='set'>\x00"));
     try x.elementClose("iq");
     try x.finish();
     try testing.expectEqualStrings("<iq></iq>", w.buffered());
+}
+
+test "attribute whitespace and text CR escape as char refs (L3)" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    try x.attr("a", "t\tn\n r\rs");
+    x.elementOpenEnd();
+    try x.text("l1\rl2\nl3");
+    try x.elementClose("m");
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<m a='t&#9;n&#10; r&#13;s'>l1&#13;l2\nl3</m>",
+        w.buffered(),
+    );
 }
