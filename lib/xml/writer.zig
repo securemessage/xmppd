@@ -10,13 +10,18 @@
 //! The writer owns nothing and never allocates: every byte goes to the
 //! caller's writer. When that writer fills or fails, a sticky failure is
 //! latched, later emits are dropped, and finish() reports error.Overflow
-//! once, so partial output can never count as success.
+//! once, so partial output can never count as success. The Overflow
+//! contract: a fixed caller buffer then holds a truncated prefix, and
+//! with a streaming outbox the early bytes may already be gone - callers
+//! discard the buffer or fail the stream, never emit it.
 
 const std = @import("std");
 const scanner_mod = @import("scanner.zig");
 
 /// Errors for malformed caller input (operating errors, not asserts).
 pub const Error = error{
+    /// elementClose name does not match the innermost open element.
+    MismatchedClose,
     /// Element or attribute name outside the XML Name production.
     InvalidName,
     /// Value bytes are not well-formed UTF-8.
@@ -102,6 +107,9 @@ pub const StanzaWriter = struct {
     failed: bool = false,
     /// True between elementOpen and elementOpenEnd/elementSelfClose.
     in_start_tag: bool = false,
+    /// Open element names, so elementClose can refuse a mismatched
+    /// `</other>` instead of emitting it.
+    name_stack: [max_depth][max_name_len]u8 = undefined,
     /// Escaping context for the current typed value: attribute values
     /// also escape tab/LF/CR as char refs so a parser cannot turn them
     /// into spaces; text escapes CR so it does not normalize to LF.
@@ -125,6 +133,9 @@ pub const StanzaWriter = struct {
         self.emitByte('<');
         self.emit(name);
         self.in_start_tag = true;
+        const ns = &self.name_stack[self.depth];
+        ns[0] = @intCast(name.len);
+        @memcpy(ns[1 .. 1 + name.len], name);
         self.depth += 1;
     }
 
@@ -154,6 +165,22 @@ pub const StanzaWriter = struct {
         self.emitByte('\'');
     }
 
+    /// attr that omits the attribute entirely when the optional is
+    /// null (C1 needs it for absent `id`/`type`).
+    pub fn attrOpt(self: *StanzaWriter, name: []const u8, value: anytype) Error!void {
+        const inner = switch (@typeInfo(@TypeOf(value))) {
+            .optional => value orelse return,
+            else => value,
+        };
+        try self.attr(name, inner);
+    }
+
+    /// ` xmlns='uri'` convenience for the common default-namespace
+    /// attribute (C1).
+    pub fn xmlns(self: *StanzaWriter, uri: []const u8) Error!void {
+        try self.attr("xmlns", uri);
+    }
+
     /// Emits `>`, ending an open start tag.
     pub fn elementOpenEnd(self: *StanzaWriter) void {
         assert(self.in_start_tag);
@@ -178,6 +205,12 @@ pub const StanzaWriter = struct {
             self.failed = true;
             return e;
         };
+        const ns = &self.name_stack[self.depth - 1];
+        const open = ns[1 .. 1 + ns[0]];
+        if (!std.mem.eql(u8, open, name)) {
+            self.failed = true;
+            return error.MismatchedClose;
+        }
         self.emit("</");
         self.emit(name);
         self.emitByte('>');
@@ -305,20 +338,32 @@ fn isStringArg(comptime T: type) bool {
     };
 }
 
-fn isNameStart(c: u8) bool {
-    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_' or c == ':';
+fn isNcNameStart(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_';
 }
 
-fn isNameChar(c: u8) bool {
-    return isNameStart(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
+fn isNcNameChar(c: u8) bool {
+    return isNcNameStart(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
 }
 
-/// XML Name production restricted to ASCII (the only names XMPP emits).
+/// XML QName restricted to ASCII: NCName, optionally 'prefix:local'.
+/// Bare colons anywhere else are rejected (":a", "a:", "a:b:c").
 pub fn isValidName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name_len) return false;
-    if (!isNameStart(name[0])) return false;
-    for (name[1..]) |c| {
-        if (!isNameChar(c)) return false;
+    var parts: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= name.len) : (i += 1) {
+        if (i == name.len or name[i] == ':') {
+            const part = name[start..i];
+            parts += 1;
+            if (parts > 2 or part.len == 0) return false;
+            if (!isNcNameStart(part[0])) return false;
+            for (part[1..]) |c| {
+                if (!isNcNameChar(c)) return false;
+            }
+            start = i + 1;
+        }
     }
     return true;
 }
@@ -838,4 +883,46 @@ test "rejection at every byte position across lengths 0..67 (L4)" {
         // The clean baseline itself is always accepted.
         try validateChars(base);
     }
+}
+
+test "elementClose refuses a mismatched close name" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("message");
+    x.elementOpenEnd();
+    try x.elementOpen("body");
+    x.elementOpenEnd();
+    try testing.expectError(error.MismatchedClose, x.elementClose("iq"));
+    // Latched like every other rejection.
+    try testing.expectError(error.Overflow, x.finish());
+    try testing.expectEqualStrings("<message><body>", w.buffered());
+}
+
+test "names must be QName: at most one colon, NCName on each side" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try testing.expectError(error.InvalidName, x.elementOpen(":a"));
+    try testing.expectError(error.InvalidName, x.elementOpen("a:"));
+    try testing.expectError(error.InvalidName, x.elementOpen("a:b:c"));
+    try testing.expectError(error.InvalidName, x.elementOpen("xmlns:"));
+    // First character rules still apply inside each part.
+    try testing.expectError(error.InvalidName, x.elementOpen("a:1b"));
+    try testing.expectError(error.Overflow, x.finish());
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    try y.elementOpen("stream:stream");
+    try y.attrOpt("type", @as(?[]const u8, null)); // omitted entirely
+    try y.attrOpt("id", @as(?[]const u8, "s1"));
+    try y.xmlns("jabber:client");
+    y.elementSelfClose();
+    try y.finish();
+    try testing.expectEqualStrings(
+        "<stream:stream id='s1' xmlns='jabber:client'/>",
+        w2.buffered(),
+    );
 }

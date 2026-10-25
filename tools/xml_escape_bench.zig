@@ -94,7 +94,8 @@ pub fn main() !void {
         .{ "all escapables", 1_000_000 },
     };
 
-    try out.print("{s:<16} {s:>12} {s:>12} {s:>8}\n", .{ "corpus 4KiB", "scalar ns", "simd ns", "speedup" });
+    const hdr = .{ "corpus 4KiB", "scalar ns", "simd ns", "speedup" };
+    try out.print("{s:<16} {s:>12} {s:>12} {s:>8}\n", hdr);
     inline for (rows) |row| {
         fillCorpus(&corpus, row[1]);
 
