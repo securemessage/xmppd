@@ -145,14 +145,13 @@ const CHANGE_BUF_SIZE = 1024;
 
 /// Tail of the changelist held back for reconcileIpcWriteInterest (S10). The
 /// reconcile stages at most two reconnect timers and two writes or removals,
-/// one of each kind per IPC link, so four of the eight are ever spent; holding
-/// that back means a batch filled by event handling can no longer cost an arm,
-/// and a failed arm is what dropped the auth link. The timers are staged on
-/// every exit, including the drop path, since nothing else would ever retry a
-/// link dropped there. A timer that still cannot be staged leaves its pending
-/// flag set for the next iteration.
-/// dropIpcAuth's per-session writes stay best-effort as before, since one
-/// entry per mid-SASL session cannot be bounded by a fixed tail.
+/// one of each kind per IPC link, so four of the eight are ever spent. Holding
+/// them back prevents event handling from consuming entries required to arm or
+/// disarm a link. Timers are staged on every exit, including the drop path,
+/// since a link dropped there needs a retry before the next wait. A timer that
+/// still cannot be staged leaves its pending flag set for the next iteration.
+/// dropIpcAuth's per-session writes stay best-effort because one entry per
+/// mid-SASL session cannot be bounded by a fixed tail.
 const IPC_RECONCILE_RESERVED = 8;
 
 /// Maximum XML element nesting depth allowed.
@@ -621,17 +620,14 @@ pub const Server = struct {
     /// archive_writer when attached.
     archive: ?*archive_store_mod.ArchiveStore(ArchiveBackendType) = null,
 
-    /// S18: per-worker heap scratch for session-map resolution. Replaces
-    /// ~70 KiB stack frames (DEFAULT_MAX_RESOURCES SessionEntry per
-    /// lookup). The event loop is single-threaded per worker: bank A
-    /// serves dispatchStanza and the chunked batch lookups, bank B the
-    /// leaf lookups (sendCarbons runs under dispatchStanza, so they
-    /// cannot share a bank). Grown lazily to the session map's resource
-    /// cap; chunk banks hold SCRATCH_CHUNK_JIDS * cap entries.
+    /// S18: per-worker heap scratch for session-map resolution. Bank A
+    /// serves stanza routing and chunked batch lookups, bank B handler-level
+    /// lookups, and bank C leaf delivery lookups. Heap allocation keeps these
+    /// entries out of stack frames; banks grow lazily to the session map's
+    /// resource cap, with chunk banks holding SCRATCH_CHUNK_JIDS * cap entries.
     ///
-    /// A bank is handed out through `leaseScratch`, which marks it in use
-    /// until released so a nested lookup on the same bank fails an assert
-    /// instead of overwriting the outer iteration.
+    /// `leaseScratch` marks a bank in use until released so a nested lookup on
+    /// the same bank asserts instead of overwriting the outer iteration.
     scratch_entries_a: []SessionEntry = &.{},
     scratch_entries_b: []SessionEntry = &.{},
     scratch_entries_c: []SessionEntry = &.{},
@@ -1506,8 +1502,8 @@ pub const Server = struct {
 
     /// True when a session's fd is gone but the session still exists: it was
     /// detached for SM resume, or closed, after kevent returned this batch.
-    /// Such an event is stale; acting on it drives flushSend/recv against fd
-    /// -1, and the resulting error used to destroy a resumable session (S28).
+    /// Such an event is stale; acting on it would drive flushSend/recv against
+    /// fd -1 and could destroy a resumable session (S28).
     fn isStaleSessionEvent(session: *Session) bool {
         return session.sm_detached or session.conn.isClosed();
     }
@@ -2556,11 +2552,9 @@ pub const Server = struct {
     }
 
     /// S10: sole owner of IPC write interest, called once per loop
-    /// iteration. Arming scattered across send sites could lose a re-arm
-    /// to a full changelist and strand pending frames (the pre-S10
-    /// persistent filter spun and hid it); disarming here keeps an idle
-    /// link from re-firing writable every kevent. Also the sole owner of the
-    /// IPC reconnect timers.
+    /// iteration. Central re-arming keeps a full changelist from stranding
+    /// pending frames; disarming here keeps an idle link from re-firing
+    /// writable every kevent. Also the sole owner of IPC reconnect timers.
     fn reconcileIpcWriteInterest(self: *Server, changes: *ChangeList) void {
         // Spend the reserved tail: this runs last in every iteration, so a
         // batch filled by event handling must not cost us an arm or a disarm.
