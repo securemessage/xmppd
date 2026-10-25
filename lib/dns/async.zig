@@ -43,6 +43,9 @@ const CACHE_CAP: usize = 64;
 /// Flattened connect targets per resolution; a hostile SRV answer
 /// cannot grow a job's target list past this.
 const TARGET_CAP: usize = 16;
+/// Parsed SRV entries kept per job, bounded at absorb time: twice the
+/// emitted cap so per-target failures still leave targets to try.
+const SRV_CAP: usize = 32;
 /// Cache TTL ceiling: positive and negative entries alike are
 /// expired after five minutes regardless of the advertised TTL.
 const CACHE_TTL_CEIL_S: u32 = 300;
@@ -107,7 +110,16 @@ pub const QueryCb = struct {
     fun: *const fn (ctx: ?*anyopaque, session_key: usize, status: Status, res: ?RecordResult) void,
 };
 
-const Phase = enum { srv_tls, srv_plain, addr, addr6, tlsa, fallback_addr, fallback_tlsa, raw, done };
+const Phase = enum { srv_tls, srv_plain, addr, addr6, tlsa, fallback_addr, fallback_addr4, fallback_tlsa, raw, done };
+
+/// Phases that serve the SRV target at srv_pos; a failure inside one
+/// dooms only that target, never the whole job.
+fn isTargetPhase(phase: Phase) bool {
+    return switch (phase) {
+        .addr, .addr6, .tlsa => true,
+        else => false,
+    };
+}
 
 /// Session keys sharing one in-flight job. Bounded inline: a full
 /// job takes no more waiters and the lookup starts a fresh job.
@@ -139,6 +151,10 @@ const Job = struct {
 
     srv_list: std.ArrayListUnmanaged(SrvEnt) = .{},
     srv_pos: usize = 0,
+    /// A fallback address query that hard-failed (timeout, SERVFAIL):
+    /// when neither family yields an address this decides between
+    /// .failed and .nxdomain.
+    fallback_err: bool = false,
     /// Addresses collected for the current SRV target across the A
     /// and AAAA phases.
     cur_addr4: ?net.Address = null,
@@ -682,7 +698,37 @@ pub const Resolver = struct {
             return;
         }
         log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
-        self.dropJob(job, .failed);
+        self.failQuery(job);
+    }
+
+    /// The outstanding query is dead (retries exhausted or a refusal
+    /// rcode). Inside a per-target phase only that SRV target is
+    /// skipped; inside the fallback the other family still gets its
+    /// try; every other phase fails the job.
+    fn failQuery(self: *Resolver, job: *Job) void {
+        switch (job.phase) {
+            .addr, .addr6, .tlsa => self.skipTarget(job),
+            .fallback_addr => {
+                job.fallback_err = true;
+                job.phase = .fallback_addr4;
+                self.sendFallback(job, KIND_A) catch return self.dropJob(job, .failed);
+            },
+            .fallback_addr4 => {
+                job.fallback_err = true;
+                self.finishFallback(job);
+            },
+            .fallback_tlsa => self.complete(job),
+            else => self.dropJob(job, .failed),
+        }
+    }
+
+    /// Drop the current SRV target's collected addresses and move to
+    /// the next one in RFC 2782 order; only reachable inside a
+    /// per-target phase.
+    fn skipTarget(self: *Resolver, job: *Job) void {
+        job.cur_addr4 = null;
+        job.cur_addr6 = null;
+        self.nextTarget(job) catch return self.dropJob(job, .failed);
     }
 
     /// The whole-chain bound fired: regardless of which phase the job
@@ -823,7 +869,7 @@ pub const Resolver = struct {
                 self.cachePutNeg(job.pending_qname, job.pending_qtype, .nxdomain, msg);
                 return self.onNxdomain(job);
             },
-            else => return self.dropJob(job, .failed),
+            else => return self.failQuery(job),
         }
 
         // Only answer-section records that actually answer the
@@ -843,7 +889,7 @@ pub const Resolver = struct {
 
         if (job.is_raw) return self.completeRaw(job, filtered);
         switch (job.phase) {
-            .srv_tls, .srv_plain, .addr, .addr6, .tlsa, .fallback_addr, .fallback_tlsa => self.advance(job, filtered),
+            .srv_tls, .srv_plain, .addr, .addr6, .tlsa, .fallback_addr, .fallback_addr4, .fallback_tlsa => self.advance(job, filtered),
             .raw, .done => {},
         }
     }
@@ -1104,12 +1150,18 @@ pub const Resolver = struct {
                 self.sendSrv(job, SRV_PLAIN[job.service_idx]) catch return self.dropJob(job, .failed);
             },
             .srv_plain => self.startFallback(job),
-            .fallback_addr => self.dropJob(job, .nxdomain),
+            // Per fallback family: NXDOMAIN on one family still lets
+            // the other family answer.
+            .fallback_addr => {
+                job.phase = .fallback_addr4;
+                self.sendFallback(job, KIND_A) catch return self.dropJob(job, .failed);
+            },
+            .fallback_addr4 => self.finishFallback(job),
             // Per target: an NXDOMAIN on either address family means
             // that target is gone, not the whole resolution.
             .addr => {
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.dropJob(job, .failed);
+                self.sendAddr(job, KIND_AAAA) catch return self.skipTarget(job);
             },
             .addr6 => self.nextTarget(job) catch return self.dropJob(job, .failed),
             .tlsa => {
@@ -1164,7 +1216,7 @@ pub const Resolver = struct {
                     }
                 }
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.dropJob(job, .failed);
+                self.sendAddr(job, KIND_AAAA) catch return self.skipTarget(job);
             },
             .addr6 => {
                 const target = &job.srv_list.items[job.srv_pos];
@@ -1181,7 +1233,7 @@ pub const Resolver = struct {
                 }
                 if (job.want_tlsa) {
                     job.phase = .tlsa;
-                    self.sendTlsa(job) catch return self.dropJob(job, .failed);
+                    self.sendTlsa(job) catch return self.skipTarget(job);
                     return;
                 }
                 self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
@@ -1203,43 +1255,38 @@ pub const Resolver = struct {
             },
             .fallback_tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
+                defer {
+                    for (tlsa_recs.items) |r| self.alloc.free(r.association_data);
+                    tlsa_recs.deinit(self.alloc);
+                }
                 for (msg.rrs) |rr| {
                     if (rr.rtype != KIND_TLSA) continue;
                     const rec = dns.parseTlsaRdata(rr.rdata, self.alloc) catch continue;
                     tlsa_recs.append(self.alloc, rec) catch continue;
                 }
-                if (job.targets.items.len > 0) {
-                    job.targets.items[job.targets.items.len - 1].tlsa = tlsa_recs.toOwnedSlice(self.alloc) catch &.{};
+                // The fallback targets share one host: the same TLSA
+                // owner name covers every emitted address.
+                for (job.targets.items) |*t| {
+                    t.tlsa = self.dupeTlsa(tlsa_recs.items) catch &.{};
                 }
                 self.complete(job);
             },
             .fallback_addr => {
-                var addr6: ?net.Address = null;
-                var addr4: ?net.Address = null;
-                const defport: u16 = job.default_port;
                 for (msg.rrs) |rr| {
-                    if (rr.rtype == KIND_AAAA and addr6 == null) addr6 = addrFromRdata(rr, defport) catch null;
-                    if (rr.rtype == KIND_A and addr4 == null) addr4 = addrFromRdata(rr, defport) catch null;
+                    if (rr.rtype == KIND_AAAA and job.cur_addr6 == null) {
+                        job.cur_addr6 = addrFromRdata(rr, job.default_port) catch null;
+                    }
                 }
-                const addr = addr6 orelse addr4 orelse {
-                    self.dropJob(job, .nxdomain);
-                    return;
-                };
-                const host = self.alloc.dupe(u8, job.name) catch return self.dropJob(job, .failed);
-                job.targets.append(self.alloc, .{
-                    .addr = addr,
-                    .host = host,
-                    .tlsa = &.{},
-                    .is_direct_tls = false,
-                }) catch return self.dropJob(job, .failed);
-                if (!job.want_tlsa) {
-                    self.complete(job);
-                    return;
+                job.phase = .fallback_addr4;
+                self.sendFallback(job, KIND_A) catch return self.dropJob(job, .failed);
+            },
+            .fallback_addr4 => {
+                for (msg.rrs) |rr| {
+                    if (rr.rtype == KIND_A and job.cur_addr4 == null) {
+                        job.cur_addr4 = addrFromRdata(rr, job.default_port) catch null;
+                    }
                 }
-                job.phase = .fallback_tlsa;
-                var buf: [280]u8 = undefined;
-                const qname = dns.tlsaQueryName(&buf, defport, job.name) catch return self.dropJob(job, .failed);
-                self.sendQuery(job, qname, KIND_TLSA) catch return self.dropJob(job, .failed);
+                self.finishFallback(job);
             },
             .raw, .done => {},
         }
@@ -1249,6 +1296,10 @@ pub const Resolver = struct {
         for (msg.rrs) |rr| {
             if (rr.rtype != KIND_SRV) continue;
             const parsed = dns.parseSrvRdata(rr.rdata, self.alloc) catch continue;
+            if (job.srv_list.items.len >= SRV_CAP) {
+                self.alloc.free(parsed.target);
+                continue;
+            }
             job.srv_list.append(self.alloc, .{
                 .host = parsed.target,
                 .port = parsed.port,
@@ -1313,22 +1364,29 @@ pub const Resolver = struct {
         }
     }
 
+    /// Deep-copy a parsed TLSA set; every emitted target owns its own
+    /// copy because Resolution teardown frees each.
+    fn dupeTlsa(self: *Resolver, recs: []dns.TlsaRecord) ![]dns.TlsaRecord {
+        if (recs.len == 0) return &.{};
+        const tlsa = try self.alloc.alloc(dns.TlsaRecord, recs.len);
+        var n: usize = 0;
+        errdefer {
+            for (tlsa[0..n]) |r| self.alloc.free(r.association_data);
+            self.alloc.free(tlsa);
+        }
+        for (recs, 0..) |rec, i| {
+            tlsa[i] = rec;
+            tlsa[i].association_data = try self.alloc.dupe(u8, rec.association_data);
+            n += 1;
+        }
+        return tlsa;
+    }
+
     fn emitTarget(self: *Resolver, job: *Job, ent: *const SrvEnt, addr: net.Address, tlsa_recs: []dns.TlsaRecord) !void {
         if (job.targets.items.len >= TARGET_CAP) return;
         const host = try self.alloc.dupe(u8, ent.host);
         errdefer self.alloc.free(host);
-        var tlsa: []dns.TlsaRecord = &.{};
-        if (tlsa_recs.len > 0) {
-            tlsa = try self.alloc.alloc(dns.TlsaRecord, tlsa_recs.len);
-            errdefer self.alloc.free(tlsa);
-            var n: usize = 0;
-            errdefer for (tlsa[0..n]) |r| self.alloc.free(r.association_data);
-            for (tlsa_recs, 0..) |r, i| {
-                tlsa[i] = r;
-                tlsa[i].association_data = try self.alloc.dupe(u8, r.association_data);
-                n += 1;
-            }
-        }
+        const tlsa = try self.dupeTlsa(tlsa_recs);
         try job.targets.append(self.alloc, .{ .addr = addr, .host = host, .tlsa = tlsa, .is_direct_tls = ent.is_direct_tls });
     }
 
@@ -1344,6 +1402,42 @@ pub const Resolver = struct {
         var buf: [280]u8 = undefined;
         const qname = dns.tlsaQueryName(&buf, ent.port, ent.host) catch return error.NameTooLong;
         try self.sendQuery(job, qname, KIND_TLSA);
+    }
+
+    /// The no-SRV fallback asks the bare name for an address; called
+    /// once per family so a dual-stack host yields both targets.
+    fn sendFallback(self: *Resolver, job: *Job, qtype: u16) !void {
+        var buf: [280]u8 = undefined;
+        const qname = std.fmt.bufPrint(&buf, "{s}", .{job.name}) catch return error.NameTooLong;
+        try self.sendQuery(job, qname, qtype);
+    }
+
+    /// Both fallback families have answered or failed: emit what
+    /// arrived (AAAA first), answer nxdomain when nothing did, and
+    /// report .failed only when a family query actually errored.
+    fn finishFallback(self: *Resolver, job: *Job) void {
+        if (job.cur_addr4 == null and job.cur_addr6 == null) {
+            return self.dropJob(job, if (job.fallback_err) .failed else .nxdomain);
+        }
+        const addrs = [2]?net.Address{ job.cur_addr6, job.cur_addr4 };
+        for (addrs) |a| {
+            const addr = a orelse continue;
+            const host = self.alloc.dupe(u8, job.name) catch return self.dropJob(job, .failed);
+            job.targets.append(self.alloc, .{
+                .addr = addr,
+                .host = host,
+                .tlsa = &.{},
+                .is_direct_tls = false,
+            }) catch {
+                self.alloc.free(host);
+                return self.dropJob(job, .failed);
+            };
+        }
+        if (!job.want_tlsa) return self.complete(job);
+        job.phase = .fallback_tlsa;
+        var buf: [280]u8 = undefined;
+        const qname = dns.tlsaQueryName(&buf, job.default_port, job.name) catch return self.dropJob(job, .failed);
+        self.sendQuery(job, qname, KIND_TLSA) catch return self.dropJob(job, .failed);
     }
 
     fn freeJob(self: *Resolver, job: *Job) void {
@@ -1369,12 +1463,10 @@ pub const Resolver = struct {
 
     fn startFallback(self: *Resolver, job: *Job) void {
         job.phase = .fallback_addr;
-        var buf: [280]u8 = undefined;
-        const qname = std.fmt.bufPrint(&buf, "{s}", .{job.name}) catch {
-            self.dropJob(job, .failed);
-            return;
-        };
-        self.sendQuery(job, qname, KIND_A) catch return self.dropJob(job, .failed);
+        job.cur_addr4 = null;
+        job.cur_addr6 = null;
+        job.fallback_err = false;
+        self.sendFallback(job, KIND_AAAA) catch return self.dropJob(job, .failed);
     }
 };
 
@@ -1521,6 +1613,12 @@ const FakeDns = struct {
     /// When non-zero, SRV answers carry this many targets (t0.test,
     /// t1.test, ...) to exercise the flattened-target cap.
     srv_many: u8 = 0,
+    /// When < 255, address queries for "t{idx}.test" are answered
+    /// SERVFAIL, exercising the per-target skip.
+    a_servfail_idx: std.atomic.Value(u8) = std.atomic.Value(u8).init(255),
+    /// When set, AAAA queries are answered with ::1 so dual-stack
+    /// paths have real data.
+    a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, every answer is NXDOMAIN with an authority SOA whose
     /// minimum is 120 s - feeds the negative cache.
     nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1607,6 +1705,19 @@ const FakeDns = struct {
         var ancount: u16 = 0;
         if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV and self.srv_silent.load(.monotonic)) return 0;
+        if (self.a_servfail_idx.load(.monotonic) != 255 and (q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA)) {
+            var fbuf: [32]u8 = undefined;
+            const fname = std.fmt.bufPrint(&fbuf, "t{d}.test", .{self.a_servfail_idx.load(.monotonic)}) catch "";
+            if (std.mem.eql(u8, q.qname, fname)) {
+                std.mem.writeInt(u16, out[0..2], id, .big);
+                std.mem.writeInt(u16, out[2..4], 0x8182, .big);
+                std.mem.writeInt(u16, out[4..6], 1, .big);
+                @memset(out[6..12], 0);
+                const qlen = pkt.len - 12;
+                @memcpy(out[12 .. 12 + qlen], pkt[12..]);
+                return 12 + qlen;
+            }
+        }
         if (q.qtype == wire.TYPE_SRV) {
             if (self.srv_tls_dot.load(.monotonic) and std.mem.startsWith(u8, q.qname, "_xmpps")) {
                 ancount = 1;
@@ -1661,6 +1772,12 @@ const FakeDns = struct {
                 answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
                 appendEncodedName(alloc, &answers, "srv.test");
             }
+        } else if (q.qtype == wire.TYPE_AAAA and self.a_aaaa.load(.monotonic)) {
+            ancount = 1;
+            appendAnswerHdr(alloc, &answers, wire.TYPE_AAAA, 60, 16);
+            var v6: [16]u8 = .{0} ** 16;
+            v6[15] = 1;
+            answers.appendSlice(alloc, &v6) catch {};
         } else if (q.qtype == wire.TYPE_A) {
             ancount = 1;
             appendAnswerHdr(alloc, &answers, wire.TYPE_A, 60, 4);
@@ -2762,4 +2879,83 @@ test "dns-async: a repeat resolve is served by the RR cache without wire" {
     var res2 = ctx2.res.?;
     defer res2.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(wired, srv.udp_recvd.load(.monotonic));
+}
+
+test "dns-async: a SERVFAIL on one SRV target skips only that target (Q4)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 3;
+    srv.a_servfail_idx.store(0, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // Wherever the weighted draw placed t0, its refusal dooms only
+    // itself: the two healthy targets still resolve.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), res.targets.len);
+    var saw_t1 = false;
+    var saw_t2 = false;
+    for (res.targets) |t| {
+        if (std.mem.eql(u8, t.host, "t1.test")) saw_t1 = true;
+        if (std.mem.eql(u8, t.host, "t2.test")) saw_t2 = true;
+        try std.testing.expect(!std.mem.eql(u8, t.host, "t0.test"));
+    }
+    try std.testing.expect(saw_t1 and saw_t2);
+}
+
+test "dns-async: parsed SRV entries are capped at 32 (Q4)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 40;
+    srv.a_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.chain_deadline_ms = 30_000;
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    defer r.cancel(3);
+    var spins: usize = 0;
+    while (r.jobs.items.len > 0 and r.jobs.items[0].srv_list.items.len == 0 and spins < 400) : (spins += 1) r.step(50);
+
+    try std.testing.expect(r.jobs.items.len > 0);
+    try std.testing.expectEqual(@as(usize, SRV_CAP), r.jobs.items[0].srv_list.items.len);
+}
+
+test "dns-async: the fallback path asks AAAA too and emits v6 first (Q4)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+    srv.a_aaaa.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), res.targets[0].addr.any.family);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[1].addr.any.family);
+    try std.testing.expectEqual(@as(u16, 5222), res.targets[0].addr.getPort());
 }
