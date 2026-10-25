@@ -97,7 +97,9 @@ pub const QueryCb = struct {
 const Phase = enum { srv_tls, srv_plain, addr, tlsa, fallback_addr, fallback_tlsa, raw, done };
 
 const Job = struct {
-    session_key: usize,
+    /// Session keys waiting on this job; identical in-flight lookups
+    /// share one job and every waiter still gets its own callback.
+    waiters: std.ArrayListUnmanaged(usize) = .{},
     name: []const u8, // owned
     phase: Phase,
     service_idx: u8 = 0,
@@ -141,6 +143,18 @@ const CacheEnt = struct {
     expires_ms: i64,
 };
 
+/// A request waiting for an in-flight job slot.
+const WaitEnt = struct {
+    session_key: usize = 0,
+    name: []u8 = &.{}, // owned
+    kind: enum { resolve, query },
+    service_idx: u8 = 0,
+    default_port: u16 = 0,
+    rtype: u16 = 0,
+};
+
+const WAIT_CAP: usize = 256;
+
 pub const Resolver = struct {
     alloc: std.mem.Allocator,
     fd: posix.fd_t = -1,
@@ -159,6 +173,9 @@ pub const Resolver = struct {
     cb: Cb = .{ .ctx = null, .fun = noopCallback },
     qcb: QueryCb = .{ .ctx = null, .fun = noopQueryCallback },
     cache: std.ArrayListUnmanaged(CacheEnt) = .{},
+    /// Requests queued behind a full in-flight set; promoted FIFO as
+    /// jobs complete.
+    wait_queue: std.ArrayListUnmanaged(WaitEnt) = .{},
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
@@ -170,6 +187,8 @@ pub const Resolver = struct {
     pub fn deinit(self: *Resolver) void {
         for (self.jobs.items) |j| self.freeJob(j);
         self.jobs.deinit(self.alloc);
+        for (self.wait_queue.items) |e| self.alloc.free(e.name);
+        self.wait_queue.deinit(self.alloc);
         for (self.cache.items) |e| self.freeCacheEnt(e);
         self.cache.deinit(self.alloc);
         if (self.fd >= 0) posix.close(self.fd);
@@ -206,13 +225,93 @@ pub const Resolver = struct {
             return;
         }
         try self.ensureOpen();
-        if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
+        if (self.jobs.items.len >= MAX_JOBS) {
+            try self.enqueueWait(session_key, name, .{ .kind = .query, .rtype = qt });
+            return;
+        }
         const job = try self.allocJob(session_key, name);
         job.phase = .raw;
         job.is_raw = true;
         errdefer self.freeJob(job);
         try self.sendQuery(job, name, qt);
         try self.jobs.append(self.alloc, job);
+    }
+
+    /// Queue a request behind the in-flight cap; promoted FIFO by
+    /// promoteWait as jobs complete.
+    fn enqueueWait(self: *Resolver, session_key: usize, name: []const u8, opts: WaitEnt) !void {
+        if (self.wait_queue.items.len >= WAIT_CAP) return error.TooManyJobs;
+        var e = opts;
+        e.session_key = session_key;
+        e.name = try self.alloc.dupe(u8, name);
+        try self.wait_queue.append(self.alloc, e);
+    }
+
+    /// Launch the head of the wait queue now that a job slot opened.
+    fn promoteWait(self: *Resolver) void {
+        while (self.jobs.items.len < MAX_JOBS and self.wait_queue.items.len > 0) {
+            const e = self.wait_queue.orderedRemove(0);
+            defer self.alloc.free(e.name);
+            switch (e.kind) {
+                .query => self.launchQuery(e) catch |err| {
+                    log.warn("dns: queued query failed to launch: {}", .{err});
+                },
+                .resolve => self.launchResolve(e) catch |err| {
+                    log.warn("dns: queued resolve failed to launch: {}", .{err});
+                },
+            }
+        }
+    }
+
+    fn launchQuery(self: *Resolver, e: WaitEnt) !void {
+        const job = try self.allocJob(e.session_key, e.name);
+        job.phase = .raw;
+        job.is_raw = true;
+        errdefer self.freeJob(job);
+        try self.sendQuery(job, e.name, e.rtype);
+        try self.jobs.append(self.alloc, job);
+    }
+
+    fn launchResolve(self: *Resolver, e: WaitEnt) !void {
+        const job = try self.allocJob(e.session_key, e.name);
+        job.phase = .srv_tls;
+        job.service_idx = e.service_idx;
+        job.default_port = e.default_port;
+        errdefer self.freeJob(job);
+        try self.sendSrv(job, SRV_TLS[job.service_idx]);
+        try self.jobs.append(self.alloc, job);
+    }
+
+    /// Release a session's interest: detach the waiter from its job
+    /// (freeing the job when it was the last waiter) or drop a
+    /// not-yet-launched queue entry. No callback fires afterwards.
+    pub fn cancel(self: *Resolver, session_key: usize) void {
+        for (self.jobs.items) |job| {
+            for (job.waiters.items, 0..) |w, i| {
+                if (w == session_key) {
+                    _ = job.waiters.orderedRemove(i);
+                    break;
+                }
+            }
+            if (job.waiters.items.len == 0) {
+                for (self.jobs.items, 0..) |j, i| {
+                    if (j == job) {
+                        _ = self.jobs.orderedRemove(i);
+                        break;
+                    }
+                }
+                self.freeJob(job);
+                self.promoteWait();
+                return;
+            }
+        }
+        for (self.wait_queue.items, 0..) |e, i| {
+            if (e.session_key == session_key) {
+                const removed = self.wait_queue.orderedRemove(i);
+                self.alloc.free(removed.name);
+                return;
+            }
+        }
     }
 
     /// SRV chain resolve. Literal IPs complete synchronously with one
@@ -227,7 +326,20 @@ pub const Resolver = struct {
         } else |_| {}
 
         try self.ensureOpen();
-        if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
+        // An identical in-flight lookup takes another waiter instead of
+        // a second job on the wire.
+        for (self.jobs.items) |job| {
+            if (job.is_raw) continue;
+            if (job.service_idx != @intFromEnum(service)) continue;
+            if (job.default_port != default_port) continue;
+            if (!std.ascii.eqlIgnoreCase(job.name, name)) continue;
+            try job.waiters.append(self.alloc, session_key);
+            return;
+        }
+        if (self.jobs.items.len >= MAX_JOBS) {
+            try self.enqueueWait(session_key, name, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port });
+            return;
+        }
         const job = try self.allocJob(session_key, name);
         job.phase = .srv_tls;
         job.service_idx = @intFromEnum(service);
@@ -328,10 +440,12 @@ pub const Resolver = struct {
         const job = try self.alloc.create(Job);
         errdefer self.alloc.destroy(job);
         job.* = .{
-            .session_key = session_key,
             .name = try self.alloc.dupe(u8, name),
             .phase = .srv_tls,
         };
+        errdefer self.alloc.free(job.name);
+        try job.waiters.append(self.alloc, session_key);
+        errdefer job.waiters.deinit(self.alloc);
         for (&self.slots, 0..) |*s, i| {
             if (s.* == null) {
                 self.slot_gen[i] +%= 1;
@@ -578,13 +692,13 @@ pub const Resolver = struct {
                 break;
             }
         }
-        const key = job.session_key;
         if (job.is_raw) {
-            self.qcb.fun(self.qcb.ctx, key, status, null);
+            for (job.waiters.items) |key| self.qcb.fun(self.qcb.ctx, key, status, null);
         } else {
-            self.cb.fun(self.cb.ctx, key, status, null);
+            for (job.waiters.items) |key| self.cb.fun(self.cb.ctx, key, status, null);
         }
         self.freeJob(job);
+        self.promoteWait();
     }
 
     fn complete(self: *Resolver, job: *Job) void {
@@ -594,17 +708,52 @@ pub const Resolver = struct {
                 break;
             }
         }
-        const key = job.session_key;
-        const targets = self.alloc.alloc(Target, job.targets.items.len) catch {
-            self.freeJob(job);
-            self.cb.fun(self.cb.ctx, key, .failed, null);
-            return;
-        };
-        @memcpy(targets, job.targets.items);
-        job.targets.deinit(self.alloc);
-        job.targets = .{};
-        self.cb.fun(self.cb.ctx, key, .resolved, .{ .targets = targets });
+        // Every waiter gets its own deep copy of the target set; the
+        // callback owns what it receives.
+        for (job.waiters.items) |key| {
+            const targets = self.dupTargets(job.targets.items) catch {
+                self.cb.fun(self.cb.ctx, key, .failed, null);
+                continue;
+            };
+            self.cb.fun(self.cb.ctx, key, .resolved, .{ .targets = targets });
+        }
         self.freeJob(job);
+        self.promoteWait();
+    }
+
+    /// Deep-copy a target list for one waiter's Resolution.
+    fn dupTargets(self: *Resolver, items: []const Target) ![]Target {
+        const out = try self.alloc.alloc(Target, items.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |t| {
+                self.alloc.free(t.host);
+                for (t.tlsa) |r| self.alloc.free(r.association_data);
+                if (t.tlsa.len > 0) self.alloc.free(t.tlsa);
+            }
+            self.alloc.free(out);
+        }
+        for (items, 0..) |t, i| {
+            const host = try self.alloc.dupe(u8, t.host);
+            errdefer self.alloc.free(host);
+            var tlsa: []dns.TlsaRecord = &.{};
+            if (t.tlsa.len > 0) {
+                tlsa = try self.alloc.alloc(dns.TlsaRecord, t.tlsa.len);
+                var tn: usize = 0;
+                errdefer {
+                    for (tlsa[0..tn]) |r| self.alloc.free(r.association_data);
+                    self.alloc.free(tlsa);
+                }
+                for (t.tlsa, 0..) |r, j| {
+                    tlsa[j] = r;
+                    tlsa[j].association_data = try self.alloc.dupe(u8, r.association_data);
+                    tn += 1;
+                }
+            }
+            out[i] = .{ .addr = t.addr, .host = host, .tlsa = tlsa, .is_direct_tls = t.is_direct_tls };
+            built += 1;
+        }
+        return out;
     }
 
     /// Detach the answer RRs from the parse arena (deep copy of every
@@ -616,16 +765,17 @@ pub const Resolver = struct {
                 break;
             }
         }
-        const key = job.session_key;
-        const detached = self.dupRrs(msg.rrs) catch {
-            self.freeJob(job);
-            self.qcb.fun(self.qcb.ctx, key, .failed, null);
-            return;
-        };
-        self.cachePut(job.pending_qname, job.pending_qtype, detached);
-        const ttl = minTtl(detached);
-        self.qcb.fun(self.qcb.ctx, key, .resolved, .{ .rrs = detached, .ttl = ttl });
+        self.cachePut(job.pending_qname, job.pending_qtype, msg.rrs);
+        const ttl = minTtl(msg.rrs);
+        for (job.waiters.items) |key| {
+            const detached = self.dupRrs(msg.rrs) catch {
+                self.qcb.fun(self.qcb.ctx, key, .failed, null);
+                continue;
+            };
+            self.qcb.fun(self.qcb.ctx, key, .resolved, .{ .rrs = detached, .ttl = ttl });
+        }
         self.freeJob(job);
+        self.promoteWait();
     }
 
     fn minTtl(rrs: []const wire.Rr) u32 {
@@ -836,6 +986,7 @@ pub const Resolver = struct {
 
     fn freeJob(self: *Resolver, job: *Job) void {
         if (self.slots[job.slot] == job) self.slots[job.slot] = null;
+        job.waiters.deinit(self.alloc);
         self.disarmDeadline(job);
         if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
         job.tcp_buf.deinit(self.alloc);
@@ -1467,4 +1618,84 @@ test "dns-async: the fallback address path honors the requested port (J7)" {
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expect(res.targets.len >= 1);
     try std.testing.expectEqual(@as(u16, 5269), res.targets[0].addr.getPort());
+}
+
+const FreeingCtx = struct {
+    calls: usize = 0,
+    keys: [8]usize = .{0} ** 8,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+        const self: *FreeingCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        if (self.calls < self.keys.len) self.keys[self.calls] = key;
+        self.calls += 1;
+        if (res) |r| {
+            var v = r;
+            v.deinitOn(std.testing.allocator);
+        }
+    }
+};
+
+test "dns-async: identical resolves merge into one job (J6)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1);
+    try r.resolve("svc.test", .client, 5222, 2);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiters.items.len);
+
+    var spins: usize = 0;
+    while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    // Both session keys were notified exactly once.
+    try std.testing.expect((ctx.keys[0] == 1 and ctx.keys[1] == 2) or (ctx.keys[0] == 2 and ctx.keys[1] == 1));
+}
+
+test "dns-async: over-cap requests queue and cancel detaches (J6)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+
+    var name_buf: [32]u8 = undefined;
+    for (0..65) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "h{d}.test", .{i}) catch unreachable;
+        try r.resolve(n, .client, 5222, i + 1);
+    }
+    try std.testing.expectEqual(@as(usize, 64), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r.wait_queue.items.len);
+
+    // cancel removes the queued entry and an in-flight waiter.
+    r.cancel(65);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+    r.cancel(1);
+    try std.testing.expectEqual(@as(usize, 63), r.jobs.items.len);
+    // cancel of a missing key is a no-op.
+    r.cancel(999);
+}
+
+test "dns-async: a shared job notifies only its remaining waiters (J6)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1);
+    try r.resolve("svc.test", .client, 5222, 2);
+    r.cancel(1);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+
+    var spins: usize = 0;
+    while (ctx.calls < 1 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 2), ctx.keys[0]);
 }
