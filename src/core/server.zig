@@ -3374,18 +3374,8 @@ pub const Server = struct {
         router.dispatchStanza(self, session, changes);
     }
 
-    /// Generate a unique stanza ID for XEP-0359. Format:
-    /// hex(timestamp)-hex(worker_id)-hex(counter), every field zero-padded to a
-    /// fixed width.
-    ///
-    /// The ID is unique per server instance (worker_id disambiguates threads,
-    /// counter disambiguates within the same second). The padding is not
-    /// cosmetic: the archive and offline keys are
-    /// owner\x00timestamp_be(8)\x00stanza_id, so within one second the
-    /// lexicographic order of the ID is the only thing that orders the rows.
-    /// Unpadded hex sorted counter 15 ("f") after counter 16 ("10"), because
-    /// 'f' > '1'. That reordered an offline queue at every counter boundary and
-    /// every hex-digit rollover (E2c).
+    /// Generate a unique XEP-0359 stanza ID. Zero-padded timestamp, worker,
+    /// and counter fields keep the representation fixed-width.
     pub fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
         const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         const counter = self.stanza_id_counter;
@@ -3393,7 +3383,8 @@ pub const Server = struct {
 
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
-        std.fmt.format(w, "{x:0>8}-{x:0>4}-{x:0>8}", .{ timestamp, self.worker_id, counter }) catch {};
+        // The fixed-width ID occupies 22 bytes of this 32-byte buffer.
+        std.fmt.format(w, "{x:0>8}-{x:0>4}-{x:0>8}", .{ timestamp, self.worker_id, counter }) catch unreachable;
         return fbs.getWritten();
     }
 
