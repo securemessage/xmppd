@@ -75,7 +75,10 @@ pub const StanzaWriter = struct {
     pub fn elementOpen(self: *StanzaWriter, name: []const u8) Error!void {
         assert(!self.in_start_tag);
         assert(self.depth < max_depth);
-        try validateName(name);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
         self.emitByte('<');
         self.emit(name);
         self.in_start_tag = true;
@@ -88,11 +91,21 @@ pub const StanzaWriter = struct {
     /// payload (null writes an empty value).
     pub fn attr(self: *StanzaWriter, name: []const u8, value: anytype) Error!void {
         assert(self.in_start_tag);
-        try validateName(name);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        validateValue(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
         self.emitByte(' ');
         self.emit(name);
         self.emit("='");
-        try self.emitTyped(value);
+        self.emitTyped(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
         self.emitByte('\'');
     }
 
@@ -116,7 +129,10 @@ pub const StanzaWriter = struct {
     pub fn elementClose(self: *StanzaWriter, name: []const u8) Error!void {
         assert(!self.in_start_tag);
         assert(self.depth > 0);
-        try validateName(name);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
         self.emit("</");
         self.emit(name);
         self.emitByte('>');
@@ -127,7 +143,14 @@ pub const StanzaWriter = struct {
     pub fn text(self: *StanzaWriter, value: anytype) Error!void {
         assert(!self.in_start_tag);
         assert(self.depth > 0);
-        try self.emitTyped(value);
+        validateValue(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        self.emitTyped(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
     }
 
     /// Reader-validated markup emitted verbatim, escaping nothing. The
@@ -171,6 +194,29 @@ pub const StanzaWriter = struct {
         writeEscaped(self.out, s) catch {
             self.failed = true;
         };
+    }
+
+    /// Validation-only twin of emitTyped: every rejection is decided
+    /// before a single output byte is emitted for this value.
+    fn validateValue(value: anytype) Error!void {
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .optional => {
+                if (value) |v| try validateValue(v);
+            },
+            .bool, .int, .comptime_int => {},
+            .@"enum" => try validateChars(@tagName(value)),
+            .pointer => {
+                comptime {
+                    if (!isStringArg(T)) {
+                        @compileError("StanzaWriter: unsupported value type " ++ @typeName(T));
+                    }
+                }
+                const s: []const u8 = value;
+                try validateChars(s);
+            },
+            else => @compileError("StanzaWriter: unsupported value type " ++ @typeName(T)),
+        }
     }
 
     fn emitTyped(self: *StanzaWriter, value: anytype) Error!void {
@@ -448,9 +494,9 @@ test "NUL, control characters and invalid UTF-8 are rejected" {
     try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbe"));
     try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbf"));
     // Tab, LF, CR and a supplementary-plane character are legal.
-    try x.text("\t\r\nf\xf0\x9f\x98\x80");
-    try x.elementClose("t");
-    try x.finish();
+    // A rejected input latches the writer: the stanza can no longer
+    // report success at finish().
+    try testing.expectError(error.Overflow, x.finish());
 }
 
 test "element and attribute names are validated" {
@@ -467,9 +513,8 @@ test "element and attribute names are validated" {
     try testing.expectError(error.InvalidName, x.attr("=x", "v"));
     try x.attr("xml:lang", "en");
     x.elementSelfClose();
-    try x.finish();
-
-    try testing.expectEqualStrings("<ns:tag xml:lang='en'/>", w.buffered());
+    // The earlier name rejections are latched: finish() fails.
+    try testing.expectError(error.Overflow, x.finish());
 }
 
 test "rawSpan emits reader-validated bytes verbatim" {
@@ -579,4 +624,26 @@ test "StanzaWriter performs zero heap allocations" {
     x.elementSelfClose();
     try x.finish();
     try testing.expectEqualStrings("<presence from='a@b.c/r'/>", w.buffered());
+}
+
+test "a rejected attribute emits nothing and latches finish() (L1)" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    try testing.expectError(error.InvalidCharacter, x.attr("a", "bad\x00"));
+    // Nothing of the attribute reached the output: no name, no quote.
+    try testing.expectEqualStrings("<m", w.buffered());
+    // The rejection is sticky: finish() cannot report success.
+    try testing.expectError(error.Overflow, x.finish());
+
+    // Same for a bad close-tag name and bad text.
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    try y.elementOpen("m");
+    y.elementOpenEnd();
+    try testing.expectError(error.InvalidName, y.elementClose("bad name"));
+    try testing.expectEqualStrings("<m>", w2.buffered());
+    try testing.expectError(error.Overflow, y.finish());
 }
