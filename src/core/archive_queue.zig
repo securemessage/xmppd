@@ -251,9 +251,24 @@ pub const ArchiveWriteQueue = struct {
             }
             if (n == 0) break;
             const items = self.drain_jobs[0..n];
-            store.storeAll(items) catch |err| {
-                _ = self.store_failed.fetchAdd(n, .monotonic);
-                log.warn("archive store batch of {d} jobs failed ({d} failed total): {}", .{ n, self.store_failed.load(.monotonic), err });
+            store.storeAll(items) catch |batch_err| {
+                // One bad job must not discard the chunk it rode in
+                // with: retry each job alone and count only the jobs
+                // that still fail.
+                var failed: usize = 0;
+                var last_err: anyerror = batch_err;
+                for (items) |*job| {
+                    store.store(job.owner, job.with, job.stanza_id, job.timestamp, job.stanza_xml) catch |err| {
+                        failed += 1;
+                        last_err = err;
+                    };
+                }
+                if (failed > 0) {
+                    _ = self.store_failed.fetchAdd(@intCast(failed), .monotonic);
+                    log.warn("archive store: {d} of {d} jobs failed after retry ({d} failed total): {}", .{ failed, n, self.store_failed.load(.monotonic), last_err });
+                } else {
+                    log.warn("archive store batch failed; all {d} jobs landed on retry: {}", .{ n, batch_err });
+                }
             };
             for (items) |*job| job.deinit();
             processed += n;
@@ -275,6 +290,8 @@ const MockStore = struct {
     stored: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     batches: u32 = 0,
     fail_next: bool = false,
+    /// Per-job store() rejects jobs whose stanza_id equals this marker.
+    poisoned_id: []const u8 = "poison",
 
     pub fn storeAll(self: *MockStore, items: anytype) !void {
         if (self.fail_next) {
@@ -283,6 +300,11 @@ const MockStore = struct {
         }
         self.batches += 1;
         _ = self.stored.fetchAdd(@intCast(items.len), .monotonic);
+    }
+
+    pub fn store(self: *MockStore, _: []const u8, _: []const u8, stanza_id: []const u8, _: u64, _: []const u8) !void {
+        if (std.mem.eql(u8, stanza_id, self.poisoned_id)) return error.JobRejected;
+        _ = self.stored.fetchAdd(1, .monotonic);
     }
 };
 
@@ -338,7 +360,7 @@ test "ArchiveWriteQueue: writerLoop drains into store and exits on stop" {
     t.join();
 }
 
-test "ArchiveWriteQueue: store failures are counted, not silent (S31)" {
+test "ArchiveWriteQueue: a failed batch retries each job alone (S31)" {
     var q = try ArchiveWriteQueue.init();
     defer q.deinit();
 
@@ -347,9 +369,25 @@ test "ArchiveWriteQueue: store failures are counted, not silent (S31)" {
     q.enqueue("a@localhost", "b@localhost", "s2", 2, "<m/>");
     q.drainInto(&store, 64);
 
-    // A failed batch loses every job in it; each is counted.
-    try std.testing.expectEqual(@as(u64, 2), q.store_failed.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 0), store.stored.load(.monotonic));
+    // The batch error drops nothing: both jobs land on the retry.
+    try std.testing.expectEqual(@as(u64, 0), q.store_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), store.stored.load(.monotonic));
+}
+
+test "ArchiveWriteQueue: one bad job in a chunk loses only itself" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var store = MockStore{ .fail_next = true };
+    q.enqueue("a@localhost", "b@localhost", "s1", 1, "<m/>");
+    q.enqueue("a@localhost", "b@localhost", "poison", 2, "<m/>");
+    q.enqueue("a@localhost", "b@localhost", "s3", 3, "<m/>");
+    q.drainInto(&store, 64);
+
+    // The poisoned job fails both in the batch and on its own retry;
+    // its two neighbors land.
+    try std.testing.expectEqual(@as(u64, 1), q.store_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 2), store.stored.load(.monotonic));
 }
 
 test "ArchiveWriteQueue: drainInto writes one storeAll batch per chunk (Q8)" {
