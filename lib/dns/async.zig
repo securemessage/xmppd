@@ -150,7 +150,9 @@ pub const Resolver = struct {
     /// kevent batch is never touched (C3 pattern).
     slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
     slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
-    next_id: u16 = 0,
+    /// Seeded from the CSPRNG; drives query ids and RFC 2782 weighted
+    /// picks. Tests reseed it for deterministic draws.
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     cb: Cb = .{ .ctx = null, .fun = noopCallback },
     qcb: QueryCb = .{ .ctx = null, .fun = noopQueryCallback },
     cache: std.ArrayListUnmanaged(CacheEnt) = .{},
@@ -159,7 +161,7 @@ pub const Resolver = struct {
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
 
     pub fn init(alloc: std.mem.Allocator) Resolver {
-        return .{ .alloc = alloc, .next_id = std.crypto.random.int(u16) };
+        return .{ .alloc = alloc, .prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64)) };
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -296,9 +298,23 @@ pub const Resolver = struct {
         try self.sendQuery(job, qname, KIND_SRV);
     }
 
-    fn nextId(self: *Resolver) u16 {
-        self.next_id +%= 1;
-        return self.next_id;
+    /// A fresh random id per query: sequential ids from one fixed
+    /// source port make blind spoofing easy. Retries a colliding id a
+    /// bounded number of times; with at most MAX_JOBS in flight the
+    /// space of 65536 ids is never crowded.
+    fn nextId(self: *Resolver) !u16 {
+        for (0..16) |_| {
+            const id = self.prng.random().int(u16);
+            var in_flight = false;
+            for (self.jobs.items) |j| {
+                if (j.dns_id == id) {
+                    in_flight = true;
+                    break;
+                }
+            }
+            if (!in_flight) return id;
+        }
+        return error.NoFreeId;
     }
 
     /// Allocate a job in a free slot and stamp it with that slot's
@@ -356,7 +372,8 @@ pub const Resolver = struct {
 
     fn sendQuery(self: *Resolver, job: *Job, qname: []const u8, qtype: u16) !void {
         var buf: [512]u8 = undefined;
-        const q = try wire.buildQuery(&buf, self.nextId(), qname, qtype);
+        const id = try self.nextId();
+        const q = try wire.buildQuery(&buf, id, qname, qtype);
         const pkt = try self.alloc.dupe(u8, buf[0..q]);
         if (job.request.len > 0) self.alloc.free(job.request);
         job.request = pkt;
@@ -1306,4 +1323,22 @@ test "dns-async: a deadline event batched with the reply does not touch a freed 
     var res = ctx.raw.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    r.prng = std.Random.DefaultPrng.init(0xC0FFEE);
+
+    // Six in-flight jobs: a sequential allocator would emit id, id+1,
+    // id+2... while a per-query draw lands anywhere in the space.
+    const names: [6][]const u8 = .{ "a.test", "b.test", "c.test", "d.test", "e.test", "f.test" };
+    for (names, 0..) |n, i| try r.query(n, .a, i + 1);
+    try std.testing.expectEqual(@as(usize, 6), r.jobs.items.len);
+    var sequential = true;
+    for (1..r.jobs.items.len) |i| {
+        if (r.jobs.items[i].dns_id != r.jobs.items[i - 1].dns_id +% 1) sequential = false;
+    }
+    try std.testing.expect(!sequential);
 }
