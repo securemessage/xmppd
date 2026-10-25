@@ -6275,6 +6275,10 @@ test "Server: S13 message held behind a draining offline tail" {
     const n = posix.read(target_fds[1], &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
 
+    _ = alice.conn.flushSend() catch {};
+    const sender_n = posix.read(alice_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), sender_n);
+
     // Parked behind the tail instead: one offline pointer whose held copy
     // carries the stanza itself, so the drain does not depend on an archive
     // row the async writer queue may not have committed yet (E2a).
