@@ -762,3 +762,80 @@ test "attribute whitespace and text CR escape as char refs (L3)" {
         w.buffered(),
     );
 }
+
+/// A writer whose drain fails once, then accepts everything. Pins the
+/// sticky-failure mutation where a later successful write clears `failed`.
+const FailOnceWriter = struct {
+    w: std.Io.Writer,
+    failed_once: bool = false,
+    accepted: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FailOnceWriter = @fieldParentPtr("w", w);
+        if (!self.failed_once) {
+            self.failed_once = true;
+            return error.WriteFailed;
+        }
+        var n: usize = 0;
+        for (data) |d| n += d.len * splat;
+        self.accepted += n;
+        return n;
+    }
+
+    fn make() FailOnceWriter {
+        return .{ .w = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+};
+
+test "a transient writer failure stays latched through later writes (L4)" {
+    var fo = FailOnceWriter.make();
+    var x = StanzaWriter.init(&fo.w);
+
+    // First emit hits the one-shot WriteFailed; every later emit goes
+    // through fine, but finish() must still report the failure.
+    try x.elementOpen("m");
+    try x.attr("a", "still-written");
+    x.elementOpenEnd();
+    try x.text("accepted bytes");
+    try x.elementClose("m");
+
+    // Correct latching drops every later byte (accepted stays 0); a
+    // mutation that clears `failed` on a good write would both emit
+    // them and let finish() pass.
+    try testing.expectEqual(@as(usize, 0), fo.accepted);
+    try testing.expectError(error.Overflow, x.finish());
+    try testing.expectError(error.Overflow, x.finish());
+}
+
+test "rejection at every byte position across lengths 0..67 (L4)" {
+    // Goal: the vector path and the scalar tail must both reject; a bad
+    // byte anywhere, at any length, for each rejection class.
+    const bads = [_]u8{ 0x00, 0x01, 0x1F, 0xFF, 0x80, 0xC0 };
+    var s: [70]u8 = undefined;
+    var len: usize = 0;
+    while (len <= 67) : (len += 1) {
+        const base = s[0..len];
+        @memset(base, 'a');
+        for (0..len) |pos| {
+            for (bads) |bad| {
+                base[pos] = bad;
+                if (bad < 0x20) {
+                    try testing.expectError(error.InvalidCharacter, validateChars(base));
+                } else {
+                    try testing.expectError(error.InvalidUtf8, validateChars(base));
+                }
+                base[pos] = 'a';
+            }
+            // Noncharacters U+FFFE/U+FFFF embedded at this position.
+            if (pos + 3 <= len) {
+                @memcpy(base[pos .. pos + 3], "\xef\xbf\xbe");
+                try testing.expectError(error.InvalidCharacter, validateChars(base));
+                base[pos + 2] = 0xbf;
+                try testing.expectError(error.InvalidCharacter, validateChars(base));
+                @memcpy(base[pos .. pos + 3], "aaa");
+            }
+        }
+        // The clean baseline itself is always accepted.
+        try validateChars(base);
+    }
+}
