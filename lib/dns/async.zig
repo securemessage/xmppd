@@ -701,6 +701,42 @@ pub const Resolver = struct {
         _ = posix.send(job.tcp_fd, job.request, 0) catch return error.SendFailed;
     }
 
+    /// Drop the first frame_len bytes off the job's TCP frame buffer.
+    fn consumeTcpFrame(job: *Job, frame_len: usize) void {
+        const items = job.tcp_buf.items;
+        std.mem.copyForwards(u8, items[0 .. items.len - frame_len], items[frame_len..]);
+        job.tcp_buf.items.len -= frame_len;
+    }
+
+    /// Consume every complete frame in tcp_buf. A frame is a two-octet
+    /// length plus at most 65535 octets, so the length check applies
+    /// per frame, not to the whole buffer: a maximal frame followed by
+    /// more data is legal. The unconsumed tail is always a partial
+    /// frame smaller than 2 + 65535 octets, so the buffer is bounded.
+    fn pumpTcpFrames(self: *Resolver, job: *Job) void {
+        while (job.tcp_buf.items.len >= 2) {
+            const want = std.mem.readInt(u16, job.tcp_buf.items[0..2], .big);
+            const frame_len = @as(usize, want) + 2;
+            if (job.tcp_buf.items.len < frame_len) return;
+            const ours = if (self.matchJob(job.tcp_buf.items[2..frame_len])) |m| m == job else false;
+            if (ours) {
+                // Consume before handling: the job can live on for the
+                // next phase on this connection and a handled frame
+                // must never be re-parsed. handleResponse parses a
+                // stable copy because consuming slides the buffer.
+                const pkt = self.alloc.dupe(u8, job.tcp_buf.items[2..frame_len]) catch {
+                    self.dropJob(job, .failed);
+                    return;
+                };
+                defer self.alloc.free(pkt);
+                consumeTcpFrame(job, frame_len);
+                self.handleResponse(job, pkt);
+                return;
+            }
+            consumeTcpFrame(job, frame_len);
+        }
+    }
+
     fn onTcpReadable(self: *Resolver, fd: posix.fd_t) void {
         for (self.jobs.items) |job| {
             if (job.tcp_fd != fd) continue;
@@ -714,29 +750,7 @@ pub const Resolver = struct {
                 self.dropJob(job, .failed);
                 return;
             };
-            // A TCP DNS frame is a two-octet length plus at most 65535
-            // octets; more buffered data means a misbehaving peer.
-            if (job.tcp_buf.items.len > 2 + 65535) {
-                self.dropJob(job, .failed);
-                return;
-            }
-            while (job.tcp_buf.items.len >= 2) {
-                const want = std.mem.readInt(u16, job.tcp_buf.items[0..2], .big);
-                const frame_len = @as(usize, want) + 2;
-                if (job.tcp_buf.items.len < frame_len) return;
-                const pkt = job.tcp_buf.items[2..frame_len];
-                if (self.matchJob(pkt)) |matched| {
-                    if (matched == job) {
-                        // The job may be freed inside handleResponse.
-                        self.handleResponse(job, pkt);
-                        return;
-                    }
-                }
-                // A complete frame that does not answer this job's
-                // outstanding query is consumed and dropped.
-                std.mem.copyForwards(u8, job.tcp_buf.items[0 .. job.tcp_buf.items.len - frame_len], job.tcp_buf.items[frame_len..]);
-                job.tcp_buf.items.len -= frame_len;
-            }
+            self.pumpTcpFrames(job);
             return;
         }
     }
@@ -1839,6 +1853,28 @@ test "dns-async: a failed query build leaves no freed job in the list (J1)" {
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
+/// Build a minimal A answer to the query in `query_pkt` at `out`:
+/// echo the question, then one A record for 127.0.0.1.
+fn buildAResponse(out: []u8, query_pkt: []const u8) usize {
+    const id = std.mem.readInt(u16, query_pkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], 1, .big);
+    @memset(out[8..12], 0);
+    const qlen = query_pkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], query_pkt[12..]);
+    const off = 12 + qlen;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], wire.TYPE_A, .big);
+    std.mem.writeInt(u16, out[off + 4 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 6 ..][0..4], 60, .big);
+    std.mem.writeInt(u16, out[off + 10 ..][0..2], 4, .big);
+    @memcpy(out[off + 12 .. off + 16], &[_]u8{ 127, 0, 0, 1 });
+    return off + 16;
+}
+
 test "dns-async: TCP frame length math and consumption (J2)" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
@@ -1848,33 +1884,52 @@ test "dns-async: TCP frame length math and consumption (J2)" {
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     const job = r.jobs.items[0];
 
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.Socketpair;
-    defer posix.close(fds[0]);
-    job.tcp_fd = fds[1];
-    defer {
-        job.tcp_fd = -1;
-        posix.close(fds[1]);
-    }
-
     // A maximal legal frame header: the u16 length must be widened
     // before adding the two-octet prefix or the math overflows.
     var hdr: [2]u8 = undefined;
     std.mem.writeInt(u16, &hdr, 65535, .big);
-    _ = try posix.write(fds[0], &hdr);
-    _ = try posix.write(fds[0], &[_]u8{0} ** 64);
-    r.onTcpReadable(fds[1]);
+    try job.tcp_buf.appendSlice(std.testing.allocator, &hdr);
+    try job.tcp_buf.appendSlice(std.testing.allocator, &[_]u8{0} ** 64);
+    r.pumpTcpFrames(job);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
 
     // A complete frame that answers no outstanding query is consumed.
     job.tcp_buf.clearRetainingCapacity();
     std.mem.writeInt(u16, &hdr, 12, .big);
-    _ = try posix.write(fds[0], &hdr);
-    _ = try posix.write(fds[0], &[_]u8{0} ** 12);
-    r.onTcpReadable(fds[1]);
+    try job.tcp_buf.appendSlice(std.testing.allocator, &hdr);
+    try job.tcp_buf.appendSlice(std.testing.allocator, &[_]u8{0} ** 12);
+    r.pumpTcpFrames(job);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 0), job.tcp_buf.items.len);
+}
+
+test "dns-async: a maximal frame ahead of the answer is consumed, not fatal (Q1)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("host.test", .a, 7);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    const job = r.jobs.items[0];
+
+    // A complete 65535-octet frame of junk, then the real answer frame:
+    // the buffer holding more than one max frame is legal per frame.
+    var stream: [2 + 65535 + 2 + 512]u8 = undefined;
+    std.mem.writeInt(u16, stream[0..2], 65535, .big);
+    @memset(stream[2 .. 2 + 65535], 0xAA);
+    var off: usize = 2 + 65535;
+    const alen = buildAResponse(stream[off + 2 ..], job.request);
+    std.mem.writeInt(u16, stream[off..][0..2], @intCast(alen), .big);
+    off += 2 + alen;
+    try job.tcp_buf.appendSlice(std.testing.allocator, stream[0..off]);
+    r.pumpTcpFrames(job);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
 test "dns-async: a deadline event batched with the reply does not touch a freed job (J3)" {
