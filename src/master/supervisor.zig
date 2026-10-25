@@ -734,10 +734,11 @@ fn probeDropPrivilege(gid: posix.gid_t, call: SetgroupsCall) bool {
         var groups: [1]posix.gid_t = .{gid};
         std.c._exit(if (call(1, &groups[0]) == 0) 0 else 1);
     }
-    var status: u32 = 0;
-    const ret = std.c.waitpid(pid, @ptrCast(&status), 0);
-    if (ret < 0) return false;
-    return ((status >> 8) & 0xFF) == 0;
+    // posix.waitpid retries EINTR. A child killed by a signal has no exit
+    // status; treating the empty status as 0 would report privilege present.
+    const res = posix.waitpid(pid, 0);
+    if (!posix.W.IFEXITED(res.status)) return false;
+    return posix.W.EXITSTATUS(res.status) == 0;
 }
 
 /// Run a test only where the drop privilege exists: without it the child
@@ -752,6 +753,17 @@ fn probeSetgroupsOk(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
 
 fn probeSetgroupsDenied(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
     return -1;
+}
+
+fn probeSetgroupsSignal(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
+    _ = std.c.kill(std.c.getpid(), posix.SIG.KILL);
+    return 0;
+}
+
+test "Supervisor: the drop-privilege probe rejects a signaled child" {
+    // WIFEXITED must gate the exit-status read: a KILLed probe is not a
+    // successful setgroups call.
+    try std.testing.expect(!probeDropPrivilege(0, probeSetgroupsSignal));
 }
 
 test "Supervisor: the drop-privilege probe reports the setgroups privilege (D6)" {
