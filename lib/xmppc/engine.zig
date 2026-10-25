@@ -35,9 +35,9 @@ const Session = @import("session.zig").Session;
 const SessionConfig = @import("session.zig").SessionConfig;
 const Event = @import("session.zig").Event;
 const Transport = @import("transport.zig").Transport;
-const Resolver = @import("resolver.zig").Resolver;
-const Resolution = @import("resolver.zig").Resolution;
-const DnsStatus = @import("resolver.zig").Status;
+const Resolver = @import("dns_async").Resolver;
+const Resolution = @import("dns_async").Resolution;
+const DnsStatus = @import("dns_async").Status;
 
 const log = std.log.scoped(.xmppc);
 
@@ -1029,7 +1029,7 @@ pub const Engine = struct {
             self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         }
         s.phase = .resolving;
-        self.resolver.?.resolve(s.host, s.port, h.encode()) catch {
+        self.resolver.?.resolve(s.host, .client, s.port, h.encode()) catch {
             s.fail(self.allocator, "resolve-error");
             return;
         };
@@ -1260,11 +1260,11 @@ pub const Engine = struct {
         for (evbuf[0..n]) |ev| {
             if (ev.udata == WAKE_UDATA) continue;
             if (ev.udata == DNS_UDATA) {
-                if (self.resolver) |*r| r.onReadable();
+                if (self.resolver) |*r| r.step(0);
                 continue;
             }
             if (ev.udata == TICK_UDATA) {
-                if (self.resolver) |*r| r.tick();
+                if (self.resolver) |*r| r.step(0);
                 continue;
             }
             // Consumer timer window: dispatch the callback and consume the

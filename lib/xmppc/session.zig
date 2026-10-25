@@ -39,7 +39,7 @@ const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
 const Parser = @import("parser.zig").Parser;
 const Transport = @import("transport.zig").Transport;
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("dns_async");
 const Resolution = resolver_mod.Resolution;
 
 const Jid = xmpp.Jid;
