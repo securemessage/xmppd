@@ -149,9 +149,13 @@ pub const ArchiveWriteQueue = struct {
 
         const n = self.countLocked();
         if (n >= MAX_JOBS) {
-            _ = self.dropped.fetchAdd(1, .monotonic);
+            const total = self.dropped.fetchAdd(1, .monotonic) + 1;
             job.deinit();
-            log.warn("archive write queue full ({d}) — dropping job ({d} dropped total)", .{ n, self.dropped.load(.monotonic) });
+            // Log the first drop and every power of two after it: a full
+            // queue would otherwise log per job on the event loop.
+            if (total == 1 or std.math.isPowerOfTwo(total)) {
+                log.warn("archive write queue full ({d}) - dropping job ({d} dropped total)", .{ n, total });
+            }
             return;
         }
         const warn_mark = MAX_JOBS * 3 / 4;
@@ -264,8 +268,10 @@ pub const ArchiveWriteQueue = struct {
                     };
                 }
                 if (failed > 0) {
-                    _ = self.store_failed.fetchAdd(@intCast(failed), .monotonic);
-                    log.warn("archive store: {d} of {d} jobs failed after retry ({d} failed total): {}", .{ failed, n, self.store_failed.load(.monotonic), last_err });
+                    const total = self.store_failed.fetchAdd(@intCast(failed), .monotonic) + failed;
+                    if (total == failed or std.math.isPowerOfTwo(total)) {
+                        log.warn("archive store: {d} of {d} jobs failed after retry ({d} failed total): {}", .{ failed, n, total, last_err });
+                    }
                 } else {
                     log.warn("archive store batch failed; all {d} jobs landed on retry: {}", .{ n, batch_err });
                 }

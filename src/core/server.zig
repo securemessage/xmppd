@@ -851,7 +851,10 @@ pub const Server = struct {
         if (self.archive) |archive| {
             archive.store(owner, with, stanza_id, timestamp, stanza_xml) catch |err| {
                 self.archive_store_failed += 1;
-                log.warn("inline archive store failed ({d} total): {}", .{ self.archive_store_failed, err });
+                // Log the first failure and every power of two after it.
+                if (self.archive_store_failed == 1 or std.math.isPowerOfTwo(self.archive_store_failed)) {
+                    log.warn("inline archive store failed ({d} total): {}", .{ self.archive_store_failed, err });
+                }
             };
         }
     }
