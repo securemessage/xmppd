@@ -1127,13 +1127,28 @@ pub const Resolver = struct {
     fn advance(self: *Resolver, job: *Job, msg: wire.Message) void {
         switch (job.phase) {
             .srv_tls, .srv_plain => {
-                self.absorbSrv(job, msg, job.phase == .srv_tls);
-                if (job.srv_list.items.len == 0) {
-                    if (job.phase == .srv_tls) {
+                const direct_tls = job.phase == .srv_tls;
+                self.absorbSrv(job, msg, direct_tls);
+                var live: usize = 0;
+                var dots: usize = 0;
+                for (job.srv_list.items) |e| {
+                    if (e.unavailable) dots += 1 else live += 1;
+                }
+                if (live == 0) {
+                    if (direct_tls) {
+                        // RFC 2782 "." on the _xmpps name says "no
+                        // direct TLS", not "no service" (XEP-0368): an
+                        // empty answer means the same here. Either way
+                        // the STARTTLS name still gets its try.
+                        self.clearSrvList(job);
                         job.phase = .srv_plain;
                         self.sendSrv(job, SRV_PLAIN[job.service_idx]) catch return self.dropJob(job, .failed);
                         return;
                     }
+                    // "." on the STARTTLS name too is the domain saying
+                    // "no XMPP service here"; an empty answer is the
+                    // ordinary no-SRV fallback.
+                    if (dots > 0) return self.dropJob(job, .service_unavailable);
                     return self.startFallback(job);
                 }
                 orderSrvRfc2782(job.srv_list.items, self.prng.random());
@@ -1245,6 +1260,14 @@ pub const Resolver = struct {
         }
     }
 
+    /// Free every parsed SRV entry; used when a prefix falls through
+    /// to the next name so stale "." markers cannot leak in.
+    fn clearSrvList(self: *Resolver, job: *Job) void {
+        for (job.srv_list.items) |s| self.alloc.free(s.host);
+        job.srv_list.clearRetainingCapacity();
+        job.srv_pos = 0;
+    }
+
     /// Begin (or continue) the per-target chain: a target marked "." is
     /// skipped; the first live target gets an A query.
     fn stepTargetAddr(self: *Resolver, job: *Job) !void {
@@ -1256,6 +1279,9 @@ pub const Resolver = struct {
         }
         if (job.srv_pos >= job.srv_list.items.len) {
             if (job.targets.items.len == 0) {
+                // Every entry was consumed without yielding an address;
+                // an all-"." list reports the domain's explicit "no
+                // service" instead of a missing name.
                 var all_dot = job.srv_list.items.len > 0;
                 for (job.srv_list.items) |e| {
                     if (!e.unavailable) all_dot = false;
@@ -1486,6 +1512,9 @@ const FakeDns = struct {
     /// When set, SRV answers carry a single "." target: RFC 2782's
     /// "service unavailable on this domain".
     srv_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, only the _xmpps* SRV answer carries the "." target:
+    /// "no direct TLS", which must still fall through to _xmpp*.
+    srv_tls_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, address queries are received but never answered,
     /// exercising per-query retries and the whole-chain deadline.
     a_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1579,7 +1608,18 @@ const FakeDns = struct {
         if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV and self.srv_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV) {
-            if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
+            if (self.srv_tls_dot.load(.monotonic) and std.mem.startsWith(u8, q.qname, "_xmpps")) {
+                ancount = 1;
+                appendAnswerHdr(alloc, &answers, wire.TYPE_SRV, 60, 7);
+                var v: u16 = 0;
+                v = 10;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                v = 100;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                v = 0;
+                answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
+                answers.append(alloc, 0) catch {}; // "." root target
+            } else if (std.mem.startsWith(u8, q.qname, "_xmpps") or self.empty_srv.load(.monotonic)) {
                 // NODATA for the direct-TLS prefix, or everywhere when
                 // the test wants the fallback path.
             } else if (self.srv_many > 0) {
@@ -2118,6 +2158,30 @@ test "dns-async: an all-'.' SRV answer reports service_unavailable, not nxdomain
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
 
     try std.testing.expectEqual(Status.service_unavailable, ctx.status.?);
+}
+
+test "dns-async: a '.' _xmpps answer falls through to _xmpp (Q3)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_tls_dot.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // "No direct TLS" is not "no service": the STARTTLS SRV answers.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+    try std.testing.expect(!res.targets[0].is_direct_tls);
 }
 
 test "dns-async: the whole-chain deadline bounds a silent target list" {
