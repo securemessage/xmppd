@@ -1153,8 +1153,8 @@ test "S11: 2 MiB of inter-stanza whitespace does not grow the token buffers" {
     _ = try scanner.next("<presence/>", &pos);
     try std.testing.expectEqual(@as(u32, 1), scanner.depth);
 
-    // Whitespace a peer streams between stanzas without ever sending the next
-    // '<' used to accumulate in buf for the life of the connection.
+    // Inter-stanza whitespace without a following '<' must not accumulate in
+    // the scanner buffer for the life of the connection.
     const ws = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(ws);
     @memset(ws, ' ');

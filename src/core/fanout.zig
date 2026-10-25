@@ -183,11 +183,8 @@ pub fn buildComplete(
 /// misrouting future events onto this session slot (T153). Such stanzas are
 /// tracked for replay on resume instead of being delivered live.
 ///
-/// This also keeps `sm_out_seq` accurate. XEP-0198 counts *every* outbound
-/// stanza; fan-out paths that bypassed `smTrackOutbound` used to leave the
-/// server's counter behind the client's, which makes `SmUnackedQueue.ack()`
-/// take its "client acked more than we have buffered" branch and discard the
-/// whole replay queue.
+/// Every live or detached delivery updates XEP-0198 tracking so the server and
+/// client acknowledgment windows stay aligned with the replay queue.
 ///
 /// `session` is a `*Session` and `changes` a `*ChangeList`; both are taken as
 /// `anytype` because `Session` lives in server.zig, which imports this module.
@@ -215,12 +212,10 @@ pub fn deliverToSession(
 }
 
 /// Pre-built variant of `deliverToSession`: assembles `prefix + recipient_jid +
-/// suffix` into `buf`, then delivers it. Replaces the `queueSend()` +
-/// `hasPendingWrite()`/`addWrite()` pair at fan-out sites.
+/// suffix` into `buf`, then delivers the assembled stanza.
 ///
 /// `buf` is caller-supplied so a fan-out loop can lease one scratch bank and
-/// reuse it for every recipient instead of taking a 20 KiB stack frame per
-/// delivery (S18).
+/// reuse it for every recipient without a per-delivery stack buffer (S18).
 pub fn deliverPrebuiltToSession(
     session: anytype,
     buf: []u8,

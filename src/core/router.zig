@@ -773,10 +773,9 @@ fn sendCarbons(
     const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
-    // One serialization buffer reused across resources: each carbon is fully
-    // consumed (copied by queueSend / the MPSC deliver) before the next
-    // iteration builds into it. Leased from the pool rather than the stack so
-    // the per-resource 20 KiB frame is gone (S18).
+    // Reuse one serialization buffer across resources: each carbon is fully
+    // consumed by queueSend or the MPSC delivery before the next iteration.
+    // The pool lease keeps per-recipient serialization storage off the stack.
     var carbon_lease = server.leaseByteScratch() orelse return;
     defer carbon_lease.release();
     const cbuf = carbon_lease.buf;

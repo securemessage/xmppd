@@ -259,12 +259,9 @@ pub const Connection = struct {
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {
-        // A closed connection has no writable fd, so any bytes still in the
-        // buffer are undeliverable, not pending. Callers arm EVFILT_WRITE on
-        // this, and an SM-detached session keeps its buffer while its fd is
-        // gone; reporting it as pending made a stale same-batch writable event
-        // reach flushSend(-1), whose error closed a session that was still
-        // resumable (S28).
+        // A closed connection has no writable fd, so buffered bytes are
+        // undeliverable, not pending. A detached SM session retains those bytes
+        // for resume but must not arm EVFILT_WRITE until it has a new fd (S28).
         if (self.closed) return false;
         return self.write_start < self.write_end;
     }

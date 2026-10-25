@@ -1187,8 +1187,8 @@ test "reader: S11 2 MiB of inter-stanza whitespace pins no buffer" {
     _ = try reader.next(stream_open, &pos);
     try drainAll(&reader, "<presence/>");
 
-    // The peer never sends the next '<', so no stanza boundary ever arrives to
-    // reset anything. This used to pin 2.87 MB on the connection.
+    // Without a following '<', no stanza boundary arrives. Buffered
+    // inter-stanza whitespace must remain bounded for the connection lifetime.
     const ws = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(ws);
     @memset(ws, ' ');

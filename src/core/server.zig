@@ -1258,11 +1258,10 @@ pub const Server = struct {
     /// serializer running inside another one's live buffer takes a different
     /// bank and cannot overwrite the outer stanza.
     ///
-    /// When every bank is already out, the buffer is allocated instead, so a
-    /// deeper-than-expected call chain costs an allocation rather than dropping
-    /// the stanza. Returns null only if that allocation failed; callers then
-    /// drop the stanza, which is the same fail-closed behavior a fixed stack
-    /// buffer had when the stanza did not fit.
+    /// When every bank is already out, allocate an independent buffer instead
+    /// of overwriting a live lease or dropping the stanza. Return null only on
+    /// allocation failure; callers then discard the stanza without emitting
+    /// partial output.
     pub fn leaseByteScratch(self: *Server) ?ByteLease {
         self.growByteScratch();
         for (0..BYTE_BANK_COUNT) |bank| {
@@ -3534,9 +3533,8 @@ pub const Server = struct {
         _ = session.conn.flushSend() catch |err| {
             switch (err) {
                 error.WouldBlock => return,
-                // The fd is already gone, so there is nothing to flush and
-                // nothing to close: tearing the session down here destroyed a
-                // resumable one (S28).
+                // The fd is already gone, so there is nothing to flush or
+                // close. Preserve the detached session for a possible resume.
                 error.ConnectionClosed => return,
                 else => {
                     session_lifecycle.closeSession(self, id, changes);
@@ -5760,8 +5758,8 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
     server.handleWritable(1, &changes);
 
     // handleWritable must stop at the failed upgrade. Continuing into the
-    // offline-pending drain and the read-backpressure re-arm below it reads
-    // the freed session (segfault observed).
+    // offline-pending drain and read-backpressure re-arm would access freed
+    // session state.
     try std.testing.expect(server.sessions[1] == null);
     try std.testing.expect(!server.fail_next_tls_upgrade);
 }
@@ -8628,7 +8626,7 @@ test "S10: IPC write interest lives only in server.zig" {
     // place, reconcileIpcWriteInterest. A send site that arms it itself leaves
     // a persistent EVFILT_WRITE with the *_write_armed flag still false, so no
     // later reconcile removes it and the filter fires writable every kevent.
-    // The five such arms found in review 31 were deleted; this keeps them out.
+    // Send sites must not bypass the reconciler's armed-state tracking.
     // The patterns are split so this test does not match itself.
     const auth_needle = "IPC_AUTH_" ++ "UDATA";
     const s2s_needle = "IPC_S2S_" ++ "UDATA";
