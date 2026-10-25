@@ -4627,3 +4627,30 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     // No session at slot 3, so nothing should crash or write
     try std.testing.expect(server.sessions[3] == null);
 }
+
+test "Server: inline archiveStore failure increments archive_store_failed (S31)" {
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("archive");
+    const path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(path);
+
+    var be = try ArchiveBackendType.open(path, .{});
+    defer be.close();
+
+    // An allocator that always fails makes ArchiveStore.store() return
+    // OutOfMemory while building the key: the inline path must count it.
+    var empty_buf: [0]u8 = .{};
+    var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
+    var store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&be, fba.allocator());
+    server.archive = &store;
+
+    server.archiveStore("a@localhost", "b@localhost", "s1", 1, "<m/>");
+    server.archiveStore("a@localhost", "b@localhost", "s2", 2, "<m/>");
+    try std.testing.expectEqual(@as(u64, 2), server.archive_store_failed);
+}
