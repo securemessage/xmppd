@@ -156,6 +156,8 @@ pub const Stream = struct {
     stream_id: [16]u8 = undefined,
     /// Hex-encoded stream ID (persisted for pointer stability)
     stream_id_hex: [32]u8 = undefined,
+    /// Whether the server opening tag was queued for this stream.
+    response_opened: bool = false,
 
     pub fn init(server_host: []const u8, direct_tls: bool) Stream {
         var s = Stream{
@@ -174,6 +176,7 @@ pub const Stream = struct {
     fn regenerateStreamId(self: *Stream) void {
         std.crypto.random.bytes(&self.stream_id);
         self.stream_id_hex = std.fmt.bytesToHex(self.stream_id, .lower);
+        self.response_opened = false;
     }
 
     /// Process a stream open from the client.
@@ -424,8 +427,9 @@ pub fn writeFeatures(writer: anytype, features: FeatureSet) !void {
     try writer.writeAll("</stream:features>");
 }
 
-/// Generate a stream error XML.
-pub fn writeStreamError(writer: anytype, err: StreamError) !void {
+/// Generate a stream error XML, opening the stream first when needed.
+pub fn writeStreamError(writer: anytype, err: StreamError, open_params: ?StreamOpenParams) !void {
+    if (open_params) |params| try writeStreamOpen(writer, params);
     try writer.writeAll("<stream:error><");
     try writer.writeAll(err.toString());
     try writer.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>");
@@ -622,11 +626,28 @@ test "writeStreamError" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
-    try writeStreamError(fbs.writer(), .host_unknown);
+    try writeStreamError(fbs.writer(), .host_unknown, null);
     const result = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, result, "<stream:error>") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "<host-unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<stream:stream") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "</stream:stream>") != null);
+}
+
+test "writeStreamError opens an unopened stream" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try writeStreamError(fbs.writer(), .host_unknown, .{
+        .from = "example.com",
+        .to = "example.com",
+        .id = "stream-id",
+    });
+    const result = fbs.getWritten();
+    try std.testing.expect(std.mem.startsWith(u8, result, "<?xml version='1.0'?><stream:stream"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result, "<stream:stream"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "<stream:error><host-unknown") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "</stream:stream>"));
 }
 
 test "StreamError.toString" {

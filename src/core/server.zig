@@ -3448,6 +3448,7 @@ pub const Server = struct {
             .send_stream_open => |params| {
                 xmpp.stream.writeStreamOpen(writer, params) catch return;
                 session.conn.queueSend(fbs.getWritten()) catch return;
+                session.stream.response_opened = true;
 
                 // Immediately send features after stream open
                 if (session.stream.getFeatures()) |features| {
@@ -3513,8 +3514,7 @@ pub const Server = struct {
                 session.queueSendStanza(fbs.getWritten()) catch return;
             },
             .send_error => |err| {
-                xmpp.stream.writeStreamError(writer, err) catch return;
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                self.sendStreamError(session, err);
             },
             .session_established => {
                 // Nothing to send — session is now active
@@ -3630,10 +3630,15 @@ pub const Server = struct {
     // ========================================================================
 
     pub fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.StreamError) void {
-        _ = self;
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
-        xmpp.stream.writeStreamError(fbs.writer(), err) catch return;
+        const open_params: ?xmpp.stream.StreamOpenParams = if (session.stream.response_opened) null else .{
+            .from = self.server_host,
+            .to = self.server_host,
+            .id = &session.stream.stream_id_hex,
+        };
+        xmpp.stream.writeStreamError(fbs.writer(), err, open_params) catch return;
         session.conn.queueSend(fbs.getWritten()) catch return;
+        session.stream.response_opened = true;
     }
 
     fn sendRaw(_: *Server, session: *Session, data: []const u8) void {
@@ -5836,6 +5841,7 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
         total += n;
     } else |_| {}
     try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "not-well-formed") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, buf[0..total], "<stream:stream"));
 }
 
 /// Feed a bad stream root, then keep feeding stanzas. The connection must die
@@ -5864,7 +5870,10 @@ fn expectBadRootBounded(root: []const u8) !void {
         if (n == 0) break;
         err_total += n;
     } else |_| {}
-    try std.testing.expect(std.mem.indexOf(u8, err_buf[0..err_total], "not-well-formed") != null);
+    const err_xml = err_buf[0..err_total];
+    try std.testing.expect(std.mem.indexOf(u8, err_xml, "not-well-formed") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, err_xml, "<stream:stream"));
+    try std.testing.expect(std.mem.startsWith(u8, err_xml, "<?xml version='1.0'?><stream:stream"));
 
     var cap_max: usize = 0;
     var chunk_buf: [4096]u8 = undefined;
@@ -6182,7 +6191,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 27 }, // stream/SASL/SM nonzas + queueSendStanza itself.
+        .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
         .{ "message.zig", @embedFile("message.zig"), 0 },
