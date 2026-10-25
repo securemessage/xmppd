@@ -70,6 +70,9 @@ pub const Entry = struct {
 ///   // Atomic batch writes
 ///   fn writeBatch(self: *B) !B.WriteBatch
 ///
+///   // Shared lock for compound domain-store operations
+///   compound_mutex: std.Thread.Mutex
+///
 /// Required on B.Iterator:
 ///   fn next(self: *Iterator) ?Entry
 ///   fn deinit(self: *Iterator) void
@@ -92,6 +95,8 @@ pub fn assertBackend(comptime B: type) void {
             @compileError("StorageBackend missing: put(*B, []const u8, []const u8, []const u8) !void");
         if (!@hasDecl(B, "delete"))
             @compileError("StorageBackend missing: delete(*B, []const u8, []const u8) !void");
+        if (!@hasField(B, "compound_mutex"))
+            @compileError("StorageBackend missing: compound_mutex: std.Thread.Mutex");
 
         if (!@hasDecl(B, "Iterator"))
             @compileError("StorageBackend missing: const Iterator type");
@@ -129,6 +134,7 @@ pub const MemoryBackend = struct {
     namespaces: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
     arena: std.heap.ArenaAllocator,
     backing: std.mem.Allocator,
+    compound_mutex: std.Thread.Mutex = .{},
 
     pub fn open(path: []const u8, opts: OpenOptions) !Self {
         _ = path;

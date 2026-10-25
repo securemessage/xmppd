@@ -29,6 +29,7 @@ pub const RocksDbBackend = struct {
     cf_count: u32,
     path_buf: [4096]u8,
     path_len: usize,
+    compound_mutex: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(RocksDbBackend);

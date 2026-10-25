@@ -499,7 +499,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         // (S13) points at an archive row that the async writer queue may not
         // have committed yet, and reading the archive alone would see a
         // dangling pointer and destroy a stanza that is still on its way.
-        var stanza_xml = store.getHeldStanza(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+        var stanza_xml = store.getHeldStanza(ptr) catch |err| {
             log.warn("offline delivery to {s} stalled: getHeldStanza failed: {s}", .{ bare_jid, @errorName(err) });
             stallOnStoreError(session, bare_jid, err, changes);
             return;
@@ -533,14 +533,14 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 break;
             };
             // Only delete what was actually handed to the connection.
-            store.deletePointer(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+            store.deletePointer(ptr) catch |err| {
                 log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
             };
             delivered += 1;
         } else {
             // Neither copy exists: the archive entry is genuinely gone. A
             // dangling pointer would stall every future drain, so drop it.
-            store.deletePointer(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+            store.deletePointer(ptr) catch |err| {
                 log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
             };
         }
@@ -1139,6 +1139,9 @@ test "S13: held stanza is delivered before the archive row is committed" {
     const held = "<message from='alice@localhost' to='bob@localhost' id='h1'><body>held</body></message>";
     const ok = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "h1", 2000, held);
     try std.testing.expect(ok);
+    const pointers = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 1), pointers.len);
 
     deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
 
@@ -1151,9 +1154,83 @@ test "S13: held stanza is delivered before the archive row is committed" {
     try std.testing.expect(!session.offline_pending);
     // The held payload goes with the pointer, or the row leaks forever.
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
-    const still_held = try offline_store.getHeldStanza("bob@localhost", 2000, "h1");
+    const still_held = try offline_store.getHeldStanza(pointers[0]);
     try std.testing.expect(still_held == null);
     if (still_held) |h| allocator.free(h);
+}
+
+test "G2: a legacy offline row drains before newly sequenced rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try archive_backend.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    const recipient = "bob@localhost";
+    const legacy_id = "legacy";
+    const legacy_xml = "<message id='legacy'><body>legacy-first</body></message>";
+    const legacy_key = try allocator.alloc(u8, recipient.len + 1 + 8 + 1 + legacy_id.len);
+    defer allocator.free(legacy_key);
+    @memcpy(legacy_key[0..recipient.len], recipient);
+    legacy_key[recipient.len] = 0;
+    std.mem.writeInt(u64, legacy_key[recipient.len + 1 ..][0..8], 3000, .big);
+    legacy_key[recipient.len + 1 + 8] = 0;
+    @memcpy(legacy_key[recipient.len + 1 + 8 + 1 ..], legacy_id);
+    try op_db.put("offline", legacy_key, "alice@localhost");
+    try op_db.put("offline_hold", legacy_key, legacy_xml);
+
+    const new_xml = "<message id='new'><body>new-second</body></message>";
+    try std.testing.expect(try offline_store.storeHeldPointer(recipient, "alice@localhost", "new", 1000, new_xml));
+    const ordered = try offline_store.getPointers(recipient);
+    defer offline_store.freePointers(ordered);
+    try std.testing.expectEqual(@as(usize, 2), ordered.len);
+    try std.testing.expectEqualStrings("legacy", ordered[0].stanza_id);
+    try std.testing.expectEqualStrings("new", ordered[1].stanza_id);
+    try std.testing.expectEqual(@as(u64, 3000), ordered[0].timestamp);
+    try std.testing.expectEqual(@as(u64, 1000), ordered[1].timestamp);
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const got = buf[0..n];
+    const legacy_pos = std.mem.indexOf(u8, got, "legacy-first") orelse return error.MissingLegacyStanza;
+    const new_pos = std.mem.indexOf(u8, got, "new-second") orelse return error.MissingNewStanza;
+    try std.testing.expect(legacy_pos < new_pos);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
 }
 
 // S13: a drain that stalls on a store error with an empty write buffer has no

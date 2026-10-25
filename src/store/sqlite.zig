@@ -24,6 +24,7 @@ pub const SqliteBackend = struct {
     db: *c.sqlite3,
     table_cache: [MAX_TABLES]TableCacheEntry,
     table_count: u32,
+    compound_mutex: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(SqliteBackend);

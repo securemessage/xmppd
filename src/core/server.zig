@@ -6240,7 +6240,7 @@ test "Server: S13 message held behind a draining offline tail" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     const ptrs = try offline_store.getPointers("bob@localhost");
     defer offline_store.freePointers(ptrs);
-    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
     try std.testing.expect(held != null);
     if (held) |h| {
         defer allocator.free(h);
@@ -6307,7 +6307,7 @@ test "Server: S13 offline store delivers without a committed archive row" {
     // The pointer resolves from its own held payload, with no archive row.
     const ptrs = try offline_store.getPointers("bob@localhost");
     defer offline_store.freePointers(ptrs);
-    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
     try std.testing.expect(held != null);
     if (held) |h| {
         try std.testing.expect(std.mem.indexOf(u8, h, "<body>for later</body>") != null);
@@ -6475,7 +6475,7 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     defer offline_store.freePointers(ptrs);
     try std.testing.expectEqual(@as(usize, 1), ptrs.len);
 
-    const held = try offline_store.getHeldStanza(ptrs[0].recipient, ptrs[0].timestamp, ptrs[0].stanza_id);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
     try std.testing.expect(held != null);
     defer if (held) |h| allocator.free(h);
     try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>federated</body>") != null);
@@ -6811,10 +6811,8 @@ test "Server: E2c stanza ids sort in generation order across counter boundaries"
     }
 }
 
-// E2c: the consequence of that ordering. Rows stored under one timestamp are
-// keyed owner\x00timestamp_be\x00stanza_id, so the offline queue a drain walks
-// is sorted by stanza ID. IDs minted across a counter boundary must come back
-// in the order they went in, or the recipient is handed a reordered queue.
+// E2c: generated stanza ids are not offline queue keys. Rows inserted at one
+// timestamp must retain insertion order across the id counter's lexical boundary.
 test "Server: E2c an offline queue drains in the order it was filled" {
     const allocator = std.testing.allocator;
 
@@ -6850,6 +6848,99 @@ test "Server: E2c an offline queue drains in the order it was filled" {
     for (stored_ids, ptrs) |want, got| {
         try std.testing.expectEqualStrings(want, got.stanza_id);
     }
+}
+
+test "Server: G2 offline insertion order survives an operational backend reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    {
+        var op_db = try OpBackendMod.Backend.open(op_path, .{});
+        defer op_db.close();
+        var store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+        try std.testing.expect(try store.storeHeldPointer("bob@localhost", "alice@localhost/first", "reused-id", 1000, "<message id='first'/>"));
+    }
+    {
+        var op_db = try OpBackendMod.Backend.open(op_path, .{});
+        defer op_db.close();
+        var store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+        try std.testing.expect(try store.storeHeldPointer("bob@localhost", "alice@localhost/second", "reused-id", 1000, "<message id='second'/>"));
+
+        const pointers = try store.getPointers("bob@localhost");
+        defer store.freePointers(pointers);
+        try std.testing.expectEqual(@as(usize, 2), pointers.len);
+        try std.testing.expectEqualStrings("alice@localhost/first", pointers[0].from_jid);
+        try std.testing.expectEqualStrings("alice@localhost/second", pointers[1].from_jid);
+        try std.testing.expectEqualStrings("reused-id", pointers[0].stanza_id);
+        try std.testing.expectEqualStrings("reused-id", pointers[1].stanza_id);
+    }
+}
+
+test "Server: G2 two workers cannot exceed the shared offline quota" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    try op_db.put("offline", "warmup", "");
+    try op_db.delete("offline", "warmup");
+
+    const Store = GenericOfflineStore(OpBackendType);
+    const Context = struct {
+        store: *Store,
+        ready: *std.Thread.Semaphore,
+        start: *std.Thread.Semaphore,
+        successes: *std.atomic.Value(usize),
+        errors: *std.atomic.Value(usize),
+        worker: usize,
+
+        fn run(ctx: *@This()) void {
+            ctx.ready.post();
+            ctx.start.wait();
+            for (0..150) |i| {
+                var id_buf: [32]u8 = undefined;
+                const id = std.fmt.bufPrint(&id_buf, "worker-{d}-message-{d}", .{ ctx.worker, i }) catch unreachable;
+                var from_buf: [48]u8 = undefined;
+                const from = std.fmt.bufPrint(&from_buf, "alice@localhost/worker-{d}-{d}", .{ ctx.worker, i }) catch unreachable;
+                const timestamp: u64 = 10_000 + ctx.worker * 1000 + i;
+                const stored = ctx.store.storePointer("bob@localhost", from, id, timestamp) catch {
+                    _ = ctx.errors.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (stored) _ = ctx.successes.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var first_store = Store.init(&op_db, allocator);
+    var second_store = Store.init(&op_db, allocator);
+    var ready: std.Thread.Semaphore = .{};
+    var start: std.Thread.Semaphore = .{};
+    var successes = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+    var contexts = [2]Context{
+        .{ .store = &first_store, .ready = &ready, .start = &start, .successes = &successes, .errors = &errors, .worker = 0 },
+        .{ .store = &second_store, .ready = &ready, .start = &start, .successes = &successes, .errors = &errors, .worker = 1 },
+    };
+    const first_thread = try std.Thread.spawn(.{}, Context.run, .{&contexts[0]});
+    const second_thread = try std.Thread.spawn(.{}, Context.run, .{&contexts[1]});
+    ready.wait();
+    ready.wait();
+    start.post();
+    start.post();
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), errors.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 100), successes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 100), try first_store.countMessages("bob@localhost"));
 }
 
 // S13: the writable handler must resume a stalled offline drain once the

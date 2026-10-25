@@ -1,21 +1,22 @@
 //! # Generic OfflineStore (Step 10g)
 //!
 //! Stores offline message delivery pointers in the operational storage backend.
-//! Actual stanza payloads live in the archive (ArchiveStore) — this store only
-//! tracks which messages are pending delivery.
+//! Archive rows and optional held payloads carry the stanza bytes.
 //!
 //! ## Key Schema
 //!
-//! Namespace: `offline`
-//! Key: `recipient_bare_jid\x00timestamp_be(8)\x00stanza_id`
-//! Value: `from_jid` (sender's full JID — needed to reconstruct the <message>)
+//! Current namespace: `offline_v2`
+//! Key: `recipient_bare_jid\x00sequence_be(8)`
+//! Value: `timestamp_be(8) || stanza_id_len_be(4) || stanza_id || from_jid`
+//!
+//! Legacy `offline` timestamp/id rows remain readable and drain before v2 rows.
 //!
 //! ## Lifecycle
 //!
 //! 1. Message arrives for unavailable user
 //! 2. Stanza stored in ArchiveStore (normal MAM write)
-//! 3. Pointer stored here: (recipient, timestamp, stanza_id) → from_jid
-//! 4. User reconnects → scan pointers → fetch from archive → deliver → delete pointers
+//! 3. Pointer stored here: (recipient, sequence) → archive metadata and sender
+//! 4. User reconnects → scan pointers → fetch held payload or archive row → deliver → delete pointers
 
 const std = @import("std");
 const backend = @import("backend");
@@ -23,12 +24,10 @@ const backend = @import("backend");
 const MAX_KEY_LEN = 511;
 
 const NS_OFFLINE = "offline";
-
-/// Held stanza payloads, keyed exactly like an offline pointer. A message
-/// parked behind a draining tail (S13) stores its stanza here so the drain
-/// reads it back without depending on the archive row, which the async
-/// writer queue may not have committed yet.
 const NS_OFFLINE_HOLD = "offline_hold";
+const NS_OFFLINE_V2 = "offline_v2";
+const NS_OFFLINE_HOLD_V2 = "offline_hold_v2";
+const NS_OFFLINE_SEQ = "offline_seq";
 
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;
@@ -43,6 +42,8 @@ pub const OfflinePointer = struct {
     stanza_id: []const u8,
     /// Full JID of the original sender.
     from_jid: []const u8,
+    /// Server-minted insertion order. Zero identifies a legacy timestamp row.
+    sequence: u64 = 0,
 };
 
 /// Generic offline store parameterized on a StorageBackend.
@@ -69,22 +70,11 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             stanza_id: []const u8,
             timestamp: u64,
         ) !bool {
-            // Check per-user limit
-            const count = try self.countMessages(recipient);
-            if (count >= MAX_PER_USER) return false;
-
-            const key = try self.buildKey(recipient, timestamp, stanza_id);
-            defer self.allocator.free(key);
-
-            try self.db.put(NS_OFFLINE, key, from_jid);
-            return true;
+            return self.storeInternal(recipient, from_jid, stanza_id, timestamp, null);
         }
 
         /// Store a delivery pointer together with the stanza payload it
-        /// delivers. Use this when the payload may not be readable from the
-        /// archive yet: a message held behind a draining tail (S13) points at
-        /// a row the async writer queue has only been asked to commit.
-        /// Returns false if the user's queue is full, and then stores nothing.
+        /// delivers. Returns false if the user's queue is full.
         pub fn storeHeldPointer(
             self: *Self,
             recipient: []const u8,
@@ -93,136 +83,248 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             timestamp: u64,
             stanza_xml: []const u8,
         ) !bool {
-            const count = try self.countMessages(recipient);
-            if (count >= MAX_PER_USER) return false;
-
-            const key = try self.buildKey(recipient, timestamp, stanza_id);
-            defer self.allocator.free(key);
-
-            // Payload first, pointer second: nothing reads a payload except
-            // through its pointer. If the pointer write fails the payload is
-            // removed again, so a failed store cannot leak an unreachable row.
-            try self.db.put(NS_OFFLINE_HOLD, key, stanza_xml);
-            self.db.put(NS_OFFLINE, key, from_jid) catch |err| {
-                self.db.delete(NS_OFFLINE_HOLD, key) catch {};
-                return err;
-            };
-            return true;
+            return self.storeInternal(recipient, from_jid, stanza_id, timestamp, stanza_xml);
         }
 
         /// Read back a payload stored by `storeHeldPointer`. Null when this
         /// pointer carries no held copy.
-        pub fn getHeldStanza(
-            self: *Self,
-            recipient: []const u8,
-            timestamp: u64,
-            stanza_id: []const u8,
-        ) !?[]u8 {
-            const key = try self.buildKey(recipient, timestamp, stanza_id);
+        pub fn getHeldStanza(self: *Self, ptr: OfflinePointer) !?[]u8 {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
+            const is_v2 = ptr.sequence != 0;
+            const key = if (is_v2)
+                try self.buildV2Key(ptr.recipient, ptr.sequence)
+            else
+                try self.buildLegacyKey(ptr.recipient, ptr.timestamp, ptr.stanza_id);
             defer self.allocator.free(key);
-            return self.db.get(self.allocator, NS_OFFLINE_HOLD, key);
+            return self.db.get(self.allocator, if (is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, key);
         }
 
         /// Count pending offline messages for a recipient.
         pub fn countMessages(self: *Self, recipient: []const u8) !usize {
-            const prefix = try self.buildRecipientPrefix(recipient);
-            defer self.allocator.free(prefix);
-
-            var iter = try self.db.iterator(NS_OFFLINE, prefix);
-            defer iter.deinit();
-
-            var count: usize = 0;
-            while (iter.next()) |_| {
-                count += 1;
-            }
-            return count;
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
+            return self.countMessagesLocked(recipient);
         }
 
-        /// Get all pending offline pointers for a recipient.
+        /// Get all pending offline pointers for a recipient. Legacy rows sort
+        /// first by timestamp and id; sequenced rows follow in insertion order.
         /// Caller owns the returned slice and each pointer's fields.
         pub fn getPointers(self: *Self, recipient: []const u8) ![]OfflinePointer {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
             const prefix = try self.buildRecipientPrefix(recipient);
             defer self.allocator.free(prefix);
 
-            var iter = try self.db.iterator(NS_OFFLINE, prefix);
-            defer iter.deinit();
-
             var pointers = std.ArrayListUnmanaged(OfflinePointer){};
-            while (iter.next()) |entry| {
-                // Parse key: recipient\x00timestamp_be(8)\x00stanza_id
-                const ts = self.extractTimestamp(entry.key, recipient.len + 1) orelse continue;
-                const id_offset = recipient.len + 1 + 8 + 1;
-                if (entry.key.len <= id_offset) continue;
-                const stanza_id = entry.key[id_offset..];
-
-                try pointers.append(self.allocator, .{
-                    .recipient = try self.allocator.dupe(u8, recipient),
-                    .timestamp = ts,
-                    .stanza_id = try self.allocator.dupe(u8, stanza_id),
-                    .from_jid = try self.allocator.dupe(u8, entry.value),
-                });
-            }
-
+            errdefer self.deinitPointerList(&pointers);
+            try self.appendLegacyPointers(recipient, prefix, &pointers);
+            const legacy_count = pointers.items.len;
+            try self.appendV2Pointers(recipient, prefix, &pointers);
+            std.sort.heap(OfflinePointer, pointers.items[0..legacy_count], {}, legacyBefore);
+            std.sort.heap(OfflinePointer, pointers.items[legacy_count..], {}, sequenceBefore);
             return try pointers.toOwnedSlice(self.allocator);
         }
 
         /// Delete a specific offline pointer after successful delivery.
         /// Also drops any held payload stored with it.
-        pub fn deletePointer(
-            self: *Self,
-            recipient: []const u8,
-            timestamp: u64,
-            stanza_id: []const u8,
-        ) !void {
-            const key = try self.buildKey(recipient, timestamp, stanza_id);
+        pub fn deletePointer(self: *Self, ptr: OfflinePointer) !void {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
+            const is_v2 = ptr.sequence != 0;
+            const key = if (is_v2)
+                try self.buildV2Key(ptr.recipient, ptr.sequence)
+            else
+                try self.buildLegacyKey(ptr.recipient, ptr.timestamp, ptr.stanza_id);
             defer self.allocator.free(key);
-            try self.db.delete(NS_OFFLINE_HOLD, key);
-            try self.db.delete(NS_OFFLINE, key);
+
+            var batch = try self.db.writeBatch();
+            errdefer batch.abort();
+            try batch.delete(if (is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, key);
+            try batch.delete(if (is_v2) NS_OFFLINE_V2 else NS_OFFLINE, key);
+            try batch.commit();
         }
 
         /// Delete all offline pointers for a recipient (after full delivery).
         pub fn clearAll(self: *Self, recipient: []const u8) !void {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
             const prefix = try self.buildRecipientPrefix(recipient);
             defer self.allocator.free(prefix);
 
-            var iter = try self.db.iterator(NS_OFFLINE, prefix);
-            defer iter.deinit();
-
-            // Collect keys to delete
-            var keys = std.ArrayListUnmanaged([]u8){};
+            var keys = std.ArrayListUnmanaged(StoredKey){};
             defer {
-                for (keys.items) |k| self.allocator.free(k);
+                for (keys.items) |item| self.allocator.free(item.key);
                 keys.deinit(self.allocator);
             }
-
-            while (iter.next()) |entry| {
-                try keys.append(self.allocator, try self.allocator.dupe(u8, entry.key));
-            }
-
+            try self.collectKeys(NS_OFFLINE, prefix, false, &keys);
+            try self.collectKeys(NS_OFFLINE_V2, prefix, true, &keys);
             if (keys.items.len == 0) return;
 
             var batch = try self.db.writeBatch();
-            for (keys.items) |k| {
-                try batch.delete(NS_OFFLINE_HOLD, k);
-                try batch.delete(NS_OFFLINE, k);
+            errdefer batch.abort();
+            for (keys.items) |item| {
+                try batch.delete(if (item.is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, item.key);
+                try batch.delete(if (item.is_v2) NS_OFFLINE_V2 else NS_OFFLINE, item.key);
             }
             try batch.commit();
         }
 
         /// Free a slice of OfflinePointers returned by getPointers.
         pub fn freePointers(self: *Self, pointers: []OfflinePointer) void {
-            for (pointers) |p| {
-                self.allocator.free(@constCast(p.recipient));
-                self.allocator.free(@constCast(p.stanza_id));
-                self.allocator.free(@constCast(p.from_jid));
-            }
+            for (pointers) |ptr| self.freePointer(ptr);
             self.allocator.free(pointers);
         }
 
         // -- Internal --
 
-        fn buildKey(self: *Self, recipient: []const u8, timestamp: u64, stanza_id: []const u8) ![]u8 {
-            // recipient\x00timestamp_be(8)\x00stanza_id
+        const StoredKey = struct { key: []u8, is_v2: bool };
+
+        fn storeInternal(
+            self: *Self,
+            recipient: []const u8,
+            from_jid: []const u8,
+            stanza_id: []const u8,
+            timestamp: u64,
+            stanza_xml: ?[]const u8,
+        ) !bool {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
+            if (try self.countMessagesLocked(recipient) >= MAX_PER_USER) return false;
+
+            const sequence = try self.nextSequenceLocked(recipient);
+            const key = try self.buildV2Key(recipient, sequence);
+            defer self.allocator.free(key);
+            const value = try self.buildValue(from_jid, stanza_id, timestamp);
+            defer self.allocator.free(value);
+            var sequence_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &sequence_bytes, sequence, .big);
+
+            var batch = try self.db.writeBatch();
+            errdefer batch.abort();
+            try batch.put(NS_OFFLINE_SEQ, recipient, &sequence_bytes);
+            try batch.put(NS_OFFLINE_V2, key, value);
+            if (stanza_xml) |xml| try batch.put(NS_OFFLINE_HOLD_V2, key, xml);
+            try batch.commit();
+            return true;
+        }
+
+        fn nextSequenceLocked(self: *Self, recipient: []const u8) !u64 {
+            const raw = try self.db.get(self.allocator, NS_OFFLINE_SEQ, recipient);
+            defer if (raw) |value| self.allocator.free(value);
+            const previous = if (raw) |value| blk: {
+                if (value.len != 8) return error.InvalidOfflineSequence;
+                break :blk std.mem.readInt(u64, value[0..8], .big);
+            } else 0;
+            if (previous == std.math.maxInt(u64)) return error.OfflineSequenceExhausted;
+            return previous + 1;
+        }
+
+        fn countMessagesLocked(self: *Self, recipient: []const u8) !usize {
+            const prefix = try self.buildRecipientPrefix(recipient);
+            defer self.allocator.free(prefix);
+            const legacy = try self.countNamespace(NS_OFFLINE, prefix);
+            return legacy + try self.countNamespace(NS_OFFLINE_V2, prefix);
+        }
+
+        fn countNamespace(self: *Self, ns: []const u8, prefix: []const u8) !usize {
+            var iter = try self.db.iterator(ns, prefix);
+            defer iter.deinit();
+            var count: usize = 0;
+            while (iter.next()) |_| count += 1;
+            return count;
+        }
+
+        fn collectKeys(self: *Self, ns: []const u8, prefix: []const u8, is_v2: bool, keys: *std.ArrayListUnmanaged(StoredKey)) !void {
+            var iter = try self.db.iterator(ns, prefix);
+            defer iter.deinit();
+            while (iter.next()) |entry| {
+                const key = try self.allocator.dupe(u8, entry.key);
+                errdefer self.allocator.free(key);
+                try keys.append(self.allocator, .{ .key = key, .is_v2 = is_v2 });
+            }
+        }
+
+        fn appendLegacyPointers(self: *Self, recipient: []const u8, prefix: []const u8, pointers: *std.ArrayListUnmanaged(OfflinePointer)) !void {
+            var iter = try self.db.iterator(NS_OFFLINE, prefix);
+            defer iter.deinit();
+            while (iter.next()) |entry| {
+                const ptr = (try self.parseLegacyPointer(recipient, entry)) orelse continue;
+                errdefer self.freePointer(ptr);
+                try pointers.append(self.allocator, ptr);
+            }
+        }
+
+        fn appendV2Pointers(self: *Self, recipient: []const u8, prefix: []const u8, pointers: *std.ArrayListUnmanaged(OfflinePointer)) !void {
+            var iter = try self.db.iterator(NS_OFFLINE_V2, prefix);
+            defer iter.deinit();
+            while (iter.next()) |entry| {
+                const ptr = (try self.parseV2Pointer(recipient, entry)) orelse continue;
+                errdefer self.freePointer(ptr);
+                try pointers.append(self.allocator, ptr);
+            }
+        }
+
+        fn parseLegacyPointer(self: *Self, recipient: []const u8, entry: backend.Entry) !?OfflinePointer {
+            const id_offset = recipient.len + 1 + 8 + 1;
+            if (entry.key.len < id_offset) return null;
+            const owned_recipient = try self.allocator.dupe(u8, recipient);
+            errdefer self.allocator.free(owned_recipient);
+            const stanza_id = try self.allocator.dupe(u8, entry.key[id_offset..]);
+            errdefer self.allocator.free(stanza_id);
+            const from_jid = try self.allocator.dupe(u8, entry.value);
+            return .{
+                .recipient = owned_recipient,
+                .timestamp = std.mem.readInt(u64, entry.key[recipient.len + 1 ..][0..8], .big),
+                .stanza_id = stanza_id,
+                .from_jid = from_jid,
+                .sequence = 0,
+            };
+        }
+
+        fn parseV2Pointer(self: *Self, recipient: []const u8, entry: backend.Entry) !?OfflinePointer {
+            if (entry.key.len != recipient.len + 1 + 8 or entry.value.len < 12) return null;
+            const id_len = std.mem.readInt(u32, entry.value[8..12], .big);
+            if (entry.value.len - 12 < id_len) return null;
+            const id_end = 12 + @as(usize, id_len);
+            const sequence = std.mem.readInt(u64, entry.key[recipient.len + 1 ..][0..8], .big);
+            if (sequence == 0) return null;
+
+            const owned_recipient = try self.allocator.dupe(u8, recipient);
+            errdefer self.allocator.free(owned_recipient);
+            const stanza_id = try self.allocator.dupe(u8, entry.value[12..id_end]);
+            errdefer self.allocator.free(stanza_id);
+            const from_jid = try self.allocator.dupe(u8, entry.value[id_end..]);
+            return .{
+                .recipient = owned_recipient,
+                .timestamp = std.mem.readInt(u64, entry.value[0..8], .big),
+                .stanza_id = stanza_id,
+                .from_jid = from_jid,
+                .sequence = sequence,
+            };
+        }
+
+        fn legacyBefore(_: void, a: OfflinePointer, b: OfflinePointer) bool {
+            if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+            return std.mem.lessThan(u8, a.stanza_id, b.stanza_id);
+        }
+
+        fn sequenceBefore(_: void, a: OfflinePointer, b: OfflinePointer) bool {
+            return a.sequence < b.sequence;
+        }
+
+        fn freePointer(self: *Self, ptr: OfflinePointer) void {
+            self.allocator.free(@constCast(ptr.recipient));
+            self.allocator.free(@constCast(ptr.stanza_id));
+            self.allocator.free(@constCast(ptr.from_jid));
+        }
+
+        fn deinitPointerList(self: *Self, pointers: *std.ArrayListUnmanaged(OfflinePointer)) void {
+            for (pointers.items) |ptr| self.freePointer(ptr);
+            pointers.deinit(self.allocator);
+        }
+
+        fn buildLegacyKey(self: *Self, recipient: []const u8, timestamp: u64, stanza_id: []const u8) ![]u8 {
             const len = recipient.len + 1 + 8 + 1 + stanza_id.len;
             if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
@@ -239,17 +341,34 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             return key;
         }
 
+        fn buildV2Key(self: *Self, recipient: []const u8, sequence: u64) ![]u8 {
+            const len = recipient.len + 1 + 8;
+            if (len > MAX_KEY_LEN) return error.KeyTooLong;
+            const key = try self.allocator.alloc(u8, len);
+            @memcpy(key[0..recipient.len], recipient);
+            key[recipient.len] = 0;
+            std.mem.writeInt(u64, key[recipient.len + 1 ..][0..8], sequence, .big);
+            return key;
+        }
+
+        fn buildValue(self: *Self, from_jid: []const u8, stanza_id: []const u8, timestamp: u64) ![]u8 {
+            if (stanza_id.len > std.math.maxInt(u32)) return error.ValueTooLong;
+            const id_end = std.math.add(usize, 12, stanza_id.len) catch return error.ValueTooLong;
+            const len = std.math.add(usize, id_end, from_jid.len) catch return error.ValueTooLong;
+            const value = try self.allocator.alloc(u8, len);
+            std.mem.writeInt(u64, value[0..8], timestamp, .big);
+            std.mem.writeInt(u32, value[8..12], @intCast(stanza_id.len), .big);
+            @memcpy(value[12..id_end], stanza_id);
+            @memcpy(value[id_end..], from_jid);
+            return value;
+        }
+
         fn buildRecipientPrefix(self: *Self, recipient: []const u8) ![]u8 {
             if (recipient.len + 1 > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, recipient.len + 1);
             @memcpy(key[0..recipient.len], recipient);
             key[recipient.len] = 0;
             return key;
-        }
-
-        fn extractTimestamp(_: *Self, key: []const u8, offset: usize) ?u64 {
-            if (key.len < offset + 8) return null;
-            return std.mem.readInt(u64, key[offset..][0..8], .big);
         }
     };
 }
@@ -310,7 +429,10 @@ test "GenericOfflineStore: deletePointer" {
     _ = try store.storePointer("bob@example.com", "alice@example.com/d", "msg-001", 1000);
     _ = try store.storePointer("bob@example.com", "alice@example.com/d", "msg-002", 2000);
 
-    try store.deletePointer("bob@example.com", 1000, "msg-001");
+    const pointers = try store.getPointers("bob@example.com");
+    defer store.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 2), pointers.len);
+    try store.deletePointer(pointers[0]);
 
     const count = try store.countMessages("bob@example.com");
     try std.testing.expectEqual(@as(usize, 1), count);
@@ -373,31 +495,33 @@ test "GenericOfflineStore: held payload round-trips and is deleted with its poin
     const stanza = "<message from='alice@example.com' to='bob@example.com'><body>held</body></message>";
     try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "h1", 1000, stanza));
 
-    // The pointer and its payload are both readable.
     try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@example.com"));
-    const got = try store.getHeldStanza("bob@example.com", 1000, "h1");
+    const first = try store.getPointers("bob@example.com");
+    defer store.freePointers(first);
+    const got = try store.getHeldStanza(first[0]);
     try std.testing.expect(got != null);
     if (got) |g| {
         try std.testing.expectEqualStrings(stanza, g);
         allocator.free(g);
     }
 
-    // Deleting the pointer deletes the payload with it.
-    try store.deletePointer("bob@example.com", 1000, "h1");
+    try store.deletePointer(first[0]);
     try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@example.com"));
-    try std.testing.expect(try store.getHeldStanza("bob@example.com", 1000, "h1") == null);
+    try std.testing.expect(try store.getHeldStanza(first[0]) == null);
 
-    // clearAll drops held payloads too, or they leak unreachable rows.
     try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "h2", 2000, stanza));
     try std.testing.expect(try store.storeHeldPointer("bob@example.com", "carol@example.com/d", "h3", 3000, stanza));
+    const rest = try store.getPointers("bob@example.com");
+    defer store.freePointers(rest);
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
     try store.clearAll("bob@example.com");
     try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@example.com"));
-    try std.testing.expect(try store.getHeldStanza("bob@example.com", 2000, "h2") == null);
-    try std.testing.expect(try store.getHeldStanza("bob@example.com", 3000, "h3") == null);
+    try std.testing.expect(try store.getHeldStanza(rest[0]) == null);
+    try std.testing.expect(try store.getHeldStanza(rest[1]) == null);
 }
 
-// S13: a pointer written by the older storePointer path carries no payload, so
-// getHeldStanza must report null and let the caller fall back to the archive.
+// S13: a pointer-only entry carries no payload, so getHeldStanza reports null
+// and the caller falls back to the archive.
 test "GenericOfflineStore: pointer-only entry has no held payload" {
     const allocator = std.testing.allocator;
     var db = try MemoryBackend.open("", .{});
@@ -406,7 +530,10 @@ test "GenericOfflineStore: pointer-only entry has no held payload" {
     var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
 
     try std.testing.expect(try store.storePointer("bob@example.com", "alice@example.com/d", "p1", 1000));
-    try std.testing.expect(try store.getHeldStanza("bob@example.com", 1000, "p1") == null);
+    const pointers = try store.getPointers("bob@example.com");
+    defer store.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 1), pointers.len);
+    try std.testing.expect(try store.getHeldStanza(pointers[0]) == null);
 }
 
 // S13: the held pointer honors the same per-user quota as a plain pointer, and
@@ -429,7 +556,9 @@ test "GenericOfflineStore: held pointer honors the per-user quota" {
     // At quota: refused, and no payload is left behind.
     try std.testing.expect(!(try store.storeHeldPointer("bob@example.com", "alice@example.com/d", "over", 9000, "<message/>")));
     try std.testing.expectEqual(@as(usize, 100), try store.countMessages("bob@example.com"));
-    try std.testing.expect(try store.getHeldStanza("bob@example.com", 9000, "over") == null);
+    var held_iter = try db.iterator(NS_OFFLINE_HOLD_V2, "bob@example.com\x00");
+    defer held_iter.deinit();
+    try std.testing.expect(held_iter.next() == null);
 }
 
 test "OfflineStore: S4 over-long recipient is rejected with KeyTooLong on the held path" {
@@ -440,4 +569,52 @@ test "OfflineStore: S4 over-long recipient is rejected with KeyTooLong on the he
     var long_recipient: [600]u8 = undefined;
     @memset(&long_recipient, 'a');
     try std.testing.expectError(error.KeyTooLong, store.storeHeldPointer(&long_recipient, "bob@localhost", "s1", 1, "<message/>"));
+}
+
+test "GenericOfflineStore: G2 empty stanza ids remain distinct and ordered" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/one", "", 1000, "<message id='one'/>"));
+    try std.testing.expect(try store.storeHeldPointer("bob@example.com", "alice@example.com/two", "", 1000, "<message id='two'/>"));
+
+    const pointers = try store.getPointers("bob@example.com");
+    defer store.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 2), pointers.len);
+    try std.testing.expectEqualStrings("alice@example.com/one", pointers[0].from_jid);
+    try std.testing.expectEqualStrings("alice@example.com/two", pointers[1].from_jid);
+    try std.testing.expectEqual(@as(u64, 1000), pointers[0].timestamp);
+    try std.testing.expectEqualStrings("", pointers[0].stanza_id);
+    try std.testing.expectEqualStrings("", pointers[1].stanza_id);
+}
+
+test "GenericOfflineStore: G2 stores sharing a backend preserve insertion order" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var first = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+    var second = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    for (0..8) |i| {
+        var from_a_buf: [32]u8 = undefined;
+        const from_a = try std.fmt.bufPrint(&from_a_buf, "alice@example.com/a-{d}", .{i});
+        var from_b_buf: [32]u8 = undefined;
+        const from_b = try std.fmt.bufPrint(&from_b_buf, "alice@example.com/b-{d}", .{i});
+        try std.testing.expect(try first.storePointer("bob@example.com", from_a, "reused-id", 2000));
+        try std.testing.expect(try second.storePointer("bob@example.com", from_b, "reused-id", 2000));
+    }
+
+    const pointers = try first.getPointers("bob@example.com");
+    defer first.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 16), pointers.len);
+    for (0..8) |i| {
+        var expected_a_buf: [32]u8 = undefined;
+        const expected_a = try std.fmt.bufPrint(&expected_a_buf, "alice@example.com/a-{d}", .{i});
+        var expected_b_buf: [32]u8 = undefined;
+        const expected_b = try std.fmt.bufPrint(&expected_b_buf, "alice@example.com/b-{d}", .{i});
+        try std.testing.expectEqualStrings(expected_a, pointers[i * 2].from_jid);
+        try std.testing.expectEqualStrings(expected_b, pointers[i * 2 + 1].from_jid);
+    }
 }

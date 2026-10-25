@@ -26,6 +26,7 @@ pub const LmdbBackend = struct {
     dbi_cache: [MAX_DBS]DbiCacheEntry,
     dbi_count: u32,
     map_size: usize,
+    compound_mutex: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(LmdbBackend);
