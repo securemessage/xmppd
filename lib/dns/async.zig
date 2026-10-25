@@ -30,6 +30,7 @@ const KIND_SRV = wire.TYPE_SRV;
 const KIND_A = wire.TYPE_A;
 const KIND_AAAA = wire.TYPE_AAAA;
 const KIND_TLSA = wire.TYPE_TLSA;
+const KIND_SOA: u16 = 6;
 
 const TIMEOUT_MS: i64 = 2000;
 const MAX_TRIES: u8 = 2;
@@ -42,6 +43,9 @@ const CACHE_CAP: usize = 64;
 /// Flattened connect targets per resolution; a hostile SRV answer
 /// cannot grow a job's target list past this.
 const TARGET_CAP: usize = 16;
+/// Cache TTL ceiling: positive and negative entries alike are
+/// expired after five minutes regardless of the advertised TTL.
+const CACHE_TTL_CEIL_S: u32 = 300;
 
 pub const Service = enum(u8) { client = 0, server = 1 };
 
@@ -160,9 +164,14 @@ const SrvEnt = struct {
     unavailable: bool = false,
 };
 
+/// Negative cache flavor: the name is absent (nxdomain) or the name
+/// exists without records of the asked type (nodata).
+const NegKind = enum { none, nxdomain, nodata };
+
 const CacheEnt = struct {
-    key: []u8, // "qname\0qtype_be2"
-    rrs: []wire.Rr, // names and rdata owned per record
+    key: []u8, // "folded_qname\0qtype_be2"
+    rrs: []wire.Rr, // names and rdata owned per record; empty when neg
+    neg: NegKind = .none,
     expires_ms: i64,
 };
 
@@ -249,9 +258,15 @@ pub const Resolver = struct {
     pub fn query(self: *Resolver, name: []const u8, rtype: RType, session_key: usize) !void {
         const qt: u16 = @intFromEnum(rtype);
         if (self.cacheGet(name, qt)) |ent| {
-            const rrs = try self.dupRrs(ent.rrs);
-            const ttl_ms = @max(0, ent.expires_ms - nowMs());
-            self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = rrs, .ttl = @intCast(ttl_ms / 1000) });
+            switch (ent.neg) {
+                .nxdomain => self.qcb.fun(self.qcb.ctx, session_key, .nxdomain, null),
+                .nodata => self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = &.{}, .ttl = 0 }),
+                .none => {
+                    const rrs = try self.dupRrs(ent.rrs);
+                    const ttl_ms = @max(0, ent.expires_ms - nowMs());
+                    self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = rrs, .ttl = @intCast(ttl_ms / 1000) });
+                },
+            }
             return;
         }
         try self.ensureOpen();
@@ -586,8 +601,19 @@ pub const Resolver = struct {
 
     fn sendQuery(self: *Resolver, job: *Job, qname: []const u8, qtype: u16) !void {
         // The chain consults the RR cache the same way a raw query
-        // does; a hit feeds the phase machine a synthetic message.
+        // does; a hit feeds the phase machine a synthetic message,
+        // and a negative hit drives the matching failure path.
         if (self.cacheGet(qname, qtype)) |ent| {
+            if (job.is_raw) {
+                switch (ent.neg) {
+                    .nxdomain => return self.dropJob(job, .nxdomain),
+                    .nodata => return self.completeRaw(job, .{ .id = 0, .rcode = wire.RCODE_NOERROR, .truncated = false, .rrs = &.{}, .raw = &.{} }),
+                    .none => {},
+                }
+            } else switch (ent.neg) {
+                .nxdomain => return self.onNxdomain(job),
+                .nodata, .none => {},
+            }
             const hit = wire.Message{ .id = 0, .rcode = wire.RCODE_NOERROR, .truncated = false, .rrs = ent.rrs, .raw = &.{} };
             if (job.is_raw) return self.completeRaw(job, hit);
             return self.advance(job, hit);
@@ -749,7 +775,10 @@ pub const Resolver = struct {
 
         switch (msg.rcode) {
             wire.RCODE_NOERROR => {},
-            wire.RCODE_NXDOMAIN => return self.onNxdomain(job),
+            wire.RCODE_NXDOMAIN => {
+                self.cachePutNeg(job.pending_qname, job.pending_qtype, .nxdomain, msg);
+                return self.onNxdomain(job);
+            },
             else => return self.dropJob(job, .failed),
         }
 
@@ -759,6 +788,14 @@ pub const Resolver = struct {
             return self.dropJob(job, .failed);
         var filtered = msg;
         filtered.rrs = valid;
+
+        if (valid.len == 0) {
+            self.cachePutNeg(job.pending_qname, job.pending_qtype, .nodata, msg);
+        } else if (!job.is_raw) {
+            // Chain responses fill the same RR cache raw queries use;
+            // completeRaw covers the raw path on its own.
+            self.cachePut(job.pending_qname, job.pending_qtype, valid);
+        }
 
         if (job.is_raw) return self.completeRaw(job, filtered);
         switch (job.phase) {
@@ -924,13 +961,20 @@ pub const Resolver = struct {
 
     // -- bounded TTL cache -------------------------------------------------
 
+    /// Cache key: the case-folded qname, a NUL, then the big-endian
+    /// qtype. DNS names compare case-insensitively, so lookups keyed
+    /// on the wire form must fold or a cased duplicate misses.
+    fn cacheKey(buf: []u8, qname: []const u8, qtype: u16) ?[]u8 {
+        if (qname.len + 3 > buf.len) return null;
+        for (qname, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        buf[qname.len] = 0;
+        std.mem.writeInt(u16, buf[qname.len + 1 ..][0..2], qtype, .big);
+        return buf[0 .. qname.len + 3];
+    }
+
     fn cacheGet(self: *Resolver, qname: []const u8, qtype: u16) ?*CacheEnt {
         var key_buf: [280]u8 = undefined;
-        if (qname.len + 3 > key_buf.len) return null;
-        @memcpy(key_buf[0..qname.len], qname);
-        key_buf[qname.len] = 0;
-        std.mem.writeInt(u16, key_buf[qname.len + 1 ..][0..2], qtype, .big);
-        const key = key_buf[0 .. qname.len + 3];
+        const key = cacheKey(&key_buf, qname, qtype) orelse return null;
         const now = nowMs();
         for (self.cache.items) |*e| {
             if (std.mem.eql(u8, e.key, key) and e.expires_ms > now) return e;
@@ -938,15 +982,11 @@ pub const Resolver = struct {
         return null;
     }
 
-    /// Store a second deep copy of the answer under (qname, qtype) with a
-    /// TTL-derived expiry. Bound: CACHE_CAP entries, FIFO eviction.
-    fn cachePut(self: *Resolver, qname: []const u8, qtype: u16, rrs: []wire.Rr) void {
-        const ttl = minTtl(rrs);
-        if (ttl == 0) return;
-        const key = self.alloc.alloc(u8, qname.len + 3) catch return;
-        @memcpy(key[0..qname.len], qname);
-        key[qname.len] = 0;
-        std.mem.writeInt(u16, key[qname.len + 1 ..][0..2], qtype, .big);
+    /// Shared insert: folded key, CACHE_CAP bound with FIFO eviction.
+    fn cacheInsert(self: *Resolver, qname: []const u8, qtype: u16, rrs: []wire.Rr, neg: NegKind, ttl_s: u32) void {
+        var key_buf: [280]u8 = undefined;
+        const kb = cacheKey(&key_buf, qname, qtype) orelse return;
+        const key = self.alloc.dupe(u8, kb) catch return;
         const dup = self.dupRrs(rrs) catch {
             self.alloc.free(key);
             return;
@@ -955,15 +995,45 @@ pub const Resolver = struct {
             const e = self.cache.orderedRemove(0);
             self.freeCacheEnt(e);
         }
-        self.cache.append(self.alloc, .{ .key = key, .rrs = dup, .expires_ms = nowMs() + @as(i64, ttl) * 1000 }) catch {
+        self.cache.append(self.alloc, .{ .key = key, .rrs = dup, .neg = neg, .expires_ms = nowMs() + @as(i64, ttl_s) * 1000 }) catch {
             self.alloc.free(key);
             self.freeRrs(dup);
         };
     }
 
+    /// Store a second deep copy of the answer under (qname, qtype) with a
+    /// TTL-derived expiry, capped at CACHE_TTL_CEIL_S; TTL 0 is not
+    /// cached.
+    fn cachePut(self: *Resolver, qname: []const u8, qtype: u16, rrs: []wire.Rr) void {
+        const ttl = @min(minTtl(rrs), CACHE_TTL_CEIL_S);
+        if (ttl == 0) return;
+        self.cacheInsert(qname, qtype, rrs, .none, ttl);
+    }
+
+    /// Negative caching per RFC 2308: NXDOMAIN and NODATA answers live
+    /// as long as the zone's SOA minimum (the last u32 of the SOA
+    /// rdata), capped at the same ceiling. No SOA, no cache.
+    fn cachePutNeg(self: *Resolver, qname: []const u8, qtype: u16, neg: NegKind, msg: wire.Message) void {
+        const ttl = @min(soaMinimum(msg) orelse return, CACHE_TTL_CEIL_S);
+        if (ttl == 0) return;
+        self.cacheInsert(qname, qtype, &.{}, neg, ttl);
+    }
+
+    /// The SOA "minimum" field is the last u32 of the record's rdata;
+    /// the owner names that precede it stay unparsed.
+    fn soaMinimum(msg: wire.Message) ?u32 {
+        for (msg.rrs) |rr| {
+            if (rr.section != .authority) continue;
+            if (rr.rtype != KIND_SOA) continue;
+            if (rr.rdata.len < 20) continue;
+            return std.mem.readInt(u32, rr.rdata[rr.rdata.len - 4 ..][0..4], .big);
+        }
+        return null;
+    }
+
     fn freeCacheEnt(self: *Resolver, e: CacheEnt) void {
         self.alloc.free(e.key);
-        self.freeRrs(e.rrs);
+        if (e.rrs.len > 0) self.freeRrs(e.rrs);
     }
 
     fn onNxdomain(self: *Resolver, job: *Job) void {
@@ -1362,6 +1432,11 @@ const FakeDns = struct {
     /// When non-zero, SRV answers carry this many targets (t0.test,
     /// t1.test, ...) to exercise the flattened-target cap.
     srv_many: u8 = 0,
+    /// When set, every answer is NXDOMAIN with an authority SOA whose
+    /// minimum is 120 s — feeds the negative cache.
+    nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, NODATA answers carry the same authority SOA record.
+    soa_nodata: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     udp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tcp_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1508,8 +1583,20 @@ const FakeDns = struct {
             extra.appendSlice(alloc, &.{ 10, 9, 9, 9 }) catch {};
         }
 
+        if (self.nxdomain_all.load(.monotonic) or (ancount == 0 and self.soa_nodata.load(.monotonic))) {
+            // Authority SOA: owner ".", mname "." rname ".", five u32
+            // fields whose last (minimum) is 120 seconds.
+            nscount += 1;
+            extra.append(alloc, 0) catch {};
+            appendAnswerTail(alloc, &extra, 6, 60, 22);
+            extra.appendSlice(alloc, &.{ 0, 0 }) catch {};
+            for ([_]u32{ 1, 7200, 3600, 604800, 120 }) |w| {
+                extra.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u32, w))) catch {};
+            }
+        }
+        const flags: u16 = if (self.nxdomain_all.load(.monotonic)) 0x8183 else 0x8180;
         std.mem.writeInt(u16, out[0..2], id, .big);
-        std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+        std.mem.writeInt(u16, out[2..4], flags, .big);
         std.mem.writeInt(u16, out[4..6], 1, .big);
         std.mem.writeInt(u16, out[6..8], ancount, .big);
         std.mem.writeInt(u16, out[8..10], nscount, .big);
@@ -2035,6 +2122,94 @@ test "dns-async: over-cap requests queue and cancel detaches (J6)" {
     try std.testing.expectEqual(@as(usize, 63), r.jobs.items.len);
     // cancel of a missing key is a no-op.
     r.cancel(999);
+}
+
+test "dns-async: cache keys fold case; TTL 0 stays off the wire (J8)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+
+    // First query goes to the wire; the differently-cased repeat is a
+    // folded-key cache hit and never retransmits.
+    var ctx1 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx1, .fun = TestCtx.onQuery });
+    try r.query("HOST.test", .a, 7);
+    var spins: usize = 0;
+    while (ctx1.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx1.status.?);
+    var res1 = ctx1.raw.?;
+    defer res1.deinitOn(std.testing.allocator);
+    const wired = srv.udp_recvd.load(.monotonic);
+
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("host.TEST", .a, 8);
+    try std.testing.expectEqual(Status.resolved, ctx2.status.?);
+    var res2 = ctx2.raw.?;
+    defer res2.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(wired, srv.udp_recvd.load(.monotonic));
+
+    // TTL is capped at the 300 s ceiling regardless of the wire value.
+    const owned_name = try std.testing.allocator.dupe(u8, "ttl.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 1, 2, 3, 4 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 600, .rdata = owned_rdata }};
+    r.cachePut("ttl.test", KIND_A, &rrs);
+    const ent = r.cacheGet("ttl.test", KIND_A).?;
+    const remaining_ms = ent.expires_ms - nowMs();
+    try std.testing.expect(remaining_ms <= 300_000 and remaining_ms > 290_000);
+
+    // TTL 0 is never cached.
+    rrs[0].ttl = 0;
+    r.cachePut("ttl0.test", KIND_A, &rrs);
+    try std.testing.expect(r.cacheGet("ttl0.test", KIND_A) == null);
+}
+
+test "dns-async: NXDOMAIN and NODATA are negative-cached from the SOA minimum (J8)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.nxdomain_all.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+
+    var ctx1 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx1, .fun = TestCtx.onQuery });
+    try r.query("gone.test", .a, 7);
+    var spins: usize = 0;
+    while (ctx1.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.nxdomain, ctx1.status.?);
+    const wired = srv.udp_recvd.load(.monotonic);
+
+    // The repeat is answered from the negative entry, not the wire.
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("gone.test", .a, 8);
+    try std.testing.expectEqual(Status.nxdomain, ctx2.status.?);
+    try std.testing.expectEqual(wired, srv.udp_recvd.load(.monotonic));
+
+    // NODATA (answer empty, SOA present) caches the same way.
+    srv.nxdomain_all.store(false, .monotonic);
+    srv.soa_nodata.store(true, .monotonic);
+    var ctx3 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx3, .fun = TestCtx.onQuery });
+    try r.query("empty.test", .aaaa, 9);
+    spins = 0;
+    while (ctx3.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx3.status.?);
+    try std.testing.expectEqual(@as(usize, 0), ctx3.raw.?.rrs.len);
+    const wired2 = srv.udp_recvd.load(.monotonic);
+
+    var ctx4 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx4, .fun = TestCtx.onQuery });
+    try r.query("empty.test", .aaaa, 10);
+    try std.testing.expectEqual(Status.resolved, ctx4.status.?);
+    try std.testing.expectEqual(wired2, srv.udp_recvd.load(.monotonic));
 }
 
 test "dns-async: a full waiter array starts a second job, not a failure" {
