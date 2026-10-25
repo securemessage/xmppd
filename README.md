@@ -7,18 +7,18 @@ A carrier-grade XMPP server written in Zig, inspired by Postfix's architecture.
 ## Overview
 
 xmppd is a modern XMPP server designed for carrier-grade deployments. It draws
-architectural inspiration from Postfix — separation of concerns, privilege
-separation, sensible defaults — while leveraging Zig's async I/O and compile-time
+architectural inspiration from Postfix - separation of concerns, privilege
+separation, sensible defaults - while leveraging Zig's async I/O and compile-time
 polymorphism for performance at scale.
 
 ### Key Features
 
-- **Hybrid process model** — master daemon supervises isolated components
-- **Async I/O** — kqueue/kevent event loop handles millions of concurrent connections
-- **DANE-first** — TLSA certificate validation as primary trust path for S2S federation
-- **Pluggable storage** — RocksDB (default), PostgreSQL, MariaDB, LDAP
-- **Pluggable auth** — internal, LDAP, OIDC, PAM
-- **Postfix admin UX** — one package, one config, one service
+- **Hybrid process model** - master daemon supervises isolated components
+- **Async I/O** - kqueue/kevent event loop handles millions of concurrent connections
+- **DANE-first** - TLSA certificate validation as primary trust path for S2S federation
+- **Pluggable storage** - RocksDB (default), PostgreSQL, MariaDB, LDAP
+- **Pluggable auth** - internal, LDAP, OIDC, PAM
+- **Postfix admin UX** - one package, one config, one service
 
 ### Target Platforms
 
@@ -89,7 +89,7 @@ queries answer 0 while the account is online and seconds since its last session
 teardown while offline (durable record in the ops DB, consistent across
 workers), gated to presence-sharing contacts (roster from/both, else
 `forbidden`). Full-JID queries forward to the addressed resource per RFC 6121
-§8.5.3 — per XEP-0012 the client answers its own idle time; a server-side
+§8.5.3 - per XEP-0012 the client answers its own idle time; a server-side
 proxy answer would risk double results against XEP-aware clients. Shipped in
 v0.9.0 (T164).
 

@@ -117,5 +117,5 @@ xmppctl invite create            # Generate registration code
 ## Firewall
 
 Open ports:
-- **5222/tcp** — C2S (client connections)
-- **5269/tcp** — S2S (federation, if enabled)
+- **5222/tcp** - C2S (client connections)
+- **5269/tcp** - S2S (federation, if enabled)

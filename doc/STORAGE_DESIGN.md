@@ -1,4 +1,4 @@
-# xmppd Phase 5 — Storage Subsystem (Final Design)
+# xmppd Phase 5 - Storage Subsystem (Final Design)
 
 Dual-engine storage: LMDB for operational data (bounded, read-heavy) + RocksDB for message archives (unbounded, append-heavy), both behind a unified comptime trait interface that allows any backend for either role.
 
@@ -6,12 +6,12 @@ Dual-engine storage: LMDB for operational data (bounded, read-heavy) + RocksDB f
 
 ## 1. Design Principles
 
-- **Library, not daemon** — Storage is linked directly into each binary. No IPC overhead.
-- **Comptime backend selection** — Zero runtime dispatch. Build flags select engines.
-- **Two storage roles** — Operational and archive are independent, each with their own engine.
-- **User decides** — Any backend can be used for either role. We ship sensible defaults.
-- **Works out of the box** — `pkg install xmppd` → add user → start. Zero config.
-- **Postfix-inspired, not Postfix-complex** — Two roles (not per-table selection).
+- **Library, not daemon** - Storage is linked directly into each binary. No IPC overhead.
+- **Comptime backend selection** - Zero runtime dispatch. Build flags select engines.
+- **Two storage roles** - Operational and archive are independent, each with their own engine.
+- **User decides** - Any backend can be used for either role. We ship sensible defaults.
+- **Works out of the box** - `pkg install xmppd` → add user → start. Zero config.
+- **Postfix-inspired, not Postfix-complex** - Two roles (not per-table selection).
 
 ## 2. Defaults and Options
 
@@ -20,7 +20,7 @@ Dual-engine storage: LMDB for operational data (bounded, read-heavy) + RocksDB f
 | **Operational** (users, rosters, offline, vcards) | LMDB | SQLite | PostgreSQL, MariaDB |
 | **Archive** (MAM for DMs + MUC history) | RocksDB | SQLite | PostgreSQL, MariaDB |
 
-Any engine can be used for either role. A user could run SQLite for both, or RocksDB for both, or LMDB for operational + PostgreSQL for archive — their choice.
+Any engine can be used for either role. A user could run SQLite for both, or RocksDB for both, or LMDB for operational + PostgreSQL for archive - their choice.
 
 ### Build Flags
 
@@ -46,18 +46,18 @@ zig build -Dop-storage=lmdb -Darchive-storage=sqlite       # mix
 
 ### LMDB (operational default)
 - 32KB object code. Postfix's default since v2.11.
-- Memory-mapped B+ tree — roster lookups are pointer dereferences.
+- Memory-mapped B+ tree - roster lookups are pointer dereferences.
 - Crash-safe via copy-on-write (no WAL needed).
 - `databases/lmdb` in FreeBSD ports. Zig bindings: `nDimensional/zig-lmdb` v0.3.2 (targets 0.15.1).
 
 ### RocksDB (archive default)
-- LSM tree — purpose-built for append-heavy + range-scan workloads.
-- Built-in compression (Snappy/LZ4/Zstd) — XML messages compress 3-5x.
-- Built-in TTL via CompactionFilter — retention policy is a config option.
+- LSM tree - purpose-built for append-heavy + range-scan workloads.
+- Built-in compression (Snappy/LZ4/Zstd) - XML messages compress 3-5x.
+- Built-in TTL via CompactionFilter - retention policy is a config option.
 - Column families for namespace isolation (archive data vs. indexes).
 - Proven Raft log store (TiKV). Future clustering path.
 - `databases/rocksdb` in FreeBSD ports. Zig bindings: `Syndica/rocksdb-zig` (targets 0.15).
-- ~12MB added to binary size (acceptable — NATS is 20MB, Consul is 80MB).
+- ~12MB added to binary size (acceptable - NATS is 20MB, Consul is 80MB).
 
 ### SQLite (MVP alternative for both)
 - In FreeBSD base. Zero external deps.
@@ -112,7 +112,7 @@ pub fn StorageBackend(comptime Impl: type) type {
         pub fn put(self: *@This(), ns: []const u8, key: []const u8, val: []const u8) !void { ... }
         pub fn delete(self: *@This(), ns: []const u8, key: []const u8) !void { ... }
 
-        // Range iteration (prefix scan — essential for both roster enum and MAM paging)
+        // Range iteration (prefix scan - essential for both roster enum and MAM paging)
         // INVARIANT: Iterator is prefix-bounded. next() returns null when the
         // cursor key no longer starts with `prefix`. Each backend enforces this
         // internally so callers never leak data from adjacent namespaces.
@@ -146,7 +146,7 @@ pub fn RosterStore(comptime Backend: type) type {
 | `users` | `username` | binary: `salt(32) \| stored_key(32) \| server_key(32) \| iter_count(4)` |
 | `rosters` | `owner\x00contact` | binary: `subscription(1) \| ask(1) \| name_len(2) \| name` |
 | `roster_rev` | `contact\x00owner` | `""` (reverse index for presence fan-out) |
-| `offline` | `recipient\x00timestamp_be(8)\x00msg_id` | `""` (delivery flag — payload lives in archive) |
+| `offline` | `recipient\x00timestamp_be(8)\x00msg_id` | `""` (delivery flag - payload lives in archive) |
 | `vcards` | `bare_jid` | vCard XML blob |
 | `meta` | `schema_version` | version u32 |
 
@@ -172,12 +172,12 @@ The operational `offline` namespace holds only lightweight delivery pointers
 2. Fetch each stanza from the archive by `recipient\x00timestamp\x00stanza_id`
 3. Deliver to client, then delete the offline pointer
 
-This keeps LMDB strictly bounded and lean — no unbounded stanza XML accumulating
+This keeps LMDB strictly bounded and lean - no unbounded stanza XML accumulating
 in the operational B+ tree. LMDB's B+ tree does not reclaim disk space on deletion
 (freed pages are reused internally), so keeping large payloads out prevents the
 operational DB file from growing permanently due to offline message churn.
 
-## 8. XEP-0313 (MAM) — The "Slack Scrollback"
+## 8. XEP-0313 (MAM) - The "Slack Scrollback"
 
 MAM is a stable XMPP standard providing:
 - **Infinite scrollback** for both 1:1 DMs and MUC rooms
@@ -185,7 +185,7 @@ MAM is a stable XMPP standard providing:
 - **Filtering** by time range, conversation partner, or ID range
 - **Multi-device sync** combined with Carbons (XEP-0280) + Stream Management (XEP-0198)
 
-MUC history is MAM applied to room JIDs — same storage, same query API.
+MUC history is MAM applied to room JIDs - same storage, same query API.
 
 ### Retention
 - **Default: indefinite** (Slack/Matrix model)
@@ -208,28 +208,28 @@ Flat-file backend remains available as `-Dop-storage=flatfile` for backward comp
 
 | Step | What | ~LOC |
 |------|------|------|
-| **10a** | `src/store/backend.zig` — comptime trait interface + Iterator + WriteBatch | 150 |
-| **10b** | `src/store/lmdb.zig` — LMDB backend impl (zig-lmdb dep) | 350 |
-| **10c** | `src/store/rocksdb.zig` — RocksDB backend impl (rocksdb-zig dep) | 400 |
-| **10d** | `src/store/flatfile.zig` — Wrap existing flat-file stores | 200 |
+| **10a** | `src/store/backend.zig` - comptime trait interface + Iterator + WriteBatch | 150 |
+| **10b** | `src/store/lmdb.zig` - LMDB backend impl (zig-lmdb dep) | 350 |
+| **10c** | `src/store/rocksdb.zig` - RocksDB backend impl (rocksdb-zig dep) | 400 |
+| **10d** | `src/store/flatfile.zig` - Wrap existing flat-file stores | 200 |
 | **10e** | Migrate `UserStore` → `UserStore(Backend)` | 150 |
 | **10f** | Migrate `RosterStore` → `RosterStore(Backend)` | 200 |
-| **10g** | Migrate `OfflineStore` → `OfflineStore(Backend)` — pointer in op DB, payload in archive | 200 |
+| **10g** | Migrate `OfflineStore` → `OfflineStore(Backend)` - pointer in op DB, payload in archive | 200 |
 | **10h** | New: `VCardStore(Backend)` | 100 |
-| **10i** | New: `ArchiveStore(Backend)` — MAM write + paginated read + retention | 500 |
+| **10i** | New: `ArchiveStore(Backend)` - MAM write + paginated read + retention | 500 |
 | **10j** | MAM query handler in core (XEP-0313 IQ handling + RSM pagination) | 400 |
-| **10k** | `src/store/sqlite.zig` — SQLite backend impl | 350 |
-| **10l** | `build.zig` — `-Dop-storage` + `-Darchive-storage` flags, zig-lmdb + rocksdb-zig deps | 80 |
+| **10k** | `src/store/sqlite.zig` - SQLite backend impl | 350 |
+| **10l** | `build.zig` - `-Dop-storage` + `-Darchive-storage` flags, zig-lmdb + rocksdb-zig deps | 80 |
 | **10m** | `xmppctl migrate` + `xmppctl archive-import` | 200 |
 | **10n** | Tests: each backend × each store + MAM query pagination | 600 |
 
 **Total: ~3,830 LOC**
 
 ### Suggested execution order
-1. Trait interface (10a) → LMDB backend (10b) → migrate UserStore (10e) — proves the pattern
-2. RosterStore (10f) → VCardStore (10h) — operational stores (no archive dependency)
-3. RocksDB backend (10c) → ArchiveStore (10i) → MAM handler (10j) — archive layer
-4. OfflineStore (10g) — depends on ArchiveStore (pointers in op DB, payloads in archive)
+1. Trait interface (10a) → LMDB backend (10b) → migrate UserStore (10e) - proves the pattern
+2. RosterStore (10f) → VCardStore (10h) - operational stores (no archive dependency)
+3. RocksDB backend (10c) → ArchiveStore (10i) → MAM handler (10j) - archive layer
+4. OfflineStore (10g) - depends on ArchiveStore (pointers in op DB, payloads in archive)
 5. SQLite (10k) → flat-file compat (10d) → migration tooling (10m)
 6. build.zig integration (10l) → comprehensive tests (10n)
 
@@ -252,7 +252,7 @@ The zig-lmdb and rocksdb-zig packages both bundle their C/C++ sources and compil
 pkg install xmppd
 xmppctl adduser alice@example.com
 service xmppd start
-# LMDB for ops, RocksDB for archive — just works
+# LMDB for ops, RocksDB for archive - just works
 ```
 
 ### Mixed backends (config file)
@@ -291,17 +291,17 @@ archive_dsn = postgresql://xmppd:pass@db/xmppd_archive
 
 ## 13. Open Questions
 
-1. ~~**zig-lmdb** v0.3.2 targets Zig 0.15.1~~ — **RESOLVED:** builds clean on 0.15.2
-2. ~~**rocksdb-zig** (Syndica)~~ — **RESOLVED:** Syndica/rocksdb-zig moved to Zig 0.16. Using RocksDB C API directly via `@cImport` + system `librocksdb` (databases/rocksdb in ports). Cleaner for FreeBSD port — no bundled C++ sources.
-3. ~~**LMDB map size**~~ — **RESOLVED:** auto-resize on `MDB_MAP_FULL` implemented (3 retries, double map size)
-4. ~~**Value serialization**~~ — **RESOLVED:** compact binary: users=100B packed, roster=4+name_len, vcard=raw XML
-5. **Archive stanza format** — store verbatim XML (spec-compliant) with RocksDB block compression
-6. **Config file format** — INI (shown above) vs. TOML vs. custom. Postfix uses `main.cf` (key=value). INI is simplest.
+1. ~~**zig-lmdb** v0.3.2 targets Zig 0.15.1~~ - **RESOLVED:** builds clean on 0.15.2
+2. ~~**rocksdb-zig** (Syndica)~~ - **RESOLVED:** Syndica/rocksdb-zig moved to Zig 0.16. Using RocksDB C API directly via `@cImport` + system `librocksdb` (databases/rocksdb in ports). Cleaner for FreeBSD port - no bundled C++ sources.
+3. ~~**LMDB map size**~~ - **RESOLVED:** auto-resize on `MDB_MAP_FULL` implemented (3 retries, double map size)
+4. ~~**Value serialization**~~ - **RESOLVED:** compact binary: users=100B packed, roster=4+name_len, vcard=raw XML
+5. **Archive stanza format** - store verbatim XML (spec-compliant) with RocksDB block compression
+6. **Config file format** - INI (shown above) vs. TOML vs. custom. Postfix uses `main.cf` (key=value). INI is simplest.
 
 ## 14. Implementation Notes
 
 - **Trait pattern diverges from §6:** Implementation uses `assertBackend()` comptime validation + duck typing rather than the `StorageBackend(Impl)` wrapper. Simpler, same zero-cost result.
 - **`get()` takes allocator:** Returns allocator-owned `!?[]u8`. Caller frees. Needed because LMDB mmap pointers are only valid during the read transaction.
-- **Named module imports:** Use `@import("backend")` not `@import("backend.zig")` — Zig disallows a file belonging to two modules when referenced via both paths.
-- **AuthHandler generic over Store type** (not Backend) — handler doesn't know or care about the storage engine, only the store interface.
+- **Named module imports:** Use `@import("backend")` not `@import("backend.zig")` - Zig disallows a file belonging to two modules when referenced via both paths.
+- **AuthHandler generic over Store type** (not Backend) - handler doesn't know or care about the storage engine, only the store interface.
 - **`roster_rev` deferred:** Forward prefix scan on `owner\x00` in the `rosters` namespace handles all current presence queries. Reverse index for inbound presence probes can be added later.
