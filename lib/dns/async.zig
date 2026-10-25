@@ -94,7 +94,7 @@ pub const QueryCb = struct {
     fun: *const fn (ctx: ?*anyopaque, session_key: usize, status: Status, res: ?RecordResult) void,
 };
 
-const Phase = enum { srv_tls, srv_plain, addr, tlsa, fallback_addr, fallback_tlsa, raw, done };
+const Phase = enum { srv_tls, srv_plain, addr, addr6, tlsa, fallback_addr, fallback_tlsa, raw, done };
 
 const Job = struct {
     /// Session keys waiting on this job; identical in-flight lookups
@@ -114,6 +114,10 @@ const Job = struct {
 
     srv_list: std.ArrayListUnmanaged(SrvEnt) = .{},
     srv_pos: usize = 0,
+    /// Addresses collected for the current SRV target across the A
+    /// and AAAA phases.
+    cur_addr4: ?net.Address = null,
+    cur_addr6: ?net.Address = null,
 
     // Wire state for the outstanding query.
     dns_id: u16 = 0,
@@ -135,6 +139,8 @@ const SrvEnt = struct {
     weight: u16 = 0,
     is_direct_tls: bool = false,
     addr: ?net.Address = null,
+    /// RFC 2782: a "." target means the service is unavailable here.
+    unavailable: bool = false,
 };
 
 const CacheEnt = struct {
@@ -489,6 +495,13 @@ pub const Resolver = struct {
     }
 
     fn sendQuery(self: *Resolver, job: *Job, qname: []const u8, qtype: u16) !void {
+        // The chain consults the RR cache the same way a raw query
+        // does; a hit feeds the phase machine a synthetic message.
+        if (self.cacheGet(qname, qtype)) |ent| {
+            const hit = wire.Message{ .id = 0, .rcode = wire.RCODE_NOERROR, .truncated = false, .rrs = ent.rrs, .raw = &.{} };
+            if (job.is_raw) return self.completeRaw(job, hit);
+            return self.advance(job, hit);
+        }
         var buf: [512]u8 = undefined;
         const id = try self.nextId();
         const q = try wire.buildQuery(&buf, id, qname, qtype);
@@ -652,7 +665,7 @@ pub const Resolver = struct {
 
         if (job.is_raw) return self.completeRaw(job, filtered);
         switch (job.phase) {
-            .srv_tls, .srv_plain, .addr, .tlsa, .fallback_addr, .fallback_tlsa => self.advance(job, filtered),
+            .srv_tls, .srv_plain, .addr, .addr6, .tlsa, .fallback_addr, .fallback_tlsa => self.advance(job, filtered),
             .raw, .done => {},
         }
     }
@@ -865,7 +878,19 @@ pub const Resolver = struct {
             },
             .srv_plain => self.startFallback(job),
             .fallback_addr => self.dropJob(job, .nxdomain),
-            .tlsa, .fallback_tlsa, .addr => self.complete(job),
+            // Per target: an NXDOMAIN on either address family means
+            // that target is gone, not the whole resolution.
+            .addr => {
+                job.phase = .addr6;
+                self.sendAddr(job, KIND_AAAA) catch return self.dropJob(job, .failed);
+            },
+            .addr6 => self.nextTarget(job) catch return self.dropJob(job, .failed),
+            .tlsa => {
+                // TLSA NXDOMAIN keeps the target, just without DANE.
+                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+                self.nextTarget(job) catch return self.dropJob(job, .failed);
+            },
+            .fallback_tlsa => self.complete(job),
             .raw, .done => {},
         }
     }
@@ -884,33 +909,52 @@ pub const Resolver = struct {
                     }
                     return self.startFallback(job);
                 }
-                orderSrvRfc2782(job.srv_list.items);
+                orderSrvRfc2782(job.srv_list.items, self.prng.random());
                 job.srv_pos = 0;
                 job.phase = .addr;
-                self.sendAddr(job) catch return self.dropJob(job, .failed);
+                self.stepTargetAddr(job) catch return self.dropJob(job, .failed);
             },
             .addr => {
                 const target = &job.srv_list.items[job.srv_pos];
                 for (msg.rrs) |rr| {
-                    if (rr.rtype == KIND_A or rr.rtype == KIND_AAAA) {
-                        if (std.ascii.eqlIgnoreCase(rr.name, target.host)) {
-                            target.addr = addrFromRdata(rr, target.port) catch null;
-                        }
+                    if (rr.rtype == KIND_A and job.cur_addr4 == null) {
+                        job.cur_addr4 = addrFromRdata(rr, target.port) catch null;
                     }
                 }
-                if (target.addr == null) {
-                    job.srv_pos += 1;
-                    if (job.srv_pos < job.srv_list.items.len) {
-                        self.sendAddr(job) catch return self.dropJob(job, .failed);
-                        return;
+                job.phase = .addr6;
+                self.sendAddr(job, KIND_AAAA) catch return self.dropJob(job, .failed);
+            },
+            .addr6 => {
+                const target = &job.srv_list.items[job.srv_pos];
+                for (msg.rrs) |rr| {
+                    if (rr.rtype == KIND_AAAA and job.cur_addr6 == null) {
+                        job.cur_addr6 = addrFromRdata(rr, target.port) catch null;
                     }
-                    self.startFallback(job);
+                }
+                if (job.cur_addr4 == null and job.cur_addr6 == null) {
+                    // This target has no usable address; the next one
+                    // in RFC 2782 order is still tried.
+                    self.nextTarget(job) catch return self.dropJob(job, .failed);
                     return;
                 }
                 job.phase = .tlsa;
                 self.sendTlsa(job) catch return self.dropJob(job, .failed);
             },
-            .tlsa, .fallback_tlsa => {
+            .tlsa => {
+                var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
+                defer {
+                    for (tlsa_recs.items) |r| self.alloc.free(r.association_data);
+                    tlsa_recs.deinit(self.alloc);
+                }
+                for (msg.rrs) |rr| {
+                    if (rr.rtype != KIND_TLSA) continue;
+                    const rec = dns.parseTlsaRdata(rr.rdata, self.alloc) catch continue;
+                    tlsa_recs.append(self.alloc, rec) catch continue;
+                }
+                self.emitTargets(job, tlsa_recs.items) catch return self.dropJob(job, .failed);
+                self.nextTarget(job) catch return self.dropJob(job, .failed);
+            },
+            .fallback_tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
                 for (msg.rrs) |rr| {
                     if (rr.rtype != KIND_TLSA) continue;
@@ -960,28 +1004,76 @@ pub const Resolver = struct {
                 .priority = parsed.priority,
                 .weight = parsed.weight,
                 .is_direct_tls = direct_tls,
+                .unavailable = std.mem.eql(u8, parsed.target, "."),
             }) catch continue;
         }
     }
 
-    fn sendAddr(self: *Resolver, job: *Job) !void {
+    /// Begin (or continue) the per-target chain: a target marked "." is
+    /// skipped; the first live target gets an A query.
+    fn stepTargetAddr(self: *Resolver, job: *Job) !void {
+        while (job.srv_pos < job.srv_list.items.len and
+            job.srv_list.items[job.srv_pos].unavailable)
+        {
+            job.srv_pos += 1;
+        }
+        if (job.srv_pos >= job.srv_list.items.len) {
+            if (job.targets.items.len == 0) return self.dropJob(job, .nxdomain);
+            return self.complete(job);
+        }
+        job.cur_addr4 = null;
+        job.cur_addr6 = null;
+        job.phase = .addr;
+        try self.sendAddr(job, KIND_A);
+    }
+
+    /// Move to the next SRV target in order, or complete the job.
+    fn nextTarget(self: *Resolver, job: *Job) !void {
+        job.srv_pos += 1;
+        try self.stepTargetAddr(job);
+    }
+
+    /// Emit the current target's collected addresses: AAAA first, then
+    /// A, each carrying the per-target TLSA set and the direct-TLS flag.
+    fn emitTargets(self: *Resolver, job: *Job, tlsa_recs: []dns.TlsaRecord) !void {
+        const ent = &job.srv_list.items[job.srv_pos];
+        const addrs = [2]?net.Address{ job.cur_addr6, job.cur_addr4 };
+        for (addrs) |a| {
+            const addr = a orelse continue;
+            try self.emitTarget(job, ent, addr, tlsa_recs);
+        }
+    }
+
+    fn emitTarget(self: *Resolver, job: *Job, ent: *const SrvEnt, addr: net.Address, tlsa_recs: []dns.TlsaRecord) !void {
+        const host = try self.alloc.dupe(u8, ent.host);
+        errdefer self.alloc.free(host);
+        var tlsa: []dns.TlsaRecord = &.{};
+        if (tlsa_recs.len > 0) {
+            tlsa = try self.alloc.alloc(dns.TlsaRecord, tlsa_recs.len);
+            errdefer self.alloc.free(tlsa);
+            var n: usize = 0;
+            errdefer for (tlsa[0..n]) |r| self.alloc.free(r.association_data);
+            for (tlsa_recs, 0..) |r, i| {
+                tlsa[i] = r;
+                tlsa[i].association_data = try self.alloc.dupe(u8, r.association_data);
+                n += 1;
+            }
+        }
+        try job.targets.append(self.alloc, .{ .addr = addr, .host = host, .tlsa = tlsa, .is_direct_tls = ent.is_direct_tls });
+    }
+
+    fn sendAddr(self: *Resolver, job: *Job, qtype: u16) !void {
         const ent = &job.srv_list.items[job.srv_pos];
         var buf: [280]u8 = undefined;
         const qname = std.fmt.bufPrint(&buf, "{s}", .{ent.host}) catch return error.NameTooLong;
-        try self.sendQuery(job, qname, KIND_A);
+        try self.sendQuery(job, qname, qtype);
     }
 
     fn sendTlsa(self: *Resolver, job: *Job) !void {
         const ent = &job.srv_list.items[job.srv_pos];
-        const addr = ent.addr.?;
         var buf: [280]u8 = undefined;
         const qname = dns.tlsaQueryName(&buf, ent.port, ent.host) catch return error.NameTooLong;
         try self.sendQuery(job, qname, KIND_TLSA);
-        const ta = try self.alloc.alloc(Target, 1);
-        ta[0] = .{ .addr = addr, .host = self.alloc.dupe(u8, ent.host) catch return error.OutOfMemory, .tlsa = &.{}, .is_direct_tls = ent.is_direct_tls };
-        errdefer self.alloc.free(ta);
-        job.targets.append(self.alloc, ta[0]) catch return error.OutOfMemory;
-        self.alloc.free(ta);
     }
 
     fn freeJob(self: *Resolver, job: *Job) void {
@@ -1050,37 +1142,41 @@ fn parseQuestion(alloc: std.mem.Allocator, pkt: []const u8) !Question {
 }
 
 /// RFC 2782 ordering: sort by priority, then within a priority pick
-/// targets with probability proportional to weight.
-fn orderSrvRfc2782(items: []SrvEnt) void {
+/// targets with probability proportional to weight. Weight-0 records
+/// are placed at the beginning of each round so an inclusive random
+/// draw still gives them a small chance.
+fn orderSrvRfc2782(items: []SrvEnt, rand: std.Random) void {
     std.mem.sort(SrvEnt, items, {}, struct {
         fn lt(_: void, a: SrvEnt, b: SrvEnt) bool {
             return a.priority < b.priority;
         }
     }.lt);
     var i: usize = 0;
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-    const rand = rng.random();
     while (i < items.len) {
         var j = i;
-        var total: u64 = 0;
-        while (j < items.len and items[j].priority == items[i].priority) : (j += 1) total += items[j].weight;
-        var k = i;
-        while (k < j) : (k += 1) {
+        while (j < items.len and items[j].priority == items[i].priority) : (j += 1) {}
+        const group = items[i..j];
+        // Stable partition: weight-0 records lead each pick round.
+        std.mem.sort(SrvEnt, group, {}, struct {
+            fn lt(_: void, a: SrvEnt, b: SrvEnt) bool {
+                return (a.weight == 0) != (b.weight == 0) and a.weight == 0;
+            }
+        }.lt);
+        var k: usize = 0;
+        while (k < group.len) : (k += 1) {
+            var total: u64 = 0;
+            for (group[k..]) |it| total += it.weight;
+            const r = rand.intRangeAtMost(u64, 0, total);
+            var acc: u64 = 0;
             var pick: usize = k;
-            if (total > 0) {
-                const r = rand.uintLessThan(u64, total);
-                var acc: u64 = 0;
-                var m = k;
-                while (m < j) : (m += 1) {
-                    acc += items[m].weight;
-                    if (r < acc) {
-                        pick = m;
-                        break;
-                    }
+            for (group[k..], k..) |it, m| {
+                acc += it.weight;
+                if (r <= acc) {
+                    pick = m;
+                    break;
                 }
             }
-            std.mem.swap(SrvEnt, &items[k], &items[pick]);
-            total -= items[k].weight;
+            std.mem.swap(SrvEnt, &group[k], &group[pick]);
         }
         i = j;
     }
