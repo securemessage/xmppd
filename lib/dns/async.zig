@@ -1192,7 +1192,11 @@ pub const Resolver = struct {
 
     fn minTtl(rrs: []const wire.Rr) u32 {
         var m: u32 = std.math.maxInt(u32);
-        for (rrs) |rr| m = @min(m, rr.ttl);
+        for (rrs) |rr| {
+            // RFC 2181: the TTL field is 31 bits; a set top bit means 0.
+            const t = if (rr.ttl & 0x8000_0000 != 0) 0 else rr.ttl;
+            m = @min(m, t);
+        }
         return if (m == std.math.maxInt(u32)) 0 else m;
     }
 
@@ -1785,6 +1789,9 @@ const FakeDns = struct {
     /// When set, SRV answers exist only for the _xmpps-client and
     /// _xmpp-client prefixes; anything else is NODATA.
     client_srv_only: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, A answers carry a TTL with the top bit set (RFC 2181
+    /// treats that as zero, not as a large number).
+    a_ttl_highbit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, every answer is NXDOMAIN with an authority SOA whose
     /// minimum is 120 s - feeds the negative cache.
     nxdomain_all: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1966,7 +1973,8 @@ const FakeDns = struct {
             answers.appendSlice(alloc, &v6) catch {};
         } else if (q.qtype == wire.TYPE_A) {
             ancount = 1;
-            appendAnswerHdr(alloc, &answers, wire.TYPE_A, 60, 4);
+            const ttl: u32 = if (self.a_ttl_highbit.load(.monotonic)) 0x8000_0000 else 60;
+            appendAnswerHdr(alloc, &answers, wire.TYPE_A, ttl, 4);
             answers.appendSlice(alloc, &.{ 127, 0, 0, 1 }) catch {};
         } else if (q.qtype == wire.TYPE_TLSA) {
             _ = self.tlsa_recvd.fetchAdd(1, .monotonic);
@@ -3378,4 +3386,24 @@ test "dns-async: resolv.conf is read into the resolver, not on the loop" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expectEqual(@as(u16, 53), r.server.getPort());
+}
+
+test "dns-async: a TTL with the top bit set reports zero (RFC 2181)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_ttl_highbit.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), res.ttl);
 }
