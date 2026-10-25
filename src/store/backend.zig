@@ -643,39 +643,144 @@ fn skipToken(text: []const u8, i: usize) ?Token {
     return null;
 }
 
-const CallArgs = struct { count: usize, ns_literal: bool };
+const Decl = struct {
+    /// Offset of the `const`/`var` keyword.
+    at: usize,
+    /// Brace depth of the declaration, so a nearer local binding wins.
+    depth: isize,
+    name: []const u8,
+    init_start: usize,
+    init_end: usize,
+};
+
+/// Collect direct `const NAME = ...;` and `var NAME = ...;` initializers.
+/// The scan is textual and bounded to one file: no type inference, no
+/// cross-file lookup, and no tracking of later assignments.
+fn collectDecls(text: []const u8, allocator: std.mem.Allocator) !std.ArrayList(Decl) {
+    var decls = std.ArrayList(Decl){};
+    errdefer decls.deinit(allocator);
+    var depth: isize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (skipToken(text, i)) |tok| {
+            i = tok.end - 1;
+            continue;
+        }
+        switch (text[i]) {
+            '{' => {
+                depth += 1;
+                continue;
+            },
+            '}' => {
+                depth -= 1;
+                continue;
+            },
+            else => {},
+        }
+        if (text[i] != 'c' and text[i] != 'v') continue;
+        if (!std.mem.startsWith(u8, text[i..], "const") and !std.mem.startsWith(u8, text[i..], "var")) continue;
+        if (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) continue;
+        const keyword_len: usize = if (text[i] == 'c') 5 else 3;
+        var j = i + keyword_len;
+        if (j >= text.len or !std.ascii.isWhitespace(text[j])) continue;
+        while (j < text.len and std.ascii.isWhitespace(text[j])) : (j += 1) {}
+        const name_start = j;
+        while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_')) : (j += 1) {}
+        if (j == name_start) continue;
+        const name_end = j;
+
+        // Find the `=` at the declaration's own nesting level.
+        var d: usize = 0;
+        var eq: ?usize = null;
+        while (j < text.len) : (j += 1) {
+            if (skipToken(text, j)) |tok| {
+                j = tok.end - 1;
+                continue;
+            }
+            switch (text[j]) {
+                '(', '[', '{' => d += 1,
+                ')', ']', '}' => {
+                    if (d == 0) break;
+                    d -= 1;
+                },
+                ';' => if (d == 0) break,
+                '=' => {
+                    if (d == 0 and (j + 1 >= text.len or text[j + 1] != '=')) {
+                        eq = j + 1;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+        const init_start = eq orelse continue;
+
+        // The initializer runs to the `;` at its own nesting level.
+        var k = init_start;
+        d = 0;
+        while (k < text.len) : (k += 1) {
+            if (skipToken(text, k)) |tok| {
+                k = tok.end - 1;
+                continue;
+            }
+            switch (text[k]) {
+                '(', '[', '{' => d += 1,
+                ')', ']', '}' => {
+                    if (d == 0) break;
+                    d -= 1;
+                },
+                ';' => if (d == 0) break,
+                else => {},
+            }
+        }
+        try decls.append(allocator, .{
+            .at = i,
+            .depth = depth,
+            .name = text[name_start..name_end],
+            .init_start = init_start,
+            .init_end = k,
+        });
+        i = k;
+    }
+    return decls;
+}
+
+const ArgRange = struct { count: usize, start: usize, end: usize };
 
 /// Parse the top-level argument list of a call starting just after its
-/// open paren: the argument count and whether the namespace slot is a
-/// string literal. Null on an unbalanced call.
-fn nsArgIsLiteral(text: []const u8, start: usize, ns_index: usize) ?CallArgs {
+/// open paren. Returns the argument count and the range of the namespace
+/// slot; null on an unbalanced call or a missing slot.
+fn nsArgRange(text: []const u8, start: usize, ns_index: usize) ?ArgRange {
     var depth: usize = 0;
     var i: usize = start;
     var count: usize = 0;
     var arg_index: usize = 0;
+    var arg_start: usize = start;
     var saw = false;
-    var first_seen = false;
-    var ns_literal = false;
+    var ns_start: usize = 0;
+    var ns_end: usize = 0;
+    var have_ns = false;
     while (i < text.len) : (i += 1) {
         if (skipToken(text, i)) |tok| {
-            if (!first_seen and arg_index == ns_index and tok.kind == .str) ns_literal = true;
-            if (tok.kind != .comment) {
-                first_seen = true;
-                saw = true;
-            }
+            if (tok.kind != .comment) saw = true;
             i = tok.end - 1;
             continue;
         }
         switch (text[i]) {
             '(', '[', '{' => {
                 depth += 1;
-                first_seen = true;
                 saw = true;
             },
             ')', ']', '}' => {
                 if (text[i] == ')' and depth == 0) {
                     if (saw) count += 1;
-                    return .{ .count = count, .ns_literal = ns_literal };
+                    if (arg_index == ns_index) {
+                        ns_start = arg_start;
+                        ns_end = i;
+                        have_ns = true;
+                    }
+                    if (!have_ns) return null;
+                    return .{ .count = count, .start = ns_start, .end = ns_end };
                 }
                 if (depth == 0) return null;
                 depth -= 1;
@@ -684,44 +789,179 @@ fn nsArgIsLiteral(text: []const u8, start: usize, ns_index: usize) ?CallArgs {
             ',' => {
                 if (depth == 0) {
                     if (saw) count += 1;
+                    if (arg_index == ns_index) {
+                        ns_start = arg_start;
+                        ns_end = i;
+                        have_ns = true;
+                    }
                     arg_index += 1;
+                    arg_start = i + 1;
                     saw = false;
-                    first_seen = false;
                 }
             },
             else => {
-                if (!std.ascii.isWhitespace(text[i])) {
-                    if (!first_seen) {
-                        first_seen = true;
-                        if (arg_index == ns_index) ns_literal = text[i] == '"';
-                    }
-                    saw = true;
-                }
+                if (!std.ascii.isWhitespace(text[i])) saw = true;
             },
         }
     }
     return null;
 }
 
+const Range = struct { start: usize, end: usize };
+
+fn trimRange(text: []const u8, start: usize, end: usize) Range {
+    var s = start;
+    var e = end;
+    while (s < e and std.ascii.isWhitespace(text[s])) : (s += 1) {}
+    while (e > s and std.ascii.isWhitespace(text[e - 1])) : (e -= 1) {}
+    return .{ .start = s, .end = e };
+}
+
+/// Strip balanced parentheses that wrap the whole expression.
+fn stripOuterParens(text: []const u8, start: usize, end: usize) Range {
+    var r = trimRange(text, start, end);
+    while (r.start < r.end and text[r.start] == '(') {
+        var depth: usize = 0;
+        var i = r.start;
+        var close: ?usize = null;
+        while (i < r.end) : (i += 1) {
+            if (skipToken(text, i)) |tok| {
+                i = tok.end - 1;
+                continue;
+            }
+            if (text[i] == '(') {
+                depth += 1;
+            } else if (text[i] == ')') {
+                if (depth == 0) break;
+                depth -= 1;
+                if (depth == 0) {
+                    close = i;
+                    break;
+                }
+            }
+        }
+        const c = close orelse break;
+        if (c != r.end - 1) break;
+        r = trimRange(text, r.start + 1, r.end - 1);
+    }
+    return r;
+}
+
+fn isStringLiteral(text: []const u8, start: usize, end: usize) bool {
+    const r = stripOuterParens(text, start, end);
+    if (r.start >= r.end or text[r.start] != '"') return false;
+    const tok = skipToken(text, r.start) orelse return false;
+    return tok.kind == .str and tok.end == r.end;
+}
+
+fn containsStringLiteral(text: []const u8, start: usize, end: usize) bool {
+    var i = start;
+    while (i < end) {
+        if (skipToken(text, i)) |tok| {
+            if (tok.kind == .str and text[i] == '"') return true;
+            i = tok.end;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn isIdentifier(text: []const u8, start: usize, end: usize) bool {
+    if (start >= end) return false;
+    if (!(std.ascii.isAlphabetic(text[start]) or text[start] == '_')) return false;
+    for (text[start..end]) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+    }
+    return true;
+}
+
+fn startsWithWord(text: []const u8, start: usize, end: usize, word: []const u8) bool {
+    if (start + word.len > end) return false;
+    if (!std.mem.eql(u8, text[start .. start + word.len], word)) return false;
+    return start + word.len == end or !(std.ascii.isAlphanumeric(text[start + word.len]) or text[start + word.len] == '_');
+}
+
+/// The nearest preceding declaration of `name` at or above `depth`, so a
+/// local binding shadows an outer one. Bounded to the file being scanned.
+fn findDecl(decls: []const Decl, name: []const u8, at: usize, depth: isize) ?Decl {
+    var best: ?Decl = null;
+    for (decls) |d| {
+        if (!std.mem.eql(u8, d.name, name)) continue;
+        if (d.at >= at or d.depth > depth) continue;
+        if (best == null or d.at > best.?.at) best = d;
+    }
+    return best;
+}
+
+/// Whether a namespace argument resolves to a string literal: the literal
+/// itself, parentheses around it, any call-site expression containing a
+/// literal (an if, a call), or a local const/var whose initializer is a
+/// literal or a conditional of literals. A constant bound to a call such
+/// as registered("locks") is not counted: that is the bound form the
+/// ratchet wants. Bounded to four identifier hops and one file.
+fn nsArgIsLiteralDerived(
+    text: []const u8,
+    decls: []const Decl,
+    start: usize,
+    end: usize,
+    call_depth: isize,
+    hops: usize,
+    from_decl: bool,
+) bool {
+    if (hops > 4) return false;
+    const r = stripOuterParens(text, start, end);
+    if (r.start >= r.end) return false;
+    if (isStringLiteral(text, r.start, r.end)) return true;
+    if (isIdentifier(text, r.start, r.end)) {
+        const d = findDecl(decls, text[r.start..r.end], r.start, call_depth) orelse return false;
+        return nsArgIsLiteralDerived(text, decls, d.init_start, d.init_end, d.depth, hops + 1, true);
+    }
+    if (from_decl) {
+        // A conditional initializer is literal-derived; a call initializer
+        // (registered(...)) is the bound form and is not.
+        const conditional = startsWithWord(text, r.start, r.end, "if") or
+            startsWithWord(text, r.start, r.end, "switch") or
+            startsWithWord(text, r.start, r.end, "orelse");
+        return conditional and containsStringLiteral(text, r.start, r.end);
+    }
+    return containsStringLiteral(text, r.start, r.end);
+}
+
 const ScanResult = struct { count: usize, first_line: usize };
 
-/// Count call sites whose namespace argument is a string literal. The
-/// backend signatures fix both the arity and the namespace slot
-/// (put(ns, key, value), delete(ns, key), iterator(ns, prefix),
+/// Count call sites whose namespace argument resolves to a string literal.
+/// The backend signatures fix the namespace slot (put(ns, key, value) and
+/// put(ns, key, value, options), delete(ns, key), iterator(ns, prefix),
 /// get(allocator, ns, key)), so map, config and pool calls do not match.
-fn countNsLiterals(text: []const u8) ScanResult {
-    const calls = [_]struct { name: []const u8, args: usize, ns: usize }{
-        .{ .name = "pu" ++ "t", .args = 3, .ns = 0 },
-        .{ .name = "del" ++ "ete", .args = 2, .ns = 0 },
-        .{ .name = "it" ++ "erator", .args = 2, .ns = 0 },
-        .{ .name = "g" ++ "et", .args = 3, .ns = 1 },
+fn countNsLiterals(text: []const u8, allocator: std.mem.Allocator) !ScanResult {
+    const calls = [_]struct { name: []const u8, args: usize, alt_args: usize, ns: usize }{
+        .{ .name = "pu" ++ "t", .args = 3, .alt_args = 4, .ns = 0 },
+        .{ .name = "del" ++ "ete", .args = 2, .alt_args = 0, .ns = 0 },
+        .{ .name = "it" ++ "erator", .args = 2, .alt_args = 0, .ns = 0 },
+        .{ .name = "g" ++ "et", .args = 3, .alt_args = 0, .ns = 1 },
     };
+    var decls = try collectDecls(text, allocator);
+    defer decls.deinit(allocator);
+
     var result = ScanResult{ .count = 0, .first_line = 0 };
+    var depth: isize = 0;
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         if (skipToken(text, i)) |tok| {
             i = tok.end - 1;
             continue;
+        }
+        switch (text[i]) {
+            '{' => {
+                depth += 1;
+                continue;
+            },
+            '}' => {
+                depth -= 1;
+                continue;
+            },
+            else => {},
         }
         if (text[i] != '.') continue;
         var j = i + 1;
@@ -729,12 +969,12 @@ fn countNsLiterals(text: []const u8) ScanResult {
         for (calls) |call| {
             if (!std.mem.eql(u8, text[i + 1 .. j], call.name)) continue;
             if (j >= text.len or text[j] != '(') break;
-            if (nsArgIsLiteral(text, j + 1, call.ns)) |parsed| {
-                if (parsed.count == call.args and parsed.ns_literal) {
-                    result.count += 1;
-                    if (result.first_line == 0) {
-                        result.first_line = std.mem.count(u8, text[0..i], "\n") + 1;
-                    }
+            const parsed = nsArgRange(text, j + 1, call.ns) orelse break;
+            const arity_ok = parsed.count == call.args or (call.alt_args != 0 and parsed.count == call.alt_args);
+            if (arity_ok and nsArgIsLiteralDerived(text, decls.items, parsed.start, parsed.end, depth, 0, false)) {
+                result.count += 1;
+                if (result.first_line == 0) {
+                    result.first_line = std.mem.count(u8, text[0..i], "\n") + 1;
                 }
             }
             break;
@@ -760,18 +1000,73 @@ fn openSrcDir() !std.fs.Dir {
     return error.SourceTreeNotFound;
 }
 
+test "D7: literal-derived namespace arguments are counted" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\const NS = "users";
+        \\const BOUND = registered("locks");
+        \\fn f(db: anytype, alloc: std.mem.Allocator, k: []const u8, v: []const u8) void {
+        \\    db.put("rosters", k, v);
+        \\    db.put(("vcards"), k, v);
+        \\    db.put(NS, k, v);
+        \\    db.put(BOUND, k, v);
+        \\    db.put(if (k.len > 0) "pep" else "offline", k, v);
+        \\    db.put("locks", k, v, .{});
+        \\    db.delete(NS, k);
+        \\    var it = db.iterator("messages", "");
+        \\    _ = db.get(alloc, NS, k);
+        \\    _ = db.get(alloc, BOUND, k);
+        \\}
+    ;
+    const result = try countNsLiterals(src, alloc);
+    try std.testing.expectEqual(@as(usize, 8), result.count);
+}
+
+test "D7: calls in strings and comments and non-literal arguments are not counted" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\// db.put("users", k, v);
+        \\const note = "db.put(\"users\", k, v)";
+        \\fn f(db: anytype, ns: []const u8, k: []const u8, v: []const u8) void {
+        \\    db.put(ns, k, v);
+        \\    db.put(k, k, v);
+        \\}
+    ;
+    const result = try countNsLiterals(src, alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.count);
+}
+
+test "D7: a constant bound to registered() is not a literal namespace" {
+    const alloc = std.testing.allocator;
+    const src =
+        \\const NAMESPACE = backend.registered("locks");
+        \\const CONDITIONAL = if (true) "users" else "rosters";
+        \\fn f(db: anytype, k: []const u8, v: []const u8) void {
+        \\    db.put(NAMESPACE, k, v);
+        \\    db.put(CONDITIONAL, k, v);
+        \\}
+    ;
+    const result = try countNsLiterals(src, alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.count);
+}
+
 test "D7: source ratchet, no string-literal namespace arguments in src/" {
     // The backend API takes a runtime namespace string, so a call site
     // passing a literal skips the registered() binding to
     // canonical_namespaces: a renamed owner can drift from its call sites
-    // while the suite stays green (B7). Every backend call whose
-    // namespace argument is a string literal is counted per file and
-    // pinned here. Counts may only shrink; a new literal must be
-    // justified in this table. The four backend conformance test files
-    // seed fixture rows under unregistered names ("scratch",
-    // "nonexistent") and carry their fixture counts; every other file in
-    // src/ is zero.
+    // while the suite stays green (B7). Every backend call whose namespace
+    // argument resolves to a string literal (direct, parenthesized, an if
+    // or other expression containing one, or a local const/var bound to
+    // one) is counted per file and pinned here. Counts may only shrink; a
+    // new literal must be justified in this table. The four backend
+    // conformance test files seed fixture rows under unregistered names
+    // ("scratch", "nonexistent") and carry their fixture counts.
+    // auth/crypto_pool.zig has three 4-argument put calls whose first
+    // argument is a password literal; the text scan cannot tell that shape
+    // from a backend put with an options argument, so it is pinned too.
+    // Every other file in src/ is zero.
     const expected = [_]struct { []const u8, usize }{
+        .{ "auth/crypto_pool.zig", 3 },
         .{ "store/backend.zig", 29 },
         .{ "store/lmdb.zig", 39 },
         .{ "store/rocksdb.zig", 32 },
@@ -800,7 +1095,7 @@ test "D7: source ratchet, no string-literal namespace arguments in src/" {
                 seen[idx] = true;
             }
         }
-        const result = countNsLiterals(text);
+        const result = try countNsLiterals(text, allocator);
         if (result.count != want) {
             std.log.err("D7 ratchet: {s} has {d} string-literal namespace arguments (first at line {d}), table pins {d}", .{ entry.path, result.count, result.first_line, want });
             return error.RatchetMismatch;
