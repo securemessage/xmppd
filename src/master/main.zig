@@ -502,17 +502,17 @@ pub fn main() !void {
 
     // Initialize supervisors for all children
     var auth_sup = if (child_uid != 0)
-        Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid)
+        try Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid, posix.geteuid())
     else
-        Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
+        try Supervisor.init(auth_path, auth_args_buf[0..auth_argc], posix.geteuid());
     var s2s_sup = if (child_uid != 0)
-        Supervisor.initWithUser(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid)
+        try Supervisor.initWithUser(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid, posix.geteuid())
     else
-        Supervisor.init(s2s_path, s2s_args_buf[0..s2s_argc]);
+        try Supervisor.init(s2s_path, s2s_args_buf[0..s2s_argc], posix.geteuid());
     var core_sup = if (child_uid != 0)
-        Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
+        try Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid, posix.geteuid())
     else
-        Supervisor.init(core_path, core_args_buf[0..core_argc]);
+        try Supervisor.init(core_path, core_args_buf[0..core_argc], posix.geteuid());
 
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
     // listener, auth nothing; everything else in the master's table closes.

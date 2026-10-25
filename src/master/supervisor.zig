@@ -36,6 +36,9 @@ const MAX_BACKOFF_NS: u64 = 30 * std.time.ns_per_s;
 /// If the child runs for this long, reset backoff.
 const STABLE_RUN_NS: u64 = 60 * std.time.ns_per_s;
 
+/// Init failures: a root process without a run user.
+pub const InitError = error{RunUserRequired};
+
 /// Child process state.
 pub const ChildState = enum {
     /// No child has been spawned.
@@ -70,19 +73,31 @@ pub const Supervisor = struct {
     /// Number of consecutive restarts (resets after stable run).
     restart_count: u32 = 0,
 
-    /// Initialize the supervisor.
-    ///
-    /// - `exe_path` — absolute path to the child executable
-    /// - `args` — arguments (exe_path is NOT automatically prepended)
-    pub fn init(exe_path: []const u8, args: []const []const u8) Supervisor {
+    /// Initialize the supervisor. A process running as root must name a run
+    /// user; without one every child would start as root, so init refuses.
+    /// The euid is a parameter so the refusal is testable without being root.
+    pub fn init(
+        exe_path: []const u8,
+        args: []const []const u8,
+        euid: std.posix.uid_t,
+    ) InitError!Supervisor {
+        if (euid == 0) return error.RunUserRequired;
         return .{
             .exe_path = exe_path,
             .args = args,
         };
     }
 
-    /// Initialize with privilege drop.
-    pub fn initWithUser(exe_path: []const u8, args: []const []const u8, uid: std.posix.uid_t, gid: std.posix.gid_t) Supervisor {
+    /// Initialize with privilege drop. A root caller passing uid 0 has not
+    /// named a run user and is refused; a non-root caller may inherit.
+    pub fn initWithUser(
+        exe_path: []const u8,
+        args: []const []const u8,
+        uid: std.posix.uid_t,
+        gid: std.posix.gid_t,
+        euid: std.posix.uid_t,
+    ) InitError!Supervisor {
+        if (euid == 0 and uid == 0) return error.RunUserRequired;
         return .{
             .exe_path = exe_path,
             .args = args,
@@ -331,15 +346,25 @@ pub const Supervisor = struct {
 // ============================================================================
 
 test "Supervisor: init and basic state" {
-    const sup = Supervisor.init("/usr/local/bin/xmppd-core", &.{});
+    const sup = try Supervisor.init("/usr/local/bin/xmppd-core", &.{}, 1);
     try std.testing.expect(sup.child_pid == null);
     try std.testing.expect(sup.state == .not_started);
     try std.testing.expect(!sup.isRunning());
     try std.testing.expectEqual(@as(u32, 1000), sup.backoffMs());
 }
 
+test "Supervisor: init refuses root without a run user" {
+    try std.testing.expectError(error.RunUserRequired, Supervisor.init("/unused", &.{}, 0));
+    try std.testing.expectError(error.RunUserRequired, Supervisor.initWithUser("/unused", &.{}, 0, 0, 0));
+
+    const with_user = try Supervisor.initWithUser("/unused", &.{}, 65534, 65534, 0);
+    try std.testing.expectEqual(@as(posix.uid_t, 65534), with_user.uid);
+    const nonroot = try Supervisor.init("/unused", &.{}, 1000);
+    try std.testing.expectEqual(@as(posix.uid_t, 0), nonroot.uid);
+}
+
 test "Supervisor: handleChildExit with quick exit increases backoff" {
-    var sup = Supervisor.init("/usr/local/bin/xmppd-core", &.{});
+    var sup = try Supervisor.init("/usr/local/bin/xmppd-core", &.{}, 1);
     sup.state = .running;
     sup.child_pid = 12345;
     sup.last_start = std.time.nanoTimestamp(); // Just started
@@ -352,7 +377,7 @@ test "Supervisor: handleChildExit with quick exit increases backoff" {
 }
 
 test "Supervisor: handleChildExit during shutdown returns false" {
-    var sup = Supervisor.init("/usr/local/bin/xmppd-core", &.{});
+    var sup = try Supervisor.init("/usr/local/bin/xmppd-core", &.{}, 1);
     sup.state = .shutting_down;
     sup.child_pid = 12345;
 
@@ -361,7 +386,7 @@ test "Supervisor: handleChildExit during shutdown returns false" {
 }
 
 test "Supervisor: backoff caps at MAX_BACKOFF" {
-    var sup = Supervisor.init("/usr/local/bin/xmppd-core", &.{});
+    var sup = try Supervisor.init("/usr/local/bin/xmppd-core", &.{}, 1);
     sup.backoff_ns = MAX_BACKOFF_NS;
     sup.state = .running;
     sup.child_pid = 12345;
@@ -372,7 +397,7 @@ test "Supervisor: backoff caps at MAX_BACKOFF" {
 }
 
 test "Supervisor: shutdown sets state and clears after wait" {
-    var sup = Supervisor.init("/usr/local/bin/xmppd-core", &.{});
+    var sup = try Supervisor.init("/usr/local/bin/xmppd-core", &.{}, 1);
     sup.state = .running;
     // No real child — just test state transitions
     sup.child_pid = null;
@@ -390,7 +415,7 @@ test "Supervisor: fork and wait" {
     }
 
     // Parent — simulate supervisor state
-    var sup = Supervisor.init("/nonexistent", &.{});
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
     sup.child_pid = pid;
     sup.state = .running;
 
@@ -416,7 +441,7 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     defer posix.close(stray[0]);
     defer posix.close(stray[1]);
 
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = try Supervisor.init("/unused", &.{}, 1);
     sup.pass_fds = &.{ p1[1], p2[1] };
     const stray_child_end = stray[1];
 
@@ -435,7 +460,7 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     try std.testing.expectEqual(@as(usize, 4), n);
     try std.testing.expectEqualStrings("YY", buf[0..2]);
 
-    var sup2 = Supervisor.init("/nonexistent", &.{});
+    var sup2 = try Supervisor.init("/nonexistent", &.{}, 1);
     sup2.child_pid = pid;
     sup2.state = .running;
     _ = try sup2.waitChild();
@@ -449,7 +474,7 @@ test "Supervisor: a pass_fd already at its target survives exec" {
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p) != 0) return error.Socketpair;
     defer posix.close(p[0]);
 
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = try Supervisor.init("/unused", &.{}, 1);
     sup.pass_fds = &.{3};
 
     const pid = try posix.fork();
@@ -473,7 +498,7 @@ test "Supervisor: a pass_fd already at its target survives exec" {
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Y'), buf[0]);
 
-    var sup2 = Supervisor.init("/nonexistent", &.{});
+    var sup2 = try Supervisor.init("/nonexistent", &.{}, 1);
     sup2.child_pid = pid;
     sup2.state = .running;
     _ = try sup2.waitChild();
@@ -487,7 +512,7 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
     var p2: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p2) != 0) return error.Socketpair;
 
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = try Supervisor.init("/unused", &.{}, 1);
     sup.pass_fds = &.{ 6, 7 };
 
     const pid = try posix.fork();
@@ -529,7 +554,7 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("YY", buf[0..2]);
 
-    var sup2 = Supervisor.init("/nonexistent", &.{});
+    var sup2 = try Supervisor.init("/nonexistent", &.{}, 1);
     sup2.child_pid = pid;
     sup2.state = .running;
     _ = try sup2.waitChild();
@@ -583,7 +608,7 @@ fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
 }
 
 fn childResolveUnknownUid() callconv(.c) u8 {
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = Supervisor.init("/unused", &.{}, 1) catch return 1;
     sup.uid = 999999;
     if (sup.resolveRunGid()) |_| return 1 else |err| {
         return if (err == error.PasswdLookupFailed) 0 else 2;
@@ -591,7 +616,7 @@ fn childResolveUnknownUid() callconv(.c) u8 {
 }
 
 fn childSpawnNoPasswd() callconv(.c) u8 {
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = Supervisor.init("/unused", &.{}, 1) catch return 1;
     sup.uid = 999999;
     if (sup.spawnChild()) |_| return 1 else |err| {
         if (err != error.PasswdLookupFailed) return 2;
@@ -601,7 +626,7 @@ fn childSpawnNoPasswd() callconv(.c) u8 {
 }
 
 fn childAdoptGidZero() callconv(.c) u8 {
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = Supervisor.init("/unused", &.{}, 1) catch return 1;
     sup.uid = 65534;
     if (sup.adoptRunGid(0)) |_| return 1 else |err| {
         if (err != error.RunGidIsRoot) return 2;
@@ -612,18 +637,18 @@ fn childAdoptGidZero() callconv(.c) u8 {
 test "Supervisor: uid-only drop resolves the run user's gid" {
     // setgroups([0]) on a uid-only drop kept wheel; the gid must come from
     // the passwd entry of the run user.
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = try Supervisor.init("/unused", &.{}, 1);
     sup.uid = 65534; // nobody
     try sup.resolveRunGid();
     try std.testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
 
     // No drop configured: untouched.
-    var sup2 = Supervisor.init("/unused", &.{});
+    var sup2 = try Supervisor.init("/unused", &.{}, 1);
     try sup2.resolveRunGid();
     try std.testing.expectEqual(@as(posix.gid_t, 0), sup2.gid);
 
     // Explicit gid wins; no lookup.
-    var sup3 = Supervisor.init("/unused", &.{});
+    var sup3 = try Supervisor.init("/unused", &.{}, 1);
     sup3.uid = 65534;
     sup3.gid = 4242;
     try sup3.resolveRunGid();
@@ -737,7 +762,7 @@ test "Supervisor: spawnChild drops the child into the run user's primary group" 
     var w_open = true;
     errdefer if (w_open) posix.close(p[1]);
 
-    var sup = Supervisor.init("/bin/sh", &.{ "-c", "exec /usr/bin/id -G >&3" });
+    var sup = try Supervisor.init("/bin/sh", &.{ "-c", "exec /usr/bin/id -G >&3" }, 1);
     sup.uid = uid; // uid-only drop: the gid comes from the passwd lookup
     sup.pass_fds = &.{p[1]};
 
@@ -766,13 +791,13 @@ test "Supervisor: a run gid of 0 is refused" {
     try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
 
     // A real primary gid is adopted.
-    var sup = Supervisor.init("/unused", &.{});
+    var sup = try Supervisor.init("/unused", &.{}, 1);
     sup.uid = 65534;
     try sup.adoptRunGid(65534);
     try std.testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
 
     // uid 0 means no drop; gid 0 stays.
-    var sup2 = Supervisor.init("/unused", &.{});
+    var sup2 = try Supervisor.init("/unused", &.{}, 1);
     try sup2.adoptRunGid(0);
     try std.testing.expectEqual(@as(posix.gid_t, 0), sup2.gid);
 }
