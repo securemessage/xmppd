@@ -433,11 +433,11 @@ pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
         if (!session.sm_overflow) continue;
         session.sm_overflow = false;
         if (session.sm_detached) {
-            log.warn("session {d} outbound queue overflowed while detached — destroying (resume will fail item-not-found)", .{i});
+            log.warn("session {d} outbound queue overflowed while detached: destroying (resume will fail item-not-found)", .{i});
             session.sm_resume_enabled = false; // Prevent re-detach
             destroySession(server, i, session, changes);
         } else {
-            log.warn("connection {d} outbound queue overflowed — closing stream (resource-constraint)", .{i});
+            log.warn("connection {d} outbound queue overflowed: closing stream (resource-constraint)", .{i});
             server.sendStreamError(session, .resource_constraint);
             // Flush the stream error before teardown so the client sees it.
             session.conn.flushSync();

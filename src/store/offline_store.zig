@@ -15,8 +15,8 @@
 //!
 //! 1. Message arrives for unavailable user
 //! 2. Stanza stored in ArchiveStore (normal MAM write)
-//! 3. Pointer stored here: (recipient, sequence) → archive metadata and sender
-//! 4. User reconnects → scan pointers → fetch held payload or archive row → deliver → delete pointers
+//! 3. Pointer stored here: (recipient, sequence) -> archive metadata and sender
+//! 4. User reconnects -> scan pointers -> fetch held payload or archive row -> deliver -> delete pointers
 
 const std = @import("std");
 const backend = @import("backend");
