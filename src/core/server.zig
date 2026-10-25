@@ -119,10 +119,6 @@ const S2S_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 7;
 /// Interval for SM detached session expiry sweep (milliseconds).
 const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
 
-/// Interval for retrying stalled offline drains (S13). Shorter than the SM
-/// sweep because a held tail is user-visible latency, not a reap deadline.
-const OFFLINE_RETRY_SWEEP_MS: u32 = 5_000;
-
 /// Auth-IPC reconnect backoff (milliseconds). One-shot timer, re-armed on
 /// failure — constant pacing is deliberate: the auth daemon restarts in
 /// O(100ms) under the supervisor, and longer backoffs just extend the
@@ -405,11 +401,12 @@ pub const Session = struct {
     /// cannot overtake the tail.
     offline_pending: bool = false,
     /// S13: consecutive offline-drain stalls caused by a store error rather
-    /// than a full send buffer. A stalled drain with an empty write buffer
-    /// has no EVFILT_WRITE left to wake it, so it stages one prompt retry;
-    /// this bounds those retries so a persistently failing store cannot spin
-    /// the event loop. Past the cap the periodic sweep owns the retry.
+    /// than a full send buffer. Prompt retries are bounded so a failing store
+    /// cannot spin the event loop; a one-shot timer owns the next retry.
     offline_store_stalls: u8 = 0,
+    /// Whether the session's one-shot offline retry timer is armed. The flag
+    /// rejects a stale timer after the session slot has been reused.
+    offline_retry_timer_armed: bool = false,
     /// T178: set when the unacked queue overflowed (oldest stanza evicted).
     /// XEP-0198 has no gap signaling, so the session must be failed —
     /// reaped by session_lifecycle.reapSmOverflow at the end of the event
@@ -615,6 +612,9 @@ pub const Server = struct {
 
     /// Generic offline store — delivery pointers for unavailable recipients.
     offline: ?*GenericOfflineStore(OpBackendType) = null,
+    /// Set when a per-session offline retry timer cannot be staged. The
+    /// periodic fallback checks this flag before scanning session slots.
+    offline_retry_sweep_needed: bool = false,
 
     /// Archive store — MAM message archive (stanza payloads). Read path
     /// (queries/history/offline fetch) stays inline; WRITES go through
@@ -1323,8 +1323,8 @@ pub const Server = struct {
         // Register periodic timer for SM resume expiry sweep
         try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
 
-        // Register periodic retry for offline drains stalled on a store error
-        try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+        // Fallback for offline retry timers that could not be staged.
+        try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
 
         // Auth daemon not connected at boot (standalone run or it crashed
         // before we came up): owe a reconnect attempt (T243).
@@ -1486,6 +1486,8 @@ pub const Server = struct {
                         self.tryAuthReconnect(changes);
                     } else if (t.ident == S2S_RECONNECT_TIMER_IDENT) {
                         self.tryS2sReconnect(changes);
+                    } else {
+                        session_lifecycle.retryOfflineDrain(self, t.ident, changes);
                     }
                 },
                 .fd_error => |e| {
@@ -8797,7 +8799,7 @@ test "Server: S10 a reconnect owed by a full batch still gets its timer" {
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
     try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
     // The link dies while the batch is full: the drop stages nothing and owes
@@ -8923,7 +8925,7 @@ test "Server: S10 reconcile arms IPC write interest from a full batch" {
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
     try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
     try std.testing.expectEqual(@as(usize, 2), changes.count());
     try std.testing.expectError(error.ChangeListFull, changes.addRead(fds[1], 1));
 
@@ -9123,7 +9125,7 @@ test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
     try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, OFFLINE_RETRY_SWEEP_MS, false);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
     server.armAuthReconnect();

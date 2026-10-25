@@ -391,6 +391,8 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         }
     }
 
+    cancelOfflineRetryTimer(session, changes);
+
     // Drop any staged kqueue entries for this fd even when already closed:
     // close(2) drops the kernel-side knotes; the staged ones would hit
     // whichever connection reuses the fd number in this iteration (T238).
@@ -487,7 +489,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     if (count == 0) return;
 
     const pointers = store.getPointers(bare_jid) catch |err| {
-        stallOnStoreError(session, bare_jid, err, changes);
+        stallOnStoreError(server, session, bare_jid, err, changes);
         return;
     };
     defer store.freePointers(pointers);
@@ -501,7 +503,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         // dangling pointer and destroy a stanza that is still on its way.
         var stanza_xml = store.getHeldStanza(ptr) catch |err| {
             log.warn("offline delivery to {s} stalled: getHeldStanza failed: {s}", .{ bare_jid, @errorName(err) });
-            stallOnStoreError(session, bare_jid, err, changes);
+            stallOnStoreError(server, session, bare_jid, err, changes);
             return;
         };
         if (stanza_xml == null) {
@@ -510,7 +512,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 // would deliver later messages ahead of this one, and skipping
                 // it would retry the same pointer on every pass forever.
                 log.warn("offline delivery to {s} stalled: getMessage failed: {s}", .{ bare_jid, @errorName(err) });
-                stallOnStoreError(session, bare_jid, err, changes);
+                stallOnStoreError(server, session, bare_jid, err, changes);
                 return;
             };
         }
@@ -541,6 +543,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     }
 
     if (completed) {
+        cancelOfflineRetryTimer(session, changes);
         session.offline_pending = false;
         session.offline_store_stalls = 0;
     }
@@ -553,9 +556,9 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
 }
 
 /// Bounded prompt retries for an offline drain stalled on a store error.
-/// Beyond this the periodic sweep retries, so a persistently failing store
-/// cannot spin the event loop.
+/// Beyond this a one-shot deadline retries without scanning other sessions.
 const OFFLINE_STALL_RETRY_MAX: u8 = 8;
+pub const OFFLINE_RETRY_DELAY_MS: u32 = 5_000;
 
 /// Mark the drain stalled after a store error and make sure something will
 /// retry it. A buffer-full stall leaves data in the write buffer, so
@@ -563,6 +566,7 @@ const OFFLINE_STALL_RETRY_MAX: u8 = 8;
 /// nothing armed and the tail would sit undelivered until the next presence
 /// stanza or reconnect.
 fn stallOnStoreError(
+    server: *Server,
     session: *Session,
     bare_jid: []const u8,
     err: anyerror,
@@ -573,30 +577,67 @@ fn stallOnStoreError(
         session.offline_store_stalls += 1;
     }
     if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        changes.addWrite(session.conn.fd, session.conn.id) catch |stage_err| {
+            server.offline_retry_sweep_needed = true;
+            log.warn("offline retry write arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
+        };
         return;
     }
     if (session.offline_store_stalls > OFFLINE_STALL_RETRY_MAX) {
-        log.warn("offline delivery to {s} stalled {d} times on {s}; leaving it to the periodic retry", .{
-            bare_jid, session.offline_store_stalls, @errorName(err),
+        if (!session.offline_retry_timer_armed) {
+            changes.addTimer(session.conn.id, OFFLINE_RETRY_DELAY_MS, true) catch |stage_err| {
+                server.offline_retry_sweep_needed = true;
+                log.warn("offline retry timer for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
+                return;
+            };
+            session.offline_retry_timer_armed = true;
+        }
+        log.warn("offline delivery to {s} stalled {d} times on {s}; retrying in {d}ms", .{
+            bare_jid, session.offline_store_stalls, @errorName(err), OFFLINE_RETRY_DELAY_MS,
         });
         return;
     }
     // One-shot so the retry is a single prompt attempt, not a level-triggered
     // wake that fires on every loop pass while the store stays broken.
-    changes.addWriteOnce(session.conn.fd, session.conn.id) catch {};
+    changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+        server.offline_retry_sweep_needed = true;
+        log.warn("offline prompt retry for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
+    };
 }
 
-/// S13: retry offline drains that exhausted their prompt-retry budget. A
-/// drain stalled on a store error with an empty write buffer has no
-/// EVFILT_WRITE left to wake it, so this sweep is the only thing that can
-/// resume it without waiting for the next presence stanza or reconnect.
+fn cancelOfflineRetryTimer(session: *Session, changes: *ChangeList) void {
+    if (!session.offline_retry_timer_armed) return;
+    session.offline_retry_timer_armed = false;
+    changes.removeTimer(session.conn.id) catch |err| {
+        log.warn("offline retry timer cancel for session {d} failed: {s}", .{ session.conn.id, @errorName(err) });
+    };
+}
+
+/// Fire one session's offline retry. The armed flag rejects stale timers after
+/// teardown or session-slot reuse; a one-shot timer is already removed by kqueue.
+pub fn retryOfflineDrain(server: *Server, id: usize, changes: *ChangeList) void {
+    if (id >= server.sessions.len) return;
+    const session = server.sessions[id] orelse return;
+    if (!session.offline_retry_timer_armed) return;
+    session.offline_retry_timer_armed = false;
+    if (!session.offline_pending) return;
+    if (session.offline_store_stalls == 0) return;
+    if (session.conn.isClosed()) return;
+    session.offline_store_stalls = 0;
+    drainOfflinePending(server, session, changes);
+}
+
+/// Fallback for retry events that could not be staged. Normal retries use
+/// per-session timers, so the periodic event returns without scanning slots.
 pub fn retryStalledOfflineDrains(server: *Server, changes: *ChangeList) void {
     if (server.offline == null) return;
+    if (!server.offline_retry_sweep_needed) return;
+    server.offline_retry_sweep_needed = false;
     for (server.sessions) |slot| {
         const session = slot orelse continue;
         if (!session.offline_pending) continue;
         if (session.offline_store_stalls == 0) continue;
+        if (session.offline_retry_timer_armed) continue;
         if (session.conn.isClosed()) continue;
         session.offline_store_stalls = 0;
         drainOfflinePending(server, session, changes);
@@ -1330,9 +1371,9 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>hi</body>") != null);
 }
 
-// S13: the prompt retries are bounded so a persistently failing store cannot
-// spin the event loop; the periodic sweep owns retries after that.
-test "S13: store-error retries are bounded, then the sweep resumes" {
+// S13: prompt retries are bounded so a persistently failing store cannot
+// spin the event loop; a one-shot deadline owns retries after that.
+test "S13: store-error retries are bounded, then a one-shot timer resumes" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1396,10 +1437,46 @@ test "S13: store-error retries are bounded, then the sweep resumes" {
     try std.testing.expect(stalls == OFFLINE_STALL_RETRY_MAX);
     try std.testing.expect(session.offline_pending);
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    var retry_timer = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.TIMER and
+            ev.ident == @as(usize, @intCast(session.conn.id)) and
+            (ev.flags & std.c.EV.ONESHOT) != 0) retry_timer = true;
+    }
+    try std.testing.expect(retry_timer);
+    try std.testing.expect(session.offline_retry_timer_armed);
+    try std.testing.expect(!server.offline_retry_sweep_needed);
 
-    // Repair the pointer metadata, then the sweep delivers the archived stanza.
+    // Repair the pointer metadata, then fire the session's retry deadline.
     try repairFirstOfflinePointerForTest(&op_db);
-    retryStalledOfflineDrains(&server, &changes);
+    retryOfflineDrain(&server, session.conn.id, &changes);
     try std.testing.expect(!session.offline_pending);
+    try std.testing.expect(!session.offline_retry_timer_armed);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
+test "S13: full changelist preserves the offline retry fallback" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    var change_buf: [1]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+    defer destroySession(&server, 1, session, &changes);
+    try changes.addTimer(42, 1, true);
+
+    session.offline_store_stalls = OFFLINE_STALL_RETRY_MAX;
+    stallOnStoreError(&server, session, "bob@localhost", error.StorageError, &changes);
+
+    try std.testing.expect(session.offline_pending);
+    try std.testing.expectEqual(OFFLINE_STALL_RETRY_MAX + 1, session.offline_store_stalls);
+    try std.testing.expect(!session.offline_retry_timer_armed);
+    try std.testing.expect(server.offline_retry_sweep_needed);
 }
