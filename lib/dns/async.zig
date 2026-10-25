@@ -194,15 +194,20 @@ pub const Resolver = struct {
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
         const job = try self.alloc.create(Job);
-        job.* = .{
-            .session_key = session_key,
-            .name = try self.alloc.dupe(u8, name),
-            .phase = .raw,
-            .is_raw = true,
-        };
+        {
+            // Covers only the initializer: once freeJob is armed below it
+            // owns the destroy, and stacking both would double-free.
+            errdefer self.alloc.destroy(job);
+            job.* = .{
+                .session_key = session_key,
+                .name = try self.alloc.dupe(u8, name),
+                .phase = .raw,
+                .is_raw = true,
+            };
+        }
         errdefer self.freeJob(job);
-        try self.jobs.append(self.alloc, job);
         try self.sendQuery(job, name, qt);
+        try self.jobs.append(self.alloc, job);
     }
 
     /// SRV chain resolve. Literal IPs complete synchronously with one
@@ -219,15 +224,18 @@ pub const Resolver = struct {
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
         const job = try self.alloc.create(Job);
-        job.* = .{
-            .session_key = session_key,
-            .name = try self.alloc.dupe(u8, name),
-            .phase = .srv_tls,
-            .service_idx = @intFromEnum(service),
-        };
+        {
+            errdefer self.alloc.destroy(job);
+            job.* = .{
+                .session_key = session_key,
+                .name = try self.alloc.dupe(u8, name),
+                .phase = .srv_tls,
+                .service_idx = @intFromEnum(service),
+            };
+        }
         errdefer self.freeJob(job);
-        try self.jobs.append(self.alloc, job);
         try self.sendSrv(job, SRV_TLS[job.service_idx]);
+        try self.jobs.append(self.alloc, job);
     }
 
     // -- kqueue pump -----------------------------------------------------
@@ -1178,4 +1186,17 @@ test "dns-async: resolve() runs the SRV chain and the TTL cache serves repeats" 
     var qres2 = qctx2.raw.?;
     defer qres2.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(first_udp, srv.udp_recvd.load(.monotonic));
+}
+
+test "dns-async: a failed query build leaves no freed job in the list (J1)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+
+    try std.testing.expectError(error.InvalidName, r.resolve("bad..name", .client, 5222, 1));
+    try std.testing.expectError(error.InvalidName, r.query("bad..name", .a, 2));
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
