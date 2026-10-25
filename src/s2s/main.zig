@@ -1628,6 +1628,20 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     }
 }
 
+/// Build the SASL success answer, then record the verified domain and mark
+/// the stream authenticated. The answer must exist before any state change:
+/// a build failure leaves the session unauthenticated and records nothing
+/// (C6). S2: the FSM only reaches SASL success after DANE verified, so the
+/// verified domain joins the authenticated set; a full set means the
+/// identity cannot be recorded and the exchange fails instead of succeeding
+/// unrecorded.
+fn beginInboundSaslSuccess(session: *S2sSession, buf: []u8) ![]const u8 {
+    const success = try session.buildSaslSuccess(buf);
+    if (!session.promoteDaneCandidate()) return error.AuthenticatedDomainSetFull;
+    session.stream.completeSaslExternal();
+    return success;
+}
+
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
 fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction, batch: ?*ChangeList) void {
     var buf: [2048]u8 = undefined;
@@ -1680,20 +1694,18 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             }
         },
         .send_sasl_success => {
-            // S2: SASL EXTERNAL accepted (the FSM only reaches here after
-            // DANE verified): the verified domain joins the authenticated
-            // set. When the set is full the identity cannot be recorded and
-            // the exchange fails instead of succeeding unrecorded.
-            if (!session.promoteDaneCandidate()) {
-                log.warn("inbound S2S id={d}: authenticated-domain set full; SASL EXTERNAL rejected", .{session.id});
-                const failure = session.buildSaslFailure(&buf, "policy") catch return;
-                session.queueWrite(failure) catch {};
+            const success = beginInboundSaslSuccess(session, &buf) catch |err| {
+                if (err == error.AuthenticatedDomainSetFull) {
+                    log.warn("inbound S2S id={d}: authenticated-domain set full; SASL EXTERNAL rejected", .{session.id});
+                    const failure = session.buildSaslFailure(&buf, "policy") catch return;
+                    session.queueWrite(failure) catch {};
+                } else {
+                    log.err("inbound S2S id={d}: cannot build the SASL success", .{session.id});
+                    const failure = session.buildSaslFailure(&buf, "internal-server-error") catch return;
+                    session.queueWrite(failure) catch {};
+                }
                 return;
-            }
-            // The stream turns authenticated only once the domain is
-            // recorded (C6).
-            session.stream.completeSaslExternal();
-            const success = session.buildSaslSuccess(&buf) catch return;
+            };
             session.queueWrite(success) catch {};
             _ = session.flushWrite() catch {};
             log.info("inbound S2S authenticated: remote={s}", .{session.getRemoteDomain()});
@@ -4391,6 +4403,31 @@ test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeedin
     try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
     try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: the SASL success answer exists before the stream turns authenticated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.setDaneCandidate("them.example");
+
+    // A buffer too small for the answer: nothing is recorded and the stream
+    // stays unauthenticated.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, beginInboundSaslSuccess(in1.session, &tiny));
+    try std.testing.expect(!in1.session.stream.authenticated);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.auth_domain_count);
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+
+    // With room for the answer, the domain and the state are committed.
+    var buf: [2048]u8 = undefined;
+    const success = try beginInboundSaslSuccess(in1.session, &buf);
+    try std.testing.expectEqualStrings("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>", success);
+    try std.testing.expect(in1.session.stream.authenticated);
+    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
 }
 
 test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream unauthenticated" {
