@@ -586,6 +586,52 @@ test "SqliteBackend: a failed COMMIT rolls back and resets the table cache" {
     try std.testing.expectEqualStrings("v2", v.?);
 }
 
+test "SqliteBackend: a failed COMMIT that leaves the txn open is rolled back" {
+    const path = "/tmp/xmppd-test-sqlite-deferredfk.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    // A deferred foreign key violation fails COMMIT with the transaction
+    // still open, so only the batch's own ROLLBACK ends it. A vetoed commit
+    // (the fault hook above) proves nothing here: SQLite rolls that one back
+    // itself.
+    const setup_rc = c.sqlite3_exec(db.db,
+        \\PRAGMA foreign_keys = ON;
+        \\CREATE TABLE parent (id INTEGER PRIMARY KEY);
+        \\CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));
+        \\CREATE TRIGGER users_child AFTER INSERT ON "users"
+        \\BEGIN INSERT INTO child (parent_id) VALUES (999); END;
+    , null, null, null);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), setup_rc);
+    // The pragma switches itself off at every commit, so it is set after the
+    // DDL and applies to the batch's transaction.
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db.db, "PRAGMA defer_foreign_keys = ON", null, null, null));
+
+    const users = comptime backend.registered("users");
+    var b1 = try db.writeBatch();
+    try b1.put(users, "alice", "a");
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    try std.testing.expect(b1.ended);
+
+    // Drop the trigger outside any transaction: the failed one is gone.
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db.db, "DROP TRIGGER users_child", null, null, null));
+
+    // The connection begins again, so the ROLLBACK ran; the insert is gone.
+    var b2 = try db.writeBatch();
+    try b2.put(users, "bob", "b");
+    try b2.commit();
+
+    const alice = try db.get(std.testing.allocator, users, "alice");
+    defer if (alice) |v| std.testing.allocator.free(v);
+    try std.testing.expect(alice == null);
+
+    const bob = try db.get(std.testing.allocator, users, "bob");
+    defer if (bob) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", bob.?);
+}
+
 test "SqliteBackend: reopen preserves data" {
     const path = "/tmp/xmppd-test-sqlite-reopen.db";
     cleanDb(path);
