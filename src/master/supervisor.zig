@@ -631,10 +631,9 @@ test "Supervisor: spawnChild refuses to start when the run user has no passwd en
 }
 
 /// The identity drop runs setgroups, which needs privilege: a non-root
-/// caller on a stock host gets EPERM and the child dies at 125 (this
-/// tree's host grants the call through mac_do_auto). The probe runs the
-/// call in a forked child so the runner's own group list is never
-/// touched. The call is injectable to test the probe itself (D6).
+/// caller on a host without it gets EPERM and the child dies at 125. The
+/// probe runs the call in a forked child so the runner's own group list is
+/// never touched. The call is injectable to test the probe itself (D6).
 const SetgroupsCall = *const fn (c_int, *const posix.gid_t) callconv(.c) c_int;
 
 fn probeDropPrivilege(gid: posix.gid_t, call: SetgroupsCall) bool {
@@ -663,9 +662,11 @@ fn probeSetgroupsDenied(_: c_int, _: *const posix.gid_t) callconv(.c) c_int {
     return -1;
 }
 
-test "Supervisor: the drop-privilege probe skips without the setgroups privilege (D6)" {
-    try requireDropPrivilege(0, probeSetgroupsOk);
-    try std.testing.expectError(error.SkipZigTest, requireDropPrivilege(0, probeSetgroupsDenied));
+test "Supervisor: the drop-privilege probe reports the setgroups privilege (D6)" {
+    // A probe that is stuck reporting "no privilege" must fail the test,
+    // not turn it into a skip.
+    try std.testing.expect(probeDropPrivilege(0, probeSetgroupsOk));
+    try std.testing.expect(!probeDropPrivilege(0, probeSetgroupsDenied));
 }
 
 test "Supervisor: spawnChild drops the child into the run user's primary group" {
