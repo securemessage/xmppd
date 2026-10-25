@@ -668,10 +668,16 @@ pub fn main() !void {
     log.info("xmppd master shutdown complete", .{});
 }
 
+/// The uid and gid a child runs as.
+const RunUserIds = struct { uid: posix.uid_t, gid: posix.gid_t };
+
+/// Passwd lookup used by decideRunUser; injectable for tests.
+const RunUserLookup = *const fn ([]const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds);
+
 /// Resolve the run user's uid and gid. A missing user or an unusable name
 /// is a startup failure: falling back to uid 0 would run the children as
 /// root (C5). Logging belongs to the caller.
-fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong }!struct { uid: posix.uid_t, gid: posix.gid_t }) {
+fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds) {
     var user_buf: [256]u8 = undefined;
     if (username.len >= user_buf.len) return error.RunUserTooLong;
     @memcpy(user_buf[0..username.len], username);
@@ -685,14 +691,20 @@ fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong 
 /// does not drop privileges and is refused. Without root and without a
 /// run user the children inherit the master's identity (0/0 means
 /// "inherit" at the supervisor call sites).
-fn decideRunUser(username: ?[]const u8, euid: posix.uid_t) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!struct { uid: posix.uid_t, gid: posix.gid_t }) {
+fn decideRunUser(username: ?[]const u8, euid: posix.uid_t) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    return decideRunUserWith(username, euid, &resolveRunUser);
+}
+
+/// The decision with an injectable lookup: the refusal compares the
+/// resolved uid, so any name that resolves to uid 0 is refused.
+fn decideRunUserWith(username: ?[]const u8, euid: posix.uid_t, lookup: RunUserLookup) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!RunUserIds) {
     const name = username orelse {
         if (euid == 0) return error.RunUserRequired;
         return .{ .uid = 0, .gid = 0 };
     };
-    const ids = try resolveRunUser(name);
+    const ids = try lookup(name);
     if (ids.uid == 0) return error.RunUserIsRoot;
-    return .{ .uid = ids.uid, .gid = ids.gid };
+    return ids;
 }
 
 /// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
@@ -1024,4 +1036,25 @@ test "decideRunUser: an unprivileged run user resolves to its passwd entry" {
     try std.testing.expectEqual(expected.uid, ids.uid);
     try std.testing.expectEqual(expected.gid, ids.gid);
     try std.testing.expect(ids.uid != 0);
+}
+
+/// Any non-empty name resolves to uid 0, like the conventional toor alias.
+fn lookupUidZero(name: []const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    if (name.len == 0) return error.RunUserNotFound;
+    return .{ .uid = 0, .gid = 0 };
+}
+
+test "decideRunUser: a uid-0 alias is refused by uid, not by name" {
+    // A name comparison against "root" would admit any alias that resolves
+    // to uid 0. The stub keeps the test independent of the host passwd
+    // database.
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUserWith("toor", 0, &lookupUidZero));
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUserWith("alias", 0, &lookupUidZero));
+
+    // The real lookup agrees when the host carries the conventional toor
+    // alias; hosts without it skip this half.
+    const ids = resolveRunUser("toor") catch return;
+    if (ids.uid == 0) {
+        try std.testing.expectError(error.RunUserIsRoot, decideRunUser("toor", 0));
+    }
 }
