@@ -102,6 +102,10 @@ const Job = struct {
     phase: Phase,
     service_idx: u8 = 0,
     is_raw: bool = false,
+    /// Index into the resolver's slot table; paired with `gen` so a
+    /// queued timer event can be told apart from a live job.
+    slot: u8 = 0,
+    gen: u16 = 0,
 
     srv_list: std.ArrayListUnmanaged(SrvEnt) = .{},
     srv_pos: usize = 0,
@@ -141,6 +145,11 @@ pub const Resolver = struct {
     server: net.Address = undefined,
     server_configured: bool = false,
     jobs: std.ArrayListUnmanaged(*Job) = .{},
+    /// Slot table for timer udata: a queued deadline event carries
+    /// (gen, slot) so a job freed by an earlier event in the same
+    /// kevent batch is never touched (C3 pattern).
+    slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
+    slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
     next_id: u16 = 0,
     cb: Cb = .{ .ctx = null, .fun = noopCallback },
     qcb: QueryCb = .{ .ctx = null, .fun = noopQueryCallback },
@@ -193,18 +202,9 @@ pub const Resolver = struct {
         }
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
-        const job = try self.alloc.create(Job);
-        {
-            // Covers only the initializer: once freeJob is armed below it
-            // owns the destroy, and stacking both would double-free.
-            errdefer self.alloc.destroy(job);
-            job.* = .{
-                .session_key = session_key,
-                .name = try self.alloc.dupe(u8, name),
-                .phase = .raw,
-                .is_raw = true,
-            };
-        }
+        const job = try self.allocJob(session_key, name);
+        job.phase = .raw;
+        job.is_raw = true;
         errdefer self.freeJob(job);
         try self.sendQuery(job, name, qt);
         try self.jobs.append(self.alloc, job);
@@ -223,16 +223,9 @@ pub const Resolver = struct {
 
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) return error.TooManyJobs;
-        const job = try self.alloc.create(Job);
-        {
-            errdefer self.alloc.destroy(job);
-            job.* = .{
-                .session_key = session_key,
-                .name = try self.alloc.dupe(u8, name),
-                .phase = .srv_tls,
-                .service_idx = @intFromEnum(service),
-            };
-        }
+        const job = try self.allocJob(session_key, name);
+        job.phase = .srv_tls;
+        job.service_idx = @intFromEnum(service);
         errdefer self.freeJob(job);
         try self.sendSrv(job, SRV_TLS[job.service_idx]);
         try self.jobs.append(self.alloc, job);
@@ -267,8 +260,9 @@ pub const Resolver = struct {
         const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
         for (events[0..n]) |ev| {
             if (ev.filter == std.c.EVFILT.TIMER) {
-                const job: *Job = @ptrFromInt(ev.udata);
-                self.onDeadline(job);
+                // The event may have been queued before the job was
+                // freed by an earlier event in this same batch.
+                if (self.jobFromUdata(ev.udata)) |job| self.onDeadline(job);
             } else if (ev.filter == std.c.EVFILT.READ) {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
@@ -307,8 +301,31 @@ pub const Resolver = struct {
         return self.next_id;
     }
 
-    /// Arm the job's one-shot deadline; udata carries the job pointer so
-    /// a fired timer always finds its owner regardless of list order.
+    /// Allocate a job in a free slot and stamp it with that slot's
+    /// generation; timer udata carries both so a queued event naming a
+    /// freed job is ignored instead of dereferenced.
+    fn allocJob(self: *Resolver, session_key: usize, name: []const u8) !*Job {
+        const job = try self.alloc.create(Job);
+        errdefer self.alloc.destroy(job);
+        job.* = .{
+            .session_key = session_key,
+            .name = try self.alloc.dupe(u8, name),
+            .phase = .srv_tls,
+        };
+        for (&self.slots, 0..) |*s, i| {
+            if (s.* == null) {
+                self.slot_gen[i] +%= 1;
+                s.* = job;
+                job.slot = @intCast(i);
+                job.gen = self.slot_gen[i];
+                return job;
+            }
+        }
+        return error.TooManyJobs;
+    }
+
+    /// Arm the job's one-shot deadline; udata carries (gen, slot) so an
+    /// event queued before the job's free is recognized as stale.
     fn armDeadline(self: *Resolver, job: *Job, ms: i64) void {
         var ch = [1]posix.Kevent{.{
             .ident = @intFromPtr(job),
@@ -316,7 +333,7 @@ pub const Resolver = struct {
             .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
             .fflags = 0, // default unit is ms
             .data = @intCast(ms),
-            .udata = @intFromPtr(job),
+            .udata = (@as(usize, job.gen) << 8) | job.slot,
         }};
         _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
     }
@@ -324,6 +341,17 @@ pub const Resolver = struct {
     fn disarmDeadline(self: *Resolver, job: *Job) void {
         var ch = [1]posix.Kevent{.{ .ident = @intFromPtr(job), .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 }};
         _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+    }
+
+    /// Resolve a timer event's (gen, slot) udata back to a live job;
+    /// null when the job was freed or its slot was re-used.
+    fn jobFromUdata(self: *Resolver, udata: usize) ?*Job {
+        const slot: usize = udata & 0xFF;
+        const gen: u16 = @intCast(udata >> 8);
+        if (slot >= MAX_JOBS) return null;
+        const job = self.slots[slot] orelse return null;
+        if (self.slot_gen[slot] != gen) return null;
+        return job;
     }
 
     fn sendQuery(self: *Resolver, job: *Job, qname: []const u8, qtype: u16) !void {
@@ -751,6 +779,7 @@ pub const Resolver = struct {
     }
 
     fn freeJob(self: *Resolver, job: *Job) void {
+        if (self.slots[job.slot] == job) self.slots[job.slot] = null;
         self.disarmDeadline(job);
         if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
         job.tcp_buf.deinit(self.alloc);
@@ -1253,4 +1282,28 @@ test "dns-async: TCP frame length math and consumption (J2)" {
     r.onTcpReadable(fds[1]);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 0), job.tcp_buf.items.len);
+}
+
+test "dns-async: a deadline event batched with the reply does not touch a freed job (J3)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    r.armDeadline(job, 1);
+    // The reply and the expired deadline are harvested in one kevent
+    // batch; the reply frees the job first, so the timer event must be
+    // recognized as stale.
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
