@@ -387,6 +387,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                         return;
                     }
                 } else {
+                    _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
                     log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
                 }
             }
@@ -450,6 +451,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             // tail, so tell the sender instead of dropping it silently.
             if (!hold_bounced) {
                 hold_bounced = true;
+                _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
                 log.info("connection {d} message to {s} not held, offline queue unavailable or full", .{ session.conn.id, to_str });
                 sendServiceUnavailable(session, id_str, to_str, from_str);
                 if (session.conn.hasPendingWrite()) {

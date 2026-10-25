@@ -32,6 +32,12 @@ pub const MAX_PAYLOAD_SIZE = 4080;
 /// worker increments it; the M1 metrics task can export it later.
 pub var cross_worker_drops = std.atomic.Value(u64).init(0);
 
+/// Delivery outcomes exported by the R5 metrics gate. All are process-wide and
+/// incremented by multiple workers.
+pub var s2s_bounces = std.atomic.Value(u64).init(0);
+pub var offline_not_stored = std.atomic.Value(u64).init(0);
+pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
+
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.

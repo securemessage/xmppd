@@ -2973,7 +2973,9 @@ pub const Server = struct {
             .stanza_xml = fbs.getWritten(),
         } }) catch {
             log.err("failed to bounce S2S inbound for {s}", .{remote_from});
+            return;
         };
+        _ = delivery_queue_mod.s2s_bounces.fetchAdd(1, .monotonic);
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
@@ -3102,7 +3104,9 @@ pub const Server = struct {
                         }
                         fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
                     } else if (self.delivery_system) |ds| {
-                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml) catch {};
+                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml) catch {
+                            _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+                        };
                     }
                 }
                 log.info("S2S inbound from {s} delivered to {d} session(s)", .{ m.from_jid, target_count });
@@ -6610,6 +6614,7 @@ test "Server: E2d an oversized archive form is not stored offline" {
     @memset(long_id, 'x');
     alice.stanza_id = long_id;
 
+    const not_stored_before = delivery_queue_mod.offline_not_stored.load(.monotonic);
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     router.dispatchStanza(&server, &alice, &changes);
@@ -6626,6 +6631,7 @@ test "Server: E2d an oversized archive form is not stored offline" {
         allocator.free(archived.messages);
     }
     try std.testing.expectEqual(@as(usize, 0), archived.messages.len);
+    try std.testing.expectEqual(not_stored_before + 1, delivery_queue_mod.offline_not_stored.load(.monotonic));
 }
 
 // E2b: an inbound S2S stanza for an offline local user is stored with its
@@ -6761,6 +6767,7 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     }
 
     const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r2' type='chat'><body>too much</body></message>";
+    const bounces_before = delivery_queue_mod.s2s_bounces.load(.monotonic);
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     server.dispatchS2sResponse(.{ .s2s_inbound = .{
@@ -6788,6 +6795,7 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     try std.testing.expectEqualStrings("carol@example.com/res", delivered.to_jid);
     try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "service-unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "id='r2'") != null);
+    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.s2s_bounces.load(.monotonic));
 }
 
 // E2b: with no offline store the inbound message still bounces rather than
@@ -7315,6 +7323,7 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     @memcpy(alice.stanza_buf[0..body.len], body);
     alice.stanza_buf_len = body.len;
 
+    const hold_bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     router.dispatchStanza(&server, &alice, &changes);
@@ -7329,12 +7338,49 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
 
     // Nothing was held: the queue is still exactly at quota.
     try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(hold_bounces_before + 1, delivery_queue_mod.offline_hold_bounces.load(.monotonic));
 
     // bob got nothing out of order.
     _ = target.conn.flushSend() catch {};
     var tbuf: [4096]u8 = undefined;
     const tn = posix.read(target_fds[1], &tbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), tn);
+}
+
+test "Server: R5 S2S cross-worker delivery drops are counted" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    _ = try sm.bind(1, 7, "bob", "localhost", "mobile");
+    sm.setPresenceAvailable("bob", "localhost", "mobile", true);
+
+    const stanza = try allocator.alloc(u8, 4200);
+    defer allocator.free(stanza);
+    const prefix = "<message from='carol@example.com/res' to='bob@localhost' id='drop' type='chat'><body>";
+    const suffix = "</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'x');
+    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+
+    const drops_before = delivery_queue_mod.cross_worker_drops.load(.monotonic);
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &changes);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.cross_worker_drops.load(.monotonic));
 }
 
 test "S14: failed cross-worker resource does not block local delivery" {
