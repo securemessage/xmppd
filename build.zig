@@ -279,6 +279,24 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
+
+    // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
+    const esc_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/xml_escape_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    esc_bench_mod.addImport("xml-writer", b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const esc_bench = b.addExecutable(.{
+        .name = "xml-escape-bench",
+        .root_module = esc_bench_mod,
+    });
+    const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
+    bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
