@@ -70,8 +70,8 @@ pub const StanzaWriter = struct {
         return .{ .out = out };
     }
 
-    /// `<name` — opens a start tag. Attributes follow until elementOpenEnd
-    /// or elementSelfClose.
+    /// Emits `<name`, opening a start tag. Attributes follow until
+    /// elementOpenEnd or elementSelfClose.
     pub fn elementOpen(self: *StanzaWriter, name: []const u8) Error!void {
         assert(!self.in_start_tag);
         assert(self.depth < max_depth);
@@ -96,14 +96,14 @@ pub const StanzaWriter = struct {
         self.emitByte('\'');
     }
 
-    /// `>` — ends an open start tag.
+    /// Emits `>`, ending an open start tag.
     pub fn elementOpenEnd(self: *StanzaWriter) void {
         assert(self.in_start_tag);
         self.emitByte('>');
         self.in_start_tag = false;
     }
 
-    /// `/>` — ends an open start tag and its element.
+    /// Emits `/>`, ending an open start tag and its element.
     pub fn elementSelfClose(self: *StanzaWriter) void {
         assert(self.in_start_tag);
         assert(self.depth > 0);
