@@ -168,9 +168,11 @@ pub const S2sDaemon = struct {
             ob_slot.* = null;
         }
 
+        // Connections hold SSL objects created from these contexts; free
+        // them first, as SslContext.deinit requires.
+        self.pool.deinit();
         if (self.tls_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
-        self.pool.deinit();
         self.ipc.deinit();
         self.allocator.destroy(self.ipc);
 
@@ -419,6 +421,12 @@ pub const S2sDaemon = struct {
     /// that can never fit the write buffer is failed to the sender instead
     /// of wedging the queue.
     fn flushOutboundStanzas(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        // Stanzas never travel before TLS. A conn in .established without a
+        // TLS layer is a downgrade: keep the queue where it is.
+        if (conn.tls_conn == null) {
+            log.warn("outbound {s}: refusing to flush stanzas without TLS", .{conn.remote_domain});
+            return;
+        }
         const items = conn.pending_stanzas.items;
         var i: usize = 0;
         var kept: usize = 0;
@@ -1915,6 +1923,14 @@ fn processOutboundEvent(
             // <starttls> features
             if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls)) {
                 if (std.mem.eql(u8, elem.local_name, "proceed")) {
+                    // Only an answered <starttls/> may proceed; a peer that
+                    // sends it unsolicited is trying to skip negotiation.
+                    if (conn.state != .starttls_negotiation or conn.tls_conn != null) {
+                        log.warn("outbound {s}: unsolicited STARTTLS proceed (state={s}); failing the stream", .{ conn.remote_domain, @tagName(conn.state) });
+                        conn.fail("unsolicited-starttls-proceed");
+                        daemon.closeOutbound(batch, slot);
+                        return;
+                    }
                     log.info("outbound STARTTLS proceed from {s}", .{conn.remote_domain});
                     reader.reset();
                     if (conn.handleStarttlsProceed()) {
@@ -1944,6 +1960,15 @@ fn processOutboundEvent(
             } else if (std.mem.eql(u8, elem.local_name, "success") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
             {
+                // A SASL outcome is only meaningful after TLS and our
+                // <auth/>; accepting one earlier marks a cleartext conn
+                // established and lets keys and stanzas out unprotected.
+                if (!conn.canAcceptSaslOutcome()) {
+                    log.warn("outbound {s}: unsolicited SASL success (state={s}, tls={any}); failing the stream", .{ conn.remote_domain, @tagName(conn.state), conn.tls_conn != null });
+                    conn.fail("unsolicited-sasl-success");
+                    daemon.closeOutbound(batch, slot);
+                    return;
+                }
                 log.info("outbound SASL success from {s}", .{conn.remote_domain});
                 conn.handleAuthSuccess();
 
@@ -1956,6 +1981,12 @@ fn processOutboundEvent(
             } else if (std.mem.eql(u8, elem.local_name, "failure") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
             {
+                if (!conn.canAcceptSaslOutcome()) {
+                    log.warn("outbound {s}: unsolicited SASL failure (state={s}, tls={any}); failing the stream", .{ conn.remote_domain, @tagName(conn.state), conn.tls_conn != null });
+                    conn.fail("unsolicited-sasl-failure");
+                    daemon.closeOutbound(batch, slot);
+                    return;
+                }
                 log.warn("outbound SASL failure from {s}", .{conn.remote_domain});
                 conn.handleAuthFailure();
                 daemon.closeOutbound(batch, slot);
@@ -1975,31 +2006,39 @@ fn processOutboundEvent(
                     if (std.mem.eql(u8, attr.local_name, "to")) r_to = attr.value;
                 }
                 // XEP-0185: the verdict on our db:verify is a typed db:result
-                // echoing the id. Complete the matching callback entry only;
-                // an unmatched verdict never authenticates anything here.
-                if (result_type.len > 0) {
-                    if (conn.findPendingVerify(r_id, r_from, r_to)) |idx| {
-                        log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
-                        handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
-                        return;
-                    }
-                    // The verdict on the dialback key this connection sent:
-                    // it authenticates the connection only while that
-                    // exchange is outstanding.
-                    if (conn.takePendingAssertion(r_from, r_to)) {
-                        if (std.mem.eql(u8, result_type, "valid")) {
-                            log.info("outbound dialback verified by {s}", .{conn.remote_domain});
-                            conn.handleAuthSuccess();
-                            daemon.flushOutboundStanzas(batch, conn);
-                        } else {
-                            log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
-                            conn.handleAuthFailure();
-                            daemon.closeOutbound(batch, slot);
-                        }
-                        return;
-                    }
-                    log.warn("dialback: unmatched db:result verdict type={s} from {s} (id={s} from={s} to={s}); ignored", .{ result_type, conn.remote_domain, r_id, r_from, r_to });
+                // echoing the id. Complete the matching callback entry only.
+                // A db:result that answers no exchange we sent is a peer
+                // claiming an auth outcome out of state: fail the stream.
+                if (result_type.len == 0) {
+                    log.warn("dialback: db:result without type from {s}; failing the stream", .{conn.remote_domain});
+                    conn.fail("unexpected-db-result");
+                    daemon.closeOutbound(batch, slot);
+                    return;
                 }
+                if (conn.findPendingVerify(r_id, r_from, r_to)) |idx| {
+                    log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
+                    handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
+                    return;
+                }
+                // The verdict on the dialback key this connection sent:
+                // it authenticates the connection only while that
+                // exchange is outstanding.
+                if (conn.takePendingAssertion(r_from, r_to)) {
+                    if (std.mem.eql(u8, result_type, "valid")) {
+                        log.info("outbound dialback verified by {s}", .{conn.remote_domain});
+                        conn.handleAuthSuccess();
+                        daemon.flushOutboundStanzas(batch, conn);
+                    } else {
+                        log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
+                        conn.handleAuthFailure();
+                        daemon.closeOutbound(batch, slot);
+                    }
+                    return;
+                }
+                log.warn("dialback: unmatched db:result verdict type={s} from {s} (id={s} from={s} to={s}); failing the stream", .{ result_type, conn.remote_domain, r_id, r_from, r_to });
+                conn.fail("unmatched-db-result");
+                daemon.closeOutbound(batch, slot);
+                return;
             }
             // Handle db:verify response (dialback callback path)
             else if (std.mem.eql(u8, elem.local_name, "verify") and
@@ -2062,9 +2101,18 @@ fn processOutboundEvent(
                         var act_buf: [512]u8 = undefined;
                         const ext = conn.buildSaslExternal(&act_buf) catch return;
                         conn.queueWrite(ext) catch return;
+                        conn.sasl_auth_sent = true;
                         _ = conn.flushWrite() catch return;
                     },
                     .begin_dialback => {
+                        // The dialback key is authentication material: it
+                        // never travels before TLS, whatever the FSM says.
+                        if (conn.tls_conn == null) {
+                            log.warn("outbound {s}: dialback key requested before TLS; failing the stream", .{conn.remote_domain});
+                            conn.fail("dialback-key-before-tls");
+                            daemon.closeOutbound(batch, slot);
+                            return;
+                        }
                         const stream_id = conn.getRemoteStreamId();
                         if (stream_id.len == 0) {
                             log.err("outbound dialback for {s}: no remote stream ID", .{conn.remote_domain});
@@ -2702,13 +2750,10 @@ test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow t
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.SocketPairFailed;
-    defer posix.close(fds[1]);
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
 
-    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
-    conn.fd = fds[0];
+    const conn = link.conn;
     conn.handleAuthSuccess(); // mark established without the protocol dance
 
     const pad = try alloc.alloc(u8, 9000);
@@ -2734,13 +2779,10 @@ test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275)
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.SocketPairFailed;
-    defer posix.close(fds[1]);
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
 
-    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
-    conn.fd = fds[0];
+    const conn = link.conn;
     conn.handleAuthSuccess();
     daemon.outbound[0] = conn; // writable-edge dispatch finds it by slot
 
@@ -2767,16 +2809,16 @@ test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275)
     const ev = cl.slice()[0];
     try std.testing.expect(ev.filter == std.c.EVFILT.WRITE);
     try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
-    try std.testing.expectEqual(@as(@TypeOf(ev.ident), @intCast(fds[0])), ev.ident);
+    try std.testing.expectEqual(@as(@TypeOf(ev.ident), @intCast(conn.fd)), ev.ident);
     try std.testing.expectEqual(@as(@TypeOf(ev.udata), OUTBOUND_UDATA_BASE), ev.udata);
 
     // Drain the peer so the next flush has room, then fire the writable
     // edge with NO new stanza arriving: the tail must resume by itself.
     var rbuf: [20480]u8 = undefined;
-    _ = drainPeer(fds[1], &rbuf);
+    _ = drainTlsPeer(&link.peer, &rbuf);
     handleOutboundWritable(&daemon, &cl, 0);
     try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
-    const got = rbuf[0..drainPeer(fds[1], &rbuf)];
+    const got = rbuf[0..drainTlsPeer(&link.peer, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, got, "b@them.example") != null);
 }
 
@@ -2785,13 +2827,10 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.SocketPairFailed;
-    defer posix.close(fds[1]);
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
 
-    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
-    conn.fd = fds[0];
+    const conn = link.conn;
     conn.handleAuthSuccess();
 
     // A stanza that can never fit the 16 KiB write buffer, queued ahead of
@@ -2819,7 +2858,7 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     // The queue drains: oversize failed to the sender, the follower went out.
     try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
     var rbuf: [4096]u8 = undefined;
-    const got = rbuf[0..drainPeer(fds[1], &rbuf)];
+    const got = rbuf[0..drainTlsPeer(&link.peer, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, got, "after") != null);
 
     // The bounce reached the core client as a delivery-failed notice.
@@ -2955,13 +2994,26 @@ fn makeTestInbound(alloc: std.mem.Allocator, daemon: *S2sDaemon, slot: usize) !s
     return .{ .session = session, .peer_fd = fds[1] };
 }
 
-/// Read whatever is currently available on a non-blocking peer fd.
+/// Read what a non-blocking peer fd has sent. A write on loopback is not
+/// always visible to the reader in the same instant, so wait briefly for
+/// the first byte and stop once the stream stays idle.
 fn drainPeer(fd: posix.fd_t, buf: []u8) usize {
     var total: usize = 0;
+    var idle_ms: usize = 0;
     while (total < buf.len) {
-        const n = posix.read(fd, buf[total..]) catch return total;
+        const n = posix.read(fd, buf[total..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (total > 0 and idle_ms >= 20) return total;
+                if (idle_ms >= 200) return total;
+                std.Thread.sleep(std.time.ns_per_ms);
+                idle_ms += 1;
+                continue;
+            },
+            else => return total,
+        };
         if (n == 0) return total;
         total += n;
+        idle_ms = 0;
     }
     return total;
 }
@@ -3006,12 +3058,14 @@ fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeL
 
 /// Self-signed throwaway cert for "localhost" via the openssl CLI (no key
 /// material in the tree). error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
 fn genS2sTestCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
         .cwd_dir = dir,
-        .max_output_bytes = 4096,
+        .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
     defer std.testing.allocator.free(r.stdout);
     defer std.testing.allocator.free(r.stderr);
@@ -3046,6 +3100,11 @@ fn makeS2sTestTcpPair() ![2]posix.fd_t {
     };
     const server_fd = posix.accept(listen_fd, null, null, posix.SOCK.NONBLOCK) catch return error.AcceptFailed;
     errdefer posix.close(server_fd);
+    // Small protocol writes must not wait on Nagle: tests read the peer
+    // immediately after a write and would race a delayed segment.
+    const nodelay_one: c_int = 1;
+    posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+    posix.setsockopt(server_fd, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
     return .{ client_fd, server_fd };
 }
 
@@ -3129,17 +3188,414 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)
     try pf.checkQuarantine();
 }
 
-/// An established callback connection on a socketpair: db:verify is written
-/// to the returned peer fd instead of the network, so no DNS happens.
-fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
+/// Initialize the daemon's TLS contexts for a test link. The cert comes
+/// from the openssl CLI. kTLS is off on both ends: two kTLS peers over
+/// loopback hit FreeBSD PR 296498.
+fn ensureTestTlsContexts(daemon: *S2sDaemon) !void {
+    if (daemon.tls_ctx != null and daemon.tls_client_ctx != null) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genS2sTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+    var server_ctx = try SslContext.initServer(cert_path, key_path);
+    errdefer server_ctx.deinit();
+    server_ctx.disableKtls();
+    var client_ctx = try SslContext.initClient();
+    errdefer client_ctx.deinit();
+    client_ctx.disableKtls();
+    daemon.tls_ctx = server_ctx;
+    daemon.tls_client_ctx = client_ctx;
+}
+
+/// Drive both ends of a non-blocking TLS handshake to completion.
+fn completeTestTlsHandshake(client: *SslConn, server: *SslConn) !void {
+    var c_done = false;
+    var s_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while ((!c_done or !s_done) and std.time.milliTimestamp() < deadline) {
+        if (!c_done) c_done = (try client.doHandshake()) == .complete;
+        if (!s_done) s_done = (try server.doHandshake()) == .complete;
+    }
+    if (!c_done or !s_done) return error.TlsHandshakeTimeout;
+}
+
+/// Read decrypted bytes the peer has sent. Stops at want_read once
+/// OpenSSL has nothing buffered.
+fn drainTlsPeer(peer: *SslConn, buf: []u8) usize {
+    var total: usize = 0;
+    var idle_ms: usize = 0;
+    while (total < buf.len) {
+        const r = peer.read(buf[total..]) catch return total;
+        switch (r) {
+            .ok => |n| {
+                if (n == 0) return total;
+                total += n;
+                idle_ms = 0;
+            },
+            .want_read, .want_write => {
+                if (peer.pending() > 0) continue;
+                // Give a slow loopback segment a moment before treating the
+                // peer as drained; return early once data has arrived and
+                // the stream stays idle.
+                if (total > 0 and idle_ms >= 20) return total;
+                if (idle_ms >= 200) return total;
+                std.Thread.sleep(std.time.ns_per_ms);
+                idle_ms += 1;
+            },
+        }
+    }
+    return total;
+}
+
+/// A TLS-protected outbound link to a test peer. The conn owns its fd;
+/// deinit frees the peer SSL object and closes the peer fd.
+const TestTlsLink = struct {
+    conn: *OutboundConnection,
+    peer: SslConn,
+    peer_fd: posix.fd_t,
+
+    fn deinit(self: *TestTlsLink) void {
+        if (self.peer_fd >= 0) {
+            self.peer.shutdown();
+            posix.close(self.peer_fd);
+            self.peer_fd = -1;
+        }
+        self.peer.deinit();
+    }
+};
+
+/// Connect a fresh outbound conn to a loopback TLS peer, complete the
+/// handshake, and return the link. The conn stays in its initial state so
+/// callers drive the protocol.
+fn makeTestTlsLink(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    try ensureTestTlsContexts(daemon);
+    const fds = try makeS2sTestTcpPair();
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
     const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    var client = try SslConn.initClient(daemon.tls_client_ctx.?, fds[0], "localhost");
+    errdefer client.deinit();
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    errdefer peer.deinit();
+    try completeTestTlsHandshake(&client, &peer);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    conn.tls_conn = client;
+    conn.tls_state = .established;
+    return .{ .conn = conn, .peer = peer, .peer_fd = fds[1] };
+}
+
+/// Start TLS on an already-connected conn and its test peer, completing
+/// the handshake. Returns the peer end.
+fn attachTestTls(daemon: *S2sDaemon, conn: *OutboundConnection, peer_fd: posix.fd_t) !SslConn {
+    try ensureTestTlsContexts(daemon);
+    var client = try SslConn.initClient(daemon.tls_client_ctx.?, conn.fd, "localhost");
+    errdefer client.deinit();
+    var peer = try SslConn.init(daemon.tls_ctx.?, peer_fd);
+    errdefer peer.deinit();
+    try completeTestTlsHandshake(&client, &peer);
+    conn.tls_conn = client;
+    conn.tls_state = .established;
+    return peer;
+}
+
+/// An established callback connection over TLS: db:verify is written to
+/// the returned peer instead of the network, so no DNS happens.
+fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    var link = try makeTestTlsLink(daemon, origin);
+    link.conn.handleAuthSuccess(); // skip the protocol dance
+    return link;
+}
+
+/// A connected outbound conn with no TLS layer, for the pre-STARTTLS
+/// downgrade tests.
+fn makeTestCleartextConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
     var fds: [2]posix.fd_t = undefined;
     if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
         return error.SocketPairFailed;
     errdefer posix.close(fds[1]);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
     conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
-    conn.handleAuthSuccess(); // skip the protocol dance
     return .{ .conn = conn, .peer_fd = fds[1] };
+}
+
+fn feedSaslOutcome(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, name: []const u8) void {
+    var attrs = [_]xml.Attribute{};
+    const elem = xml.Element{
+        .name = name,
+        .prefix = "",
+        .local_name = name,
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+test "S2sDaemon: an unsolicited SASL success before STARTTLS fails the stream and writes nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.state = .stream_open;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    feedSaslOutcome(&daemon, t.conn, &cl, &reader, "success");
+
+    // A cleartext peer cannot authenticate the link: no stream restart, no
+    // stanza flush, no established state.
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-success", t.conn.error_msg);
+    try std.testing.expect(!t.conn.isEstablished());
+    try std.testing.expect(!t.conn.stream.authenticated);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
+}
+
+test "S2sDaemon: a SASL outcome is refused until our auth request went out" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+    const conn = link.conn;
+    conn.state = .authenticating;
+    conn.stream.state = .authenticating;
+    try std.testing.expect(!conn.sasl_auth_sent);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    feedSaslOutcome(&daemon, conn, &cl, &reader, "success");
+    try std.testing.expect(conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-success", conn.error_msg);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainTlsPeer(&link.peer, &wire));
+}
+
+test "S2sDaemon: a SASL success after our auth request establishes the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+    const conn = link.conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // Post-TLS features with DANE verified select SASL EXTERNAL: the
+    // <auth/> goes out and the outcome becomes acceptable.
+    conn.stream.dane_verified = true;
+    conn.stream.state = .features_auth;
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    try std.testing.expect(conn.sasl_auth_sent);
+    try std.testing.expectEqual(connector_mod.OutboundState.authenticating, conn.state);
+
+    feedSaslOutcome(&daemon, conn, &cl, &reader, "success");
+    try std.testing.expect(conn.isEstablished());
+    try std.testing.expect(conn.stream.authenticated);
+
+    var wire: [1024]u8 = undefined;
+    const sent = wire[0..drainTlsPeer(&link.peer, &wire)];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<stream:stream") != null);
+}
+
+test "S2sDaemon: an unsolicited SASL failure and STARTTLS proceed fail the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    const f1 = try makeTestCleartextConn(&daemon, "one.example");
+    defer posix.close(f1.peer_fd);
+    f1.conn.state = .stream_open;
+    feedSaslOutcome(&daemon, f1.conn, &cl, &reader, "failure");
+    try std.testing.expect(f1.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-failure", f1.conn.error_msg);
+
+    const f2 = try makeTestCleartextConn(&daemon, "two.example");
+    defer posix.close(f2.peer_fd);
+    f2.conn.state = .stream_open;
+    var attrs = [_]xml.Attribute{};
+    const proceed = xml.Element{
+        .name = "proceed",
+        .prefix = "",
+        .local_name = "proceed",
+        .namespace_uri = xml.ns.tls,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, f2.conn, &reader, .{ .element_start = proceed });
+    try std.testing.expect(f2.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-starttls-proceed", f2.conn.error_msg);
+    try std.testing.expect(!f2.conn.isTlsHandshaking());
+}
+
+test "S2sDaemon: a db:result verdict for a verify that never went out authenticates nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A cleartext callback conn cannot send the verify (no TLS), so a
+    // matching verdict must not stand in for one.
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    daemon.outbound[0] = t.conn; // the failure tears it out of the slot
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "abababababababababababababababababababababababababababababababab";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(t.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), t.conn.pendingVerifyCount());
+    const sid = try alloc.dupe(u8, in1.session.getStreamId());
+    defer alloc.free(sid);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    var attrs = [_]xml.Attribute{ testAttr("type", "valid"), testAttr("id", sid), testAttr("from", "them.example"), testAttr("to", "us.example") };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, t.conn, &reader, .{ .element_start = elem });
+
+    // The unsent exchange is answered invalid and the stream fails; the
+    // inbound session never becomes authenticated.
+    try std.testing.expect(daemon.outbound[0] == null);
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a dialback key is never sent before TLS" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A peer that advertises auth features before STARTTLS must not make
+    // us put the dialback key on a cleartext link.
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.state = .stream_open;
+    t.conn.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    processOutboundEvent(&daemon, &cl, 0, t.conn, &reader, .{ .element_end = "features" });
+
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("dialback-key-before-tls", t.conn.error_msg);
+    try std.testing.expect(!t.conn.db_assertion_pending);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
+}
+
+test "S2sDaemon: a cleartext db:result verdict cannot answer our dialback key" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.db_assertion_pending = true; // key marked sent, but no TLS
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedDbResultVerdict(&daemon, t.conn, &cl, &reader, "valid", "them.example", "us.example");
+
+    try std.testing.expect(!t.conn.isEstablished());
+    try std.testing.expect(!t.conn.stream.authenticated);
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("unmatched-db-result", t.conn.error_msg);
+}
+
+test "S2sDaemon: a db:result without a type fails the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    // Mark the key outstanding: an untyped verdict must still not answer it.
+    ob.conn.db_assertion_pending = true;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    var attrs = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "us.example") };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_start = elem });
+
+    try std.testing.expect(ob.conn.isFailed());
+    try std.testing.expectEqualStrings("unexpected-db-result", ob.conn.error_msg);
+    try std.testing.expect(!ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.stream.authenticated);
+}
+
+test "S2sDaemon: stanzas are never flushed on a cleartext outbound conn" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.handleAuthSuccess(); // established state without a TLS layer
+
+    try t.conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>secret</body></message>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, t.conn);
+
+    try std.testing.expectEqual(@as(usize, 1), t.conn.pendingCount());
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
 }
 
 test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
@@ -3147,8 +3603,8 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
@@ -3168,7 +3624,7 @@ test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
 
     // One db:verify per pending entry, each naming its own stream id.
     var vbuf: [2048]u8 = undefined;
-    const verifies = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    const verifies = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, verifies, "<db:verify"));
     try std.testing.expect(daemon.getInbound(1) != null);
     try std.testing.expect(daemon.getInbound(2) != null);
@@ -3226,8 +3682,8 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     var scratch: [16]posix.Kevent = undefined;
@@ -3256,17 +3712,11 @@ test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
 }
 
-/// A connected outbound connection on a socketpair, still unauthenticated:
+/// A connected, TLS-protected outbound connection, still unauthenticated:
 /// the test drives the dialback exchange directly, so no DNS happens. The
 /// conn fd is owned by the pool (daemon.deinit closes it).
-fn makeTestOutboundConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
-    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.SocketPairFailed;
-    errdefer posix.close(fds[1]);
-    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
-    return .{ .conn = conn, .peer_fd = fds[1] };
+fn makeTestOutboundConn(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    return makeTestTlsLink(daemon, origin);
 }
 
 /// Feed a typed db:result verdict through processOutboundEvent: the answer
@@ -3290,8 +3740,8 @@ test "S2sDaemon: a typed db:result verdict with no dialback key sent authenticat
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const ob = try makeTestOutboundConn(&daemon, "them.example");
-    defer posix.close(ob.peer_fd);
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
@@ -3313,8 +3763,8 @@ test "S2sDaemon: a typed db:result verdict answers the dialback key this connect
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const ob = try makeTestOutboundConn(&daemon, "them.example");
-    defer posix.close(ob.peer_fd);
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
@@ -3329,7 +3779,7 @@ test "S2sDaemon: a typed db:result verdict answers the dialback key this connect
     try std.testing.expect(ob.conn.db_assertion_pending);
 
     var kbuf: [1024]u8 = undefined;
-    const key_xml = kbuf[0..drainPeer(ob.peer_fd, &kbuf)];
+    const key_xml = kbuf[0..drainTlsPeer(&ob.peer, &kbuf)];
     try std.testing.expect(std.mem.indexOf(u8, key_xml, "<db:result") != null);
     try std.testing.expect(std.mem.indexOf(u8, key_xml, "from='us.example'") != null);
     try std.testing.expect(std.mem.indexOf(u8, key_xml, "to='them.example'") != null);
@@ -3351,8 +3801,8 @@ test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
@@ -3389,7 +3839,7 @@ test "S2sDaemon: a failed db:verify write tears the outbound conn out of its slo
     defer daemon.deinit();
 
     var cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    defer cb.deinit();
     daemon.outbound[0] = cb.conn;
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
@@ -3419,8 +3869,8 @@ test "S2sDaemon: a full changelist fails the pending exchanges instead of losing
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
     daemon.outbound[0] = cb.conn;
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
@@ -3462,8 +3912,8 @@ test "S2sDaemon: a db:verify that could not be queued goes out on the writable e
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
     daemon.outbound[0] = cb.conn; // writable dispatch resolves the slot
 
     // Room for the whole write buffer to drain in one flush.
@@ -3501,7 +3951,7 @@ test "S2sDaemon: a db:verify that could not be queued goes out on the writable e
     try std.testing.expect(!cb.conn.hasUnsentVerify());
 
     var vbuf: [32768]u8 = undefined;
-    const out = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    const out = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
     try std.testing.expect(std.mem.indexOf(u8, out, "<db:verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, key) != null);
 }
@@ -3513,11 +3963,9 @@ test "S2sDaemon: a db:verify registered while connecting stays off the wire unti
 
     // Callback conn with no protocol state yet: connecting, no TLS, no
     // stream, no features.
-    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
-    var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
-        return error.SocketPairFailed;
+    const fds = try makeS2sTestTcpPair();
     defer posix.close(fds[1]);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
     conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
     daemon.outbound[0] = conn;
     try std.testing.expectEqual(connector_mod.OutboundState.connecting, conn.state);
@@ -3557,14 +4005,19 @@ test "S2sDaemon: a db:verify registered while connecting stays off the wire unti
     try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") == null);
     try std.testing.expect(conn.hasUnsentVerify());
 
-    // Post-TLS stream restart reaches the auth phase; the features edge
-    // sends the verify.
+    // The STARTTLS handshake completes; the post-TLS stream restart reaches
+    // the auth phase and the features edge sends the verify.
+    var peer = try attachTestTls(&daemon, conn, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
     conn.tlsHandshakeComplete();
     conn.setDaneResult(.no_records);
     conn.handleRemoteStreamOpen("them.example", "remote-sid-1");
     try std.testing.expectEqual(connector_mod.OutboundState.authenticating, conn.state);
     processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
-    total += drainPeer(fds[1], wire[total..]);
+    total += drainTlsPeer(&peer, wire[total..]);
     try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") != null);
     try std.testing.expect(std.mem.indexOf(u8, wire[0..total], key) != null);
     try std.testing.expect(!conn.hasUnsentVerify());
@@ -3576,7 +4029,7 @@ test "S2sDaemon: a callback conn torn down with pending exchanges answers them i
     defer daemon.deinit();
 
     var cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    defer cb.deinit();
     daemon.outbound[0] = cb.conn;
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
@@ -3588,7 +4041,7 @@ test "S2sDaemon: a callback conn torn down with pending exchanges answers them i
     submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
 
     var wire: [4096]u8 = undefined;
-    const sent = wire[0..drainPeer(cb.peer_fd, &wire)];
+    const sent = wire[0..drainTlsPeer(&cb.peer, &wire)];
     try std.testing.expect(std.mem.indexOf(u8, sent, "<db:verify") != null);
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
 
@@ -3625,7 +4078,7 @@ test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid
     defer daemon.deinit();
 
     var cb = try makeTestCallbackConn(&daemon, long_origin);
-    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    defer cb.deinit();
     daemon.outbound[0] = cb.conn;
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
@@ -3665,8 +4118,8 @@ test "S2sDaemon: a db:result verdict whose answer cannot be built fails the inbo
     var daemon = try S2sDaemon.init(alloc, long_host);
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, long_origin);
-    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, long_origin);
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
@@ -3720,8 +4173,8 @@ test "S2sDaemon: a db:result verdict whose answer cannot be queued fails the inb
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer if (cb.peer_fd >= 0) posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
@@ -3748,8 +4201,8 @@ test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
 
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
@@ -4041,8 +4494,8 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host" 
     defer daemon.deinit();
     daemon.muc_host = "conference.us.example";
 
-    const cb = try makeTestCallbackConn(&daemon, "them.example");
-    defer posix.close(cb.peer_fd);
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
     const in1 = try makeTestInbound(alloc, &daemon, 1);
     defer posix.close(in1.peer_fd);
     var scratch: [16]posix.Kevent = undefined;
@@ -4055,7 +4508,7 @@ test "S2sDaemon: db:result for the MUC host completes and answers as that host" 
 
     // The db:verify speaks as the MUC host.
     var vbuf: [1024]u8 = undefined;
-    const verifies = vbuf[0..drainPeer(cb.peer_fd, &vbuf)];
+    const verifies = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
     try std.testing.expect(std.mem.indexOf(u8, verifies, "from='conference.us.example'") != null);
     try std.testing.expect(std.mem.indexOf(u8, verifies, "to='them.example'") != null);
 

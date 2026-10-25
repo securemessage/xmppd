@@ -145,6 +145,9 @@ pub const OutboundConnection = struct {
     /// answers it. A verdict can only authenticate this connection while
     /// that exchange is outstanding.
     db_assertion_pending: bool = false,
+    /// A SASL <auth/> element was written on this connection. A SASL
+    /// outcome is only meaningful after the peer has seen our auth request.
+    sasl_auth_sent: bool = false,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
@@ -402,9 +405,20 @@ pub const OutboundConnection = struct {
     /// post-TLS auth phase or an established stream may carry the dialback
     /// key: earlier the key would go out in cleartext.
     pub fn canSendDbVerify(self: *const OutboundConnection) bool {
+        if (self.tls_conn == null) return false;
         return self.state == .authenticating or
             self.state == .established or
             self.stream.state == .features_auth;
+    }
+
+    /// Whether a SASL <success/> or <failure/> may be accepted now: TLS is
+    /// up, the auth phase is open, and our <auth/> went out. Any other
+    /// outcome means the peer skipped a negotiation step.
+    pub fn canAcceptSaslOutcome(self: *const OutboundConnection) bool {
+        return self.tls_conn != null and
+            self.state == .authenticating and
+            self.stream.state == .authenticating and
+            self.sasl_auth_sent;
     }
 
     /// Transition to the TLS handshake phase after TCP connect completes.
@@ -562,7 +576,8 @@ pub const OutboundConnection = struct {
     ) ?usize {
         if (id.len == 0 or from.len == 0) return null;
         for (self.db_pending, 0..) |p, i| {
-            if (!p.in_use) continue;
+            // A verdict can only answer a db:verify that reached the peer.
+            if (!p.in_use or !p.verify_sent) continue;
             if (std.mem.eql(u8, p.streamId(), id) and
                 std.ascii.eqlIgnoreCase(p.origin(), from) and
                 std.ascii.eqlIgnoreCase(p.target(), to)) return i;
@@ -579,6 +594,9 @@ pub const OutboundConnection = struct {
     /// (from=peer, to=us); a missing attribute is not a mismatch. Returns
     /// false, leaving the exchange outstanding, for anything else.
     pub fn takePendingAssertion(self: *OutboundConnection, from: []const u8, to: []const u8) bool {
+        // The dialback key only leaves the connection after TLS, so a
+        // verdict arriving in cleartext cannot answer it.
+        if (self.tls_conn == null) return false;
         if (!self.db_assertion_pending) return false;
         if (from.len > 0 and !std.ascii.eqlIgnoreCase(from, self.remote_domain)) return false;
         if (to.len > 0 and !std.ascii.eqlIgnoreCase(to, self.local_domain)) return false;
@@ -788,6 +806,26 @@ test "OutboundConnection: init and basic state" {
     try std.testing.expect(!conn.isFailed());
 }
 
+test "OutboundConnection: canSendDbVerify requires a TLS layer" {
+    const alloc = std.testing.allocator;
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    conn.state = .established;
+    try std.testing.expect(!conn.canSendDbVerify());
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; deinit closes it
+    conn.tls_conn = try SslConn.initClient(ctx, fds[0], null);
+    try std.testing.expect(conn.canSendDbVerify());
+}
+
 test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
     const alloc = std.testing.allocator;
     var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
@@ -954,6 +992,11 @@ test "OutboundConnection: one pending verify per (stream id, origin, target)" {
     const s2 = conn.addPendingVerify(2, 11, "stream1", "a.example", "two.example", "key2") orelse return error.NoSlot;
     try std.testing.expect(s1 != s2);
     try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+
+    // A verdict only answers a verify that reached the peer.
+    try std.testing.expect(conn.findPendingVerify("stream1", "a.example", "one.example") == null);
+    conn.db_pending[s1].verify_sent = true;
+    conn.db_pending[s2].verify_sent = true;
 
     // A verdict correlates to its own entry (S2).
     try std.testing.expectEqual(s1, conn.findPendingVerify("stream1", "a.example", "one.example").?);
