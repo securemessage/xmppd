@@ -169,6 +169,11 @@ const Job = struct {
     use_tcp: bool = false,
     tcp_fd: posix.fd_t = -1,
     tcp_buf: std.ArrayListUnmanaged(u8) = .{},
+    /// Outbound TCP frame staged once and flushed incrementally;
+    /// tcp_connected marks whether connect() has completed.
+    tcp_out: std.ArrayListUnmanaged(u8) = .{},
+    tcp_out_pos: usize = 0,
+    tcp_connected: bool = false,
 
     targets: std.ArrayListUnmanaged(Target) = .{},
 };
@@ -545,15 +550,19 @@ pub const Resolver = struct {
                     self.onTcpReadable(fd);
                 }
             } else if (ev.filter == std.c.EVFILT.WRITE) {
-                // TCP connect finished - a refused connect also reports
-                // writable, so check SO_ERROR before sending.
+                // A refused connect also reports writable, so check
+                // SO_ERROR once before the socket is used; a connected
+                // socket arriving here resumes a WouldBlock flush.
                 const fd: posix.fd_t = @intCast(ev.ident);
                 for (self.jobs.items) |job| {
                     if (job.tcp_fd == fd) {
-                        posix.getsockoptError(fd) catch {
-                            self.dropJob(job, .failed);
-                            break;
-                        };
+                        if (!job.tcp_connected) {
+                            posix.getsockoptError(fd) catch {
+                                self.dropJob(job, .failed);
+                                break;
+                            };
+                            job.tcp_connected = true;
+                        }
                         self.tcpWrite(job) catch self.dropJob(job, .failed);
                         break;
                     }
@@ -832,19 +841,50 @@ pub const Resolver = struct {
             else => return e,
         };
         ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 };
-        ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = 0 };
-        try self.keventApply(&ch);
+        var n: usize = 1;
+        if (!connected) {
+            // Only a pending connect wants the writable event; arming
+            // it after an immediate connect would fire a second write
+            // of the same frame later.
+            ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = 0 };
+            n = 2;
+        }
+        try self.keventApply(ch[0..n]);
         job.tcp_fd = fd;
+        job.tcp_connected = connected;
         if (connected) return self.tcpWrite(job);
     }
 
-    /// TCP DNS frames are length-prefixed.
+    /// Re-arm the one-shot writable event so a flush that hit
+    /// WouldBlock resumes when the socket drains.
+    fn armTcpWrite(self: *Resolver, job: *Job) !void {
+        var ch = [1]posix.Kevent{.{
+            .ident = @intCast(job.tcp_fd),
+            .filter = std.c.EVFILT.WRITE,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        }};
+        try self.keventApply(&ch);
+    }
+
+    /// TCP DNS frames are length-prefixed; the frame is staged once in
+    /// tcp_out and flushed across partial writes and WouldBlock.
     fn tcpWrite(self: *Resolver, job: *Job) !void {
-        _ = self;
-        var hdr: [2]u8 = undefined;
-        std.mem.writeInt(u16, &hdr, @intCast(job.request.len), .big);
-        _ = posix.send(job.tcp_fd, &hdr, 0) catch return error.SendFailed;
-        _ = posix.send(job.tcp_fd, job.request, 0) catch return error.SendFailed;
+        if (job.tcp_out.items.len == 0) {
+            var hdr: [2]u8 = undefined;
+            std.mem.writeInt(u16, &hdr, @intCast(job.request.len), .big);
+            try job.tcp_out.appendSlice(self.alloc, &hdr);
+            try job.tcp_out.appendSlice(self.alloc, job.request);
+        }
+        while (job.tcp_out_pos < job.tcp_out.items.len) {
+            const n = posix.send(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], 0) catch |err| switch (err) {
+                error.WouldBlock => return self.armTcpWrite(job),
+                else => return error.SendFailed,
+            };
+            job.tcp_out_pos += n;
+        }
     }
 
     /// Drop the first frame_len bytes off the job's TCP frame buffer.
@@ -1550,6 +1590,7 @@ pub const Resolver = struct {
         self.disarmDeadline(job);
         if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
         job.tcp_buf.deinit(self.alloc);
+        job.tcp_out.deinit(self.alloc);
         self.alloc.free(job.name);
         if (job.request.len > 0) self.alloc.free(job.request);
         if (job.pending_qname.len > 0) self.alloc.free(job.pending_qname);
@@ -3256,4 +3297,56 @@ test "dns-async: a client resolve asks only the client SRV prefixes (Q6)" {
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+}
+
+test "dns-async: TCP sends the frame exactly once across connect" {
+    // Test-owned listener; the query takes the TCP path directly so
+    // nothing sleeps: connect completes on loopback without waiting.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    job.use_tcp = true;
+    try r.tcpSend(job);
+
+    var peer: posix.sockaddr = undefined;
+    var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const cfd = try posix.accept(lfd, &peer, &plen, 0);
+    defer posix.close(cfd);
+
+    // Drive the resolver so a pending connect finishes and the write
+    // fires; then read exactly one frame.
+    var spins: usize = 0;
+    while (!job.tcp_connected and spins < 100) : (spins += 1) r.step(10);
+    try std.testing.expect(job.tcp_connected);
+    r.step(10);
+    var fbuf: [300]u8 = undefined;
+    const want = job.request.len + 2;
+    var got: usize = 0;
+    spins = 0;
+    while (got < want and spins < 100_000) : (spins += 1) {
+        got += posix.recv(cfd, fbuf[got..], posix.MSG.DONTWAIT) catch 0;
+    }
+    try std.testing.expectEqual(want, got);
+    try std.testing.expectEqual(job.request.len, std.mem.readInt(u16, fbuf[0..2], .big));
+    try std.testing.expectEqualSlices(u8, job.request, fbuf[2..got]);
+
+    // A stale writable event must not produce a second copy.
+    r.step(10);
+    const extra = posix.recv(cfd, fbuf[0..1], posix.MSG.DONTWAIT) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), extra);
 }
