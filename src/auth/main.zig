@@ -118,6 +118,11 @@ pub fn main() !void {
                 log.err("--lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
             });
+        } else if (std.mem.eql(u8, arg, "--ip-lockout-threshold")) {
+            rate_policy.ip_lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+                log.err("--ip-lockout-threshold requires a numeric value", .{});
+                return error.InvalidArgs;
+            });
         } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
             rate_limit_enabled = false;
         } else if (std.mem.eql(u8, arg, "--enable-registration")) {
@@ -183,6 +188,11 @@ pub fn main() !void {
                 rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_threshold);
             }
         }
+        if (rate_policy.ip_lockout_threshold == rate_defaults.ip_lockout_threshold) {
+            if (c.get("auth", "ip_lockout_threshold")) |v| {
+                rate_policy.ip_lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.ip_lockout_threshold);
+            }
+        }
         if (c.get("auth", "rate_limit")) |v| {
             if (std.mem.eql(u8, v, "false")) rate_limit_enabled = false;
         }
@@ -226,12 +236,13 @@ pub fn main() !void {
     var handler = AuthHandler.init(allocator, &store);
     if (rate_limit_enabled) {
         handler.setRateLimiter(&rate_limiter);
-        log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} failures", .{
+        log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{
             rate_policy.max_per_account,
             rate_policy.max_per_ip,
             rate_policy.window_seconds,
             rate_policy.lockout_duration,
             rate_policy.lockout_threshold,
+            rate_policy.ip_lockout_threshold,
         });
     } else {
         log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
@@ -578,11 +589,12 @@ fn printUsage() void {
         \\Options:
         \\  --db PATH                  Storage directory (default: /var/db/xmppd)
         \\  --socket PATH              IPC socket path (default: /var/run/xmppd/auth.sock)
-        \\  --max-auth-per-account N   Max attempts per account per window (default: 5)
-        \\  --max-auth-per-ip N        Max attempts per IP per window (default: 20)
+        \\  --max-auth-per-account N   Max attempts per account per window (default: 60)
+        \\  --max-auth-per-ip N        Max attempts per IP per window (default: 200)
         \\  --auth-window N            Rate window in seconds (default: 120)
         \\  --lockout-duration N       Temp lockout duration in seconds (default: 300)
-        \\  --lockout-threshold N      Consecutive failures before lockout (default: 10)
+        \\  --lockout-threshold N      Consecutive account failures before lockout (default: 10)
+        \\  --ip-lockout-threshold N   Consecutive IP failures before lockout (default: 20)
         \\  --no-rate-limit            Disable auth rate limiting entirely (testing/benchmarks only)
         \\  --enable-registration      Enable in-band registration (XEP-0077)
         \\  --no-require-invite        Allow registration without invitation code

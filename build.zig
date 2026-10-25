@@ -608,6 +608,20 @@ pub fn build(b: *std.Build) void {
 
     const run_invite_store_tests = b.addRunArtifact(invite_store_tests);
 
+    const policy_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    policy_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
+    policy_test_mod.addImport("lock_store", lock_store_test_mod);
+
+    const policy_tests = b.addTest(.{
+        .name = "policy-tests",
+        .root_module = policy_test_mod,
+    });
+    const run_policy_tests = b.addRunArtifact(policy_tests);
+
     const auth_handler_test_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/handler.zig"),
         .target = target,
@@ -621,6 +635,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_test_mod.addImport("user_store", generic_user_store_test_mod);
     auth_handler_test_mod.addImport("backend", backend_test_mod);
     auth_handler_test_mod.addImport("crypto_pool", crypto_pool_mod);
+    auth_handler_test_mod.addImport("policy", policy_test_mod);
 
     // T121 crypto-pool tests live in the module itself
     const crypto_pool_tests = b.addTest(.{
@@ -1385,11 +1400,20 @@ pub fn build(b: *std.Build) void {
     });
     auth_lock_store_mod.addImport("backend", auth_backend_mod);
 
+    const auth_policy_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_policy_mod.addImport("rate_limiter", auth_rate_limiter_mod);
+    auth_policy_mod.addImport("lock_store", auth_lock_store_mod);
+
     auth_handler_mod.addImport("sasl", sasl_mod);
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
     auth_handler_mod.addImport("crypto_pool", crypto_pool_mod);
+    auth_handler_mod.addImport("policy", auth_policy_mod);
 
     const auth_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -1469,12 +1493,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const oidc_policy_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oidc_policy_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
+    oidc_policy_mod.addImport("lock_store", auth_lock_store_mod);
+
     oidc_handler_mod.addImport("sasl", sasl_mod);
     oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
     oidc_handler_mod.addImport("crypto_pool", crypto_pool_mod);
     oidc_handler_mod.addImport("invite_store", auth_invite_store_mod);
+    oidc_handler_mod.addImport("policy", oidc_policy_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/core/event_loop.zig"),
@@ -1692,6 +1725,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_generic_offline_store_tests.step);
     test_step.dependOn(&run_last_activity_store_tests.step);
     test_step.dependOn(&run_rate_limiter_tests.step);
+    test_step.dependOn(&run_policy_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);
     test_step.dependOn(&run_invite_store_tests.step);
     test_step.dependOn(&run_pep_store_tests.step);

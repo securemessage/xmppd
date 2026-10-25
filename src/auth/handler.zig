@@ -14,60 +14,18 @@ const std = @import("std");
 const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
+const policy_mod = @import("policy");
 const lock_store_mod = @import("lock_store");
 const crypto_pool_mod = @import("crypto_pool");
 
 const log = std.log.scoped(.auth_handler);
 
-/// Three-state lock verdict (T352/S3): a store error must NOT be mapped to
-/// "unlocked": that is fail-open on exactly the path that protects
-/// permanently locked accounts.
-pub const LockCheckResult = enum {
-    unlocked,
-    locked,
-    store_error,
-};
-
-/// Normalize an IdP-issued identity to its localpart for lock storage: the
-/// IdP's own claim ("Alice@morante.dev", "alice") resolves to the row the
-/// admission check enforces for every other mechanism (S3).
-fn localpartOf(identity: []const u8) []const u8 {
-    const cut = if (std.mem.indexOfScalar(u8, identity, '@')) |p| identity[0..p] else identity;
-    return cut;
-}
-
-/// Interface for permanent lock checking. The auth daemon sets this to
-/// a closure over the LockStore. Decouples handler from Backend type.
-pub const LockChecker = struct {
-    ctx: *anyopaque,
-    checkFn: *const fn (ctx: *anyopaque, username: []const u8) LockCheckResult,
-
-    pub fn check(self: LockChecker, username: []const u8) LockCheckResult {
-        return self.checkFn(self.ctx, username);
-    }
-};
-
-/// Standard LockChecker adapter over a LockStore (shared by xmppd-auth and
-/// xmppd-auth-oidc so both enforce the same permanent locks).
-pub fn makeLockChecker(comptime Backend: type, ls: *@import("lock_store").LockStore(Backend), alloc: std.mem.Allocator) LockChecker {
-    const S = struct {
-        const Ctx = struct {
-            lock_store: *@import("lock_store").LockStore(Backend),
-            allocator: std.mem.Allocator,
-        };
-        var ctx: Ctx = undefined;
-
-        fn check(_: *anyopaque, username: []const u8) LockCheckResult {
-            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return .store_error;
-            return if (result != null) .locked else .unlocked;
-        }
-    };
-    S.ctx = .{ .lock_store = ls, .allocator = alloc };
-    return .{
-        .ctx = @ptrCast(&S.ctx),
-        .checkFn = &S.check,
-    };
-}
+/// The lock types live in the policy module; these aliases keep the daemon
+/// and test call sites stable.
+pub const LockCheckResult = policy_mod.LockCheckResult;
+pub const LockChecker = policy_mod.LockChecker;
+pub const makeLockChecker = policy_mod.makeLockChecker;
+pub const localpartOf = policy_mod.localpartOf;
 
 /// Interface for invite code validation. The auth daemon sets this to
 /// a closure over the InviteStore.
@@ -159,11 +117,26 @@ const ScramSession = struct {
     /// Last activity (unix seconds); drives lazy reclamation of slots whose
     /// XMPP connection died mid-exchange (see SCRAM_SLOT_STALE_SECONDS).
     touched_at: i64 = 0,
+    /// Client address from the auth request, kept for the client-final
+    /// outcome. The request buffer does not outlive the first message.
+    client_ip: [64]u8 = undefined,
+    client_ip_len: u8 = 0,
 
     fn deinit(self: *ScramSession) void {
         self.server.deinit();
         self.active = false;
         self.touched_at = 0;
+        self.client_ip_len = 0;
+    }
+
+    fn setClientIp(self: *ScramSession, ip: []const u8) void {
+        const n = @min(ip.len, self.client_ip.len);
+        @memcpy(self.client_ip[0..n], ip[0..n]);
+        self.client_ip_len = @intCast(n);
+    }
+
+    fn clientIp(self: *const ScramSession) []const u8 {
+        return self.client_ip[0..self.client_ip_len];
     }
 };
 
@@ -173,10 +146,8 @@ pub fn AuthHandler(comptime Store: type) type {
         allocator: std.mem.Allocator,
         /// Active SCRAM sessions indexed by slot.
         scram_sessions: [MAX_SCRAM_SESSIONS]ScramSession = undefined,
-        /// Rate limiter (optional — null disables rate limiting).
-        rate_limiter: ?*RateLimiter = null,
-        /// Permanent lock checker (optional — null disables lock checking).
-        lock_checker: ?LockChecker = null,
+        /// Admission policy: permanent locks and the rate limiter.
+        policy: policy_mod.Policy = .{},
         /// Registration configuration.
         reg_config: RegistrationConfig = .{},
         /// Invite code validator (optional — required when reg_config.require_invite is true).
@@ -212,35 +183,12 @@ pub fn AuthHandler(comptime Store: type) type {
 
         /// Set the rate limiter (call after init).
         pub fn setRateLimiter(self: *Self, limiter: *RateLimiter) void {
-            self.rate_limiter = limiter;
+            self.policy.limiter = limiter;
         }
 
         /// Set the lock checker (call after init).
         pub fn setLockChecker(self: *Self, checker: LockChecker) void {
-            self.lock_checker = checker;
-        }
-
-        /// Admission gate run by EVERY mechanism once the identity is known
-        /// (T352/S3): null means admitted. Fail closed on lock-store errors.
-        fn admit(self: *Self, username: []const u8) ?[]const u8 {
-            if (self.lock_checker) |checker| {
-                // Locks are keyed by the canonical localpart: strip any
-                // domain the typed or claimed identity carries; the lock
-                // store folds case on both write and check (S3).
-                switch (checker.check(localpartOf(username))) {
-                    .locked => {
-                        log.info("auth rejected: account '{s}' is permanently locked", .{username});
-                        return "account-disabled";
-                    },
-                    .store_error => {
-                        // warn, not err: tests trip the runner on err logs.
-                        log.warn("lock store error checking '{s}': failing closed", .{username});
-                        return "temporary-auth-failure";
-                    },
-                    .unlocked => {},
-                }
-            }
-            return null;
+            self.policy.lock_checker = checker;
         }
 
         /// Look up credentials in cache by precomputed hash.
@@ -303,7 +251,7 @@ pub fn AuthHandler(comptime Store: type) type {
 
             if (completion.ok) {
                 log.info("PLAIN auth success: '{s}'", .{pend.username});
-                if (self.rate_limiter) |rl| rl.recordSuccess(pend.username);
+                self.policy.recordOutcome(pend.username, pend.client_ip, .success);
                 return .{
                     .slot = pend.slot,
                     .slot_gen = pend.slot_gen,
@@ -317,7 +265,7 @@ pub fn AuthHandler(comptime Store: type) type {
             }
 
             log.info("PLAIN auth failed: wrong password for '{s}'", .{pend.username});
-            if (self.rate_limiter) |rl| rl.recordFailure(pend.username, pend.client_ip);
+            self.policy.recordOutcome(pend.username, pend.client_ip, .failure);
             self.allocator.free(pend.username);
             return .{
                 .slot = pend.slot,
@@ -351,21 +299,10 @@ pub fn AuthHandler(comptime Store: type) type {
             // (core sends "" today; the mechanism handlers enforce the lock
             // on the parsed identity post-S3 regardless).
             if (req.username.len > 0) {
-                if (self.admit(req.username)) |reason| {
+                if (self.policy.admit(req.username, req.client_ip)) |reason| {
                     log.info("auth rejected at entry: {s}", .{reason});
                     return .{ .reply = authFailure(req.conn_id, reason) };
                 }
-            }
-
-            // Rate limiting (if enabled). Per-IP only here: core sends
-            // username="" (the daemon extracts it from the SASL payload), so
-            // the per-account check runs in each mechanism handler once the
-            // username is known.
-            if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed("", req.client_ip)) |reason| {
-                    return .{ .reply = authFailure(req.conn_id, reason) };
-                }
-                rl.recordAttempt("", req.client_ip);
             }
 
             return switch (req.mechanism) {
@@ -411,17 +348,9 @@ pub fn AuthHandler(comptime Store: type) type {
             const username = payload[authcid_start..authcid_end];
             const password = payload[passwd_start..];
 
-            // Lock check on the parsed identity (S3).
-            if (self.admit(username)) |reason| {
+            // Admission on the parsed identity: permanent lock, account and IP.
+            if (self.policy.admit(username, req.client_ip)) |reason| {
                 return .{ .reply = authFailure(req.conn_id, reason) };
-            }
-
-            // Per-account rate limiting (username was "" at auth_request entry)
-            if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed(username, "")) |reason| {
-                    return .{ .reply = authFailure(req.conn_id, reason) };
-                }
-                rl.recordAttempt(username, "");
             }
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
@@ -435,11 +364,11 @@ pub fn AuthHandler(comptime Store: type) type {
                     // "Alice" resolve to the same "alice" admission every
                     // mechanism enforces).
                     const identity = localpartOf(validated_user);
-                    if (self.admit(identity)) |reason| {
+                    if (self.policy.admit(identity, req.client_ip)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
                     }
                     log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ username, identity });
-                    if (self.rate_limiter) |rl| rl.recordSuccess(identity);
+                    self.policy.recordOutcome(identity, req.client_ip, .success);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
                         .username = identity,
@@ -447,7 +376,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     } } };
                 } else {
                     log.info("PLAIN auth failed (IdP): '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    self.policy.recordOutcome(username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
             }
@@ -459,7 +388,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 };
                 const creds = maybe_creds orelse {
                     log.info("PLAIN auth failed: user '{s}' not found", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    self.policy.recordOutcome(username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
 
@@ -500,18 +429,18 @@ pub fn AuthHandler(comptime Store: type) type {
                 // prepped stored credential: treat as a failed auth.
                 const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count) catch {
                     log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    self.policy.recordOutcome(username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
                 // T211 follow-up: constant-time compare for StoredKey.
                 if (!std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, creds.stored_key)) {
                     log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    self.policy.recordOutcome(username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
 
                 log.info("PLAIN auth success: '{s}'", .{username});
-                if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                self.policy.recordOutcome(username, req.client_ip, .success);
                 return .{ .reply = protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
                     .username = username,
@@ -560,11 +489,11 @@ pub fn AuthHandler(comptime Store: type) type {
 
             if (result) |validated_user| {
                 // Lock check on the IdP-verified identity (S3).
-                if (self.admit(validated_user)) |reason| {
+                if (self.policy.admit(validated_user, req.client_ip)) |reason| {
                     return authFailure(req.conn_id, reason);
                 }
                 log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
-                if (self.rate_limiter) |rl| rl.recordSuccess(validated_user);
+                self.policy.recordOutcome(validated_user, req.client_ip, .success);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
                     self.store.getPhotoUrl()
                 else
@@ -577,7 +506,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             } else {
                 log.info("OAUTHBEARER auth failed", .{});
-                if (self.rate_limiter) |rl| rl.recordFailure(req.username, req.client_ip);
+                self.policy.recordOutcome(req.username, req.client_ip, .failure);
                 return authFailure(req.conn_id, "not-authorized");
             }
         }
@@ -610,21 +539,12 @@ pub fn AuthHandler(comptime Store: type) type {
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
 
-                // Lock check on the parsed identity (S3): before any
-                // challenge work happens for a locked account.
-                if (self.admit(username)) |reason| {
+                // Admission on the parsed identity before any challenge work.
+                if (self.policy.admit(username, req.client_ip)) |reason| {
                     session.deinit();
                     return authFailure(req.conn_id, reason);
                 }
-
-                // Per-account rate limiting (username was "" at auth_request entry)
-                if (self.rate_limiter) |rl| {
-                    if (rl.checkAllowed(username, "")) |reason| {
-                        session.deinit();
-                        return authFailure(req.conn_id, reason);
-                    }
-                    rl.recordAttempt(username, "");
-                }
+                session.setClientIp(req.client_ip);
 
                 // Look up credentials — try cache first, fall back to store
                 const name_hash = hashUsername(username);
@@ -677,7 +597,7 @@ pub fn AuthHandler(comptime Store: type) type {
             const server_final = session.server.handleClientFinal(resp.payload) catch {
                 log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
                 const username = session.server.username;
-                if (self.rate_limiter) |rl| rl.recordFailure(username, "");
+                self.policy.recordOutcome(username, session.clientIp(), .failure);
                 session.deinit();
                 return authFailure(resp.conn_id, "not-authorized");
             };
@@ -685,13 +605,13 @@ pub fn AuthHandler(comptime Store: type) type {
             const username = session.server.username;
             // S3: re-check the lock at client-final; a lock that
             // arrived between challenge and final must not authenticate.
-            if (self.admit(username)) |reason| {
+            if (self.policy.admit(username, session.clientIp())) |reason| {
                 session.deinit();
                 return authFailure(resp.conn_id, reason);
             }
 
             log.info("SCRAM auth success: '{s}' conn={d}", .{ username, resp.conn_id });
-            if (self.rate_limiter) |rl| rl.recordSuccess(username);
+            self.policy.recordOutcome(username, session.clientIp(), .success);
 
             // Keep session alive briefly for the username reference, then clean up
             const result = protocol.Message{ .auth_success = .{
@@ -808,6 +728,12 @@ pub fn AuthHandler(comptime Store: type) type {
             // so only root or the daemon uid may even open it.
             const is_admin = std.mem.eql(u8, req.client_ip, "ctl");
 
+            // One IP outcome per registration request, success or failure.
+            var registered = false;
+            defer {
+                if (!is_admin) self.policy.recordOutcome("", req.client_ip, if (registered) .success else .failure);
+            }
+
             // Check if registration is enabled (skip for admin)
             if (!is_admin and !self.reg_config.enabled) {
                 return protocol.Message{ .register_result = regResult{
@@ -817,17 +743,14 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Rate limit registration attempts (skip for admin)
+            // Rate limit registration attempts (skip for admin).
             if (!is_admin) {
-                if (self.rate_limiter) |rl| {
-                    if (rl.checkAllowed("", req.client_ip)) |reason| {
-                        return protocol.Message{ .register_result = regResult{
-                            .conn_id = req.conn_id,
-                            .success = false,
-                            .reason = reason,
-                        } };
-                    }
-                    rl.recordAttempt("", req.client_ip);
+                if (self.policy.admit("", req.client_ip)) |reason| {
+                    return protocol.Message{ .register_result = regResult{
+                        .conn_id = req.conn_id,
+                        .success = false,
+                        .reason = reason,
+                    } };
                 }
             }
 
@@ -883,6 +806,7 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             log.info("user registered: '{s}'", .{req.username});
+            registered = true;
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = true,
