@@ -16,6 +16,64 @@ pub const Hash = enum {
     }
 };
 
+/// HMAC-SHA-256 with the keyed inner and outer hash states hashed once.
+/// PBKDF2 clones both per U block instead of re-hashing the key pads for
+/// every iteration.
+const HmacSha256Precomputed = struct {
+    inner: Sha256,
+    outer: Sha256,
+
+    fn init(key: []const u8) HmacSha256Precomputed {
+        var block: [Sha256.block_length]u8 = @splat(0);
+        if (key.len > block.len) {
+            Sha256.hash(key, block[0..Sha256.digest_length], .{});
+        } else {
+            @memcpy(block[0..key.len], key);
+        }
+        var ipad: [Sha256.block_length]u8 = undefined;
+        var opad: [Sha256.block_length]u8 = undefined;
+        for (block, 0..) |b, i| {
+            ipad[i] = b ^ 0x36;
+            opad[i] = b ^ 0x5c;
+        }
+        var inner = Sha256.init(.{});
+        inner.update(&ipad);
+        var outer = Sha256.init(.{});
+        outer.update(&opad);
+        std.crypto.secureZero(u8, std.mem.asBytes(&block));
+        std.crypto.secureZero(u8, std.mem.asBytes(&ipad));
+        std.crypto.secureZero(u8, std.mem.asBytes(&opad));
+        return .{ .inner = inner, .outer = outer };
+    }
+
+    fn mac(self: *const HmacSha256Precomputed, msg: []const u8, out: *[Sha256.digest_length]u8) void {
+        self.macParts(msg, "", out);
+    }
+
+    fn macParts(
+        self: *const HmacSha256Precomputed,
+        part1: []const u8,
+        part2: []const u8,
+        out: *[Sha256.digest_length]u8,
+    ) void {
+        var inner = self.inner;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&inner));
+        inner.update(part1);
+        inner.update(part2);
+        var digest: [Sha256.digest_length]u8 = undefined;
+        inner.final(&digest);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&digest));
+        var outer = self.outer;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&outer));
+        outer.update(&digest);
+        outer.final(out);
+    }
+
+    fn deinit(self: *HmacSha256Precomputed) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
+
 /// A Hi() output with its hash family tagged; SHA-1 fills bytes[0..20].
 /// The engine crypto worker and the SaltedPassword cache pass this around so
 /// a SHA-1 derivation can never be fed to a SHA-256 exchange (or vice versa).
@@ -94,12 +152,17 @@ pub const StoredCredentials = struct {
         var prep_cps: [3072]u21 = undefined;
         var prep_cccs: [3072]u8 = undefined;
         if (password.len > prep_buf.len / 2) return error.NoSpaceLeft;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_buf));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_cps));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_cccs));
         const prepped = try stringprep.prepareOpaqueString(password, &prep_buf, &prep_cps, &prep_cccs);
         var salted_password: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&salted_password));
         pbkdf2(prepped, &salt, iteration_count, &salted_password);
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&client_key));
         HmacSha256.create(&client_key, "Client Key", &salted_password);
 
         // StoredKey := H(ClientKey)
@@ -181,9 +244,14 @@ pub const ScramServer = struct {
         // gs2-header is "n,," (no channel binding, no authzid) for basic SCRAM
         // or "y,," or "p=..." for channel binding variants
 
-        // Capture the gs2 channel binding flag
+        // Capture the gs2 channel binding flag. RFC 5802 admits exactly
+        // n, y, p; anything else must fail here, or an unknown flag sails
+        // straight past validateChannelBinding (T260).
         if (message.len > 0) {
-            self.gs2_cb_flag = message[0];
+            switch (message[0]) {
+                'n', 'y', 'p' => self.gs2_cb_flag = message[0],
+                else => return error.ChannelBindingMismatch,
+            }
         }
 
         // Skip gs2-header (everything up to and including the second comma after the flag)
@@ -312,11 +380,11 @@ pub const ScramServer = struct {
             r.* = p ^ s;
         }
 
-        // Verify: H(recovered_client_key) == StoredKey
+        // Verify: H(recovered_client_key) == StoredKey (constant-time: it
+        // authenticates the peer's proof of the shared secret: T211).
         var recovered_stored_key: [32]u8 = undefined;
         Sha256.hash(&recovered_client_key, &recovered_stored_key, .{});
-
-        if (!std.mem.eql(u8, &recovered_stored_key, &creds.stored_key)) {
+        if (!std.crypto.timing_safe.eql([32]u8, recovered_stored_key, creds.stored_key)) {
             self.state = .failed;
             return error.AuthenticationFailed;
         }
@@ -383,6 +451,10 @@ pub const ScramServer = struct {
             if (!std.mem.eql(u8, client_cb, self.cb_data)) {
                 return error.ChannelBindingMismatch;
             }
+        } else {
+            // Belt and braces: handleClientFirst already rejects unknown
+            // flags; never let a fresh code path skip CB verification.
+            return error.ChannelBindingMismatch;
         }
     }
 
@@ -481,6 +553,7 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
         pub fn handleServerFirst(self: *Self, message: []const u8) ![]const u8 {
             try self.parseServerFirst(message);
             var salted_password: [mac_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&salted_password));
             pbkdf2With(Hmac, self.password, self.salt_raw[0..self.salt_raw_len], self.iteration_count, &salted_password);
             return self.clientFinal(salted_password);
         }
@@ -658,8 +731,43 @@ fn findClientFirstBare(message: []const u8) ?usize {
     return i;
 }
 
-/// PBKDF2 over a comptime HMAC, dkLen = mac_length (one block).
+/// PBKDF2-HMAC-SHA-256 with both keyed HMAC states precomputed once.
+/// dkLen = 32 (one block).
+fn pbkdf2Sha256(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
+    var hmac = HmacSha256Precomputed.init(password);
+    defer hmac.deinit();
+
+    // U1 = HMAC(password, salt || INT(1)); both precomputed states are
+    // cloned, so only salt and the counter are hashed.
+    var u: [32]u8 = undefined;
+    hmac.macParts(salt, &[_]u8{ 0, 0, 0, 1 }, &u);
+
+    var result: [32]u8 = u;
+
+    // U2..Ui: clone the precomputed inner and outer states per block.
+    var i: u32 = 1;
+    while (i < iterations) : (i += 1) {
+        var next: [32]u8 = undefined;
+        hmac.mac(&u, &next);
+        u = next;
+        for (&result, u) |*r, x| {
+            r.* ^= x;
+        }
+    }
+
+    output.* = result;
+    std.crypto.secureZero(u8, std.mem.asBytes(&u));
+    std.crypto.secureZero(u8, std.mem.asBytes(&result));
+}
+
+/// PBKDF2 over a comptime HMAC, dkLen = mac_length (one block). SHA-256 uses
+/// the precomputed state; the SHA-1 path keeps the generic HMAC.
 pub fn pbkdf2With(comptime Hmac: type, password: []const u8, salt: []const u8, iterations: u32, output: *[Hmac.mac_length]u8) void {
+    if (comptime Hmac == HmacSha256) {
+        pbkdf2Sha256(password, salt, iterations, output);
+        return;
+    }
+
     // U1 = HMAC(password, salt || INT(1)) — streamed, any salt length.
     var h = Hmac.init(password);
     h.update(salt);
@@ -686,7 +794,7 @@ pub fn pbkdf2With(comptime Hmac: type, password: []const u8, salt: []const u8, i
 /// PBKDF2-HMAC-SHA-256. Public so event-loop callers (xmppc Engine) can run
 /// the derivation on a worker thread between parseServerFirst and clientFinal.
 pub fn pbkdf2(password: []const u8, salt: []const u8, iterations: u32, output: *[32]u8) void {
-    pbkdf2With(HmacSha256, password, salt, iterations, output);
+    pbkdf2Sha256(password, salt, iterations, output);
 }
 
 /// PBKDF2-HMAC-SHA-1 (SCRAM-SHA-1, RFC 5802).
@@ -872,7 +980,6 @@ test "SCRAM-SHA-1 client: RFC 5802 test vector" {
     try std.testing.expect(client.isComplete());
 }
 
-
 test "SCRAM client: forged server signature is rejected" {
     const allocator = std.testing.allocator;
     var client = ScramClient.init(allocator, "user", "pw");
@@ -1054,4 +1161,78 @@ test "gs2 'p=tls-exporter' binds the c= payload" {
         client_final,
         "c=cD10bHMtZXhwb3J0ZXIsLAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f,r=clientnonceservernonce,p=",
     ));
+}
+
+test "ScramServer: unknown gs2 channel-binding flag is rejected (T260)" {
+    const alloc = std.testing.allocator;
+    var server = ScramServer.init(alloc);
+    defer server.deinit();
+    // 'x' is not in {n, y, p}: an unknown gs2 flag is a channel-binding
+    // mismatch, never a skip.
+    try std.testing.expectError(
+        error.ChannelBindingMismatch,
+        server.handleClientFirst("x,,n=alice,r=AAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+}
+
+test "precomputed HMAC-SHA-256 matches RFC 4231 vectors" {
+    var expected_buf: [32]u8 = undefined;
+
+    const key1 = [_]u8{0x0b} ** 20;
+    var st1 = HmacSha256Precomputed.init(&key1);
+    defer st1.deinit();
+    var mac: [32]u8 = undefined;
+    st1.mac("Hi There", &mac);
+    try std.testing.expectEqualSlices(
+        u8,
+        try std.fmt.hexToBytes(&expected_buf, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+        &mac,
+    );
+
+    var st2 = HmacSha256Precomputed.init("Jefe");
+    defer st2.deinit();
+    st2.mac("what do ya want for nothing?", &mac);
+    try std.testing.expectEqualSlices(
+        u8,
+        try std.fmt.hexToBytes(&expected_buf, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+        &mac,
+    );
+
+    // A 131-byte key exercises the key-hash branch.
+    const long_key = [_]u8{0xaa} ** 131;
+    var st3 = HmacSha256Precomputed.init(&long_key);
+    defer st3.deinit();
+    st3.mac("Test Using Larger Than Block-Size Key - Hash Key First", &mac);
+    try std.testing.expectEqualSlices(
+        u8,
+        try std.fmt.hexToBytes(&expected_buf, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"),
+        &mac,
+    );
+}
+
+test "pbkdf2 matches std.crypto.pwhash.pbkdf2" {
+    var prng = std.Random.DefaultPrng.init(0x9e3779b97f4a7c15);
+    const random = prng.random();
+    var password_buf: [96]u8 = undefined;
+    var salt_buf: [96]u8 = undefined;
+
+    for (0..24) |_| {
+        const password_len = random.intRangeAtMost(usize, 0, password_buf.len);
+        const salt_len = random.intRangeAtMost(usize, 0, salt_buf.len);
+        const rounds = random.intRangeAtMost(u32, 1, 2048);
+        random.bytes(password_buf[0..password_len]);
+        random.bytes(salt_buf[0..salt_len]);
+
+        var ours: [32]u8 = undefined;
+        pbkdf2(password_buf[0..password_len], salt_buf[0..salt_len], rounds, &ours);
+        var theirs: [32]u8 = undefined;
+        try std.crypto.pwhash.pbkdf2(
+            &theirs,
+            password_buf[0..password_len],
+            salt_buf[0..salt_len],
+            rounds,
+            HmacSha256,
+        );
+        try std.testing.expectEqualSlices(u8, &theirs, &ours);
+    }
 }

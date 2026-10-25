@@ -31,6 +31,9 @@ const ChangeList = event_loop_mod.ChangeList;
 const config_mod = @import("config");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
+const OpBackendType = @import("op_backend").Backend;
+const lock_store_mod = @import("lock_store");
+const LockStore = lock_store_mod.LockStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd_auth_oidc);
 
@@ -51,6 +54,8 @@ pub fn main() !void {
 
     var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
     var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
+    var db_path: []const u8 = "/var/db/xmppd";
+    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9)
 
     _ = args.next(); // Skip argv[0]
 
@@ -58,6 +63,11 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
             config_path = args.next() orelse {
                 log.err("--config requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--db")) {
+            db_path = args.next() orelse {
+                log.err("--db requires a value", .{});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--socket")) {
@@ -109,6 +119,13 @@ pub fn main() !void {
     if (cfg.get("oidc", "socket")) |s| {
         socket_path = s;
     }
+    // Same db resolution as xmppd-auth: [server] db_path when not overridden.
+    if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
+        if (cfg.get("server", "db_path")) |v| db_path = v;
+    }
+    if (cfg.get("server", "lmdb_map_size_mb")) |v| {
+        map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
+    }
 
     log.info("xmppd-auth-oidc starting", .{});
     log.info("  issuer: {s}", .{issuer});
@@ -151,6 +168,22 @@ pub fn main() !void {
         log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
     }
     defer handler.deinit();
+
+    // Permanent account locks come from the shared store, read-only, no
+    // creation: an OIDC daemon seeing an empty/missing store must not boot
+    // into fail-open (S3). A startup error kills the daemon outright. A
+    // fresh install (missing environment or namespaces) is provisioned once
+    // read-write and reopened read-only; every other open fault kills the
+    // daemon instead of being provisioned over.
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
+    var lock_backend: OpBackendType = undefined;
+    var lock_store = openLockStore(OpBackendType, allocator, auth_path, map_size_mb * 1024 * 1024, &lock_backend) catch |err| {
+        log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
+        return err;
+    };
+    defer lock_backend.close();
+    handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
 
     // Start IPC server (heap-allocated: the struct is ~2 MB since
     // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
@@ -263,9 +296,10 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
                 };
 
                 // Clean up session after sending success/failure
+                // (lane, conn_id) keyed, matching xmppd-auth (T279).
                 switch (response) {
-                    .auth_success => |s| handler.cleanupSession(s.conn_id),
-                    .auth_failure => |f| handler.cleanupSession(f.conn_id),
+                    .auth_success => |s| handler.cleanupSession(@intCast(slot), s.conn_id),
+                    .auth_failure => |f| handler.cleanupSession(@intCast(slot), f.conn_id),
                     else => {},
                 }
 
@@ -299,6 +333,31 @@ fn flushIpcClient(ipc: *IpcServer, batch: *ChangeList, slot: usize) void {
     }
 }
 
+/// Open the lock store the handler checks against. This daemon is the writer
+/// of record for the locks namespace in an OIDC deployment, so the legacy-key
+/// migration runs here on a short-lived read-write handle: legacy rows would
+/// otherwise stay in place and every lock-check miss would scan the whole
+/// namespace on the auth loop thread (S3). The store is then opened read-only
+/// and told the namespace is canonical when the migration ran, so its misses
+/// skip the legacy scan from the first check on.
+fn openLockStore(
+    comptime Backend: type,
+    allocator: std.mem.Allocator,
+    auth_path: []const u8,
+    map_size: usize,
+    backend: *Backend,
+) !lock_store_mod.LockStore(Backend) {
+    const canonical = try lock_store_mod.migrateIfWritable(Backend, allocator, auth_path, .{
+        .map_size = map_size,
+    });
+    backend.* = try lock_store_mod.openReadOnlyProvisioned(Backend, auth_path, .{
+        .map_size = map_size,
+    });
+    var store = lock_store_mod.LockStore(Backend).init(backend);
+    if (canonical) store.learnLegacyFree();
+    return store;
+}
+
 fn printUsage() void {
     const usage =
         \\Usage: xmppd-auth-oidc [OPTIONS]
@@ -325,4 +384,39 @@ fn printUsage() void {
     var buf: [0]u8 = .{};
     var stdout = std.fs.File.stdout().writer(&buf);
     stdout.interface.writeAll(usage) catch {};
+}
+
+test "oidc daemon: the start path migrates legacy lock keys before the read-only open" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(store_path);
+
+    // One canonical row and one written before keys were case-folded.
+    {
+        var rw = try OpBackendType.open(store_path, .{ .map_size = 1024 * 1024 });
+        defer rw.close();
+        var seed = LockStore.init(&rw);
+        try seed.lock("bob", .permanent);
+        try rw.put(lock_store_mod.NAMESPACE, "Alice", &[_]u8{ 0x01, 0, 0, 0, 7 });
+    }
+
+    var backend: OpBackendType = undefined;
+    var store = try openLockStore(OpBackendType, allocator, store_path, 1024 * 1024, &backend);
+    defer backend.close();
+
+    // The migration ran before the read-only open: the pre-fold row is gone
+    // and its canonical key carries the record.
+    const legacy = try store.backend.get(allocator, lock_store_mod.NAMESPACE, "Alice");
+    defer if (legacy) |v| allocator.free(v);
+    try std.testing.expect(legacy == null);
+    const canon = try store.backend.get(allocator, lock_store_mod.NAMESPACE, "alice");
+    defer if (canon) |v| allocator.free(v);
+    try std.testing.expect(canon != null);
+
+    // The read-only handle serves both accounts.
+    const alice = (try store.isLocked(allocator, "ALICE")) orelse return error.NotLocked;
+    try std.testing.expectEqual(@as(u32, 7), alice.locked_epoch);
+    try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
 }

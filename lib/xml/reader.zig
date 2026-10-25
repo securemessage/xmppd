@@ -102,6 +102,10 @@ pub const Reader = struct {
     /// (T232); `resolveNamespace` always prefers the newest binding.
     ns_marks: [64]u32 = undefined,
     ns_mark_depth: u32 = 0,
+    /// A self-closing element's namespace scope outlives its event: the pop
+    /// waits for the next next() call, so the consumer can resolve prefixes
+    /// the element declared on itself while handling it.
+    pending_scope_pop: bool = false,
     /// Default namespace URI
     default_ns: []const u8 = "",
     /// Namespace stack — saves default_ns on element_open, restores on element_close.
@@ -136,6 +140,12 @@ pub const Reader = struct {
     /// Feed input data and get the next XMPP stream event.
     /// Returns null if more data is needed.
     pub fn next(self: *Reader, input: []const u8, pos: *usize) !?Event {
+        // Retire the previous self-closing element's scope before any new
+        // token is scanned: its bindings never leak into a sibling.
+        if (self.pending_scope_pop) {
+            self.pending_scope_pop = false;
+            self.popScope();
+        }
         while (true) {
             const token = try self.scan.next(input, pos) orelse return null;
 
@@ -205,34 +215,21 @@ pub const Reader = struct {
                     }
 
                     self.depth -= 1;
-                    // Scope ends immediately: pop the ns mark and default ns.
-                    if (self.ns_mark_depth > 0) {
-                        self.ns_mark_depth -= 1;
-                        self.ns_binding_count = self.ns_marks[self.ns_mark_depth];
-                    }
-                    // Restore the parent's default namespace — self-closing element's
-                    // xmlns scope ends immediately.
-                    if (self.ns_stack_depth > 0) {
-                        self.ns_stack_depth -= 1;
-                        self.default_ns = self.ns_stack[self.ns_stack_depth];
-                    }
+                    // The element's namespace scope stays live until the
+                    // next next() call: the consumer resolves the prefixes
+                    // the element declared on itself while handling this
+                    // event. The deferred pop restores the parent scope
+                    // before any later token is scanned.
+                    self.pending_scope_pop = true;
                     return Event{ .element_start = elem };
                 },
                 .element_close => {
                     if (self.depth > 0) {
                         self.depth -= 1;
                     }
-                    // Pop the ns scope mark: any prefix bound inside this
+                    // Pop the ns scope: any prefix bound inside this
                     // element's tag disappears with the element.
-                    if (self.ns_mark_depth > 0) {
-                        self.ns_mark_depth -= 1;
-                        self.ns_binding_count = self.ns_marks[self.ns_mark_depth];
-                    }
-                    // Restore the parent's default namespace
-                    if (self.ns_stack_depth > 0) {
-                        self.ns_stack_depth -= 1;
-                        self.default_ns = self.ns_stack[self.ns_stack_depth];
-                    }
+                    self.popScope();
 
                     // Stream close
                     if (std.mem.eql(u8, token.prefix, "stream") and
@@ -275,6 +272,19 @@ pub const Reader = struct {
         return "";
     }
 
+    /// Restore the enclosing element's namespace scope: the bindings and
+    /// default namespace declared on the closed element end with it.
+    fn popScope(self: *Reader) void {
+        if (self.ns_mark_depth > 0) {
+            self.ns_mark_depth -= 1;
+            self.ns_binding_count = self.ns_marks[self.ns_mark_depth];
+        }
+        if (self.ns_stack_depth > 0) {
+            self.ns_stack_depth -= 1;
+            self.default_ns = self.ns_stack[self.ns_stack_depth];
+        }
+    }
+
     fn buildElement(self: *Reader, self_closing: bool) Element {
         const namespace_uri = self.resolveNamespace(self.current_element_prefix);
         return Element{
@@ -301,6 +311,7 @@ pub const Reader = struct {
         self.ns_stack_depth = 0;
         self.ns_binding_count = 0;
         self.ns_mark_depth = 0;
+        self.pending_scope_pop = false;
         self.current_element_name = "";
         self.current_element_prefix = "";
         self.current_element_local = "";
@@ -372,6 +383,30 @@ test "reader: namespace prefix bindings are element-scoped (T232)" {
     try std.testing.expectEqualStrings("urn:first", uris.items[0]);
     try std.testing.expectEqualStrings("urn:second", uris.items[1]);
     try std.testing.expectEqualStrings("urn:inner", uris.items[2]);
+}
+
+test "reader: a self-closing element's binding is retired before the next sibling is scanned" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // <p:a/> redeclares p on itself. Its scope pop is deferred to the next
+    // next() call: the element's own event still resolves its own binding,
+    // and the sibling's tokens are scanned after the pop, so the sibling
+    // resolves p to the outer URI again.
+    const input = "<r xmlns:p='urn:outer'><p:a xmlns:p='urn:inner'/><p:b/></r>";
+    var pos: usize = 0;
+
+    _ = (try reader.next(input, &pos)).?; // <r>
+    const a = (try reader.next(input, &pos)).?; // <p:a/> self-closing
+    try std.testing.expect(a == .element_start);
+    try std.testing.expectEqualStrings("urn:inner", a.element_start.namespace_uri);
+    try std.testing.expectEqualStrings("urn:inner", reader.resolveNamespace("p"));
+
+    const b = (try reader.next(input, &pos)).?; // <p:b/> self-closing
+    try std.testing.expect(b == .element_start);
+    try std.testing.expectEqualStrings("urn:outer", b.element_start.namespace_uri);
+    try std.testing.expectEqualStrings("urn:outer", reader.resolveNamespace("p"));
 }
 
 test "namespace resolution on master stream: redeclared prefix resolves newest-first" {

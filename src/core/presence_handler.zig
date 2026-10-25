@@ -26,6 +26,7 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const generic_roster = @import("roster_store");
+const backend_mod = @import("backend");
 const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
@@ -922,7 +923,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
 // Pending subscription storage (RFC 6121 §3.1.3 rule 4)
 // ========================================================================
 
-const PENDING_SUB_NS = "pending_sub";
+pub const PENDING_SUB_NS = backend_mod.registered("pending_sub");
 
 /// Store a pending subscription request for deferred delivery to an offline contact.
 /// Key: contact_bare\x00subscriber_bare. Value: raw subscribe presence XML.
