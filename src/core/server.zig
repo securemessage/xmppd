@@ -1634,9 +1634,10 @@ pub const Server = struct {
                 const event = session.reader.next(data, &pos) catch |err| {
                     // Client-side protocol violation, not a server fault.
                     log.warn("connection {d} XML parse error: {}", .{ id, err });
-                    // An overlong token is a resource limit the peer hit, not
-                    // malformed XML (S11).
-                    self.sendStreamError(session, if (err == error.TokenTooLong)
+                    // Resource limits are policy violations, not malformed XML.
+                    self.sendStreamError(session, if (err == error.TokenTooLong or
+                        err == error.ItemTooLong or
+                        err == error.TooManyAttributes)
                         .policy_violation
                     else
                         .not_well_formed);
@@ -2203,10 +2204,9 @@ pub const Server = struct {
                 }
             } else {
                 // Stanza complete (depth back to stream level): route to targets.
-                // Fail closed on an oversized stanza (E5). The accumulation
-                // buffer overflowed, so what is buffered is a partial stanza;
-                // never deliver it. The reader cap (512 KiB) is the hard limit,
-                // this buffer is the per-stanza limit.
+                // The accumulation buffer holds only a partial stanza after
+                // overflow; never deliver it. Scanner token caps do not replace
+                // this whole-stanza limit.
                 if (session.stanza_overflow) {
                     log.warn("connection {d} stanza exceeds {d} bytes: policy-violation", .{ session.conn.id, session.stanza_buf.len });
                     self.sendStreamError(session, .policy_violation);

@@ -100,6 +100,7 @@ pub const max_ns_depth = 64;
 /// life of the connection (S26). Sized well above the server's stanza cap.
 const max_arena_retain = 64 * 1024;
 const max_ns_arena_retain = 4 * 1024;
+const max_attributes_per_element = 64;
 
 const NsBinding = struct {
     prefix: []const u8,
@@ -112,6 +113,7 @@ pub const Reader = struct {
     depth: u32 = 0,
     /// Accumulated attributes for the current element being opened
     attrs: std.ArrayList(Attribute) = .{},
+    attribute_count: u32 = 0,
     /// Namespace prefix-to-URI bindings for the current scope
     ns_bindings: [max_ns_bindings]NsBinding = undefined,
     ns_binding_count: u32 = 0,
@@ -156,6 +158,10 @@ pub const Reader = struct {
         };
     }
 
+    pub fn setMaxItemBytes(self: *Reader, max_bytes: usize) void {
+        self.scan.setMaxItemBytes(max_bytes);
+    }
+
     pub fn deinit(self: *Reader) void {
         self.scan.deinit();
         self.attrs.deinit(self.allocator);
@@ -190,6 +196,7 @@ pub const Reader = struct {
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
                     self.current_element_local = try self.arenaDupe(token.local_name);
                     self.attrs.clearRetainingCapacity();
+                    self.attribute_count = 0;
                     // Scope mark: the matching close restores this many bindings.
                     // Both stacks advance in lockstep; full is a hard error,
                     // never a silent skip (S12).
@@ -202,6 +209,7 @@ pub const Reader = struct {
                     self.ns_stack_depth += 1;
                 },
                 .namespace_decl => {
+                    try self.accountAttribute();
                     const uri = try self.nsDupe(token.value);
                     if (token.prefix.len == 0) {
                         // Default namespace
@@ -217,6 +225,7 @@ pub const Reader = struct {
                     }
                 },
                 .attribute => {
+                    try self.accountAttribute();
                     try self.attrs.append(self.allocator, .{
                         .name = try self.arenaDupe(token.name),
                         .value = try self.arenaDupe(token.value),
@@ -396,6 +405,11 @@ pub const Reader = struct {
         return try a.dupe(u8, s);
     }
 
+    fn accountAttribute(self: *Reader) !void {
+        if (self.attribute_count >= max_attributes_per_element) return error.TooManyAttributes;
+        self.attribute_count += 1;
+    }
+
     /// Reset the reader for a new stream (e.g., after STARTTLS or SASL reset).
     /// Clears both the Reader state and the underlying Scanner so a fresh
     /// XML stream can be parsed from scratch.
@@ -411,6 +425,7 @@ pub const Reader = struct {
         self.current_element_prefix = "";
         self.current_element_local = "";
         self.attrs.clearRetainingCapacity();
+        self.attribute_count = 0;
         _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
         _ = self.ns_arena.reset(.{ .retain_with_limit = max_ns_arena_retain });
         self.scan.reset();
@@ -744,6 +759,75 @@ test "reader: E1 a non-stream root is a stream error" {
     var pos: usize = 0;
     try std.testing.expectError(error.InvalidStreamRoot, reader.next(input, &pos));
     try std.testing.expect(!reader.stream_opened);
+}
+
+test "reader: G5 ignored root errors cannot grow the stanza arena" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    // Keep parsing after every invalid root. Depth alone must bound each item.
+    const input = "<presence/>";
+    for (0..20_000) |_| {
+        var pos: usize = 0;
+        _ = reader.next(input, &pos) catch {};
+    }
+    try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
+}
+
+test "reader: G5 attributes per element are capped" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    var pos: usize = 0;
+    _ = try reader.next("<foo", &pos);
+    for (0..100_000) |i| {
+        var buf: [64]u8 = undefined;
+        const attr = try std.fmt.bufPrint(&buf, " a{d}='v'", .{i});
+        pos = 0;
+        _ = reader.next(attr, &pos) catch |err| {
+            try std.testing.expectEqual(error.TooManyAttributes, err);
+            try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
+            return;
+        };
+    }
+    return error.ExpectedTooManyAttributes;
+}
+
+test "reader: G5 namespace declarations count toward the attribute cap" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    var pos: usize = 0;
+    _ = try reader.next("<foo", &pos);
+    for (0..100_000) |_| {
+        pos = 0;
+        _ = reader.next(" xmlns='urn:example'", &pos) catch |err| {
+            try std.testing.expectEqual(error.TooManyAttributes, err);
+            try std.testing.expect(reader.ns_arena.queryCapacity() <= max_ns_arena_retain);
+            return;
+        };
+    }
+    return error.ExpectedTooManyAttributes;
+}
+
+test "reader: G5 an unterminated item has a whole-item byte cap" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try drainAll(&reader, "<iq>");
+    for (0..300_000) |_| {
+        var pos: usize = 0;
+        _ = reader.next("<a/>", &pos) catch |err| {
+            try std.testing.expectEqual(error.ItemTooLong, err);
+            return;
+        };
+    }
+    return error.ExpectedItemTooLong;
 }
 
 test "reader: parse message stanza" {

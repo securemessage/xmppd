@@ -72,6 +72,9 @@ const MAX_INBOUND_SESSIONS = 256;
 /// Maximum outbound S2S connections.
 const MAX_OUTBOUND_CONNS = 128;
 
+/// Unauthenticated streams need only negotiation elements and dialback keys.
+const PRE_AUTH_ITEM_MAX_BYTES = 16 * 1024;
+
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
     allocator: std.mem.Allocator,
@@ -243,6 +246,7 @@ pub const S2sDaemon = struct {
             return null;
         };
         reader.* = XmlReader.init(self.allocator);
+        reader.setMaxItemBytes(PRE_AUTH_ITEM_MAX_BYTES);
         self.readers[slot] = reader;
 
         log.info("accepted inbound S2S connection id={d} fd={d}", .{ slot, client_fd });
@@ -838,13 +842,7 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     while (true) {
         const event = reader.next(data, &pos) catch |err| {
             log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            // An overlong token is a resource limit the peer hit, not malformed
-            // XML (S11).
-            sendStreamError(session, stream_mod.streamErrorForXmlError(err));
-            if (session.hasPendingWrite()) {
-                batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
-            }
-            // Close after flushing error
+            closeInboundWithStreamError(daemon, slot, stream_mod.streamErrorForXmlError(err));
             return;
         };
         if (event == null) break;
@@ -936,6 +934,9 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
 
             session.setRemoteDomain(from);
             const action = session.stream.handleStreamOpen(from, to, version);
+            if (session.stream.isEstablished()) {
+                reader.setMaxItemBytes(xml.scanner.default_max_item_bytes);
+            }
             executeAction(daemon, session, action);
 
             // After post-TLS stream open, perform DANE verification on peer cert
@@ -1250,6 +1251,9 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     if (valid) {
         session.inbound_dialback.setValid();
         session.stream.setAuthenticated();
+        if (daemon.readers[inbound_slot]) |reader| {
+            reader.setMaxItemBytes(xml.scanner.default_max_item_bytes);
+        }
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{
             session.getRemoteDomain(), inbound_slot,
         });
@@ -1334,6 +1338,13 @@ fn sendStreamError(session: *S2sSession, err: StreamError) void {
     var buf: [512]u8 = undefined;
     const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
     session.queueWrite(error_xml) catch {};
+}
+
+fn closeInboundWithStreamError(daemon: *S2sDaemon, slot: usize, err: StreamError) void {
+    const session = daemon.getInbound(slot) orelse return;
+    sendStreamError(session, err);
+    _ = session.flushWrite() catch {};
+    daemon.closeInbound(slot);
 }
 
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
@@ -1962,6 +1973,119 @@ fn printUsage() void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn connectInboundForTest(daemon: *S2sDaemon) !posix.fd_t {
+    try daemon.listen("127.0.0.1", 0);
+    if (std.c.fcntl(daemon.listener_fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(daemon.listener_fd, @ptrCast(&addr), &addr_len) != 0) {
+        return error.GetSockNameFailed;
+    }
+
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(client_fd);
+    var connect_addr = std.c.sockaddr.in{
+        .port = addr.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in));
+    const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
+    try std.testing.expectEqual(@as(usize, 0), slot);
+    const session = daemon.getInbound(slot) orelse return error.NoSession;
+    if (std.c.fcntl(session.fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    return client_fd;
+}
+
+test "S2sDaemon: G5 an XML error is flushed once and closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<foo/>");
+    handleInboundReadable(&daemon, &batch, 0);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") != null);
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(client_fd, &response));
+}
+
+test "S2sDaemon: G5 a small pre-auth item cap closes an unterminated stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    _ = try posix.write(client_fd, stream_open);
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    _ = try posix.write(client_fd, "<iq>");
+    handleInboundReadable(&daemon, &batch, 0);
+    // The synchronous test invokes the readable handler directly, so loopback
+    // readiness races must not block it.
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    for (0..20_000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, "<a/>");
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [16384]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G5 the pre-auth cap covers an unterminated stream header" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<stream:stream xmlns='jabber:server' from='");
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    const chunk = [_]u8{'a'} ** 64;
+    for (0..2000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, &chunk);
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
 
 test "extractDomain: user@domain" {
     try std.testing.expectEqualStrings("b.example", extractDomain("alice@b.example"));

@@ -82,6 +82,10 @@ pub const max_token_retain = 4 * 1024;
 /// reader's own retain limit (S26).
 pub const max_token_arena_retain = 64 * 1024;
 
+/// Default ceiling on all bytes in one stream header or top-level stanza.
+/// It exceeds the per-token cap so token errors keep their existing boundary.
+pub const default_max_item_bytes = 2 * max_token_bytes;
+
 /// Streaming XML scanner for XMPP streams.
 ///
 /// Designed for XMPP's streaming model where `<stream:stream>` is opened
@@ -94,6 +98,9 @@ pub const Scanner = struct {
     /// exists so inter-stanza whitespace is never accumulated and so the
     /// token arena can be reset at each stanza boundary (S11).
     depth: u32 = 0,
+    max_item_bytes: usize = default_max_item_bytes,
+    item_bytes: usize = 0,
+    item_active: bool = false,
     buf: std.ArrayList(u8) = .{},
     /// Secondary buffer for attribute values
     val_buf: std.ArrayList(u8) = .{},
@@ -144,8 +151,14 @@ pub const Scanner = struct {
         self.ent_buf.clearRetainingCapacity();
         self.quote_char = 0;
         self.saw_slash = false;
+        self.item_bytes = 0;
+        self.item_active = false;
         self.pending.clearRetainingCapacity();
         _ = self.token_arena.reset(.retain_capacity);
+    }
+
+    pub fn setMaxItemBytes(self: *Scanner, max_bytes: usize) void {
+        self.max_item_bytes = max_bytes;
     }
 
     const ally = struct {
@@ -162,12 +175,22 @@ pub const Scanner = struct {
     pub fn next(self: *Scanner, input: []const u8, pos: *usize) !?Token {
         const token = try self.nextToken(input, pos) orelse return null;
         switch (token.type) {
-            .element_open_end => self.depth += 1,
+            .xml_declaration => {
+                if (self.depth <= 1) self.item_active = false;
+            },
+            .element_open_end => {
+                const was_stream_root = self.depth == 0;
+                self.depth += 1;
+                if (was_stream_root) self.item_active = false;
+            },
             // Opens and closes in one token, so the net depth change is zero,
             // matching the reader's own bookkeeping.
-            .element_self_close => {},
+            .element_self_close => {
+                if (self.depth <= 1) self.item_active = false;
+            },
             .element_close => {
                 if (self.depth > 0) self.depth -= 1;
+                if (self.depth <= 1) self.item_active = false;
             },
             else => {},
         }
@@ -186,6 +209,15 @@ pub const Scanner = struct {
         while (pos.* < input.len) {
             const c = input[pos.*];
             pos.* += 1;
+
+            if (self.state == .content and c == '<' and self.depth <= 1) {
+                self.item_bytes = 0;
+                self.item_active = true;
+            }
+            if (self.item_active) {
+                if (self.item_bytes >= self.max_item_bytes) return error.ItemTooLong;
+                self.item_bytes += 1;
+            }
 
             switch (self.state) {
                 .content => {

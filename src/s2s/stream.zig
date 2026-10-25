@@ -112,10 +112,12 @@ pub const StreamError = enum {
     }
 };
 
-/// Map an XML parse error to a stream error. An overlong token is a resource
-/// limit the peer hit (policy-violation), not malformed XML (S11).
+/// Resource limits are policy violations; malformed XML is not-well-formed.
 pub fn streamErrorForXmlError(err: anyerror) StreamError {
-    return if (err == error.TokenTooLong) .policy_violation else .not_well_formed;
+    return switch (err) {
+        error.TokenTooLong, error.ItemTooLong, error.TooManyAttributes => .policy_violation,
+        else => .not_well_formed,
+    };
 }
 
 test "S2S: an over-long token maps to policy-violation, not not-well-formed" {
