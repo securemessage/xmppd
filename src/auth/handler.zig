@@ -568,6 +568,9 @@ pub fn AuthHandler(comptime Store: type) type {
                     };
                     const c = maybe_creds orelse {
                         log.info("SCRAM auth failed: user '{s}' not found", .{username});
+                        // The attempt was counted at admission; an unknown
+                        // user is still a failed authentication.
+                        self.policy.recordOutcome(username, req.client_ip, .failure);
                         session.deinit();
                         return authFailure(req.conn_id, "not-authorized");
                     };
@@ -2168,4 +2171,46 @@ test "AuthHandler: OAUTHBEARER denies a locked IP before validating the token" {
     if (result != .auth_failure) return error.ExpectedAuthFailure;
     try std.testing.expectEqualStrings("policy-violation", result.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 0), store.token_calls);
+}
+
+test "AuthHandler: SCRAM unknown user records a failure" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        var client = sasl.ScramClient.init(allocator, "ghost", "whatever");
+        defer client.deinit();
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 140 + i,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.8",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        if (reply != .auth_failure) return error.ExpectedAuthFailure;
+        if (i == 0) {
+            try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+        } else {
+            try std.testing.expectEqualStrings("account-disabled", reply.auth_failure.reason);
+        }
+    }
 }
