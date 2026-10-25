@@ -9176,6 +9176,39 @@ test "Server: S10 handshake write interest is one-shot" {
     try std.testing.expect(found_oneshot);
 }
 
+test "Server: S4 jid-malformed subscription escapes the stanza id" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = session;
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.authenticated_jid = session.stream.bound_jid;
+
+    var to_buf: [600]u8 = undefined;
+    @memset(&to_buf, 'a');
+    @memcpy(to_buf[588..], "@example.org");
+    session.stanza_to = &to_buf;
+    session.stanza_id = "sess-'&<";
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    presence_handler.dispatchSubscription(&server, session, .subscribe, "", &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-&apos;&amp;&lt;'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-'&<'") == null);
+}
+
 // Force analysis of sibling files whose tests otherwise never run.
 test {
     _ = iq_handler;

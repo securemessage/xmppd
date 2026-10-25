@@ -870,6 +870,22 @@ test "scanner: close tag allows trailing whitespace but not attributes" {
     }
 }
 
+test "scanner: close tag allows trailing tab CR and LF" {
+    const allocator = std.testing.allocator;
+    const inputs = [_][]const u8{ "<x></a\t>", "<x></a\r>", "<x></a\n>" };
+
+    for (inputs) |input| {
+        var scanner = Scanner.init(allocator);
+        defer scanner.deinit();
+        var pos: usize = 0;
+        _ = (try scanner.next(input, &pos)).?;
+        _ = (try scanner.next(input, &pos)).?;
+        const close = (try scanner.next(input, &pos)).?;
+        try std.testing.expectEqual(TokenType.element_close, close.type);
+        try std.testing.expectEqualStrings("a", close.name);
+    }
+}
+
 test "scanner: uppercase hex CharRef is rejected (&#X41;)" {
     const allocator = std.testing.allocator;
     var scanner = Scanner.init(allocator);

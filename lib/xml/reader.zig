@@ -708,6 +708,29 @@ test "reader: S27 self-closing stream child is an ordinary element" {
     try std.testing.expectEqual(@as(usize, 1), reader.depth);
 }
 
+test "reader: S27 a self-closing stream in another namespace is an ordinary element" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    const input = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>" ++
+        "<x:stream xmlns:x='urn:other'/>" ++
+        "<presence/>";
+    var pos: usize = 0;
+    try std.testing.expect((try reader.next(input, &pos)).? == .stream_open);
+
+    const foreign = (try reader.next(input, &pos)).?;
+    try std.testing.expect(foreign == .element_start);
+    try std.testing.expectEqualStrings("stream", foreign.element_start.local_name);
+    try std.testing.expectEqualStrings("urn:other", foreign.element_start.namespace_uri);
+    try std.testing.expect(foreign.element_start.self_closing);
+    try std.testing.expectEqual(@as(usize, 1), reader.depth);
+
+    const next = (try reader.next(input, &pos)).?;
+    try std.testing.expect(next == .element_start);
+    try std.testing.expectEqualStrings("presence", next.element_start.local_name);
+}
+
 test "reader: E1 a self-closing stream header is a stream error" {
     const allocator = std.testing.allocator;
     var reader = Reader.init(allocator);
