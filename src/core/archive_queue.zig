@@ -15,10 +15,11 @@
 //! - Bounded ring (MAX_JOBS). At 75% a warning logs once; full jobs are
 //!   dropped with an error — message delivery is never delayed by archival.
 //! - The writer wakes via the classic 1-byte pipe: its read end sits in the
-//!   writer thread's own kqueue; producers write a byte after enqueueing.
-//! - The writer calls store() per job (a single WriteBatch was considered
-//!   and deferred: duplicate-key behavior within one batch differs per
-//!   backend; per-job keeps semantics identical to the old inline path).
+//!   writer thread's own kqueue; producers write a byte only when an
+//!   enqueue takes the ring from empty to non-empty, and the writer
+//!   re-checks the count before sleeping so no wakeup can be lost.
+//! - Job payloads live in one allocation per job; the writer commits a
+//!   storeAll batch per DRAIN_CAP chunk instead of one commit per job.
 //! - MAM/history reads stay inline on the workers (eventually consistent by
 //!   design: a MAM query may miss a message archived milliseconds ago).
 
@@ -28,44 +29,50 @@ const posix = std.posix;
 const log = std.log.scoped(.archive_writer);
 
 /// One archive write: owner bare JID, conversation partner, stanza-id,
-/// timestamp, full stanza XML. All slices owned by the queue.
+/// timestamp, full stanza XML. All slices point into `block`, the single
+/// allocation the queue owns.
 pub const Job = struct {
     owner: []u8,
     with: []u8,
     stanza_id: []u8,
     timestamp: u64,
     stanza_xml: []u8,
+    /// Backing allocation for the four slices above.
+    block: []u8,
 
     pub fn deinit(self: *Job) void {
-        std.heap.c_allocator.free(self.owner);
-        std.heap.c_allocator.free(self.with);
-        std.heap.c_allocator.free(self.stanza_id);
-        std.heap.c_allocator.free(self.stanza_xml);
+        std.heap.c_allocator.free(self.block);
     }
 };
 
-/// Deep-copy a job; the job owns its slices on success.
+/// Deep-copy a job in one allocation; the job owns `block` on success.
 fn copyJob(owner: []const u8, with: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) !Job {
-    var job = Job{
-        .owner = try std.heap.c_allocator.dupe(u8, owner),
-        .with = undefined,
-        .stanza_id = undefined,
+    const block = try std.heap.c_allocator.alloc(u8, owner.len + with.len + stanza_id.len + stanza_xml.len);
+    const o_end = owner.len;
+    const w_end = o_end + with.len;
+    const s_end = w_end + stanza_id.len;
+    @memcpy(block[0..o_end], owner);
+    @memcpy(block[o_end..w_end], with);
+    @memcpy(block[w_end..s_end], stanza_id);
+    @memcpy(block[s_end..], stanza_xml);
+    return .{
+        .block = block,
+        .owner = block[0..o_end],
+        .with = block[o_end..w_end],
+        .stanza_id = block[w_end..s_end],
         .timestamp = timestamp,
-        .stanza_xml = undefined,
+        .stanza_xml = block[s_end..],
     };
-    errdefer std.heap.c_allocator.free(job.owner);
-    job.with = try std.heap.c_allocator.dupe(u8, with);
-    errdefer std.heap.c_allocator.free(job.with);
-    job.stanza_id = try std.heap.c_allocator.dupe(u8, stanza_id);
-    errdefer std.heap.c_allocator.free(job.stanza_id);
-    job.stanza_xml = try std.heap.c_allocator.dupe(u8, stanza_xml);
-    return job;
 }
 
 /// Bounded producer/consumer ring with a wake pipe.
 pub const ArchiveWriteQueue = struct {
     /// Survives ~12s of stall at 170 archive writes/sec (task analysis).
     pub const MAX_JOBS: usize = 2048;
+
+    /// Jobs per storeAll call inside a drain; bounds the live job set the
+    /// writer holds between pops.
+    const DRAIN_CAP: usize = 64;
 
     slots: [MAX_JOBS]Job = undefined,
     head: usize = 0, // next pop
@@ -89,6 +96,13 @@ pub const ArchiveWriteQueue = struct {
 
     /// Jobs the store call rejected inside the writer — logged per job.
     store_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Wake-pipe writes that failed after an empty-to-non-empty enqueue —
+    /// the writer may sleep while work is pending.
+    wake_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Chunk of jobs popped per storeAll call inside a drain.
+    drain_jobs: [DRAIN_CAP]Job = undefined,
 
     pub fn init() !ArchiveWriteQueue {
         const fds = try posix.pipe();
@@ -151,7 +165,14 @@ pub const ArchiveWriteQueue = struct {
         self.slots[self.tail % MAX_JOBS] = job;
         self.tail += 1;
 
-        _ = posix.write(self.pipe_wr, "\x00") catch {};
+        // Wake the writer only on the empty-to-non-empty transition; it
+        // re-checks the count before sleeping, so further bytes buy nothing.
+        if (n == 0) {
+            _ = posix.write(self.pipe_wr, "\x00") catch {
+                _ = self.wake_failed.fetchAdd(1, .monotonic);
+                log.err("archive write queue: wake write failed — writer may stall until next enqueue", .{});
+            };
+        }
     }
 
     /// Pop a job (caller owns its memory). Null when empty.
@@ -206,6 +227,11 @@ pub const ArchiveWriteQueue = struct {
             }
 
             self.drainPipe();
+            // Sleep only when the ring is empty: jobs pushed between the
+            // drain and this point must not wait for a later wakeup (V15).
+            // A job pushed after this check is an empty-to-non-empty
+            // transition, so its wake byte lands in the pipe before kevent.
+            if (!self.countIsEmpty()) continue;
             _ = posix.kevent(kq, &.{}, &events, null) catch |err| {
                 log.err("writer kevent failed: {} — exiting writer thread", .{err});
                 return;
@@ -213,17 +239,24 @@ pub const ArchiveWriteQueue = struct {
         }
     }
 
-    /// Store up to `batch` queued jobs. Bounded so a flood can't starve the
-    /// stopping check; the wake pipe keeps the loop hot between batches.
+    /// Store up to `batch` queued jobs in chunks of DRAIN_CAP, one storeAll
+    /// commit per chunk. Bounded so a flood can't starve the stopping check.
     fn drainInto(self: *ArchiveWriteQueue, store: anytype, batch: usize) void {
         var processed: usize = 0;
-        while (processed < batch) : (processed += 1) {
-            var job = self.pop() orelse break;
-            store.store(job.owner, job.with, job.stanza_id, job.timestamp, job.stanza_xml) catch |err| {
-                _ = self.store_failed.fetchAdd(1, .monotonic);
-                log.warn("archive store failed ({d} total): {}", .{ self.store_failed.load(.monotonic), err });
+        while (processed < batch) {
+            var n: usize = 0;
+            const room = @min(batch - processed, DRAIN_CAP);
+            while (n < room) : (n += 1) {
+                self.drain_jobs[n] = self.pop() orelse break;
+            }
+            if (n == 0) break;
+            const items = self.drain_jobs[0..n];
+            store.storeAll(items) catch |err| {
+                _ = self.store_failed.fetchAdd(n, .monotonic);
+                log.warn("archive store batch of {d} jobs failed ({d} failed total): {}", .{ n, self.store_failed.load(.monotonic), err });
             };
-            job.deinit();
+            for (items) |*job| job.deinit();
+            processed += n;
         }
     }
 
@@ -240,19 +273,16 @@ pub const ArchiveWriteQueue = struct {
 
 const MockStore = struct {
     stored: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    batches: u32 = 0,
     fail_next: bool = false,
 
-    pub fn store(self: *MockStore, owner: []const u8, with: []const u8, stanza_id: []const u8, ts: u64, xml: []const u8) !void {
-        _ = owner;
-        _ = with;
-        _ = stanza_id;
-        _ = ts;
-        _ = xml;
+    pub fn storeAll(self: *MockStore, items: anytype) !void {
         if (self.fail_next) {
             self.fail_next = false;
             return error.Fail;
         }
-        _ = self.stored.fetchAdd(1, .monotonic);
+        self.batches += 1;
+        _ = self.stored.fetchAdd(@intCast(items.len), .monotonic);
     }
 };
 
@@ -317,8 +347,56 @@ test "ArchiveWriteQueue: store failures are counted, not silent (S31)" {
     q.enqueue("a@localhost", "b@localhost", "s2", 2, "<m/>");
     q.drainInto(&store, 64);
 
-    try std.testing.expectEqual(@as(u64, 1), q.store_failed.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 1), store.stored.load(.monotonic));
+    // A failed batch loses every job in it; each is counted.
+    try std.testing.expectEqual(@as(u64, 2), q.store_failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), store.stored.load(.monotonic));
+}
+
+test "ArchiveWriteQueue: drainInto writes one storeAll batch per chunk (Q8)" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var store = MockStore{};
+    for (0..ArchiveWriteQueue.DRAIN_CAP + 1) |_| {
+        q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
+    }
+    q.drainInto(&store, 128);
+
+    try std.testing.expectEqual(@as(u32, 2), store.batches);
+    try std.testing.expectEqual(@as(u32, ArchiveWriteQueue.DRAIN_CAP + 1), store.stored.load(.monotonic));
+}
+
+test "ArchiveWriteQueue: wake byte only on the empty-to-non-empty transition (Q8)" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var buf: [8]u8 = undefined;
+    q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(q.pipe_rd, &buf));
+
+    q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
+    try std.testing.expectError(error.WouldBlock, posix.read(q.pipe_rd, &buf));
+}
+
+test "ArchiveWriteQueue: a burst larger than one drain all lands (V15)" {
+    var q = try ArchiveWriteQueue.init();
+    defer q.deinit();
+
+    var store = MockStore{};
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *ArchiveWriteQueue, st: *MockStore) void {
+            queue.writerLoop(st, 64);
+        }
+    }.run, .{ &q, &store });
+
+    for (0..200) |_| {
+        q.enqueue("a@localhost", "b@localhost", "s", 1, "<m/>");
+    }
+
+    q.stopping.store(true, .release);
+    _ = posix.write(q.pipe_wr, "\x00") catch {};
+    t.join();
+    try std.testing.expectEqual(@as(u32, 200), store.stored.load(.monotonic));
 }
 
 // S31 regression: jobs pushed through the queue must land in the backend

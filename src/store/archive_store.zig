@@ -95,6 +95,24 @@ pub fn ArchiveStore(comptime Backend: type) type {
             try batch.commit();
         }
 
+        /// Store several messages in one backend write batch: one commit
+        /// per call, aborted as a whole on error. Items must carry
+        /// owner/with/stanza_id/timestamp/stanza_xml fields.
+        pub fn storeAll(self: *Self, items: anytype) !void {
+            if (items.len == 0) return;
+            var batch = try self.db.writeBatch();
+            errdefer batch.abort();
+            for (items) |it| {
+                const primary_key = try self.buildPrimaryKey(it.owner, it.timestamp, it.stanza_id);
+                defer self.allocator.free(primary_key);
+                const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp);
+                defer self.allocator.free(contact_key);
+                try batch.put(NS_MESSAGES, primary_key, it.stanza_xml);
+                try batch.put(NS_BY_CONTACT, contact_key, it.stanza_id);
+            }
+            try batch.commit();
+        }
+
         /// Query the archive with RSM pagination.
         pub fn query(
             self: *Self,
