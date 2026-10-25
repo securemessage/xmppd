@@ -3405,3 +3405,39 @@ test "S16: local replaced-resource notice overflow fails the session" {
 
     try std.testing.expect(target.sm_overflow);
 }
+
+test "S16: local delivery refuses a stale session generation" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const sm_mod = @import("session_map");
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = sm_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    server.worker_id = 0;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = session;
+    const generation = try sm.bind(0, 0, "bob", "localhost", "phone");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const stanza = "<message from='room@conference.localhost' to='bob@localhost/phone' type='error'/>";
+    deliverToTriple(&server, stanza, 0, 0, generation + 1, &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [1024]u8 = undefined;
+    var n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(!session.sm_overflow);
+
+    deliverToTriple(&server, stanza, 0, 0, generation, &changes);
+    _ = try session.conn.flushSend();
+    n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqualStrings(stanza, buf[0..n]);
+}
