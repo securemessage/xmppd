@@ -702,6 +702,26 @@ test "Supervisor: captured stderr keeps a child's long output" {
     try std.testing.expect(std.mem.allEqual(u8, captured.stderr[0..captured.len], 'x'));
 }
 
+fn childWriteHugeStderr() callconv(.c) u8 {
+    var line: [1024]u8 = undefined;
+    @memset(line[0..], 'y');
+    var written: usize = 0;
+    while (written < 192 * 1024) {
+        const n = posix.write(2, &line) catch return 1;
+        written += n;
+    }
+    return 0;
+}
+
+test "Supervisor: the capture cap drops only the excess while the drain reaches EOF" {
+    // 192 KiB is more than the 64 KiB cap plus a 64 KiB pipe buffer: a drain
+    // that stops at the cap would block the child and never reap it.
+    const captured = try runCaptured(childWriteHugeStderr);
+    try std.testing.expectEqual(@as(u8, 0), captured.status);
+    try std.testing.expectEqual(captured_stderr_cap, captured.len);
+    try std.testing.expect(std.mem.allEqual(u8, captured.stderr[0..captured.len], 'y'));
+}
+
 /// The identity drop runs setgroups, which needs privilege: a non-root
 /// caller on a host without it gets EPERM and the child dies at 125. The
 /// probe runs the call in a forked child so the runner's own group list is
