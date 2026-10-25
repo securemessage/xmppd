@@ -64,8 +64,9 @@ pub const Handle = packed struct {
 
 /// One kqueue registration change, staged until the waiting kevent() call.
 const Change = Kevent;
-// =====================================================================// Engine
-// ============================================================================
+// ======================================================================
+// Engine
+// ======================================================================
 
 pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
@@ -1057,7 +1058,7 @@ pub const Engine = struct {
     /// Register the resolver's kqueue on this loop: the child kqueue
     /// reports readable while it has pending knotes, covering the DNS
     /// socket, TCP fallbacks and every resolver deadline in one fd.
-    /// That replaces the old 1 s housekeeping tick entirely.
+    /// All resolver progress reaches the loop through that one fd.
     fn armResolverWatch(self: *Engine) void {
         if (self.resolver == null or self.resolver_watch_armed) return;
         self.resolver_watch_armed = true;

@@ -1,13 +1,13 @@
-//! # lib/dns/async.zig — shared async resolver (X2, Phorge T276)
+//! # lib/dns/async.zig - shared async resolver (X2, Phorge T276)
 //!
-//! Lifted from lib/xmppc/resolver.zig into a reusable library:
+//! A reusable asynchronous DNS resolver:
 //!
 //! - Responses are demuxed on (id, qname, qtype) together (T296), never
 //!   on the id alone.
 //! - `Service` selects the SRV prefix pair: client = _xmpps-client then
 //!   _xmpp-client; server = _xmpps-server then _xmpp-server (XEP-0368).
 //! - Raw record queries (A/AAAA/SRV/TLSA) via `query()`; `resolve()` is
-//!   the SRV→addr→TLSA chain on top of them.
+//!   the SRV->addr->TLSA chain on top of them.
 //! - Multiple SRV targets are ordered per RFC 2782 (priority, then
 //!   weighted-random by weight).
 //! - A truncated (TC) UDP answer retries the same query over TCP.
@@ -310,7 +310,7 @@ pub const Resolver = struct {
         self.qcb = cb;
     }
 
-    /// UDP socket fd — callers may register it on their own loop and call
+    /// UDP socket fd - callers may register it on their own loop and call
     /// step(0) when it reads; deadlines still fire via step().
     pub fn sockFd(self: *const Resolver) posix.fd_t {
         return self.fd;
@@ -540,7 +540,7 @@ pub const Resolver = struct {
     }
 
     /// One kevent turn on the resolver's kqueue. `timeout_ms` may be 0
-    /// (pump only) — callers pass their next-loop deadline, not a sleep.
+    /// (pump only) - callers pass their next-loop deadline, not a sleep.
     pub fn step(self: *Resolver, timeout_ms: i32) void {
         if (self.kq < 0) return;
         self.drainStash();
@@ -964,7 +964,7 @@ pub const Resolver = struct {
     // -- responses --------------------------------------------------------
 
     /// T296: a response belongs to a query only when id AND qname AND
-    /// qtype all match — a colliding id does not steer a different query.
+    /// qtype all match - a colliding id does not steer a different query.
     fn matchJob(self: *Resolver, pkt: []const u8) ?*Job {
         if (pkt.len < 12) return null;
         const id = std.mem.readInt(u16, pkt[0..2], .big);
@@ -1837,7 +1837,7 @@ const FakeDns = struct {
                 var qbuf: [4096]u8 = undefined;
                 @memcpy(qbuf[0..n], buf[0..n]);
                 const resp_len = self.buildResponse(&buf, qbuf[0..n]);
-                // Optional decoy: same id, wrong qname — must be ignored (T296).
+                // Optional decoy: same id, wrong qname - must be ignored (T296).
                 if (self.decoy_qname.len > 0) {
                     var decoy: [1024]u8 = undefined;
                     const dn = self.buildDecoy(&decoy, qbuf[0..n]);
@@ -2043,7 +2043,7 @@ const FakeDns = struct {
     }
 
     /// Same id and a real answer, but the question section names a
-    /// different owner — a T296 decoy.
+    /// different owner - a T296 decoy.
     fn buildDecoy(self: *FakeDns, out: []u8, pkt: []const u8) usize {
         var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
