@@ -105,10 +105,15 @@ pub const QueryCb = struct {
 
 const Phase = enum { srv_tls, srv_plain, addr, addr6, tlsa, fallback_addr, fallback_tlsa, raw, done };
 
+/// Session keys sharing one in-flight job. Bounded inline: a full
+/// job takes no more waiters and the lookup starts a fresh job.
+const MAX_WAITERS: usize = 16;
+
 const Job = struct {
     /// Session keys waiting on this job; identical in-flight lookups
     /// share one job and every waiter still gets its own callback.
-    waiters: std.ArrayListUnmanaged(usize) = .{},
+    waiters: [MAX_WAITERS]usize = undefined,
+    waiter_count: usize = 0,
     name: []const u8, // owned
     phase: Phase,
     service_idx: u8 = 0,
@@ -198,6 +203,9 @@ pub const Resolver = struct {
     /// Whole-chain deadline for resolve() jobs; a field so tests can
     /// shrink it instead of sleeping ten seconds.
     chain_deadline_ms: i64 = CHAIN_DEADLINE_MS,
+    /// Requests rejected because the wait queue was full; observability
+    /// for a queue that silently dropping would otherwise hide.
+    too_many_jobs: usize = 0,
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
     fn noopQueryCallback(_: ?*anyopaque, _: usize, _: Status, _: ?RecordResult) void {}
@@ -269,7 +277,10 @@ pub const Resolver = struct {
     /// Queue a request behind the in-flight cap; promoted FIFO by
     /// promoteWait as jobs complete.
     fn enqueueWait(self: *Resolver, session_key: usize, name: []const u8, opts: WaitEnt) !void {
-        if (self.wait_queue.items.len >= WAIT_CAP) return error.TooManyJobs;
+        if (self.wait_queue.items.len >= WAIT_CAP) {
+            self.too_many_jobs += 1;
+            return error.TooManyJobs;
+        }
         var e = opts;
         e.session_key = session_key;
         e.name = try self.alloc.dupe(u8, name);
@@ -323,35 +334,39 @@ pub const Resolver = struct {
         };
     }
 
-    /// Release a session's interest: detach the waiter from its job
-    /// (freeing the job when it was the last waiter) or drop a
-    /// not-yet-launched queue entry. No callback fires afterwards.
+    /// Release a session's interest: detach the waiter from every job
+    /// (freeing a job when it was the last waiter, which disarms its
+    /// deadlines and purges its slot so a queued timer event is
+    /// stale) and drop any not-yet-launched queue entries. No
+    /// callback fires for the key afterwards.
     pub fn cancel(self: *Resolver, session_key: usize) void {
-        for (self.jobs.items) |job| {
-            for (job.waiters.items, 0..) |w, i| {
-                if (w == session_key) {
-                    _ = job.waiters.orderedRemove(i);
+        var i: usize = 0;
+        while (i < self.jobs.items.len) {
+            const job = self.jobs.items[i];
+            var w: usize = 0;
+            while (w < job.waiter_count) : (w += 1) {
+                if (job.waiters[w] == session_key) {
+                    job.waiters[w] = job.waiters[job.waiter_count - 1];
+                    job.waiter_count -= 1;
                     break;
                 }
             }
-            if (job.waiters.items.len == 0) {
-                for (self.jobs.items, 0..) |j, i| {
-                    if (j == job) {
-                        _ = self.jobs.orderedRemove(i);
-                        break;
-                    }
-                }
+            if (job.waiter_count == 0) {
+                _ = self.jobs.orderedRemove(i);
                 self.freeJob(job);
                 self.promoteWait();
-                return;
+                continue; // the list shifted; re-examine slot i
             }
+            i += 1;
         }
-        for (self.wait_queue.items, 0..) |e, i| {
-            if (e.session_key == session_key) {
-                const removed = self.wait_queue.orderedRemove(i);
+        var qi: usize = 0;
+        while (qi < self.wait_queue.items.len) {
+            if (self.wait_queue.items[qi].session_key == session_key) {
+                const removed = self.wait_queue.orderedRemove(qi);
                 self.alloc.free(removed.name);
-                return;
+                continue;
             }
+            qi += 1;
         }
     }
 
@@ -379,7 +394,11 @@ pub const Resolver = struct {
             if (job.default_port != default_port) continue;
             if (job.want_tlsa != want_tlsa) continue;
             if (!std.ascii.eqlIgnoreCase(job.name, name)) continue;
-            try job.waiters.append(self.alloc, session_key);
+            // A full job takes no more waiters; the lookup starts a
+            // fresh job on the wire instead of failing.
+            if (job.waiter_count >= MAX_WAITERS) continue;
+            job.waiters[job.waiter_count] = session_key;
+            job.waiter_count += 1;
             return;
         }
         if (self.jobs.items.len >= MAX_JOBS) {
@@ -500,8 +519,8 @@ pub const Resolver = struct {
             .phase = .srv_tls,
         };
         errdefer self.alloc.free(job.name);
-        try job.waiters.append(self.alloc, session_key);
-        errdefer job.waiters.deinit(self.alloc);
+        job.waiters[0] = session_key;
+        job.waiter_count = 1;
         for (&self.slots, 0..) |*s, i| {
             if (s.* == null) {
                 self.slot_gen[i] +%= 1;
@@ -784,9 +803,9 @@ pub const Resolver = struct {
             }
         }
         if (job.is_raw) {
-            for (job.waiters.items) |key| self.qcb.fun(self.qcb.ctx, key, status, null);
+            for (job.waiters[0..job.waiter_count]) |key| self.qcb.fun(self.qcb.ctx, key, status, null);
         } else {
-            for (job.waiters.items) |key| self.cb.fun(self.cb.ctx, key, status, null);
+            for (job.waiters[0..job.waiter_count]) |key| self.cb.fun(self.cb.ctx, key, status, null);
         }
         self.freeJob(job);
         self.promoteWait();
@@ -801,7 +820,7 @@ pub const Resolver = struct {
         }
         // Every waiter gets its own deep copy of the target set; the
         // callback owns what it receives.
-        for (job.waiters.items) |key| {
+        for (job.waiters[0..job.waiter_count]) |key| {
             const targets = self.dupTargets(job.targets.items) catch {
                 self.cb.fun(self.cb.ctx, key, .failed, null);
                 continue;
@@ -858,7 +877,7 @@ pub const Resolver = struct {
         }
         self.cachePut(job.pending_qname, job.pending_qtype, msg.rrs);
         const ttl = minTtl(msg.rrs);
-        for (job.waiters.items) |key| {
+        for (job.waiters[0..job.waiter_count]) |key| {
             const detached = self.dupRrs(msg.rrs) catch {
                 self.qcb.fun(self.qcb.ctx, key, .failed, null);
                 continue;
@@ -1173,7 +1192,6 @@ pub const Resolver = struct {
 
     fn freeJob(self: *Resolver, job: *Job) void {
         if (self.slots[job.slot] == job) self.slots[job.slot] = null;
-        job.waiters.deinit(self.alloc);
         self.disarmDeadline(job);
         if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
         job.tcp_buf.deinit(self.alloc);
@@ -1988,7 +2006,7 @@ test "dns-async: identical resolves merge into one job (J6)" {
     try r.resolve("svc.test", .client, 5222, 1, true);
     try r.resolve("svc.test", .client, 5222, 2, true);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
-    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiters.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
 
     var spins: usize = 0;
     while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
@@ -2017,6 +2035,67 @@ test "dns-async: over-cap requests queue and cancel detaches (J6)" {
     try std.testing.expectEqual(@as(usize, 63), r.jobs.items.len);
     // cancel of a missing key is a no-op.
     r.cancel(999);
+}
+
+test "dns-async: a full waiter array starts a second job, not a failure" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    // MAX_WAITERS+1 identical resolves: the 17th must not error and
+    // must not grow the first job's bounded waiter array.
+    for (0..17) |i| try r.resolve("svc.test", .client, 5222, i + 1, true);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 16), r.jobs.items[0].waiter_count);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items[1].waiter_count);
+}
+
+test "dns-async: a full wait queue counts the rejection (TooManyJobs)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+
+    var name_buf: [32]u8 = undefined;
+    // 64 in-flight jobs plus 256 queued requests fills both bounds.
+    for (0..320) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "h{d}.test", .{i}) catch unreachable;
+        try r.resolve(n, .client, 5222, i + 1, true);
+    }
+    try std.testing.expectEqual(@as(usize, 64), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 256), r.wait_queue.items.len);
+
+    const n = std.fmt.bufPrint(&name_buf, "overflow.test", .{}) catch unreachable;
+    try std.testing.expectError(error.TooManyJobs, r.resolve(n, .client, 5222, 999, true));
+    try std.testing.expectEqual(@as(usize, 1), r.too_many_jobs);
+}
+
+test "dns-async: cancel fires no callback and frees a last-waiter job" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    try r.resolve("svc.test", .client, 5222, 2, true);
+    r.cancel(1);
+    r.cancel(2);
+    // Both waiters gone: the job is freed and its slot purged, so a
+    // queued deadline event would be recognized as stale.
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    for (r.slots) |s| try std.testing.expect(s == null);
+
+    var spins: usize = 0;
+    while (spins < 50) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
 }
 
 test "dns-async: a shared job notifies only its remaining waiters (J6)" {
