@@ -1,9 +1,13 @@
-//! # Auth policy — one admission gate for every mechanism
+//! # Auth policy: one admission gate for every mechanism
 //!
-//! `admit` runs the permanent account lock check and the rate limiter
-//! (account and IP) once the caller has parsed the identity. `recordOutcome`
-//! records the attempt and its result. Store errors and an untrackable key
-//! fail closed; a denied admission always carries a SASL failure reason.
+//! `admitIp` counts the IP attempt before any identity is known;
+//! `admitAccount` counts the account attempt and runs the permanent lock
+//! check once the identity is parsed. `check` re-runs both checks without
+//! counting, for the SCRAM client-final. `recordOutcome` records only the
+//! result of an attempt already counted at admission.
+//!
+//! Account keys are the identity localpart. Store errors and an untrackable
+//! key fail closed; a denied admission always carries a SASL failure reason.
 
 const std = @import("std");
 const rate_limiter = @import("rate_limiter");
@@ -63,32 +67,100 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
     };
 }
 
+fn canonicalAccount(identity: []const u8, buf: *[rate_limiter.max_key_len]u8) []const u8 {
+    const local = localpartOf(identity);
+    if (local.len > buf.len) return local;
+    for (local, 0..) |c, i| buf[i] = c;
+    return buf[0..local.len];
+}
+
+fn permanentLockReason(checker: LockChecker, username: []const u8) ?[]const u8 {
+    switch (checker.check(localpartOf(username))) {
+        .locked => {
+            log.info("auth rejected: account '{s}' is permanently locked", .{username});
+            return "account-disabled";
+        },
+        .store_error => {
+            log.warn("lock store error checking '{s}': failing closed", .{username});
+            return "temporary-auth-failure";
+        },
+        .unlocked => return null,
+    }
+}
+
 pub const Policy = struct {
     limiter: ?*rate_limiter.RateLimiter = null,
     lock_checker: ?LockChecker = null,
 
-    /// Admission check. The caller has already parsed the identity, so the
-    /// permanent lock and the account rate checks run here; the IP check runs
-    /// for every request that carries one. Returns null when admitted.
+    /// Count one IP attempt and check the IP lock and window. Runs before
+    /// the identity is known, so in-flight work is bounded. Returns null
+    /// when admitted.
+    pub fn admitIp(self: Policy, client_ip: []const u8) ?[]const u8 {
+        const limiter = self.limiter orelse return null;
+        return switch (limiter.admitIp(client_ip)) {
+            .allowed => null,
+            .ip_locked, .ip_rate_limited => blk: {
+                log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
+                break :blk "policy-violation";
+            },
+            .unavailable => blk: {
+                log.warn("rate state cannot track the request: failing closed", .{});
+                break :blk "temporary-auth-failure";
+            },
+            else => null,
+        };
+    }
+
+    /// Count one account attempt, then check the permanent lock and the
+    /// account lock and window. Returns null when admitted.
+    pub fn admitAccount(self: Policy, username: []const u8) ?[]const u8 {
+        if (username.len == 0) return null;
+        if (self.lock_checker) |checker| {
+            if (permanentLockReason(checker, username)) |reason| return reason;
+        }
+
+        const limiter = self.limiter orelse return null;
+        var buf: [rate_limiter.max_key_len]u8 = undefined;
+        const account = canonicalAccount(username, &buf);
+        return switch (limiter.admitAccount(account)) {
+            .allowed => null,
+            .account_locked => blk: {
+                log.info("auth rejected: account '{s}' is locked", .{username});
+                break :blk "account-disabled";
+            },
+            .account_rate_limited => blk: {
+                log.info("auth rejected: account '{s}' is rate limited", .{username});
+                break :blk "policy-violation";
+            },
+            .unavailable => blk: {
+                log.warn("rate state cannot track the request: failing closed", .{});
+                break :blk "temporary-auth-failure";
+            },
+            else => null,
+        };
+    }
+
+    /// Count one attempt for both keys. One-shot callers only; mechanisms
+    /// call admitIp and then admitAccount so each key is counted once.
     pub fn admit(self: Policy, username: []const u8, client_ip: []const u8) ?[]const u8 {
+        if (self.admitIp(client_ip)) |reason| return reason;
+        return self.admitAccount(username);
+    }
+
+    /// Re-check both keys without counting. Used at SCRAM client-final
+    /// before proof verification, so a locked account gets the same reply
+    /// whether or not the password is right.
+    pub fn check(self: Policy, username: []const u8, client_ip: []const u8) ?[]const u8 {
         if (username.len > 0) {
             if (self.lock_checker) |checker| {
-                switch (checker.check(localpartOf(username))) {
-                    .locked => {
-                        log.info("auth rejected: account '{s}' is permanently locked", .{username});
-                        return "account-disabled";
-                    },
-                    .store_error => {
-                        log.warn("lock store error checking '{s}': failing closed", .{username});
-                        return "temporary-auth-failure";
-                    },
-                    .unlocked => {},
-                }
+                if (permanentLockReason(checker, username)) |reason| return reason;
             }
         }
 
         const limiter = self.limiter orelse return null;
-        return switch (limiter.admit(username, client_ip)) {
+        var buf: [rate_limiter.max_key_len]u8 = undefined;
+        const account = if (username.len > 0) canonicalAccount(username, &buf) else "";
+        return switch (limiter.check(account, client_ip)) {
             .allowed => null,
             .account_locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
@@ -109,10 +181,12 @@ pub const Policy = struct {
         };
     }
 
-    /// Record the attempt and its outcome for both the account and the IP.
+    /// Record the outcome of an attempt already counted at admission.
     pub fn recordOutcome(self: Policy, username: []const u8, client_ip: []const u8, outcome: Outcome) void {
         const limiter = self.limiter orelse return;
-        limiter.recordOutcome(username, client_ip, outcome == .success);
+        var buf: [rate_limiter.max_key_len]u8 = undefined;
+        const account = if (username.len > 0) canonicalAccount(username, &buf) else "";
+        limiter.recordOutcome(account, client_ip, outcome == .success);
     }
 };
 
@@ -156,7 +230,7 @@ test "Policy: the lock is keyed by the identity localpart" {
     try std.testing.expectEqualStrings("Alice", S.seen);
 }
 
-test "Policy: the rate limiter denies and records both keys" {
+test "Policy: admission counts the account and IP keys once" {
     var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 1,
         .max_per_ip = 100,
@@ -168,8 +242,9 @@ test "Policy: the rate limiter denies and records both keys" {
     defer limiter.deinit();
     const policy = Policy{ .limiter = &limiter };
 
-    policy.recordOutcome("alice", "10.0.0.1", .success);
-    try std.testing.expectEqualStrings("policy-violation", policy.admit("alice", "10.0.0.1").?);
+    try std.testing.expect(policy.admit("alice", "10.0.0.1") == null);
+    try std.testing.expectEqualStrings("policy-violation", policy.admit("alice", "10.0.0.1") orelse return error.ExpectedDenial);
+    try std.testing.expect(policy.admit("bob", "10.0.0.1") == null);
 
     var other = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,
@@ -181,6 +256,23 @@ test "Policy: the rate limiter denies and records both keys" {
     });
     defer other.deinit();
     const ip_policy = Policy{ .limiter = &other };
-    ip_policy.recordOutcome("alice", "10.0.0.9", .success);
-    try std.testing.expectEqualStrings("policy-violation", ip_policy.admit("bob", "10.0.0.9").?);
+    try std.testing.expect(ip_policy.admitIp("10.0.0.9") == null);
+    try std.testing.expectEqualStrings("policy-violation", ip_policy.admitIp("10.0.0.9").?);
+}
+
+test "Policy: a re-check does not count a second account attempt" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 1,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    try std.testing.expect(policy.admitAccount("alice") == null);
+    try std.testing.expect(policy.check("alice", "") == null);
+    try std.testing.expectEqualStrings("policy-violation", policy.admitAccount("alice") orelse return error.ExpectedDenial);
 }

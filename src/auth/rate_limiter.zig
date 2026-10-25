@@ -1,10 +1,16 @@
-//! # Rate Limiter v2 — bounded per-account and per-IP admission
+//! # Rate Limiter v2: bounded per-account and per-IP admission
 //!
 //! Fixed-size open-addressed tables (one per account, one per IP). Each
 //! entry stores the key bytes (not just a hash), a tumbling window counter
 //! and a consecutive-failure lockout. Expired entries become tombstones on
 //! the probe path and are reused; a table full of live entries rejects new
 //! keys instead of admitting them (fail closed).
+//!
+//! Attempts are counted at admission, so work already in flight is bounded.
+//! The outcome updates only the failure counter and lockout. Windows are
+//! tumbling and fixed, so a boundary can pass up to twice the per-window
+//! limit. A failure after a lock expires re-locks at once: expiry does not
+//! reset the consecutive-failure count.
 //!
 //! State is intentionally ephemeral: a daemon restart clears every lock.
 
@@ -98,15 +104,15 @@ pub const RateLimiter = struct {
         self.allocator.free(self.ip_table);
     }
 
-    /// Admission check at the current time.
+    /// Count one attempt for both keys and check them.
     pub fn admit(self: *RateLimiter, username: []const u8, client_ip: []const u8) Decision {
         return self.admitAt(username, client_ip, currentEpoch());
     }
 
-    /// Admission check at an explicit time (tests).
+    /// Count one attempt for both keys at an explicit time (tests).
     pub fn admitAt(self: *RateLimiter, username: []const u8, client_ip: []const u8, now: u32) Decision {
         if (username.len > 0) {
-            switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now)) {
+            switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now, .count)) {
                 .allowed => {},
                 .locked => return .account_locked,
                 .rate_limited => return .account_rate_limited,
@@ -114,7 +120,7 @@ pub const RateLimiter = struct {
             }
         }
         if (client_ip.len > 0) {
-            switch (self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now)) {
+            switch (self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now, .count)) {
                 .allowed => {},
                 .locked => return .ip_locked,
                 .rate_limited => return .ip_rate_limited,
@@ -124,9 +130,65 @@ pub const RateLimiter = struct {
         return .allowed;
     }
 
-    /// Record one attempt and its outcome at the current time. The account
-    /// and IP windows both count every attempt; success clears both failure
-    /// counters, failure advances both lockouts.
+    /// Count one IP attempt only. Mechanisms admit the IP before the
+    /// identity is known, then admit the account once it is.
+    pub fn admitIp(self: *RateLimiter, client_ip: []const u8) Decision {
+        return self.admitIpAt(client_ip, currentEpoch());
+    }
+
+    pub fn admitIpAt(self: *RateLimiter, client_ip: []const u8, now: u32) Decision {
+        if (client_ip.len == 0) return .allowed;
+        return switch (self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now, .count)) {
+            .allowed => .allowed,
+            .locked => .ip_locked,
+            .rate_limited => .ip_rate_limited,
+            .unavailable => .unavailable,
+        };
+    }
+
+    /// Count one account attempt only.
+    pub fn admitAccount(self: *RateLimiter, username: []const u8) Decision {
+        return self.admitAccountAt(username, currentEpoch());
+    }
+
+    pub fn admitAccountAt(self: *RateLimiter, username: []const u8, now: u32) Decision {
+        if (username.len == 0) return .allowed;
+        return switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now, .count)) {
+            .allowed => .allowed,
+            .locked => .account_locked,
+            .rate_limited => .account_rate_limited,
+            .unavailable => .unavailable,
+        };
+    }
+
+    /// Re-check both keys without counting. Used at SCRAM client-final so an
+    /// attempt already counted at client-first can still complete.
+    pub fn check(self: *RateLimiter, username: []const u8, client_ip: []const u8) Decision {
+        return self.checkAt(username, client_ip, currentEpoch());
+    }
+
+    pub fn checkAt(self: *RateLimiter, username: []const u8, client_ip: []const u8, now: u32) Decision {
+        if (username.len > 0) {
+            switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now, .check)) {
+                .allowed => {},
+                .locked => return .account_locked,
+                .rate_limited => return .account_rate_limited,
+                .unavailable => return .unavailable,
+            }
+        }
+        if (client_ip.len > 0) {
+            switch (self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now, .check)) {
+                .allowed => {},
+                .locked => return .ip_locked,
+                .rate_limited => return .ip_rate_limited,
+                .unavailable => return .unavailable,
+            }
+        }
+        return .allowed;
+    }
+
+    /// Record the outcome of an attempt already counted at admission.
+    /// Success clears both failure counters; failure advances both lockouts.
     pub fn recordOutcome(self: *RateLimiter, username: []const u8, client_ip: []const u8, success: bool) void {
         self.recordOutcomeAt(username, client_ip, success, currentEpoch());
     }
@@ -152,15 +214,24 @@ pub const RateLimiter = struct {
         }
     }
 
-    fn admitKey(self: *RateLimiter, table: []RateEntry, key: []const u8, max: u32, now: u32) KeyDecision {
+    const AdmitMode = enum { count, check };
+
+    fn admitKey(self: *RateLimiter, table: []RateEntry, key: []const u8, max: u32, now: u32, mode: AdmitMode) KeyDecision {
         if (key.len > max_key_len) return .unavailable;
-        const entry = self.find(table, key) orelse {
-            if (!self.hasSlot(table, now)) return .unavailable;
+        if (mode == .check) {
+            const entry = self.find(table, key) orelse return .allowed;
+            if (entry.locked_until > now) return .locked;
+            self.rollWindow(entry, now);
+            if (entry.count > max) return .rate_limited;
             return .allowed;
-        };
+        }
+
+        const entry = self.findOrCreate(table, key, now) orelse return .unavailable;
         if (entry.locked_until > now) return .locked;
         self.rollWindow(entry, now);
-        if (entry.count >= max) return .rate_limited;
+        entry.count +|= 1;
+        entry.last_seen = now;
+        if (entry.count > max) return .rate_limited;
         return .allowed;
     }
 
@@ -181,7 +252,6 @@ pub const RateLimiter = struct {
             return;
         };
         self.rollWindow(entry, now);
-        entry.count +|= 1;
         entry.last_seen = now;
         if (success) {
             entry.failures = 0;
@@ -204,18 +274,6 @@ pub const RateLimiter = struct {
     fn evictAfter(self: *RateLimiter) u32 {
         const longest = @max(self.policy.window_seconds, self.policy.lockout_duration);
         return @max(longest, 1) * 2;
-    }
-
-    /// True when an absent key can still be inserted: an empty slot, a
-    /// tombstone, or an expired entry that can be reclaimed.
-    fn hasSlot(self: *RateLimiter, table: []const RateEntry, now: u32) bool {
-        for (table) |*entry| {
-            switch (entry.state) {
-                .empty, .tombstone => return true,
-                .occupied => if (self.isExpired(entry, now)) return true,
-            }
-        }
-        return false;
     }
 
     fn isExpired(self: *RateLimiter, entry: *const RateEntry, now: u32) bool {
@@ -324,7 +382,7 @@ test "RateLimiter: allows initial attempts" {
     try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
 }
 
-test "RateLimiter: blocks after max_per_account exceeded" {
+test "RateLimiter: each admit counts the account attempt" {
     var limiter = try testLimiter(.{
         .max_per_account = 3,
         .max_per_ip = 100,
@@ -334,14 +392,13 @@ test "RateLimiter: blocks after max_per_account exceeded" {
     });
     defer limiter.deinit();
 
-    limiter.recordOutcomeAt("alice", "10.0.0.1", true, 100);
-    limiter.recordOutcomeAt("alice", "10.0.0.2", true, 100);
-    limiter.recordOutcomeAt("alice", "10.0.0.3", true, 100);
-
-    try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "10.0.0.4", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "10.0.0.1", 100));
 }
 
-test "RateLimiter: blocks after max_per_ip exceeded" {
+test "RateLimiter: each admit counts the IP attempt" {
     var limiter = try testLimiter(.{
         .max_per_account = 100,
         .max_per_ip = 2,
@@ -352,9 +409,8 @@ test "RateLimiter: blocks after max_per_ip exceeded" {
     });
     defer limiter.deinit();
 
-    limiter.recordOutcomeAt("user1", "10.0.0.1", true, 100);
-    limiter.recordOutcomeAt("user2", "10.0.0.1", true, 100);
-
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("user1", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("user2", "10.0.0.1", 100));
     try std.testing.expectEqual(Decision.ip_rate_limited, limiter.admitAt("user3", "10.0.0.1", 100));
 }
 
@@ -424,9 +480,8 @@ test "RateLimiter: different accounts are independent" {
     });
     defer limiter.deinit();
 
-    limiter.recordOutcomeAt("alice", "10.0.0.1", true, 100);
-    limiter.recordOutcomeAt("alice", "10.0.0.2", true, 100);
-
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.2", 100));
     try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "10.0.0.3", 100));
     try std.testing.expectEqual(Decision.allowed, limiter.admitAt("bob", "10.0.0.3", 100));
 }
@@ -437,11 +492,15 @@ test "RateLimiter: default policy engages at its own limits" {
     const policy = RatePolicy{};
 
     var i: u32 = 0;
-    while (i < policy.max_per_ip) : (i += 1) limiter.recordOutcomeAt("", "10.1.2.3", true, 1000);
+    while (i < policy.max_per_ip) : (i += 1) {
+        try std.testing.expectEqual(Decision.allowed, limiter.admitAt("", "10.1.2.3", 1000));
+    }
     try std.testing.expectEqual(Decision.ip_rate_limited, limiter.admitAt("", "10.1.2.3", 1000));
 
     i = 0;
-    while (i < policy.max_per_account) : (i += 1) limiter.recordOutcomeAt("user", "10.9.8.7", true, 1000);
+    while (i < policy.max_per_account) : (i += 1) {
+        try std.testing.expectEqual(Decision.allowed, limiter.admitAt("user", "10.9.8.7", 1000));
+    }
     try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("user", "10.9.8.7", 1000));
 }
 
@@ -465,10 +524,26 @@ test "RateLimiter: the window expires" {
     });
     defer limiter.deinit();
 
-    limiter.recordOutcomeAt("alice", "", true, 1000);
-    limiter.recordOutcomeAt("alice", "", true, 1000);
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "", 1000));
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "", 1000));
     try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "", 1000));
     try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "", 1061));
+}
+
+test "RateLimiter: a re-check does not count a second attempt" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 1,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "", 100));
+    try std.testing.expectEqual(Decision.allowed, limiter.checkAt("alice", "", 100));
+    try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "", 100));
 }
 
 test "RateLimiter: an expired entry is reused on probe" {
