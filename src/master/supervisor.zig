@@ -29,6 +29,53 @@ extern "c" fn closefrom(lowfd: c_int) void;
 /// by std.c).
 const FD_CLOEXEC: c_int = 1;
 
+/// memfd_create flags (FreeBSD 13+); not exported by std.c.
+const MFD_CLOEXEC: c_uint = 0x0001;
+const MFD_ALLOW_SEALING: c_uint = 0x0002;
+
+/// Forwarded-configuration blob ceiling shared with lib/conf: a child
+/// preads it in one pass, so it stays deliberately small.
+pub const conf_max_blob: usize = 256 * 1024;
+
+/// The sealed anonymous blob a child inherits as its forwarded
+/// configuration. Created once per reload, CLOEXEC in the master, and
+/// reused for every respawn: applyFdPass's dup2 clears CLOEXEC only in
+/// each child, where the blob lands in the slot right after that
+/// child's listener fds. A SIGHUP rebuild swaps in a fresh object.
+pub const ConfFd = struct {
+    fd: posix.fd_t = -1,
+
+    /// Creates the sealed blob object. The master copy stays CLOEXEC;
+    /// only a child's remap slot drops the flag.
+    pub fn create(blob: []const u8) !ConfFd {
+        if (blob.len > conf_max_blob) return error.BlobTooLarge;
+        const fd = std.c.memfd_create("xmppd-conf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (fd < 0) return error.MemfdFailed;
+        errdefer posix.close(fd);
+        var off: usize = 0;
+        while (off < blob.len) {
+            off += posix.write(fd, blob[off..]) catch return error.WriteFailed;
+        }
+        const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+        if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
+        return .{ .fd = fd };
+    }
+
+    /// Rebuilds after a reload: the new sealed object replaces the old
+    /// one so the next respawn reads fresh config while running
+    /// children keep nothing but the fd they already read and closed.
+    pub fn rebuild(self: *ConfFd, blob: []const u8) !void {
+        const next = try ConfFd.create(blob);
+        if (self.fd >= 0) posix.close(self.fd);
+        self.* = next;
+    }
+
+    pub fn deinit(self: *ConfFd) void {
+        if (self.fd >= 0) posix.close(self.fd);
+        self.fd = -1;
+    }
+};
+
 /// Minimum backoff delay (nanoseconds).
 const MIN_BACKOFF_NS: u64 = 1 * std.time.ns_per_s;
 /// Maximum backoff delay (nanoseconds).
@@ -464,6 +511,72 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     sup2.child_pid = pid;
     sup2.state = .running;
     _ = try sup2.waitChild();
+}
+
+test "Supervisor: two children each hold only their own conf fd slot" {
+    // Two sealed conf blobs, one per child. Each child verifies it can
+    // pread its own remap slot (fd 4) and that nothing leaks past it:
+    // the sibling's objects never exist in its table (fd 5 is EBADF).
+    var conf_a = try ConfFd.create("--host=a.test\n");
+    defer conf_a.deinit();
+    var conf_b = try ConfFd.create("--host=b.test\n");
+    defer conf_b.deinit();
+    try std.testing.expect(conf_a.fd != conf_b.fd);
+
+    var pa: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pa) != 0) return error.Socketpair;
+    defer posix.close(pa[0]);
+    defer posix.close(pa[1]);
+    var pb: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pb) != 0) return error.Socketpair;
+    defer posix.close(pb[0]);
+    defer posix.close(pb[1]);
+
+    const pid_a = try posix.fork();
+    if (pid_a == 0) {
+        var sup = try Supervisor.init("/unused", &.{}, 1);
+        sup.pass_fds = &.{ pa[1], conf_a.fd };
+        sup.applyFdPass();
+        var verdict: [3]u8 = .{ 'N', 'N', 'N' };
+        var b: [16]u8 = undefined;
+        const rn = std.c.pread(4, &b, 16, 0);
+        if (rn == 14 and std.mem.eql(u8, b[0..14], "--host=a.test\n")) verdict[0] = 'Y';
+        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
+        // CLOEXEC is cleared only in this child's remap slot.
+        const fl = std.c.fcntl(4, std.c.F.GETFD);
+        if (fl >= 0 and fl & FD_CLOEXEC == 0) verdict[2] = 'Y';
+        _ = std.c.write(3, &verdict, verdict.len);
+        std.c._exit(0);
+    }
+    const pid_b = try posix.fork();
+    if (pid_b == 0) {
+        var sup = try Supervisor.init("/unused", &.{}, 1);
+        sup.pass_fds = &.{ pb[1], conf_b.fd };
+        sup.applyFdPass();
+        var verdict: [3]u8 = .{ 'N', 'N', 'N' };
+        var b: [16]u8 = undefined;
+        const rn = std.c.pread(4, &b, 16, 0);
+        if (rn == 14 and std.mem.eql(u8, b[0..14], "--host=b.test\n")) verdict[0] = 'Y';
+        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
+        const fl = std.c.fcntl(4, std.c.F.GETFD);
+        if (fl >= 0 and fl & FD_CLOEXEC == 0) verdict[2] = 'Y';
+        _ = std.c.write(3, &verdict, verdict.len);
+        std.c._exit(0);
+    }
+
+    // Parent keeps CLOEXEC on both copies; the children cleared only
+    // their own dup2'd slot.
+    const pfl = std.c.fcntl(conf_a.fd, std.c.F.GETFD);
+    try std.testing.expect(pfl >= 0 and pfl & FD_CLOEXEC != 0);
+
+    var ra: [3]u8 = undefined;
+    var rb: [3]u8 = undefined;
+    _ = try posix.read(pa[0], &ra);
+    _ = try posix.read(pb[0], &rb);
+    try std.testing.expectEqualStrings("YYY", &ra);
+    try std.testing.expectEqualStrings("YYY", &rb);
+    _ = posix.waitpid(pid_a, 0);
+    _ = posix.waitpid(pid_b, 0);
 }
 
 test "Supervisor: a pass_fd already at its target survives exec" {

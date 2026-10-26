@@ -17,6 +17,7 @@
 //! config is freed by one deinit.
 
 const std = @import("std");
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 pub const max_file_bytes = 1 << 20;
@@ -24,7 +25,9 @@ pub const max_line_bytes = 1024;
 pub const default_max_keys = 2048;
 
 /// Where a field's effective value came from.
-pub const Source = enum { default, file, cli };
+/// file < forwarded < cli: a value forwarded over the sealed conf fd
+/// loses to a real CLI flag but still beats the config file.
+pub const Source = enum { default, file, forwarded, cli };
 
 /// One configurable field and its INI spelling.
 pub const FieldSpec = struct {
@@ -361,6 +364,13 @@ pub fn Loader(
             var self = Self.init(gpa);
             errdefer self.deinit();
             if (opts.path) |p| try self.loadFile(p, diag);
+            // Order is precedence: file < forwarded < real CLI. The blob
+            // lives in the load arena because forwarded values borrow it
+            // the way file values borrow the file bytes.
+            if (opts.conf_fd) |fd| {
+                const blob = try readForwarded(fd, self.arena_state.allocator(), diag);
+                try self.applyForwarded(blob, diag);
+            }
             try self.applyArgs(opts.args, diag);
             return self;
         }
@@ -463,6 +473,21 @@ pub fn Loader(
         /// "--name value", "--name=value", "-name value" and flag options
         /// declared in the cli table.
         pub fn applyArgs(self: *Self, args: []const []const u8, diag: *Diag) Error!void {
+            try self.applyArgv(args, .cli, diag);
+        }
+
+        /// Applies a forwarded configuration blob: the memfd contents are
+        /// canonical CLI lines, one per line, parsed exactly like real
+        /// arguments but recorded with provenance .forwarded.
+        pub fn applyForwarded(self: *Self, blob: []const u8, diag: *Diag) Error!void {
+            var lines = std.mem.splitScalar(u8, blob, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try self.applyArgv(&.{line}, .forwarded, diag);
+            }
+        }
+
+        fn applyArgv(self: *Self, args: []const []const u8, prov: Source, diag: *Diag) Error!void {
             var end_of_options = false;
             var i: usize = 0;
             while (i < args.len) : (i += 1) {
@@ -497,7 +522,7 @@ pub fn Loader(
                             return error.FlagTakesNoValue;
                         }
                         try self.setField(cli_targets[ci], if (sets) "true" else "false", .{}, diag);
-                        self.provenance[cli_targets[ci]] = .cli;
+                        self.provenance[cli_targets[ci]] = prov;
                         continue;
                     }
                     if (value == null) {
@@ -509,7 +534,7 @@ pub fn Loader(
                         value = args[i];
                     }
                     try self.setField(cli_targets[ci], value.?, .{ .key = arg }, diag);
-                    self.provenance[cli_targets[ci]] = .cli;
+                    self.provenance[cli_targets[ci]] = prov;
                 } else {
                     diag.* = .{ .key = arg, .detail = "unknown argument" };
                     return error.UnknownArgument;
@@ -536,6 +561,43 @@ pub fn Loader(
                 }
             }
             return list.toOwnedSlice(arena);
+        }
+
+        /// Serializes the resolved config as the forwarding blob: one
+        /// canonical "--name=value" (or bare "--name") line per CLI option,
+        /// LF-terminated. A value containing LF cannot survive the line
+        /// form and is rejected with a diagnostic naming the key.
+        pub fn forwardBlob(self: *const Self, arena: Allocator, diag: *Diag) Error![]u8 {
+            var blob = std.ArrayList(u8).empty;
+            var buf: [512]u8 = undefined;
+            inline for (cli, 0..) |c, i| {
+                const v = @field(@field(self.values, fields[cli_targets[i]].section), fields[cli_targets[i]].field);
+                if (c.flag) |sets| {
+                    if (v == sets) {
+                        try blob.appendSlice(arena, "--");
+                        try blob.appendSlice(arena, c.name);
+                        try blob.append(arena, '\n');
+                    }
+                } else {
+                    var w: std.Io.Writer = .fixed(&buf);
+                    writeValue(field_types[cli_targets[i]], &w, v) catch unreachable;
+                    const val = w.buffered();
+                    if (std.mem.indexOfScalar(u8, val, '\n') != null) {
+                        diag.* = .{
+                            .key = try std.fmt.allocPrint(arena, "--{s}", .{c.name}),
+                            .value = try arena.dupe(u8, val),
+                            .detail = "value contains a newline and cannot be forwarded",
+                        };
+                        return error.BadValue;
+                    }
+                    try blob.appendSlice(arena, "--");
+                    try blob.appendSlice(arena, c.name);
+                    try blob.append(arena, '=');
+                    try blob.appendSlice(arena, val);
+                    try blob.append(arena, '\n');
+                }
+            }
+            return blob.toOwnedSlice(arena);
         }
 
         /// Generated --help: every CLI option, then every file key, each
@@ -629,8 +691,38 @@ pub fn Loader(
 
 pub const LoadOpts = struct {
     path: ?[]const u8 = null,
+    /// Inherited sealed conf blob fd (-1/none when absent): pread to EOF
+    /// and closed by the loader, applied between file and real CLI args.
+    conf_fd: ?posix.fd_t = null,
     args: []const []const u8 = &.{},
 };
+
+/// The forwarded blob is bounded so a child can pread it in one pass.
+pub const forward_max: usize = 256 * 1024;
+
+/// pread a sealed conf fd from offset 0 to EOF into a buffer the caller
+/// frees, then close the fd. The fd is always closed, error or not.
+pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
+    defer posix.close(fd);
+    var blob = std.ArrayList(u8).empty;
+    errdefer blob.deinit(gpa);
+    var buf: [8192]u8 = undefined;
+    var off: u64 = 0;
+    while (true) {
+        const n = posix.pread(fd, &buf, off) catch {
+            diag.* = .{ .detail = "cannot read forwarded configuration fd" };
+            return error.ReadFailed;
+        };
+        if (n == 0) break;
+        if (blob.items.len + n > forward_max) {
+            diag.* = .{ .detail = "forwarded configuration exceeds 256 KiB" };
+            return error.FileTooLarge;
+        }
+        try blob.appendSlice(gpa, buf[0..n]);
+        off += n;
+    }
+    return blob.toOwnedSlice(gpa);
+}
 
 fn keyOf(f: FieldSpec) []const u8 {
     return if (f.key.len != 0) f.key else f.field;
@@ -1214,6 +1306,114 @@ test "forwardArgs round-trips the resolved config" {
     try testing.expectEqual(@as(u16, 6111), child.values.server.c2s_port);
     try testing.expect(!child.values.s2s.enabled);
     try testing.expectEqual(.cli, child.provenanceOf("server", "hostname"));
+}
+
+const MFD_CLOEXEC: c_uint = 0x0001;
+const MFD_ALLOW_SEALING: c_uint = 0x0002;
+
+/// Creates a sealed anonymous conf blob fd the way the master does, so
+/// loader tests exercise the real kernel path: write, seal, hand back.
+fn testConfFd(blob: []const u8) !posix.fd_t {
+    const fd = std.c.memfd_create("xmppd-conf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return error.MemfdFailed;
+    errdefer posix.close(fd);
+    _ = try posix.write(fd, blob);
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
+    return fd;
+}
+
+test "forwarded blob round-trips through a sealed memfd with .forwarded provenance" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "fwd.ini",
+        \\[server]
+        \\hostname = file.test
+        \\[tls]
+        \\cert = c.pem
+        \\
+    , &path_buf);
+
+    var diag: Diag = .{};
+    var parent = try MasterLoader.load(testing.allocator, .{
+        .path = path,
+        .args = &.{ "--no-s2s", "--port", "6111" },
+    }, &diag);
+    defer parent.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const blob = try parent.forwardBlob(arena.allocator(), &diag);
+    const fd = try testConfFd(blob);
+
+    // The child loads file < forwarded < cli: a real CLI flag on the
+    // child still beats the forwarded value.
+    var child = try MasterLoader.load(testing.allocator, .{
+        .path = null,
+        .conf_fd = fd,
+        .args = &.{ "--port", "7000" },
+    }, &diag);
+    defer child.deinit();
+
+    try testing.expectEqualStrings("file.test", child.values.server.hostname);
+    try testing.expectEqualStrings("c.pem", child.values.tls.cert);
+    try testing.expectEqual(@as(u16, 7000), child.values.server.c2s_port);
+    try testing.expect(!child.values.s2s.enabled);
+    try testing.expectEqual(.forwarded, child.provenanceOf("server", "hostname"));
+    try testing.expectEqual(.forwarded, child.provenanceOf("s2s", "enabled"));
+    try testing.expectEqual(.cli, child.provenanceOf("server", "c2s_port"));
+    // The loader closed the fd after reading.
+    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+}
+
+test "a forwarded value beats the file but loses to the child CLI" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "prec.ini",
+        \\[server]
+        \\hostname = file.test
+        \\c2s_port = 1000
+        \\
+    , &path_buf);
+    var diag: Diag = .{};
+
+    var l = try MasterLoader.load(testing.allocator, .{
+        .path = path,
+        .conf_fd = try testConfFd("--port=2000\n--host=fwd.test\n"),
+        .args = &.{ "--port", "3000" },
+    }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqualStrings("fwd.test", l.values.server.hostname);
+    try testing.expectEqual(@as(u16, 3000), l.values.server.c2s_port);
+    try testing.expectEqual(.forwarded, l.provenanceOf("server", "hostname"));
+    try testing.expectEqual(.cli, l.provenanceOf("server", "c2s_port"));
+}
+
+test "forwardBlob rejects a value containing LF and names the key" {
+    var diag: Diag = .{};
+    var l = MasterLoader.init(testing.allocator);
+    defer l.deinit();
+    l.values.server.hostname = try l.arena_state.allocator().dupe(u8, "a\nb");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.BadValue, l.forwardBlob(arena.allocator(), &diag));
+    try testing.expectEqualStrings("--host", diag.key);
+}
+
+test "readForwarded caps the blob at 256 KiB and still closes the fd" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("big.blob", .{ .read = true });
+    const fd = f.handle;
+    try f.setEndPos(forward_max + 1);
+
+    var diag: Diag = .{};
+    try testing.expectError(error.FileTooLarge, readForwarded(fd, testing.allocator, &diag));
+    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
 }
 
 const capped_sections = struct {

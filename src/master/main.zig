@@ -26,7 +26,8 @@ const xmppd_log = @import("xmppd_log");
 pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
-const Supervisor = @import("supervisor.zig").Supervisor;
+const supervisor_mod = @import("supervisor.zig");
+const Supervisor = supervisor_mod.Supervisor;
 const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
@@ -399,7 +400,7 @@ pub fn main() !void {
     const s2s_fd_str = "3"; // the single remapped s2s listener slot
 
     // Build child argv: pass --config, --db, --socket to auth, s2s, and core children
-    var auth_args_buf: [6][]const u8 = undefined;
+    var auth_args_buf: [8][]const u8 = undefined;
     var auth_argc: usize = 0;
     if (config_path) |cp| {
         auth_args_buf[auth_argc] = "--config";
@@ -419,7 +420,7 @@ pub fn main() !void {
     auth_args_buf[auth_argc] = auth_socket;
     auth_argc += 1;
 
-    var s2s_args_buf: [16][]const u8 = undefined;
+    var s2s_args_buf: [18][]const u8 = undefined;
     var s2s_argc: usize = 0;
     if (config_path) |cp| {
         s2s_args_buf[s2s_argc] = "--config";
@@ -466,7 +467,7 @@ pub fn main() !void {
         s2s_argc += 1;
     }
 
-    var core_args_buf: [14][]const u8 = undefined;
+    var core_args_buf: [16][]const u8 = undefined;
     var core_argc: usize = 0;
     if (config_path) |cp| {
         core_args_buf[core_argc] = "--config";
@@ -501,20 +502,75 @@ pub fn main() !void {
         core_argc += 1;
     }
 
+    // Forwarded configuration (M1): the resolved config rides a sealed
+    // anonymous memfd as canonical --name=value lines. One object is
+    // reused across every respawn until a SIGHUP reload rebuilds it;
+    // the master's copy stays CLOEXEC and each child's applyFdPass
+    // dup2 clears that flag only in its own remap slot, so the blob fd
+    // can never leak into a sibling or a grandchild. The conf fd is
+    // always the LAST pass_fd, so its remapped slot is the one right
+    // after the child's listener slots; --conf-fd names that slot.
+    var conf_blob_buf: [4096]u8 = undefined;
+    const conf_blob = try buildConfBlob(
+        &conf_blob_buf,
+        host,
+        port,
+        s2s_enabled,
+        s2s_port,
+        auth_socket,
+        s2s_socket,
+        db_path,
+        muc_host,
+        cert_path,
+        key_path,
+    );
+    var conf_fd = try supervisor_mod.ConfFd.create(conf_blob);
+    defer conf_fd.deinit();
+
+    const auth_conf_slot = "3";
+    var core_conf_slot_buf: [8]u8 = undefined;
+    const core_conf_slot = std.fmt.bufPrint(&core_conf_slot_buf, "{d}", .{3 + c2s_fd_count}) catch "3";
+    const s2s_conf_slot = if (s2s_listen_fd >= 0) "4" else "3";
+
+    auth_args_buf[auth_argc] = "--conf-fd";
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = auth_conf_slot;
+    auth_argc += 1;
+    s2s_args_buf[s2s_argc] = "--conf-fd";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = s2s_conf_slot;
+    s2s_argc += 1;
+    core_args_buf[core_argc] = "--conf-fd";
+    core_argc += 1;
+    core_args_buf[core_argc] = core_conf_slot;
+    core_argc += 1;
+
     // Initialize supervisors for all children
     var auth_sup = try initSupervisor(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid, euid);
     var s2s_sup = try initSupervisor(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid, euid);
     var core_sup = try initSupervisor(core_path, core_args_buf[0..core_argc], child_uid, child_gid, euid);
 
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
-    // listener, auth nothing; everything else in the master's table closes.
-    core_sup.pass_fds = c2s_listen_fds[0..c2s_fd_count];
-    // Hoisted: pass_fds points at it at spawn AND every respawn (S7).
-    var s2s_pass_fds: [1]posix.fd_t = undefined;
+    // listener, auth nothing; the sealed conf fd trails them all.
+    // pass_fds outlives every respawn because the arrays are hoisted (S7).
+    var auth_pass_fds: [1]posix.fd_t = .{conf_fd.fd};
+    var s2s_pass_fds: [2]posix.fd_t = undefined;
+    var s2s_pass_n: usize = 0;
     if (s2s_listen_fd >= 0) {
         s2s_pass_fds[0] = s2s_listen_fd;
-        s2s_sup.pass_fds = s2s_pass_fds[0..1];
+        s2s_pass_fds[1] = conf_fd.fd;
+        s2s_pass_n = 2;
+    } else {
+        s2s_pass_fds[0] = conf_fd.fd;
+        s2s_pass_n = 1;
     }
+    var core_pass_fds: [MAX_WORKERS + 1]posix.fd_t = undefined;
+    @memcpy(core_pass_fds[0..c2s_fd_count], c2s_listen_fds[0..c2s_fd_count]);
+    core_pass_fds[c2s_fd_count] = conf_fd.fd;
+
+    auth_sup.pass_fds = auth_pass_fds[0..1];
+    s2s_sup.pass_fds = s2s_pass_fds[0..s2s_pass_n];
+    core_sup.pass_fds = core_pass_fds[0 .. c2s_fd_count + 1];
 
     log.info("config: auth_socket={s} s2s={any} s2s_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
@@ -645,6 +701,12 @@ pub fn main() !void {
                     } else if (s.signo == posix.SIG.HUP) {
                         log.info("received SIGHUP, forwarding to auth daemon", .{});
                         auth_sup.forwardSignal(@intCast(s.signo));
+                        // Rebuild the sealed conf blob so the next
+                        // respawn reads fresh config; running children
+                        // already consumed their copy.
+                        conf_fd.rebuild(conf_blob) catch |err| {
+                            log.err("SIGHUP conf rebuild failed: {}", .{err});
+                        };
                     }
                 },
                 else => {},
@@ -658,6 +720,33 @@ pub fn main() !void {
     removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"));
 
     log.info("xmppd master shutdown complete", .{});
+}
+
+/// Serializes the master's resolved config as canonical --name=value
+/// lines for the sealed conf blob (M1). Fixed-buffer, no allocation.
+fn buildConfBlob(
+    buf: []u8,
+    host: []const u8,
+    port: []const u8,
+    s2s_enabled: bool,
+    s2s_port: []const u8,
+    auth_socket: []const u8,
+    s2s_socket: []const u8,
+    db_path: []const u8,
+    muc_host: []const u8,
+    cert_path: ?[]const u8,
+    key_path: ?[]const u8,
+) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("--host={s}\n--port={s}\n--db={s}\n--auth-socket={s}\n", .{ host, port, db_path, auth_socket });
+    if (s2s_enabled) {
+        try w.print("--s2s-socket={s}\n--s2s-port={s}\n--muc-host={s}\n", .{ s2s_socket, s2s_port, muc_host });
+    } else {
+        try w.writeAll("--no-s2s\n");
+    }
+    if (cert_path) |cp| try w.print("--cert={s}\n", .{cp});
+    if (key_path) |kp| try w.print("--key={s}\n", .{kp});
+    return w.buffered();
 }
 
 /// Build a supervisor for one child. A root process without a run user is
