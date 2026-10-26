@@ -2946,17 +2946,25 @@ pub const Server = struct {
 
     /// Return a service-unavailable error over the inbound S2S link.
     fn bounceS2sInbound(self: *Server, remote_from: []const u8, local_to: []const u8, tag_name: []const u8, stanza_id: []const u8) void {
+        _ = self.sendS2sError(remote_from, local_to, tag_name, stanza_id);
+    }
+
+    /// Serialize and queue a service-unavailable bounce for an inbound S2S
+    /// stanza. Returns false when the bounce could not be handed to the S2S
+    /// daemon, so callers can count and log the refusal instead of assuming
+    /// the sender was told.
+    fn sendS2sError(self: *Server, remote_from: []const u8, local_to: []const u8, tag_name: []const u8, stanza_id: []const u8) bool {
         if (!self.s2s_ipc.connected) {
             log.warn("S2S bounce for {s} dropped: no S2S daemon", .{remote_from});
-            return;
+            return false;
         }
 
-        var lease = self.leaseByteScratch() orelse return;
+        var lease = self.leaseByteScratch() orelse return false;
         defer lease.release();
         var fbs = std.io.fixedBufferStream(lease.buf);
         writeS2sError(fbs.writer(), tag_name, local_to, remote_from, stanza_id) catch {
             log.warn("S2S bounce for {s} dropped: serialization failed", .{remote_from});
-            return;
+            return false;
         };
 
         self.s2s_ipc.send(.{ .s2s_deliver = .{
@@ -2965,10 +2973,78 @@ pub const Server = struct {
             .stanza_xml = fbs.getWritten(),
         } }) catch {
             log.err("failed to bounce S2S inbound for {s}", .{remote_from});
-            return;
+            return false;
         };
         _ = delivery_queue_mod.s2s_bounces.fetchAdd(1, .monotonic);
         // Write interest: reconcileIpcWriteInterest (S10).
+        return true;
+    }
+
+    /// Tell the sender of a cross-worker stanza that it could not be held
+    /// behind the recipient's draining offline tail. The sender may live on
+    /// another worker, so the bounce is routed through the session map and
+    /// the MPSC queue the same way a delivery is.
+    fn bounceCrossWorkerUnavailable(
+        self: *Server,
+        sender_wire: []const u8,
+        recipient_bare: []const u8,
+        stanza_id: []const u8,
+        tag_name: []const u8,
+        changes: *ChangeList,
+    ) void {
+        const sm = self.session_map orelse return;
+        // sender_wire is the raw on-wire attribute, still entity-encoded.
+        var sender_buf: [512]u8 = undefined;
+        var sender_fbs = std.io.fixedBufferStream(&sender_buf);
+        xml.decodeWrite(sender_fbs.writer(), sender_wire) catch {
+            log.warn("cross-worker bounce dropped: sender attribute does not decode", .{});
+            return;
+        };
+        const sender_full = sender_fbs.getWritten();
+        const sender = xmpp.Jid.parse(sender_full) catch {
+            log.warn("cross-worker bounce for {s} dropped: unparsable sender", .{sender_full});
+            return;
+        };
+        if (sender.resource.len == 0) {
+            log.warn("cross-worker bounce for {s} dropped: sender is a bare JID", .{sender_full});
+            return;
+        }
+        const entry = sm.findByFullJid(sender.local, sender.domain, sender.resource) orelse {
+            log.warn("cross-worker bounce for {s} dropped: sender session gone", .{sender_full});
+            return;
+        };
+
+        var buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        writeCrossWorkerError(fbs.writer(), tag_name, recipient_bare, sender_full, stanza_id) catch {
+            log.warn("cross-worker bounce for {s} dropped: serialization failed", .{sender_full});
+            return;
+        };
+        const stanza = fbs.getWritten();
+
+        if (entry.worker_id == self.worker_id) {
+            const session = self.sessions[entry.local_session_id] orelse {
+                log.warn("cross-worker bounce for {s} dropped: sender slot empty", .{sender_full});
+                return;
+            };
+            session.queueSendStanza(stanza) catch |err| {
+                log.warn("cross-worker bounce for {s} not queued: {s}", .{ sender_full, @errorName(err) });
+                return;
+            };
+            if (session.conn.hasPendingWrite()) {
+                changes.addWrite(session.conn.fd, session.conn.id) catch {};
+            }
+        } else if (self.delivery_system) |ds| {
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, stanza) catch {
+                _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+                log.warn("cross-worker bounce for {s} dropped: delivery queue full", .{sender_full});
+                return;
+            };
+        } else {
+            log.warn("cross-worker bounce for {s} dropped: no delivery system", .{sender_full});
+            return;
+        }
+        _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
     }
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
@@ -3107,7 +3183,12 @@ pub const Server = struct {
                         if (target_session.offline_pending and live_parts.is_message and !std.mem.eql(u8, live_parts.msg_type, "error")) {
                             const hold_id = if (live_parts.msg_id.len > 0) live_parts.msg_id else "s2s-offline";
                             if (self.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, m.from_jid, hold_id, s2s_archive_ts, m.stanza_xml)) continue;
-                            log.warn("S2S message to {s} not held, offline queue unavailable or full", .{m.to_jid});
+                            // Held neither in the queue nor on the wire: tell
+                            // the remote sender instead of dropping (H2).
+                            log.warn("S2S message to {s} not held, bouncing to the sender", .{m.to_jid});
+                            if (self.sendS2sError(m.from_jid, m.to_jid, "message", live_parts.msg_id)) {
+                                _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
+                            }
                             continue;
                         }
                         fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
@@ -3710,7 +3791,15 @@ pub const Server = struct {
                         return;
                     };
                     if (c.server.holdBehindOfflineTail(target_session, bound.local, bound.domain, from_jid, hold_id, timestamp, payload)) return;
-                    log.warn("cross-worker message to session {d} not held, offline queue unavailable or full", .{local_session_id});
+                    // The stanza can neither be held nor sent without
+                    // overtaking the draining tail. Tell the sender rather
+                    // than dropping it (H2), as the c2s router does.
+                    var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
+                    const recipient_bare = router.buildBareJid(bound.local, bound.domain, &recip_buf) catch "";
+                    log.warn("cross-worker message to session {d} not held, bouncing to the sender", .{local_session_id});
+                    if (recipient_bare.len > 0) {
+                        c.server.bounceCrossWorkerUnavailable(from_jid, recipient_bare, parts.msg_id, "message", c.changes);
+                    }
                     return;
                 }
                 target_session.conn.queueSend(payload) catch return;
@@ -5138,6 +5227,30 @@ fn extractStanzaParts(stanza: []const u8) StanzaParts {
 /// errors propagate so the caller can log them.
 fn writeS2sBounce(w: anytype, local_to: []const u8, remote_from: []const u8, msg_id: []const u8) !void {
     return writeS2sError(w, "message", local_to, remote_from, msg_id);
+}
+
+/// Serialize a service-unavailable bounce for a stanza whose sender lives on
+/// the local server. Mirrors `writeS2sError`: the id is decoded and escaped
+/// once so an entity in the id is not double-escaped (G7).
+fn writeCrossWorkerError(w: anytype, tag_name: []const u8, recipient: []const u8, sender: []const u8, stanza_id: []const u8) !void {
+    try w.writeByte('<');
+    try w.writeAll(tag_name);
+    try w.writeAll(" type='error' from='");
+    try xml.escapeWrite(w, recipient);
+    try w.writeAll("' to='");
+    try xml.escapeWrite(w, sender);
+    try w.writeByte('\'');
+    if (stanza_id.len > 0) {
+        try w.writeAll(" id='");
+        var id_buf: [1024]u8 = undefined;
+        var id_fbs = std.io.fixedBufferStream(&id_buf);
+        try xml.decodeWrite(id_fbs.writer(), stanza_id);
+        try xml.escapeWrite(w, id_fbs.getWritten());
+        try w.writeByte('\'');
+    }
+    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></");
+    try w.writeAll(tag_name);
+    try w.writeByte('>');
 }
 
 fn writeS2sError(w: anytype, tag_name: []const u8, local_to: []const u8, remote_from: []const u8, stanza_id: []const u8) !void {
@@ -6781,6 +6894,221 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "service-unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "id='gc1'") != null);
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+}
+
+// H2: the c2s router bounces (and counts) a message it cannot hold behind a
+// draining offline tail. The cross-worker and S2S inbound paths used to drop
+// it with a log line only, so the sender was told nothing.
+test "Server: H2 a cross-worker hold failure bounces to the sender on the same worker" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    // No offline store at all: the hold cannot succeed.
+
+    // alice (the sender) lives on this worker.
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    server.sessions[9] = alice;
+    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
+    const alice_bound = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
+    alice.stream.bound_jid = alice_bound;
+
+    // bob (the recipient) lives here too, with a draining offline tail.
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.offline_pending = true;
+    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
+    server.sessions[5] = bob;
+    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+
+    const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-1' type='chat'><body>hi</body></message>";
+    try delivery_sys.deliver(0, 5, bob_gen, stanza);
+
+    const bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // alice is told the message was not accepted.
+    const alice_n = try alice.conn.flushSend();
+    try std.testing.expect(alice_n > 0);
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(alice_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "id='h2-1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='bob@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "to='alice@localhost/mobile'") != null);
+
+    // bob's socket got nothing: the stanza never overtook his tail.
+    _ = bob.conn.flushSend() catch {};
+    var bbuf: [4096]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), bn);
+
+    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.offline_hold_bounces.load(.monotonic));
+}
+
+test "Server: H2 a cross-worker hold failure bounces across workers" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    // Worker 1 drains bob's queue; alice lives on worker 0.
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.offline_pending = true;
+    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
+    server.sessions[5] = bob;
+    const bob_gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+
+    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
+
+    const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-2' type='chat'><body>hi</body></message>";
+    try delivery_sys.deliver(1, 5, bob_gen, stanza);
+
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // bob got nothing.
+    _ = bob.conn.flushSend() catch {};
+    var bbuf: [4096]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), bn);
+
+    // The bounce went back through worker 0's queue, generation-checked.
+    const Seen = struct {
+        count: usize = 0,
+        session_id: u32 = 0,
+        payload: []const u8 = "",
+
+        fn handle(self: *@This(), id: u32, _: u32, payload: []const u8) void {
+            self.count += 1;
+            self.session_id = id;
+            self.payload = payload;
+        }
+    };
+    var seen = Seen{};
+    _ = delivery_sys.getQueue(0).drain(&seen, Seen.handle);
+    try std.testing.expectEqual(@as(usize, 1), seen.count);
+    try std.testing.expectEqual(@as(u32, 9), seen.session_id);
+    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "id='h2-2'") != null);
+}
+test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_path);
+    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
+
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var listener = try TestIpcListener.init(sock_path);
+    defer listener.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    try server.configureS2s(sock_path);
+
+    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
+    defer posix.close(daemon_fd);
+
+    // bob is online but his offline tail is still draining, and his queue is
+    // at quota so the hold cannot succeed.
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.offline_pending = true;
+    server.sessions[5] = bob;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var id_buf: [16]u8 = undefined;
+        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
+        const stored = try offline_store.storePointer("bob@localhost", "carol@example.com", sid, 100 + @as(u64, @intCast(i)));
+        try std.testing.expect(stored);
+    }
+
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='h2-3' type='chat'><body>federated</body></message>";
+    const bounces_before = delivery_queue_mod.s2s_bounces.load(.monotonic);
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &changes);
+
+    // The remote sender learns the stanza was refused.
+    _ = server.s2s_ipc.flush() catch {};
+    var frame_buf: [4096]u8 = undefined;
+    const got = posix.read(daemon_fd, &frame_buf) catch 0;
+    try std.testing.expect(got > 0);
+    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    try std.testing.expect(frame != null);
+    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
+        .s2s_deliver => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("carol@example.com/res", bounced.to_jid);
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='h2-3'") != null);
+    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.s2s_bounces.load(.monotonic));
+
+    // Nothing was stored on top of the full queue, and bob's socket stayed
+    // empty: the stanza did not overtake his tail.
+    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
+    _ = bob.conn.flushSend() catch {};
+    var bbuf: [4096]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), bn);
 }
 
 test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
