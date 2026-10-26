@@ -166,6 +166,8 @@ fn spanCheckCharrefs(bytes: []const u8) Error!void {
 }
 
 const stream_ns = "http://etherx.jabber.org/streams";
+const xml_ns = "http://www.w3.org/XML/1998/namespace";
+const xmlns_ns = "http://www.w3.org/2000/xmlns/";
 
 /// Stream-level elements must never ride inside a stanza-level span,
 /// and the check is the resolved namespace URI, not a literal prefix:
@@ -282,6 +284,12 @@ fn spanCheckLex(bytes: []const u8) Error!void {
     // Ending mid-construct is the scanner's problem, not this pass's.
 }
 
+/// The URI a checked attribute prefix expands to; xml is always bound.
+fn spanAttrUri(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) []const u8 {
+    if (std.mem.eql(u8, prefix, "xml")) return xml_ns;
+    return spanResolvePrefix(bytes, prefix, decls) orelse "";
+}
+
 /// Element and attribute prefixes are only resolved once the start
 /// tag ends: an xmlns on the same tag is already in scope for its own
 /// tag name and every attribute on it.
@@ -309,6 +317,23 @@ fn spanCheckPrefixes(
         if (a_prefix.len > 0 and !spanPrefixOk(bytes, a_prefix, decls))
             return error.NotWellFormed;
     }
+    // Attribute uniqueness is by expanded name: two prefixes bound to
+    // the same URI collide when their local names match, so comparing
+    // qualified names alone is not enough.
+    for (attrs, 0..) |a, i| {
+        const aq = spanQName(bytes, a.name);
+        const a_prefix = spanSlice(bytes, aq.prefix);
+        if (a_prefix.len == 0 or std.mem.eql(u8, a_prefix, "xmlns")) continue;
+        const a_uri = spanAttrUri(bytes, a_prefix, decls);
+        for (attrs[i + 1 ..]) |b| {
+            const bq = spanQName(bytes, b.name);
+            const b_prefix = spanSlice(bytes, bq.prefix);
+            if (b_prefix.len == 0 or std.mem.eql(u8, b_prefix, "xmlns")) continue;
+            if (!std.mem.eql(u8, spanSlice(bytes, aq.local), spanSlice(bytes, bq.local))) continue;
+            if (std.mem.eql(u8, a_uri, spanAttrUri(bytes, b_prefix, decls)))
+                return error.NotWellFormed;
+        }
+    }
 }
 
 /// Markup bytes proven valid by the validating reader (XML Char, UTF-8,
@@ -322,11 +347,13 @@ pub const ValidatedSpan = struct {
     /// elements it rejects everything RFC 6120 section 11.1 forbids in
     /// a stream (comments, PIs, declarations, DTDs) plus CDATA, elements
     /// in the stream namespace, the stream prefix under any binding,
-    /// any declaration of the stream namespace, invalid names, malformed
-    /// attribute syntax, ']]>' in text, xmlns:xmlns, duplicate
-    /// attributes, a '<' inside an attribute value, non-Char character
-    /// references, undeclared prefixes other than xml:, and truncated
-    /// input. A
+    /// any declaration of the stream namespace, Namespaces in XML
+    /// violations (xmlns:xml rebinding, the XML and XMLNS URIs bound
+    /// elsewhere, xmlns:p='', duplicate attributes by expanded name),
+    /// invalid names, malformed attribute syntax, ']]>' in text,
+    /// xmlns:xmlns, duplicate attributes, a '<' inside an attribute
+    /// value, non-Char character references, undeclared prefixes other
+    /// than xml:, and truncated input. A
     /// dedicated zero-cost reader-produced constructor arrives with
     /// C5; until then callers pay one scan per span.
     pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
@@ -397,6 +424,22 @@ pub const ValidatedSpan = struct {
                         if (std.mem.eql(u8, spanSlice(bytes, prefix), "stream"))
                             return error.NotWellFormed;
                         if (spanStreamDecl(tok.?.value)) return error.NotWellFormed;
+                        // Namespaces in XML: a non-empty prefix may not
+                        // be unbound (xmlns:p='' is NS 1.0 illegal), the
+                        // xml prefix may only bind its own fixed URI,
+                        // and nothing else may bind the XML or XMLNS
+                        // namespace names, default included.
+                        const declared = spanSlice(bytes, prefix);
+                        if (declared.len > 0 and tok.?.value.len == 0)
+                            return error.NotWellFormed;
+                        if (std.mem.eql(u8, declared, "xml")) {
+                            if (!std.mem.eql(u8, tok.?.value, xml_ns))
+                                return error.NotWellFormed;
+                        } else if (std.mem.eql(u8, tok.?.value, xml_ns) or
+                            std.mem.eql(u8, tok.?.value, xmlns_ns))
+                        {
+                            return error.NotWellFormed;
+                        }
                         // The stored URI is the raw range between the
                         // value quotes; pos-1 is the closing quote.
                         const oq = std.mem.indexOfAnyPos(u8, bytes, head.eq + 1, "'\"") orelse
@@ -1420,6 +1463,36 @@ test "spans reject the stream prefix and stream namespace declarations (R4-2)" {
     // Ordinary prefixes and namespaces are unaffected.
     _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:s='urn:x'><s:b/></a>");
     _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns='urn:x'><b/></a>");
+}
+
+test "spans enforce Namespaces in XML constraints (R4-3)" {
+    // A strict peer parser drops the stream on any of these.
+    const bad = [_][]const u8{
+        "<a xmlns:xml='urn:x'/>", // the xml prefix may not be rebound
+        "<a xmlns:xml='http://www.w3.org/2000/xmlns/'/>",
+        "<a xmlns:q='http://www.w3.org/XML/1998/namespace'/>", // xml URI bound elsewhere
+        "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+        "<a xmlns:q='http://www.w3.org/2000/xmlns/'/>", // xmlns URI bound at all
+        "<a xmlns='http://www.w3.org/2000/xmlns/'/>",
+        "<a xmlns:p=''/>", // prefix undeclare is NS 1.0 illegal
+        "<a xmlns:p=\"\"/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>", // dup expanded name
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    const good = [_][]const u8{
+        "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>",
+        "<a xml:lang='en' xml:space='preserve'/>",
+        "<a xmlns=''/>",
+    };
+    for (good) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
