@@ -19,7 +19,6 @@
     <license rdf:resource="https://raw.githubusercontent.com/securemessage/xmppd/master/LICENSE"/>
 
     <schema:logo rdf:resource="https://www.xmppd.org/media/clear.svg"/>
-    <mascot rdf:resource="https://www.xmppd.org/media/clear.svg"/>
 
     <developer>
       <Person>
