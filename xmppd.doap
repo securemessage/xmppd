@@ -140,6 +140,7 @@
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0160.html"/>
         <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">Store-and-forward while offline, delivered on next login. Offline-delivered messages are not yet stamped with an XEP-0203 delay, which XEP-0160 section 2 recommends; tracked in https://pacyworld.dev/securemessage/xmppd/issues/25.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
