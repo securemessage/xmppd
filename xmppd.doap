@@ -78,7 +78,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0012.html"/>
         <xmpp:status>complete</xmpp:status>
         <xmpp:since>0.9.0</xmpp:since>
-        <xmpp:note xml:lang="en">Domain queries return server uptime; bare-JID queries are server-answered while the account is online and gated to presence-sharing contacts; full-JID queries forward to the addressed resource.</xmpp:note>
+        <xmpp:note xml:lang="en">Domain queries return server uptime; bare-JID queries answer 0 while the account is online and the seconds since its last session teardown while offline (durable record, consistent across workers), gated to presence-sharing contacts (roster from/both, else forbidden); full-JID queries forward to the addressed resource, where per XEP-0012 the client answers its own idle time.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
