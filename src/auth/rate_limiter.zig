@@ -184,12 +184,14 @@ pub const RateLimiter = struct {
         return .allowed;
     }
 
-    /// Re-check both keys without counting. Used at SCRAM client-final so an
-    /// attempt already counted at client-first can still complete.
+    /// Test-only window re-check without counting. Production uses checkLock
+    /// at SCRAM client-final and before IdP validation; this remains to
+    /// compare the window and lock behaviours.
     pub fn check(self: *RateLimiter, username: []const u8, client_ip: []const u8) Decision {
         return self.checkAt(username, client_ip, currentEpoch());
     }
 
+    /// Test-only explicit-time variant of check.
     pub fn checkAt(self: *RateLimiter, username: []const u8, client_ip: []const u8, now: u32) Decision {
         if (username.len > 0) {
             switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now, .check)) {
@@ -308,7 +310,7 @@ pub const RateLimiter = struct {
         clear_on_success: bool,
     ) void {
         if (key.len > max_key_len) {
-            log.warn("rate key is {d} bytes, above the {d}-byte bound; denying admission separately", .{ key.len, max_key_len });
+            log.warn("rate key is {d} bytes, above the {d}-byte bound; not tracked", .{ key.len, max_key_len });
             return;
         }
         const entry = self.findOrCreate(table, key, now) orelse {

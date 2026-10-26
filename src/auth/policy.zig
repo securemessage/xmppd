@@ -2,9 +2,12 @@
 //!
 //! `admitIp` counts the IP attempt before any identity is known;
 //! `admitAccount` counts the account attempt and runs the permanent lock
-//! check once the identity is parsed. `check` re-runs both checks without
-//! counting, for the SCRAM client-final. `recordOutcome` records only the
-//! result of an attempt already counted at admission.
+//! check once the identity is parsed; `admitAccountPending` also counts
+//! in-flight crypto-pool jobs against the lockout threshold. `check`
+//! re-runs only the permanent and temporary locks, without counting or
+//! consulting the windows, for the SCRAM client-final and the IdP
+//! pre-check. `recordOutcome` records only the result of an attempt
+//! already counted at admission.
 //!
 //! Account keys are the case-folded identity localpart, the same key the
 //! permanent lock store uses. Store errors and an untrackable key fail
