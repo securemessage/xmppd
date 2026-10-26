@@ -2,11 +2,10 @@
 //!
 //! One StanzaWriter emits one stanza into a caller-provided writer. Element
 //! and attribute names are checked against the XML QName production
-//! (NCName with an optional 'prefix:'; ASCII subset). Attribute values
-//! and text are
-//! validated against the XML Char production and always escaped for the five
-//! escapables (`& < > ' "`). Only reader-validated markup may pass through
-//! rawSpan; the ValidatedSpan type carries that proof.
+//! (NCName with an optional 'prefix:'; ASCII subset). Attribute values and
+//! text are validated against the XML Char production and always escaped
+//! for the five escapables (`& < > ' "`). Only reader-validated markup may
+//! pass through rawSpan; the ValidatedSpan type carries that proof.
 //!
 //! The writer owns nothing and never allocates: every byte goes to the
 //! caller's writer. When that writer fills or fails, a sticky failure is
@@ -31,7 +30,8 @@ pub const Error = error{
     /// controls other than tab/LF/CR, or the noncharacters U+FFFE/U+FFFF.
     InvalidCharacter,
     /// rawSpan input is not well-formed XML, or is forbidden inside an
-    /// XMPP stream (comments, PIs, declarations, DTDs: RFC 6120 11.1).
+    /// XMPP stream (comments, PIs, declarations, DTDs: RFC 6120 11.1;
+    /// CDATA is also rejected as an implementation restriction).
     NotWellFormed,
 };
 
@@ -256,7 +256,7 @@ pub const ValidatedSpan = struct {
     /// The only constructor, and it validates: XML Char plus a full
     /// well-formedness pass through lib/xml/scanner. Beyond balanced
     /// elements it rejects everything RFC 6120 section 11.1 forbids in
-    /// a stream (comments, PIs, declarations, DOCTYPE/CDATA), elements
+    /// a stream (comments, PIs, declarations, DTDs) plus CDATA, elements
     /// in the stream namespace, invalid names, malformed attribute
     /// syntax, ']]>' in text, xmlns:xmlns, duplicate attributes, a
     /// '<' inside an attribute value, non-Char character references,
@@ -373,7 +373,9 @@ pub const StanzaWriter = struct {
     }
 
     /// Emits `<name`, opening a start tag. Attributes follow until
-    /// elementOpenEnd or elementSelfClose.
+    /// elementOpenEnd or elementSelfClose. The name slice is borrowed:
+    /// it is kept on the element stack for the later elementClose
+    /// match, so it must outlive the writer.
     pub fn elementOpen(self: *StanzaWriter, name: []const u8) Error!void {
         assert(!self.in_start_tag);
         assert(self.depth < max_depth);
@@ -1297,12 +1299,13 @@ test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
 
     try x.elementOpen("m");
     x.elementOpenEnd();
-    try x.text("tab\there line\nfeed cr\r and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars");
+    // Over 128 bytes so the SIMD suspect scan runs at full width.
+    try x.text("tab\there line\nfeed cr\r and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars, padded past the vector width with plain ascii words to keep scanning");
     try x.elementClose("m");
     try x.finish();
 
     try testing.expectEqualStrings(
-        "<m>tab\there line\nfeed cr&#13; and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars</m>",
+        "<m>tab\there line\nfeed cr&#13; and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars, padded past the vector width with plain ascii words to keep scanning</m>",
         w.buffered(),
     );
 }
