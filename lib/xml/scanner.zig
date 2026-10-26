@@ -78,10 +78,6 @@ pub const Scanner = struct {
     buf: std.ArrayList(u8) = .{},
     /// Secondary buffer for attribute values
     val_buf: std.ArrayList(u8) = .{},
-    /// Buffer for the entity name inside &...; references, so an
-    /// entity in an attribute value does not clobber the name held
-    /// in buf (or the value in val_buf).
-    entity_buf: std.ArrayList(u8) = .{},
     /// The quote character for the current attribute value
     quote_char: u8 = 0,
     /// Track if we just saw a `/` that might precede `>`
@@ -103,7 +99,6 @@ pub const Scanner = struct {
     pub fn deinit(self: *Scanner) void {
         self.buf.deinit(self.allocator);
         self.val_buf.deinit(self.allocator);
-        self.entity_buf.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.token_arena.deinit();
     }
@@ -119,7 +114,6 @@ pub const Scanner = struct {
         self.state = .content;
         self.buf.clearRetainingCapacity();
         self.val_buf.clearRetainingCapacity();
-        self.entity_buf.clearRetainingCapacity();
         self.quote_char = 0;
         self.saw_slash = false;
         self.pending.clearRetainingCapacity();
@@ -287,9 +281,8 @@ pub const Scanner = struct {
                             };
                         }
                     } else if (c == '&') {
-                        // Entity reference in attribute value; buf
-                        // keeps the attribute name while the entity
-                        // name accumulates in entity_buf.
+                        // Entity reference in attribute value
+                        self.buf.clearRetainingCapacity();
                         self.state = .entity_attr;
                     } else {
                         try self.val_buf.append(a, c);
@@ -354,31 +347,31 @@ pub const Scanner = struct {
                     }
                 },
                 .entity_content => {
-                    // Reading entity name after `&` in text content;
-                    // buf keeps the accumulated text meanwhile.
+                    // Reading entity name after `&` in text content.
+                    // Uses val_buf to accumulate entity name (buf holds text content).
                     if (c == ';') {
-                        const decoded = try resolveEntity(self.entity_buf.items);
+                        const decoded = try resolveEntity(self.val_buf.items);
                         try self.buf.append(a, decoded);
-                        self.entity_buf.clearRetainingCapacity();
+                        self.val_buf.clearRetainingCapacity();
                         self.state = .content;
-                    } else if (self.entity_buf.items.len > 8) {
+                    } else if (self.val_buf.items.len > 8) {
                         return error.InvalidEntityReference;
                     } else {
-                        try self.entity_buf.append(a, c);
+                        try self.val_buf.append(a, c);
                     }
                 },
                 .entity_attr => {
-                    // Reading entity name after `&` in attribute value;
-                    // buf keeps the attribute name, val_buf the value.
+                    // Reading entity name after `&` in attribute value.
+                    // Uses buf to accumulate entity name (val_buf holds attr value).
                     if (c == ';') {
-                        const decoded = try resolveEntity(self.entity_buf.items);
-                        self.entity_buf.clearRetainingCapacity();
+                        const decoded = try resolveEntity(self.buf.items);
+                        self.buf.clearRetainingCapacity();
                         try self.val_buf.append(a, decoded);
                         self.state = .attr_value;
-                    } else if (self.entity_buf.items.len > 8) {
+                    } else if (self.buf.items.len > 8) {
                         return error.InvalidEntityReference;
                     } else {
-                        try self.entity_buf.append(a, c);
+                        try self.buf.append(a, c);
                     }
                 },
             }

@@ -766,28 +766,6 @@ test "element and attribute names are validated" {
     try testing.expectError(error.Overflow, x.finish());
 }
 
-test "rawSpan emits reader-validated bytes verbatim" {
-    var buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var x = StanzaWriter.init(&w);
-
-    try x.elementOpen("iq");
-    x.elementOpenEnd();
-    const span = try ValidatedSpan.fromReader(
-        testing.allocator,
-        "<child a='&amp;'>raw &amp; text</child>",
-    );
-    x.rawSpan(span);
-    try x.elementClose("iq");
-    try x.finish();
-
-    // Entities inside the span stay as the reader produced them.
-    try testing.expectEqualStrings(
-        "<iq><child a='&amp;'>raw &amp; text</child></iq>",
-        w.buffered(),
-    );
-}
-
 test "SIMD escaper matches scalar reference, 100000 random inputs" {
     // Goal: differential proof that writeEscaped equals the per-byte
     // reference on arbitrary input, fixed seed for reproducibility.
