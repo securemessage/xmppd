@@ -41,7 +41,7 @@ polymorphism for performance at scale.
 | XEP-0085 | Chat State Notifications | Full | Interop |
 | XEP-0092 | Software Version | Full | Interop |
 | XEP-0115 | Entity Capabilities | Full | Unit |
-| XEP-0160 | Offline Message Storage | Full | E2E, Unit |
+| XEP-0160 | Offline Message Storage | Full⁶ | E2E, Unit |
 | XEP-0163 | Personal Eventing Protocol | Partial³ | E2E |
 | XEP-0184 | Message Delivery Receipts | Pass-through | E2E |
 | XEP-0191 | Blocking Command | Full | E2E, Unit |
