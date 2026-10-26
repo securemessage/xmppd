@@ -4401,6 +4401,58 @@ test "dns-async: a nameserver past the first kilobyte is still found" {
     try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.54", 53)));
 }
 
+test "dns-async: a SERVFAIL is never cached and hits the wire again" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("fail.test", .a, 1);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    const n1 = srv.udp_recvd.load(.monotonic);
+
+    ctx.status = null;
+    try r.query("fail.test", .a, 2);
+    spins = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    // A cached SERVFAIL would have answered the repeat from memory;
+    // a temporary failure must go back to the wire instead.
+    try std.testing.expect(srv.udp_recvd.load(.monotonic) > n1);
+}
+
+test "dns-async: a timed-out query is never cached and hits the wire again" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("fail.test", .a, 1);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    const n1 = srv.udp_recvd.load(.monotonic);
+
+    ctx.status = null;
+    try r.query("fail.test", .a, 2);
+    spins = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expect(srv.udp_recvd.load(.monotonic) > n1);
+}
+
 test "dns-async: a TTL with the top bit set reports zero (RFC 2181)" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
