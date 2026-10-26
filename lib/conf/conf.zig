@@ -165,6 +165,12 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
             return std.fmt.parseInt(T, s, 10) catch error.BadValue;
         },
         .@"enum" => return std.meta.stringToEnum(T, s) orelse error.BadValue,
+        .@"union" => {
+            // IntOr(K) and friends must bring their own parser; the check
+            // stays inline because a helper call loses comptime decls.
+            if (!@hasDecl(T, "parse")) @compileError("conf.parseValue: unsupported union " ++ @typeName(T));
+            return T.parse(s);
+        },
         else => @compileError("conf.parseValue: unsupported type " ++ @typeName(T)),
     }
 }
@@ -179,6 +185,44 @@ fn parseBool(s: []const u8) ParseError!bool {
     if (std.mem.eql(u8, s, "1")) return true;
     if (std.mem.eql(u8, s, "0")) return false;
     return error.BadValue;
+}
+
+/// A field type that is either an integer or one keyword from K, e.g.
+/// `workers = auto` or `workers = 8`. Carries its own parse/write so
+/// parseValue needs no comptime introspection of the union.
+pub fn IntOr(comptime K: type) type {
+    if (@typeInfo(K) != .@"enum") @compileError("conf.IntOr: keyword set must be an enum");
+    return union(enum) {
+        kw: K,
+        num: i64,
+
+        pub fn parse(s: []const u8) ParseError!@This() {
+            if (std.fmt.parseInt(i64, s, 10)) |n| {
+                return .{ .num = n };
+            } else |_| {}
+            const kw = std.meta.stringToEnum(K, s) orelse return error.BadValue;
+            return .{ .kw = kw };
+        }
+
+        pub fn write(self: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (self) {
+                .kw => |k| try w.writeAll(@tagName(k)),
+                .num => |n| try w.print("{d}", .{n}),
+            }
+        }
+    };
+}
+
+/// Splits a comma list into trimmed item slices; the array comes from
+/// `arena`, the items borrow the source text like scalar strings do.
+fn parseList(s: []const u8, arena: Allocator) Error![][]const u8 {
+    var items = std.ArrayList([]const u8).empty;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |item| {
+        const t = std.mem.trim(u8, item, " \t");
+        if (t.len != 0) try items.append(arena, t);
+    }
+    return items.toOwnedSlice(arena);
 }
 
 /// Duration in milliseconds. Fields that only need one unit stay plain
@@ -229,9 +273,17 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, v: T) std.Io.Writer.Error!voi
     if (T == bool) return w.writeAll(if (v) "true" else "false");
     if (T == Duration) return w.print("{f}", .{v});
     if (T == std.net.Address) return w.print("{f}", .{v});
+    if (T == [][]const u8) {
+        for (v, 0..) |item, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll(item);
+        }
+        return;
+    }
     switch (@typeInfo(T)) {
         .int => try w.print("{d}", .{v}),
         .@"enum" => try w.writeAll(@tagName(v)),
+        .@"union" => try v.write(w),
         else => unreachable, // field types are checked at comptime
     }
 }
@@ -282,9 +334,13 @@ pub fn Loader(
             types[i] = fieldTypeOf(sec, f.field);
             // Every field type must be parseable.
             const T = types[i];
-            if (T != []const u8 and T != bool and T != Duration and T != std.net.Address) {
+            if (T != []const u8 and T != bool and T != Duration and T != std.net.Address and T != [][]const u8) {
                 switch (@typeInfo(T)) {
                     .int, .@"enum" => {},
+                    .@"union" => {
+                        if (!@hasDecl(T, "parse")) @compileError("conf: unsupported union type " ++ @typeName(T) ++
+                            " for " ++ f.section ++ "." ++ f.field);
+                    },
                     else => @compileError("conf: unparseable field type " ++ @typeName(T) ++
                         " for " ++ f.section ++ "." ++ f.field),
                 }
@@ -715,6 +771,25 @@ pub fn Loader(
         fn setField(self: *Self, idx: usize, s: []const u8, ctx: LoadContext, diag: *Diag) Error!void {
             inline for (fields, 0..) |f, i| {
                 if (idx == i) {
+                    if (field_types[i] == [][]const u8) {
+                        @field(@field(self.values, f.section), f.field) = parseList(s, self.arena_state.allocator()) catch |err| {
+                            switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => {
+                                    diag.set(.{
+                                        .path = ctx.path,
+                                        .line = ctx.line,
+                                        .section = f.section,
+                                        .key = if (ctx.key.len != 0) ctx.key else keyOf(f),
+                                        .value = s,
+                                        .detail = "invalid value",
+                                    });
+                                    return error.BadValue;
+                                },
+                            }
+                        };
+                        return;
+                    }
                     const val = parseValue(field_types[i], s) catch {
                         diag.set(.{
                             .path = ctx.path,
@@ -1483,6 +1558,67 @@ test "inline comments end a value only after whitespace; quoting is literal" {
     // '#'/';' inside a token is literal, and so are quote bytes.
     try testing.expectEqualStrings("/data/p#ss.db", l.values.server.db_path);
     try testing.expectEqualStrings("\"quoted.log\"", l.values.server.log_file);
+}
+
+const m6_sections = struct {
+    srv: struct {
+        addrs: [][]const u8 = &.{},
+        workers: IntOr(enum { auto }) = .{ .kw = .auto },
+    } = .{},
+};
+const m6_fields = [_]FieldSpec{
+    .{ .section = "srv", .field = "addrs" },
+    .{ .section = "srv", .field = "workers" },
+};
+const m6_cli = [_]CliSpec{
+    .{ .name = "addrs", .target = "srv.addrs" },
+    .{ .name = "workers", .target = "srv.workers" },
+};
+const M6Loader = Loader(@TypeOf(m6_sections{}), &m6_fields, &m6_cli, .{});
+
+test "comma-list and int-or-keyword field types parse and serialize" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "m6.ini",
+        \\[srv]
+        \\addrs = 10.0.0.1, ::1 , 127.0.0.1
+        \\workers = 8
+        \\
+    , &path_buf);
+    var diag: Diag = .{};
+
+    var l = try M6Loader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, 3), l.values.srv.addrs.len);
+    try testing.expectEqualStrings("::1", l.values.srv.addrs[1]);
+    switch (l.values.srv.workers) {
+        .num => |n| try testing.expectEqual(@as(i64, 8), n),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // CLI and keyword forms land the same types.
+    var l2 = try M6Loader.load(testing.allocator, .{
+        .args = &.{ "--workers=auto", "--addrs=one,two" },
+    }, &diag);
+    defer l2.deinit();
+    switch (l2.values.srv.workers) {
+        .kw => |k| try testing.expectEqual(.auto, k),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 2), l2.values.srv.addrs.len);
+
+    // writeValue emits the canonical forms back.
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeValue([][]const u8, &w, l.values.srv.addrs);
+    try testing.expectEqualStrings("10.0.0.1,::1,127.0.0.1", w.buffered());
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeValue(@TypeOf(l2.values.srv.workers), &w2, l2.values.srv.workers);
+    try testing.expectEqualStrings("auto", w2.buffered());
+
+    // A bad keyword and a bad list item are rejected, not clamped.
+    try testing.expectError(error.BadValue, parseValue(IntOr(enum { auto }), "sometimes"));
 }
 
 const capped_sections = struct {
