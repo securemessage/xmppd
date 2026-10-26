@@ -773,6 +773,11 @@ pub const Resolver = struct {
         job.pending_qtype = qtype;
         job.tries = 1;
         if (job.use_tcp) {
+            // A connection surviving from an earlier query still holds
+            // that query's staged frame; reset it or the new query is
+            // never written and the chain stalls on this socket.
+            job.tcp_out.clearRetainingCapacity();
+            job.tcp_out_pos = 0;
             try self.tcpSend(job);
         } else {
             try self.sendUdp(pkt);
@@ -2422,7 +2427,6 @@ test "dns-async: a deadline event batched with the reply does not touch a freed 
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
-
 test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
@@ -3390,6 +3394,146 @@ test "dns-async: TCP sends the frame exactly once across connect" {
     r.step(10);
     const extra = posix.recv(cfd, fbuf[0..1], posix.MSG.DONTWAIT) catch 0;
     try std.testing.expectEqual(@as(usize, 0), extra);
+}
+
+/// A TC-flagged echo of `qpkt` with no answers: forces the chain's
+/// UDP->TCP upgrade in tests that drive the resolver directly.
+fn buildTruncated(out: []u8, qpkt: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180 | wire.FLAG_TC, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    return 12 + qlen;
+}
+
+/// One SRV answer record (owner = the question via a 0xC00C pointer).
+fn encodeSrvRr(out: []u8, port: u16, target: []const u8) usize {
+    var off: usize = 0;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    off += 2;
+    std.mem.writeInt(u16, out[off..][0..2], wire.TYPE_SRV, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 4 ..][0..4], 60, .big);
+    std.mem.writeInt(u16, out[off + 8 ..][0..2], @intCast(6 + encLen(target)), .big);
+    off += 10;
+    std.mem.writeInt(u16, out[off..][0..2], 10, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 100, .big);
+    std.mem.writeInt(u16, out[off + 4 ..][0..2], port, .big);
+    off += 6;
+    appendEncodedNameTo(out, &off, target);
+    return off;
+}
+
+/// One A answer record for 127.0.0.1 (owner = the question).
+fn encodeARr(out: []u8) usize {
+    var off: usize = 0;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    off += 2;
+    std.mem.writeInt(u16, out[off..][0..2], wire.TYPE_A, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 4 ..][0..4], 60, .big);
+    std.mem.writeInt(u16, out[off + 8 ..][0..2], 4, .big);
+    off += 10;
+    @memcpy(out[off .. off + 4], &[_]u8{ 127, 0, 0, 1 });
+    return off + 4;
+}
+
+/// Canned answer for one query frame `qpkt`: NODATA for the direct-TLS
+/// SRV name, an SRV record for the STARTTLS name, an A record for the
+/// target host, NODATA for anything else (AAAA included).
+fn answerTcpQuery(out: []u8, qpkt: []const u8) usize {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const q = parseQuestion(arena_state.allocator(), qpkt) catch return 0;
+    var rr_buf: [128]u8 = undefined;
+    var rrs: []const u8 = &.{};
+    var ancount: u16 = 0;
+    if (q.qtype == KIND_SRV and !std.mem.startsWith(u8, q.qname, "_xmpps")) {
+        ancount = 1;
+        rrs = rr_buf[0..encodeSrvRr(&rr_buf, 15222, "srv.test")];
+    } else if (q.qtype == KIND_A) {
+        ancount = 1;
+        rrs = rr_buf[0..encodeARr(&rr_buf)];
+    }
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], ancount, .big);
+    @memset(out[8..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    const off = 12 + qlen;
+    @memcpy(out[off .. off + rrs.len], rrs);
+    return off + rrs.len;
+}
+
+test "dns-async: a kept-open TCP connection carries every chain query" {
+    // The test owns the nameserver: a TCP listener whose accepted
+    // connection stays open while the chain sends it several
+    // length-prefixed queries. A staged frame that is never reset
+    // would send only the first query and stall the resolve.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+
+    // The UDP answer's TC bit upgrades the chain to TCP; the _xmpps
+    // SRV query is re-sent as the connection's first frame.
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+
+    var peer: posix.sockaddr = undefined;
+    var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const cfd = try posix.accept(lfd, &peer, &plen, 0);
+    defer posix.close(cfd);
+    const tv = posix.timeval{ .sec = 0, .usec = 200_000 };
+    try posix.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
+    var frames: usize = 0;
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) {
+        r.step(10);
+        var fbuf: [1024]u8 = undefined;
+        var hdr: [2]u8 = undefined;
+        if (readFull(cfd, &hdr) != 2) continue;
+        const want = std.mem.readInt(u16, &hdr, .big);
+        if (readFull(cfd, fbuf[0..want]) != want) continue;
+        frames += 1;
+        var abuf: [1024]u8 = undefined;
+        const rlen = answerTcpQuery(&abuf, fbuf[0..want]);
+        var out_hdr: [2]u8 = undefined;
+        std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+        _ = try posix.send(cfd, &out_hdr, 0);
+        _ = try posix.send(cfd, abuf[0..rlen], 0);
+    }
+
+    // _xmpps SRV, _xmpp SRV, A, AAAA: four queries share the one
+    // connection the TC upgrade opened.
+    try std.testing.expectEqual(@as(usize, 4), frames);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
 }
 
 test "dns-async: resolv.conf is read into the resolver, not on the loop" {
