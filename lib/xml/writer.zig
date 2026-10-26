@@ -1255,6 +1255,39 @@ test "a literal '<' in an attribute value is rejected" {
     );
 }
 
+test "ValidatedSpan accepts depth 64 and rejects depth 65" {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (0..64) |d| {
+        buf[pos] = '<';
+        buf[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        buf[pos + 2] = '>';
+        pos += 3;
+    }
+    for (0..64) |d| {
+        buf[pos] = '<';
+        buf[pos + 1] = '/';
+        buf[pos + 2] = 'a' + @as(u8, @intCast((63 - d) % 26));
+        buf[pos + 3] = '>';
+        pos += 4;
+    }
+    _ = try ValidatedSpan.fromReader(testing.allocator, buf[0..pos]);
+
+    // One more level of nesting exceeds the name stack bound.
+    var deep: [512]u8 = undefined;
+    pos = 0;
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        deep[pos + 2] = '>';
+        pos += 3;
+    }
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, deep[0..pos]),
+    );
+}
+
 test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
     // At least vec_len bytes so the SIMD path proves it does not
     // reject the whitespace characters it scans as suspects.
