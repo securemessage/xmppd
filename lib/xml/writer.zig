@@ -119,6 +119,64 @@ fn isStreamElement(name: []const u8) bool {
         std.mem.eql(u8, name, "stream:features");
 }
 
+/// Lexical pass over the raw span bytes, independent of the scanner:
+/// a '<' is illegal inside a quoted attribute value, and the check
+/// must run on the source bytes because an entity-produced '<' like
+/// &lt; is legal while a literal one is not.
+fn spanCheckLex(bytes: []const u8) Error!void {
+    const LexState = enum { text, tag_name, before_attr, attr_name, attr_eq, attr_value, close_name };
+    var state: LexState = .text;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        switch (state) {
+            .text => {
+                if (c == '<') {
+                    state = .tag_name;
+                    if (i + 1 < bytes.len and bytes[i + 1] == '/') state = .close_name;
+                }
+            },
+            .close_name => {
+                if (c == '>') state = .text;
+            },
+            .tag_name => {
+                if (c == '>') {
+                    state = .text;
+                } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    state = .before_attr;
+                }
+            },
+            .before_attr => {
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+                if (c == '>') {
+                    state = .text;
+                } else {
+                    state = .attr_name;
+                }
+            },
+            .attr_name => {
+                if (c == '=') {
+                    state = .attr_eq;
+                } else if (c == '/' or c == '>') {
+                    state = .text;
+                }
+            },
+            .attr_eq => {
+                if (c == '\'' or c == '"') {
+                    quote = c;
+                    state = .attr_value;
+                }
+            },
+            .attr_value => {
+                if (c == '<') return error.NotWellFormed;
+                if (c == quote) state = .before_attr;
+            },
+        }
+    }
+    // Ending mid-construct is the scanner's problem, not this pass's.
+}
+
 /// Element and attribute prefixes are only resolved once the start
 /// tag ends: an xmlns on the same tag is already in scope for its own
 /// tag name and every attribute on it.
@@ -156,6 +214,7 @@ pub const ValidatedSpan = struct {
         // is already illegal inside attribute values and text, so the
         // raw scan is exact.
         if (std.mem.indexOf(u8, bytes, "<!") != null) return error.NotWellFormed;
+        try spanCheckLex(bytes);
         var sc = scanner_mod.Scanner.init(alloc);
         defer sc.deinit();
         var pos: usize = 0;
@@ -182,9 +241,6 @@ pub const ValidatedSpan = struct {
                 .attribute => {
                     if (attr_count >= span_max_attrs) return error.NotWellFormed;
                     if (!isValidName(tok.?.name)) return error.NotWellFormed;
-                    // A '<' may never sit inside an attribute value.
-                    if (std.mem.indexOfScalar(u8, tok.?.value, '<') != null)
-                        return error.NotWellFormed;
                     for (attrs[0..attr_count]) |p| {
                         if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
                     }
@@ -1120,6 +1176,20 @@ test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
     for (good) |probe| {
         _ = try ValidatedSpan.fromReader(testing.allocator, probe);
     }
+}
+
+test "a literal '<' in an attribute value is rejected" {
+    // The '<' check runs on the source bytes: an entity-produced '<'
+    // like &lt; is well-formed and becomes acceptable once the scanner
+    // entity fix lands; a literal '<' inside the quotes never is.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a x='<'/>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a x=\"a<b\"/>"),
+    );
 }
 
 test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
