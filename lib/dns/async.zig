@@ -3335,6 +3335,118 @@ test "dns-async: a nested completion inside a callback keeps sibling cancel" {
     try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
 }
 
+const NestCancelCtx = struct {
+    r: *Resolver,
+    calls: [16]usize = .{0} ** 16,
+    nested: enum { none, promote_query, resolve_nx } = .none,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+        const self: *NestCancelCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.calls[key] += 1;
+        if (res) |*v| {
+            var x = v.*;
+            x.deinitOn(std.testing.allocator);
+        }
+        if (key != 1) return;
+        // Whatever the nested completion did to in_callback, it must
+        // be restored so this sibling cancel still marks the outer job.
+        switch (self.nested) {
+            .none => {},
+            .promote_query => self.r.cancel(3),
+            .resolve_nx => self.r.resolve("neg.test", .client, 5222, 9, false) catch {},
+        }
+        self.r.cancel(2);
+    }
+};
+
+/// Outer job: resolve("x.test") shared by waiters 1 and 2, completed
+/// by hand through onChainDeadline so waiter 1's callback drives the
+/// nested completion under test and then cancels waiter 2.
+fn driveNestedCancel(r: *Resolver, ctx: *NestCancelCtx) !void {
+    try r.resolve("x.test", .client, 5222, 1, false);
+    try r.resolve("x.test", .client, 5222, 2, false);
+    var outer: ?*Job = null;
+    for (r.jobs.items) |j| {
+        if (std.mem.eql(u8, j.name, "x.test")) outer = j;
+    }
+    try std.testing.expectEqual(@as(usize, 2), outer.?.waiter_count);
+    const host = try std.testing.allocator.dupe(u8, "x.test");
+    try outer.?.targets.append(std.testing.allocator, .{
+        .addr = try net.Address.parseIp("127.0.0.1", 5222),
+        .host = host,
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    });
+    r.onChainDeadline(outer.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls[1]);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
+}
+
+test "dns-async: a nested completeRaw restores the outer in_callback" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = NestCancelCtx{ .r = &r, .nested = .promote_query };
+    r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+
+    // Key 3 holds a second in-flight job; a queued raw query sits
+    // behind it. cancel(3) frees the job, promoteWait launches the
+    // query, and the cache hit completes it through completeRaw.
+    try r.resolve("j.test", .client, 5222, 3, false);
+    const wname = try std.testing.allocator.dupe(u8, "cached.test");
+    try r.wait_queue.append(std.testing.allocator, .{
+        .session_key = 5,
+        .name = wname,
+        .kind = .query,
+        .rtype = KIND_A,
+    });
+    var rrs = [1]wire.Rr{.{ .name = "cached.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cachePut("cached.test", KIND_A, &rrs);
+
+    try driveNestedCancel(&r, &ctx);
+}
+
+test "dns-async: a nested dropJob (raw) restores the outer in_callback" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = NestCancelCtx{ .r = &r, .nested = .promote_query };
+    r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+
+    // Same promote as above, but the queued query hits a cached
+    // NXDOMAIN: launchQuery -> sendQuery -> dropJob on the raw branch.
+    try r.resolve("j.test", .client, 5222, 3, false);
+    const wname = try std.testing.allocator.dupe(u8, "negq.test");
+    try r.wait_queue.append(std.testing.allocator, .{
+        .session_key = 5,
+        .name = wname,
+        .kind = .query,
+        .rtype = KIND_A,
+    });
+    r.cacheInsert("negq.test", KIND_A, &.{}, .nxdomain, 60);
+
+    try driveNestedCancel(&r, &ctx);
+}
+
+test "dns-async: a nested dropJob (resolve) restores the outer in_callback" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = NestCancelCtx{ .r = &r, .nested = .resolve_nx };
+    r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+
+    // Every step of the neg.test chain is a cached NXDOMAIN: the
+    // nested resolve drops through dropJob on the resolve branch.
+    r.cacheInsert("_xmpps-client._tcp.neg.test", KIND_SRV, &.{}, .nxdomain, 60);
+    r.cacheInsert("_xmpp-client._tcp.neg.test", KIND_SRV, &.{}, .nxdomain, 60);
+    r.cacheInsert("neg.test", KIND_AAAA, &.{}, .nxdomain, 60);
+    r.cacheInsert("neg.test", KIND_A, &.{}, .nxdomain, 60);
+
+    try driveNestedCancel(&r, &ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls[9]);
+}
+
 test "dns-async: cancel purges the key's queued entry before promoting" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
