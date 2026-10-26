@@ -681,12 +681,18 @@ pub const Resolver = struct {
         try self.keventApply(&ch);
     }
 
+    /// Disarm both timer knotes. The retry knote may already be gone
+    /// (a fired ONESHOT deletes itself on delivery), so deletes run
+    /// through the receipt path with ENOENT accepted: a raw changelist
+    /// would abort at the first failure and leave the chain timer
+    /// armed past freeJob.
     fn disarmDeadline(self: *Resolver, job: *Job) void {
+        if (self.kq < 0) return;
         var ch = [2]posix.Kevent{
             .{ .ident = @intFromPtr(job), .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
             .{ .ident = @intFromPtr(job) | 1, .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
         };
-        _ = posix.kevent(self.kq, &ch, &.{}, null) catch {};
+        self.keventDelete(&ch) catch {};
     }
 
     /// Resolve a timer event's (gen, slot) udata back to a live job;
@@ -722,6 +728,17 @@ pub const Resolver = struct {
     /// reaches step() through the kqueue alone and a failed entry cannot
     /// eat an event harvested after it.
     fn keventApply(self: *Resolver, ch: []const posix.Kevent) !void {
+        try self.keventApplyChecked(ch, false);
+    }
+
+    /// Changelist of deletes: a receipt reporting ENOENT means the
+    /// knote was already gone, which is exactly the state the delete
+    /// asked for. Any other receipt errno still fails the call.
+    fn keventDelete(self: *Resolver, ch: []const posix.Kevent) !void {
+        try self.keventApplyChecked(ch, true);
+    }
+
+    fn keventApplyChecked(self: *Resolver, ch: []const posix.Kevent, enoent_ok: bool) !void {
         const nonblock = std.c.timespec{ .sec = 0, .nsec = 0 };
         var evbuf: [8]posix.Kevent = undefined;
         var off: usize = 0;
@@ -736,7 +753,9 @@ pub const Resolver = struct {
             }
             const got = try posix.kevent(self.kq, batch[0..n], &evbuf, &nonblock);
             for (evbuf[0..got]) |ev| {
-                if (ev.data != 0) return error.KeventChange;
+                if (ev.data == 0) continue;
+                if (enoent_ok and ev.data == @intFromEnum(std.c.E.NOENT)) continue;
+                return error.KeventChange;
             }
             off += n;
         }
@@ -3788,6 +3807,42 @@ test "dns-async: a stale deadline cannot hit a re-used slot" {
     for (0..16) |_| r.step(0);
     try std.testing.expectEqual(@as(u8, 1), job_b.tries);
     try std.testing.expect(ctx.status == null);
+}
+
+test "dns-async: disarming a fired retry timer still removes the chain timer" {
+    const sink = try startUdpSink();
+    defer posix.close(sink.fd);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", sink.port));
+    r.chain_deadline_ms = 50;
+
+    try r.resolve("svc.test", .client, 5222, 7, false);
+    const job = r.jobs.items[0];
+
+    // Simulate the retry knote already delivered and gone: the first
+    // delete of disarmDeadline reports ENOENT, and a raw changelist
+    // would stop there, leaving the chain timer armed past freeJob.
+    var del = [1]posix.Kevent{.{
+        .ident = @intFromPtr(job),
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.DELETE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = try posix.kevent(r.kq, &del, &.{}, null);
+    r.cancel(7);
+
+    // Harvest the resolver kqueue directly: a surviving chain knote
+    // fires ~50 ms out and shows up here even though the slot is dead.
+    var evs: [8]posix.Kevent = undefined;
+    const ts = std.c.timespec{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+    const n = try posix.kevent(r.kq, &.{}, &evs, &ts);
+    for (evs[0..n]) |ev| {
+        try std.testing.expect(ev.filter != std.c.EVFILT.TIMER);
+    }
 }
 
 test "dns-async: a failed registration change reports per entry" {
