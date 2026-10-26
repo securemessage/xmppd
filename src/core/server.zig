@@ -3775,13 +3775,12 @@ pub const Server = struct {
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
                 const target_session = c.server.sessions[local_session_id] orelse return;
-                if (target_session.sm_detached) {
-                    // T153: no live connection to deliver to — track for resume
-                    // replay instead of silently dropping the stanza.
-                    target_session.smTrackOutbound(payload);
-                    return;
-                }
                 const parts = extractStanzaParts(payload);
+                // The hold check comes before the SM-detach check: a detached
+                // session may still have an undrained offline tail, and a
+                // message pushed into its replay queue would be replayed
+                // ahead of that tail (H3). The c2s router orders them the
+                // same way.
                 if (target_session.offline_pending and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
                     const hold_id = if (parts.msg_id.len > 0) parts.msg_id else "offline";
                     const timestamp: u64 = @intCast(std.time.timestamp());
@@ -3800,6 +3799,12 @@ pub const Server = struct {
                     if (recipient_bare.len > 0) {
                         c.server.bounceCrossWorkerUnavailable(from_jid, recipient_bare, parts.msg_id, "message", c.changes);
                     }
+                    return;
+                }
+                if (target_session.sm_detached) {
+                    // T153: no live connection to deliver to — track for resume
+                    // replay instead of silently dropping the stanza.
+                    target_session.smTrackOutbound(payload);
                     return;
                 }
                 target_session.conn.queueSend(payload) catch return;
@@ -4288,6 +4293,7 @@ pub const Server = struct {
         session.stream.state = .active;
         session.roster_interested = detached.roster_interested;
         session.carbons_enabled = detached.carbons_enabled;
+        session.offline_pending = detached.offline_pending;
         @memcpy(
             session.last_presence_inner[0..detached.last_presence_inner_len],
             detached.last_presence_inner[0..detached.last_presence_inner_len],
@@ -4363,6 +4369,12 @@ pub const Server = struct {
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
+        }
+
+        // Resume sends no initial presence, so nothing else would restart a
+        // tail that was still draining at detach (H3).
+        if (session.offline_pending) {
+            session_lifecycle.drainOfflinePending(self, session, changes);
         }
 
         log.info("connection {d} session resumed (id={s}, replayed {d} stanzas, {d} rooms)", .{
@@ -4503,6 +4515,7 @@ pub const Server = struct {
             },
             .base_seq = if (detached.sm_unacked) |q| q.base_seq else 1,
             .last_h = if (detached.sm_unacked) |q| q.last_h else 0,
+            .offline_pending = detached.offline_pending,
             .created = std.time.timestamp(),
         };
         @memcpy(&bundle.previd, req.previd[0..sm_state.SM_ID_HEX_LEN]);
@@ -4670,6 +4683,7 @@ pub const Server = struct {
         session.roster_interested = bundle.roster_interested;
         session.carbons_enabled = bundle.carbons_enabled;
         session.csi_active = bundle.csi_active;
+        session.offline_pending = bundle.offline_pending;
         @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
         session.last_presence_inner_len = bundle.last_presence.len;
 
@@ -4720,6 +4734,12 @@ pub const Server = struct {
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
+        }
+
+        // Resume sends no initial presence, so nothing else would restart a
+        // tail that was still draining at detach (H3).
+        if (session.offline_pending) {
+            session_lifecycle.drainOfflinePending(self, session, changes);
         }
 
         log.info("connection {d} cross-worker session resumed (id={s}, replayed {d} stanzas, {d} rooms)", .{
@@ -7020,6 +7040,259 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     try std.testing.expect(std.mem.indexOf(u8, seen.payload, "service-unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen.payload, "id='h2-2'") != null);
 }
+// H3: a detached session can still have an undrained offline tail. A live
+// message must be parked behind that tail, not pushed into the SM replay
+// queue, which would replay it ahead of the tail.
+test "Server: H3 a cross-worker message to a detached session is held behind its tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.sm_detached = true;
+    target.sm_resume_enabled = true;
+    target.sm_detach_time = std.time.timestamp();
+    target.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const sm_id = "11112222333344445555666677778888";
+    @memcpy(&target.sm_id, sm_id);
+    target.offline_pending = true;
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    queue.base_seq = 1;
+    target.sm_unacked = queue;
+    server.sessions[5] = target;
+    server.detached_count = 1;
+    server.smIdMapInsert(&target.sm_id, 5);
+    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+
+    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='h3-1' type='chat'><body>live</body></message>";
+    try delivery_sys.deliver(0, 5, bob_gen, payload);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // Nothing went into the replay queue: that would have replayed ahead of
+    // the undrained tail.
+    try std.testing.expectEqual(@as(u32, 0), queue.count);
+    // Parked in the offline store instead.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
+    try std.testing.expect(held != null);
+    if (held) |h| {
+        defer allocator.free(h);
+        try std.testing.expect(std.mem.indexOf(u8, h, "<body>live</body>") != null);
+    }
+    // The flag survives: the tail is still outstanding.
+    try std.testing.expect(target.offline_pending);
+}
+
+test "Server: H3 a resume carries the stalled offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+    sm_handoff.resetForTesting();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    const previd = "cccccccccccccccccccccccccccccccc";
+    session.sm_resume_pending = true;
+    session.sm_resume_epoch = 7;
+    @memcpy(&session.sm_resume_previd, previd);
+
+    // A stanza waiting in the store for the resumed session.
+    _ = try offline_store.storeHeldPointer(
+        "alice@localhost",
+        "bob@localhost/res",
+        "tail-1",
+        1000,
+        "<message from='bob@localhost/res' to='alice@localhost' id='tail-1'><body>tail</body></message>",
+    );
+
+    // Hand the bundle over with the tail still pending.
+    const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch unreachable;
+    bundle.* = .{
+        .previd = undefined,
+        .sm_in_h = 0,
+        .sm_out_seq = 1,
+        .sm_out_h = 0,
+        .r_outstanding = false,
+        .roster_interested = false,
+        .carbons_enabled = false,
+        .csi_active = false,
+        .username = sm_handoff.allocator.dupe(u8, "alice") catch unreachable,
+        .resource = sm_handoff.allocator.dupe(u8, "res") catch unreachable,
+        .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
+        .base_seq = 1,
+        .last_h = 0,
+        .offline_pending = true,
+        .created = std.time.timestamp(),
+    };
+    @memcpy(&bundle.previd, previd);
+    try sm_handoff.put(previd, bundle);
+
+    server.handleSmResumeReply(.{
+        .previd = previd,
+        .req_session = 1,
+        .req_epoch = 7,
+        .status = "ok",
+    }, &changes);
+
+    // Resume sends no initial presence, so without the carried flag (and the
+    // drain restart) the tail would wait for the next login.
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-1") != null);
+}
+
+test "Server: H3 a local resume carries the stalled offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Detached session on slot 2 with an undrained tail.
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    const detached = try allocator.create(Session);
+    detached.* = Session.init(det_fds[0], 2, "localhost", false, allocator);
+    @memcpy(detached.auth_username_buf[0..5], "alice");
+    detached.auth_username_len = 5;
+    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.sm_detached = true;
+    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_resume_enabled = true;
+    detached.offline_pending = true;
+    const det_queue = try allocator.create(sm_state.SmUnackedQueue);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    det_queue.base_seq = 1;
+    detached.sm_unacked = det_queue;
+    server.sessions[2] = detached;
+
+    var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+    sm_state.generateSmId(server.worker_id, &previd);
+    server.smIdMapInsert(&previd, 2);
+    server.detached_count = 1;
+
+    _ = try offline_store.storeHeldPointer(
+        "alice@localhost",
+        "bob@localhost/res",
+        "tail-2",
+        1000,
+        "<message from='bob@localhost/res' to='alice@localhost' id='tail-2'><body>tail</body></message>",
+    );
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = xmpp.Jid.parse("alice@localhost") catch null;
+    // Flush the stream-features reply so the offline tail has buffer room.
+    while (true) {
+        const wrote = session.conn.flushSend() catch break;
+        while (posix.read(fds[1], &drain_buf)) |dn| {
+            if (dn == 0) break;
+        } else |_| {}
+        if (wrote == 0 or !session.conn.hasPendingWrite()) break;
+    }
+
+    var resume_buf: [128]u8 = undefined;
+    const resume_xml = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{previd}) catch unreachable;
+    _ = try posix.write(fds[1], resume_xml);
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-2") != null);
+}
+
 test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     const allocator = std.testing.allocator;
 
