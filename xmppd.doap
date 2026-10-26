@@ -249,8 +249,8 @@
     <implements>
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0440.html"/>
-        <xmpp:status>complete</xmpp:status>
-        <xmpp:note xml:lang="en">Channel binding announced over tls-server-end-point.</xmpp:note>
+        <xmpp:status>planned</xmpp:status>
+        <xmpp:note xml:lang="en">Channel binding is plumbed (gs2 flag, tls-server-end-point) but never negotiated: no urn:xmpp:sasl-cb:0 feature is announced and no SCRAM-SHA-256-PLUS mechanism is offered. Tracked in https://pacyworld.dev/securemessage/xmppd/issues/24.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
 

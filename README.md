@@ -57,7 +57,7 @@ polymorphism for performance at scale.
 | XEP-0352 | Client State Indication | Full | E2E |
 | XEP-0359 | Unique and Stable Stanza IDs | Full | Unit |
 | XEP-0402 | PEP Native Bookmarks | Full | E2E |
-| XEP-0440 | SASL Channel-Binding Type Negotiation | Full | Unit |
+| XEP-0440 | SASL Channel-Binding Type Negotiation | Planned⁸ | - |
 
 **Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2 (495 tests available),
 **E2E** = verified with Gajim, Conversations, and/or Dino,
@@ -99,6 +99,11 @@ offline-delivered messages (the primary XEP-0160 + XEP-0203 offline case).
 ⁷ Core dialback (db:result / db:verify in both directions) is complete and
 Prosody interop-tested, used where SASL EXTERNAL or DANE is unavailable.
 Missing: graceful dialback errors (XEP-0220 §2.5 type='error' handling).
+
+⁸ Channel binding is plumbed (gs2 flag, tls-server-end-point retrieval) but
+never negotiated: no `urn:xmpp:sasl-cb:0` feature is announced and no
+`SCRAM-SHA-256-PLUS` mechanism is offered. Tracked in issue
+[#24](https://pacyworld.dev/securemessage/xmppd/issues/24).
 
 ## Building
 
