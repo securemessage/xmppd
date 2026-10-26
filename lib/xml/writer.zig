@@ -181,13 +181,8 @@ fn spanStreamDecl(uri: []const u8) bool {
 /// prefix resolves against the default namespace declaration. The
 /// newest declaration wins, matching in-scope shadowing.
 fn spanResolvePrefix(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?[]const u8 {
-    var i = decls.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix))
-            return spanSlice(bytes, decls[i].uri);
-    }
-    return null;
+    const r = spanResolveRange(bytes, prefix, decls) orelse return null;
+    return spanSlice(bytes, r);
 }
 
 /// Lexical pass over the raw span bytes, independent of the scanner:
@@ -284,10 +279,54 @@ fn spanCheckLex(bytes: []const u8) Error!void {
     // Ending mid-construct is the scanner's problem, not this pass's.
 }
 
-/// The URI a checked attribute prefix expands to; xml is always bound.
-fn spanAttrUri(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) []const u8 {
-    if (std.mem.eql(u8, prefix, "xml")) return xml_ns;
-    return spanResolvePrefix(bytes, prefix, decls) orelse "";
+/// The URI range a prefix expands to, newest declaration first;
+/// unresolved prefixes return null (the declared-prefix check
+/// rejects them first).
+fn spanResolveRange(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?SpanRange {
+    var i = decls.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix)) return decls[i].uri;
+    }
+    return null;
+}
+
+/// The next character in a raw attribute value, resolving one entity
+/// or character reference at '&' to its codepoint. The scanner already
+/// accepted every reference in the value, so a null result only means
+/// the range is exhausted.
+fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) ?u21 {
+    if (i.* >= r.end) return null;
+    const c = bytes[i.*];
+    i.* += 1;
+    if (c != '&') return c;
+    const semi = std.mem.indexOfScalarPos(u8, bytes, i.*, ';') orelse return null;
+    const name = bytes[i.*..semi];
+    i.* = semi + 1;
+    if (std.mem.eql(u8, name, "amp")) return '&';
+    if (std.mem.eql(u8, name, "lt")) return '<';
+    if (std.mem.eql(u8, name, "gt")) return '>';
+    if (std.mem.eql(u8, name, "apos")) return '\'';
+    if (std.mem.eql(u8, name, "quot")) return '"';
+    if (name.len > 1 and name[0] == '#') {
+        if (name[1] == 'x' or name[1] == 'X')
+            return std.fmt.parseInt(u21, name[2..], 16) catch return null;
+        return std.fmt.parseInt(u21, name[1..], 10) catch return null;
+    }
+    return null;
+}
+
+/// Two raw ranges are equal once decoded when they yield the same
+/// character sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
+fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) bool {
+    var ai = a.start;
+    var bi = b.start;
+    while (true) {
+        const ac = spanNextDecoded(bytes, a, &ai);
+        const bc = spanNextDecoded(bytes, b, &bi);
+        if (ac == null or bc == null) return ac == null and bc == null;
+        if (ac.? != bc.?) return false;
+    }
 }
 
 /// Element and attribute prefixes are only resolved once the start
@@ -319,19 +358,25 @@ fn spanCheckPrefixes(
     }
     // Attribute uniqueness is by expanded name: two prefixes bound to
     // the same URI collide when their local names match, so comparing
-    // qualified names alone is not enough.
+    // qualified names alone is not enough. Unprefixed attributes have
+    // no namespace and are skipped; xml: cannot collide because the
+    // XML URI may never be bound to another prefix, and same-name
+    // xml: duplicates already failed the qualified-name check. URIs
+    // compare after entity decoding so 'urn:&#117;' equals 'urn:u'.
     for (attrs, 0..) |a, i| {
         const aq = spanQName(bytes, a.name);
         const a_prefix = spanSlice(bytes, aq.prefix);
-        if (a_prefix.len == 0 or std.mem.eql(u8, a_prefix, "xmlns")) continue;
-        const a_uri = spanAttrUri(bytes, a_prefix, decls);
+        if (a_prefix.len == 0 or std.mem.eql(u8, a_prefix, "xmlns") or
+            std.mem.eql(u8, a_prefix, "xml")) continue;
+        const a_uri = spanResolveRange(bytes, a_prefix, decls) orelse continue;
         for (attrs[i + 1 ..]) |b| {
             const bq = spanQName(bytes, b.name);
             const b_prefix = spanSlice(bytes, bq.prefix);
-            if (b_prefix.len == 0 or std.mem.eql(u8, b_prefix, "xmlns")) continue;
+            if (b_prefix.len == 0 or std.mem.eql(u8, b_prefix, "xmlns") or
+                std.mem.eql(u8, b_prefix, "xml")) continue;
             if (!std.mem.eql(u8, spanSlice(bytes, aq.local), spanSlice(bytes, bq.local))) continue;
-            if (std.mem.eql(u8, a_uri, spanAttrUri(bytes, b_prefix, decls)))
-                return error.NotWellFormed;
+            const b_uri = spanResolveRange(bytes, b_prefix, decls) orelse continue;
+            if (spanDecodedEql(bytes, a_uri, b_uri)) return error.NotWellFormed;
         }
     }
 }
@@ -1517,6 +1562,25 @@ test "span validator pins: '<!' scan, declaration pops, newest-first (R4-4)" {
     // xmlns:xmlns can never be declared, whitespace before '=' or not.
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns = 'u'/>"));
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns='u'/>"));
+}
+
+test "expanded-name duplicates compare decoded URIs (R5-1)" {
+    // Stored URI ranges are raw bytes, so the expanded-name check must
+    // decode before comparing or entity-encoded duplicates slip past.
+    const bad = [_][]const u8{
+        "<a xmlns:p='urn:u' xmlns:q='urn:&#117;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:&#x75;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&amp;b' xmlns:q='urn:a&#38;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&amp;b' xmlns:q='urn:a&#x26;b' p:x='1' q:x='2'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // Distinct decoded URIs still pass.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>");
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
