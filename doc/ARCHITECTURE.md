@@ -3,7 +3,7 @@
 ## Overview
 
 xmppd is a multi-process XMPP server inspired by Postfix's design philosophy:
-one package, one config, one service — complexity is internal.
+one package, one config, one service - complexity is internal.
 
 ## Process Model
 
@@ -78,9 +78,9 @@ Comptime generic stores with pluggable backends:
 
 Selected at build time via `-Dop-storage=` and `-Darchive-storage=`:
 
-- **LMDB** — default for operational data (fast, zero-config, ACID)
-- **RocksDB** — archive/MAM (better for large sequential writes)
-- **SQLite** — alternative single-file backend
+- **LMDB** - default for operational data (fast, zero-config, ACID)
+- **RocksDB** - archive/MAM (better for large sequential writes)
+- **SQLite** - alternative single-file backend
 
 ## Security Model
 
