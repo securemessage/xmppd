@@ -1495,6 +1495,30 @@ test "spans enforce Namespaces in XML constraints (R4-3)" {
     }
 }
 
+test "span validator pins: '<!' scan, declaration pops, newest-first (R4-4)" {
+    // '<!' can only begin a forbidden construct; a comment without a
+    // space slips past the lexical pass, so the raw scan is what
+    // rejects it.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!----></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!--x--></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!-- c --></a>"));
+
+    // Declarations die with their element: after a self-close or a
+    // close, the prefix is out of scope again.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b xmlns:p='urn:u'/><p:c/></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b xmlns:p='urn:u'></b><p:c/></a>"));
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b/><p:c/></a>");
+
+    // Prefix resolution is newest-first: q is shadowed inside <b>, so
+    // q:x expands to urn:v and is not a duplicate of p:x. Resolving
+    // oldest-first wrongly reports a duplicate here.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u' xmlns:q='urn:u'><b xmlns:q='urn:v' p:x='1' q:x='2'/></a>");
+
+    // xmlns:xmlns can never be declared, whitespace before '=' or not.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns = 'u'/>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns='u'/>"));
+}
+
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
