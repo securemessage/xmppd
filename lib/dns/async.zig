@@ -814,7 +814,14 @@ pub const Resolver = struct {
     /// try; every other phase fails the job.
     fn failQuery(self: *Resolver, job: *Job) void {
         switch (job.phase) {
-            .addr, .addr6, .tlsa => self.skipTarget(job),
+            // A per-target failure costs only the phase that failed:
+            // one dead address family still lets the other answer,
+            // and a failed TLSA lookup degrades the target to no-DANE.
+            .addr => {
+                job.phase = .addr6;
+                self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
+            },
+            .addr6, .tlsa => self.finishTarget(job),
             .fallback_addr => {
                 job.fallback_err = true;
                 job.phase = .fallback_addr4;
@@ -829,10 +836,13 @@ pub const Resolver = struct {
         }
     }
 
-    /// Drop the current SRV target's collected addresses and move to
-    /// the next one in RFC 2782 order; only reachable inside a
-    /// per-target phase.
-    fn skipTarget(self: *Resolver, job: *Job) void {
+    /// End the current SRV target after a failure: emit whichever
+    /// address families did resolve, then move to the next target in
+    /// RFC 2782 order. Only a target with nothing resolved is skipped.
+    fn finishTarget(self: *Resolver, job: *Job) void {
+        if (job.cur_addr4 != null or job.cur_addr6 != null) {
+            self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+        }
         job.cur_addr4 = null;
         job.cur_addr6 = null;
         self.nextTarget(job) catch return self.dropJob(job, .failed);
@@ -1343,7 +1353,7 @@ pub const Resolver = struct {
             // that target is gone, not the whole resolution.
             .addr => {
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.skipTarget(job);
+                self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
             .addr6 => self.nextTarget(job) catch return self.dropJob(job, .failed),
             .tlsa => {
@@ -1398,7 +1408,7 @@ pub const Resolver = struct {
                     }
                 }
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.skipTarget(job);
+                self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
             .addr6 => {
                 const target = &job.srv_list.items[job.srv_pos];
@@ -1415,7 +1425,7 @@ pub const Resolver = struct {
                 }
                 if (job.want_tlsa) {
                     job.phase = .tlsa;
-                    self.sendTlsa(job) catch return self.skipTarget(job);
+                    self.sendTlsa(job) catch return self.finishTarget(job);
                     return;
                 }
                 self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
@@ -1799,6 +1809,10 @@ const FakeDns = struct {
     /// When < 255, address queries for "t{idx}.test" are answered
     /// SERVFAIL, exercising the per-target skip.
     a_servfail_idx: std.atomic.Value(u8) = std.atomic.Value(u8).init(255),
+    /// When set, every A (or AAAA) query is answered SERVFAIL: one
+    /// failed family must not doom the family that resolved.
+    a_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    aaaa_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, AAAA queries are answered with ::1 so dual-stack
     /// paths have real data.
     a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1897,18 +1911,23 @@ const FakeDns = struct {
         var ancount: u16 = 0;
         if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV and self.srv_silent.load(.monotonic)) return 0;
-        if (self.a_servfail_idx.load(.monotonic) != 255 and (q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA)) {
+        const is_addr_q = q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA;
+        const family_fail = (q.qtype == wire.TYPE_A and self.a_fail.load(.monotonic)) or
+            (q.qtype == wire.TYPE_AAAA and self.aaaa_fail.load(.monotonic));
+        var named_fail = false;
+        if (self.a_servfail_idx.load(.monotonic) != 255 and is_addr_q) {
             var fbuf: [32]u8 = undefined;
             const fname = std.fmt.bufPrint(&fbuf, "t{d}.test", .{self.a_servfail_idx.load(.monotonic)}) catch "";
-            if (std.mem.eql(u8, q.qname, fname)) {
-                std.mem.writeInt(u16, out[0..2], id, .big);
-                std.mem.writeInt(u16, out[2..4], 0x8182, .big);
-                std.mem.writeInt(u16, out[4..6], 1, .big);
-                @memset(out[6..12], 0);
-                const qlen = pkt.len - 12;
-                @memcpy(out[12 .. 12 + qlen], pkt[12..]);
-                return 12 + qlen;
-            }
+            named_fail = std.mem.eql(u8, q.qname, fname);
+        }
+        if (is_addr_q and (family_fail or named_fail)) {
+            std.mem.writeInt(u16, out[0..2], id, .big);
+            std.mem.writeInt(u16, out[2..4], 0x8182, .big);
+            std.mem.writeInt(u16, out[4..6], 1, .big);
+            @memset(out[6..12], 0);
+            const qlen = pkt.len - 12;
+            @memcpy(out[12 .. 12 + qlen], pkt[12..]);
+            return 12 + qlen;
         }
         if (q.qtype == wire.TYPE_SRV) {
             const client_prefix = std.mem.startsWith(u8, q.qname, "_xmpps-client") or std.mem.startsWith(u8, q.qname, "_xmpp-client");
@@ -3193,6 +3212,58 @@ test "dns-async: a SERVFAIL on one SRV target skips only that target (Q4)" {
         try std.testing.expect(!std.mem.eql(u8, t.host, "t0.test"));
     }
     try std.testing.expect(saw_t1 and saw_t2);
+}
+
+test "dns-async: an AAAA SERVFAIL keeps the resolved A address (R2)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.aaaa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The A half resolved before the AAAA refusal: the target survives
+    // with its IPv4 address instead of being skipped wholesale.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[0].addr.any.family);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
+test "dns-async: an A SERVFAIL still yields the AAAA address (R2)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.a_fail.store(true, .monotonic);
+    srv.a_aaaa.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The failing family goes first here: the A refusal must still
+    // let the AAAA query run and produce the only target.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), res.targets[0].addr.any.family);
 }
 
 test "dns-async: parsed SRV entries are capped at 32 (Q4)" {
