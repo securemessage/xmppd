@@ -258,10 +258,13 @@ pub const Resolver = struct {
     /// keventApply; dispatched by step() so registration never steals
     /// socket progress from the event pump.
     pending_events: std.ArrayListUnmanaged(posix.Kevent) = .{},
-    /// The job currently firing completion callbacks, or null. Only
-    /// set inside a dropJob/complete/completeRaw waiter loop, after the
+    /// The job currently firing completion callbacks, or null. Set
+    /// inside a dropJob/complete/completeRaw waiter loop, after the
     /// job is already off `jobs`, so a cancel() issued from inside a
-    /// callback can still mark the job's remaining waiters.
+    /// callback can still mark the job's remaining waiters. Loops
+    /// restore the previous value on exit: a callback that completes
+    /// another job synchronously (a cached resolve) must not lose the
+    /// outer job's cancel marks.
     in_callback: ?*Job = null,
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
@@ -1117,20 +1120,21 @@ pub const Resolver = struct {
                 break;
             }
         }
+        const prev_cb = self.in_callback;
         if (job.is_raw) {
             self.in_callback = job;
             for (job.waiters[0..job.waiter_count], 0..) |key, w| {
                 if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
                 self.qcb.fun(self.qcb.ctx, key, status, null);
             }
-            self.in_callback = null;
+            self.in_callback = prev_cb;
         } else {
             self.in_callback = job;
             for (job.waiters[0..job.waiter_count], 0..) |key, w| {
                 if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
                 self.cb.fun(self.cb.ctx, key, status, null);
             }
-            self.in_callback = null;
+            self.in_callback = prev_cb;
         }
         self.freeJob(job);
         self.promoteWait();
@@ -1145,6 +1149,7 @@ pub const Resolver = struct {
         }
         // Every waiter gets its own deep copy of the target set; the
         // callback owns what it receives.
+        const prev_cb = self.in_callback;
         self.in_callback = job;
         for (job.waiters[0..job.waiter_count], 0..) |key, w| {
             if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
@@ -1154,7 +1159,7 @@ pub const Resolver = struct {
             };
             self.cb.fun(self.cb.ctx, key, .resolved, .{ .targets = targets });
         }
-        self.in_callback = null;
+        self.in_callback = prev_cb;
         self.freeJob(job);
         self.promoteWait();
     }
@@ -1205,6 +1210,7 @@ pub const Resolver = struct {
         }
         self.cachePut(job.pending_qname, job.pending_qtype, msg.rrs);
         const ttl = minTtl(msg.rrs);
+        const prev_cb = self.in_callback;
         self.in_callback = job;
         for (job.waiters[0..job.waiter_count], 0..) |key, w| {
             if (job.waiter_cancelled & (@as(u16, 1) << @intCast(w)) != 0) continue;
@@ -1214,7 +1220,7 @@ pub const Resolver = struct {
             };
             self.qcb.fun(self.qcb.ctx, key, .resolved, .{ .rrs = detached, .ttl = ttl });
         }
-        self.in_callback = null;
+        self.in_callback = prev_cb;
         self.freeJob(job);
         self.promoteWait();
     }
@@ -2943,6 +2949,57 @@ test "dns-async: cancel inside a sibling callback suppresses its callback (Q2)" 
     while (ctx.calls[1] == 0 and spins < 200) : (spins += 1) r.step(50);
 
     try std.testing.expectEqual(@as(usize, 1), ctx.calls[1]);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
+}
+
+const NestCtx = struct {
+    r: *Resolver,
+    calls: [16]usize = .{0} ** 16,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+        const self: *NestCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.calls[key] += 1;
+        if (res) |*v| {
+            var x = v.*;
+            x.deinitOn(std.testing.allocator);
+        }
+        // Key 1 finishes a second resolve synchronously from cache and
+        // then cancels its sibling: the nested completion must not
+        // hide the outer job from cancel().
+        if (key == 1) {
+            self.r.resolve("svc.test", .client, 5222, 9, false) catch {};
+            self.r.cancel(2);
+        }
+    }
+};
+
+test "dns-async: a nested completion inside a callback keeps sibling cancel (R3)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = NestCtx{ .r = &r };
+    r.setCallback(.{ .ctx = &ctx, .fun = NestCtx.onResolve });
+
+    // Keys 1 and 2 share one in-flight job; the svc.test chain is
+    // cache-seeded so key 1's nested resolve completes inline.
+    try r.resolve("x.test", .client, 5222, 1, false);
+    try r.resolve("x.test", .client, 5222, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
+    seedSvcChain(&r, false);
+
+    const job = r.jobs.items[0];
+    const host = try std.testing.allocator.dupe(u8, "x.test");
+    job.targets.append(std.testing.allocator, .{
+        .addr = try net.Address.parseIp("127.0.0.1", 5222),
+        .host = host,
+        .tlsa = &.{},
+        .is_direct_tls = false,
+    }) catch unreachable;
+    r.onChainDeadline(job);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls[1]);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls[9]);
     try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
 }
 
