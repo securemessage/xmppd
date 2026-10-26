@@ -101,6 +101,44 @@ const max_arena_retain = 64 * 1024;
 const max_ns_arena_retain = 4 * 1024;
 const max_attributes_per_element = 64;
 
+/// Reader memory per item is several times its source bytes: element names and
+/// text runs are held by the scanner and again by the reader, and short
+/// elements amplify worst. Measured on this reader: 4.0x for a 4 KiB text body
+/// (3.3x at 16 KiB), 3.4x for 100-byte names, 3.9x for 400-byte names. A byte
+/// cap alone therefore understates the footprint, which is how a 1 MiB item
+/// cap held 4.14 MB per connection (H6).
+pub const item_memory_allowance = 4;
+
+/// Slack above the scaled byte cap for the fixed buffers and allocator
+/// rounding, so an item that is legal by bytes is never rejected in memory.
+const item_memory_slack = 64 * 1024;
+
+/// Memory budget that goes with a byte cap. Callers set bytes and get the
+/// matching memory bound, so neither can be loosened without the other.
+pub fn memoryBudgetFor(max_item_bytes: usize) usize {
+    return item_memory_allowance * max_item_bytes + item_memory_slack;
+}
+
+/// Largest item a peer may send before it has authenticated. Negotiation
+/// elements (stream header, SASL blobs, dialback keys) are far smaller.
+pub const max_item_bytes_pre_auth = 16 * 1024;
+
+/// Largest item an authenticated peer (c2s client or federated server) may
+/// send. Every consumer accumulates a stanza into a 16 KiB buffer before it is
+/// relayed or stored, and the serialization banks are 20 KiB, so a larger item
+/// could never be delivered: accepting it would only spend memory on a stanza
+/// that is dropped later. Sized just above the accumulator so a stanza that
+/// fits today keeps fitting, while the item's memory stays bounded at
+/// `memoryBudgetFor(20 KiB)` (H6).
+pub const max_item_bytes_authenticated = 20 * 1024;
+
+/// Default item byte cap inherited from the scanner, re-exported so callers
+/// can compare their own cap against it without reaching into the scanner.
+pub const default_max_item_bytes = scanner.default_max_item_bytes;
+
+/// Per-item memory budget used until a caller sets one.
+pub const default_max_item_memory = memoryBudgetFor(scanner.default_max_item_bytes);
+
 const NsBinding = struct {
     prefix: []const u8,
     uri: []const u8,
@@ -147,6 +185,11 @@ pub const Reader = struct {
     ns_arena: std.heap.ArenaAllocator,
     /// Allocator for dynamic collections
     allocator: std.mem.Allocator,
+    /// Live bytes held for the item being parsed. Set on item start to the
+    /// capacity the arenas retained from the previous item, so reuse is not
+    /// charged to this one; the cap applies to the growth above it (H6).
+    item_memory_base: usize = 0,
+    max_item_memory: usize = default_max_item_memory,
     /// Name of the element currently being assembled
     current_element_name: []const u8 = "",
     current_element_prefix: []const u8 = "",
@@ -161,8 +204,32 @@ pub const Reader = struct {
         };
     }
 
+    /// Set the byte ceiling for one stream header or top-level stanza, and the
+    /// matching memory ceiling. The reader holds each name and text run twice
+    /// (scanner token, then reader arena), so a byte cap alone understates
+    /// memory by up to 4x; both are set here so they cannot diverge (H6).
     pub fn setMaxItemBytes(self: *Reader, max_bytes: usize) void {
         self.scan.setMaxItemBytes(max_bytes);
+        self.setMaxItemMemory(memoryBudgetFor(max_bytes));
+    }
+
+    pub fn setMaxItemMemory(self: *Reader, max_bytes: usize) void {
+        self.max_item_memory = max_bytes;
+    }
+
+    /// Bytes currently held for the open item: reader arena, stream-level
+    /// namespace arena, the scanner's token arena, and its token buffers.
+    /// An arena that shrank below the item's baseline contributes nothing
+    /// rather than wrapping.
+    pub fn itemMemory(self: *const Reader) usize {
+        return self.memoryBytes() -| self.item_memory_base;
+    }
+
+    fn memoryBytes(self: *const Reader) usize {
+        return self.arena.queryCapacity() +
+            self.ns_arena.queryCapacity() +
+            self.attrs.capacity * @sizeOf(Attribute) +
+            self.scan.memoryBytes();
     }
 
     pub fn deinit(self: *Reader) void {
@@ -183,6 +250,10 @@ pub const Reader = struct {
         }
         while (true) {
             const token = try self.scan.next(input, pos) orelse return null;
+            // Charge the item for what the previous token added and stop
+            // before the next one: names and text are held by the scanner and
+            // again by the reader, up to 4x the source bytes (H6).
+            if (self.itemMemory() > self.max_item_memory) return error.ItemTooLong;
 
             switch (token.type) {
                 .xml_declaration => {
@@ -195,6 +266,9 @@ pub const Reader = struct {
                         // root name and namespace context remain in ns_arena.
                         // Bound retained capacity independently of stanza size.
                         _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
+                        // Charge the new item only for what it adds: retained
+                        // arena capacity is reuse, not this item's footprint.
+                        self.item_memory_base = self.memoryBytes();
                     }
                     self.current_element_name = try self.arenaDupe(token.name);
                     self.current_element_prefix = try self.arenaDupe(token.prefix);
@@ -423,6 +497,7 @@ pub const Reader = struct {
         self.attribute_count = 0;
         _ = self.arena.reset(.{ .retain_with_limit = max_arena_retain });
         _ = self.ns_arena.reset(.{ .retain_with_limit = max_ns_arena_retain });
+        self.item_memory_base = self.memoryBytes();
         self.scan.reset();
     }
 };
@@ -875,6 +950,154 @@ test "reader: G5 an unterminated item has a whole-item byte cap" {
         };
     }
     return error.ExpectedItemTooLong;
+}
+
+test "H6: memory budget scales with the byte cap" {
+    // 4x measured amplification plus slack; both caps move together.
+    try std.testing.expectEqual(@as(usize, 4 * 20 * 1024 + 64 * 1024), memoryBudgetFor(20 * 1024));
+    try std.testing.expectEqual(memoryBudgetFor(16 * 1024), memoryBudgetFor(max_item_bytes_pre_auth));
+    // A byte cap can never be loosened without its memory cap following.
+    try std.testing.expect(memoryBudgetFor(20 * 1024) > memoryBudgetFor(16 * 1024));
+}
+
+test "H6: setMaxItemBytes sets the matching memory budget" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+
+    reader.setMaxItemBytes(max_item_bytes_authenticated);
+    try std.testing.expectEqual(memoryBudgetFor(max_item_bytes_authenticated), reader.max_item_memory);
+    // Memory may be pinned independently downward, but setMaxItemBytes always
+    // re-derives it from the byte cap rather than leaving a stale value.
+    reader.setMaxItemMemory(1);
+    try std.testing.expectEqual(@as(usize, 1), reader.max_item_memory);
+    reader.setMaxItemBytes(max_item_bytes_pre_auth);
+    try std.testing.expectEqual(memoryBudgetFor(max_item_bytes_pre_auth), reader.max_item_memory);
+}
+
+test "H6: the memory cap rejects an item the byte cap would allow" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    reader.setMaxItemBytes(max_item_bytes_authenticated);
+    // Force the memory bound below what this item costs. The byte cap is left
+    // as shipped, so a rejection here can only come from the memory check.
+    reader.setMaxItemMemory(8 * 1024);
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try drainAll(&reader, "<iq>");
+
+    var rejected = false;
+    for (0..200_000) |_| {
+        var pos: usize = 0;
+        _ = reader.next("<a/>", &pos) catch |err| {
+            try std.testing.expectEqual(error.ItemTooLong, err);
+            rejected = true;
+            break;
+        };
+    }
+    try std.testing.expect(rejected);
+    // Rejection happens before the overrun is grown any further.
+    try std.testing.expect(reader.itemMemory() < 16 * 1024);
+}
+
+test "H6: an item at the byte cap stays inside its memory budget" {
+    try expectPeakWithinBudget(.names);
+    try expectPeakWithinBudget(.text);
+}
+
+/// The two shapes measured for memory per source byte: many short element
+/// names, and one long text run.
+const ItemShape = enum { names, text };
+
+fn expectPeakWithinBudget(shape: ItemShape) !void {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    reader.setMaxItemBytes(max_item_bytes_authenticated);
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try drainAll(&reader, "<iq>");
+
+    // Drive the item to its byte cap in the measured shape: names amplify 3.5x
+    // at 20 bytes and 3.9x at 400, a text run 4.0x at 4 KiB. The peak this run
+    // reaches is the one the budget has to cover.
+    var chunk: [512]u8 = undefined;
+    @memset(&chunk, 't');
+    const unit: []const u8 = switch (shape) {
+        .names => "<aaaaaaaaaaaaaaaaaaaa/>",
+        .text => &chunk,
+    };
+    var peak: usize = 0;
+    var src: usize = 0;
+    while (true) {
+        var pos: usize = 0;
+        _ = reader.next(unit, &pos) catch |err| {
+            try std.testing.expectEqual(error.ItemTooLong, err);
+            break;
+        };
+        src += unit.len;
+        peak = @max(peak, reader.itemMemory());
+    }
+    // The byte cap, not the memory cap, is what stops this item.
+    try std.testing.expect(src >= max_item_bytes_authenticated - unit.len);
+    try std.testing.expect(peak > 0);
+    try std.testing.expect(peak <= reader.max_item_memory);
+}
+
+test "H6: a new item starts from a fresh memory baseline" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    reader.setMaxItemBytes(max_item_bytes_authenticated);
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+
+    // An item that is legal by bytes but large enough to grow the arenas.
+    var big: [8192]u8 = undefined;
+    @memset(&big, 'A');
+    try drainAll(&reader, "<message><body>");
+    try drainAll(&reader, &big);
+    try drainAll(&reader, "</body></message>");
+    const retained = reader.arena.queryCapacity();
+    try std.testing.expect(retained > 4096);
+
+    // Retained capacity is reuse, not the next item's footprint. A small
+    // stanza after it must be charged for its own bytes only: charging the
+    // retained arenas too would reject legal stanzas on a busy connection.
+    try drainAll(&reader, "<presence/>");
+    try std.testing.expect(reader.itemMemory() < 1024);
+    try std.testing.expect(reader.arena.queryCapacity() <= max_arena_retain);
+}
+
+test "H6: a stream restart rebases the memory baseline" {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    reader.setMaxItemBytes(max_item_bytes_authenticated);
+
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+
+    // Grow both arenas well past the token-arena retain floor, as a large
+    // pre-auth or first stanza does.
+    var big: [8192]u8 = undefined;
+    @memset(&big, 'A');
+    try drainAll(&reader, "<message><body>");
+    try drainAll(&reader, &big);
+    try drainAll(&reader, "</body></message>");
+
+    // Restart the stream (STARTTLS, SASL success). Both arenas are reset to
+    // their retain limits but stay allocated; that retained capacity is not
+    // the next item's footprint.
+    reader.reset();
+
+    // A tiny budget is now the whole allowance. If the restart had left the
+    // baseline at the old item's start, the retained arenas would be charged
+    // to the new item and the next stream header would be rejected.
+    reader.setMaxItemMemory(4 * 1024);
+    try drainAll(&reader, "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+    try drainAll(&reader, "<presence/>");
+    try std.testing.expect(reader.itemMemory() <= 4 * 1024);
 }
 
 test "reader: parse message stanza" {

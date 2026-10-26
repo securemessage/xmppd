@@ -72,9 +72,6 @@ const MAX_INBOUND_SESSIONS = 256;
 /// Maximum outbound S2S connections.
 const MAX_OUTBOUND_CONNS = 128;
 
-/// Unauthenticated streams need only negotiation elements and dialback keys.
-const PRE_AUTH_ITEM_MAX_BYTES = 16 * 1024;
-
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
     allocator: std.mem.Allocator,
@@ -267,7 +264,7 @@ pub const S2sDaemon = struct {
             return null;
         };
         reader.* = XmlReader.init(self.allocator);
-        reader.setMaxItemBytes(PRE_AUTH_ITEM_MAX_BYTES);
+        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         self.readers[slot] = reader;
 
         log.info("accepted inbound S2S connection id={d} fd={d}", .{ slot, client_fd });
@@ -968,6 +965,13 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     var pos: usize = 0;
 
     while (true) {
+        // The item cap follows the stream's authentication state, checked
+        // before each item so a stanza that arrives in the same read as the
+        // auth that permits it is still accepted (H6).
+        reader.setMaxItemBytes(if (session.stream.isEstablished())
+            xml.max_item_bytes_authenticated
+        else
+            xml.max_item_bytes_pre_auth);
         const event = reader.next(data, &pos) catch |err| {
             log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
             closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
@@ -1114,9 +1118,6 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 session.setServedHost(to);
             }
             const action = session.stream.handleStreamOpen(from, to, version);
-            if (session.stream.isEstablished()) {
-                reader.setMaxItemBytes(xml.scanner.default_max_item_bytes);
-            }
             executeAction(daemon, session, action, batch);
 
             // After post-TLS stream open, perform DANE verification on peer cert
@@ -1138,6 +1139,9 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // If accumulating a stanza, serialize child elements into inner buffer
             if (session.stanza_active) {
                 session.accumulateElement(elem, reader);
+                // The stanza can no longer be forwarded whole. Keep parsing is
+                // pure cost: close now rather than at the end of the item.
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
 
@@ -1229,6 +1233,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             if (session.stanza_active) {
                 if (reader.depth > 1) {
                     session.accumulateClose(name);
+                    if (session.stanzaBroken()) closeBrokenStanza(daemon, batch, session);
                 } else {
                     dispatchInboundStanza(daemon, session, batch);
                 }
@@ -1247,6 +1252,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // Stanza content accumulation
             if (session.stanza_active) {
                 session.accumulateText(text_content);
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
             // Capture db:result key text (dialback key submission)
@@ -1636,9 +1642,6 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     if (accepted) {
         session.inbound_dialback.setValid();
         session.stream.setAuthenticated();
-        if (daemon.readers[inbound_slot]) |reader| {
-            reader.setMaxItemBytes(xml.scanner.default_max_item_bytes);
-        }
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
         session.inbound_dialback.setInvalid();
@@ -1766,6 +1769,16 @@ fn closeInboundWithStreamError(daemon: *S2sDaemon, batch: *ChangeList, slot: usi
     sendStreamError(session, err);
     _ = session.flushWrite() catch {};
     daemon.closeInbound(batch, slot);
+}
+
+/// Drop a stanza that overflowed the accumulator and fail the stream.
+/// A peer whose stanza we cannot relay is not a peer we can serve, and
+/// staying open would let it keep sending bytes we must parse and discard.
+fn closeBrokenStanza(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+    const slot = session.id;
+    log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
+    session.resetStanza();
+    closeInboundWithStreamError(daemon, batch, slot, .policy_violation);
 }
 
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
@@ -1919,6 +1932,12 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     var pos: usize = 0;
 
     while (true) {
+        // Pre-auth cap until the stream is established, then the federation
+        // cap; derived per item so an auth completed mid-read applies at once.
+        reader.setMaxItemBytes(if (conn.isEstablished())
+            xml.max_item_bytes_authenticated
+        else
+            xml.max_item_bytes_pre_auth);
         const event = reader.next(data, &pos) catch {
             conn.fail("xml-parse-error");
             daemon.closeOutbound(batch, slot);
@@ -2599,7 +2618,7 @@ fn attachInboundSocketpairForTest(daemon: *S2sDaemon, slot: usize) !posix.fd_t {
     daemon_owns_fd = true;
     const reader = try daemon.allocator.create(XmlReader);
     reader.* = XmlReader.init(daemon.allocator);
-    reader.setMaxItemBytes(PRE_AUTH_ITEM_MAX_BYTES);
+    reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
     daemon.readers[slot] = reader;
     return fds[1];
 }
@@ -2648,7 +2667,6 @@ test "S2sDaemon: E6 an over-long token maps to policy-violation at the call site
     const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
     try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
     daemon.getInbound(0).?.stream.setAuthenticated();
-    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
 
     const payload = try alloc.alloc(u8, xml.scanner.max_token_bytes + 2);
     defer alloc.free(payload);
@@ -2742,7 +2760,6 @@ test "S2sDaemon: G4 an oversized accumulated stanza is rejected whole" {
     const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
     try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
     daemon.getInbound(0).?.stream.setAuthenticated();
-    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
 
     const prefix = "<message from='b.example' to='alice@a.example'><body>";
     const suffix = "</body></message>";
@@ -2783,7 +2800,6 @@ test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
     try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
     daemon.getInbound(0).?.stream.setAuthenticated();
     try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
-    daemon.readers[0].?.setMaxItemBytes(xml.scanner.default_max_item_bytes);
 
     const prefix = "<message from='b.example' to='alice@a.example'><body>";
     const suffix = "</body></message>";

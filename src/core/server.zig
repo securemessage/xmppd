@@ -438,9 +438,13 @@ pub const Session = struct {
     bind_kick_resource_len: u8 = 0,
 
     pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
+        var reader = xml.Reader.init(allocator);
+        // Pre-auth cap: negotiation elements are small, and an unauthenticated
+        // peer must not be able to spend the post-auth budget (H6).
+        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         return .{
             .conn = Connection.init(fd, id),
-            .reader = xml.Reader.init(allocator),
+            .reader = reader,
             .stream = xmpp.Stream.init(server_host, direct_tls),
         };
     }
@@ -1651,6 +1655,13 @@ pub const Server = struct {
             var pos: usize = 0;
 
             while (true) {
+                // The item cap follows authentication: pre-auth elements are
+                // negotiation only, and an authenticated client gets a cap no
+                // larger than a stanza can be delivered through (H6).
+                session.reader.setMaxItemBytes(if (session.stream.isAuthenticated())
+                    xml.max_item_bytes_authenticated
+                else
+                    xml.max_item_bytes_pre_auth);
                 const event = session.reader.next(data, &pos) catch |err| {
                     // Client-side protocol violation, not a server fault.
                     log.warn("connection {d} XML parse error: {}", .{ id, err });
@@ -5581,6 +5592,111 @@ test "Server: read backpressure toggles EVFILT_READ across write-buffer threshol
         if (ev.ident == session.conn.fd and ev.filter == std.c.EVFILT.READ and (ev.flags & std.c.EV.ENABLE) != 0) saw_enable = true;
     }
     try std.testing.expect(saw_enable);
+}
+
+test "H6: the c2s reader cap follows authentication" {
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer {
+        session.deinit();
+        allocator.destroy(session);
+    }
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+
+    // Before auth the reader holds the pre-auth budget, not the 1 MiB default.
+    try std.testing.expectEqual(xml.max_item_bytes_pre_auth, session.reader.scan.max_item_bytes);
+    try std.testing.expectEqual(
+        xml.memoryBudgetFor(xml.max_item_bytes_pre_auth),
+        session.reader.max_item_memory,
+    );
+    try std.testing.expect(session.reader.scan.max_item_bytes < xml.default_max_item_bytes);
+}
+
+test "H6: an oversized pre-auth element is a policy violation, not a silent drop" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // One element larger than the pre-auth cap. It is never authenticated, so
+    // the pre-auth cap applies and the stream is failed closed with a
+    // policy-violation rather than buffered. Feeds one read event's worth at a
+    // time, as the loop does in production.
+    _ = try posix.write(fds[1], "<presence><show>");
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'A');
+    var fed: usize = 0;
+    while (fed <= xml.max_item_bytes_pre_auth and server.sessions[1] != null) : (fed += big.len) {
+        _ = try posix.write(fds[1], &big);
+        server.handleReadable(1, &changes);
+    }
+
+    try std.testing.expect(server.sessions[1] == null);
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "policy-violation") != null);
+}
+
+test "H6: a stanza the accumulator can deliver is accepted after auth" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    // Authenticated, so the post-auth cap applies.
+    session.stream.authenticated = true;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // A body that fills most of the 16 KiB stanza accumulator: legal today, so
+    // the authenticated cap must not reject it (the cap is a memory bound, not
+    // a new stanza limit).
+    const body_len = 15000;
+    var msg: [body_len + 64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&msg);
+    const w = fbs.writer();
+    try w.writeAll("<message to='localhost' type='chat'><body>");
+    @memset(msg[fbs.pos..][0..body_len], 'A');
+    fbs.pos += body_len;
+    try w.writeAll("</body></message>");
+    _ = try posix.write(fds[1], fbs.getWritten());
+    server.handleReadable(1, &changes);
+
+    try std.testing.expect(server.sessions[1] != null);
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "policy-violation") == null);
+
+    // The loop must have raised the cap once the stream was authenticated;
+    // otherwise the session still runs on the pre-auth budget.
+    try std.testing.expectEqual(
+        xml.max_item_bytes_authenticated,
+        session.reader.scan.max_item_bytes,
+    );
 }
 
 test "Server: stream open produces response" {

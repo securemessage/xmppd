@@ -161,6 +161,15 @@ pub const Scanner = struct {
         self.max_item_bytes = max_bytes;
     }
 
+    /// Bytes the scanner holds for the item being parsed: the token arena
+    /// plus the three token buffers.
+    pub fn memoryBytes(self: *const Scanner) usize {
+        return self.token_arena.queryCapacity() +
+            self.buf.capacity +
+            self.val_buf.capacity +
+            self.ent_buf.capacity;
+    }
+
     const ally = struct {
         inline fn get(self: *Scanner) std.mem.Allocator {
             return self.allocator;
