@@ -945,6 +945,10 @@ pub const Resolver = struct {
                 self.handleResponse(job, pkt);
                 return;
             }
+            // A frame that answers no outstanding query on this
+            // connection is foreign: count it like an unmatched UDP
+            // reply, then drop it.
+            self.unmatched_replies += 1;
             consumeTcpFrame(job, frame_len);
         }
     }
@@ -2333,7 +2337,8 @@ test "dns-async: TCP frame length math and consumption (J2)" {
     r.pumpTcpFrames(job);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
 
-    // A complete frame that answers no outstanding query is consumed.
+    // A complete frame that answers no outstanding query is consumed
+    // and counted foreign, like an unmatched UDP reply.
     job.tcp_buf.clearRetainingCapacity();
     std.mem.writeInt(u16, &hdr, 12, .big);
     try job.tcp_buf.appendSlice(std.testing.allocator, &hdr);
@@ -2341,6 +2346,7 @@ test "dns-async: TCP frame length math and consumption (J2)" {
     r.pumpTcpFrames(job);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 0), job.tcp_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r.unmatched_replies);
 }
 
 test "dns-async: a maximal frame ahead of the answer is consumed, not fatal (Q1)" {
