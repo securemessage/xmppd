@@ -149,9 +149,13 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             defer self.allocator.free(key);
 
             var batch = try self.db.writeBatch();
-            errdefer batch.abort();
-            try batch.delete(if (is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, key);
-            try batch.delete(if (is_v2) NS_OFFLINE_V2 else NS_OFFLINE, key);
+            {
+                // Abort only delete failures; commit ends the batch on both
+                // success and failure, so an abort after it is contract misuse.
+                errdefer batch.abort();
+                try batch.delete(if (is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, key);
+                try batch.delete(if (is_v2) NS_OFFLINE_V2 else NS_OFFLINE, key);
+            }
             try batch.commit();
         }
 
@@ -215,10 +219,12 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             std.mem.writeInt(u64, &sequence_bytes, sequence, .big);
 
             var batch = try self.db.writeBatch();
-            errdefer batch.abort();
-            try batch.put(NS_OFFLINE_SEQ, recipient, &sequence_bytes);
-            try batch.put(NS_OFFLINE_V2, key, value);
-            if (stanza_xml) |xml| try batch.put(NS_OFFLINE_HOLD_V2, key, xml);
+            {
+                errdefer batch.abort();
+                try batch.put(NS_OFFLINE_SEQ, recipient, &sequence_bytes);
+                try batch.put(NS_OFFLINE_V2, key, value);
+                if (stanza_xml) |xml| try batch.put(NS_OFFLINE_HOLD_V2, key, xml);
+            }
             try batch.commit();
             return true;
         }
@@ -434,6 +440,46 @@ test "GenericOfflineStore: a failed clearAll commit is not aborted again" {
     try std.testing.expectEqual(@as(usize, 0), db.committed);
     try std.testing.expectEqual(@as(usize, 0), db.aborted);
     try std.testing.expectEqual(@as(usize, 0), db.abort_after_commit);
+}
+
+test "GenericOfflineStore: deletePointer aborts a failed batch and never after commit" {
+    const allocator = std.testing.allocator;
+
+    // An op failure must still end the batch (a leaked txn pins the writer).
+    var db = try FailBatchBackend.open("", .{});
+    var store = GenericOfflineStore(FailBatchBackend).init(&db, allocator);
+    const ptr = OfflinePointer{ .recipient = "bob@us.example", .stanza_id = "msg-1", .timestamp = 1, .from_jid = "alice@us.example/phone", .sequence = 1 };
+    try std.testing.expectError(error.MapFull, store.deletePointer(ptr));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.commit_attempts);
+
+    // A commit failure ends the batch itself; an abort after it would free
+    // memory the backend already released (C4).
+    var commit_db = try FailBatchBackend.open("", .{});
+    commit_db.fail_ops = false;
+    commit_db.fail_commit = true;
+    var commit_store = GenericOfflineStore(FailBatchBackend).init(&commit_db, allocator);
+    try std.testing.expectError(error.MapFull, commit_store.deletePointer(ptr));
+    try std.testing.expectEqual(@as(usize, 1), commit_db.commit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), commit_db.abort_after_commit);
+}
+
+test "GenericOfflineStore: storeHeldPointer aborts a failed batch and never after commit" {
+    const allocator = std.testing.allocator;
+
+    var db = try FailBatchBackend.open("", .{});
+    var store = GenericOfflineStore(FailBatchBackend).init(&db, allocator);
+    try std.testing.expectError(error.MapFull, store.storeHeldPointer("bob@us.example", "alice@us.example/phone", "msg-1", 1, "<message/>"));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.commit_attempts);
+
+    var commit_db = try FailBatchBackend.open("", .{});
+    commit_db.fail_ops = false;
+    commit_db.fail_commit = true;
+    var commit_store = GenericOfflineStore(FailBatchBackend).init(&commit_db, allocator);
+    try std.testing.expectError(error.MapFull, commit_store.storeHeldPointer("bob@us.example", "alice@us.example/phone", "msg-1", 1, "<message/>"));
+    try std.testing.expectEqual(@as(usize, 1), commit_db.commit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), commit_db.abort_after_commit);
 }
 
 test "GenericOfflineStore: store and retrieve pointers" {

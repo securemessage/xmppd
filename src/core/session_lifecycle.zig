@@ -701,8 +701,11 @@ fn repairFirstOfflinePointerForTest(db: *op_backend.Backend) !void {
     @memcpy(value[12 + stanza_id.len ..][0..from_jid.len], from_jid);
 
     var batch = try db.writeBatch();
-    errdefer batch.abort();
-    try batch.put(offline_store_mod.NS_OFFLINE_V2, &key, &value);
+    {
+        // Abort only put failures; commit ends the batch either way (C4).
+        errdefer batch.abort();
+        try batch.put(offline_store_mod.NS_OFFLINE_V2, &key, &value);
+    }
     try batch.commit();
 }
 
