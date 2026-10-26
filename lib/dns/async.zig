@@ -1368,12 +1368,13 @@ pub const Resolver = struct {
             },
             .fallback_addr4 => self.finishFallback(job),
             // Per target: an NXDOMAIN on either address family means
-            // that target is gone, not the whole resolution.
+            // that family is gone; the family that resolved still
+            // emits the target.
             .addr => {
                 job.phase = .addr6;
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
-            .addr6 => self.nextTarget(job) catch return self.dropJob(job, .failed),
+            .addr6 => self.finishTarget(job),
             .tlsa => {
                 // TLSA NXDOMAIN keeps the target, just without DANE.
                 self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
@@ -1839,6 +1840,10 @@ const FakeDns = struct {
     /// failed family must not doom the family that resolved.
     a_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     aaaa_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, A (or AAAA) queries are answered NXDOMAIN with the
+    /// shared authority SOA: the family is absent, not failed.
+    a_nxdomain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    aaaa_nxdomain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, AAAA queries are answered with ::1 so dual-stack
     /// paths have real data.
     a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1940,6 +1945,9 @@ const FakeDns = struct {
         const is_addr_q = q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA;
         const family_fail = (q.qtype == wire.TYPE_A and self.a_fail.load(.monotonic)) or
             (q.qtype == wire.TYPE_AAAA and self.aaaa_fail.load(.monotonic));
+        const family_nx = (q.qtype == wire.TYPE_A and self.a_nxdomain.load(.monotonic)) or
+            (q.qtype == wire.TYPE_AAAA and self.aaaa_nxdomain.load(.monotonic));
+        const nx = self.nxdomain_all.load(.monotonic) or family_nx;
         var named_fail = false;
         if (self.a_servfail_idx.load(.monotonic) != 255 and is_addr_q) {
             var fbuf: [32]u8 = undefined;
@@ -2040,13 +2048,13 @@ const FakeDns = struct {
                 answers.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u16, v))) catch {};
                 appendEncodedName(alloc, &answers, "srv.test");
             }
-        } else if (q.qtype == wire.TYPE_AAAA and self.a_aaaa.load(.monotonic)) {
+        } else if (q.qtype == wire.TYPE_AAAA and self.a_aaaa.load(.monotonic) and !family_nx) {
             ancount = 1;
             appendAnswerHdr(alloc, &answers, wire.TYPE_AAAA, 60, 16);
             var v6: [16]u8 = .{0} ** 16;
             v6[15] = 1;
             answers.appendSlice(alloc, &v6) catch {};
-        } else if (q.qtype == wire.TYPE_A) {
+        } else if (q.qtype == wire.TYPE_A and !family_nx) {
             ancount = 1;
             const ttl: u32 = if (self.a_ttl_highbit.load(.monotonic)) 0x8000_0000 else 60;
             appendAnswerHdr(alloc, &answers, wire.TYPE_A, ttl, 4);
@@ -2075,7 +2083,7 @@ const FakeDns = struct {
             extra.appendSlice(alloc, &.{ 10, 9, 9, 9 }) catch {};
         }
 
-        if (self.nxdomain_all.load(.monotonic) or (ancount == 0 and self.soa_nodata.load(.monotonic))) {
+        if (nx or (ancount == 0 and self.soa_nodata.load(.monotonic))) {
             // Authority SOA: owner ".", mname "." rname ".", five u32
             // fields whose last (minimum) is 120 seconds.
             nscount += 1;
@@ -2086,7 +2094,7 @@ const FakeDns = struct {
                 extra.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToBig(u32, w))) catch {};
             }
         }
-        const flags: u16 = if (self.nxdomain_all.load(.monotonic)) 0x8183 else 0x8180;
+        const flags: u16 = if (nx) 0x8183 else 0x8180;
         std.mem.writeInt(u16, out[0..2], id, .big);
         std.mem.writeInt(u16, out[2..4], flags, .big);
         std.mem.writeInt(u16, out[4..6], 1, .big);
@@ -3399,6 +3407,58 @@ test "dns-async: an A SERVFAIL still yields the AAAA address" {
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
 
     // The failing family goes first here: the A refusal must still
+    // let the AAAA query run and produce the only target.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), res.targets[0].addr.any.family);
+}
+
+test "dns-async: an AAAA NXDOMAIN keeps the resolved A address" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.aaaa_nxdomain.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The A half resolved before the AAAA NXDOMAIN: the target
+    // survives with its IPv4 address instead of being skipped.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[0].addr.any.family);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
+test "dns-async: an A NXDOMAIN still yields the AAAA address" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.a_nxdomain.store(true, .monotonic);
+    srv.a_aaaa.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The absent family goes first here: the A NXDOMAIN must still
     // let the AAAA query run and produce the only target.
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
