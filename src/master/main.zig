@@ -60,6 +60,7 @@ pub fn main() !void {
     var s2s_enabled: bool = true;
     var db_path: []const u8 = "/var/db/xmppd/users.db";
     var config_path: ?[]const u8 = null;
+    var muc_host_cfg: ?[]const u8 = null;
     var run_user: ?[]const u8 = null;
     var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
     var run_dir: []const u8 = "/var/run/xmppd";
@@ -192,6 +193,9 @@ pub fn main() !void {
             if (c.get("s2s", "port")) |v| s2s_port = v;
         }
 
+        // [muc] section (s2s federation to= served-host check)
+        if (c.get("muc", "host")) |v| muc_host_cfg = v;
+
         // [core] section — workers
         if (workers == 0) {
             if (c.get("core", "workers")) |v| {
@@ -212,25 +216,23 @@ pub fn main() !void {
     }
     defer if (cfg) |*c| c.deinit();
 
-    // Resolve unprivileged user for child processes
-    var child_uid: posix.uid_t = 0;
-    var child_gid: posix.gid_t = 0;
-    if (run_user) |username| {
-        var user_buf: [256]u8 = undefined;
-        if (username.len < user_buf.len) {
-            @memcpy(user_buf[0..username.len], username);
-            user_buf[username.len] = 0;
-            const pw = std.c.getpwnam(@ptrCast(&user_buf));
-            if (pw) |entry| {
-                child_uid = entry.uid;
-                child_gid = entry.gid;
-                log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
-            } else {
-                log.err("user '{s}' not found — children will run as root", .{username});
-            }
-        } else {
-            log.err("user name too long: {s}", .{username});
+    // Resolve the unprivileged user for child processes. A root master
+    // without a run user would start every child as root, and a run user
+    // that resolves to uid 0 does not drop privileges: refuse both.
+    const euid = posix.geteuid();
+    const ids = decideRunUser(run_user, euid) catch |err| {
+        switch (err) {
+            error.RunUserRequired => log.err("running as root requires a run user; refusing to start", .{}),
+            error.RunUserIsRoot => log.err("run user '{s}' resolves to root; refusing to start", .{run_user orelse ""}),
+            error.RunUserNotFound => log.err("user '{s}' not found: refusing to start; children must not run as root", .{run_user orelse ""}),
+            error.RunUserTooLong => log.err("user name too long: {s}", .{run_user orelse ""}),
         }
+        return err;
+    };
+    const child_uid = ids.uid;
+    const child_gid = ids.gid;
+    if (run_user) |username| {
+        log.info("child processes will run as {s} (uid={d} gid={d})", .{ username, child_uid, child_gid });
     }
 
     // --- Daemonize if requested ---
@@ -300,13 +302,19 @@ pub fn main() !void {
     }
 
     // --- Orphan child cleanup ---
-    // Kill any stale children from a previous master that died ungracefully
+    // Kill any stale children from a previous master that died ungracefully.
+    // The exe basename ride-along keeps us from ever SIGKILLing a pid that
+    // was recycled by an unrelated process (T259).
     {
         var orphan_buf: [4096]u8 = undefined;
-        const orphan_names = [_][]const u8{ "auth.pid", "s2s.pid", "core.pid" };
-        for (orphan_names) |name| {
-            const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, name }) catch continue;
-            cleanupOrphan(p);
+        const orphan_spec = [_]struct { file: []const u8, exe: []const u8 }{
+            .{ .file = "auth.pid", .exe = "xmppd-auth" },
+            .{ .file = "s2s.pid", .exe = "xmppd-s2s" },
+            .{ .file = "core.pid", .exe = "xmppd-core" },
+        };
+        for (orphan_spec) |spec| {
+            const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, spec.file }) catch continue;
+            cleanupOrphan(p, spec.exe);
         }
     }
 
@@ -337,8 +345,10 @@ pub fn main() !void {
     log.info("worker threads: {d}", .{workers});
 
     // --- Bind privileged ports while still root ---
-    // Create N C2S sockets with SO_REUSEPORT (one per worker thread).
-    // Fds survive fork+exec (no CLOEXEC) — children use --listen-fd 5,6,7,...
+    // Create N C2S sockets with SO_REUSEPORT (one per worker thread), and
+    // the S2S listener. Children receive them remapped to fds 3.. on exec
+    // (Supervisor.applyFdPass, T356/S7): the --listen-fd list is therefore
+    // always the deterministic 3,4,...,3+N-1.
     const MAX_WORKERS = 64;
     var c2s_listen_fds: [MAX_WORKERS]posix.fd_t = .{-1} ** MAX_WORKERS;
     var c2s_fd_count: u16 = 0;
@@ -371,7 +381,7 @@ pub fn main() !void {
     }
     defer if (s2s_listen_fd >= 0) posix.close(s2s_listen_fd);
 
-    // Format fd numbers as comma-separated string for --listen-fd arg
+    // Deterministic fd list: applyFdPass remaps the sockets to 3,4,5,...
     var c2s_fd_str_buf: [256]u8 = undefined;
     var c2s_fd_str_len: usize = 0;
     {
@@ -381,13 +391,12 @@ pub fn main() !void {
                 c2s_fd_str_buf[c2s_fd_str_len] = ',';
                 c2s_fd_str_len += 1;
             }
-            const written = std.fmt.bufPrint(c2s_fd_str_buf[c2s_fd_str_len..], "{d}", .{c2s_listen_fds[i]}) catch break;
+            const written = std.fmt.bufPrint(c2s_fd_str_buf[c2s_fd_str_len..], "{d}", .{3 + i}) catch break;
             c2s_fd_str_len += written.len;
         }
     }
     const c2s_fd_str = c2s_fd_str_buf[0..c2s_fd_str_len];
-    var s2s_fd_str_buf: [12]u8 = undefined;
-    const s2s_fd_str = std.fmt.bufPrint(&s2s_fd_str_buf, "{d}", .{s2s_listen_fd}) catch "4";
+    const s2s_fd_str = "3"; // the single remapped s2s listener slot
 
     // Build child argv: pass --config, --db, --socket to auth, s2s, and core children
     var auth_args_buf: [6][]const u8 = undefined;
@@ -398,20 +407,19 @@ pub fn main() !void {
         auth_args_buf[auth_argc] = cp;
         auth_argc += 1;
     }
-    // Only pass --db to auth backends that need it (not OIDC)
-    const is_oidc_auth = std.mem.indexOf(u8, auth_path, "oidc") != null;
-    if (!is_oidc_auth) {
-        auth_args_buf[auth_argc] = "--db";
-        auth_argc += 1;
-        auth_args_buf[auth_argc] = db_path;
-        auth_argc += 1;
-    }
+    // All auth backends get --db: xmppd-auth uses it for credentials AND
+    // locks; xmppd-auth-oidc reads only the shared lock table (S3:
+    // without it the OIDC daemon opened a fresh store and found nothing).
+    auth_args_buf[auth_argc] = "--db";
+    auth_argc += 1;
+    auth_args_buf[auth_argc] = db_path;
+    auth_argc += 1;
     auth_args_buf[auth_argc] = "--socket";
     auth_argc += 1;
     auth_args_buf[auth_argc] = auth_socket;
     auth_argc += 1;
 
-    var s2s_args_buf: [14][]const u8 = undefined;
+    var s2s_args_buf: [16][]const u8 = undefined;
     var s2s_argc: usize = 0;
     if (config_path) |cp| {
         s2s_args_buf[s2s_argc] = "--config";
@@ -430,6 +438,14 @@ pub fn main() !void {
     s2s_args_buf[s2s_argc] = "--core-socket";
     s2s_argc += 1;
     s2s_args_buf[s2s_argc] = s2s_socket;
+    s2s_argc += 1;
+    // Served MUC host for the s2s to= check; defaults to conference.<host>.
+    var muc_host_buf: [512]u8 = undefined;
+    const muc_host: []const u8 = muc_host_cfg orelse
+        (std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch "conference");
+    s2s_args_buf[s2s_argc] = "--muc-host";
+    s2s_argc += 1;
+    s2s_args_buf[s2s_argc] = muc_host;
     s2s_argc += 1;
     if (cert_path) |cp| {
         s2s_args_buf[s2s_argc] = "--cert";
@@ -486,18 +502,19 @@ pub fn main() !void {
     }
 
     // Initialize supervisors for all children
-    var auth_sup = if (child_uid != 0)
-        Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid)
-    else
-        Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
-    var s2s_sup = if (child_uid != 0)
-        Supervisor.initWithUser(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid)
-    else
-        Supervisor.init(s2s_path, s2s_args_buf[0..s2s_argc]);
-    var core_sup = if (child_uid != 0)
-        Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
-    else
-        Supervisor.init(core_path, core_args_buf[0..core_argc]);
+    var auth_sup = try initSupervisor(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid, euid);
+    var s2s_sup = try initSupervisor(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid, euid);
+    var core_sup = try initSupervisor(core_path, core_args_buf[0..core_argc], child_uid, child_gid, euid);
+
+    // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
+    // listener, auth nothing; everything else in the master's table closes.
+    core_sup.pass_fds = c2s_listen_fds[0..c2s_fd_count];
+    // Hoisted: pass_fds points at it at spawn AND every respawn (S7).
+    var s2s_pass_fds: [1]posix.fd_t = undefined;
+    if (s2s_listen_fd >= 0) {
+        s2s_pass_fds[0] = s2s_listen_fd;
+        s2s_sup.pass_fds = s2s_pass_fds[0..1];
+    }
 
     log.info("config: auth_socket={s} s2s={any} s2s_socket={s} db={s} cert={s} key={s}", .{
         auth_socket,
@@ -518,9 +535,10 @@ pub fn main() !void {
     try loop.addSignal(posix.SIG.HUP);
 
     // Spawn xmppd-auth first (must be ready before core connects)
+    var pid_path_buf: [4096]u8 = undefined;
     const auth_pid = try auth_sup.spawnChild();
     try loop.addProcess(auth_pid);
-    writeChildPid("/var/run/xmppd/auth.pid", auth_pid);
+    writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"), auth_pid, "xmppd-auth");
     log.info("auth daemon started, waiting for socket", .{});
 
     // Brief delay for auth daemon to bind its socket
@@ -530,7 +548,7 @@ pub fn main() !void {
     if (s2s_enabled) {
         const s2s_pid = try s2s_sup.spawnChild();
         try loop.addProcess(s2s_pid);
-        writeChildPid("/var/run/xmppd/s2s.pid", s2s_pid);
+        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), s2s_pid, "xmppd-s2s");
         log.info("s2s daemon started, waiting for socket", .{});
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
@@ -538,7 +556,7 @@ pub fn main() !void {
     // Spawn xmppd-core
     const core_pid = try core_sup.spawnChild();
     try loop.addProcess(core_pid);
-    writeChildPid("/var/run/xmppd/core.pid", core_pid);
+    writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"), core_pid, "xmppd-core");
 
     // Timer idents for restart backoff
     const AUTH_UDATA: usize = 1;
@@ -593,6 +611,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"), new_pid, "xmppd-auth");
                     } else if (t.ident == CORE_UDATA) {
                         const new_pid = core_sup.spawnChild() catch |err| {
                             log.err("failed to respawn core: {}", .{err});
@@ -600,6 +619,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"), new_pid, "xmppd-core");
                     } else if (t.ident == S2S_UDATA) {
                         const new_pid = s2s_sup.spawnChild() catch |err| {
                             log.err("failed to respawn s2s: {}", .{err});
@@ -607,6 +627,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
+                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), new_pid, "xmppd-s2s");
                     }
                 },
                 .signal => |s| {
@@ -632,20 +653,111 @@ pub fn main() !void {
     }
 
     // Clean up child PID files on graceful shutdown
-    removeChildPid("/var/run/xmppd/auth.pid");
-    removeChildPid("/var/run/xmppd/s2s.pid");
-    removeChildPid("/var/run/xmppd/core.pid");
+    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"));
+    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"));
+    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"));
 
     log.info("xmppd master shutdown complete", .{});
 }
 
-/// Write a child PID to a file for orphan detection on restart.
-fn writeChildPid(path: []const u8, pid: posix.pid_t) void {
-    const file = std.fs.cwd().createFile(path, .{}) catch return;
+/// Build a supervisor for one child. A root process without a run user is
+/// refused by the Supervisor itself; log that refusal at err here so a
+/// disagreement between decideRunUser and the Supervisor is not silent.
+fn initSupervisor(
+    exe_path: []const u8,
+    args: []const []const u8,
+    uid: posix.uid_t,
+    gid: posix.gid_t,
+    euid: posix.uid_t,
+) !Supervisor {
+    if (uid != 0) {
+        return Supervisor.initWithUser(exe_path, args, uid, gid, euid) catch |err| {
+            if (err == error.RunUserRequired) {
+                log.err("running as root requires a run user; refusing to start", .{});
+            }
+            return err;
+        };
+    }
+    return Supervisor.init(exe_path, args, euid) catch |err| {
+        if (err == error.RunUserRequired) {
+            log.err("running as root requires a run user; refusing to start", .{});
+        }
+        return err;
+    };
+}
+
+/// The uid and gid a child runs as.
+const RunUserIds = struct { uid: posix.uid_t, gid: posix.gid_t };
+
+/// Passwd lookup used by decideRunUser; injectable for tests.
+const RunUserLookup = *const fn ([]const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds);
+
+/// Resolve the run user's uid and gid. A missing user or an unusable name
+/// is a startup failure: falling back to uid 0 would run the children as
+/// root (C5). Logging belongs to the caller.
+fn resolveRunUser(username: []const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    var user_buf: [256]u8 = undefined;
+    if (username.len >= user_buf.len) return error.RunUserTooLong;
+    @memcpy(user_buf[0..username.len], username);
+    user_buf[username.len] = 0;
+    const pw = std.c.getpwnam(@ptrCast(&user_buf)) orelse return error.RunUserNotFound;
+    return .{ .uid = pw.uid, .gid = pw.gid };
+}
+
+/// Decide the uid/gid child processes run as. A master started as root
+/// must name an unprivileged run user; a run user that resolves to uid 0
+/// does not drop privileges and is refused. Without root and without a
+/// run user the children inherit the master's identity (0/0 means
+/// "inherit" at the supervisor call sites).
+fn decideRunUser(username: ?[]const u8, euid: posix.uid_t) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    return decideRunUserWith(username, euid, &resolveRunUser);
+}
+
+/// The decision with an injectable lookup: the refusal compares the
+/// resolved uid, so any name that resolves to uid 0 is refused.
+fn decideRunUserWith(username: ?[]const u8, euid: posix.uid_t, lookup: RunUserLookup) (error{ RunUserRequired, RunUserIsRoot, RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    const name = username orelse {
+        if (euid == 0) return error.RunUserRequired;
+        return .{ .uid = 0, .gid = 0 };
+    };
+    const ids = try lookup(name);
+    if (ids.uid == 0) return error.RunUserIsRoot;
+    return ids;
+}
+
+/// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
+/// (T259: nothing under /var/run/xmppd is hardcoded anymore).
+fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
+    if (run_dir.len + 1 + file.len > buf.len) return error.PathTooLong;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ run_dir, file }) catch unreachable;
+}
+
+/// The child's kernel-reported start time in seconds, or null when the pid
+/// has no kinfo. writeChildPid records 0 for null; a stored 0 never matches
+/// a live process's ki_start, so the orphan-kill identity check spares it.
+fn childStartSec(pid: posix.pid_t) ?i64 {
+    var kp: KinfoProc = undefined;
+    if (!lookupKinfoProc(pid, &kp)) return null;
+    return kp.ki_start.tv_sec;
+}
+
+/// Write a child PID file for orphan detection on restart. Contents: a
+/// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
+/// kinfo_proc. (T259: run_dir-scoped, failures are logged.)
+fn writeChildPid(path: []const u8, pid: posix.pid_t, base: []const u8) void {
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        log.err("writeChildPid {s}: {}", .{ path, err });
+        return;
+    };
     defer file.close();
-    var buf: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}\n", .{pid}) catch return;
-    file.writeAll(s) catch {};
+    const start_opt = childStartSec(pid);
+    if (start_opt == null) {
+        log.warn("writeChildPid {s}: no kinfo for pid {d}; recording start 0", .{ path, pid });
+    }
+    const start_sec = start_opt orelse 0;
+    var buf: [80]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d} {d} {s}\n", .{ pid, start_sec, base }) catch return;
+    file.writeAll(s) catch |err| log.err("writeChildPid write {s}: {}", .{ path, err });
 }
 
 /// Remove a child PID file (called during clean shutdown).
@@ -653,36 +765,109 @@ fn removeChildPid(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
+/// FreeBSD kinfo_proc slice for the orphan sanity check (T259).
+/// Layout probed from /usr/include/sys/user.h on 15.1 amd64: ppid at 76,
+/// start at 336, comm at 447, sizeof 1088. Returned by the
+/// { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid } sysctl.
+/// Absent from zig's std.c for this version, so declare it.
+extern "c" fn sysctl(mib: [*c]const c_int, miblen: c_uint, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+const KinfoProc = extern struct {
+    _pad0: [76]u8,
+    ki_ppid: c_int,
+    _pad1: [256]u8,
+    ki_start: extern struct { tv_sec: c_long, tv_usec: c_long },
+    _pad2: [95]u8,
+    ki_comm: [20]u8,
+    _pad3: [621]u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(KinfoProc) == 1088);
+    std.debug.assert(@offsetOf(KinfoProc, "ki_ppid") == 76);
+    std.debug.assert(@offsetOf(KinfoProc, "ki_start") == 336);
+    std.debug.assert(@offsetOf(KinfoProc, "ki_comm") == 447);
+}
+
+/// Live-process identity via kern.proc.pid.X (T259). Handles the
+/// `/usr/include/sys/user.h` ABI directly rather than kern.proc.pathname:
+/// PATHNAME returns ENOENT once a pkg upgrade has replaced the binary,
+/// while ki_comm survives. ki_start distinguishes pid recycling.
+fn lookupKinfoProc(pid: posix.pid_t, out: *KinfoProc) bool {
+    // { CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1, pid }
+    const mib = [_]c_int{ 1, 14, 1, pid };
+    var len: usize = @sizeOf(KinfoProc);
+    if (sysctl(&mib, mib.len, @ptrCast(out), &len, null, 0) != 0) return false;
+    if (len < @offsetOf(KinfoProc, "ki_comm") + 20) return false;
+    return true;
+}
+
+/// True when pid currently runs a binary whose comm starts with
+/// expected_basename AND was started at expected_start_sec (epoch).
+/// An orphan passes a further constraint handled in cleanupOrphan: the
+/// process must have been reparented to init (ppid==1).
+fn procMatchesIdentity(pid: posix.pid_t, expected_basename: []const u8, expected_start_sec: i64) bool {
+    var kp: KinfoProc = undefined;
+    if (!lookupKinfoProc(pid, &kp)) return false;
+    if (kp.ki_start.tv_sec != expected_start_sec) return false;
+    const comm = std.mem.sliceTo(&kp.ki_comm, 0);
+    return std.mem.startsWith(u8, comm, expected_basename);
+}
+
+/// Identity triple-check for the orphan-kill: matches comm+start AND the
+/// process is a child of init (ppid==1, orphans get reparented there).
+fn procIsOrphanMatch(pid: posix.pid_t, expected_basename: []const u8, expected_start_sec: i64) bool {
+    if (!procMatchesIdentity(pid, expected_basename, expected_start_sec)) return false;
+    var kp: KinfoProc = undefined;
+    if (!lookupKinfoProc(pid, &kp)) return false;
+    return kp.ki_ppid == 1;
+}
+
 /// Check for an orphaned child process from a previous master instance.
-/// If the PID file exists and the process is still alive, terminate it.
-fn cleanupOrphan(path: []const u8) void {
+/// PID files now live under run_dir and hold "PID START_SEC BASE". Kill
+/// only when the live process still matches comm + start time + ppid==1,
+/// so a recycled pid or a pkg-upgraded binary can never take a stray
+/// SIGKILL (T259). identity is re-verified before SIGKILL too.
+fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
     const file = std.fs.cwd().openFile(path, .{}) catch return;
     defer file.close();
 
-    var buf: [20]u8 = undefined;
+    var buf: [80]u8 = undefined;
     const n = posix.read(file.handle, &buf) catch return;
     if (n == 0) return;
 
     const trimmed = std.mem.trimRight(u8, buf[0..n], "\n \t\r");
-    const pid = std.fmt.parseInt(posix.pid_t, trimmed, 10) catch return;
+    var parts = std.mem.tokenizeScalar(u8, trimmed, ' ');
+    const pid = std.fmt.parseInt(posix.pid_t, parts.next() orelse return, 10) catch return;
+    const start_field = parts.next() orelse "0"; // old one-field files: no start time
+    const pid_start = std.fmt.parseInt(i64, start_field, 10) catch 0;
     if (pid <= 1) return;
 
-    // Check if process exists
-    const ret = std.c.kill(pid, 0);
-    if (ret != 0) {
-        // Process doesn't exist — clean up stale PID file
+    const alive = std.c.kill(pid, 0) == 0;
+    if (!alive) {
         std.fs.cwd().deleteFile(path) catch {};
         return;
     }
 
-    // Process exists — send SIGTERM, wait briefly, then SIGKILL
+    // Old-format one-line pid files have no start time: there is no safe
+    // tie-break against a recycled pid, so clean up the file and move on.
+    if (pid_start == 0) {
+        log.warn("pid file {s} has no start time; orphan guessing stoppers here, NOT killing pid={d}", .{ path, pid });
+        std.fs.cwd().deleteFile(path) catch {};
+        return;
+    }
+    if (!procIsOrphanMatch(pid, expected_basename, pid_start)) {
+        log.warn("pid file {s} references pid={d} that is not our child: NOT killing it", .{ path, pid });
+        std.fs.cwd().deleteFile(path) catch {};
+        return;
+    }
+
     log.warn("killing orphaned child pid={d} from {s}", .{ pid, path });
     _ = std.c.kill(pid, posix.SIG.TERM);
     std.Thread.sleep(2 * std.time.ns_per_s);
 
-    // Check again
-    const ret2 = std.c.kill(pid, 0);
-    if (ret2 == 0) {
+    // Re-verify before the kill escalation: a fresh process on the same
+    // pid number between SIGTERM and SIGKILL must not eat it.
+    if (std.c.kill(pid, 0) == 0 and procIsOrphanMatch(pid, expected_basename, pid_start)) {
         log.warn("orphan pid={d} did not exit, sending SIGKILL", .{pid});
         _ = std.c.kill(pid, posix.SIG.KILL);
         std.Thread.sleep(100 * std.time.ns_per_ms);
@@ -737,9 +922,12 @@ fn printVersion() void {
 /// it preserves historic POSIX behavior and delivers all to one socket.
 /// SO_REUSEPORT_LB was introduced in FreeBSD 12.0 specifically for this purpose.
 fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
+    // CLOEXEC on every master-bound listener (S7): only children
+    // explicitly granted a fd (via applyFdPass mapping them onto 3..N)
+    // may hold them; anything spawn elsewhere after fork never inherits.
     const fd = try posix.socket(
         posix.AF.INET,
-        posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
+        posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
         0,
     );
     errdefer posix.close(fd);
@@ -795,4 +983,120 @@ fn detectCpuCount() u16 {
         return @intCast(@min(ncpu, 64));
     }
     return 1;
+}
+
+test "lookupKinfoProc/procMatchesIdentity: live process facts for self; identity mismatch rejected (T259)" {
+    const self_pid = std.c.getpid();
+    var kp: KinfoProc = undefined;
+    try std.testing.expect(lookupKinfoProc(self_pid, &kp));
+
+    // comm of this test binary is "master-tests".
+    const comm = std.mem.sliceTo(&kp.ki_comm, 0);
+    try std.testing.expectEqualStrings("master-tests", comm);
+    try std.testing.expect(procMatchesIdentity(self_pid, "master-tests", kp.ki_start.tv_sec));
+    try std.testing.expect(!procMatchesIdentity(self_pid, "xmppd-core", kp.ki_start.tv_sec));
+    try std.testing.expect(!procMatchesIdentity(self_pid, "master-tests", kp.ki_start.tv_sec + 1));
+    // A pid surely not ours must not match at all.
+    try std.testing.expect(!procMatchesIdentity(1, "xmppd-core", kp.ki_start.tv_sec));
+}
+
+fn lookupKinfoProcChecked(pid: posix.pid_t) bool {
+    var kp: KinfoProc = undefined;
+    return lookupKinfoProc(pid, &kp);
+}
+
+test "lookupKinfoProc returns false for a pid that does not exist" {
+    try std.testing.expect(!lookupKinfoProcChecked(-1));
+}
+
+test "childStartSec: live pid has a start time; a dead pid returns null (T259)" {
+    // writeChildPid must not silently store start 0 for a pid it cannot
+    // look up; the null return is what makes the warn path reachable.
+    try std.testing.expect(childStartSec(std.c.getpid()) != null);
+    try std.testing.expect(childStartSec(-1) == null);
+}
+
+test "pidFilePath builds run_dir-relative path" {
+    var buf: [4096]u8 = undefined;
+    const p = try pidFilePath(&buf, "/var/run/xmppd", "auth.pid");
+    try std.testing.expectEqualStrings("/var/run/xmppd/auth.pid", p);
+}
+
+test "resolveRunUser: a missing user is a startup failure, not a root fallback (C5)" {
+    try std.testing.expectError(error.RunUserNotFound, resolveRunUser("xmppd-no-such-user"));
+    var too_long: [256]u8 = @splat('x');
+    try std.testing.expectError(error.RunUserTooLong, resolveRunUser(&too_long));
+}
+
+test "resolveRunUser: a configured user resolves to its passwd entry (C5)" {
+    const ids = try resolveRunUser("root");
+    try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
+    try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
+}
+
+test "initSupervisor logs a root refusal at err" {
+    const fds = try posix.pipe();
+    const pid = try posix.fork();
+    if (pid == 0) {
+        _ = posix.close(fds[0]);
+        posix.dup2(fds[1], 2) catch std.c._exit(125);
+        _ = posix.close(fds[1]);
+        const result = initSupervisor("/unused", &.{}, 0, 0, 0);
+        std.c._exit(if (result) |_| 1 else |err| if (err == error.RunUserRequired) 0 else 2);
+    }
+    _ = posix.close(fds[1]);
+    var buf: [512]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    _ = posix.close(fds[0]);
+    const res = posix.waitpid(pid, 0);
+    try std.testing.expect(posix.W.IFEXITED(res.status));
+    try std.testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(res.status));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        buf[0..n],
+        "(err): running as root requires a run user; refusing to start",
+    ) != null);
+}
+
+test "decideRunUser: root without a run user is refused" {
+    try std.testing.expectError(error.RunUserRequired, decideRunUser(null, 0));
+}
+
+test "decideRunUser: a run user that resolves to root is refused" {
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUser("root", 0));
+}
+
+test "decideRunUser: non-root without a run user inherits" {
+    const ids = try decideRunUser(null, @as(posix.uid_t, 1001));
+    try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
+    try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
+}
+
+test "decideRunUser: an unprivileged run user resolves to its passwd entry" {
+    const expected = try resolveRunUser("nobody");
+    const ids = try decideRunUser("nobody", 0);
+    try std.testing.expectEqual(expected.uid, ids.uid);
+    try std.testing.expectEqual(expected.gid, ids.gid);
+    try std.testing.expect(ids.uid != 0);
+}
+
+/// Any non-empty name resolves to uid 0, like the conventional toor alias.
+fn lookupUidZero(name: []const u8) (error{ RunUserNotFound, RunUserTooLong }!RunUserIds) {
+    if (name.len == 0) return error.RunUserNotFound;
+    return .{ .uid = 0, .gid = 0 };
+}
+
+test "decideRunUser: a uid-0 alias is refused by uid, not by name" {
+    // A name comparison against "root" would admit any alias that resolves
+    // to uid 0. The stub keeps the test independent of the host passwd
+    // database.
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUserWith("toor", 0, &lookupUidZero));
+    try std.testing.expectError(error.RunUserIsRoot, decideRunUserWith("alias", 0, &lookupUidZero));
+
+    // The real lookup agrees when the host carries the conventional toor
+    // alias; hosts without it skip this half.
+    const ids = resolveRunUser("toor") catch return;
+    if (ids.uid == 0) {
+        try std.testing.expectError(error.RunUserIsRoot, decideRunUser("toor", 0));
+    }
 }

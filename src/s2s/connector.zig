@@ -59,6 +59,54 @@ pub const DaneStatus = enum {
     pending,
 };
 
+/// Maximum concurrent dialback callbacks on one outbound connection.
+pub const MAX_PENDING_VERIFY = 8;
+
+/// One pending dialback verification exchange on an outbound connection:
+/// an inbound session submitted a db:result and we are waiting for the
+/// origin's verdict on our db:verify. Entries are keyed by (stream id,
+/// origin); a verdict only completes the entry whose id, from and to match,
+/// and only while the inbound slot still holds the same session
+/// (generation check) (S2).
+pub const PendingVerify = struct {
+    in_use: bool = false,
+    /// Inbound session slot that submitted the db:result.
+    inbound_slot: usize = 0,
+    /// Slot generation when the callback was registered.
+    inbound_gen: u32 = 0,
+    /// Inbound session stream id (the id= of our db:verify).
+    stream_id_buf: [64]u8 = undefined,
+    stream_id_len: usize = 0,
+    /// Claimed origin (from= of the db:result).
+    origin_buf: [256]u8 = undefined,
+    origin_len: usize = 0,
+    /// Host the db:result was addressed to (local domain or MUC host); our
+    /// db:verify and the final db:result answer speak as this host.
+    target_buf: [256]u8 = undefined,
+    target_len: usize = 0,
+    /// Dialback key to be verified.
+    key_buf: [128]u8 = undefined,
+    key_len: usize = 0,
+    /// db:verify was written to the peer.
+    verify_sent: bool = false,
+
+    pub fn streamId(self: *const PendingVerify) []const u8 {
+        return self.stream_id_buf[0..self.stream_id_len];
+    }
+
+    pub fn origin(self: *const PendingVerify) []const u8 {
+        return self.origin_buf[0..self.origin_len];
+    }
+
+    pub fn target(self: *const PendingVerify) []const u8 {
+        return self.target_buf[0..self.target_len];
+    }
+
+    pub fn key(self: *const PendingVerify) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+};
+
 /// An outbound S2S connection to a remote domain.
 pub const OutboundConnection = struct {
     /// Remote domain we're connecting to.
@@ -88,15 +136,18 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
-    /// If set, this outbound connection is a dialback verification callback.
-    /// The value is the inbound session slot that initiated the callback.
-    /// After db:verify response, the result is sent back on that inbound session.
-    db_callback_inbound_slot: ?usize = null,
-    /// The key and stream ID for the pending db:verify request.
-    db_callback_key_buf: [128]u8 = undefined,
-    db_callback_key_len: usize = 0,
-    db_callback_stream_id_buf: [64]u8 = undefined,
-    db_callback_stream_id_len: usize = 0,
+    /// Pending dialback callbacks awaiting a verdict (S2). One entry
+    /// per (stream id, origin, target): a later db:result for a different
+    /// target must not overwrite another session's callback.
+    db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
+    /// Our own outbound dialback key awaiting its verdict: set when the key
+    /// is written on this connection, cleared by the typed db:result that
+    /// answers it. A verdict can only authenticate this connection while
+    /// that exchange is outstanding.
+    db_assertion_pending: bool = false,
+    /// A SASL <auth/> element was written on this connection. A SASL
+    /// outcome is only meaningful after the peer has seen our auth request.
+    sasl_auth_sent: bool = false,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
@@ -109,6 +160,11 @@ pub const OutboundConnection = struct {
     write_buf: [WRITE_BUF_SIZE]u8 = undefined,
     write_start: usize = 0,
     write_end: usize = 0,
+    /// Length of the pinned TLS write starting at write_start. While > 0,
+    /// flushWrite retries exactly that slice: OpenSSL retains the caller
+    /// buffer across WANT_READ/WANT_WRITE (AGENTS.md identical pointer and
+    /// length rule), so bytes queued after the stall wait behind it (S23).
+    pinned_tls_len: usize = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
@@ -118,9 +174,12 @@ pub const OutboundConnection = struct {
         allocator: std.mem.Allocator,
         local_domain: []const u8,
         remote_domain: []const u8,
-    ) OutboundConnection {
+    ) !OutboundConnection {
+        // Copy the domain: callers hand slices that borrow the IPC recv
+        // buffer; the pool key depends on it being stable (T275).
+        const domain = try allocator.dupe(u8, remote_domain);
         return .{
-            .remote_domain = remote_domain,
+            .remote_domain = domain,
             .local_domain = local_domain,
             .state = .connecting,
             .stream = S2sStream.init(.initiating, local_domain),
@@ -131,9 +190,10 @@ pub const OutboundConnection = struct {
 
     pub fn deinit(self: *OutboundConnection, allocator: std.mem.Allocator) void {
         for (self.pending_stanzas.items) |stanza| {
-            allocator.free(stanza.xml);
+            stanza.deinit(allocator);
         }
         self.pending_stanzas.deinit(allocator);
+        allocator.free(self.remote_domain);
         if (self.target_host.len > 0) {
             allocator.free(self.target_host);
             self.target_host = "";
@@ -257,24 +317,40 @@ pub const OutboundConnection = struct {
 
     /// Flush the write buffer to the socket (TLS-aware).
     /// Returns true if all data was flushed.
+    ///
+    /// When a TLS write stalls, this retries only the pinned prefix; bytes
+    /// queued after the stall are flushed by later calls once the pin
+    /// releases. The TLS record layer never sees a slice that differs from
+    /// the stalled one in pointer or length (S23).
     pub fn flushWrite(self: *OutboundConnection) !bool {
         if (self.write_start >= self.write_end) return true;
 
-        const data = self.write_buf[self.write_start..self.write_end];
+        const flush_end = if (self.pinned_tls_len > 0)
+            self.write_start + self.pinned_tls_len
+        else
+            self.write_end;
+        const data = self.write_buf[self.write_start..flush_end];
 
         if (self.tls_conn) |*tls| {
             const result = tls.write(data) catch return error.ConnectionReset;
             switch (result) {
                 .ok => |n| {
                     self.write_start += n;
+                    self.pinned_tls_len -|= n;
                     if (self.write_start >= self.write_end) {
                         self.write_start = 0;
                         self.write_end = 0;
+                        self.pinned_tls_len = 0;
                         return true;
                     }
                     return false;
                 },
-                .want_read, .want_write => return false,
+                .want_read, .want_write => {
+                    // OpenSSL retains the caller buffer across the retry;
+                    // pin the exact slice and let nothing grow it.
+                    self.pinned_tls_len = data.len;
+                    return false;
+                },
             }
         }
 
@@ -299,12 +375,18 @@ pub const OutboundConnection = struct {
     }
 
     /// Queue a stanza for delivery once the connection is established.
+    /// from/to/xml are all copied: the caller's slices borrow the IPC recv
+    /// buffer whose next frame rewrites them (T275).
     pub fn queueStanza(self: *OutboundConnection, allocator: std.mem.Allocator, from: []const u8, to: []const u8, xml: []const u8) !void {
+        const from_copy = try allocator.dupe(u8, from);
+        errdefer allocator.free(from_copy);
+        const to_copy = try allocator.dupe(u8, to);
+        errdefer allocator.free(to_copy);
         const xml_copy = try allocator.dupe(u8, xml);
         errdefer allocator.free(xml_copy);
         try self.pending_stanzas.append(allocator, .{
-            .from_jid = from,
-            .to_jid = to,
+            .from_jid = from_copy,
+            .to_jid = to_copy,
             .xml = xml_copy,
         });
     }
@@ -317,6 +399,26 @@ pub const OutboundConnection = struct {
     /// Check if the connection has permanently failed.
     pub fn isFailed(self: *const OutboundConnection) bool {
         return self.state == .failed;
+    }
+
+    /// Whether a db:verify may be written on this connection. Only the
+    /// post-TLS auth phase or an established stream may carry the dialback
+    /// key: earlier the key would go out in cleartext.
+    pub fn canSendDbVerify(self: *const OutboundConnection) bool {
+        if (self.tls_conn == null) return false;
+        return self.state == .authenticating or
+            self.state == .established or
+            self.stream.state == .features_auth;
+    }
+
+    /// Whether a SASL <success/> or <failure/> may be accepted now: TLS is
+    /// up, the auth phase is open, and our <auth/> went out. Any other
+    /// outcome means the peer skipped a negotiation step.
+    pub fn canAcceptSaslOutcome(self: *const OutboundConnection) bool {
+        return self.tls_conn != null and
+            self.state == .authenticating and
+            self.stream.state == .authenticating and
+            self.sasl_auth_sent;
     }
 
     /// Transition to the TLS handshake phase after TCP connect completes.
@@ -395,17 +497,135 @@ pub const OutboundConnection = struct {
         return .none;
     }
 
-    /// STARTTLS proceed received — start TLS handshake.
-    pub fn handleStarttlsProceed(self: *OutboundConnection) void {
-        // Flush any pending plaintext writes before upgrading
-        _ = self.flushWrite() catch {};
+    /// STARTTLS proceed received: by the time <proceed/> arrives, all bytes
+    /// through the <starttls/> request are by definition on the wire (the
+    /// peer could not have seen it otherwise; T250). Anything left in
+    /// the local write buffer was queued after <starttls/>; flushing it now
+    /// would push plaintext into the TLS record layer, so fail instead.
+    pub fn handleStarttlsProceed(self: *OutboundConnection) bool {
+        if (self.hasPendingWrite()) {
+            self.fail("plaintext-after-starttls");
+            return false;
+        }
         self.state = .tls_handshake;
+        return true;
     }
 
     /// SASL success received — connection is authenticated.
     pub fn handleAuthSuccess(self: *OutboundConnection) void {
         self.stream.setAuthenticated();
         self.state = .established;
+    }
+
+    /// Register a dialback callback. A repeated db:result for the same
+    /// (stream id, origin, target) replaces that entry; returns null when
+    /// the table is full.
+    pub fn addPendingVerify(
+        self: *OutboundConnection,
+        inbound_slot: usize,
+        inbound_gen: u32,
+        stream_id: []const u8,
+        origin: []const u8,
+        target: []const u8,
+        key: []const u8,
+    ) ?usize {
+        var idx: ?usize = null;
+        for (&self.db_pending, 0..) |*p, i| {
+            if (p.in_use) {
+                if (std.mem.eql(u8, p.streamId(), stream_id) and
+                    std.ascii.eqlIgnoreCase(p.origin(), origin) and
+                    std.ascii.eqlIgnoreCase(p.target(), target))
+                {
+                    idx = i; // same exchange resubmitted: replace it
+                    break;
+                }
+            } else if (idx == null) {
+                idx = i;
+            }
+        }
+        const slot = idx orelse return null;
+        var p = &self.db_pending[slot];
+        p.* = .{
+            .in_use = true,
+            .inbound_slot = inbound_slot,
+            .inbound_gen = inbound_gen,
+        };
+        const sl = @min(stream_id.len, p.stream_id_buf.len);
+        @memcpy(p.stream_id_buf[0..sl], stream_id[0..sl]);
+        p.stream_id_len = sl;
+        const ol = @min(origin.len, p.origin_buf.len);
+        @memcpy(p.origin_buf[0..ol], origin[0..ol]);
+        p.origin_len = ol;
+        const tl = @min(target.len, p.target_buf.len);
+        @memcpy(p.target_buf[0..tl], target[0..tl]);
+        p.target_len = tl;
+        const kl = @min(key.len, p.key_buf.len);
+        @memcpy(p.key_buf[0..kl], key[0..kl]);
+        p.key_len = kl;
+        return slot;
+    }
+
+    /// Find the pending entry a verdict refers to: id must equal the entry's
+    /// stream id, from the claimed origin, to the host the db:result named
+    /// (S2 correlation).
+    pub fn findPendingVerify(
+        self: *const OutboundConnection,
+        id: []const u8,
+        from: []const u8,
+        to: []const u8,
+    ) ?usize {
+        if (id.len == 0 or from.len == 0) return null;
+        for (self.db_pending, 0..) |p, i| {
+            // A verdict can only answer a db:verify that reached the peer.
+            if (!p.in_use or !p.verify_sent) continue;
+            if (std.mem.eql(u8, p.streamId(), id) and
+                std.ascii.eqlIgnoreCase(p.origin(), from) and
+                std.ascii.eqlIgnoreCase(p.target(), to)) return i;
+        }
+        return null;
+    }
+
+    pub fn clearPendingVerify(self: *OutboundConnection, idx: usize) void {
+        if (idx < self.db_pending.len) self.db_pending[idx] = .{};
+    }
+
+    /// Complete the outstanding dialback key this connection sent, if the
+    /// verdict answers it. The responder echoes from and to swapped
+    /// (from=peer, to=us); a missing attribute is not a mismatch. Returns
+    /// false, leaving the exchange outstanding, for anything else.
+    pub fn takePendingAssertion(self: *OutboundConnection, from: []const u8, to: []const u8) bool {
+        // The dialback key only leaves the connection after TLS, so a
+        // verdict arriving in cleartext cannot answer it.
+        if (self.tls_conn == null) return false;
+        if (!self.db_assertion_pending) return false;
+        if (from.len > 0 and !std.ascii.eqlIgnoreCase(from, self.remote_domain)) return false;
+        if (to.len > 0 and !std.ascii.eqlIgnoreCase(to, self.local_domain)) return false;
+        self.db_assertion_pending = false;
+        return true;
+    }
+
+    /// Any registered callback (sent or not).
+    pub fn hasPendingVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use) return true;
+        }
+        return false;
+    }
+
+    /// Any registered callback whose db:verify has not been written yet.
+    pub fn hasUnsentVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use and !p.verify_sent) return true;
+        }
+        return false;
+    }
+
+    pub fn pendingVerifyCount(self: *const OutboundConnection) usize {
+        var n: usize = 0;
+        for (self.db_pending) |p| {
+            if (p.in_use) n += 1;
+        }
+        return n;
     }
 
     /// SASL failure or auth rejected.
@@ -421,13 +641,15 @@ pub const OutboundConnection = struct {
     }
 
     /// Get the stream open XML to send to the remote server.
+    /// remote_domain was peer-supplied at queue time (T275 duped it, but the
+    /// incoming bytes may still be entity-decoded specials: escape (S1).
     pub fn buildStreamOpen(self: *const OutboundConnection, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
-        try writer.writeAll(self.local_domain);
+        try @import("session.zig").xmlEscapeWrite(writer, self.local_domain);
         try writer.writeAll("' to='");
-        try writer.writeAll(self.remote_domain);
+        try @import("session.zig").xmlEscapeWrite(writer, self.remote_domain);
         try writer.writeAll("' version='1.0'>");
         return fbs.getWritten();
     }
@@ -468,11 +690,17 @@ pub const OutboundConnection = struct {
     }
 };
 
-/// A stanza queued for delivery.
+/// A stanza queued for delivery. Owns all three slices.
 pub const PendingStanza = struct {
     from_jid: []const u8,
     to_jid: []const u8,
     xml: []const u8,
+
+    pub fn deinit(self: PendingStanza, allocator: std.mem.Allocator) void {
+        allocator.free(self.from_jid);
+        allocator.free(self.to_jid);
+        allocator.free(self.xml);
+    }
 };
 
 /// Actions the connector tells the event loop to perform.
@@ -527,8 +755,17 @@ pub const ConnectionPool = struct {
         }
 
         const conn = try self.allocator.create(OutboundConnection);
-        conn.* = OutboundConnection.init(self.allocator, local_domain, remote_domain);
-        try self.connections.put(remote_domain, conn);
+        conn.* = OutboundConnection.init(self.allocator, local_domain, remote_domain) catch |err| {
+            self.allocator.destroy(conn);
+            return err;
+        };
+        // The map key is the connection's own duped domain (T275): one
+        // owner, freed at deinit; a caller-borrowed slice never reaches it.
+        self.connections.put(conn.remote_domain, conn) catch |err| {
+            conn.deinit(self.allocator);
+            self.allocator.destroy(conn);
+            return err;
+        };
         return conn;
     }
 
@@ -559,7 +796,7 @@ pub const ConnectionPool = struct {
 
 test "OutboundConnection: init and basic state" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     try std.testing.expectEqual(OutboundState.connecting, conn.state);
@@ -569,9 +806,29 @@ test "OutboundConnection: init and basic state" {
     try std.testing.expect(!conn.isFailed());
 }
 
+test "OutboundConnection: canSendDbVerify requires a TLS layer" {
+    const alloc = std.testing.allocator;
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    conn.state = .established;
+    try std.testing.expect(!conn.canSendDbVerify());
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; deinit closes it
+    conn.tls_conn = try SslConn.initClient(ctx, fds[0], null);
+    try std.testing.expect(conn.canSendDbVerify());
+}
+
 test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = false;
@@ -581,7 +838,7 @@ test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
 
 test "OutboundConnection: TCP connected → TLS handshake (direct TLS path)" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = true;
@@ -591,7 +848,7 @@ test "OutboundConnection: TCP connected → TLS handshake (direct TLS path)" {
 
 test "OutboundConnection: full DANE-verified lifecycle" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     // Direct TLS path
@@ -620,9 +877,54 @@ test "OutboundConnection: full DANE-verified lifecycle" {
     try std.testing.expect(conn.isEstablished());
 }
 
+test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the connection (T250)" {
+    const alloc = std.testing.allocator;
+
+    // TCP loopback pair with a tiny send buffer (unix socketpairs ignore
+    // SO_SNDBUF on FreeBSD): queue the <starttls/> request plus a tail.
+    const fds = try makeTestTcpPair();
+    defer posix.close(fds[1]); // fds[0] goes out via conn.deinit below
+
+    const sndbuf: c_int = 2048;
+    var actual_sndbuf: c_int = 0;
+    var optlen: posix.socklen_t = @sizeOf(c_int);
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    if (std.c.getsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&actual_sndbuf), &optlen) != 0)
+        return error.SkipZigTest;
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+    conn.fd = fds[0];
+    conn.tcpConnected();
+    conn.state = .starttls_negotiation;
+
+    // Queue the <starttls/> request...
+    var buf: [2048]u8 = undefined;
+    const msg = try conn.buildStarttls(&buf);
+    try conn.queueWrite(msg);
+
+    // ...and a tail queued AFTER <starttls/> (the protocol error), big
+    // enough that the flush below cannot drain it into the tiny send
+    // buffer: the guard must catch bytes a real flush left behind (T250).
+    const tail = try alloc.alloc(u8, 8192);
+    defer alloc.free(tail);
+    @memset(tail, 'x');
+    try conn.queueWrite(tail);
+
+    // A real flush under backpressure: part goes out, the tail lingers.
+    const flushed_all = try conn.flushWrite();
+    try std.testing.expect(!flushed_all);
+    try std.testing.expect(conn.hasPendingWrite());
+
+    // <proceed/> arrives: the connection must fail, no upgrade begins.
+    try std.testing.expect(!conn.handleStarttlsProceed());
+    try std.testing.expect(conn.isFailed());
+    try std.testing.expectEqualStrings("plaintext-after-starttls", conn.error_msg);
+}
+
 test "OutboundConnection: STARTTLS lifecycle with no DANE" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = false;
@@ -636,7 +938,7 @@ test "OutboundConnection: STARTTLS lifecycle with no DANE" {
     try std.testing.expectEqual(OutboundState.starttls_negotiation, conn.state);
 
     // Proceed received
-    conn.handleStarttlsProceed();
+    _ = conn.handleStarttlsProceed();
     try std.testing.expectEqual(OutboundState.tls_handshake, conn.state);
 
     // TLS done, DANE check
@@ -658,7 +960,7 @@ test "OutboundConnection: STARTTLS lifecycle with no DANE" {
 
 test "OutboundConnection: DANE failure rejects connection" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     conn.is_direct_tls = true;
@@ -671,7 +973,7 @@ test "OutboundConnection: DANE failure rejects connection" {
 
 test "OutboundConnection: queue and count pending stanzas" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     try conn.queueStanza(alloc, "alice@a.example", "bob@b.example", "<message><body>hi</body></message>");
@@ -679,9 +981,37 @@ test "OutboundConnection: queue and count pending stanzas" {
     try std.testing.expectEqual(@as(usize, 2), conn.pendingCount());
 }
 
+test "OutboundConnection: one pending verify per (stream id, origin, target)" {
+    const alloc = std.testing.allocator;
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    // One socket to the remote host carries verifies for several origin or
+    // target pairs sharing a stream id: each is its own entry.
+    const s1 = conn.addPendingVerify(1, 10, "stream1", "a.example", "one.example", "key1") orelse return error.NoSlot;
+    const s2 = conn.addPendingVerify(2, 11, "stream1", "a.example", "two.example", "key2") orelse return error.NoSlot;
+    try std.testing.expect(s1 != s2);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+
+    // A verdict only answers a verify that reached the peer.
+    try std.testing.expect(conn.findPendingVerify("stream1", "a.example", "one.example") == null);
+    conn.db_pending[s1].verify_sent = true;
+    conn.db_pending[s2].verify_sent = true;
+
+    // A verdict correlates to its own entry (S2).
+    try std.testing.expectEqual(s1, conn.findPendingVerify("stream1", "a.example", "one.example").?);
+    try std.testing.expectEqual(s2, conn.findPendingVerify("stream1", "a.example", "two.example").?);
+
+    // The same triple resubmitted replaces its entry in place.
+    const s3 = conn.addPendingVerify(3, 12, "stream1", "a.example", "one.example", "key3") orelse return error.NoSlot;
+    try std.testing.expectEqual(s1, s3);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+    try std.testing.expectEqualStrings("key3", conn.db_pending[s1].key());
+}
+
 test "OutboundConnection: buildStreamOpen" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
@@ -694,7 +1024,7 @@ test "OutboundConnection: buildStreamOpen" {
 
 test "OutboundConnection: buildSaslExternal" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [1024]u8 = undefined;
@@ -707,7 +1037,7 @@ test "OutboundConnection: buildSaslExternal" {
 
 test "OutboundConnection: buildStarttls" {
     const alloc = std.testing.allocator;
-    var conn = OutboundConnection.init(alloc, "a.example", "b.example");
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
     defer conn.deinit(alloc);
 
     var buf: [256]u8 = undefined;
@@ -763,6 +1093,164 @@ test "ConnectionPool: remove" {
 
     pool.remove("b.example");
     try std.testing.expectEqual(@as(usize, 0), pool.count());
+}
+
+// --- S23: pinned TLS write retry under backpressure -----------------------
+
+/// Self-signed throwaway cert+key for "localhost" via the openssl CLI (no
+/// key material in the tree). error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
+fn genTestTlsCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .cwd_dir = dir,
+        .max_output_bytes = 64 * 1024,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Drive both ends of a non-blocking TLS pair until the handshake finishes.
+fn driveTestTlsHandshake(server: *SslConn, client: *SslConn) !void {
+    const deadline = std.time.milliTimestamp() + 5000;
+    var s_done = false;
+    var c_done = false;
+    while ((!s_done or !c_done) and std.time.milliTimestamp() < deadline) {
+        if (!s_done) s_done = (try server.doHandshake()) == .complete;
+        if (!c_done) c_done = (try client.doHandshake()) == .complete;
+    }
+    if (!s_done or !c_done) return error.TlsHandshakeTimeout;
+}
+
+/// Connected non-blocking TCP loopback pair for TLS test rigs. AF_UNIX
+/// socketpairs do not enforce SO_SNDBUF strictly on stream sockets, so the
+/// backpressure rig needs real TCP; both ends run userland TLS (PR 296498).
+fn makeTestTcpPair() ![2]posix.fd_t {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return error.SocketFailed;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return error.BindFailed;
+    posix.listen(listen_fd, 1) catch return error.ListenFailed;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return error.GetSockNameFailed;
+
+    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch return error.SocketFailed;
+    errdefer posix.close(client_fd);
+    posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
+        error.WouldBlock => {},
+        else => return error.ConnectFailed,
+    };
+    const server_fd = posix.accept(listen_fd, null, null, posix.SOCK.NONBLOCK) catch return error.AcceptFailed;
+    errdefer posix.close(server_fd);
+
+    // nodelay keeps the interleaved drive loop free of delayed-ACK stalls.
+    const nodelay: c_int = 1;
+    try posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay)); // IPPROTO_TCP, TCP_NODELAY
+    try posix.setsockopt(server_fd, 6, 1, std.mem.asBytes(&nodelay));
+    return .{ client_fd, server_fd };
+}
+
+test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestTlsCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    const fds = try makeTestTcpPair();
+    // The listener side is only a scripted TLS server for this rig.
+    defer posix.close(fds[1]);
+
+    // Tiny send buffer on the connection side forces TLS write backpressure.
+    const head_len = 8192;
+    const sndbuf: c_int = 2048;
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    var actual_sndbuf: c_int = 0;
+    var optlen: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&actual_sndbuf), &optlen) != 0)
+        return error.SkipZigTest;
+    // One ~8 KiB TLS record must not fit, or the rig cannot stall the write.
+    if (actual_sndbuf >= head_len) return error.SkipZigTest;
+
+    // kTLS stays off on both ends: two kTLS peers over lo0 hit FreeBSD
+    // PR 296498 (EBADMSG). This rig is entirely userland TLS.
+    var client_ctx = try SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls();
+    var server_ctx = try SslContext.initServer(cert_path, key_path);
+    defer server_ctx.deinit();
+    server_ctx.disableKtls();
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc); // also closes fds[0]
+    conn.fd = fds[0];
+    conn.tls_conn = try SslConn.initClient(client_ctx, fds[0], null);
+    conn.tls_state = .established;
+    var server = try SslConn.init(server_ctx, fds[1]);
+    defer server.deinit();
+    try driveTestTlsHandshake(&server, &conn.tls_conn.?);
+
+    // Q11: the accessors behind the post-handshake kTLS log line.
+    {
+        const tls = &(conn.tls_conn orelse unreachable);
+        try std.testing.expect(tls.versionName().len > 0);
+        try std.testing.expect(tls.cipherName().len > 0);
+        _ = tls.ktlsSend();
+        _ = tls.ktlsRecv();
+    }
+
+    var head: [head_len]u8 = undefined;
+    for (&head, 0..) |*b, i| b.* = @truncate(i);
+    const tail = "TAIL-AFTER-PINNED-WRITE";
+
+    // First flush exceeds the send buffer: it must stall and pin the slice.
+    try conn.queueWrite(&head);
+    try std.testing.expect(!(try conn.flushWrite()));
+    try std.testing.expectEqual(@as(usize, head_len), conn.pinned_tls_len);
+
+    // Queue while pinned: the tail must wait behind the pinned slice, not
+    // grow the retry.
+    try conn.queueWrite(tail);
+
+    var received: [head_len + tail.len]u8 = undefined;
+    var got: usize = 0;
+    var chunk: [4096]u8 = undefined;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (got < received.len and std.time.milliTimestamp() < deadline) {
+        if (conn.hasPendingWrite()) {
+            _ = conn.flushWrite() catch return error.FlushFailed;
+        }
+        const rr = server.read(&chunk) catch return error.PeerReadFailed;
+        switch (rr) {
+            .ok => |n| {
+                @memcpy(received[got .. got + n], chunk[0..n]);
+                got += n;
+            },
+            .want_read, .want_write => {},
+        }
+    }
+    try std.testing.expectEqual(received.len, got);
+    try std.testing.expect(std.mem.eql(u8, &head, received[0..head_len]));
+    try std.testing.expectEqualStrings(tail, received[head_len..][0..tail.len]);
+    try std.testing.expectEqual(@as(usize, 0), conn.pinned_tls_len);
+    try std.testing.expect(!conn.hasPendingWrite());
 }
 
 test "ConnectionPool: getEstablished" {

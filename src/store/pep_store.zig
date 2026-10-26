@@ -23,7 +23,7 @@ const backend_mod = @import("backend");
 
 const log = std.log.scoped(.pep_store);
 
-const NAMESPACE = "pep";
+pub const NAMESPACE = backend_mod.registered("pep");
 
 pub fn PepStore(comptime Backend: type) type {
     comptime backend_mod.assertBackend(Backend);

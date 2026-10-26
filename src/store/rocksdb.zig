@@ -29,6 +29,9 @@ pub const RocksDbBackend = struct {
     cf_count: u32,
     path_buf: [4096]u8,
     path_len: usize,
+    /// Guards cf_cache lookups/appends (S9): canonical column families are
+    /// created at open(); the lock covers only test/unknown names.
+    cf_lock: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(RocksDbBackend);
@@ -108,6 +111,7 @@ pub const RocksDbBackend = struct {
                 .path_len = path.len,
             };
             @memcpy(self.path_buf[0..path.len], path);
+            try self.ensureCanonicalCfs();
             return self;
         }
 
@@ -191,7 +195,14 @@ pub const RocksDbBackend = struct {
         }
 
         c.rocksdb_list_column_families_destroy(cf_names, cf_count);
+        try self.ensureCanonicalCfs();
         return self;
+    }
+
+    /// Canonical namespaces exist as column families from day one (S9), so
+    /// workers never race lazy creation on the cf cache.
+    fn ensureCanonicalCfs(self: *RocksDbBackend) !void {
+        for (backend.canonical_namespaces) |ns| _ = try self.getOrCreateCf(ns);
     }
 
     pub fn close(self: *RocksDbBackend) void {
@@ -359,8 +370,15 @@ pub const RocksDbBackend = struct {
     // -- WriteBatch --
 
     pub const WriteBatch = struct {
-        batch: *c.rocksdb_writebatch_t,
+        batch: ?*c.rocksdb_writebatch_t,
         backend: *RocksDbBackend,
+        /// End attempts so far (commit or abort). abort() after a commit
+        /// attempt is a no-op (S9); the count keeps a guard violation
+        /// observable instead of a silent double destroy.
+        ends: u8 = 0,
+        /// Test-only fault hook (S9): the commit fails the way a RocksDB
+        /// write error does, without driving the C layer.
+        fail_commit: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const cf = try self.backend.getOrCreateCf(ns);
@@ -385,6 +403,13 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
+            // A write is atomic and the C batch is destroyed once either
+            // way: abort() after a commit attempt is a no-op (S9).
+            self.ends += 1;
+            if (self.fail_commit) {
+                self.destroyBatch();
+                return error.RocksDbWriteFailed;
+            }
             var err: [*c]u8 = null;
             c.rocksdb_write(
                 self.backend.db,
@@ -392,7 +417,7 @@ pub const RocksDbBackend = struct {
                 self.batch,
                 &err,
             );
-            c.rocksdb_writebatch_destroy(self.batch);
+            self.destroyBatch();
 
             if (err != null) {
                 log.err("rocksdb_write: {s}", .{std.mem.span(err)});
@@ -402,13 +427,25 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn abort(self: *WriteBatch) void {
-            c.rocksdb_writebatch_destroy(self.batch);
+            if (self.ends > 0) return;
+            self.ends += 1;
+            self.destroyBatch();
+        }
+
+        fn destroyBatch(self: *WriteBatch) void {
+            if (self.batch) |b| {
+                c.rocksdb_writebatch_destroy(b);
+                self.batch = null;
+            }
         }
     };
 
     // -- Internal --
 
     fn getOrCreateCf(self: *RocksDbBackend, ns: []const u8) !*c.rocksdb_column_family_handle_t {
+        // S9: cache lookup and lazy creation share this lock.
+        self.cf_lock.lock();
+        defer self.cf_lock.unlock();
         // Check cache
         for (self.cf_cache[0..self.cf_count]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
@@ -462,12 +499,14 @@ fn freshTestDir() []const u8 {
 
 test "RocksDbBackend: open and close" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     db.close();
 }
 
 test "RocksDbBackend: put and get" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -484,6 +523,7 @@ test "RocksDbBackend: put and get" {
 
 test "RocksDbBackend: delete" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -499,6 +539,7 @@ test "RocksDbBackend: delete" {
 
 test "RocksDbBackend: overwrite value" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -512,6 +553,7 @@ test "RocksDbBackend: overwrite value" {
 
 test "RocksDbBackend: separate namespaces" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -529,6 +571,7 @@ test "RocksDbBackend: separate namespaces" {
 
 test "RocksDbBackend: iterator prefix-bounded" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -549,6 +592,7 @@ test "RocksDbBackend: iterator prefix-bounded" {
 
 test "RocksDbBackend: iterator returns key and value" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -564,6 +608,7 @@ test "RocksDbBackend: iterator returns key and value" {
 
 test "RocksDbBackend: writeBatch commit" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -583,6 +628,7 @@ test "RocksDbBackend: writeBatch commit" {
 
 test "RocksDbBackend: writeBatch abort" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
 
@@ -594,8 +640,51 @@ test "RocksDbBackend: writeBatch abort" {
     try std.testing.expect(val == null);
 }
 
+test "RocksDbBackend: abort after a commit attempt is a no-op" {
+    const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    try batch.commit();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+}
+
+test "RocksDbBackend: a failed write ends the batch" {
+    const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    // Fault hook: the commit fails the way a RocksDB write error does.
+    batch.fail_commit = true;
+    try std.testing.expectError(error.RocksDbWriteFailed, batch.commit());
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    // abort() after the commit attempt is a no-op.
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    // Nothing was written.
+    const val = try db.get(std.testing.allocator, "users", "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expect(val == null);
+}
+
 test "RocksDbBackend: reopen preserves data" {
     const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
     {
         var db = try RocksDbBackend.open(path, .{});
         try db.put("users", "alice", "persisted");
