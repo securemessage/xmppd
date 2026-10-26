@@ -460,7 +460,18 @@ pub fn Loader(
                     diag.set(.{ .path = path, .line = line_no, .detail = "line too long" });
                     return error.LineTooLong;
                 }
-                const line = std.mem.trim(u8, raw, " \t\r");
+                // Comment policy: '#' or ';' opens a comment at line
+                // start or after whitespace; inside a token it is a
+                // literal byte (p#ss stays intact). There is no quote
+                // processing: a quoted value keeps its quote bytes.
+                var line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0) continue;
+                for (line[1..], 1..) |c, j| {
+                    if ((c == '#' or c == ';') and (line[j - 1] == ' ' or line[j - 1] == '\t')) {
+                        line = std.mem.trim(u8, line[0..j], " \t");
+                        break;
+                    }
+                }
                 if (line.len == 0) continue;
                 if (line[0] == '#' or line[0] == ';') continue;
                 if (line[0] == '[') {
@@ -1449,6 +1460,29 @@ test "readForwarded caps the blob at 256 KiB and still closes the fd" {
     var diag: Diag = .{};
     try testing.expectError(error.FileTooLarge, readForwarded(fd, testing.allocator, &diag));
     try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+}
+
+test "inline comments end a value only after whitespace; quoting is literal" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "comments.ini",
+        \\# whole-line comment
+        \\[server] ; trailing comment on a header
+        \\hostname = h.test # inline comment
+        \\bind_address = 127.0.0.1 ; another
+        \\db_path = /data/p#ss.db
+        \\log_file = "quoted.log"
+        \\
+    , &path_buf);
+    var diag: Diag = .{};
+    var l = try MasterLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+    try testing.expectEqualStrings("h.test", l.values.server.hostname);
+    try testing.expectEqual(@as(u16, posix.AF.INET), l.values.server.bind_address.any.family);
+    // '#'/';' inside a token is literal, and so are quote bytes.
+    try testing.expectEqualStrings("/data/p#ss.db", l.values.server.db_path);
+    try testing.expectEqualStrings("\"quoted.log\"", l.values.server.log_file);
 }
 
 const capped_sections = struct {
