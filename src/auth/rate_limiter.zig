@@ -64,6 +64,13 @@ const KeyDecision = enum {
     unavailable,
 };
 
+/// Lock verdicts for a re-check that must not consult the rate windows.
+pub const LockDecision = enum {
+    allowed,
+    account_locked,
+    ip_locked,
+};
+
 /// Rate limiting policy. Defaults are the configured defaults; the CLI help
 /// and doc/CONFIGURATION.md carry the same numbers.
 pub const RatePolicy = struct {
@@ -186,6 +193,28 @@ pub const RateLimiter = struct {
                 .locked => return .ip_locked,
                 .rate_limited => return .ip_rate_limited,
                 .unavailable => return .unavailable,
+            }
+        }
+        return .allowed;
+    }
+
+    /// Re-check only the account and IP locks, without consulting the
+    /// windows. Used at SCRAM client-final and before IdP validation, where
+    /// an in-flight attempt must not be denied merely because other attempts
+    /// filled the window.
+    pub fn checkLock(self: *RateLimiter, username: []const u8, client_ip: []const u8) LockDecision {
+        return self.checkLockAt(username, client_ip, currentEpoch());
+    }
+
+    pub fn checkLockAt(self: *RateLimiter, username: []const u8, client_ip: []const u8, now: u32) LockDecision {
+        if (username.len > 0) {
+            if (self.find(self.account_table, username)) |entry| {
+                if (entry.locked_until > now) return .account_locked;
+            }
+        }
+        if (client_ip.len > 0) {
+            if (self.find(self.ip_table, client_ip)) |entry| {
+                if (entry.locked_until > now) return .ip_locked;
             }
         }
         return .allowed;
@@ -604,6 +633,32 @@ test "RateLimiter: a re-check does not count a second attempt" {
     try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "", 100));
     try std.testing.expectEqual(Decision.allowed, limiter.checkAt("alice", "", 100));
     try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "", 100));
+}
+
+test "RateLimiter: a lock-only check ignores the window" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 1,
+        .max_per_ip = 1,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    try std.testing.expectEqual(Decision.allowed, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.account_rate_limited, limiter.admitAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(Decision.account_rate_limited, limiter.checkAt("alice", "10.0.0.1", 100));
+    try std.testing.expectEqual(LockDecision.allowed, limiter.checkLockAt("alice", "10.0.0.1", 100));
+
+    const account = limiter.find(limiter.account_table, "alice").?;
+    account.locked_until = 200;
+    try std.testing.expectEqual(LockDecision.account_locked, limiter.checkLockAt("alice", "10.0.0.1", 100));
+
+    account.locked_until = 0;
+    const ip = limiter.find(limiter.ip_table, "10.0.0.1").?;
+    ip.locked_until = 200;
+    try std.testing.expectEqual(LockDecision.ip_locked, limiter.checkLockAt("alice", "10.0.0.1", 100));
 }
 
 test "RateLimiter: a full table evicts the oldest unlocked entry" {

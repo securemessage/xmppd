@@ -148,9 +148,11 @@ pub const Policy = struct {
         return self.admitAccount(username);
     }
 
-    /// Re-check both keys without counting. Used at SCRAM client-final
-    /// before proof verification, so a locked account gets the same reply
-    /// whether or not the password is right.
+    /// Re-check only the permanent and temporary locks, without counting or
+    /// consulting the rate windows. Used at SCRAM client-final before proof
+    /// verification and before IdP password validation, so a locked account
+    /// gets the same reply whether or not the password is right and an
+    /// in-flight attempt is not denied by a filled window.
     pub fn check(self: Policy, username: []const u8, client_ip: []const u8) ?[]const u8 {
         if (username.len > 0) {
             if (self.lock_checker) |checker| {
@@ -161,23 +163,15 @@ pub const Policy = struct {
         const limiter = self.limiter orelse return null;
         var buf: [rate_limiter.max_key_len]u8 = undefined;
         const account = if (username.len > 0) canonicalAccount(username, &buf) else "";
-        return switch (limiter.check(account, client_ip)) {
+        return switch (limiter.checkLock(account, client_ip)) {
             .allowed => null,
             .account_locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
                 break :blk "account-disabled";
             },
-            .account_rate_limited => blk: {
-                log.info("auth rejected: account '{s}' is rate limited", .{username});
+            .ip_locked => blk: {
+                log.info("auth rejected: IP '{s}' is locked", .{client_ip});
                 break :blk "policy-violation";
-            },
-            .ip_locked, .ip_rate_limited => blk: {
-                log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
-                break :blk "policy-violation";
-            },
-            .unavailable => blk: {
-                log.warn("rate state cannot track the request: failing closed", .{});
-                break :blk "temporary-auth-failure";
             },
         };
     }

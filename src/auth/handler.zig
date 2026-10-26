@@ -2333,3 +2333,61 @@ test "AuthHandler: registration counts the IP before adding a user" {
     try std.testing.expect(!second.register_result.success);
     try std.testing.expectEqualStrings("policy-violation", second.register_result.reason);
 }
+
+test "AuthHandler: SCRAM client-final ignores a filled IP window" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var alice = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer alice.deinit();
+    var bob = sasl.ScramClient.init(allocator, "bob", "whatever");
+    defer bob.deinit();
+
+    const challenge = (handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 300,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.20",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try alice.clientFirst(),
+    } }) orelse return error.NoResponse).auth_challenge.challenge;
+
+    // A second client-first fills the IP window; alice's exchange is still
+    // in flight and must be allowed to finish.
+    const blocked = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 301,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.20",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try bob.clientFirst(),
+    } }) orelse return error.NoResponse;
+    if (blocked != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", blocked.auth_failure.reason);
+
+    const success = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 300,
+        .payload = try alice.handleServerFirst(challenge),
+    } }) orelse return error.NoResponse;
+    if (success != .auth_success) return error.ExpectedAuthSuccess;
+    try std.testing.expectEqualStrings("alice", success.auth_success.username);
+}
