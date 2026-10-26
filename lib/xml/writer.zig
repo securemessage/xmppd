@@ -1522,6 +1522,7 @@ test "spans enforce Namespaces in XML constraints (R4-3)" {
         "<a xmlns:p=''/>", // prefix undeclare is NS 1.0 illegal
         "<a xmlns:p=\"\"/>",
         "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>", // dup expanded name
+        "<a xmlns:p=\"urn:u\" xmlns:q='urn:u' p:x='1' q:x='2'/>", // dup across quote styles
     };
     for (bad) |probe| {
         try testing.expectError(
@@ -1534,6 +1535,9 @@ test "spans enforce Namespaces in XML constraints (R4-3)" {
         "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>",
         "<a xml:lang='en' xml:space='preserve'/>",
         "<a xmlns=''/>",
+        // An unprefixed attribute has no namespace and can never
+        // collide with a prefixed one in the expanded-name check.
+        "<a xmlns='urn:u' xmlns:p='urn:u' x='1' p:x='2'/>",
     };
     for (good) |probe| {
         _ = try ValidatedSpan.fromReader(testing.allocator, probe);
