@@ -535,9 +535,21 @@ inbound s2s after X1/X2).
 - **Cache (v0.9.1).** The resolver cache (X2) serves s2s as well as xmppc:
   positive and NXDOMAIN/NODATA entries, TTL honored with a ceiling, SERVFAIL
   and timeouts never cached. Sized for federation (hash map, bounded entries
-  with LRU eviction, not a 64-entry linear FIFO). Serve-stale (RFC 8767) is a
-  pending operator decision: when a refresh fails, reuse the expired answer
-  (including TLSA) for a bounded time instead of failing.
+  with LRU eviction, not a 64-entry linear FIFO).
+- **Serve-stale (RFC 8767, v0.9.1, approved 2026-10-26).** An expired entry is
+  used only after a refresh attempt fails: timeout, SERVFAIL, REFUSED or any
+  RCODE other than NOERROR/NXDOMAIN (section 4). NOERROR and NXDOMAIN always
+  replace the entry. Failed refreshes are retried no more often than every
+  30 s (section 5 failure recheck timer); a refresh still in flight when the
+  per-query timeout passes returns the stale answer and keeps resolving.
+  Maximum stale age 1 day (section 5 suggests 1 to 3 days). 0-TTL records are
+  never cached, so never served stale (section 7). A CNAME at an owner
+  evicts other cached types for that owner (section 7). Under memory pressure
+  stale entries are evicted before fresh ones (section 6). Stale answers of
+  every type are served, TLSA and negative answers included: each was a real
+  answer when received, and the TLS check (DANE or PKIX) still authenticates
+  the peer, so a stale address that now points elsewhere fails closed.
+  Stale serves are counted and logged per name.
 - **Later (v0.10.x or v0.12.x).** Operator-configurable case-4 policy;
   remembered-DANE domains (fail closed for domains seen with TLSA, configurable
   for unknown ones).
