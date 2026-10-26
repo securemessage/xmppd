@@ -234,18 +234,6 @@ pub const RateLimiter = struct {
         return .allowed;
     }
 
-    /// Record one account failure only. Used when an IdP alias resolves a
-    /// typed name to a different account and both keys must be charged.
-    pub fn recordAccountFailure(self: *RateLimiter, username: []const u8) void {
-        self.recordAccountFailureAt(username, currentEpoch());
-    }
-
-    pub fn recordAccountFailureAt(self: *RateLimiter, username: []const u8, now: u32) void {
-        if (username.len > 0) {
-            self.recordKey(self.account_table, username, false, self.policy.lockout_threshold, now, true);
-        }
-    }
-
     /// Record the outcome of an attempt already counted at admission.
     /// Success clears only the account failure counter; the IP failure
     /// counter is never cleared by a success.

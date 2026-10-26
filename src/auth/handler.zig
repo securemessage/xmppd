@@ -391,7 +391,10 @@ pub fn AuthHandler(comptime Store: type) type {
                         if (self.policy.check(identity, "")) |reason| {
                             if (std.mem.eql(u8, reason, "account-disabled")) {
                                 log.info("PLAIN auth failed (IdP alias): '{s}' maps to locked '{s}'", .{ username, identity });
-                                self.policy.recordAliasFailure(username, identity, req.client_ip);
+                                // Same bookkeeping as a wrong password: the
+                                // typed name and the IP, never the already
+                                // locked identity.
+                                self.policy.recordOutcome(username, req.client_ip, .failure);
                                 return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                             }
                             return .{ .reply = authFailure(req.conn_id, reason) };
@@ -2585,6 +2588,40 @@ test "AuthHandler: a locked IdP alias gets the wrong-password reply" {
     try std.testing.expectEqualDeep(right_reply, wrong_reply);
     try std.testing.expectEqualStrings("not-authorized", right_reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 2), store.password_calls);
+}
+
+test "AuthHandler: an alias failure charges the typed name" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    // A temporary lock on the identity, which the alias path resolves to.
+    limiter.recordOutcome("alice", "10.0.0.1", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(415, "10.0.0.2", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // The wrong-password bookkeeping charged a.smith; the handler must not
+    // return here without charging the typed name.
+    try std.testing.expectEqualStrings("account-disabled", handler.policy.check("a.smith", "") orelse return error.ExpectedDenial);
 }
 
 test "AuthHandler: a failed crypto-pool completion leaves no pending entry" {
