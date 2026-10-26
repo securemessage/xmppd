@@ -335,6 +335,24 @@ test "Policy: an alias failure charges both accounts and the IP once" {
     try std.testing.expect(policy.check("other", "10.0.0.1") == null);
 }
 
+test "Policy: check folds case against a temporary lock" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordOutcome("alice", "10.0.0.1", .failure);
+
+    // The folded ALICE@x must hit the same temporary lock as alice.
+    try std.testing.expectEqualStrings("account-disabled", policy.check("ALICE@x", "10.0.0.2") orelse return error.ExpectedDenial);
+}
+
 test "Policy: account keys fold case and domain to one localpart" {
     var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
         .max_per_account = 100,

@@ -2586,3 +2586,68 @@ test "AuthHandler: a locked IdP alias gets the wrong-password reply" {
     try std.testing.expectEqualStrings("not-authorized", right_reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 2), store.password_calls);
 }
+
+test "AuthHandler: a failed crypto-pool completion leaves no pending entry" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "wrongpw");
+    try std.testing.expect(handleSync(&handler, plainRequest(420, "10.0.0.50", payload)) == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.pending_plain.count());
+
+    try waitForPoolWake(&pool);
+    const completion = pool.popCompletion() orelse return error.NoCompletion;
+    try std.testing.expect(!completion.ok);
+
+    var reply = handler.takeCryptoReply(completion) orelse return error.NoReply;
+    defer reply.deinit(allocator);
+    if (reply.msg != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.msg.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
+}
+
+test "AuthHandler: PLAIN-IdP pre-check sees a temporary lock" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    limiter.recordOutcome("alice", "10.0.0.1", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
