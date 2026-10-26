@@ -57,7 +57,10 @@ pub const Decision = enum {
     unavailable,
 };
 
-const KeyDecision = enum {
+/// Verdict for a single key (account or IP). The caller knows which key it
+/// asked about, so the verdict carries no key kind and has no impossible
+/// cases.
+pub const KeyDecision = enum {
     allowed,
     locked,
     rate_limited,
@@ -143,33 +146,23 @@ pub const RateLimiter = struct {
 
     /// Count one IP attempt only. Mechanisms admit the IP before the
     /// identity is known, then admit the account once it is.
-    pub fn admitIp(self: *RateLimiter, client_ip: []const u8) Decision {
+    pub fn admitIp(self: *RateLimiter, client_ip: []const u8) KeyDecision {
         return self.admitIpAt(client_ip, currentEpoch());
     }
 
-    pub fn admitIpAt(self: *RateLimiter, client_ip: []const u8, now: u32) Decision {
+    pub fn admitIpAt(self: *RateLimiter, client_ip: []const u8, now: u32) KeyDecision {
         if (client_ip.len == 0) return .allowed;
-        return switch (self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now, .count)) {
-            .allowed => .allowed,
-            .locked => .ip_locked,
-            .rate_limited => .ip_rate_limited,
-            .unavailable => .unavailable,
-        };
+        return self.admitKey(self.ip_table, client_ip, self.policy.max_per_ip, now, .count);
     }
 
     /// Count one account attempt only.
-    pub fn admitAccount(self: *RateLimiter, username: []const u8) Decision {
+    pub fn admitAccount(self: *RateLimiter, username: []const u8) KeyDecision {
         return self.admitAccountAt(username, currentEpoch());
     }
 
-    pub fn admitAccountAt(self: *RateLimiter, username: []const u8, now: u32) Decision {
+    pub fn admitAccountAt(self: *RateLimiter, username: []const u8, now: u32) KeyDecision {
         if (username.len == 0) return .allowed;
-        return switch (self.admitKey(self.account_table, username, self.policy.max_per_account, now, .count)) {
-            .allowed => .allowed,
-            .locked => .account_locked,
-            .rate_limited => .account_rate_limited,
-            .unavailable => .unavailable,
-        };
+        return self.admitKey(self.account_table, username, self.policy.max_per_account, now, .count);
     }
 
     /// Re-check both keys without counting. Used at SCRAM client-final so an

@@ -100,7 +100,7 @@ pub const Policy = struct {
         const limiter = self.limiter orelse return null;
         return switch (limiter.admitIp(client_ip)) {
             .allowed => null,
-            .ip_locked, .ip_rate_limited => blk: {
+            .locked, .rate_limited => blk: {
                 log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
                 break :blk "policy-violation";
             },
@@ -108,7 +108,6 @@ pub const Policy = struct {
                 log.warn("rate state cannot track the request: failing closed", .{});
                 break :blk "temporary-auth-failure";
             },
-            else => null,
         };
     }
 
@@ -125,11 +124,11 @@ pub const Policy = struct {
         const account = canonicalAccount(username, &buf);
         return switch (limiter.admitAccount(account)) {
             .allowed => null,
-            .account_locked => blk: {
+            .locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
                 break :blk "account-disabled";
             },
-            .account_rate_limited => blk: {
+            .rate_limited => blk: {
                 log.info("auth rejected: account '{s}' is rate limited", .{username});
                 break :blk "policy-violation";
             },
@@ -137,7 +136,6 @@ pub const Policy = struct {
                 log.warn("rate state cannot track the request: failing closed", .{});
                 break :blk "temporary-auth-failure";
             },
-            else => null,
         };
     }
 
