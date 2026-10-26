@@ -3357,6 +3357,13 @@ const NestCancelCtx = struct {
         }
         self.r.cancel(2);
     }
+
+    fn onQuery(_: ?*anyopaque, _: usize, _: Status, res: ?RecordResult) void {
+        if (res) |*v| {
+            var x = v.*;
+            x.deinitOn(std.testing.allocator);
+        }
+    }
 };
 
 /// Outer job: resolve("x.test") shared by waiters 1 and 2, completed
@@ -3389,6 +3396,7 @@ test "dns-async: a nested completeRaw restores the outer in_callback" {
     r.setServer(try net.Address.parseIp("127.0.0.1", 9));
     var ctx = NestCancelCtx{ .r = &r, .nested = .promote_query };
     r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onQuery });
 
     // Key 3 holds a second in-flight job; a queued raw query sits
     // behind it. cancel(3) frees the job, promoteWait launches the
@@ -3413,6 +3421,7 @@ test "dns-async: a nested dropJob (raw) restores the outer in_callback" {
     r.setServer(try net.Address.parseIp("127.0.0.1", 9));
     var ctx = NestCancelCtx{ .r = &r, .nested = .promote_query };
     r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onQuery });
 
     // Same promote as above, but the queued query hits a cached
     // NXDOMAIN: launchQuery -> sendQuery -> dropJob on the raw branch.
@@ -3435,6 +3444,7 @@ test "dns-async: a nested dropJob (resolve) restores the outer in_callback" {
     r.setServer(try net.Address.parseIp("127.0.0.1", 9));
     var ctx = NestCancelCtx{ .r = &r, .nested = .resolve_nx };
     r.setCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onResolve });
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = NestCancelCtx.onQuery });
 
     // Every step of the neg.test chain is a cached NXDOMAIN: the
     // nested resolve drops through dropJob on the resolve branch.
@@ -3977,6 +3987,7 @@ test "dns-async: a failed registration change reports per entry" {
         .udata = 0,
     }};
     try std.testing.expectError(error.KeventChange, r.keventApply(&bad));
+
 }
 
 test "dns-async: applying changes never drains the events a parent watches" {
