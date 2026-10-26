@@ -123,7 +123,8 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == []const u8) return s;
     if (T == bool) return parseBool(s);
     if (T == Duration) return Duration.parse(s);
-    if (T == std.net.Address) return std.net.Address.parseIp(s, 0) catch error.BadValue;
+    if (T == std.net.Address) return std.net.Address.parseIpAndPort(s) catch
+        std.net.Address.parseIp(s, 0) catch error.BadValue;
     switch (@typeInfo(T)) {
         .int => |i| {
             _ = i;
@@ -1498,4 +1499,16 @@ test "parseValue covers ints, bools, enums, strings, address, durations" {
     const a6 = try parseValue(std.net.Address, "::1");
     try testing.expectEqual(std.posix.AF.INET6, a6.any.family);
     try testing.expectError(error.BadValue, parseValue(std.net.Address, "not-an-ip"));
+
+    // Port-bearing forms round-trip: "ip:port" and "[v6]:port" keep
+    // their port, a bare literal formats as :0 and parses back.
+    const ap = try parseValue(std.net.Address, "127.0.0.1:5222");
+    try testing.expectEqual(@as(u16, 5222), ap.getPort());
+    const a6p = try parseValue(std.net.Address, "[::1]:5269");
+    try testing.expectEqual(@as(u16, 5269), a6p.getPort());
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeValue(std.net.Address, &w, ap);
+    const back = try parseValue(std.net.Address, w.buffered());
+    try testing.expect(back.eql(ap));
 }
