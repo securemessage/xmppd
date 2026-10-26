@@ -225,7 +225,7 @@ pub const Resolver = struct {
     jobs: std.ArrayListUnmanaged(*Job) = .{},
     /// Slot table for timer udata: a queued deadline event carries
     /// (gen, slot) so a job freed by an earlier event in the same
-    /// kevent batch is never touched (C3 pattern).
+    /// kevent batch is recognized as stale and never touched.
     slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
     slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
     /// Seeded from the CSPRNG; drives only the RFC 2782 weighted picks
@@ -779,26 +779,28 @@ pub const Resolver = struct {
     }
 
     fn onDeadline(self: *Resolver, job: *Job) void {
-        job.tries += 1;
-        if (job.tries <= MAX_TRIES) {
-            if (job.use_tcp) {
-                self.tcpSend(job) catch {
-                    self.dropJob(job, .failed);
-                    return;
-                };
-            } else {
-                self.sendUdp(job.request) catch {
-                    self.dropJob(job, .failed);
-                    return;
-                };
-            }
-            self.armDeadline(job, TIMEOUT_MS) catch {
-                self.dropJob(job, .failed);
-            };
+        if (job.tries >= MAX_TRIES) {
+            // tries counts datagrams actually sent: the initial send
+            // plus each retransmission below.
+            log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
+            self.failQuery(job);
             return;
         }
-        log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
-        self.failQuery(job);
+        job.tries += 1;
+        if (job.use_tcp) {
+            self.tcpSend(job) catch {
+                self.dropJob(job, .failed);
+                return;
+            };
+        } else {
+            self.sendUdp(job.request) catch {
+                self.dropJob(job, .failed);
+                return;
+            };
+        }
+        self.armDeadline(job, TIMEOUT_MS) catch {
+            self.dropJob(job, .failed);
+        };
     }
 
     /// The outstanding query is dead (retries exhausted or a refusal
@@ -988,6 +990,8 @@ pub const Resolver = struct {
 
     /// T296: a response belongs to a query only when id AND qname AND
     /// qtype all match - a colliding id does not steer a different query.
+    /// Dropping the qtype check alone is masked by the qname check;
+    /// the wrong-qtype decoy test still pins the combination.
     fn matchJob(self: *Resolver, pkt: []const u8) ?*Job {
         if (pkt.len < 12) return null;
         const id = std.mem.readInt(u16, pkt[0..2], .big);
@@ -1087,6 +1091,9 @@ pub const Resolver = struct {
         var out = try std.ArrayList(wire.Rr).initCapacity(alloc, msg.rrs.len);
         var expected = job.pending_qname;
         for (msg.rrs) |rr| {
+            // The section check alone is masked by the owner/type
+            // checks below for most injections; the poisoned-section
+            // test pins the combination.
             if (rr.section != .answer) continue;
             if (rr.class != wire.CLASS_IN) continue;
             if (!std.ascii.eqlIgnoreCase(rr.name, expected)) continue;
@@ -1805,7 +1812,7 @@ const FakeDns = struct {
     truncate_udp: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     decoy_qname: []const u8 = "",
     /// When set, A answers also carry an authority SOA and an
-    /// additional-section A for an unrelated owner (J5 probe).
+    /// additional-section A for an unrelated owner.
     poison_sections: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, every SRV answer is NODATA, pushing resolve() onto
     /// the fallback address path.
@@ -2310,7 +2317,7 @@ test "dns-async: resolve() runs the SRV chain and the TTL cache serves repeats" 
     try std.testing.expectEqual(first_udp, srv.udp_recvd.load(.monotonic));
 }
 
-test "dns-async: a failed query build leaves no freed job in the list (J1)" {
+test "dns-async: a failed query build leaves no freed job in the list" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -2345,7 +2352,7 @@ fn buildAResponse(out: []u8, query_pkt: []const u8) usize {
     return off + 16;
 }
 
-test "dns-async: TCP frame length math and consumption (J2)" {
+test "dns-async: TCP frame length math and consumption" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -2375,7 +2382,7 @@ test "dns-async: TCP frame length math and consumption (J2)" {
     try std.testing.expectEqual(@as(usize, 1), r.unmatched_replies);
 }
 
-test "dns-async: a maximal frame ahead of the answer is consumed, not fatal (Q1)" {
+test "dns-async: a maximal frame ahead of the answer is consumed, not fatal" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -2433,7 +2440,7 @@ fn armStaleTimer(r: *Resolver, udata: usize) void {
     _ = posix.kevent(r.kq, &ch, &.{}, null) catch {};
 }
 
-test "dns-async: a deadline event batched with the reply does not touch a freed job (J3)" {
+test "dns-async: a deadline event batched with the reply does not touch a freed job" {
     const sink = try startUdpSink();
     defer posix.close(sink.fd);
 
@@ -2478,7 +2485,7 @@ test "dns-async: a deadline event batched with the reply does not touch a freed 
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
-test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
+test "dns-async: query ids are drawn fresh per query, not sequential" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -2496,7 +2503,7 @@ test "dns-async: query ids are drawn fresh per query, not sequential (J4)" {
     try std.testing.expect(!sequential);
 }
 
-test "dns-async: identically seeded resolvers still draw different ids (J4)" {
+test "dns-async: identically seeded resolvers still draw different ids" {
     var r1 = Resolver.init(std.testing.allocator);
     defer r1.deinit();
     r1.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -2518,7 +2525,7 @@ test "dns-async: identically seeded resolvers still draw different ids (J4)" {
     try std.testing.expect(same < 4);
 }
 
-test "dns-async: authority and additional records are dropped, not cached (J5)" {
+test "dns-async: authority and additional records are dropped, not cached" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.poison_sections.store(true, .monotonic);
@@ -2551,7 +2558,7 @@ test "dns-async: authority and additional records are dropped, not cached (J5)" 
     if (ctx2.raw) |*res2| res2.deinitOn(std.testing.allocator);
 }
 
-test "dns-async: the fallback address path honors the requested port (J7)" {
+test "dns-async: the fallback address path honors the requested port" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.empty_srv.store(true, .monotonic);
@@ -2605,7 +2612,7 @@ test "dns-async: an all-'.' SRV answer reports service_unavailable, not nxdomain
     try std.testing.expectEqual(Status.service_unavailable, ctx.status.?);
 }
 
-test "dns-async: a '.' _xmpps answer falls through to _xmpp (Q3)" {
+test "dns-async: a '.' _xmpps answer falls through to _xmpp" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_tls_dot.store(true, .monotonic);
@@ -2779,7 +2786,7 @@ test "dns-async: want_tlsa=true attaches the fetched records per target" {
     try std.testing.expect(res.targets[0].tlsa.len >= 1);
 }
 
-test "dns-async: identical resolves merge into one job (J6)" {
+test "dns-async: identical resolves merge into one job" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -2801,7 +2808,7 @@ test "dns-async: identical resolves merge into one job (J6)" {
     try std.testing.expect((ctx.keys[0] == 1 and ctx.keys[1] == 2) or (ctx.keys[0] == 2 and ctx.keys[1] == 1));
 }
 
-test "dns-async: over-cap requests queue and cancel detaches (J6)" {
+test "dns-async: over-cap requests queue and cancel detaches" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -2823,7 +2830,7 @@ test "dns-async: over-cap requests queue and cancel detaches (J6)" {
     r.cancel(999);
 }
 
-test "dns-async: cache keys fold case; TTL 0 stays off the wire (J8)" {
+test "dns-async: cache keys fold case; TTL 0 stays off the wire" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -2868,7 +2875,7 @@ test "dns-async: cache keys fold case; TTL 0 stays off the wire (J8)" {
     try std.testing.expect(r.cacheGet("ttl0.test", KIND_A) == null);
 }
 
-test "dns-async: NXDOMAIN and NODATA are negative-cached from the SOA minimum (J8)" {
+test "dns-async: NXDOMAIN and NODATA are negative-cached from the SOA minimum" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.nxdomain_all.store(true, .monotonic);
@@ -2972,7 +2979,7 @@ test "dns-async: cancel fires no callback and frees a last-waiter job" {
     try std.testing.expectEqual(@as(usize, 0), ctx.calls);
 }
 
-test "dns-async: a shared job notifies only its remaining waiters (J6)" {
+test "dns-async: a shared job notifies only its remaining waiters" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -3008,7 +3015,7 @@ const CancelSiblingCtx = struct {
     }
 };
 
-test "dns-async: cancel inside a sibling callback suppresses its callback (Q2)" {
+test "dns-async: cancel inside a sibling callback suppresses its callback" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -3050,7 +3057,7 @@ const NestCtx = struct {
     }
 };
 
-test "dns-async: a nested completion inside a callback keeps sibling cancel (R3)" {
+test "dns-async: a nested completion inside a callback keeps sibling cancel" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 9));
@@ -3080,7 +3087,7 @@ test "dns-async: a nested completion inside a callback keeps sibling cancel (R3)
     try std.testing.expectEqual(@as(usize, 0), ctx.calls[2]);
 }
 
-test "dns-async: cancel purges the key's queued entry before promoting (Q2)" {
+test "dns-async: cancel purges the key's queued entry before promoting" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -3114,7 +3121,7 @@ test "dns-async: cancel purges the key's queued entry before promoting (Q2)" {
     for (r.jobs.items) |j| try std.testing.expect(!std.ascii.eqlIgnoreCase(j.name, "queued.test"));
 }
 
-test "dns-async: a failed launch inside promoteWait answers .failed (Q2)" {
+test "dns-async: a failed launch inside promoteWait answers .failed" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", 53));
@@ -3316,7 +3323,7 @@ test "dns-async: a repeat resolve is served by the RR cache without wire" {
     try std.testing.expectEqual(wired, srv.udp_recvd.load(.monotonic));
 }
 
-test "dns-async: a SERVFAIL on one SRV target skips only that target (Q4)" {
+test "dns-async: a SERVFAIL on one SRV target skips only that target" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_many = 3;
@@ -3348,7 +3355,7 @@ test "dns-async: a SERVFAIL on one SRV target skips only that target (Q4)" {
     try std.testing.expect(saw_t1 and saw_t2);
 }
 
-test "dns-async: an AAAA SERVFAIL keeps the resolved A address (R2)" {
+test "dns-async: an AAAA SERVFAIL keeps the resolved A address" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_many = 1;
@@ -3374,7 +3381,7 @@ test "dns-async: an AAAA SERVFAIL keeps the resolved A address (R2)" {
     try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
 }
 
-test "dns-async: an A SERVFAIL still yields the AAAA address (R2)" {
+test "dns-async: an A SERVFAIL still yields the AAAA address" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_many = 1;
@@ -3400,7 +3407,7 @@ test "dns-async: an A SERVFAIL still yields the AAAA address (R2)" {
     try std.testing.expectEqual(@as(u16, posix.AF.INET6), res.targets[0].addr.any.family);
 }
 
-test "dns-async: parsed SRV entries are capped at 32 (Q4)" {
+test "dns-async: parsed SRV entries are capped at 32" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_many = 40;
@@ -3422,7 +3429,7 @@ test "dns-async: parsed SRV entries are capped at 32 (Q4)" {
     try std.testing.expectEqual(@as(usize, SRV_CAP), r.jobs.items[0].srv_list.items.len);
 }
 
-test "dns-async: the fallback path asks AAAA too and emits v6 first (Q4)" {
+test "dns-async: the fallback path asks AAAA too and emits v6 first" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.empty_srv.store(true, .monotonic);
@@ -3447,7 +3454,7 @@ test "dns-async: the fallback path asks AAAA too and emits v6 first (Q4)" {
     try std.testing.expectEqual(@as(u16, 5222), res.targets[0].addr.getPort());
 }
 
-test "dns-async: a stale deadline cannot hit a re-used slot (Q6)" {
+test "dns-async: a stale deadline cannot hit a re-used slot" {
     const sink = try startUdpSink();
     defer posix.close(sink.fd);
 
@@ -3557,7 +3564,7 @@ fn fakeNow() i64 {
     return fake_now;
 }
 
-test "dns-async: a cache entry past its TTL is a miss (Q6)" {
+test "dns-async: a cache entry past its TTL is a miss" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.now_ms = fakeNow;
@@ -3576,7 +3583,7 @@ test "dns-async: a cache entry past its TTL is a miss (Q6)" {
     try std.testing.expect(r.cacheGet("ttl.test", KIND_A) == null);
 }
 
-test "dns-async: SRV targets come back in RFC 2782 priority order (Q6)" {
+test "dns-async: SRV targets come back in RFC 2782 priority order" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.srv_prio_mix.store(true, .monotonic);
@@ -3602,7 +3609,7 @@ test "dns-async: SRV targets come back in RFC 2782 priority order (Q6)" {
     try std.testing.expectEqualStrings("t_hi.test", res.targets[2].host);
 }
 
-test "dns-async: a client resolve asks only the client SRV prefixes (Q6)" {
+test "dns-async: a client resolve asks only the client SRV prefixes" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
     srv.client_srv_only.store(true, .monotonic);
