@@ -1108,8 +1108,11 @@ test "EventLoop: process exit monitoring" {
     // Fork a child that exits immediately
     const pid = try posix.fork();
     if (pid == 0) {
-        // Child — exit with code 42
-        posix.exit(42);
+        // Child exits with code 42. _exit, not exit: a forked child must
+        // not run atexit handlers or C++ static destructors (librocksdb's
+        // PosixEnv::~JoinThreadsOnExit throws std::system_error joining
+        // threads that do not exist after fork).
+        std.c._exit(42);
     }
 
     // Parent — monitor the child
@@ -1120,6 +1123,10 @@ test "EventLoop: process exit monitoring" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0] == .process_exit);
     try std.testing.expectEqual(pid, events[0].process_exit.pid);
+    // A clean exit reports status 42; an abort would surface as a signal.
+    const status = events[0].process_exit.status;
+    try std.testing.expect(posix.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(status));
 
     // Reap the child to avoid zombies
     _ = posix.waitpid(pid, 0);
