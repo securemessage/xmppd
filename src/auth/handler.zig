@@ -347,6 +347,13 @@ pub fn AuthHandler(comptime Store: type) type {
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
+                // A lock on the supplied localpart must reject before the
+                // IdP call, or a right password for a locked account is
+                // distinguishable from a wrong one.
+                if (self.policy.check(username, req.client_ip)) |reason| {
+                    return .{ .reply = authFailure(req.conn_id, reason) };
+                }
+
                 const result = self.store.validatePassword(self.allocator, username, password) catch {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
@@ -922,15 +929,20 @@ fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
 /// and run (the local UserStore never reaches them).
 const TestIdpStore = struct {
     password_user: ?[]const u8 = null,
+    password_secret: ?[]const u8 = null,
     token_user: ?[]const u8 = null,
-    /// Number of validateToken calls, so a test can prove a locked IP is
-    /// rejected before any IdP work.
+    /// Number of IdP calls, so a test can prove a lock is checked before
+    /// any IdP work.
+    password_calls: u32 = 0,
     token_calls: u32 = 0,
 
-    pub fn validatePassword(self: *const @This(), allocator: std.mem.Allocator, username: []const u8, password: []const u8) !?[]const u8 {
+    pub fn validatePassword(self: *@This(), allocator: std.mem.Allocator, username: []const u8, password: []const u8) !?[]const u8 {
         _ = allocator;
         _ = username;
-        _ = password;
+        self.password_calls += 1;
+        if (self.password_secret) |secret| {
+            if (!std.mem.eql(u8, password, secret)) return null;
+        }
         return self.password_user;
     }
 
@@ -2390,4 +2402,30 @@ test "AuthHandler: SCRAM client-final ignores a filled IP window" {
     } }) orelse return error.NoResponse;
     if (success != .auth_success) return error.ExpectedAuthSuccess;
     try std.testing.expectEqualStrings("alice", success.auth_success.username);
+}
+
+test "AuthHandler: PLAIN-IdP rejects a locked supplied name before the IdP" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(200, "127.0.0.1", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(200, "127.0.0.1", plainPayload(&buf, "alice", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
 }
