@@ -255,6 +255,9 @@
       </xmpp:SupportedXep>
     </implements>
 
+    <!-- Release dates are taken from the CHANGELOG release headings, which is
+         the project's record of when a release shipped. The v0.9.0 tag was cut
+         2026-10-03 23:13 -0400, i.e. 2026-10-04 UTC, so the two agree. -->
     <release>
       <Version>
         <revision>0.9.0</revision>
