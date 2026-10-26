@@ -3844,7 +3844,7 @@ test "dns-async: a commented nameserver line stays a comment" {
     r.resolv_conf_path = path;
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
-    try std.testing.expectEqual(try net.Address.parseIp("127.0.0.53", 53), r.server);
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.53", 53)));
 }
 
 test "dns-async: a TTL with the top bit set reports zero (RFC 2181)" {
