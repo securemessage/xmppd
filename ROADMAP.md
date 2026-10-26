@@ -18,7 +18,7 @@ Last updated: 2026-08-30
 | 6. Auth Daemon + IPC | ✅ Complete | xmppd-auth, SCRAM-SHA-256, PLAIN, binary IPC |
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
-| 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
+| 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding (planned) |
 | 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) - rooms, join/part, groupchat, kick |
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
 | 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
@@ -538,7 +538,7 @@ Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 | 9c | In-band registration (XEP-0077) - invitation codes, InviteStore | ✅ |
 | 9d | Password change (XEP-0077 §3.3) - IPC tags 0x08/0x09 | ✅ |
 | 9e | Account deletion (XEP-0077 §3.2) - cascade cleanup | ✅ |
-| 9f | Channel binding (XEP-0440) - tls-server-end-point + tls-exporter | ✅ |
+| 9f | Channel binding (XEP-0440) - tls-server-end-point + tls-exporter | ◐ partial (#24) |
 
 ### Key Design Decisions
 
