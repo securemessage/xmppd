@@ -63,10 +63,18 @@ pub const CryptoPool = struct {
 
     pub const MAX_THREADS = 8;
 
-    /// Pool owns job.password after a successful put.
+    /// Pool owns job.password after a successful put. One completion slot is
+    /// reserved before the job is accepted, so a worker can always publish
+    /// its completion without allocating.
     pub fn put(self: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
         const copy = std.heap.c_allocator.dupe(u8, password) catch return error.OutOfMemory;
         errdefer std.heap.c_allocator.free(copy);
+
+        {
+            self.completion_mutex.lock();
+            defer self.completion_mutex.unlock();
+            try self.completions.ensureUnusedCapacity(self.allocator, 1);
+        }
 
         self.job_mutex.lock();
         defer self.job_mutex.unlock();
@@ -146,6 +154,18 @@ pub const CryptoPool = struct {
         self.completions.deinit(self.allocator);
     }
 
+    /// Publish one completion and wake the loop. put() reserves capacity for
+    /// every accepted job, so the append cannot allocate or fail here.
+    fn finish(self: *CryptoPool, id: u64, ok: bool) void {
+        self.completion_mutex.lock();
+        self.completions.appendAssumeCapacity(.{ .id = id, .ok = ok });
+        self.completion_mutex.unlock();
+
+        _ = posix.write(self.pipe_wr, "\x00") catch |err| {
+            log.err("completion wake write failed for job {d}: {s}", .{ id, @errorName(err) });
+        };
+    }
+
     fn workerMain(self: *CryptoPool) void {
         while (true) {
             const job = blk: {
@@ -162,26 +182,13 @@ pub const CryptoPool = struct {
             // Prep failure means the presented password can never match a
             // prepped stored credential: report as a mismatch.
             const test_creds = sasl.StoredCredentials.derive(job.password, job.salt, job.iteration_count) catch {
-                self.completion_mutex.lock();
-                defer self.completion_mutex.unlock();
-                self.completions.append(self.allocator, .{ .id = job.id, .ok = false }) catch {};
+                self.finish(job.id, false);
                 continue;
             };
             // T211 follow-up: constant-time compare for StoredKey (the
             // reference in scram.zig uses the same pattern).
             const ok = std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, job.expected_stored_key);
-
-            {
-                self.completion_mutex.lock();
-                defer self.completion_mutex.unlock();
-                self.completions.append(self.allocator, .{ .id = job.id, .ok = ok }) catch {
-                    // Dropping a completion strands the client's auth attempt on
-                    // the core side until it times out — loud, not silent.
-                    log.err("completion queue append failed for job {d}", .{job.id});
-                    continue;
-                };
-            }
-            _ = posix.write(self.pipe_wr, "\x00") catch {};
+            self.finish(job.id, ok);
         }
     }
 };

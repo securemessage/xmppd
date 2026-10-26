@@ -943,6 +943,21 @@ fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
     };
 }
 
+/// Wait for the pool's completion wake byte. The read end is non-blocking.
+fn waitForPoolWake(pool: *TestCryptoPool) !void {
+    var buf: [8]u8 = undefined;
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < deadline) {
+        const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) return;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.PoolWakeTimeout;
+}
+
 /// IdP-delegating test store: credentials and tokens are answered by the
 /// identity provider instead of a local user table, so the
 /// @hasDecl(Store, "validatePassword"/"validateToken") admit paths compile
@@ -2491,4 +2506,36 @@ test "AuthHandler: crypto-pool pending jobs count against the lockout threshold"
     if (third != .auth_failure) return error.ExpectedAuthFailure;
     try std.testing.expectEqualStrings("policy-violation", third.auth_failure.reason);
     try std.testing.expectEqual(@as(usize, 2), handler.pending_plain.count());
+}
+
+test "AuthHandler: a PLAIN prep failure completes and replies" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [32]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "x\x07y");
+    try std.testing.expect(handleSync(&handler, plainRequest(400, "10.0.0.40", payload)) == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.pending_plain.count());
+
+    try waitForPoolWake(&pool);
+    const completion = pool.popCompletion() orelse return error.NoCompletion;
+    try std.testing.expect(!completion.ok);
+
+    var reply = handler.takeCryptoReply(completion) orelse return error.NoReply;
+    defer reply.deinit(allocator);
+    if (reply.msg != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.msg.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
 }
