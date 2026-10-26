@@ -45,6 +45,9 @@ pub const CryptoPool = struct {
 
     jobs: std.ArrayListUnmanaged(Job) = .{},
     completions: std.ArrayListUnmanaged(Completion) = .{},
+    /// Accepted jobs whose completion has not been published yet. Protected
+    /// by completion_mutex and used to size the completions list.
+    reserved_completions: usize = 0,
 
     job_mutex: std.Thread.Mutex = .{},
     job_cond: std.Thread.Condition = .{},
@@ -73,7 +76,13 @@ pub const CryptoPool = struct {
         {
             self.completion_mutex.lock();
             defer self.completion_mutex.unlock();
-            try self.completions.ensureUnusedCapacity(self.allocator, 1);
+            try self.completions.ensureUnusedCapacity(self.allocator, self.reserved_completions + 1);
+            self.reserved_completions += 1;
+        }
+        errdefer {
+            self.completion_mutex.lock();
+            self.reserved_completions -= 1;
+            self.completion_mutex.unlock();
         }
 
         self.job_mutex.lock();
@@ -159,6 +168,7 @@ pub const CryptoPool = struct {
     fn finish(self: *CryptoPool, id: u64, ok: bool) void {
         self.completion_mutex.lock();
         self.completions.appendAssumeCapacity(.{ .id = id, .ok = ok });
+        self.reserved_completions -= 1;
         self.completion_mutex.unlock();
 
         _ = posix.write(self.pipe_wr, "\x00") catch |err| {
@@ -196,6 +206,49 @@ pub const CryptoPool = struct {
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn completionCount(pool: *CryptoPool) usize {
+    pool.completion_mutex.lock();
+    defer pool.completion_mutex.unlock();
+    return pool.completions.items.len;
+}
+
+/// Keep the password out of a literal first argument; the D7 source ratchet
+/// cannot distinguish this pool's put from a backend put at the call site.
+fn putTestJob(pool: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
+    return pool.put(password, salt, iteration_count, expected_stored_key);
+}
+
+test "CryptoPool: more than eight completions wait without a drain" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(4);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("burst", @splat(3), 4096);
+    var ids: [16]u64 = undefined;
+    for (&ids) |*id| id.* = try putTestJob(&pool, "burst", @splat(3), 4096, creds.stored_key);
+
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (completionCount(&pool) < ids.len and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 16), completionCount(&pool));
+
+    var seen = [_]bool{false} ** 16;
+    for (0..ids.len) |_| {
+        const c = pool.popCompletion() orelse return error.NoCompletion;
+        var found = false;
+        for (ids, 0..) |id, i| {
+            if (id == c.id) {
+                seen[i] = true;
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+    for (seen) |s| try std.testing.expect(s);
+}
 
 test "CryptoPool: derive matches inline computation" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
