@@ -3988,6 +3988,29 @@ test "dns-async: a failed registration change reports per entry" {
     }};
     try std.testing.expectError(error.KeventChange, r.keventApply(&bad));
 
+    // A failing entry must not stop later changes in the same batch:
+    // the delete below still applies, so this already-fired timer is
+    // disarmed instead of surfacing in a later harvest.
+    var armed = [1]posix.Kevent{.{
+        .ident = 0xBEEF,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+        .fflags = std.c.NOTE.ABSTIME,
+        .data = 1,
+        .udata = 0,
+    }};
+    _ = try posix.kevent(r.kq, &armed, &.{}, null);
+    var mixed = [2]posix.Kevent{
+        bad[0],
+        .{ .ident = 0xBEEF, .filter = std.c.EVFILT.TIMER, .flags = std.c.EV.DELETE, .fflags = 0, .data = 0, .udata = 0 },
+    };
+    try std.testing.expectError(error.KeventChange, r.keventApply(&mixed));
+    var evs: [8]posix.Kevent = undefined;
+    const ts = std.c.timespec{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+    const n = try posix.kevent(r.kq, &.{}, &evs, &ts);
+    for (evs[0..n]) |ev| {
+        try std.testing.expect(ev.ident != 0xBEEF);
+    }
 }
 
 test "dns-async: applying changes never drains the events a parent watches" {
