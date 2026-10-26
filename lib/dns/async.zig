@@ -267,7 +267,9 @@ pub const Resolver = struct {
     /// callback can still mark the job's remaining waiters. Loops
     /// restore the previous value on exit: a callback that completes
     /// another job synchronously (a cached resolve) must not lose the
-    /// outer job's cancel marks.
+    /// outer job's cancel marks. One slot, not a stack: a cancel of
+    /// the doubly-outer job issued from inside a doubly-nested
+    /// callback cannot be tracked this way.
     in_callback: ?*Job = null,
 
     fn noopCallback(_: ?*anyopaque, _: usize, _: Status, _: ?Resolution) void {}
@@ -806,8 +808,10 @@ pub const Resolver = struct {
 
     fn onDeadline(self: *Resolver, job: *Job) void {
         if (job.tries >= MAX_TRIES) {
-            // tries counts datagrams actually sent: the initial send
-            // plus each retransmission below.
+            // tries counts deadline firings: the initial send plus
+            // each re-armed deadline. On UDP a retry retransmits; on
+            // TCP it only retries connect/write progress and the
+            // staged frame is never resent once written.
             log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
             self.failQuery(job);
             return;
