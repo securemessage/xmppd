@@ -842,7 +842,7 @@ pub const Resolver = struct {
                 self.finishFallback(job);
             },
             .fallback_tlsa => {
-                for (job.targets.items) |*t| t.tlsa_status = .lookup_failed;
+                self.emitFallbackTargets(job, &.{}, .lookup_failed) catch return self.dropJob(job, .failed);
                 self.complete(job);
             },
             else => self.dropJob(job, .failed),
@@ -871,8 +871,15 @@ pub const Resolver = struct {
 
     /// The whole-chain bound fired: hand the waiters whatever targets
     /// were collected so far instead of failing an almost-done chain.
+    /// A target whose TLSA query is still pending at the bound is a
+    /// lookup_failed target (ADR-13), never a bare "no DANE" one.
     fn onChainDeadline(self: *Resolver, job: *Job) void {
         log.warn("dns: chain deadline exceeded for {s}", .{job.name});
+        switch (job.phase) {
+            .tlsa => self.emitTargets(job, &.{}, .lookup_failed) catch return self.dropJob(job, .failed),
+            .fallback_tlsa => self.emitFallbackTargets(job, &.{}, .lookup_failed) catch return self.dropJob(job, .failed),
+            else => {},
+        }
         if (job.targets.items.len > 0) {
             self.complete(job);
         } else {
@@ -1399,7 +1406,7 @@ pub const Resolver = struct {
                 self.emitAndAdvance(job, &.{}, .absent);
             },
             .fallback_tlsa => {
-                for (job.targets.items) |*t| t.tlsa_status = .absent;
+                self.emitFallbackTargets(job, &.{}, .absent) catch return self.dropJob(job, .failed);
                 self.complete(job);
             },
             .raw, .done => {},
@@ -1504,10 +1511,7 @@ pub const Resolver = struct {
                 // The fallback targets share one host: the same TLSA
                 // owner name covers every emitted address.
                 const status: TlsaStatus = if (saw) .present else .absent;
-                for (job.targets.items) |*t| {
-                    t.tlsa = self.dupeTlsa(tlsa_recs.items) catch &.{};
-                    t.tlsa_status = status;
-                }
+                self.emitFallbackTargets(job, tlsa_recs.items, status) catch return self.dropJob(job, .failed);
                 self.complete(job);
             },
             .fallback_addr => {
@@ -1670,30 +1674,47 @@ pub const Resolver = struct {
     /// Both fallback families have answered or failed: emit what
     /// arrived (AAAA first), answer nxdomain when nothing did, and
     /// report .failed only when a family query actually errored.
+    /// With want_tlsa the targets are held until the TLSA query
+    /// concludes: emitting them bare first would let a chain deadline
+    /// hand out "no DANE" targets whose lookup is still in flight.
     fn finishFallback(self: *Resolver, job: *Job) void {
         if (job.cur_addr4 == null and job.cur_addr6 == null) {
             return self.dropJob(job, if (job.fallback_err) .failed else .nxdomain);
         }
-        const addrs = [2]?net.Address{ job.cur_addr6, job.cur_addr4 };
-        for (addrs) |a| {
-            const addr = a orelse continue;
-            const host = self.alloc.dupe(u8, job.name) catch return self.dropJob(job, .failed);
-            job.targets.append(self.alloc, .{
-                .addr = addr,
-                .host = host,
-                .tlsa = &.{},
-                .tlsa_status = .absent,
-                .is_direct_tls = false,
-            }) catch {
-                self.alloc.free(host);
-                return self.dropJob(job, .failed);
-            };
+        if (!job.want_tlsa) {
+            self.emitFallbackTargets(job, &.{}, .absent) catch return self.dropJob(job, .failed);
+            return self.complete(job);
         }
-        if (!job.want_tlsa) return self.complete(job);
         job.phase = .fallback_tlsa;
         var buf: [280]u8 = undefined;
         const qname = dns.tlsaQueryName(&buf, job.default_port, job.name) catch return self.dropJob(job, .failed);
-        self.sendQuery(job, qname, KIND_TLSA) catch return self.dropJob(job, .failed);
+        self.sendQuery(job, qname, KIND_TLSA) catch {
+            self.emitFallbackTargets(job, &.{}, .lookup_failed) catch return self.dropJob(job, .failed);
+            return self.complete(job);
+        };
+    }
+
+    /// Emit the collected fallback addresses as targets under
+    /// `job.name`, each carrying the shared TLSA answer and status.
+    /// Idempotent: the collected addresses are cleared on emit.
+    fn emitFallbackTargets(self: *Resolver, job: *Job, tlsa_recs: []dns.TlsaRecord, status: TlsaStatus) !void {
+        const addrs = [2]?net.Address{ job.cur_addr6, job.cur_addr4 };
+        job.cur_addr4 = null;
+        job.cur_addr6 = null;
+        for (addrs) |a| {
+            const addr = a orelse continue;
+            if (job.targets.items.len >= TARGET_CAP) return;
+            const host = try self.alloc.dupe(u8, job.name);
+            errdefer self.alloc.free(host);
+            const tlsa = try self.dupeTlsa(tlsa_recs);
+            try job.targets.append(self.alloc, .{
+                .addr = addr,
+                .host = host,
+                .tlsa = tlsa,
+                .tlsa_status = status,
+                .is_direct_tls = false,
+            });
+        }
     }
 
     fn freeJob(self: *Resolver, job: *Job) void {
@@ -2782,6 +2803,61 @@ test "dns-async: the chain deadline completes with collected targets" {
     try std.testing.expectEqual(@as(usize, 1), res.targets.len);
     try std.testing.expectEqualStrings("t1.test", res.targets[0].host);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: the chain deadline marks pending fallback TLSA lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+    srv.a_aaaa.store(true, .monotonic);
+    srv.tlsa_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.chain_deadline_ms = 300;
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The bound fired while the shared fallback TLSA query was still
+    // pending: the waiting targets are temporary failures, not
+    // PKIX-eligible "no TLSA" ones.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), res.targets.len);
+    for (res.targets) |t| {
+        try std.testing.expectEqual(TlsaStatus.lookup_failed, t.tlsa_status);
+        try std.testing.expectEqual(@as(usize, 0), t.tlsa.len);
+    }
+}
+
+test "dns-async: the chain deadline marks a pending target TLSA lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    r.chain_deadline_ms = 300;
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
 test "dns-async: a hostile SRV answer is capped at 16 emitted targets" {
