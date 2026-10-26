@@ -925,7 +925,12 @@ one process). The hybrid model is where large servers converge.
 
 ---
 
-## XEPs Supported
+## XEPs Supported (Phase History)
+
+This table records the phase in which each XEP's support first shipped; it is a
+build history, not a compliance status. The README compliance table (and
+`xmppd.doap`) are the authority on current status, including partial support
+and known gaps.
 
 | XEP | Name | Phase |
 |-----|------|-------|
@@ -955,7 +960,7 @@ one process). The hybrid model is where large servers converge.
 | XEP-0352 | Client State Indication | v0.8.0 |
 | XEP-0359 | Unique Message and Stanza IDs | V1 |
 | XEP-0402 | PEP Native Bookmarks | v0.8.0 |
-| XEP-0440 | SASL Channel-Binding Type Capability | 9 |
+| XEP-0440 | SASL Channel-Binding Type Negotiation | planned (#24) |
 
 "V1" in the Phase column refers to the thread-per-core / actor work that shipped
 in v0.5.0–v0.6.0, not to pending work.
