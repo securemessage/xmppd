@@ -6649,6 +6649,247 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>normal-tail</body>") != null);
 }
 
+// H4: the G3 tests above start with an empty store, so none of them proves
+// that a live message lands behind rows that were already queued. Each of
+// these starts with a stored row and checks both the pointer order and the
+// order the drain puts on the wire.
+test "Server: H4 a cross-worker message lands behind an existing offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    // The row bob never received, stored before anything live arrives.
+    const tail = "<message from='alice@localhost/mobile' to='bob@localhost' id='tail-0' type='chat'><body>tail</body></message>";
+    try std.testing.expect(try offline_store.storeHeldPointer("bob@localhost", "alice@localhost/mobile", "tail-0", 1000, tail));
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.offline_pending = true;
+    server.sessions[5] = target;
+    const gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+
+    const live = "<message from='alice@localhost/mobile' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
+    try delivery_sys.deliver(0, 5, gen, live);
+
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.drainDeliveryQueue(&changes);
+
+    // Both are in the store, and the live one is behind the tail.
+    try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 2), ptrs.len);
+    try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
+    try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
+
+    // The drain puts the tail on the wire first.
+    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    _ = target.conn.flushSend() catch {};
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(target_fds[1], &buf) catch break;
+        if (n == 0) break;
+        try wire.appendSlice(allocator, buf[0..n]);
+    }
+    try std.testing.expect(!target.offline_pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    const tail_at = std.mem.indexOf(u8, wire.items, "<body>tail</body>");
+    const live_at = std.mem.indexOf(u8, wire.items, "<body>live</body>");
+    try std.testing.expect(tail_at != null);
+    try std.testing.expect(live_at != null);
+    try std.testing.expect(tail_at.? < live_at.?);
+}
+
+test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    const tail = "<message from='carol@example.com/res' to='bob@localhost' id='tail-0' type='chat'><body>tail</body></message>";
+    try std.testing.expect(try offline_store.storeHeldPointer("bob@localhost", "carol@example.com/res", "tail-0", 1000, tail));
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.offline_pending = true;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const live = "<message from='carol@example.com/res' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = live,
+    } }, &changes);
+
+    try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 2), ptrs.len);
+    try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
+    try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
+
+    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    _ = target.conn.flushSend() catch {};
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(target_fds[1], &buf) catch break;
+        if (n == 0) break;
+        try wire.appendSlice(allocator, buf[0..n]);
+    }
+    try std.testing.expect(!target.offline_pending);
+    const tail_at = std.mem.indexOf(u8, wire.items, "<body>tail</body>");
+    const live_at = std.mem.indexOf(u8, wire.items, "<body>live</body>");
+    try std.testing.expect(tail_at != null);
+    try std.testing.expect(live_at != null);
+    try std.testing.expect(tail_at.? < live_at.?);
+}
+
+test "Server: H4 a type normal message lands behind an existing offline tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    const tail = "<message from='alice@localhost/mobile' to='bob@localhost' id='tail-0' type='chat'><body>tail</body></message>";
+    try std.testing.expect(try offline_store.storeHeldPointer("bob@localhost", "alice@localhost/mobile", "tail-0", 1000, tail));
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.offline_pending = true;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "normal";
+    alice.stanza_id = "live-1";
+    const body = "<body>live</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 2), ptrs.len);
+    try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
+    try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
+
+    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    _ = target.conn.flushSend() catch {};
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = posix.read(target_fds[1], &buf) catch break;
+        if (n == 0) break;
+        try wire.appendSlice(allocator, buf[0..n]);
+    }
+    try std.testing.expect(!target.offline_pending);
+    const tail_at = std.mem.indexOf(u8, wire.items, "<body>tail</body>");
+    const live_at = std.mem.indexOf(u8, wire.items, "<body>live</body>");
+    try std.testing.expect(tail_at != null);
+    try std.testing.expect(live_at != null);
+    try std.testing.expect(tail_at.? < live_at.?);
+}
+
 // S13: a message stored offline for an absent recipient points at an archive
 // row that may still be sitting in the async writer queue. The payload is
 // stored with the pointer, so the drain delivers it even when the archive row
