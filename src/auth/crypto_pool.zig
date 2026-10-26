@@ -250,6 +250,59 @@ test "CryptoPool: more than eight completions wait without a drain" {
     for (seen) |s| try std.testing.expect(s);
 }
 
+test "CryptoPool: the wake follows a visible completion" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("visible", @splat(4), 1);
+    const id = try putTestJob(&pool, "visible", @splat(4), 1, creds.stored_key);
+
+    // Hold the completion lock and poll for a wake. A worker that writes the
+    // wake before publishing leaves the list empty at that moment.
+    pool.completion_mutex.lock();
+    var saw_wake = false;
+    var bad = false;
+    var buf: [1]u8 = undefined;
+    const until = std.time.milliTimestamp() + 200;
+    while (std.time.milliTimestamp() < until) {
+        const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => {
+                pool.completion_mutex.unlock();
+                return err;
+            },
+        };
+        if (n > 0) {
+            saw_wake = true;
+            bad = pool.completions.items.len == 0;
+            break;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    pool.completion_mutex.unlock();
+    try std.testing.expect(!bad);
+
+    if (!saw_wake) {
+        const deadline = std.time.milliTimestamp() + 3000;
+        while (std.time.milliTimestamp() < deadline) {
+            const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
+            };
+            if (n > 0) {
+                saw_wake = true;
+                break;
+            }
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expect(saw_wake);
+
+    const c = pool.popCompletion() orelse return error.NoCompletion;
+    try std.testing.expectEqual(id, c.id);
+}
+
 test "CryptoPool: derive matches inline computation" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     try pool.start(2);
