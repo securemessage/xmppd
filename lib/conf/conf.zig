@@ -579,10 +579,11 @@ pub fn Loader(
 
         /// Serializes the resolved config as "--name=value" pairs (flags as
         /// bare "--name") so a master can forward it to children. Allocates
-        /// the argv array and formatted values from `arena`.
-        pub fn forwardArgs(self: *const Self, arena: Allocator) Allocator.Error![]const []const u8 {
+        /// the argv array and formatted values from `arena`. A formatted
+        /// value past the 4 KiB scratch is FileTooLarge, not a panic.
+        pub fn forwardArgs(self: *const Self, arena: Allocator) Error![]const []const u8 {
             var list = std.ArrayList([]const u8).empty;
-            var buf: [512]u8 = undefined;
+            var buf: [4096]u8 = undefined;
             inline for (cli, 0..) |c, i| {
                 const v = @field(@field(self.values, fields[cli_targets[i]].section), fields[cli_targets[i]].field);
                 if (c.flag) |sets| {
@@ -591,7 +592,7 @@ pub fn Loader(
                     }
                 } else {
                     var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch unreachable;
+                    writeValue(field_types[cli_targets[i]], &w, v) catch return error.FileTooLarge;
                     try list.append(arena, try std.fmt.allocPrint(arena, "--{s}={s}", .{ c.name, w.buffered() }));
                 }
             }
@@ -604,7 +605,7 @@ pub fn Loader(
         /// form and is rejected with a diagnostic naming the key.
         pub fn forwardBlob(self: *const Self, arena: Allocator, diag: *Diag) Error![]u8 {
             var blob = std.ArrayList(u8).empty;
-            var buf: [512]u8 = undefined;
+            var buf: [4096]u8 = undefined;
             inline for (cli, 0..) |c, i| {
                 const v = @field(@field(self.values, fields[cli_targets[i]].section), fields[cli_targets[i]].field);
                 if (c.flag) |sets| {
@@ -615,12 +616,13 @@ pub fn Loader(
                     }
                 } else {
                     var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch unreachable;
+                    writeValue(field_types[cli_targets[i]], &w, v) catch return error.FileTooLarge;
                     const val = w.buffered();
                     if (std.mem.indexOfScalar(u8, val, '\n') != null) {
+                        var kbuf: [160]u8 = undefined;
                         diag.set(.{
-                            .key = try std.fmt.allocPrint(arena, "--{s}", .{c.name}),
-                            .value = try arena.dupe(u8, val),
+                            .key = std.fmt.bufPrint(&kbuf, "--{s}", .{c.name}) catch c.name,
+                            .value = val,
                             .detail = "value contains a newline and cannot be forwarded",
                         });
                         return error.BadValue;
@@ -638,7 +640,6 @@ pub fn Loader(
         /// Generated --help: every CLI option, then every file key, each
         /// with its help text and default.
         pub fn writeHelp(self: *const Self, w: *std.Io.Writer) std.Io.Writer.Error!void {
-            var buf: [512]u8 = undefined;
             try w.writeAll("Options:\n");
             inline for (cli, 0..) |c, i| {
                 const f = fields[cli_targets[i]];
@@ -654,9 +655,8 @@ pub fn Loader(
             inline for (fields, 0..) |f, i| {
                 if (!f.in_file) continue;
                 const v = @field(@field(self.values, f.section), f.field);
-                var vw: std.Io.Writer = .fixed(&buf);
-                writeValue(field_types[i], &vw, v) catch unreachable;
-                try w.print("  [{s}] {s:<28} default: {s}", .{ f.section, keyOf(f), vw.buffered() });
+                try w.print("  [{s}] {s:<28} default: ", .{ f.section, keyOf(f) });
+                try writeValue(field_types[i], w, v);
                 if (f.aliases.len != 0) {
                     try w.writeAll("  aliases:");
                     for (f.aliases) |a| try w.print(" {s}", .{a});
