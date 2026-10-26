@@ -823,7 +823,13 @@ pub const Resolver = struct {
                 job.phase = .addr6;
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
-            .addr6, .tlsa => self.finishTarget(job),
+            .addr6 => self.finishTarget(job),
+            .tlsa => {
+                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+                job.cur_addr4 = null;
+                job.cur_addr6 = null;
+                self.nextTarget(job) catch return self.dropJob(job, .failed);
+            },
             .fallback_addr => {
                 job.fallback_err = true;
                 job.phase = .fallback_addr4;
@@ -838,13 +844,30 @@ pub const Resolver = struct {
         }
     }
 
-    /// End the current SRV target after a failure: emit whichever
-    /// address families did resolve, then move to the next target in
-    /// RFC 2782 order. Only a target with nothing resolved is skipped.
+    /// End the current SRV target after an address-family failure:
+    /// emit whichever families resolved, then move to the next target
+    /// in RFC 2782 order. A caller wanting DANE still gets the TLSA
+    /// round trip for the target's surviving addresses; only a target
+    /// with nothing resolved is skipped outright.
     fn finishTarget(self: *Resolver, job: *Job) void {
-        if (job.cur_addr4 != null or job.cur_addr6 != null) {
-            self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+        if (job.cur_addr4 == null and job.cur_addr6 == null) {
+            job.cur_addr4 = null;
+            job.cur_addr6 = null;
+            self.nextTarget(job) catch return self.dropJob(job, .failed);
+            return;
         }
+        if (job.want_tlsa) {
+            job.phase = .tlsa;
+            self.sendTlsa(job) catch {
+                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
+                job.cur_addr4 = null;
+                job.cur_addr6 = null;
+                self.nextTarget(job) catch return self.dropJob(job, .failed);
+                return;
+            };
+            return;
+        }
+        self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
         job.cur_addr4 = null;
         job.cur_addr6 = null;
         self.nextTarget(job) catch return self.dropJob(job, .failed);
@@ -3465,6 +3488,32 @@ test "dns-async: an A NXDOMAIN still yields the AAAA address" {
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), res.targets.len);
     try std.testing.expectEqual(@as(u16, posix.AF.INET6), res.targets[0].addr.any.family);
+}
+
+test "dns-async: a failed AAAA still runs the TLSA query when wanted" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.aaaa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The AAAA refusal is a failure of that family, not of the target:
+    // the resolved A address still gets its TLSA lookup.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[0].addr.any.family);
+    try std.testing.expect(res.targets[0].tlsa.len >= 1);
 }
 
 test "dns-async: parsed SRV entries are capped at 32" {
