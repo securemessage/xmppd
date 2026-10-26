@@ -103,7 +103,10 @@ pub fn verifyKey(
 ) bool {
     if (received_key_hex.len != KEY_HEX_LEN) return false;
     const expected = computeKeyHex(secret, target, origin, stream_id);
-    return std.mem.eql(u8, &expected, received_key_hex);
+    // Constant-time: this compares an HMAC-derived dialback key (T261).
+    var got_bytes: [KEY_HEX_LEN]u8 = undefined;
+    @memcpy(&got_bytes, received_key_hex);
+    return std.crypto.timing_safe.eql([KEY_HEX_LEN]u8, expected, got_bytes);
 }
 
 /// Build a `<db:result>` stanza (initiating server sends this).
@@ -117,12 +120,13 @@ pub fn buildDbResult(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:result xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(origin);
+    try esc(w, origin);
     try w.writeAll("' to='");
-    try w.writeAll(target);
+    try esc(w, target);
     try w.writeAll("'>");
-    try w.writeAll(key_hex);
+    try esc(w, key_hex); // normally local HMAC hex; escape anyway (S1)
     try w.writeAll("</db:result>");
     return fbs.getWritten();
 }
@@ -138,14 +142,30 @@ pub fn buildDbResultResponse(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:result xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' type='");
     try w.writeAll(if (valid) "valid" else "invalid");
     try w.writeAll("'/>");
     return fbs.getWritten();
+}
+
+/// Whether text has the shape of a dialback key: exactly 64 lowercase-hex
+/// characters (computeKeyHex output). The callback path re-emits a captured
+/// peer key, which may have contained entity-decoded markup (S1),
+/// so capture validates against this and builders escape regardless.
+pub fn isValidKeyHex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |ch| {
+        switch (ch) {
+            '0'...'9', 'a'...'f' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 /// Build a `<db:verify>` stanza (receiving server sends this to the authoritative server).
@@ -160,14 +180,15 @@ pub fn buildDbVerify(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:verify xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' id='");
-    try w.writeAll(stream_id);
+    try esc(w, stream_id);
     try w.writeAll("'>");
-    try w.writeAll(key_hex);
+    try esc(w, key_hex);
     try w.writeAll("</db:verify>");
     return fbs.getWritten();
 }
@@ -184,12 +205,13 @@ pub fn buildDbVerifyResponse(
 ) ![]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
     try w.writeAll("<db:verify xmlns:db='jabber:server:dialback' from='");
-    try w.writeAll(from);
+    try esc(w, from);
     try w.writeAll("' to='");
-    try w.writeAll(to);
+    try esc(w, to);
     try w.writeAll("' id='");
-    try w.writeAll(stream_id);
+    try esc(w, stream_id);
     try w.writeAll("' type='");
     try w.writeAll(if (valid) "valid" else "invalid");
     try w.writeAll("'/>");
@@ -426,6 +448,13 @@ test "buildDbResult: correct XML format" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "</db:result>") != null);
 }
 
+test "buildDbResult: from/to attrs escaped" {
+    var buf: [512]u8 = undefined;
+    const key = [_]u8{'a'} ** KEY_HEX_LEN;
+    const xml = try buildDbResult(&buf, "a'&\"<>.example", "b.example", &key);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "a&apos;&amp;&quot;&lt;&gt;.example") != null);
+}
+
 test "buildDbResultResponse: valid response" {
     var buf: [256]u8 = undefined;
     const xml = try buildDbResultResponse(&buf, "b.example", "a.example", true);
@@ -577,4 +606,41 @@ test "hexEncode: known value" {
     const input = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF } ++ [_]u8{0} ** 28;
     const hex = hexEncode(&input);
     try std.testing.expect(std.mem.startsWith(u8, &hex, "deadbeef"));
+}
+
+test "isValidKeyHex: exactly 64 lowercase hex" {
+    const secret = [_]u8{0x42} ** SECRET_LEN;
+    const key_hex = computeKeyHex(&secret, "b.example", "a.example", "s2s-1");
+    try std.testing.expect(isValidKeyHex(&key_hex));
+    try std.testing.expectEqual(@as(usize, 64), key_hex.len);
+
+    try std.testing.expect(!isValidKeyHex(""));
+    try std.testing.expect(!isValidKeyHex("deadbeef"));
+
+    var longer: [65]u8 = undefined;
+    @memcpy(longer[0..64], &key_hex);
+    longer[64] = 'f';
+    try std.testing.expect(!isValidKeyHex(&longer));
+
+    var nonhex = key_hex;
+    nonhex[0] = 'G';
+    try std.testing.expect(!isValidKeyHex(&nonhex));
+
+    var upper = key_hex;
+    // Force an uppercase hex letter somewhere (first hex letter, fallback 1).
+    var i: usize = 0;
+    while (i < 64 and (key_hex[i] < 'a' or key_hex[i] > 'f')) : (i += 1) {}
+    try std.testing.expect(i < 64);
+    upper[i] = std.ascii.toUpper(upper[i]);
+    try std.testing.expect(!isValidKeyHex(&upper));
+
+    // Entity-decoded markup in a captured key.
+    try std.testing.expect(!isValidKeyHex("</db:result><message from='victim.example' to='x@us.example'><body/padding padding padding padd</"));
+}
+
+test "buildDbVerify escapes even a hostile captured key" {
+    var buf: [2048]u8 = undefined;
+    const out = try buildDbVerify(&buf, "us.example", "them.example", "s2s-1", "</db:verify><message/>");
+    try std.testing.expect(std.mem.indexOf(u8, out, "</db:verify><message/>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&lt;/db:verify&gt;") != null);
 }

@@ -17,8 +17,8 @@ const backend = @import("backend");
 /// strings here carry an 8-byte timestamp, so they cannot reuse join2.
 const MAX_KEY_LEN = 511;
 
-const NS_MESSAGES = "messages";
-const NS_BY_CONTACT = "by_contact";
+pub const NS_MESSAGES = backend.registered("messages");
+pub const NS_BY_CONTACT = backend.registered("by_contact");
 
 /// A stored archive message with metadata.
 pub const ArchivedMessage = struct {
@@ -91,10 +91,40 @@ pub fn ArchiveStore(comptime Backend: type) type {
             const contact_key = try self.buildContactKey(owner, with, timestamp);
             defer self.allocator.free(contact_key);
 
-            // Atomic write: message + contact index
+            // Atomic write: message + contact index. A failed put (MAP_FULL)
+            // must end the write txn: leaking it pins the writer lock (S9).
+            // The errdefer covers the puts only; a failed commit has already
+            // ended the batch.
             var batch = try self.db.writeBatch();
-            try batch.put(NS_MESSAGES, primary_key, stanza_xml);
-            try batch.put(NS_BY_CONTACT, contact_key, stanza_id);
+            {
+                errdefer batch.abort();
+                try batch.put(NS_MESSAGES, primary_key, stanza_xml);
+                try batch.put(NS_BY_CONTACT, contact_key, stanza_id);
+            }
+            try batch.commit();
+        }
+
+        /// Store several messages in one backend write batch: one commit
+        /// per call, aborted as a whole on error. Items must carry
+        /// owner/with/stanza_id/timestamp/stanza_xml fields.
+        pub fn storeAll(self: *Self, items: anytype) !void {
+            if (items.len == 0) return;
+            var batch = try self.db.writeBatch();
+            {
+                // The abort covers the put loop only: commit destroys the
+                // batch on success and on failure (rocksdb_writebatch_destroy
+                // runs before the error return; mdb_txn_commit frees the
+                // txn), so aborting after a failed commit double-frees.
+                errdefer batch.abort();
+                for (items) |it| {
+                    const primary_key = try self.buildPrimaryKey(it.owner, it.timestamp, it.stanza_id);
+                    defer self.allocator.free(primary_key);
+                    const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp);
+                    defer self.allocator.free(contact_key);
+                    try batch.put(NS_MESSAGES, primary_key, it.stanza_xml);
+                    try batch.put(NS_BY_CONTACT, contact_key, it.stanza_id);
+                }
+            }
             try batch.commit();
         }
 
@@ -155,8 +185,13 @@ pub fn ArchiveStore(comptime Backend: type) type {
             if (keys_to_delete.items.len == 0) return 0;
 
             var batch = try self.db.writeBatch();
-            for (keys_to_delete.items) |k| {
-                try batch.delete(NS_MESSAGES, k);
+            {
+                // A failed delete must not leak the writer lock (S9); the
+                // errdefer covers the deletes only, never the commit.
+                errdefer batch.abort();
+                for (keys_to_delete.items) |k| {
+                    try batch.delete(NS_MESSAGES, k);
+                }
             }
             try batch.commit();
 
@@ -385,6 +420,91 @@ pub fn ArchiveStore(comptime Backend: type) type {
 // ============================================================================
 
 const MemoryBackend = backend.MemoryBackend;
+const FailBatchBackend = backend.FailBatchBackend;
+
+test "ArchiveStore: a failed batch put aborts the write txn" {
+    const allocator = std.testing.allocator;
+    var db = try FailBatchBackend.open("", .{});
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    // The map-full failure must propagate AND the errdefer must end the
+    // batch: a leaked write txn pins the backend's writer lock.
+    try std.testing.expectError(error.MapFull, store.store("alice@us.example", "bob@them.example", "msg-1", 1000, "<message/>"));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
+
+test "ArchiveStore: a failed retention batch aborts the write txn" {
+    const allocator = std.testing.allocator;
+
+    // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.
+    const owner = "alice@us.example";
+    var key_buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&key_buf);
+    const w = fbs.writer();
+    try w.writeAll(owner);
+    try w.writeByte(0);
+    var ts: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ts, 1000, .big);
+    try w.writeAll(&ts);
+    try w.writeByte(0);
+    try w.writeAll("msg-1");
+    const entry = backend.Entry{ .key = key_buf[0..fbs.pos], .value = "<message/>" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.iter_entries = &.{entry};
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    try std.testing.expectError(error.MapFull, store.deleteOlderThan(owner, 2000));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
+
+test "ArchiveStore: a failed batch commit is not aborted again" {
+    const allocator = std.testing.allocator;
+    var db = try FailBatchBackend.open("", .{});
+    db.fail_ops = false;
+    db.fail_commit = true;
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    // mdb_txn_commit aborts its txn on failure: the batch is already ended
+    // and abort() must not run after it (it would free env->me_txn0).
+    try std.testing.expectError(error.MapFull, store.store("alice@us.example", "bob@them.example", "msg-1", 1000, "<message/>"));
+    try std.testing.expectEqual(@as(usize, 1), db.commit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+    try std.testing.expectEqual(@as(usize, 0), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.abort_after_commit);
+}
+
+test "ArchiveStore: a failed retention batch commit is not aborted again" {
+    const allocator = std.testing.allocator;
+
+    // One archived entry older than the cutoff: owner\x00ts_be(8)\x00id.
+    const owner = "alice@us.example";
+    var key_buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&key_buf);
+    const w = fbs.writer();
+    try w.writeAll(owner);
+    try w.writeByte(0);
+    var ts: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ts, 1000, .big);
+    try w.writeAll(&ts);
+    try w.writeByte(0);
+    try w.writeAll("msg-1");
+    const entry = backend.Entry{ .key = key_buf[0..fbs.pos], .value = "<message/>" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.fail_ops = false;
+    db.fail_commit = true;
+    db.iter_entries = &.{entry};
+    var store = ArchiveStore(FailBatchBackend).init(&db, allocator);
+
+    try std.testing.expectError(error.MapFull, store.deleteOlderThan(owner, 2000));
+    try std.testing.expectEqual(@as(usize, 1), db.commit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+    try std.testing.expectEqual(@as(usize, 0), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.abort_after_commit);
+}
 
 fn freeQueryResult(allocator: std.mem.Allocator, result: *QueryResult) void {
     for (result.messages) |msg| {
@@ -524,4 +644,80 @@ test "ArchiveStore: S4 over-long owner is rejected with KeyTooLong" {
     var long_owner: [600]u8 = undefined;
     @memset(&long_owner, 'a');
     try std.testing.expectError(error.KeyTooLong, store.store(&long_owner, "bob@localhost", "s1", 1, "<message/>"));
+}
+
+/// Test backend whose write batch always fails inside commit. Counts
+/// abort calls so the test can prove a failed commit is never followed
+/// by abort: the real backends destroy the batch inside commit, so a
+/// second destroy would be a double free.
+const FailCommitBackend = struct {
+    const Self = @This();
+
+    abort_calls: usize = 0,
+    compound_mutex: std.Thread.Mutex = .{},
+
+    pub fn open(_: []const u8, _: backend.OpenOptions) !Self {
+        return .{};
+    }
+
+    pub fn close(_: *Self) void {}
+
+    pub fn get(_: *Self, _: std.mem.Allocator, _: []const u8, _: []const u8) !?[]u8 {
+        return null;
+    }
+
+    pub fn put(_: *Self, _: []const u8, _: []const u8, _: []const u8) !void {}
+
+    pub fn delete(_: *Self, _: []const u8, _: []const u8) !void {}
+
+    pub const Iterator = struct {
+        pub fn next(_: *Iterator) ?backend.Entry {
+            return null;
+        }
+
+        pub fn deinit(_: *Iterator) void {}
+    };
+
+    pub fn iterator(_: *Self, _: []const u8, _: []const u8) !Iterator {
+        return .{};
+    }
+
+    pub const WriteBatch = struct {
+        backend: *Self,
+
+        pub fn put(_: *WriteBatch, _: []const u8, _: []const u8, _: []const u8) !void {}
+
+        pub fn delete(_: *WriteBatch, _: []const u8, _: []const u8) !void {}
+
+        pub fn commit(_: *WriteBatch) !void {
+            return error.CommitFailed;
+        }
+
+        pub fn abort(self: *WriteBatch) void {
+            self.backend.abort_calls += 1;
+        }
+    };
+
+    pub fn writeBatch(self: *Self) !WriteBatch {
+        return .{ .backend = self };
+    }
+};
+
+test "ArchiveStore: storeAll never aborts after a failed commit" {
+    var db = try FailCommitBackend.open("", .{});
+    defer db.close();
+
+    var store = ArchiveStore(FailCommitBackend).init(&db, std.testing.allocator);
+    const jobs = [_]struct {
+        owner: []const u8,
+        with: []const u8,
+        stanza_id: []const u8,
+        timestamp: u64,
+        stanza_xml: []const u8,
+    }{
+        .{ .owner = "a@x.test", .with = "b@x.test", .stanza_id = "m-1", .timestamp = 1, .stanza_xml = "<m/>" },
+    };
+
+    try std.testing.expectError(error.CommitFailed, store.storeAll(&jobs));
+    try std.testing.expectEqual(@as(usize, 0), db.abort_calls);
 }

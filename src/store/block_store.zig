@@ -18,7 +18,7 @@ const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.block_store);
 
-const NAMESPACE = "blocklist";
+pub const NAMESPACE = backend_mod.registered("blocklist");
 
 pub fn BlockStore(comptime Backend: type) type {
     comptime backend_mod.assertBackend(Backend);

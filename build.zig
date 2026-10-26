@@ -501,6 +501,29 @@ pub fn build(b: *std.Build) void {
     server_pep_store_mod.addImport("backend", server_backend_mod);
     server_pep_store_mod.addImport("store_keys", store_keys_mod);
     server_test_mod.addImport("pep_store", server_pep_store_mod);
+    // The server namespace-registry test sees every store owner constant.
+    const server_user_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/user_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_user_store_mod.addImport("backend", server_backend_mod);
+    server_user_store_mod.addImport("sasl", sasl_mod);
+    server_test_mod.addImport("user_store", server_user_store_mod);
+    const server_lock_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/lock_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_lock_store_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("lock_store", server_lock_store_mod);
+    const server_invite_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/invite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_invite_store_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("invite_store", server_invite_store_mod);
     server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
@@ -756,6 +779,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_connector_test_mod.addImport("xml", xml_mod);
     s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
     s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -775,6 +799,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_dane_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dane_test_mod.addImport("xml", xml_mod);
     s2s_dane_test_mod.linkSystemLibrary("ssl", .{});
     s2s_dane_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -791,7 +816,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/s2s/dialback.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    // dialback re-uses the session's XML escaping (S1); session.zig then
+    // pulls in ssl/xml/connector for the test module.
+    s2s_dialback_test_mod.addImport("xml", xml_mod);
+    s2s_dialback_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dialback_test_mod.linkSystemLibrary("ssl", .{});
+    s2s_dialback_test_mod.linkSystemLibrary("crypto", .{});
 
     const s2s_dialback_tests = b.addTest(.{
         .name = "s2s-dialback-tests",
@@ -809,6 +841,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     s2s_session_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_session_test_mod.addImport("xml", xml_mod);
     s2s_session_test_mod.linkSystemLibrary("ssl", .{});
     s2s_session_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1225,6 +1258,26 @@ pub fn build(b: *std.Build) void {
 
     const run_jwt_tests = b.addRunArtifact(jwt_tests);
 
+    // --- OIDC store tests ---
+    const oidc_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/oidc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    oidc_store_test_mod.addImport("http", http_test_mod);
+    oidc_store_test_mod.addImport("jwt", jwt_test_mod);
+    oidc_store_test_mod.addImport("ssl", ssl_mod);
+    oidc_store_test_mod.linkSystemLibrary("ssl", .{});
+    oidc_store_test_mod.linkSystemLibrary("crypto", .{});
+
+    const oidc_store_tests = b.addTest(.{
+        .name = "oidc-store-tests",
+        .root_module = oidc_store_test_mod,
+    });
+
+    const run_oidc_store_tests = b.addRunArtifact(oidc_store_tests);
+
     // --- Shared logging module ---
     const xmppd_log_mod = b.createModule(.{
         .root_source_file = b.path("src/log.zig"),
@@ -1299,6 +1352,14 @@ pub fn build(b: *std.Build) void {
         .root_module = master_mod,
     });
     b.installArtifact(master_exe);
+
+    // xmppd master tests (same module instance; Zig forbids re-rooting)
+    const master_tests = b.addTest(.{
+        .name = "master-tests",
+        .root_module = master_mod,
+    });
+    master_tests.root_module.link_libc = true;
+    const run_master_tests = b.addRunArtifact(master_tests);
 
     // xmppd-auth: the authentication daemon
     const auth_ipc_protocol_mod = b.createModule(.{
@@ -1423,6 +1484,7 @@ pub fn build(b: *std.Build) void {
     });
     oidc_store_mod.addImport("http", http_mod);
     oidc_store_mod.addImport("jwt", jwt_mod);
+    oidc_store_mod.addImport("ssl", ssl_mod);
     oidc_store_mod.linkSystemLibrary("ssl", .{});
     oidc_store_mod.linkSystemLibrary("crypto", .{});
 
@@ -1457,6 +1519,8 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_main_mod.addImport("op_backend", auth_op_backend_mod);
     oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
     oidc_main_mod.linkSystemLibrary("crypto", .{});
@@ -1466,6 +1530,14 @@ pub fn build(b: *std.Build) void {
         .root_module = oidc_main_mod,
     });
     b.installArtifact(oidc_exe);
+
+    // The OIDC daemon's start path is only under test when the daemon source
+    // is compiled by the test step.
+    const oidc_main_tests = b.addTest(.{
+        .name = "auth-oidc-tests",
+        .root_module = oidc_main_mod,
+    });
+    const run_oidc_main_tests = b.addRunArtifact(oidc_main_tests);
 
     // xmppd-s2s: the S2S federation daemon
     const s2s_ipc_protocol_mod = b.createModule(.{
@@ -1580,10 +1652,21 @@ pub fn build(b: *std.Build) void {
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
-    // T87: archive write queue tests (module defined next to core_mod)
+    // T87: archive write queue tests. A separate module on the same root
+    // file carries the store/backend imports; archive_queue_mod itself
+    // stays dependency-free for the production binaries.
+    const archive_queue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/archive_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    archive_queue_test_mod.addImport("archive_store", archive_store_test_mod);
+    archive_queue_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+    archive_queue_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
     const archive_queue_tests = b.addTest(.{
         .name = "archive-queue-tests",
-        .root_module = archive_queue_mod,
+        .root_module = archive_queue_test_mod,
     });
     const run_archive_queue_tests = b.addRunArtifact(archive_queue_tests);
 
@@ -1609,6 +1692,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_auth_handler_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
+    test_step.dependOn(&run_master_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
@@ -1647,6 +1731,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
+    test_step.dependOn(&run_oidc_store_tests.step);
+    test_step.dependOn(&run_oidc_main_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
 }

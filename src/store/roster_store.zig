@@ -23,7 +23,7 @@ const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.roster_store);
 
-const NAMESPACE = "rosters";
+pub const NAMESPACE = backend_mod.registered("rosters");
 
 pub const Subscription = enum(u8) {
     none = 0,

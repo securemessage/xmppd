@@ -702,7 +702,7 @@ fn repairFirstOfflinePointerForTest(db: *op_backend.Backend) !void {
 
     var batch = try db.writeBatch();
     errdefer batch.abort();
-    try batch.put("offline_v2", &key, &value);
+    try batch.put(offline_store_mod.NS_OFFLINE_V2, &key, &value);
     try batch.commit();
 }
 
@@ -1259,8 +1259,8 @@ test "G2: a legacy offline row drains before newly sequenced rows" {
     std.mem.writeInt(u64, legacy_key[recipient.len + 1 ..][0..8], 3000, .big);
     legacy_key[recipient.len + 1 + 8] = 0;
     @memcpy(legacy_key[recipient.len + 1 + 8 + 1 ..], legacy_id);
-    try op_db.put("offline", legacy_key, "alice@localhost");
-    try op_db.put("offline_hold", legacy_key, legacy_xml);
+    try op_db.put(offline_store_mod.NS_OFFLINE, legacy_key, "alice@localhost");
+    try op_db.put(offline_store_mod.NS_OFFLINE_HOLD, legacy_key, legacy_xml);
 
     const new_xml = "<message id='new'><body>new-second</body></message>";
     try std.testing.expect(try offline_store.storeHeldPointer(recipient, "alice@localhost", "new", 1000, new_xml));

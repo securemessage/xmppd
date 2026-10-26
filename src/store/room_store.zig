@@ -25,8 +25,8 @@ const backend = @import("backend");
 /// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
 const MAX_KEY_LEN = 511;
 
-const NS_ROOMS = "rooms";
-const NS_AFFILIATIONS = "room_affiliations";
+pub const NS_ROOMS = backend.registered("rooms");
+pub const NS_AFFILIATIONS = backend.registered("room_affiliations");
 
 /// MUC role — runtime only, not persisted.
 pub const Role = enum(u8) {
@@ -707,7 +707,7 @@ test "RoomStore: S4 affiliation keys bounded at 511, destroyRoom clears long key
     try store.saveRoom(room_jid, &config);
     try store.destroyRoom(room_jid);
 
-    var iter = try db.iterator("room_affiliations", room_jid);
+    var iter = try db.iterator(NS_AFFILIATIONS, room_jid);
     defer iter.deinit();
     try std.testing.expect(iter.next() == null);
 }

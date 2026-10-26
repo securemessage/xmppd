@@ -23,11 +23,11 @@ const backend = @import("backend");
 /// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
 const MAX_KEY_LEN = 511;
 
-const NS_OFFLINE = "offline";
-const NS_OFFLINE_HOLD = "offline_hold";
-const NS_OFFLINE_V2 = "offline_v2";
-const NS_OFFLINE_HOLD_V2 = "offline_hold_v2";
-const NS_OFFLINE_SEQ = "offline_seq";
+pub const NS_OFFLINE = backend.registered("offline");
+pub const NS_OFFLINE_HOLD = backend.registered("offline_hold");
+pub const NS_OFFLINE_V2 = backend.registered("offline_v2");
+pub const NS_OFFLINE_HOLD_V2 = backend.registered("offline_hold_v2");
+pub const NS_OFFLINE_SEQ = backend.registered("offline_seq");
 
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;
@@ -162,10 +162,14 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             if (keys.items.len == 0) return;
 
             var batch = try self.db.writeBatch();
-            errdefer batch.abort();
-            for (keys.items) |item| {
-                try batch.delete(if (item.is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, item.key);
-                try batch.delete(if (item.is_v2) NS_OFFLINE_V2 else NS_OFFLINE, item.key);
+            {
+                // Abort only delete failures; commit destroys the batch on
+                // both success and failure.
+                errdefer batch.abort();
+                for (keys.items) |item| {
+                    try batch.delete(if (item.is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, item.key);
+                    try batch.delete(if (item.is_v2) NS_OFFLINE_V2 else NS_OFFLINE, item.key);
+                }
             }
             try batch.commit();
         }
@@ -378,6 +382,41 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 // ============================================================================
 
 const MemoryBackend = backend.MemoryBackend;
+const FailBatchBackend = backend.FailBatchBackend;
+
+test "GenericOfflineStore: a failed clearAll batch aborts the write txn" {
+    const allocator = std.testing.allocator;
+    const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.iter_entries = &.{entry};
+    var store = GenericOfflineStore(FailBatchBackend).init(&db, allocator);
+
+    // The map-full failure must propagate AND the errdefer must end the
+    // batch: a leaked write txn pins the backend's writer lock.
+    try std.testing.expectError(error.MapFull, store.clearAll("bob@us.example"));
+    try std.testing.expectEqual(@as(usize, 1), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+}
+
+test "GenericOfflineStore: a failed clearAll commit is not aborted again" {
+    const allocator = std.testing.allocator;
+    const entry = backend.Entry{ .key = "bob@us.example\x00msg-1", .value = "ptr" };
+
+    var db = try FailBatchBackend.open("", .{});
+    db.fail_ops = false;
+    db.fail_commit = true;
+    db.iter_entries = &.{entry};
+    var store = GenericOfflineStore(FailBatchBackend).init(&db, allocator);
+
+    // mdb_txn_commit aborts its txn on failure: the batch is already ended
+    // and abort() must not run after it (it would free env->me_txn0).
+    try std.testing.expectError(error.MapFull, store.clearAll("bob@us.example"));
+    try std.testing.expectEqual(@as(usize, 1), db.commit_attempts);
+    try std.testing.expectEqual(@as(usize, 0), db.committed);
+    try std.testing.expectEqual(@as(usize, 0), db.aborted);
+    try std.testing.expectEqual(@as(usize, 0), db.abort_after_commit);
+}
 
 test "GenericOfflineStore: store and retrieve pointers" {
     var db = try MemoryBackend.open("", .{});
