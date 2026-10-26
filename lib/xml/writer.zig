@@ -60,15 +60,68 @@ const v_ef: ByteVec = @splat(0xEF);
 const span_max_attrs = 32;
 const span_max_decls = 64;
 
-const SpanAttr = struct { name: []const u8, prefix: []const u8 };
-const SpanDecl = struct { depth: usize, prefix: []const u8, uri: []const u8 };
+/// A half-open byte range into the caller's span input. Names,
+/// prefixes and URIs tracked while validating are ranges over those
+/// bytes, never slices into the scanner's token arena: a scanner may
+/// reset that arena between sibling elements and free anything a slice
+/// still points at, while the caller's bytes outlive the whole pass.
+const SpanRange = struct { start: usize, end: usize };
+
+const SpanQName = struct { prefix: SpanRange, local: SpanRange };
+
+const SpanAttr = struct { name: SpanRange };
+const SpanDecl = struct { depth: usize, prefix: SpanRange, uri: SpanRange };
+
+fn spanSlice(bytes: []const u8, r: SpanRange) []const u8 {
+    return bytes[r.start..r.end];
+}
+
+/// 'prefix:local' split at the first colon; an empty range means the
+/// name carries no prefix.
+fn spanQName(bytes: []const u8, r: SpanRange) SpanQName {
+    if (std.mem.indexOfScalar(u8, bytes[r.start..r.end], ':')) |colon| {
+        return .{
+            .prefix = .{ .start = r.start, .end = r.start + colon },
+            .local = .{ .start = r.start + colon + 1, .end = r.end },
+        };
+    }
+    return .{ .prefix = .{ .start = r.start, .end = r.start }, .local = r };
+}
+
+fn isSpanWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// The element name range after a '<' at `lt`: through the first
+/// whitespace or '>', or a '/' immediately followed by '>'.
+fn spanTagName(bytes: []const u8, lt: usize) SpanRange {
+    var end = lt + 1;
+    while (end < bytes.len) : (end += 1) {
+        const c = bytes[end];
+        if (isSpanWs(c) or c == '>') break;
+        if (c == '/' and end + 1 < bytes.len and bytes[end + 1] == '>') break;
+    }
+    return .{ .start = lt + 1, .end = end };
+}
+
+/// The attribute name region after `from`: the first non-whitespace
+/// byte through the '=' delimiter, less whitespace between the name
+/// and '=' (which a bare 'S = S' allows). Also reports the '=' offset
+/// so callers can locate the quoted value.
+fn spanAttrHead(bytes: []const u8, from: usize) ?struct { name: SpanRange, eq: usize } {
+    const start = std.mem.indexOfNonePos(u8, bytes, from, " \t\n\r") orelse return null;
+    const eq = std.mem.indexOfScalarPos(u8, bytes, start, '=') orelse return null;
+    var end = eq;
+    while (end > start and isSpanWs(bytes[end - 1])) end -= 1;
+    return .{ .name = .{ .start = start, .end = end }, .eq = eq };
+}
 
 /// A prefix is usable when it is declared in scope or is the
 /// always-bound xml: prefix.
-fn spanPrefixOk(prefix: []const u8, decls: []const SpanDecl) bool {
+fn spanPrefixOk(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) bool {
     if (std.mem.eql(u8, prefix, "xml")) return true;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.prefix, prefix)) return true;
+        if (std.mem.eql(u8, spanSlice(bytes, d.prefix), prefix)) return true;
     }
     return false;
 }
@@ -123,12 +176,14 @@ fn spanStreamDecl(uri: []const u8) bool {
 }
 
 /// Resolve a prefix against the in-scope declarations; an empty
-/// prefix resolves against the default namespace declaration.
-fn spanResolvePrefix(prefix: []const u8, decls: []const SpanDecl) ?[]const u8 {
+/// prefix resolves against the default namespace declaration. The
+/// newest declaration wins, matching in-scope shadowing.
+fn spanResolvePrefix(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?[]const u8 {
     var i = decls.len;
     while (i > 0) {
         i -= 1;
-        if (std.mem.eql(u8, decls[i].prefix, prefix)) return decls[i].uri;
+        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix))
+            return spanSlice(bytes, decls[i].uri);
     }
     return null;
 }
@@ -231,19 +286,23 @@ fn spanCheckLex(bytes: []const u8) Error!void {
 /// tag ends: an xmlns on the same tag is already in scope for its own
 /// tag name and every attribute on it.
 fn spanCheckPrefixes(
+    bytes: []const u8,
     elem_prefix: []const u8,
     attrs: []const SpanAttr,
     decls: []const SpanDecl,
 ) Error!void {
-    if (elem_prefix.len > 0 and !spanPrefixOk(elem_prefix, decls)) return error.NotWellFormed;
+    if (elem_prefix.len > 0 and !spanPrefixOk(bytes, elem_prefix, decls))
+        return error.NotWellFormed;
     // The element is a stream element whenever its resolved namespace
     // is the stream namespace, whatever prefix wrote it.
-    if (spanResolvePrefix(elem_prefix, decls)) |uri| {
+    if (spanResolvePrefix(bytes, elem_prefix, decls)) |uri| {
         if (spanStreamDecl(uri)) return error.NotWellFormed;
     }
     for (attrs) |a| {
-        if (std.mem.eql(u8, a.prefix, "xmlns")) continue;
-        if (a.prefix.len > 0 and !spanPrefixOk(a.prefix, decls)) return error.NotWellFormed;
+        const a_prefix = spanSlice(bytes, spanQName(bytes, a.name).prefix);
+        if (std.mem.eql(u8, a_prefix, "xmlns")) continue;
+        if (a_prefix.len > 0 and !spanPrefixOk(bytes, a_prefix, decls))
+            return error.NotWellFormed;
     }
 }
 
@@ -275,69 +334,96 @@ pub const ValidatedSpan = struct {
         defer sc.deinit();
         var pos: usize = 0;
         var depth: usize = 0;
-        var names: [max_depth][]const u8 = undefined;
+        var names: [max_depth]SpanRange = undefined;
         var attrs: [span_max_attrs]SpanAttr = undefined;
         var attr_count: usize = 0;
         var decls: [span_max_decls]SpanDecl = undefined;
         var decl_count: usize = 0;
-        var pending_name: []const u8 = "";
-        var pending_prefix: []const u8 = "";
+        var pending_name: SpanRange = .{ .start = 0, .end = 0 };
+        // tag_cursor is where the next tag's '<' is searched from;
+        // attr_cursor is where the next attribute name may start.
+        var tag_cursor: usize = 0;
+        var attr_cursor: usize = 0;
         while (true) {
             const tok = sc.next(bytes, &pos) catch return error.NotWellFormed;
             if (tok == null) break;
             switch (tok.?.type) {
                 .element_open => {
                     if (depth >= max_depth) return error.NotWellFormed;
-                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
-                    pending_name = tok.?.name;
-                    pending_prefix = tok.?.prefix;
+                    const lt = std.mem.indexOfScalarPos(u8, bytes, tag_cursor, '<') orelse
+                        return error.NotWellFormed;
+                    const name = spanTagName(bytes, lt);
+                    if (!isValidName(spanSlice(bytes, name))) return error.NotWellFormed;
+                    pending_name = name;
+                    attr_cursor = name.end;
                     attr_count = 0;
                 },
-                .attribute => {
-                    if (attr_count >= span_max_attrs) return error.NotWellFormed;
-                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
-                    for (attrs[0..attr_count]) |p| {
-                        if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
-                    }
-                    attrs[attr_count] = .{ .name = tok.?.name, .prefix = tok.?.prefix };
-                    attr_count += 1;
-                },
-                .namespace_decl => {
-                    if (attr_count >= span_max_attrs or decl_count >= span_max_decls)
+                .attribute, .namespace_decl => {
+                    const head = spanAttrHead(bytes, attr_cursor) orelse
                         return error.NotWellFormed;
-                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
+                    if (attr_count >= span_max_attrs) return error.NotWellFormed;
+                    if (!isValidName(spanSlice(bytes, head.name))) return error.NotWellFormed;
                     for (attrs[0..attr_count]) |p| {
-                        if (std.mem.eql(u8, p.name, tok.?.name)) return error.NotWellFormed;
+                        if (std.mem.eql(u8, spanSlice(bytes, p.name), spanSlice(bytes, head.name)))
+                            return error.NotWellFormed;
                     }
-                    attrs[attr_count] = .{ .name = tok.?.name, .prefix = "xmlns" };
+                    attrs[attr_count] = .{ .name = head.name };
                     attr_count += 1;
-                    decls[decl_count] = .{ .depth = depth, .prefix = tok.?.prefix, .uri = tok.?.value };
-                    decl_count += 1;
+                    attr_cursor = pos;
+                    if (tok.?.type == .namespace_decl) {
+                        if (decl_count >= span_max_decls) return error.NotWellFormed;
+                        const dname = spanSlice(bytes, head.name);
+                        var prefix: SpanRange = .{ .start = head.name.end, .end = head.name.end };
+                        if (std.mem.indexOfScalar(u8, dname, ':')) |colon| {
+                            prefix = .{ .start = head.name.start + colon + 1, .end = head.name.end };
+                        }
+                        // The stored URI is the raw range between the
+                        // value quotes; pos-1 is the closing quote.
+                        const oq = std.mem.indexOfAnyPos(u8, bytes, head.eq + 1, "'\"") orelse
+                            return error.NotWellFormed;
+                        if (oq >= pos - 1) return error.NotWellFormed;
+                        const uri: SpanRange = .{ .start = oq + 1, .end = pos - 1 };
+                        decls[decl_count] = .{ .depth = depth, .prefix = prefix, .uri = uri };
+                        decl_count += 1;
+                    }
                 },
                 .element_open_end => {
                     try spanCheckPrefixes(
-                        pending_prefix,
+                        bytes,
+                        spanSlice(bytes, spanQName(bytes, pending_name).prefix),
                         attrs[0..attr_count],
                         decls[0..decl_count],
                     );
                     names[depth] = pending_name;
                     depth += 1;
+                    tag_cursor = pos;
                 },
                 .element_self_close => {
                     try spanCheckPrefixes(
-                        pending_prefix,
+                        bytes,
+                        spanSlice(bytes, spanQName(bytes, pending_name).prefix),
                         attrs[0..attr_count],
                         decls[0..decl_count],
                     );
                     // Declarations inside this tag die with it.
                     while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
+                    tag_cursor = pos;
                 },
                 .element_close => {
                     if (depth == 0) return error.NotWellFormed;
-                    if (!isValidName(tok.?.name)) return error.NotWellFormed;
+                    const lt = std.mem.indexOfScalarPos(u8, bytes, tag_cursor, '<') orelse
+                        return error.NotWellFormed;
+                    // The close name runs from '</' to '>'; trailing
+                    // whitespace before '>' is legal and ignored.
+                    var end = pos - 1;
+                    while (end > lt + 2 and isSpanWs(bytes[end - 1])) end -= 1;
+                    const name: SpanRange = .{ .start = lt + 2, .end = end };
+                    if (!isValidName(spanSlice(bytes, name))) return error.NotWellFormed;
                     depth -= 1;
-                    if (!std.mem.eql(u8, names[depth], tok.?.name)) return error.NotWellFormed;
+                    if (!std.mem.eql(u8, spanSlice(bytes, names[depth]), spanSlice(bytes, name)))
+                        return error.NotWellFormed;
                     while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
+                    tag_cursor = pos;
                 },
                 .text => {},
                 .xml_declaration, .eof => return error.NotWellFormed,
@@ -1255,6 +1341,36 @@ test "a literal '<' in an attribute value is rejected" {
         error.NotWellFormed,
         ValidatedSpan.fromReader(testing.allocator, "<a x=\"a<b\"/>"),
     );
+}
+
+test "span names, prefixes and URIs are caller byte ranges (R4-1)" {
+    // Sibling elements at depth <= 1: a scanner that resets its token
+    // arena at each '<' frees token slices kept across next(), so the
+    // span check tracks ranges into the caller's bytes instead. These
+    // siblings exercise that reset path whichever scanner is present.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a><b/><c/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a/><b/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b/><p:c x='1'/><d/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b xmlns:p='urn:v'/><p:c/></a>");
+
+    // A mismatched close is still caught against the recorded range.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b/><c/></d>"));
+
+    // Whitespace the tag grammar allows is legal input; names derived
+    // from the source bytes accept it regardless of how the scanner
+    // buffers names.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a></a >");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x = '1'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x =\t'1'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&lt;'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='a&lt;b'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&#60;'/>");
+
+    // A '/' only closes the tag when '>' follows it; otherwise it is
+    // name content and the name is invalid.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a//>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/b x='1'/>"));
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
