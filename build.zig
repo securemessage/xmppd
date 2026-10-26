@@ -1150,6 +1150,29 @@ pub fn build(b: *std.Build) void {
 
     const run_rocksdb_backend_tests = b.addRunArtifact(rocksdb_backend_tests);
 
+    // --- Generic offline store over the real backends (H1) ---
+    //
+    // The store's own tests use MemoryBackend, whose iterator honors the
+    // untruncated prefix. LMDB and RocksDB clip the scan prefix to 256 bytes,
+    // so the long-recipient behavior needs a root that links both.
+
+    const generic_offline_real_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/offline_store_real_backend_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    generic_offline_real_test_mod.addImport("generic_offline_store", generic_offline_store_test_mod);
+    generic_offline_real_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    generic_offline_real_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+
+    const generic_offline_real_tests = b.addTest(.{
+        .name = "generic-offline-store-real-tests",
+        .root_module = generic_offline_real_test_mod,
+    });
+
+    const run_generic_offline_real_tests = b.addRunArtifact(generic_offline_real_tests);
+
     // --- SQLite backend tests ---
 
     const sqlite_backend_test_mod = b.createModule(.{
@@ -1714,6 +1737,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+    test_step.dependOn(&run_generic_offline_real_tests.step);
     test_step.dependOn(&run_last_activity_store_tests.step);
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_lock_store_tests.step);

@@ -23,6 +23,16 @@ const backend = @import("backend");
 /// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
 const MAX_KEY_LEN = 511;
 
+/// Full-prefix test for an iterator result. The LMDB and RocksDB iterators
+/// clip the scan prefix to 256 bytes, while v2 keys accept recipients up to
+/// 502 bytes, so a long recipient's scan also returns the rows of every
+/// recipient that shares its first 256 bytes. Every consumer of an iterator
+/// therefore re-checks the untruncated prefix before counting, parsing or
+/// collecting a key.
+fn keyHasPrefix(key: []const u8, prefix: []const u8) bool {
+    return std.mem.startsWith(u8, key, prefix);
+}
+
 pub const NS_OFFLINE = backend.registered("offline");
 pub const NS_OFFLINE_HOLD = backend.registered("offline_hold");
 pub const NS_OFFLINE_V2 = backend.registered("offline_v2");
@@ -235,7 +245,10 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             var iter = try self.db.iterator(ns, prefix);
             defer iter.deinit();
             var count: usize = 0;
-            while (iter.next()) |_| count += 1;
+            while (iter.next()) |entry| {
+                if (!keyHasPrefix(entry.key, prefix)) continue;
+                count += 1;
+            }
             return count;
         }
 
@@ -243,6 +256,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             var iter = try self.db.iterator(ns, prefix);
             defer iter.deinit();
             while (iter.next()) |entry| {
+                if (!keyHasPrefix(entry.key, prefix)) continue;
                 const key = try self.allocator.dupe(u8, entry.key);
                 errdefer self.allocator.free(key);
                 try keys.append(self.allocator, .{ .key = key, .is_v2 = is_v2 });
@@ -272,6 +286,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         fn parseLegacyPointer(self: *Self, recipient: []const u8, entry: backend.Entry) !?OfflinePointer {
             const id_offset = recipient.len + 1 + 8 + 1;
             if (entry.key.len < id_offset) return null;
+            if (!keyHasPrefix(entry.key, recipient)) return null;
+            if (entry.key[recipient.len] != 0) return null;
             const owned_recipient = try self.allocator.dupe(u8, recipient);
             errdefer self.allocator.free(owned_recipient);
             const stanza_id = try self.allocator.dupe(u8, entry.key[id_offset..]);
@@ -288,6 +304,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
         fn parseV2Pointer(self: *Self, recipient: []const u8, entry: backend.Entry) !?OfflinePointer {
             if (entry.key.len != recipient.len + 1 + 8 or entry.value.len < 12) return null;
+            if (!keyHasPrefix(entry.key, recipient)) return null;
+            if (entry.key[recipient.len] != 0) return null;
             const id_len = std.mem.readInt(u32, entry.value[8..12], .big);
             if (entry.value.len - 12 < id_len) return null;
             const id_end = 12 + @as(usize, id_len);
