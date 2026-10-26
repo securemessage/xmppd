@@ -614,10 +614,12 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
 
             // ClientKey := HMAC(SaltedPassword, "Client Key")
             var client_key: [mac_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&client_key));
             Hmac.create(&client_key, "Client Key", &salted_password);
 
             // StoredKey := H(ClientKey)
             var stored_key: [mac_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&stored_key));
             HashFn.hash(&client_key, &stored_key, .{});
 
             // c= is base64(gs2-header [+ channel-binding-data]) (RFC 5802 §7)
@@ -651,6 +653,7 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             // ServerSignature := HMAC(HMAC(SaltedPassword, "Server Key"), AuthMessage),
             // checked against the server-final-message (mutual authentication).
             var server_key: [mac_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key));
             Hmac.create(&server_key, "Server Key", &salted_password);
             Hmac.create(&self.server_signature, auth_message, &server_key);
 
