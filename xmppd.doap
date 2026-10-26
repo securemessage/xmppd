@@ -2,7 +2,8 @@
 <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
          xmlns="http://usefulinc.com/ns/doap#"
          xmlns:xmpp="https://linkmauve.fr/ns/xmpp-doap#"
-         xmlns:schema="https://schema.org/">
+         xmlns:schema="https://schema.org/"
+         xmlns:foaf="http://xmlns.com/foaf/0.1/">
   <Project>
     <name>xmppd</name>
 
@@ -21,14 +22,14 @@
     <schema:logo rdf:resource="https://www.xmppd.org/media/clear.svg"/>
 
     <developer>
-      <Person>
-        <name>Daniel Morante</name>
-      </Person>
+      <foaf:Person>
+        <foaf:name>Daniel Morante</foaf:name>
+      </foaf:Person>
     </developer>
     <maintainer>
-      <Person>
-        <name>Daniel Morante</name>
-      </Person>
+      <foaf:Person>
+        <foaf:name>Daniel Morante</foaf:name>
+      </foaf:Person>
     </maintainer>
 
     <programming-language>Zig</programming-language>
