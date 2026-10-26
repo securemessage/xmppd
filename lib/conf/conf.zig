@@ -81,6 +81,8 @@ pub const Error = error{
 
 /// Location and context of a config failure; filled by loaders before they
 /// return an error so callers can print "path:line: ..." diagnostics.
+/// Field slices point into the Diag's own storage, set by `set`, so a
+/// Diag outlives the argv, file text or temp buffer it describes.
 pub const Diag = struct {
     /// Config file path; empty when the error is about a CLI argument.
     path: []const u8 = "",
@@ -94,6 +96,38 @@ pub const Diag = struct {
     value: []const u8 = "",
     /// Static detail, e.g. "expected integer".
     detail: []const u8 = "",
+
+    path_buf: [4096]u8 = undefined,
+    section_buf: [64]u8 = undefined,
+    key_buf: [128]u8 = undefined,
+    value_buf: [512]u8 = undefined,
+    detail_buf: [256]u8 = undefined,
+
+    pub const Parts = struct {
+        path: []const u8 = "",
+        line: u32 = 0,
+        section: []const u8 = "",
+        key: []const u8 = "",
+        value: []const u8 = "",
+        detail: []const u8 = "",
+    };
+
+    fn into(dst: []u8, s: []const u8) []const u8 {
+        const n = @min(dst.len, s.len);
+        @memcpy(dst[0..n], s[0..n]);
+        return dst[0..n];
+    }
+
+    /// Copies every field into the Diag's own buffers (truncating past
+    /// the bound) so no slice ever borrows caller memory.
+    pub fn set(self: *Diag, parts: Parts) void {
+        self.* = .{ .line = parts.line };
+        self.path = into(&self.path_buf, parts.path);
+        self.section = into(&self.section_buf, parts.section);
+        self.key = into(&self.key_buf, parts.key);
+        self.value = into(&self.value_buf, parts.value);
+        self.detail = into(&self.detail_buf, parts.detail);
+    }
 
     pub fn format(self: Diag, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.line != 0) {
@@ -399,7 +433,7 @@ pub fn Loader(
         pub fn loadFile(self: *Self, path: []const u8, diag: *Diag) Error!void {
             const arena = self.arena_state.allocator();
             const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-                diag.* = .{ .path = path, .detail = @errorName(err) };
+                diag.set(.{ .path = path, .detail = @errorName(err) });
                 return switch (err) {
                     error.FileNotFound => error.FileNotFound,
                     else => error.ReadFailed,
@@ -408,7 +442,7 @@ pub fn Loader(
             defer file.close();
 
             const content = file.readToEndAlloc(arena, max_file_bytes) catch |err| {
-                diag.* = .{ .path = path, .detail = @errorName(err) };
+                diag.set(.{ .path = path, .detail = @errorName(err) });
                 return switch (err) {
                     error.FileTooBig => error.FileTooLarge,
                     error.OutOfMemory => error.OutOfMemory,
@@ -423,7 +457,7 @@ pub fn Loader(
             while (it.next()) |raw| {
                 line_no += 1;
                 if (raw.len > max_line_bytes) {
-                    diag.* = .{ .path = path, .line = line_no, .detail = "line too long" };
+                    diag.set(.{ .path = path, .line = line_no, .detail = "line too long" });
                     return error.LineTooLong;
                 }
                 const line = std.mem.trim(u8, raw, " \t\r");
@@ -431,37 +465,37 @@ pub fn Loader(
                 if (line[0] == '#' or line[0] == ';') continue;
                 if (line[0] == '[') {
                     if (line.len < 3 or line[line.len - 1] != ']') {
-                        diag.* = .{ .path = path, .line = line_no, .detail = "malformed section header" };
+                        diag.set(.{ .path = path, .line = line_no, .detail = "malformed section header" });
                         return error.MalformedLine;
                     }
                     section = line[1 .. line.len - 1];
                     if (!sectionKnown(section)) {
-                        diag.* = .{ .path = path, .line = line_no, .section = section, .detail = "unknown section" };
+                        diag.set(.{ .path = path, .line = line_no, .section = section, .detail = "unknown section" });
                         return error.UnknownSection;
                     }
                     continue;
                 }
                 const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-                    diag.* = .{ .path = path, .line = line_no, .detail = "expected key = value" };
+                    diag.set(.{ .path = path, .line = line_no, .detail = "expected key = value" });
                     return error.MalformedLine;
                 };
                 const key = std.mem.trim(u8, line[0..eq], " \t");
                 const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
                 if (key.len == 0) {
-                    diag.* = .{ .path = path, .line = line_no, .detail = "empty key" };
+                    diag.set(.{ .path = path, .line = line_no, .detail = "empty key" });
                     return error.MalformedLine;
                 }
                 keys_seen += 1;
                 if (keys_seen > options.max_keys) {
-                    diag.* = .{ .path = path, .line = line_no, .detail = "too many keys" };
+                    diag.set(.{ .path = path, .line = line_no, .detail = "too many keys" });
                     return error.TooManyKeys;
                 }
                 const idx = findField(section, key) orelse {
-                    diag.* = .{ .path = path, .line = line_no, .section = section, .key = key, .detail = "unknown key" };
+                    diag.set(.{ .path = path, .line = line_no, .section = section, .key = key, .detail = "unknown key" });
                     return error.UnknownKey;
                 };
                 if (self.provenance[idx] == .file) {
-                    diag.* = .{ .path = path, .line = self.lines[idx], .section = section, .key = key, .detail = "duplicate key (first set here)" };
+                    diag.set(.{ .path = path, .line = self.lines[idx], .section = section, .key = key, .detail = "duplicate key (first set here)" });
                     return error.DuplicateKey;
                 }
                 try self.setField(idx, value, .{ .path = path, .line = line_no }, diag);
@@ -494,11 +528,11 @@ pub fn Loader(
             while (i < args.len) : (i += 1) {
                 const arg = args[i];
                 if (end_of_options) {
-                    diag.* = .{ .key = arg, .detail = "unexpected positional argument" };
+                    diag.set(.{ .key = arg, .detail = "unexpected positional argument" });
                     return error.UnexpectedPositional;
                 }
                 if (arg.len == 0 or arg[0] != '-') {
-                    diag.* = .{ .key = arg, .detail = "unexpected positional argument" };
+                    diag.set(.{ .key = arg, .detail = "unexpected positional argument" });
                     return error.UnexpectedPositional;
                 }
                 if (std.mem.eql(u8, arg, "--")) {
@@ -507,7 +541,7 @@ pub fn Loader(
                 }
                 const stripped = if (arg.len >= 2 and arg[1] == '-') arg[2..] else arg[1..];
                 if (stripped.len == 0) {
-                    diag.* = .{ .key = arg, .detail = "malformed argument" };
+                    diag.set(.{ .key = arg, .detail = "malformed argument" });
                     return error.UnknownArgument;
                 }
                 var name = stripped;
@@ -519,7 +553,7 @@ pub fn Loader(
                 if (findCli(name)) |ci| {
                     if (cli[ci].flag) |sets| {
                         if (value != null) {
-                            diag.* = .{ .key = arg, .detail = "flag takes no value" };
+                            diag.set(.{ .key = arg, .detail = "flag takes no value" });
                             return error.FlagTakesNoValue;
                         }
                         try self.setField(cli_targets[ci], if (sets) "true" else "false", .{}, diag);
@@ -529,7 +563,7 @@ pub fn Loader(
                     if (value == null) {
                         i += 1;
                         if (i >= args.len) {
-                            diag.* = .{ .key = arg, .detail = "option requires a value" };
+                            diag.set(.{ .key = arg, .detail = "option requires a value" });
                             return error.MissingValue;
                         }
                         value = args[i];
@@ -537,7 +571,7 @@ pub fn Loader(
                     try self.setField(cli_targets[ci], value.?, .{ .key = arg }, diag);
                     self.provenance[cli_targets[ci]] = prov;
                 } else {
-                    diag.* = .{ .key = arg, .detail = "unknown argument" };
+                    diag.set(.{ .key = arg, .detail = "unknown argument" });
                     return error.UnknownArgument;
                 }
             }
@@ -584,11 +618,11 @@ pub fn Loader(
                     writeValue(field_types[cli_targets[i]], &w, v) catch unreachable;
                     const val = w.buffered();
                     if (std.mem.indexOfScalar(u8, val, '\n') != null) {
-                        diag.* = .{
+                        diag.set(.{
                             .key = try std.fmt.allocPrint(arena, "--{s}", .{c.name}),
                             .value = try arena.dupe(u8, val),
                             .detail = "value contains a newline and cannot be forwarded",
-                        };
+                        });
                         return error.BadValue;
                     }
                     try blob.appendSlice(arena, "--");
@@ -671,14 +705,14 @@ pub fn Loader(
             inline for (fields, 0..) |f, i| {
                 if (idx == i) {
                     const val = parseValue(field_types[i], s) catch {
-                        diag.* = .{
+                        diag.set(.{
                             .path = ctx.path,
                             .line = ctx.line,
                             .section = f.section,
                             .key = if (ctx.key.len != 0) ctx.key else keyOf(f),
                             .value = s,
                             .detail = "invalid value",
-                        };
+                        });
                         return error.BadValue;
                     };
                     @field(@field(self.values, f.section), f.field) = val;
@@ -711,12 +745,12 @@ pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
     var off: u64 = 0;
     while (true) {
         const n = posix.pread(fd, &buf, off) catch {
-            diag.* = .{ .detail = "cannot read forwarded configuration fd" };
+            diag.set(.{ .detail = "cannot read forwarded configuration fd" });
             return error.ReadFailed;
         };
         if (n == 0) break;
         if (blob.items.len + n > forward_max) {
-            diag.* = .{ .detail = "forwarded configuration exceeds 256 KiB" };
+            diag.set(.{ .detail = "forwarded configuration exceeds 256 KiB" });
             return error.FileTooLarge;
         }
         try blob.appendSlice(gpa, buf[0..n]);
