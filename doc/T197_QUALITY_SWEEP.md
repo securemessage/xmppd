@@ -509,6 +509,39 @@ src/core/
 
 - **Cost.** L (mostly mechanical). **Recommendation: approve.**
 
+### ADR-13: DNS failure policy, retry and cache (operator decision 2026-10-26)
+
+Applies to every consumer of `lib/dns/async.zig` (xmppc today, outbound and
+inbound s2s after X1/X2).
+
+| TLSA result for a connect target | Verification |
+|---|---|
+| Records, a usable one matches | DANE |
+| Records, none match | Fail; no PKIX fallback (RFC 7671) |
+| Authenticated absence: NXDOMAIN or NODATA | PKIX (system CA + hostname) |
+| Lookup failed: SERVFAIL, REFUSED, timeout, or the chain deadline expired with TLSA pending | **Temporary failure of that target** (RFC 7672 section 2.2). Try the next SRV target; when none remain the resolve fails as temporary. Never PKIX. |
+
+- The resolver reports per target `tlsa_status = absent | present |
+  lookup_failed`; an empty record list never means "no TLSA" on its own.
+- **Retry (s2s, v0.9.1).** Today any outbound failure bounces every queued
+  stanza at once (`failOutboundInitiation`). A temporary failure instead keeps
+  the domain's pending queue and retries on lifecycle-timer deadlines with
+  backoff; stanzas bounce with `remote-server-timeout` only when the queue
+  lifetime ends. New stanzas for a domain in backoff join the queue and do not
+  start new attempts. Permanent failures (DANE mismatch, NXDOMAIN for every
+  SRV and A/AAAA) bounce at once with `remote-server-not-found`. Initial
+  values, constants in v0.9.1: retries at 5 s, 15 s, 45 s; queue lifetime
+  120 s; queue bounds from X1.
+- **Cache (v0.9.1).** The resolver cache (X2) serves s2s as well as xmppc:
+  positive and NXDOMAIN/NODATA entries, TTL honored with a ceiling, SERVFAIL
+  and timeouts never cached. Sized for federation (hash map, bounded entries
+  with LRU eviction, not a 64-entry linear FIFO). Serve-stale (RFC 8767) is a
+  pending operator decision: when a refresh fails, reuse the expired answer
+  (including TLSA) for a bounded time instead of failing.
+- **Later (v0.10.x or v0.12.x).** Operator-configurable case-4 policy;
+  remembered-DANE domains (fail closed for domains seen with TLSA, configurable
+  for unknown ones).
+
 ---
 
 ## 5. Work plan
@@ -643,8 +676,8 @@ recorded.
 
 | ID | Task | Depends | Size |
 |----|------|---------|------|
-| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); non-fatal XEP-0220 dialback errors and the standard dialback errors feature (S34 part 1); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
-| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
+| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); ADR-13 retry with backoff on temporary failures instead of bouncing at once; non-fatal XEP-0220 dialback errors and the standard dialback errors feature (S34 part 1); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
+| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache sized for federation (ADR-13); per-target `tlsa_status` with lookup failure as a temporary target failure (ADR-13); s2s outbound and inbound moved off blocking `getaddrinfo` (IPv4 only today) and the blocking TLSA lookup onto it; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
 | X3 | Master: readiness pipes per child (T282), loop-driven shutdown with SIGKILL escalation on a one-shot timer, SIGHUP to all children, pid files on respawn and identity-checked orphan kill (T259, T336, T337), shared `bindTcp` honoring `bind_address` and IPv6 (V16) | F2 | M |
 | X4 | All daemons on `lib/conf` (ADR-9), master first | F5 | M |
 
