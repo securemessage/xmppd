@@ -1547,6 +1547,11 @@ test "span validator pins: '<!' scan, declaration pops, newest-first (R4-4)" {
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!----></a>"));
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!--x--></a>"));
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!-- c --></a>"));
+    // A comment after the last tag has no following tag token, so the
+    // '<!' raw scan is the only guard that rejects it.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/><!--c-->"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/>x<!--c-->"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<!--c--><a/>"));
 
     // Declarations die with their element: after a self-close or a
     // close, the prefix is out of scope again.
