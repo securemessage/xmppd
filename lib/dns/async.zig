@@ -285,7 +285,7 @@ pub const Resolver = struct {
     /// unparseable file leaves the resolver unconfigured, which
     /// ensureOpen reports as error.NoResolver.
     pub fn loadResolvConf(self: *Resolver) void {
-        if (readResolvConf(self.resolv_conf_path)) |addr| {
+        if (readResolvConf(self.alloc, self.resolv_conf_path)) |addr| {
             self.server = addr;
             self.server_configured = true;
         } else |_| {}
@@ -1825,21 +1825,26 @@ fn nowMs() i64 {
     return std.time.milliTimestamp();
 }
 
-fn readResolvConf(path: []const u8) !net.Address {
-    var buf: [1024]u8 = undefined;
+/// Parse resolv.conf the way FreeBSD libc's res_init does: a ';' or
+/// '#' comments out the line only in column 0, the "nameserver"
+/// keyword must start the line, and the address token ends at the
+/// first blank, ';', or '#'. The whole file is read so a long
+/// preamble cannot hide a nameserver past the first read.
+fn readResolvConf(alloc: std.mem.Allocator, path: []const u8) !net.Address {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
-    const n = try f.read(&buf);
-    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    const data = try f.readToEndAlloc(alloc, 1 << 20);
+    defer alloc.free(data);
+    var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
-        // "#" opens a comment anywhere on the line.
-        const end = std.mem.indexOfScalar(u8, line, '#') orelse line.len;
-        var it = std.mem.tokenizeAny(u8, line[0..end], " \t");
-        while (it.next()) |tok| {
-            if (!std.mem.eql(u8, tok, "nameserver")) continue;
-            const addr = it.next() orelse break;
-            return net.Address.parseIp(addr, 53) catch continue;
-        }
+        if (line.len == 0 or line[0] == ';' or line[0] == '#') continue;
+        if (!std.mem.startsWith(u8, line, "nameserver")) continue;
+        const rest = line["nameserver".len..];
+        const start = std.mem.indexOfNone(u8, rest, " \t") orelse continue;
+        const tail = rest[start..];
+        const tok = tail[0 .. std.mem.indexOfAny(u8, tail, ";# \t") orelse tail.len];
+        if (tok.len == 0) continue;
+        return net.Address.parseIp(tok, 53) catch continue;
     }
     return error.NoNameserver;
 }
@@ -4154,6 +4159,45 @@ test "dns-async: a commented nameserver line stays a comment" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.53", 53)));
+}
+
+test "dns-async: resolv.conf keywords only count at line start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // libc res_init: ';' opens a comment in column 0, the keyword
+    // must start the line, and "search nameserver" is a search line.
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "; nameserver 9.9.9.1\n  nameserver 9.9.9.2\nsearch nameserver 9.9.9.3\nnameserver 127.0.0.53 ; inline comment\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.53", 53)));
+}
+
+test "dns-async: a nameserver past the first kilobyte is still found" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var conf: std.ArrayListUnmanaged(u8) = .{};
+    defer conf.deinit(std.testing.allocator);
+    for (0..40) |_| {
+        conf.appendSlice(std.testing.allocator, "# padding comment line padding padding padding\n") catch unreachable;
+    }
+    try std.testing.expect(conf.items.len > 1024);
+    conf.appendSlice(std.testing.allocator, "nameserver 127.0.0.54\n") catch unreachable;
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = conf.items });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.54", 53)));
 }
 
 test "dns-async: a TTL with the top bit set reports zero (RFC 2181)" {
