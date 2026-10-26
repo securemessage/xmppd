@@ -520,6 +520,28 @@ test "SqliteBackend: a second batch cannot begin on a busy connection" {
     try std.testing.expectError(error.SqliteBeginFailed, db.writeBatch());
 }
 
+test "SqliteBackend: a second connection on a busy database reports SqliteBeginFailed" {
+    const path = "/tmp/xmppd-test-sqlite-twoconnbusy.db";
+    cleanDb(path);
+    defer cleanDb(path);
+
+    var a = try SqliteBackend.open(path, .{});
+    defer a.close();
+    var b = try SqliteBackend.open(path, .{});
+    defer b.close();
+
+    // The open default is five seconds; keep the BUSY window short so the
+    // test proves the error path rather than the timeout.
+    _ = c.sqlite3_busy_timeout(b.db, 10);
+
+    // WAL allows one writer. a holds the write lock; b's BEGIN IMMEDIATE
+    // retries for 10 ms and must surface the failure, not join the txn.
+    var held = try a.writeBatch();
+    defer held.abort();
+
+    try std.testing.expectError(error.SqliteBeginFailed, b.writeBatch());
+}
+
 /// sqlite3_commit_hook callback that vetoes the commit: SQLite rolls the
 /// transaction back and the COMMIT statement fails, the way a busy or full
 /// database fails one. The fault hook for the commit-failure tests.
