@@ -59,7 +59,7 @@
 
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc6120"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc6121"/>
-    <implements rdf:resource="https://www.rfc-editor.org/info/rfc6122"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc7622"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc5802"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc7677"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc6698"/>
