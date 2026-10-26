@@ -291,6 +291,10 @@ fn spanCheckPrefixes(
     attrs: []const SpanAttr,
     decls: []const SpanDecl,
 ) Error!void {
+    // The stream prefix is rejected outright: whatever it is bound
+    // to, xmppd's reader classifies by the literal prefix and would
+    // see stream events inside a forwarded stanza.
+    if (std.mem.eql(u8, elem_prefix, "stream")) return error.NotWellFormed;
     if (elem_prefix.len > 0 and !spanPrefixOk(bytes, elem_prefix, decls))
         return error.NotWellFormed;
     // The element is a stream element whenever its resolved namespace
@@ -301,6 +305,7 @@ fn spanCheckPrefixes(
     for (attrs) |a| {
         const a_prefix = spanSlice(bytes, spanQName(bytes, a.name).prefix);
         if (std.mem.eql(u8, a_prefix, "xmlns")) continue;
+        if (std.mem.eql(u8, a_prefix, "stream")) return error.NotWellFormed;
         if (a_prefix.len > 0 and !spanPrefixOk(bytes, a_prefix, decls))
             return error.NotWellFormed;
     }
@@ -316,10 +321,12 @@ pub const ValidatedSpan = struct {
     /// well-formedness pass through lib/xml/scanner. Beyond balanced
     /// elements it rejects everything RFC 6120 section 11.1 forbids in
     /// a stream (comments, PIs, declarations, DTDs) plus CDATA, elements
-    /// in the stream namespace, invalid names, malformed attribute
-    /// syntax, ']]>' in text, xmlns:xmlns, duplicate attributes, a
-    /// '<' inside an attribute value, non-Char character references,
-    /// undeclared prefixes other than xml:, and truncated input. A
+    /// in the stream namespace, the stream prefix under any binding,
+    /// any declaration of the stream namespace, invalid names, malformed
+    /// attribute syntax, ']]>' in text, xmlns:xmlns, duplicate
+    /// attributes, a '<' inside an attribute value, non-Char character
+    /// references, undeclared prefixes other than xml:, and truncated
+    /// input. A
     /// dedicated zero-cost reader-produced constructor arrives with
     /// C5; until then callers pay one scan per span.
     pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
@@ -370,13 +377,26 @@ pub const ValidatedSpan = struct {
                     attrs[attr_count] = .{ .name = head.name };
                     attr_count += 1;
                     attr_cursor = pos;
-                    if (tok.?.type == .namespace_decl) {
+                    const dname = spanSlice(bytes, head.name);
+                    // xmlns and xmlns:* are namespace declarations.
+                    // Classify on the source name, not the token type:
+                    // an entity in the value can clobber the name the
+                    // scanner carries on the token.
+                    if (std.mem.eql(u8, dname, "xmlns") or std.mem.startsWith(u8, dname, "xmlns:")) {
                         if (decl_count >= span_max_decls) return error.NotWellFormed;
-                        const dname = spanSlice(bytes, head.name);
                         var prefix: SpanRange = .{ .start = head.name.end, .end = head.name.end };
                         if (std.mem.indexOfScalar(u8, dname, ':')) |colon| {
                             prefix = .{ .start = head.name.start + colon + 1, .end = head.name.end };
                         }
+                        // The 'stream' prefix is reserved for the stream
+                        // element: inside a stanza-level span it is
+                        // rejected whatever it is bound to. The stream
+                        // namespace may never be declared here at all;
+                        // the decoded value is compared so an
+                        // entity-encoded URI cannot slip past.
+                        if (std.mem.eql(u8, spanSlice(bytes, prefix), "stream"))
+                            return error.NotWellFormed;
+                        if (spanStreamDecl(tok.?.value)) return error.NotWellFormed;
                         // The stored URI is the raw range between the
                         // value quotes; pos-1 is the closing quote.
                         const oq = std.mem.indexOfAnyPos(u8, bytes, head.eq + 1, "'\"") orelse
@@ -1371,6 +1391,35 @@ test "span names, prefixes and URIs are caller byte ranges (R4-1)" {
     // name content and the name is invalid.
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a//>"));
     try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/b x='1'/>"));
+}
+
+test "spans reject the stream prefix and stream namespace declarations (R4-2)" {
+    // xmppd's reader classifies stream elements by the literal 'stream'
+    // prefix, so a span may not carry that prefix whatever it is bound
+    // to, and may not declare the stream namespace at all (used or not).
+    const bad = [_][]const u8{
+        "<stream:stream xmlns:stream='urn:evil'></stream:stream>",
+        "<stream:features xmlns:stream='urn:evil'/>",
+        "<stream:error xmlns:stream='urn:x'/>",
+        "<stream:x/>",
+        "<a><stream:features xmlns:stream='urn:x'/></a>",
+        "<a xmlns:stream='urn:x'><b/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams'><b/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams'><s:b xmlns:s='urn:x'/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams' s:x='1'/>",
+        "<a xmlns='http://etherx.jabber.org/streams'><b/></a>",
+        "<a><b/><c xmlns:s='http://etherx.jabber.org/streams'/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/str&#101;ams'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // Ordinary prefixes and namespaces are unaffected.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:s='urn:x'><s:b/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns='urn:x'><b/></a>");
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
