@@ -57,10 +57,17 @@ const SRV_PLAIN = [2][]const u8{ "_xmpp-client._tcp", "_xmpp-server._tcp" };
 
 pub const RType = enum(u16) { a = KIND_A, aaaa = KIND_AAAA, srv = KIND_SRV, tlsa = KIND_TLSA };
 
+/// Per-target DANE outcome (ADR-13). `tlsa` is empty for both .absent
+/// and .lookup_failed, so this word is authoritative: only .absent
+/// (NXDOMAIN/NODATA) permits PKIX fallback, while .lookup_failed is a
+/// temporary failure of the target - never PKIX.
+pub const TlsaStatus = enum { absent, present, lookup_failed };
+
 pub const Target = struct {
     addr: net.Address,
     host: []const u8, // owned
     tlsa: []dns.TlsaRecord, // owned; empty when none
+    tlsa_status: TlsaStatus,
     is_direct_tls: bool,
 };
 
@@ -473,7 +480,7 @@ pub const Resolver = struct {
     /// the same addresses without the extra round trips.
     pub fn resolve(self: *Resolver, name: []const u8, service: Service, default_port: u16, session_key: usize, want_tlsa: bool) !void {
         if (net.Address.parseIp(name, default_port)) |addr| {
-            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, name), .tlsa = &.{}, .is_direct_tls = false };
+            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, name), .tlsa = &.{}, .tlsa_status = .absent, .is_direct_tls = false };
             const list = try self.alloc.alloc(Target, 1);
             list[0] = t;
             self.cb.fun(self.cb.ctx, session_key, .resolved, .{ .targets = list });
@@ -824,12 +831,7 @@ pub const Resolver = struct {
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
             .addr6 => self.finishTarget(job),
-            .tlsa => {
-                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
-                job.cur_addr4 = null;
-                job.cur_addr6 = null;
-                self.nextTarget(job) catch return self.dropJob(job, .failed);
-            },
+            .tlsa => self.failTargetTlsa(job),
             .fallback_addr => {
                 job.fallback_err = true;
                 job.phase = .fallback_addr4;
@@ -839,7 +841,10 @@ pub const Resolver = struct {
                 job.fallback_err = true;
                 self.finishFallback(job);
             },
-            .fallback_tlsa => self.complete(job),
+            .fallback_tlsa => {
+                for (job.targets.items) |*t| t.tlsa_status = .lookup_failed;
+                self.complete(job);
+            },
             else => self.dropJob(job, .failed),
         }
     }
@@ -858,19 +863,10 @@ pub const Resolver = struct {
         }
         if (job.want_tlsa) {
             job.phase = .tlsa;
-            self.sendTlsa(job) catch {
-                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
-                job.cur_addr4 = null;
-                job.cur_addr6 = null;
-                self.nextTarget(job) catch return self.dropJob(job, .failed);
-                return;
-            };
+            self.sendTlsa(job) catch return self.failTargetTlsa(job);
             return;
         }
-        self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
-        job.cur_addr4 = null;
-        job.cur_addr6 = null;
-        self.nextTarget(job) catch return self.dropJob(job, .failed);
+        self.emitAndAdvance(job, &.{}, .absent);
     }
 
     /// The whole-chain bound fired: hand the waiters whatever targets
@@ -1228,7 +1224,7 @@ pub const Resolver = struct {
                     tn += 1;
                 }
             }
-            out[i] = .{ .addr = t.addr, .host = host, .tlsa = tlsa, .is_direct_tls = t.is_direct_tls };
+            out[i] = .{ .addr = t.addr, .host = host, .tlsa = tlsa, .tlsa_status = t.tlsa_status, .is_direct_tls = t.is_direct_tls };
             built += 1;
         }
         return out;
@@ -1400,10 +1396,12 @@ pub const Resolver = struct {
             .addr6 => self.finishTarget(job),
             .tlsa => {
                 // TLSA NXDOMAIN keeps the target, just without DANE.
-                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
-                self.nextTarget(job) catch return self.dropJob(job, .failed);
+                self.emitAndAdvance(job, &.{}, .absent);
             },
-            .fallback_tlsa => self.complete(job),
+            .fallback_tlsa => {
+                for (job.targets.items) |*t| t.tlsa_status = .absent;
+                self.complete(job);
+            },
             .raw, .done => {},
         }
     }
@@ -1467,11 +1465,10 @@ pub const Resolver = struct {
                 }
                 if (job.want_tlsa) {
                     job.phase = .tlsa;
-                    self.sendTlsa(job) catch return self.finishTarget(job);
+                    self.sendTlsa(job) catch return self.failTargetTlsa(job);
                     return;
                 }
-                self.emitTargets(job, &.{}) catch return self.dropJob(job, .failed);
-                self.nextTarget(job) catch return self.dropJob(job, .failed);
+                self.emitAndAdvance(job, &.{}, .absent);
             },
             .tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
@@ -1479,13 +1476,17 @@ pub const Resolver = struct {
                     for (tlsa_recs.items) |r| self.alloc.free(r.association_data);
                     tlsa_recs.deinit(self.alloc);
                 }
+                var saw = false;
                 for (msg.rrs) |rr| {
                     if (rr.rtype != KIND_TLSA) continue;
+                    saw = true;
                     const rec = dns.parseTlsaRdata(rr.rdata, self.alloc) catch continue;
                     tlsa_recs.append(self.alloc, rec) catch continue;
                 }
-                self.emitTargets(job, tlsa_recs.items) catch return self.dropJob(job, .failed);
-                self.nextTarget(job) catch return self.dropJob(job, .failed);
+                // An answer that carried TLSA records is .present even
+                // when none parsed: unusable records fail closed in the
+                // session rather than falling back to PKIX.
+                self.emitAndAdvance(job, tlsa_recs.items, if (saw) .present else .absent);
             },
             .fallback_tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
@@ -1493,15 +1494,19 @@ pub const Resolver = struct {
                     for (tlsa_recs.items) |r| self.alloc.free(r.association_data);
                     tlsa_recs.deinit(self.alloc);
                 }
+                var saw = false;
                 for (msg.rrs) |rr| {
                     if (rr.rtype != KIND_TLSA) continue;
+                    saw = true;
                     const rec = dns.parseTlsaRdata(rr.rdata, self.alloc) catch continue;
                     tlsa_recs.append(self.alloc, rec) catch continue;
                 }
                 // The fallback targets share one host: the same TLSA
                 // owner name covers every emitted address.
+                const status: TlsaStatus = if (saw) .present else .absent;
                 for (job.targets.items) |*t| {
                     t.tlsa = self.dupeTlsa(tlsa_recs.items) catch &.{};
+                    t.tlsa_status = status;
                 }
                 self.complete(job);
             },
@@ -1589,13 +1594,29 @@ pub const Resolver = struct {
 
     /// Emit the current target's collected addresses: AAAA first, then
     /// A, each carrying the per-target TLSA set and the direct-TLS flag.
-    fn emitTargets(self: *Resolver, job: *Job, tlsa_recs: []dns.TlsaRecord) !void {
+    fn emitTargets(self: *Resolver, job: *Job, tlsa_recs: []dns.TlsaRecord, status: TlsaStatus) !void {
         const ent = &job.srv_list.items[job.srv_pos];
         const addrs = [2]?net.Address{ job.cur_addr6, job.cur_addr4 };
         for (addrs) |a| {
             const addr = a orelse continue;
-            try self.emitTarget(job, ent, addr, tlsa_recs);
+            try self.emitTarget(job, ent, addr, tlsa_recs, status);
         }
+    }
+
+    /// Emit the current target's addresses with `status` and move on
+    /// to the next SRV target in RFC 2782 order.
+    fn emitAndAdvance(self: *Resolver, job: *Job, tlsa_recs: []dns.TlsaRecord, status: TlsaStatus) void {
+        self.emitTargets(job, tlsa_recs, status) catch return self.dropJob(job, .failed);
+        job.cur_addr4 = null;
+        job.cur_addr6 = null;
+        self.nextTarget(job) catch return self.dropJob(job, .failed);
+    }
+
+    /// The current target's TLSA query failed or could not be sent:
+    /// ADR-13 marks the target lookup_failed (a temporary failure,
+    /// never PKIX) and the chain moves on to the next SRV target.
+    fn failTargetTlsa(self: *Resolver, job: *Job) void {
+        self.emitAndAdvance(job, &.{}, .lookup_failed);
     }
 
     /// Deep-copy a parsed TLSA set; every emitted target owns its own
@@ -1616,12 +1637,12 @@ pub const Resolver = struct {
         return tlsa;
     }
 
-    fn emitTarget(self: *Resolver, job: *Job, ent: *const SrvEnt, addr: net.Address, tlsa_recs: []dns.TlsaRecord) !void {
+    fn emitTarget(self: *Resolver, job: *Job, ent: *const SrvEnt, addr: net.Address, tlsa_recs: []dns.TlsaRecord, status: TlsaStatus) !void {
         if (job.targets.items.len >= TARGET_CAP) return;
         const host = try self.alloc.dupe(u8, ent.host);
         errdefer self.alloc.free(host);
         const tlsa = try self.dupeTlsa(tlsa_recs);
-        try job.targets.append(self.alloc, .{ .addr = addr, .host = host, .tlsa = tlsa, .is_direct_tls = ent.is_direct_tls });
+        try job.targets.append(self.alloc, .{ .addr = addr, .host = host, .tlsa = tlsa, .tlsa_status = status, .is_direct_tls = ent.is_direct_tls });
     }
 
     fn sendAddr(self: *Resolver, job: *Job, qtype: u16) !void {
@@ -1661,6 +1682,7 @@ pub const Resolver = struct {
                 .addr = addr,
                 .host = host,
                 .tlsa = &.{},
+                .tlsa_status = .absent,
                 .is_direct_tls = false,
             }) catch {
                 self.alloc.free(host);
@@ -1867,6 +1889,13 @@ const FakeDns = struct {
     /// shared authority SOA: the family is absent, not failed.
     a_nxdomain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     aaaa_nxdomain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, TLSA queries are answered SERVFAIL: the lookup
+    /// failed, it did not prove the RRset absent.
+    tlsa_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, TLSA queries get an empty NOERROR answer (NODATA).
+    tlsa_nodata: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, TLSA queries are received but never answered.
+    tlsa_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, AAAA queries are answered with ::1 so dual-stack
     /// paths have real data.
     a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1965,6 +1994,7 @@ const FakeDns = struct {
         var ancount: u16 = 0;
         if ((q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA) and self.a_silent.load(.monotonic)) return 0;
         if (q.qtype == wire.TYPE_SRV and self.srv_silent.load(.monotonic)) return 0;
+        if (q.qtype == wire.TYPE_TLSA and self.tlsa_silent.load(.monotonic)) return 0;
         const is_addr_q = q.qtype == wire.TYPE_A or q.qtype == wire.TYPE_AAAA;
         const family_fail = (q.qtype == wire.TYPE_A and self.a_fail.load(.monotonic)) or
             (q.qtype == wire.TYPE_AAAA and self.aaaa_fail.load(.monotonic));
@@ -2084,9 +2114,20 @@ const FakeDns = struct {
             answers.appendSlice(alloc, &.{ 127, 0, 0, 1 }) catch {};
         } else if (q.qtype == wire.TYPE_TLSA) {
             _ = self.tlsa_recvd.fetchAdd(1, .monotonic);
-            ancount = 1;
-            appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 7);
-            answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
+            if (self.tlsa_fail.load(.monotonic)) {
+                std.mem.writeInt(u16, out[0..2], id, .big);
+                std.mem.writeInt(u16, out[2..4], 0x8182, .big);
+                std.mem.writeInt(u16, out[4..6], 1, .big);
+                @memset(out[6..12], 0);
+                const qlen = pkt.len - 12;
+                @memcpy(out[12 .. 12 + qlen], pkt[12..]);
+                return 12 + qlen;
+            }
+            if (!self.tlsa_nodata.load(.monotonic)) {
+                ancount = 1;
+                appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 7);
+                answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
+            }
         }
 
         var nscount: u16 = 0;
@@ -2730,6 +2771,7 @@ test "dns-async: the chain deadline completes with collected targets" {
         .addr = try net.Address.parseIp("127.0.0.1", 5222),
         .host = host,
         .tlsa = &.{},
+        .tlsa_status = .absent,
         .is_direct_tls = false,
     }) catch unreachable;
     r.onChainDeadline(job);
@@ -2815,6 +2857,80 @@ test "dns-async: want_tlsa=true attaches the fetched records per target" {
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expect(res.targets.len >= 1);
     try std.testing.expect(res.targets[0].tlsa.len >= 1);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a TLSA NODATA marks the target tlsa_status absent" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_nodata.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), res.targets[0].tlsa.len);
+}
+
+test "dns-async: a TLSA SERVFAIL marks the target lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // The target is still emitted with its addresses; the status word
+    // marks the TLSA lookup as a temporary failure, never PKIX-eligible.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), res.targets[0].tlsa.len);
+}
+
+test "dns-async: a TLSA timeout marks the target lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_silent.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
 test "dns-async: identical resolves merge into one job" {
@@ -3109,6 +3225,7 @@ test "dns-async: a nested completion inside a callback keeps sibling cancel" {
         .addr = try net.Address.parseIp("127.0.0.1", 5222),
         .host = host,
         .tlsa = &.{},
+        .tlsa_status = .absent,
         .is_direct_tls = false,
     }) catch unreachable;
     r.onChainDeadline(job);

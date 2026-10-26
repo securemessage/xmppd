@@ -1618,6 +1618,7 @@ test "engine: a DNS answer for a reaped session is freed, not leaked" {
         .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
         .host = host,
         .tlsa = &.{},
+        .tlsa_status = .absent,
         .is_direct_tls = false,
     };
     Engine.onDnsResult(&eng, h.encode(), .resolved, .{ .targets = targets });
