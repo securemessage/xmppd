@@ -1756,11 +1756,16 @@ fn readResolvConf(path: []const u8) !net.Address {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
     const n = try f.read(&buf);
-    var it = std.mem.tokenizeAny(u8, buf[0..n], " \t\n");
-    while (it.next()) |tok| {
-        if (!std.mem.eql(u8, tok, "nameserver")) continue;
-        const addr = it.next() orelse break;
-        return net.Address.parseIp(addr, 53) catch continue;
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (lines.next()) |line| {
+        // "#" opens a comment anywhere on the line.
+        const end = std.mem.indexOfScalar(u8, line, '#') orelse line.len;
+        var it = std.mem.tokenizeAny(u8, line[0..end], " \t");
+        while (it.next()) |tok| {
+            if (!std.mem.eql(u8, tok, "nameserver")) continue;
+            const addr = it.next() orelse break;
+            return net.Address.parseIp(addr, 53) catch continue;
+        }
     }
     return error.NoNameserver;
 }
@@ -3825,6 +3830,21 @@ test "dns-async: resolv.conf is read into the resolver, not on the loop" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expectEqual(@as(u16, 53), r.server.getPort());
+}
+
+test "dns-async: a commented nameserver line stays a comment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "# nameserver 9.9.9.9\nnameserver 127.0.0.53 # local\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expectEqual(try net.Address.parseIp("127.0.0.53", 53), r.server);
 }
 
 test "dns-async: a TTL with the top bit set reports zero (RFC 2181)" {
