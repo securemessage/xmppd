@@ -68,7 +68,11 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
     };
 }
 
-fn canonicalAccount(identity: []const u8, buf: *[rate_limiter.max_key_len]u8) []const u8 {
+/// Longest supported account key, the limiter's key bound.
+pub const account_key_max = rate_limiter.max_key_len;
+
+/// Canonical account key: the identity localpart, ASCII-lowercased.
+pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
     const local = localpartOf(identity);
     if (local.len > buf.len) return local;
     for (local, 0..) |c, i| buf[i] = std.ascii.toLower(c);
@@ -120,9 +124,38 @@ pub const Policy = struct {
         }
 
         const limiter = self.limiter orelse return null;
-        var buf: [rate_limiter.max_key_len]u8 = undefined;
-        const account = canonicalAccount(username, &buf);
+        var buf: [account_key_max]u8 = undefined;
+        const account = accountKey(username, &buf);
         return switch (limiter.admitAccount(account)) {
+            .allowed => null,
+            .locked => blk: {
+                log.info("auth rejected: account '{s}' is locked", .{username});
+                break :blk "account-disabled";
+            },
+            .rate_limited => blk: {
+                log.info("auth rejected: account '{s}' is rate limited", .{username});
+                break :blk "policy-violation";
+            },
+            .unavailable => blk: {
+                log.warn("rate state cannot track the request: failing closed", .{});
+                break :blk "temporary-auth-failure";
+            },
+        };
+    }
+
+    /// Count one account attempt and enforce the lock and window, with
+    /// in-flight crypto-pool jobs counted as possible failures. Denies when
+    /// failures plus pending already reach the lockout threshold.
+    pub fn admitAccountPending(self: Policy, username: []const u8, pending: usize) ?[]const u8 {
+        if (username.len == 0) return null;
+        if (self.lock_checker) |checker| {
+            if (permanentLockReason(checker, username)) |reason| return reason;
+        }
+
+        const limiter = self.limiter orelse return null;
+        var buf: [account_key_max]u8 = undefined;
+        const account = accountKey(username, &buf);
+        return switch (limiter.admitAccountPending(account, pending)) {
             .allowed => null,
             .locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
@@ -159,8 +192,8 @@ pub const Policy = struct {
         }
 
         const limiter = self.limiter orelse return null;
-        var buf: [rate_limiter.max_key_len]u8 = undefined;
-        const account = if (username.len > 0) canonicalAccount(username, &buf) else "";
+        var buf: [account_key_max]u8 = undefined;
+        const account = if (username.len > 0) accountKey(username, &buf) else "";
         return switch (limiter.checkLock(account, client_ip)) {
             .allowed => null,
             .account_locked => blk: {
@@ -177,8 +210,8 @@ pub const Policy = struct {
     /// Record the outcome of an attempt already counted at admission.
     pub fn recordOutcome(self: Policy, username: []const u8, client_ip: []const u8, outcome: Outcome) void {
         const limiter = self.limiter orelse return;
-        var buf: [rate_limiter.max_key_len]u8 = undefined;
-        const account = if (username.len > 0) canonicalAccount(username, &buf) else "";
+        var buf: [account_key_max]u8 = undefined;
+        const account = if (username.len > 0) accountKey(username, &buf) else "";
         limiter.recordOutcome(account, client_ip, outcome == .success);
     }
 };

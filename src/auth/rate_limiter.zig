@@ -165,6 +165,25 @@ pub const RateLimiter = struct {
         return self.admitKey(self.account_table, username, self.policy.max_per_account, now, .count);
     }
 
+    /// Count one account attempt and, when jobs are already in flight for
+    /// it, deny once failures plus pending jobs reach the lockout threshold.
+    pub fn admitAccountPending(self: *RateLimiter, username: []const u8, pending: usize) KeyDecision {
+        return self.admitAccountPendingAt(username, pending, currentEpoch());
+    }
+
+    pub fn admitAccountPendingAt(self: *RateLimiter, username: []const u8, pending: usize, now: u32) KeyDecision {
+        if (username.len == 0) return .allowed;
+        const decision = self.admitAccountAt(username, now);
+        if (decision != .allowed) return decision;
+        if (pending == 0) return .allowed;
+
+        const entry = self.find(self.account_table, username) orelse return .allowed;
+        if (@as(usize, entry.failures) + pending >= @as(usize, self.policy.lockout_threshold)) {
+            return .rate_limited;
+        }
+        return .allowed;
+    }
+
     /// Re-check both keys without counting. Used at SCRAM client-final so an
     /// attempt already counted at client-first can still complete.
     pub fn check(self: *RateLimiter, username: []const u8, client_ip: []const u8) Decision {
@@ -652,6 +671,25 @@ test "RateLimiter: a lock-only check ignores the window" {
     const ip = limiter.find(limiter.ip_table, "10.0.0.1").?;
     ip.locked_until = 200;
     try std.testing.expectEqual(LockDecision.ip_locked, limiter.checkLockAt("alice", "10.0.0.1", 100));
+}
+
+test "RateLimiter: pending jobs count against the account lockout threshold" {
+    var limiter = try testLimiter(.{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    try std.testing.expectEqual(KeyDecision.allowed, limiter.admitAccountPendingAt("alice", 0, 100));
+    try std.testing.expectEqual(KeyDecision.allowed, limiter.admitAccountPendingAt("alice", 1, 100));
+    try std.testing.expectEqual(KeyDecision.rate_limited, limiter.admitAccountPendingAt("alice", 2, 100));
+
+    limiter.recordOutcomeAt("alice", "", false, 100);
+    try std.testing.expectEqual(KeyDecision.rate_limited, limiter.admitAccountPendingAt("alice", 1, 100));
 }
 
 test "RateLimiter: a full table evicts the oldest unlocked entry" {

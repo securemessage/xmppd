@@ -234,6 +234,21 @@ pub fn AuthHandler(comptime Store: type) type {
             self.pending_plain.deinit(self.allocator);
         }
 
+        /// Queued PLAIN jobs for this account, keyed by the folded localpart.
+        /// Counts in-flight crypto-pool work against the lockout threshold.
+        fn pendingFor(self: *Self, username: []const u8) usize {
+            var current_buf: [policy_mod.account_key_max]u8 = undefined;
+            const current = policy_mod.accountKey(username, &current_buf);
+            var count: usize = 0;
+            var it = self.pending_plain.iterator();
+            while (it.next()) |kv| {
+                var key_buf: [policy_mod.account_key_max]u8 = undefined;
+                const key = policy_mod.accountKey(kv.value_ptr.username, &key_buf);
+                if (std.mem.eql(u8, key, current)) count += 1;
+            }
+            return count;
+        }
+
         /// Attach a crypto pool (T121). Local-store PLAIN derives start
         /// deferring after this; the IPC loop must poll takeCryptoReply()
         /// whenever the pool's wake pipe fires.
@@ -383,8 +398,13 @@ pub fn AuthHandler(comptime Store: type) type {
             // Traditional credential lookup + SCRAM derive
             if (comptime @hasDecl(Store, "lookup")) {
                 // Count the account attempt and enforce the lock before the
-                // lookup and KDF. The outcome only records the result.
-                if (self.policy.admitAccount(username)) |reason| {
+                // lookup and KDF. A crypto-pool job also counts against the
+                // lockout threshold while it is in flight.
+                const account_reason = if (self.crypto_pool != null)
+                    self.policy.admitAccountPending(username, self.pendingFor(username))
+                else
+                    self.policy.admitAccount(username);
+                if (account_reason) |reason| {
                     return .{ .reply = authFailure(req.conn_id, reason) };
                 }
 
@@ -2428,4 +2448,47 @@ test "AuthHandler: PLAIN-IdP rejects a locked supplied name before the IdP" {
     try std.testing.expectEqualDeep(right_reply, wrong_reply);
     try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: crypto-pool pending jobs count against the lockout threshold" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "wrongpw");
+
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        try std.testing.expect(handleSync(&handler, plainRequest(310 + i, "10.0.0.30", payload)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.pending_plain.count());
+
+    // Two jobs are in flight, equal to the lockout threshold: the next
+    // attempt must not be queued.
+    const third = handleSync(&handler, plainRequest(312, "10.0.0.30", payload)) orelse return error.NoResponse;
+    if (third != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", third.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 2), handler.pending_plain.count());
 }
