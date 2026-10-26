@@ -3132,10 +3132,8 @@ pub const Server = struct {
                             // also written here, but a failed write must not leave a
                             // pointer behind: the drain would find neither copy, drop
                             // the pointer, and the message would vanish (E2b).
-                            if (self.archive) |archive| {
-                                archive.store(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch |err| {
-                                    log.warn("S2S offline archive store failed for {s}: {s}", .{ recipient_bare, @errorName(err) });
-                                };
+                            if (self.archive != null) {
+                                self.archiveStore(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml);
                             }
                             const held = store.storeHeldPointer(recipient_bare, m.from_jid, stanza_id, s2s_archive_ts, m.stanza_xml) catch |err| blk: {
                                 // A storage error is logged with its name and still
@@ -10190,6 +10188,120 @@ test "Server: inline archiveStore failure increments archive_store_failed (S31)"
     server.archiveStore("a@localhost", "b@localhost", "s1", 1, "<m/>");
     server.archiveStore("a@localhost", "b@localhost", "s2", 2, "<m/>");
     try std.testing.expectEqual(@as(u64, 2), server.archive_store_failed);
+}
+
+test "Server: H8 an inline offline archive failure on the c2s path is counted" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    // A zero-capacity allocator makes every archive store fail with
+    // OutOfMemory while building its key.
+    var empty_buf: [0]u8 = .{};
+    var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, fba.allocator());
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "normal";
+    alice.stanza_id = "n1";
+    const body = "<body>not archivable</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // The failed inline store is counted once, and the message still reaches
+    // the offline store with its payload.
+    try std.testing.expectEqual(@as(u64, 1), server.archive_store_failed);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
+    defer if (held) |xml_bytes| allocator.free(xml_bytes);
+    try std.testing.expect(held != null);
+    try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>not archivable</body>") != null);
+}
+
+test "Server: H8 an inline offline archive failure on the S2S path is counted" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    try tmp.dir.makePath("archive");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
+    defer arch_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var empty_buf: [0]u8 = .{};
+    var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
+    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, fba.allocator());
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+    server.archive = &arch_store;
+
+    const inbound = "<message from='carol@example.com/res' to='bob@localhost' id='r9' type='chat'><body>hello</body></message>";
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = inbound,
+    } }, &changes);
+
+    // Counted once, and the stanza is still held: the archive write is not a
+    // precondition for the offline copy.
+    try std.testing.expectEqual(@as(u64, 1), server.archive_store_failed);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
+    defer if (held) |xml_bytes| allocator.free(xml_bytes);
+    try std.testing.expect(held != null);
+    try std.testing.expectEqualStrings(inbound, held.?);
 }
 
 test "every store namespace constant is registered and every registry entry is owned" {

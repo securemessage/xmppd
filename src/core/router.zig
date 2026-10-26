@@ -374,15 +374,15 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     // nothing (E2d).
                     stored_form = archive_stanza;
                     stored_id = archive_stanza_id;
-                } else if (server.archive) |archive| {
+                } else if (server.archive != null) {
                     // Not archivable, so no stanza-id was minted and the
                     // stored form carries none.
                     stored_form = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, "", server.server_host) orelse "";
                     stored_id = if (id_str.len > 0) id_str else "offline";
                     if (stored_form.len > 0) {
-                        archive.store(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form) catch |err| {
-                            log.warn("offline archive store failed for {s}: {s}", .{ recipient_bare2, @errorName(err) });
-                        };
+                        // archiveStore counts failures and rate-limits its log;
+                        // a per-stanza log line here would be unbounded.
+                        server.archiveStore(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form);
                     }
                 }
 
