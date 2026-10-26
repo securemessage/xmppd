@@ -807,6 +807,13 @@ pub const Resolver = struct {
     /// try; every other phase fails the job.
     fn failQuery(self: *Resolver, job: *Job) void {
         switch (job.phase) {
+            .srv_tls => {
+                // A refusal on the direct-TLS name falls through to
+                // the STARTTLS name the way "." or an empty answer does.
+                self.clearSrvList(job);
+                job.phase = .srv_plain;
+                self.sendSrv(job, SRV_PLAIN[job.service_idx]) catch return self.dropJob(job, .failed);
+            },
             // A per-target failure costs only the phase that failed:
             // one dead address family still lets the other answer,
             // and a failed TLSA lookup degrades the target to no-DANE.
@@ -1804,6 +1811,9 @@ const FakeDns = struct {
     /// When set, only the _xmpps* SRV answer carries the "." target:
     /// "no direct TLS", which must still fall through to _xmpp*.
     srv_tls_dot: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, _xmpps* SRV queries are answered SERVFAIL: a refusal
+    /// must fall through to _xmpp* the way "." does.
+    srv_tls_fail: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, address queries are received but never answered,
     /// exercising per-query retries and the whole-chain deadline.
     a_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1925,6 +1935,17 @@ const FakeDns = struct {
             named_fail = std.mem.eql(u8, q.qname, fname);
         }
         if (is_addr_q and (family_fail or named_fail)) {
+            std.mem.writeInt(u16, out[0..2], id, .big);
+            std.mem.writeInt(u16, out[2..4], 0x8182, .big);
+            std.mem.writeInt(u16, out[4..6], 1, .big);
+            @memset(out[6..12], 0);
+            const qlen = pkt.len - 12;
+            @memcpy(out[12 .. 12 + qlen], pkt[12..]);
+            return 12 + qlen;
+        }
+        if (q.qtype == wire.TYPE_SRV and self.srv_tls_fail.load(.monotonic) and
+            std.mem.startsWith(u8, q.qname, "_xmpps"))
+        {
             std.mem.writeInt(u16, out[0..2], id, .big);
             std.mem.writeInt(u16, out[2..4], 0x8182, .big);
             std.mem.writeInt(u16, out[4..6], 1, .big);
@@ -2601,6 +2622,29 @@ test "dns-async: a '.' _xmpps answer falls through to _xmpp (Q3)" {
     try std.testing.expect(res.targets.len >= 1);
     try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
     try std.testing.expect(!res.targets[0].is_direct_tls);
+}
+
+test "dns-async: a SERVFAIL on _xmpps falls through to _xmpp" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_tls_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // A refused direct-TLS lookup is not a failure: the STARTTLS SRV
+    // still gets its try and resolves the chain.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
 }
 
 test "dns-async: the whole-chain deadline bounds a silent target list" {
