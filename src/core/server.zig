@@ -38,7 +38,7 @@ const sasl = @import("sasl");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const Connection = @import("connection.zig").Connection;
-const connection_mod = @import("connection.zig");
+pub const connection_mod = @import("connection.zig");
 const Listener = @import("listener.zig").Listener;
 const Event = @import("event_loop.zig").Event;
 

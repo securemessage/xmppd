@@ -171,6 +171,44 @@ pub fn buildComplete(
     return fbs.pos;
 }
 
+/// Bytes `xml.escapeWrite` emits for `value`. The five escaped characters
+/// expand, everything else is copied verbatim.
+pub fn escapedLen(value: []const u8) usize {
+    var total: usize = 0;
+    for (value) |c| {
+        total += switch (c) {
+            '&' => "&amp;".len,
+            '<', '>' => "&lt;".len,
+            '\'' => "&apos;".len,
+            '"' => "&quot;".len,
+            else => 1,
+        };
+    }
+    return total;
+}
+
+/// Longest escaped real JID of any occupant, which is the widest stanza the
+/// room's fan-out has to build. Sizing on the actual occupants keeps the
+/// rejection from firing on a stanza some recipient could still receive.
+pub fn longestEncodedRealJid(room: *const Room) usize {
+    var longest: usize = 0;
+    for (room.occupants) |slot| {
+        const occ = slot orelse continue;
+        longest = @max(longest, escapedLen(occ.getRealJid()));
+    }
+    return longest;
+}
+
+/// True when a groupchat stanza cannot be queued whole for a recipient whose
+/// escaped JID is `encoded_recipient_len` bytes. Such a stanza fails
+/// `queueSend` with `WriteBufferFull` for that occupant, and the failure path
+/// marks the session for the slow-reader teardown: the whole room disconnects,
+/// the sender included, for a message nobody could receive (H5). Callers
+/// reject it at MUC ingress instead.
+pub fn exceedsWriteBuffer(prefix_len: usize, suffix_len: usize, encoded_recipient_len: usize, limit: usize) bool {
+    return prefix_len + encoded_recipient_len + suffix_len > limit;
+}
+
 // ============================================================================
 // Session delivery (T153)
 // ============================================================================

@@ -87,13 +87,17 @@ pub const MAX_OCCUPANTS = 128;
 /// Sentinel session_id for remote (S2S) occupants.
 pub const REMOTE_OCCUPANT: usize = std.math.maxInt(usize);
 
+/// Longest real JID an occupant record holds. Fan-out sizing has to assume
+/// the worst case, because one recipient over the limit fails the delivery.
+pub const MAX_REAL_JID = 256;
+
 /// A single occupant in a room.
 pub const Occupant = struct {
     /// Room-local nickname.
     nick_buf: [64]u8 = [_]u8{0} ** 64,
     nick_len: u8 = 0,
     /// Full JID of the real user (user@domain/resource).
-    real_jid_buf: [256]u8 = [_]u8{0} ** 256,
+    real_jid_buf: [MAX_REAL_JID]u8 = [_]u8{0} ** MAX_REAL_JID,
     real_jid_len: u16 = 0,
     /// Bare JID of the real user (user@domain).
     bare_jid_buf: [256]u8 = [_]u8{0} ** 256,

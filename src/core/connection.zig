@@ -57,7 +57,9 @@ const READ_BUF_SIZE = 8192;
 /// Write buffer size — 16KB per connection.
 /// Larger than read because the server may need to send stream features + multiple
 /// stanzas before the client has a chance to ACK at the TCP level.
-const WRITE_BUF_SIZE = 16384;
+/// A stanza larger than this can never be queued in one piece, so producers
+/// that can size a stanza up front (MUC fan-out) reject it instead.
+pub const WRITE_BUF_SIZE = 16384;
 
 /// T110 backpressure: at/above this buffered-bytes level the server disables
 /// EVFILT_READ for the connection, so TCP-level flow control propagates to

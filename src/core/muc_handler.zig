@@ -26,6 +26,7 @@ const RoomConfig = room_store.RoomConfig;
 const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
 
+const connection_mod = @import("connection.zig");
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
@@ -174,6 +175,13 @@ pub fn handleMucGroupchat(
     var suffix_lease = server.leaseByteScratch() orelse return;
     defer suffix_lease.release();
     const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], id_str, inner_xml) orelse return;
+    if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
+        // No occupant could receive it, and queueing it would trip the
+        // slow-reader teardown on every session in the room (H5).
+        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ room_jid, prefix_len, suffix_len });
+        sendMessageError(server, session, to_local, muc_host, id_str, "resource-constraint", changes);
+        return;
+    }
     const prefix = prefix_buf[0..prefix_len];
     const suffix = suffix_lease.buf[0..suffix_len];
 
@@ -2061,6 +2069,11 @@ pub fn processRemoteGroupchat(
     var suffix_lease = server.leaseByteScratch() orelse return;
     defer suffix_lease.release();
     const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse return;
+    if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
+        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ ev.room_jid, prefix_len, suffix_len });
+        bounceRoomMailboxFull(server, .{ .room_message = ev }, ev.room_jid, changes);
+        return;
+    }
     const prefix = prefix_buf[0..prefix_len];
     const suffix = suffix_lease.buf[0..suffix_len];
 
@@ -3440,4 +3453,207 @@ test "S16: local delivery refuses a stale session generation" {
     _ = try session.conn.flushSend();
     n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expectEqualStrings(stanza, buf[0..n]);
+}
+
+// H5 keeps the slow-reader teardown for a buffer that is genuinely full, so
+// the loss still happens for an occupant whose queue is full. Review 131 and
+// 160 asked for the first fan-out after a loss: the loss must not wedge the
+// fan-out, and every other occupant must still receive the next message.
+test "H5: the first fan-out after a genuine buffer-full loss still reaches the room" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("arena@conference.localhost", .{ .persistent = false });
+
+    const names = [_][]const u8{ "alice", "bob", "carol" };
+    var peer_fds: [3]posix.fd_t = undefined;
+    for (names, 0..) |name, idx| {
+        var pair: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &pair));
+        peer_fds[idx] = pair[1];
+        const session = try allocator.create(Session);
+        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.stream.state = .active;
+        session.stream.authenticated = true;
+        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = "desk" };
+        server.sessions[idx] = session;
+        var jid_buf: [128]u8 = undefined;
+        const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/desk", .{name});
+        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+    }
+    defer for (peer_fds) |fd| posix.close(fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // bob's connection is nearly full, so a small stanza no longer fits. This
+    // is the genuinely-full case the teardown is for, not the H5 size case.
+    server.sessions[1].?.conn.write_end = connection_mod.WRITE_BUF_SIZE - 64;
+
+    const body = "<body>one</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "arena", body, "m1", &changes);
+
+    // bob is marked for teardown; alice and carol are not.
+    try std.testing.expect(server.sessions[1].?.sm_overflow);
+    try std.testing.expect(!server.sessions[0].?.sm_overflow);
+    try std.testing.expect(!server.sessions[2].?.sm_overflow);
+
+    // The next fan-out still reaches everyone whose buffer has room.
+    for (0..3) |idx| {
+        _ = server.sessions[idx].?.conn.flushSend() catch {};
+    }
+    var sink: [8192]u8 = undefined;
+    while ((posix.read(peer_fds[1], &sink) catch 0) > 0) {}
+    server.sessions[1].?.conn.write_end = 0;
+    const body2 = "<body>two</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "arena", body2, "m2", &changes);
+    for (0..3) |idx| {
+        _ = server.sessions[idx].?.conn.flushSend() catch {};
+    }
+    var buf: [4096]u8 = undefined;
+    for ([_]usize{ 0, 2 }) |idx| {
+        const n = posix.read(peer_fds[idx], &buf) catch 0;
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>two</body>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "id='m2'") != null);
+    }
+}
+
+// Review 131 asked for the first fan-out after a loss. A rejected oversized
+// groupchat is a loss the sender is told about; it must not leave the room's
+// fan-out queue or any occupant session in a state where the next groupchat
+// fails to reach everyone.
+test "H5: the first fan-out after a rejected oversized groupchat reaches every occupant" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("hall@conference.localhost", .{ .persistent = false });
+
+    const names = [_][]const u8{ "alice", "bob", "carol" };
+    const resources = [_][]const u8{ "desk", "phone", "tablet" };
+    var pair_fds: [3][2]posix.fd_t = undefined;
+    for (&pair_fds) |*pair| {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, pair));
+    }
+    defer for (pair_fds) |pair| posix.close(pair[1]);
+    for (names, resources, pair_fds, 0..) |name, res, pair, idx| {
+        const session = try allocator.create(Session);
+        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.stream.state = .active;
+        session.stream.authenticated = true;
+        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = res };
+        server.sessions[idx] = session;
+        var jid_buf: [256]u8 = undefined;
+        const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/{s}", .{ name, res });
+        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+    }
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    const oversized = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    handleMucGroupchat(&server, server.sessions[0].?, "hall", oversized, "big1", &changes);
+    try std.testing.expect(!server.fanout_queue.hasPending());
+
+    // The next groupchat is delivered to all three occupants.
+    const body = "<body>after</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "hall", body, "ok1", &changes);
+    try std.testing.expect(!server.fanout_queue.hasPending());
+
+    for (pair_fds, 0..) |pair, idx| {
+        const session = server.sessions[idx].?;
+        _ = session.conn.flushSend() catch {};
+        var buf: [2048]u8 = undefined;
+        const n = posix.read(pair[1], &buf) catch 0;
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>after</body>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "id='ok1'") != null);
+        try std.testing.expect(!session.sm_overflow);
+    }
+}
+
+// H5: a groupchat body larger than a connection's write buffer used to reach
+// every occupant as a WriteBufferFull, which marks each session for the
+// slow-reader teardown: one oversized message disconnected the whole room.
+// It is now rejected at ingress with an error to the sender instead.
+test "H5: an oversized groupchat body is rejected with a bounce, not a room teardown" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("lobby@conference.localhost", .{ .persistent = false });
+
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    server.sessions[0] = alice;
+
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 1, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    bob.stream.state = .active;
+    bob.stream.authenticated = true;
+    server.sessions[1] = bob;
+
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+    _ = try room.addOccupant("bob", "bob@localhost/phone", "bob@localhost", 1, 0, 1, .participant, .member);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // A body one byte past what any recipient's write buffer can hold, which
+    // is the size the review probe used (16,320 bytes).
+    const inner_len = connection_mod.WRITE_BUF_SIZE + 1;
+    const inner = try allocator.alloc(u8, inner_len);
+    defer allocator.free(inner);
+    @memset(inner, 'x');
+    @memcpy(inner[0..6], "<body>");
+    @memcpy(inner[inner_len - 7 ..], "</body>");
+
+    handleMucGroupchat(&server, alice, "lobby", inner, "big1", &changes);
+
+    // The sender is told, and neither session is marked for teardown.
+    try std.testing.expect(!alice.sm_overflow);
+    try std.testing.expect(!bob.sm_overflow);
+    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='big1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
+
+    // Nothing was fanned out to bob.
+    _ = bob.conn.flushSend() catch {};
+    var buf: [256]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
