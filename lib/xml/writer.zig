@@ -61,7 +61,7 @@ const span_max_attrs = 32;
 const span_max_decls = 64;
 
 const SpanAttr = struct { name: []const u8, prefix: []const u8 };
-const SpanDecl = struct { depth: usize, prefix: []const u8 };
+const SpanDecl = struct { depth: usize, prefix: []const u8, uri: []const u8 };
 
 /// A prefix is usable when it is declared in scope or is the
 /// always-bound xml: prefix.
@@ -112,21 +112,39 @@ fn spanCheckCharrefs(bytes: []const u8) Error!void {
     }
 }
 
-/// Stream-level elements must never ride inside a stanza-level span.
-fn isStreamElement(name: []const u8) bool {
-    return std.mem.eql(u8, name, "stream:stream") or
-        std.mem.eql(u8, name, "stream:error") or
-        std.mem.eql(u8, name, "stream:features");
+const stream_ns = "http://etherx.jabber.org/streams";
+
+/// Stream-level elements must never ride inside a stanza-level span,
+/// and the check is the resolved namespace URI, not a literal prefix:
+/// any binding of the stream namespace makes the element a stream
+/// element, whatever prefix (or none) it was written with.
+fn spanStreamDecl(uri: []const u8) bool {
+    return std.mem.eql(u8, uri, stream_ns);
+}
+
+/// Resolve a prefix against the in-scope declarations; an empty
+/// prefix resolves against the default namespace declaration.
+fn spanResolvePrefix(prefix: []const u8, decls: []const SpanDecl) ?[]const u8 {
+    var i = decls.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, decls[i].prefix, prefix)) return decls[i].uri;
+    }
+    return null;
 }
 
 /// Lexical pass over the raw span bytes, independent of the scanner:
-/// a '<' is illegal inside a quoted attribute value, and the check
-/// must run on the source bytes because an entity-produced '<' like
-/// &lt; is legal while a literal one is not.
+/// attributes must be name='v' or name="v" separated by whitespace
+/// (unquoted values, a '<' where the quote belongs, and adjacent
+/// attributes are all malformed), a '<' is illegal inside the quoted
+/// value itself (an entity-produced '<' like &lt; stays legal, which
+/// is exactly why this runs on the source bytes), ']]>' is illegal
+/// in text, and xmlns:xmlns may never be declared.
 fn spanCheckLex(bytes: []const u8) Error!void {
-    const LexState = enum { text, tag_name, before_attr, attr_name, attr_eq, attr_value, close_name };
+    const LexState = enum { text, tag_name, before_attr, attr_name, attr_eq, attr_value, after_attr, close_name };
     var state: LexState = .text;
     var quote: u8 = 0;
+    var attr_first: usize = 0;
     var i: usize = 0;
     while (i < bytes.len) : (i += 1) {
         const c = bytes[i];
@@ -135,6 +153,8 @@ fn spanCheckLex(bytes: []const u8) Error!void {
                 if (c == '<') {
                     state = .tag_name;
                     if (i + 1 < bytes.len and bytes[i + 1] == '/') state = .close_name;
+                } else if (std.mem.startsWith(u8, bytes[i..], "]]>")) {
+                    return error.NotWellFormed;
                 }
             },
             .close_name => {
@@ -151,26 +171,56 @@ fn spanCheckLex(bytes: []const u8) Error!void {
                 if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
                 if (c == '>') {
                     state = .text;
+                } else if (c == '/') {
+                    // '/>' ends the tag; anything else after '/' is not.
+                    if (i + 1 >= bytes.len or bytes[i + 1] != '>') return error.NotWellFormed;
                 } else {
+                    attr_first = i;
                     state = .attr_name;
                 }
             },
             .attr_name => {
                 if (c == '=') {
+                    // xmlns:xmlns can never be declared.
+                    const name = bytes[attr_first..i];
+                    if (std.mem.eql(u8, name, "xmlns:xmlns")) return error.NotWellFormed;
+                    state = .attr_eq;
+                } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    // Whitespace inside name= : the '=' may follow.
+                    var j = i;
+                    while (j < bytes.len and (bytes[j] == ' ' or bytes[j] == '\t' or bytes[j] == '\n' or bytes[j] == '\r')) j += 1;
+                    if (j >= bytes.len or bytes[j] != '=') return error.NotWellFormed;
+                    const name = bytes[attr_first..i];
+                    if (std.mem.eql(u8, name, "xmlns:xmlns")) return error.NotWellFormed;
+                    i = j;
                     state = .attr_eq;
                 } else if (c == '/' or c == '>') {
-                    state = .text;
+                    // A bare name with no value is not an attribute.
+                    return error.NotWellFormed;
                 }
             },
             .attr_eq => {
-                if (c == '\'' or c == '"') {
-                    quote = c;
-                    state = .attr_value;
-                }
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+                if (c != '\'' and c != '"') return error.NotWellFormed;
+                quote = c;
+                state = .attr_value;
             },
             .attr_value => {
                 if (c == '<') return error.NotWellFormed;
-                if (c == quote) state = .before_attr;
+                // Another attribute must follow whitespace; an adjacent
+                // name is malformed markup.
+                if (c == quote) state = .after_attr;
+            },
+            .after_attr => {
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    state = .before_attr;
+                } else if (c == '>') {
+                    state = .text;
+                } else if (c == '/' and i + 1 < bytes.len and bytes[i + 1] == '>') {
+                    state = .text;
+                } else {
+                    return error.NotWellFormed;
+                }
             },
         }
     }
@@ -186,6 +236,11 @@ fn spanCheckPrefixes(
     decls: []const SpanDecl,
 ) Error!void {
     if (elem_prefix.len > 0 and !spanPrefixOk(elem_prefix, decls)) return error.NotWellFormed;
+    // The element is a stream element whenever its resolved namespace
+    // is the stream namespace, whatever prefix wrote it.
+    if (spanResolvePrefix(elem_prefix, decls)) |uri| {
+        if (spanStreamDecl(uri)) return error.NotWellFormed;
+    }
     for (attrs) |a| {
         if (std.mem.eql(u8, a.prefix, "xmlns")) continue;
         if (a.prefix.len > 0 and !spanPrefixOk(a.prefix, decls)) return error.NotWellFormed;
@@ -201,8 +256,9 @@ pub const ValidatedSpan = struct {
     /// The only constructor, and it validates: XML Char plus a full
     /// well-formedness pass through lib/xml/scanner. Beyond balanced
     /// elements it rejects everything RFC 6120 section 11.1 forbids in
-    /// a stream (comments, PIs, declarations, DOCTYPE/CDATA), the
-    /// stream-level elements, invalid names, duplicate attributes, a
+    /// a stream (comments, PIs, declarations, DOCTYPE/CDATA), elements
+    /// in the stream namespace, invalid names, malformed attribute
+    /// syntax, ']]>' in text, xmlns:xmlns, duplicate attributes, a
     /// '<' inside an attribute value, non-Char character references,
     /// undeclared prefixes other than xml:, and truncated input. A
     /// dedicated zero-cost reader-produced constructor arrives with
@@ -233,7 +289,6 @@ pub const ValidatedSpan = struct {
                 .element_open => {
                     if (depth >= max_depth) return error.NotWellFormed;
                     if (!isValidName(tok.?.name)) return error.NotWellFormed;
-                    if (isStreamElement(tok.?.name)) return error.NotWellFormed;
                     pending_name = tok.?.name;
                     pending_prefix = tok.?.prefix;
                     attr_count = 0;
@@ -256,7 +311,7 @@ pub const ValidatedSpan = struct {
                     }
                     attrs[attr_count] = .{ .name = tok.?.name, .prefix = "xmlns" };
                     attr_count += 1;
-                    decls[decl_count] = .{ .depth = depth, .prefix = tok.?.prefix };
+                    decls[decl_count] = .{ .depth = depth, .prefix = tok.?.prefix, .uri = tok.?.value };
                     decl_count += 1;
                 },
                 .element_open_end => {
@@ -1146,9 +1201,17 @@ test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
         "<a><?pi data?></a>", // processing instruction
         "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'></stream:stream>",
         "<stream:error/>",
+        "<x:stream xmlns:x='http://etherx.jabber.org/streams'/>",
+        "<error xmlns='http://etherx.jabber.org/streams'/>",
+        "<a><f:error xmlns:f='http://etherx.jabber.org/streams'/></a>",
         "<a>&#0;</a>", // character reference to a non-Char
         "<a>&#x1;</a>",
         "<a x='1<'/>", // '<' inside an attribute value
+        "<a x=<'1'/>", // '<' where the quote belongs
+        "<a x=1/>", // unquoted attribute value
+        "<a x='1'y='2'/>", // adjacent attributes
+        "<a>x ]]> y</a>", // ']]>' in text
+        "<a xmlns:xmlns='urn:x'/>", // xmlns:xmlns is never declarable
         "<a x='1' x='2'/>", // duplicate attribute
         "<1a/>", // invalid element name
         "<a 1b='v'/>", // invalid attribute name
