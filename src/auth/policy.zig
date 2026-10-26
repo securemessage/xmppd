@@ -214,6 +214,18 @@ pub const Policy = struct {
         const account = if (username.len > 0) accountKey(username, &buf) else "";
         limiter.recordOutcome(account, client_ip, outcome == .success);
     }
+
+    /// Charge one failed alias login to the typed name and the IdP identity,
+    /// and the IP once. The caller has established that the folded keys
+    /// differ and the identity is locked.
+    pub fn recordAliasFailure(self: Policy, typed: []const u8, identity: []const u8, client_ip: []const u8) void {
+        const limiter = self.limiter orelse return;
+        var typed_buf: [account_key_max]u8 = undefined;
+        var identity_buf: [account_key_max]u8 = undefined;
+        limiter.recordAccountFailure(accountKey(typed, &typed_buf));
+        limiter.recordAccountFailure(accountKey(identity, &identity_buf));
+        limiter.recordOutcome("", client_ip, false);
+    }
 };
 
 test "Policy: no checks configured admits" {
@@ -301,6 +313,26 @@ test "Policy: a re-check does not count a second account attempt" {
     try std.testing.expect(policy.admitAccount("alice") == null);
     try std.testing.expect(policy.check("alice", "") == null);
     try std.testing.expectEqualStrings("policy-violation", policy.admitAccount("alice") orelse return error.ExpectedDenial);
+}
+
+test "Policy: an alias failure charges both accounts and the IP once" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordAliasFailure("a.smith", "alice@idp.example", "10.0.0.1");
+
+    try std.testing.expectEqualStrings("account-disabled", policy.check("a.smith", "") orelse return error.ExpectedDenial);
+    try std.testing.expectEqualStrings("account-disabled", policy.check("alice", "") orelse return error.ExpectedDenial);
+    // One IP failure, below the threshold of two; a second charge would lock.
+    try std.testing.expect(policy.check("other", "10.0.0.1") == null);
 }
 
 test "Policy: account keys fold case and domain to one localpart" {

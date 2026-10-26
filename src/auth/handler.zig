@@ -378,6 +378,25 @@ pub fn AuthHandler(comptime Store: type) type {
                     // "Alice" resolve to the same "alice" admission every
                     // mechanism enforces).
                     const identity = localpartOf(validated_user);
+                    // The IdP may resolve an alias to a different account
+                    // than the typed name. If that identity is locked, reply
+                    // exactly as for a wrong password and charge both keys;
+                    // otherwise the alias is an oracle and gets its own
+                    // failure budget.
+                    var typed_buf: [policy_mod.account_key_max]u8 = undefined;
+                    var identity_buf: [policy_mod.account_key_max]u8 = undefined;
+                    const typed_key = policy_mod.accountKey(username, &typed_buf);
+                    const identity_key = policy_mod.accountKey(identity, &identity_buf);
+                    if (!std.mem.eql(u8, typed_key, identity_key)) {
+                        if (self.policy.check(identity, "")) |reason| {
+                            if (std.mem.eql(u8, reason, "account-disabled")) {
+                                log.info("PLAIN auth failed (IdP alias): '{s}' maps to locked '{s}'", .{ username, identity });
+                                self.policy.recordAliasFailure(username, identity, req.client_ip);
+                                return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                            }
+                            return .{ .reply = authFailure(req.conn_id, reason) };
+                        }
+                    }
                     if (self.policy.admitAccount(identity)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
                     }
@@ -1415,7 +1434,9 @@ test "AuthHandler: a lock on the IdP identity rejects PLAIN" {
     } }) orelse return error.NoResponse;
     if (result != .auth_failure) return error.ExpectedAuthFailure;
 
-    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    // alicework is an alias for the locked alice: reply exactly as for a
+    // wrong password, not with a lock reason that reveals the password.
+    try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
 }
 
 test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
@@ -2538,4 +2559,30 @@ test "AuthHandler: a PLAIN prep failure completes and replies" {
     if (reply.msg != .auth_failure) return error.ExpectedAuthFailure;
     try std.testing.expectEqualStrings("not-authorized", reply.msg.auth_failure.reason);
     try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
+}
+
+test "AuthHandler: a locked IdP alias gets the wrong-password reply" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(410, "127.0.0.1", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(410, "127.0.0.1", plainPayload(&buf, "a.smith", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("not-authorized", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 2), store.password_calls);
 }
