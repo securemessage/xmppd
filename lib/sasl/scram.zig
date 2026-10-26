@@ -753,6 +753,8 @@ fn pbkdf2Sha256(password: []const u8, salt: []const u8, iterations: u32, output:
         for (&result, u) |*r, x| {
             r.* ^= x;
         }
+        // Wipe the per-iteration U block after it is folded into result.
+        std.crypto.secureZero(u8, std.mem.asBytes(&next));
     }
 
     output.* = result;
