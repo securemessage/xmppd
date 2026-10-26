@@ -851,11 +851,15 @@ pub const Resolver = struct {
         self.nextTarget(job) catch return self.dropJob(job, .failed);
     }
 
-    /// The whole-chain bound fired: regardless of which phase the job
-    /// sits in, the resolution is over.
+    /// The whole-chain bound fired: hand the waiters whatever targets
+    /// were collected so far instead of failing an almost-done chain.
     fn onChainDeadline(self: *Resolver, job: *Job) void {
         log.warn("dns: chain deadline exceeded for {s}", .{job.name});
-        self.dropJob(job, .failed);
+        if (job.targets.items.len > 0) {
+            self.complete(job);
+        } else {
+            self.dropJob(job, .failed);
+        }
     }
 
     // -- TCP fallback ----------------------------------------------------
@@ -2625,6 +2629,34 @@ test "dns-async: the whole-chain deadline bounds a silent target list" {
     // The chain bound fired long before two 2 s per-query retries
     // plus a 10 s fallback tail could.
     try std.testing.expect(elapsed < 1500);
+}
+
+test "dns-async: the chain deadline completes with collected targets" {
+    // One SRV target resolved before the chain bound fired: the
+    // waiters get that partial answer, not a failure.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("x.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    const host = try std.testing.allocator.dupe(u8, "t1.test");
+    job.targets.append(std.testing.allocator, .{
+        .addr = try net.Address.parseIp("127.0.0.1", 5222),
+        .host = host,
+        .tlsa = &.{},
+        .is_direct_tls = false,
+    }) catch unreachable;
+    r.onChainDeadline(job);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqualStrings("t1.test", res.targets[0].host);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
 test "dns-async: a hostile SRV answer is capped at 16 emitted targets" {
