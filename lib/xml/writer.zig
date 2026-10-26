@@ -1550,6 +1550,28 @@ test "ValidatedSpan accepts depth 64 and rejects depth 65" {
         error.NotWellFormed,
         ValidatedSpan.fromReader(testing.allocator, deep[0..pos]),
     );
+
+    // The bound rejects a fully balanced 65-level span too, not only
+    // an unclosed one: the error must come from the depth check, not
+    // an end-of-input state check or a bounds panic.
+    pos = 0;
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        deep[pos + 2] = '>';
+        pos += 3;
+    }
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = '/';
+        deep[pos + 2] = 'a' + @as(u8, @intCast((64 - d) % 26));
+        deep[pos + 3] = '>';
+        pos += 4;
+    }
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, deep[0..pos]),
+    );
 }
 
 test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
