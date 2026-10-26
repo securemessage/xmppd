@@ -498,11 +498,16 @@ pub const Engine = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
-        return .{
+        var self = Engine{
             .kq = kq,
             .allocator = allocator,
             .trace = std.posix.getenv("XMPPC_EVTRACE") != null,
         };
+        // The resolver reads resolv.conf at construction: create it
+        // here, off the event loop, so a first session's launchSession
+        // never does file I/O inline.
+        self.resolver = Resolver.init(allocator);
+        return self;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -1005,11 +1010,8 @@ pub const Engine = struct {
         } else |_| {}
 
         // Hostname: park the session in .resolving and hand the lookup to
-        // the async resolver on THIS engine. Nothing blocks.
-        if (self.resolver == null) {
-            self.resolver = Resolver.init(self.allocator);
-            self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
-        }
+        // the engine's resolver (built at init). Nothing blocks.
+        self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         s.phase = .resolving;
         self.resolver.?.resolve(s.host, .client, s.port, h.encode(), true) catch {
             s.fail(self.allocator, "resolve-error");
@@ -1519,7 +1521,17 @@ test "engine: timer EV_ERROR receipt drops the timer without firing it" {
     try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
 }
 
-test "engine: the resolver watch registers its kqueue, not a tick (J8)" {
+test "engine: the resolver is built at init, never on the loop" {
+    // Resolver construction reads resolv.conf from disk; doing it in
+    // Engine.init keeps that file I/O off the event loop for every
+    // later launchSession.
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    try std.testing.expect(eng.resolver != null);
+}
+
+test "engine: the resolver watch registers its kqueue, not a tick" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
     defer eng.deinit();
@@ -1551,7 +1563,7 @@ test "engine: the resolver watch registers its kqueue, not a tick (J8)" {
     eng.sessionAt(h).?.fail(alloc, "test-done");
     eng.reapDead();
 }
-test "engine: a session that dies mid-resolve frees the resolver job (J8)" {
+test "engine: a session that dies mid-resolve frees the resolver job" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
     defer eng.deinit();
@@ -1577,7 +1589,7 @@ test "engine: a session that dies mid-resolve frees the resolver job (J8)" {
     eng.reapDead();
 }
 
-test "engine: a DNS answer for a reaped session is freed, not leaked (J8)" {
+test "engine: a DNS answer for a reaped session is freed, not leaked" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
     defer eng.deinit();
