@@ -17,7 +17,7 @@
     <download-mirror rdf:resource="https://pacyworld.dev/securemessage/xmppd/tags"/>
     <bug-database rdf:resource="https://pacyworld.dev/securemessage/xmppd/issues"/>
 
-    <license rdf:resource="https://raw.githubusercontent.com/securemessage/xmppd/master/LICENSE"/>
+    <license rdf:resource="https://spdx.org/licenses/BSD-2-Clause.html"/>
 
     <schema:logo rdf:resource="https://www.xmppd.org/media/clear.svg"/>
 
