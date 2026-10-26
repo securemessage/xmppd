@@ -74,12 +74,24 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
 /// Longest supported account key, the limiter's key bound.
 pub const account_key_max = rate_limiter.max_key_len;
 
-/// Canonical account key: the identity localpart, ASCII-lowercased.
+/// Canonical account key: the identity localpart, ASCII-lowercased, with
+/// U+212A KELVIN SIGN folded to "k" to match the IdP's case folding.
 pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
     const local = localpartOf(identity);
     if (local.len > buf.len) return local;
-    for (local, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..local.len];
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < local.len) {
+        if (i + 3 <= local.len and local[i] == 0xE2 and local[i + 1] == 0x84 and local[i + 2] == 0xAA) {
+            buf[n] = 'k';
+            i += 3;
+        } else {
+            buf[n] = std.ascii.toLower(local[i]);
+            i += 1;
+        }
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 fn permanentLockReason(checker: LockChecker, username: []const u8) ?[]const u8 {
@@ -304,6 +316,25 @@ test "Policy: a re-check does not count a second account attempt" {
     try std.testing.expect(policy.admitAccount("alice") == null);
     try std.testing.expect(policy.check("alice", "") == null);
     try std.testing.expectEqualStrings("policy-violation", policy.admitAccount("alice") orelse return error.ExpectedDenial);
+}
+
+test "Policy: Kelvin sign variants share the account budget" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordOutcome("\u{212A}", "10.0.0.1", .failure);
+    policy.recordOutcome("k", "10.0.0.2", .failure);
+
+    // Both names fold to k, so the second failure locks the one budget.
+    try std.testing.expectEqualStrings("account-disabled", policy.admit("k", "10.0.0.3") orelse return error.ExpectedDenial);
 }
 
 test "Policy: check folds case against a temporary lock" {
