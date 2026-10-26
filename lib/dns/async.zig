@@ -254,10 +254,6 @@ pub const Resolver = struct {
     unmatched_replies: usize = 0,
     stale_icmp: usize = 0,
     udp_errors: usize = 0,
-    /// Real events harvested while applying changelists in
-    /// keventApply; dispatched by step() so registration never steals
-    /// socket progress from the event pump.
-    pending_events: std.ArrayListUnmanaged(posix.Kevent) = .{},
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
     /// job is already off `jobs`, so a cancel() issued from inside a
@@ -295,7 +291,6 @@ pub const Resolver = struct {
         self.wait_queue.deinit(self.alloc);
         for (self.cache.items) |e| self.freeCacheEnt(e);
         self.cache.deinit(self.alloc);
-        self.pending_events.deinit(self.alloc);
         if (self.fd >= 0) posix.close(self.fd);
         if (self.kq >= 0) posix.close(self.kq);
     }
@@ -546,12 +541,10 @@ pub const Resolver = struct {
     /// (pump only) - callers pass their next-loop deadline, not a sleep.
     pub fn step(self: *Resolver, timeout_ms: i32) void {
         if (self.kq < 0) return;
-        self.drainStash();
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
         const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
         self.dispatchEvents(events[0..n]);
-        self.drainStash();
     }
 
     /// Dispatch one event batch: socket progress first, deadlines
@@ -594,17 +587,6 @@ pub const Resolver = struct {
             if (self.jobFromUdata(ev.udata)) |job| {
                 if (ev.udata & 0x40 != 0) self.onChainDeadline(job) else self.onDeadline(job);
             }
-        }
-    }
-
-    /// Dispatch events stashed by keventApply until the stash is empty;
-    /// dispatch itself can stash again when callbacks arm timers.
-    fn drainStash(self: *Resolver) void {
-        while (self.pending_events.items.len > 0) {
-            var stash = self.pending_events;
-            self.pending_events = .empty;
-            self.dispatchEvents(stash.items);
-            stash.deinit(self.alloc);
         }
     }
 
@@ -726,22 +708,30 @@ pub const Resolver = struct {
         };
     }
 
-    /// Apply changelist entries and surface per-entry failures, which
-    /// come back as EV_ERROR events rather than a kevent() error. The
-    /// harvest is non-blocking; any real events it picks up are
-    /// stashed for step() so registration cannot steal or reorder
-    /// socket progress.
+    /// Apply changelist entries and surface per-entry failures. Every
+    /// change carries EV_RECEIPT: the kernel returns one EV_ERROR event
+    /// per entry (data = 0 on success, the errno on failure) and never
+    /// drains real pending events into this harvest, so socket progress
+    /// reaches step() through the kqueue alone and a failed entry cannot
+    /// eat an event harvested after it.
     fn keventApply(self: *Resolver, ch: []const posix.Kevent) !void {
         const nonblock = std.c.timespec{ .sec = 0, .nsec = 0 };
-        var evbuf: [64]posix.Kevent = undefined;
-        // One non-blocking harvest: the changelist's per-entry errors
-        // come back here alongside anything already pending. Draining
-        // further is wrong: a READ on an unread socket stays pending
-        // and would loop forever; leftovers still reach step().
-        const n = try posix.kevent(self.kq, ch, &evbuf, &nonblock);
-        for (evbuf[0..n]) |ev| {
-            if (ev.flags & std.c.EV.ERROR != 0) return error.KeventChange;
-            self.pending_events.append(self.alloc, ev) catch return error.KeventChange;
+        var evbuf: [8]posix.Kevent = undefined;
+        var off: usize = 0;
+        while (off < ch.len) {
+            // A full eventlist stops later changes, so the batch never
+            // exceeds the buffer that reports it.
+            const n = @min(ch.len - off, evbuf.len);
+            var batch: [8]posix.Kevent = undefined;
+            for (ch[off .. off + n], 0..) |ev, i| {
+                batch[i] = ev;
+                batch[i].flags |= std.c.EV.RECEIPT;
+            }
+            const got = try posix.kevent(self.kq, batch[0..n], &evbuf, &nonblock);
+            for (evbuf[0..got]) |ev| {
+                if (ev.data != 0) return error.KeventChange;
+            }
+            off += n;
         }
     }
 
@@ -3429,6 +3419,82 @@ test "dns-async: a stale deadline cannot hit a re-used slot (Q6)" {
     for (0..16) |_| r.step(0);
     try std.testing.expectEqual(@as(u8, 1), job_b.tries);
     try std.testing.expect(ctx.status == null);
+}
+
+test "dns-async: a failed registration change reports per entry" {
+    const sink = try startUdpSink();
+    defer posix.close(sink.fd);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", sink.port));
+
+    try r.query("a.test", .a, 7);
+    // Registration on a descriptor the kqueue cannot watch reports its
+    // errno through the change's EV_ERROR receipt.
+    var bad = [1]posix.Kevent{.{
+        .ident = @intCast(std.math.maxInt(u31)),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    try std.testing.expectError(error.KeventChange, r.keventApply(&bad));
+}
+
+test "dns-async: applying changes never drains the events a parent watches" {
+    const sink = try startUdpSink();
+    defer posix.close(sink.fd);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", sink.port));
+
+    try r.query("a.test", .a, 7);
+
+    // A one-shot WRITE on the resolver's socket is queued at once.
+    var wr = [1]posix.Kevent{.{
+        .ident = @intCast(r.fd),
+        .filter = std.c.EVFILT.WRITE,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = try posix.kevent(r.kq, &wr, &.{}, null);
+
+    // A parent kqueue watches the child the way the engine does.
+    const pkq = try posix.kqueue();
+    defer posix.close(pkq);
+    var watch = [1]posix.Kevent{.{
+        .ident = @intCast(r.kq),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = try posix.kevent(pkq, &watch, &.{}, null);
+    const zero = std.c.timespec{ .sec = 0, .nsec = 0 };
+    var evs: [4]posix.Kevent = undefined;
+    try std.testing.expect(try posix.kevent(pkq, &.{}, &evs, &zero) >= 1);
+
+    // A registration round must not harvest the queued event: drained
+    // into userspace here, it would leave the parent blind to it until
+    // something else woke step(). One-shot events never re-post.
+    var ch = [1]posix.Kevent{.{
+        .ident = 0xBEEF,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+        .fflags = std.c.NOTE.ABSTIME,
+        .data = 60_000_000,
+        .udata = 0,
+    }};
+    try r.keventApply(&ch);
+
+    const got = try posix.kevent(pkq, &.{}, &evs, &zero);
+    try std.testing.expect(got >= 1);
 }
 
 var fake_now: i64 = 0;
