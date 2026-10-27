@@ -385,6 +385,10 @@ fn splitRef(comptime ref: []const u8) struct { []const u8, []const u8 } {
 pub const Options = struct {
     /// Hard cap on key=value lines in one file.
     max_keys: usize = default_max_keys,
+    /// Positional arguments the loader collects instead of rejecting;
+    /// 0 means every positional is an error (the default). ctl opts in
+    /// for its subcommands.
+    positional_cap: usize = 0,
 };
 
 pub fn Loader(
@@ -500,6 +504,12 @@ pub fn Loader(
         /// Effective values; defaults live in the section initializers.
         values: Sections,
         /// Per-field provenance, indexed like `fields`.
+        /// Positional arguments collected when options.positional_cap
+        /// allows them (ctl subcommands). Borrowed from the caller's
+        /// argv, like string field values.
+        positionals: []const []const u8 = &.{},
+        pos_buf: [options.positional_cap][]const u8 = undefined,
+        pos_len: usize = 0,
         provenance: [fields.len]Source,
         /// File line a field was set at (0 when not set from a file).
         lines: [fields.len]u32,
@@ -556,6 +566,8 @@ pub fn Loader(
 
         /// Parses an INI file into values. Sections and keys must be known
         /// to the field table; an unknown one is an error with file:line.
+        /// Unlike the legacy parser, a key before the first [section] is
+        /// rejected rather than silently bound to an empty section.
         pub fn loadFile(self: *Self, path: []const u8, diag: *Diag) Error!void {
             const arena = self.arena_state.allocator();
             const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -664,13 +676,20 @@ pub fn Loader(
             var i: usize = 0;
             while (i < args.len) : (i += 1) {
                 const arg = args[i];
-                if (end_of_options) {
-                    diag.set(.{ .key = arg, .detail = "unexpected positional argument" });
-                    return error.UnexpectedPositional;
-                }
-                if (arg.len == 0 or arg[0] != '-') {
-                    diag.set(.{ .key = arg, .detail = "unexpected positional argument" });
-                    return error.UnexpectedPositional;
+                if (end_of_options or arg.len == 0 or arg[0] != '-') {
+                    if (comptime options.positional_cap == 0) {
+                        diag.set(.{ .key = arg, .detail = "unexpected positional argument" });
+                        return error.UnexpectedPositional;
+                    } else {
+                        if (self.pos_len == options.positional_cap) {
+                            diag.set(.{ .key = arg, .detail = "too many positional arguments" });
+                            return error.UnexpectedPositional;
+                        }
+                        self.pos_buf[self.pos_len] = arg;
+                        self.pos_len += 1;
+                        self.positionals = self.pos_buf[0..self.pos_len];
+                        continue;
+                    }
                 }
                 if (std.mem.eql(u8, arg, "--")) {
                     end_of_options = true;
@@ -1006,6 +1025,7 @@ const TestSections = struct {
         db_path: []const u8 = "/var/db/xmppd/users.db",
         user: []const u8 = "",
         log_file: []const u8 = "/var/log/xmppd/xmppd.log",
+        pidfile: []const u8 = "/var/run/xmppd/xmppd.pid",
     } = .{},
     tls: struct {
         cert: []const u8 = "",
@@ -1065,8 +1085,8 @@ const TestSections = struct {
     ctl: struct {
         password: []const u8 = "",
         password_file: []const u8 = "",
-        max_uses: u32 = 0,
-        expires_hours: u32 = 24,
+        max_uses: u16 = 1,
+        expires_hours: u32 = 0,
     } = .{},
     meta: struct {
         config_path: []const u8 = "",
@@ -1082,6 +1102,7 @@ const file_spec = [_]FieldSpec{
     .{ .section = "server", .field = "db_path", .help = "user database path" },
     .{ .section = "server", .field = "user", .help = "unprivileged user" },
     .{ .section = "server", .field = "log_file", .help = "log file path" },
+    .{ .section = "server", .field = "pidfile", .help = "pid file path" },
     .{ .section = "tls", .field = "cert", .help = "TLS certificate chain" },
     .{ .section = "tls", .field = "key", .help = "TLS private key" },
     .{ .section = "tls", .field = "enabled", .help = "enable STARTTLS" },
@@ -1214,7 +1235,7 @@ const CoreLoader = Loader(TestSections, &file_spec, &core_cli, .{});
 const AuthLoader = Loader(TestSections, &file_spec, &auth_cli, .{});
 const OidcLoader = Loader(TestSections, &file_spec, &oidc_cli, .{});
 const S2sLoader = Loader(TestSections, &file_spec, &s2s_cli, .{});
-const CtlLoader = Loader(TestSections, &file_spec, &ctl_cli, .{});
+const CtlLoader = Loader(TestSections, &file_spec, &ctl_cli, .{ .positional_cap = 8 });
 
 /// Writes `content` to a temp file and returns its absolute path in `buf`.
 fn writeTempConfig(dir: *std.fs.Dir, name: []const u8, content: []const u8, buf: []u8) ![]const u8 {
@@ -1765,9 +1786,70 @@ test "readForwarded refuses low, unsealed and dead fds without panicking" {
     // An already-closed fd errors instead of panicking through close.
     try testing.expectError(error.ReadFailed, readForwarded(99, testing.allocator, &diag));
     // Slot 0 is below the remap range. Last: the reader owns and closes
-    // the fd even on refusal, so this takes stdin with it.
+    // the fd even on refusal, so this takes stdin with it; a /dev/null
+    // open reoccupies slot 0 for the rest of the suite.
     try testing.expectError(error.UnsealedFd, readForwarded(0, testing.allocator, &diag));
     try testing.expectEqualStrings("conf fd is below the remap slot range", diag.detail);
+    // Deliberately left open: it holds slot 0 for the rest of the run.
+    const keep = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try testing.expectEqual(@as(posix.fd_t, 0), keep);
+}
+
+test "the line limit is exactly 1024 bytes, not off by one" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    // hostname value sized so the whole line is exactly 1024 bytes.
+    const vlen = max_line_bytes - "hostname = ".len;
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(testing.allocator);
+    try body.appendSlice(testing.allocator, "[server]\nhostname = ");
+    for (0..vlen) |_| try body.append(testing.allocator, 'a');
+    try body.append(testing.allocator, '\n');
+    const ok = try writeTempConfig(&tmp.dir, "edge.ini", body.items, &path_buf);
+    var diag: Diag = .{};
+    var l = try MasterLoader.load(testing.allocator, .{ .path = ok }, &diag);
+    defer l.deinit();
+    try testing.expectEqual(@as(usize, vlen), l.values.server.hostname.len);
+    try body.insert(testing.allocator, body.items.len - 1, 'b');
+    const over = try writeTempConfig(&tmp.dir, "edge2.ini", body.items, &path_buf);
+    try testing.expectError(error.LineTooLong, MasterLoader.load(testing.allocator, .{ .path = over }, &diag));
+}
+
+test "forwarded values containing spaces round-trip untouched" {
+    var d0: Diag = .{};
+    var parent = try MasterLoader.load(testing.allocator, .{
+        .args = &.{ "--host", "my host.example" },
+    }, &d0);
+    defer parent.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const blob = try parent.forwardBlob(arena.allocator(), &diag);
+    var child = try CoreLoader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob) }, &diag);
+    defer child.deinit();
+    try testing.expectEqualStrings("my host.example", child.values.server.hostname);
+    try testing.expectEqual(.forwarded, child.provenanceOf("server", "hostname"));
+}
+
+test "ctl defaults match the code and positionals collect through --" {
+    var diag: Diag = .{};
+    var d = try CtlLoader.load(testing.allocator, .{ .args = &.{} }, &diag);
+    defer d.deinit();
+    try testing.expectEqual(@as(u16, 1), d.values.ctl.max_uses);
+    try testing.expectEqual(@as(u32, 0), d.values.ctl.expires_hours);
+    var d2 = try CtlLoader.load(testing.allocator, .{
+        .args = &.{ "--db", "d.db", "--", "adduser", "alice" },
+    }, &diag);
+    defer d2.deinit();
+    try testing.expectEqual(@as(usize, 2), d2.positionals.len);
+    try testing.expectEqualStrings("adduser", d2.positionals[0]);
+    try testing.expectEqualStrings("alice", d2.positionals[1]);
+    var d3 = try CtlLoader.load(testing.allocator, .{
+        .args = &.{ "passwd", "--db", "d.db" },
+    }, &diag);
+    defer d3.deinit();
+    try testing.expectEqual(@as(usize, 1), d3.positionals.len);
 }
 
 test "inline comments end a value only after whitespace; quoting is literal" {
