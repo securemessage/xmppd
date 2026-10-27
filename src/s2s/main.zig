@@ -1093,16 +1093,21 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             if (!session.stream_open_seen) {
                 session.stream_open_seen = true;
                 session.setRemoteDomain(from);
-            } else if (!session.restartFromAllowed(from)) {
-                log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
-                sendStreamError(session, .invalid_from);
-                _ = session.flushWrite() catch {};
-                daemon.closeInbound(batch, session.id);
-                return;
-            } else if (session.auth_domain_count > 0) {
-                // Authenticated domain may differ from the first open (dialback
-                // multiplexing); the tracked identity follows it.
-                session.setRemoteDomain(from);
+            } else {
+                // A restart begins a new stream, so our header from the previous
+                // one does not cover it: an error must open this one first.
+                session.stream_header_sent = false;
+                if (!session.restartFromAllowed(from)) {
+                    log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
+                    sendStreamError(session, .invalid_from);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                } else if (session.auth_domain_count > 0) {
+                    // Authenticated domain may differ from the first open
+                    // (dialback multiplexing); the tracked identity follows it.
+                    session.setRemoteDomain(from);
+                }
             }
             // The header to= selects which served host this stream addresses;
             // replies echo it as their from= (S2). An unserved host
@@ -1674,6 +1679,7 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
                 return;
             };
             session.queueWrite(response) catch {};
+            session.stream_header_sent = true;
         },
         .send_features => {
             const features = session.buildFeatures(&buf) catch {
@@ -1759,6 +1765,17 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
 
 /// Send a stream error and close.
 fn sendStreamError(session: *S2sSession, err: StreamError) void {
+    // A peer whose header we never answered gets one first, as c2s does
+    // (RFC 6120 4.9.1). Queued separately and before the error so a host or
+    // domain at the buffer limit cannot stop the error from being sent:
+    // leaving the peer to wait is worse than an unopened error.
+    if (!session.stream_header_sent) {
+        var header_buf: [1024]u8 = undefined;
+        if (session.buildStreamOpenResponse(&header_buf)) |header| {
+            session.queueWrite(header) catch {};
+            session.stream_header_sent = true;
+        } else |_| {}
+    }
     var buf: [512]u8 = undefined;
     const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
     session.queueWrite(error_xml) catch {};
@@ -5173,6 +5190,11 @@ test "S2sDaemon: MUC host is served on stream open; replies echo the requested h
     try std.testing.expect(daemon.getInbound(2) == null);
     var rbuf2: [2048]u8 = undefined;
     const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    // RFC 6120 4.9.1: the error is preceded by the stream header we never sent,
+    // so the peer can parse it. Both must arrive.
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:error>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream").? < std.mem.indexOf(u8, resp2, "<stream:error>").?);
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
 }
 

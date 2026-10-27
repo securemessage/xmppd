@@ -114,6 +114,10 @@ pub const S2sSession = struct {
     /// Whether a stream open was already processed; any later open on this
     /// socket is a restart (post-TLS, post-SASL, post-dialback).
     stream_open_seen: bool = false,
+    /// Whether our own <stream:stream> has been written on the current stream.
+    /// A stream error for a peer whose header we never answered must open the
+    /// stream first (RFC 6120 4.9.1), as c2s does.
+    stream_header_sent: bool = false,
     /// Host this stream is addressed to (to= of the stream header: the local
     /// domain or the MUC host). Replies echo it as their from= (S2).
     served_host_buf: [256]u8 = undefined,
@@ -548,7 +552,9 @@ pub const S2sSession = struct {
         return fbs.getWritten();
     }
 
-    /// Build a stream error response.
+    /// Build a stream error response. The stream header is a separate write so
+    /// an oversized host or domain cannot stop the error itself (RFC 6120
+    /// 4.9.1); see sendStreamError.
     pub fn buildStreamError(_: *const S2sSession, buf: []u8, error_name: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
