@@ -29,53 +29,6 @@ extern "c" fn closefrom(lowfd: c_int) void;
 /// by std.c).
 const FD_CLOEXEC: c_int = 1;
 
-/// memfd_create flags (FreeBSD 13+); not exported by std.c.
-const MFD_CLOEXEC: c_uint = 0x0001;
-const MFD_ALLOW_SEALING: c_uint = 0x0002;
-
-/// Forwarded-configuration blob ceiling shared with lib/conf: a child
-/// preads it in one pass, so it stays deliberately small.
-pub const conf_max_blob: usize = 256 * 1024;
-
-/// The sealed anonymous blob a child inherits as its forwarded
-/// configuration. Created once per reload, CLOEXEC in the master, and
-/// reused for every respawn: applyFdPass's dup2 clears CLOEXEC only in
-/// each child, where the blob lands in the slot right after that
-/// child's listener fds. A SIGHUP rebuild swaps in a fresh object.
-pub const ConfFd = struct {
-    fd: posix.fd_t = -1,
-
-    /// Creates the sealed blob object. The master copy stays CLOEXEC;
-    /// only a child's remap slot drops the flag.
-    pub fn create(blob: []const u8) !ConfFd {
-        if (blob.len > conf_max_blob) return error.BlobTooLarge;
-        const fd = std.c.memfd_create("xmppd-conf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (fd < 0) return error.MemfdFailed;
-        errdefer posix.close(fd);
-        var off: usize = 0;
-        while (off < blob.len) {
-            off += posix.write(fd, blob[off..]) catch return error.WriteFailed;
-        }
-        const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
-        if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
-        return .{ .fd = fd };
-    }
-
-    /// Rebuilds after a reload: the new sealed object replaces the old
-    /// one so the next respawn reads fresh config while running
-    /// children keep nothing but the fd they already read and closed.
-    pub fn rebuild(self: *ConfFd, blob: []const u8) !void {
-        const next = try ConfFd.create(blob);
-        if (self.fd >= 0) posix.close(self.fd);
-        self.* = next;
-    }
-
-    pub fn deinit(self: *ConfFd) void {
-        if (self.fd >= 0) posix.close(self.fd);
-        self.fd = -1;
-    }
-};
-
 /// Minimum backoff delay (nanoseconds).
 const MIN_BACKOFF_NS: u64 = 1 * std.time.ns_per_s;
 /// Maximum backoff delay (nanoseconds).
@@ -513,15 +466,45 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     _ = try sup2.waitChild();
 }
 
+/// Creates a sealed anonymous blob fd the way the master's ConfFd does;
+/// the test only needs an fd whose content proves which child read it.
+fn testSealedFd(blob: []const u8) !posix.fd_t {
+    const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
+    if (fd < 0) return error.MemfdFailed;
+    errdefer posix.close(fd);
+    _ = try posix.write(fd, blob);
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
+    return fd;
+}
+
+/// Reads one child's 3-byte verdict with a deadline so a dead child
+/// fails the test instead of hanging it.
+fn readVerdict(fd: posix.fd_t, buf: *[3]u8) !void {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    var left: i32 = 5000;
+    while (true) {
+        const r = try posix.poll(&pfd, left);
+        if (r == 0) return error.ChildTimeout;
+        if (pfd[0].revents & posix.POLL.IN != 0) {
+            _ = try posix.read(fd, buf);
+            return;
+        }
+        if (pfd[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0)
+            return error.ChildGone;
+        left = 1;
+    }
+}
+
 test "Supervisor: two children each hold only their own conf fd slot" {
     // Two sealed conf blobs, one per child. Each child verifies it can
     // pread its own remap slot (fd 4) and that nothing leaks past it:
     // the sibling's objects never exist in its table (fd 5 is EBADF).
-    var conf_a = try ConfFd.create("--host=a.test\n");
-    defer conf_a.deinit();
-    var conf_b = try ConfFd.create("--host=b.test\n");
-    defer conf_b.deinit();
-    try std.testing.expect(conf_a.fd != conf_b.fd);
+    const fd_a = try testSealedFd("--host=a.test\n");
+    defer posix.close(fd_a);
+    const fd_b = try testSealedFd("--host=b.test\n");
+    defer posix.close(fd_b);
+    try std.testing.expect(fd_a != fd_b);
 
     var pa: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pa) != 0) return error.Socketpair;
@@ -535,7 +518,7 @@ test "Supervisor: two children each hold only their own conf fd slot" {
     const pid_a = try posix.fork();
     if (pid_a == 0) {
         var sup = try Supervisor.init("/unused", &.{}, 1);
-        sup.pass_fds = &.{ pa[1], conf_a.fd };
+        sup.pass_fds = &.{ pa[1], fd_a };
         sup.applyFdPass();
         var verdict: [3]u8 = .{ 'N', 'N', 'N' };
         var b: [16]u8 = undefined;
@@ -551,7 +534,7 @@ test "Supervisor: two children each hold only their own conf fd slot" {
     const pid_b = try posix.fork();
     if (pid_b == 0) {
         var sup = try Supervisor.init("/unused", &.{}, 1);
-        sup.pass_fds = &.{ pb[1], conf_b.fd };
+        sup.pass_fds = &.{ pb[1], fd_b };
         sup.applyFdPass();
         var verdict: [3]u8 = .{ 'N', 'N', 'N' };
         var b: [16]u8 = undefined;
@@ -566,13 +549,13 @@ test "Supervisor: two children each hold only their own conf fd slot" {
 
     // Parent keeps CLOEXEC on both copies; the children cleared only
     // their own dup2'd slot.
-    const pfl = std.c.fcntl(conf_a.fd, std.c.F.GETFD);
+    const pfl = std.c.fcntl(fd_a, std.c.F.GETFD);
     try std.testing.expect(pfl >= 0 and pfl & FD_CLOEXEC != 0);
 
     var ra: [3]u8 = undefined;
     var rb: [3]u8 = undefined;
-    _ = try posix.read(pa[0], &ra);
-    _ = try posix.read(pb[0], &rb);
+    try readVerdict(pa[0], &ra);
+    try readVerdict(pb[0], &rb);
     try std.testing.expectEqualStrings("YYY", &ra);
     try std.testing.expectEqualStrings("YYY", &rb);
     _ = posix.waitpid(pid_a, 0);

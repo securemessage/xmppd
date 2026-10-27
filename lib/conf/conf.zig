@@ -819,7 +819,47 @@ pub const LoadOpts = struct {
 };
 
 /// The forwarded blob is bounded so a child can pread it in one pass.
+/// Shared by the writer (ConfFd.create) and the reader (readForwarded).
 pub const forward_max: usize = 256 * 1024;
+
+/// The sealed anonymous blob a child inherits as its forwarded
+/// configuration. The creator keeps it CLOEXEC; only a child's fd remap
+/// slot drops the flag, so the blob fd cannot leak into a sibling or a
+/// grandchild. One object is reused for every respawn until a reload
+/// rebuilds it.
+pub const ConfFd = struct {
+    fd: posix.fd_t = -1,
+
+    /// Creates the sealed blob object (CLOEXEC). Only a child's remap
+    /// slot clears that flag.
+    pub fn create(blob: []const u8) error{ BlobTooLarge, MemfdFailed, WriteFailed, SealFailed }!ConfFd {
+        if (blob.len > forward_max) return error.BlobTooLarge;
+        const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
+        if (fd < 0) return error.MemfdFailed;
+        errdefer posix.close(fd);
+        var off: usize = 0;
+        while (off < blob.len) {
+            off += posix.write(fd, blob[off..]) catch return error.WriteFailed;
+        }
+        const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+        if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
+        return .{ .fd = fd };
+    }
+
+    /// Rebuilds after a reload: the new sealed object replaces the old
+    /// one so the next respawn reads fresh config while running
+    /// children keep nothing but the fd they already read and closed.
+    pub fn rebuild(self: *ConfFd, blob: []const u8) !void {
+        const next = try ConfFd.create(blob);
+        if (self.fd >= 0) posix.close(self.fd);
+        self.* = next;
+    }
+
+    pub fn deinit(self: *ConfFd) void {
+        if (self.fd >= 0) posix.close(self.fd);
+        self.fd = -1;
+    }
+};
 
 /// pread a sealed conf fd from offset 0 to EOF into a buffer the caller
 /// frees, then close the fd. The fd is always closed, error or not.
@@ -1429,19 +1469,29 @@ test "forwardArgs round-trips the resolved config" {
     try testing.expectEqual(.cli, child.provenanceOf("server", "hostname"));
 }
 
-const MFD_CLOEXEC: c_uint = 0x0001;
-const MFD_ALLOW_SEALING: c_uint = 0x0002;
-
 /// Creates a sealed anonymous conf blob fd the way the master does, so
 /// loader tests exercise the real kernel path: write, seal, hand back.
 fn testConfFd(blob: []const u8) !posix.fd_t {
-    const fd = std.c.memfd_create("xmppd-conf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (fd < 0) return error.MemfdFailed;
-    errdefer posix.close(fd);
-    _ = try posix.write(fd, blob);
-    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
-    if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
-    return fd;
+    const c = try ConfFd.create(blob);
+    return c.fd;
+}
+
+test "ConfFd creates a fully sealed CLOEXEC blob and rebuild swaps it" {
+    var c = try ConfFd.create("--server.hostname=x.test\n");
+    defer c.deinit();
+    const fl = std.c.fcntl(c.fd, std.c.F.GETFD);
+    try testing.expect(fl >= 0 and fl & 1 != 0); // FD_CLOEXEC set on the master copy
+    try testing.expectEqual(@as(c_int, 0xf), @as(c_int, @intCast(std.c.fcntl(c.fd, std.c.F.GET_SEALS))));
+    var b: [32]u8 = undefined;
+    try testing.expectEqual(@as(isize, 25), std.c.pread(c.fd, &b, 32, 0));
+    try testing.expectEqualStrings("--server.hostname=x.test\n", b[0..25]);
+    try testing.expect(std.c.write(c.fd, "x", 1) < 0); // sealed
+    const old = c.fd;
+    try c.rebuild("--server.hostname=y.test\n");
+    try testing.expect(c.fd != old);
+    try testing.expect(std.c.fcntl(old, std.c.F.GETFD) < 0); // old fd closed
+    var big: [forward_max + 1]u8 = undefined;
+    try testing.expectError(error.BlobTooLarge, ConfFd.create(&big));
 }
 
 test "forwarded blob round-trips through a sealed memfd with .forwarded provenance" {
