@@ -78,6 +78,9 @@ pub const Error = error{
     UnexpectedPositional,
     /// A serialized field did not fit the serializer's scratch buffer.
     ValueTooLong,
+    /// The inherited conf fd is below the remap range or not fully
+    /// sealed.
+    UnsealedFd,
     OutOfMemory,
 };
 
@@ -935,9 +938,32 @@ pub const ConfFd = struct {
 };
 
 /// pread a sealed conf fd from offset 0 to EOF into a buffer the caller
-/// frees, then close the fd. The fd is always closed, error or not.
+/// frees, then close the fd. The fd is always closed, error or not, and
+/// must be an inherited remap slot (>= 3) carrying all four seals;
+/// anything else is refused before a byte is read. std.c.close is used
+/// so a bad fd cannot trip posix.close's EBADF assertion.
 pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
-    defer posix.close(fd);
+    defer _ = std.c.close(fd);
+    if (fd < 3) {
+        diag.set(.{ .detail = "conf fd is below the remap slot range" });
+        return error.UnsealedFd;
+    }
+    const seals = std.c.fcntl(fd, std.c.F.GET_SEALS);
+    if (seals < 0) {
+        // EINVAL means the object simply carries no seals; a dead fd
+        // stays a read failure either way.
+        if (std.c._errno().* != @intFromEnum(std.c.E.INVAL)) {
+            diag.set(.{ .detail = "cannot query conf fd seals" });
+            return error.ReadFailed;
+        }
+        diag.set(.{ .detail = "conf fd is not fully sealed" });
+        return error.UnsealedFd;
+    }
+    // SEAL_WRITE | SEAL_GROW | SEAL_SHRINK | SEAL_SEAL.
+    if (seals != 0xf) {
+        diag.set(.{ .detail = "conf fd is not fully sealed" });
+        return error.UnsealedFd;
+    }
     var blob = std.ArrayList(u8).empty;
     errdefer blob.deinit(gpa);
     var buf: [8192]u8 = undefined;
@@ -1684,15 +1710,33 @@ test "forwardBlob rejects a value containing LF and names the key" {
 }
 
 test "readForwarded caps the blob at 256 KiB and still closes the fd" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const f = try tmp.dir.createFile("big.blob", .{ .read = true });
-    const fd = f.handle;
-    try f.setEndPos(forward_max + 1);
+    // A sealed object past the cap: built raw since ConfFd.create
+    // refuses to produce one.
+    const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
+    try testing.expect(fd >= 0);
+    try posix.ftruncate(fd, forward_max + 1);
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    try testing.expect(std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) == 0);
 
     var diag: Diag = .{};
     try testing.expectError(error.FileTooLarge, readForwarded(fd, testing.allocator, &diag));
     try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+}
+
+test "readForwarded refuses low, unsealed and dead fds without panicking" {
+    var diag: Diag = .{};
+    // A regular file carries no seals.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("plain.blob", .{ .read = true });
+    try testing.expectError(error.UnsealedFd, readForwarded(f.handle, testing.allocator, &diag));
+    try testing.expectEqualStrings("conf fd is not fully sealed", diag.detail);
+    // An already-closed fd errors instead of panicking through close.
+    try testing.expectError(error.ReadFailed, readForwarded(99, testing.allocator, &diag));
+    // Slot 0 is below the remap range. Last: the reader owns and closes
+    // the fd even on refusal, so this takes stdin with it.
+    try testing.expectError(error.UnsealedFd, readForwarded(0, testing.allocator, &diag));
+    try testing.expectEqualStrings("conf fd is below the remap slot range", diag.detail);
 }
 
 test "inline comments end a value only after whitespace; quoting is literal" {
