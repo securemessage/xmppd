@@ -572,6 +572,12 @@ pub const Server = struct {
     /// memory, so no test can arrange one otherwise. Never set in production.
     fail_next_tls_upgrade: bool = false,
 
+    /// Runs right after a drain reads its pointer list, so a test can store a
+    /// row from a second handle and prove the drain notices it. A real race
+    /// needs two worker threads and an interleaving no test can arrange.
+    /// Never set in production.
+    test_after_offline_pointers: ?*const fn (*Server, []const u8) void = null,
+
     /// IPC client for auth daemon communication.
     ipc: IpcClient = .{},
     /// Whether EVFILT_WRITE is armed for the auth/S2S IPC fds. Reconciled

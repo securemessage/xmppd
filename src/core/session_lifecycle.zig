@@ -489,6 +489,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         return;
     };
     defer store.freePointers(pointers);
+    if (server.test_after_offline_pointers) |hook| hook(server, bare_jid);
 
     var delivered: usize = 0;
     var completed = true;
@@ -552,9 +553,33 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     }
 
     if (completed) {
-        cancelOfflineRetryTimer(session, changes);
-        session.offline_pending = false;
+        // Another worker may have committed a row after this drain read its
+        // pointer list; clearing the flag would strand it until the next
+        // login. Re-count before declaring the tail empty.
+        const remaining = store.countMessages(bare_jid) catch {
+            // The count itself failed, so treat the tail as unfinished and
+            // let the retry prove otherwise.
+            stallOnStoreError(server, session, bare_jid, error.StoreUnavailable, changes);
+            return;
+        };
+        // A row another worker committed after this drain read its list would
+        // otherwise wait for the next login. Re-arming needs progress to be
+        // safe: with nothing delivered, the rows left are ones this pass could
+        // not read, and re-arming would spin the event loop on them.
+        const arrived_mid_drain = remaining > 0 and delivered > 0;
         session.offline_store_stalls = 0;
+        if (arrived_mid_drain) {
+            session.offline_pending = true;
+            if (!session.conn.hasPendingWrite()) {
+                changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+                    server.offline_retry_sweep_needed = true;
+                    log.warn("offline re-drain arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
+                };
+            }
+        } else {
+            cancelOfflineRetryTimer(session, changes);
+            session.offline_pending = false;
+        }
     }
 
     if (session.conn.hasPendingWrite()) {
@@ -898,6 +923,87 @@ test "S13: a failed pointer delete stops the drain instead of reordering" {
     // Both pointers survive, so the retry can deliver them in order.
     try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(session.offline_pending);
+}
+
+const mid_drain_stanza = "<message from='alice@localhost' to='bob@localhost' id='m3'><body>three</body></message>";
+
+fn storeMidDrainRow(server: *Server, bare_jid: []const u8) void {
+    const store = server.offline orelse return;
+    _ = store.storeHeldPointer(bare_jid, "alice@localhost", "m3", 1002, mid_drain_stanza) catch {};
+}
+
+// A message stored by another worker after this drain read its pointer list
+// must not wait for the next login. The drain re-counts and re-arms itself,
+// and the second pass delivers the row.
+test "S13: a row stored mid-drain is re-armed for rather than stranded" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "m1", 1000, "<message id='m1'><body>one</body></message>");
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "m2", 1001, "<message id='m2'><body>two</body></message>");
+
+    server.test_after_offline_pointers = &storeMidDrainRow;
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    server.test_after_offline_pointers = null;
+
+    // The late row survives and the drain stays pending.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(session.offline_pending);
+
+    // It also armed a pass of its own, so no presence event is needed. With
+    // bytes still buffered the level-triggered write registration carries the
+    // resume; with none, the drain arms a one-shot. Either one wakes it.
+    var armed = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
+        if (ev.filter != std.c.EVFILT.WRITE) continue;
+        if (ev.udata != 1) continue;
+        armed = true;
+    }
+    try std.testing.expect(armed);
+
+    changes.reset();
+    drainOfflinePending(&server, session, &changes);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.offline_pending);
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [1024]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "three") != null);
 }
 
 // S13 regression test: an offline backlog larger than the connection write
