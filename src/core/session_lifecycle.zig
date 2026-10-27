@@ -470,7 +470,9 @@ pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
 /// Deliver queued offline messages to a user who just became available.
 pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
     const store = server.offline orelse return;
-    const archive = server.archive orelse return;
+    // The archive is a fallback for pointers that carry no held copy, not a
+    // precondition: a deployment without one still drains what it stored.
+    const archive = server.archive;
 
     var bare_buf: [256]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
@@ -501,7 +503,14 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             return;
         };
         if (stanza_xml == null) {
-            stanza_xml = archive.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
+            const arch = archive orelse {
+                // No held copy and no archive to fall back on.
+                store.deletePointer(ptr) catch |err| {
+                    log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+                };
+                continue;
+            };
+            stanza_xml = arch.getMessage(ptr.recipient, ptr.timestamp, ptr.stanza_id) catch |err| {
                 // Transient store failure: stop the drain and retry. Continuing
                 // would deliver later messages ahead of this one, and skipping
                 // it would retry the same pointer on every pass forever.
@@ -776,6 +785,54 @@ test "T158: detach timer expires sessions at 300s, not before" {
     // Clean up session 2 manually to avoid allocator leak
     server.sessions[2].?.sm_resume_enabled = false;
     destroySession(&server, 2, server.sessions[2].?, &changes);
+}
+
+test "offline delivery drains a store with no archive configured" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // Held pointers carry their own payload, so the drain does not need the
+    // archive. Requiring one used to return before touching the store at all.
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(session.conn.hasPendingWrite());
+    _ = session.conn.flushSend() catch {};
+    var buf: [512]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>held</body>") != null);
 }
 
 // S13 regression test: an offline backlog larger than the connection write

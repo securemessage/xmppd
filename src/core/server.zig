@@ -6571,6 +6571,58 @@ test "Server: an over-long sender bare JID still delivers live" {
     try std.testing.expectEqual(@as(usize, 0), an);
 }
 
+test "Server: a non-archivable message stores offline with no archive" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    // type='normal' is not archivable, so the held copy is the only copy. It
+    // does not need an archive row to exist: requiring one lost the message.
+    alice.stanza_type = "normal";
+    alice.stanza_id = "n1";
+    const body = "<body>plain</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    const held = try offline_store.getHeldStanza(ptrs[0]);
+    try std.testing.expect(held != null);
+    if (held) |h| {
+        defer allocator.free(h);
+        try std.testing.expect(std.mem.indexOf(u8, h, "<body>plain</body>") != null);
+    }
+}
+
 test "Server: S13 message held behind a draining offline tail" {
     const allocator = std.testing.allocator;
 
