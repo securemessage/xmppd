@@ -762,6 +762,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    s2s_stream_test_mod.addImport("xml", xml_mod);
 
     const s2s_stream_tests = b.addTest(.{
         .name = "s2s-stream-tests",

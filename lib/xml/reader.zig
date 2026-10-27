@@ -119,6 +119,22 @@ pub fn memoryBudgetFor(max_item_bytes: usize) usize {
     return item_memory_allowance * max_item_bytes + item_memory_slack;
 }
 
+/// Errors that report a limit on the input rather than XML that cannot be
+/// parsed: an over-long token, an item past its cap, too many attributes, or a
+/// nesting/namespace-binding ceiling. A peer that hits one has sent too much,
+/// not something unreadable, so the stream error is policy-violation.
+pub fn isResourceLimit(err: anyerror) bool {
+    return switch (err) {
+        error.TokenTooLong,
+        error.ItemTooLong,
+        error.TooManyAttributes,
+        error.TooDeep,
+        error.TooManyNsBindings,
+        => true,
+        else => false,
+    };
+}
+
 /// Largest item a peer may send before it has authenticated. Negotiation
 /// elements (stream header, SASL blobs, dialback keys) are far smaller.
 pub const max_item_bytes_pre_auth = 16 * 1024;
@@ -1304,6 +1320,19 @@ test "reader: deep nesting within the stacks keeps ns context synced (S12)" {
     try std.testing.expectEqual(@as(u32, 1), reader.ns_stack_depth); // stream level only
     try std.testing.expectEqual(@as(u32, 1), reader.ns_mark_depth);
     try std.testing.expectEqualStrings("jabber:client", reader.default_ns);
+}
+
+test "reader: the resource-limit errors are classified, syntax errors are not" {
+    // The stream error a peer gets depends on this split: limits are
+    // policy-violation, malformed XML is not-well-formed.
+    try std.testing.expect(isResourceLimit(error.TokenTooLong));
+    try std.testing.expect(isResourceLimit(error.ItemTooLong));
+    try std.testing.expect(isResourceLimit(error.TooManyAttributes));
+    try std.testing.expect(isResourceLimit(error.TooDeep));
+    try std.testing.expect(isResourceLimit(error.TooManyNsBindings));
+    try std.testing.expect(!isResourceLimit(error.MismatchedCloseTag));
+    try std.testing.expect(!isResourceLimit(error.InvalidName));
+    try std.testing.expect(!isResourceLimit(error.InvalidStreamRoot));
 }
 
 test "reader: nesting past the stacks is a hard TooDeep error (S12)" {

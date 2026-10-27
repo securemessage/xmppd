@@ -23,6 +23,7 @@
 //! ```
 
 const std = @import("std");
+const xml = @import("xml");
 
 /// S2S stream role — determines which side we're on.
 pub const Role = enum {
@@ -118,16 +119,18 @@ pub const StreamError = enum {
 
 /// Resource limits are policy violations; malformed XML is not-well-formed.
 pub fn streamErrorForXmlError(err: anyerror) StreamError {
-    return switch (err) {
-        error.TokenTooLong, error.ItemTooLong, error.TooManyAttributes => .policy_violation,
-        else => .not_well_formed,
-    };
+    return if (xml.isResourceLimit(err)) .policy_violation else .not_well_formed;
 }
 
 test "S2S: an over-long token maps to policy-violation, not not-well-formed" {
     try std.testing.expectEqual(StreamError.policy_violation, streamErrorForXmlError(error.TokenTooLong));
     try std.testing.expectEqual(StreamError.not_well_formed, streamErrorForXmlError(error.MismatchedCloseTag));
     try std.testing.expectEqual(StreamError.not_well_formed, streamErrorForXmlError(error.InvalidName));
+}
+
+test "S2S: nesting and namespace ceilings map to policy-violation" {
+    try std.testing.expectEqual(StreamError.policy_violation, streamErrorForXmlError(error.TooDeep));
+    try std.testing.expectEqual(StreamError.policy_violation, streamErrorForXmlError(error.TooManyNsBindings));
 }
 
 pub const S2sFeatureSet = struct {
