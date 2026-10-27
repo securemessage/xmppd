@@ -531,9 +531,15 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 completed = false;
                 break;
             };
-            // Only delete what was actually handed to the connection.
+            // Only delete what was actually handed to the connection. If the
+            // delete fails the pointer survives, so the next drain would send
+            // this stanza again. Stop here rather than continue: continuing
+            // would also put the later messages in this list ahead of a
+            // retried copy of this one, which no client can reorder.
             store.deletePointer(ptr) catch |err| {
-                log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+                log.warn("offline pointer delete failed for {s}: {s}; stopping the drain to keep order", .{ bare_jid, @errorName(err) });
+                stallOnStoreError(server, session, bare_jid, err, changes);
+                return;
             };
             delivered += 1;
         } else {
@@ -833,6 +839,65 @@ test "offline delivery drains a store with no archive configured" {
     var buf: [512]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>held</body>") != null);
+}
+
+// A delete that fails after the stanza was queued leaves the pointer in place,
+// so the next drain sends that stanza a second time. Continuing the loop would
+// also deliver the messages after it before the retried copy, an order no
+// client can repair. The drain must stop at the failed delete.
+test "S13: a failed pointer delete stops the drain instead of reordering" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    // Seed through a writable handle, then reopen read-only: reads succeed and
+    // every delete fails, which is the failure this guard is for.
+    {
+        var seed_db = try op_backend.Backend.open(op_path, .{});
+        defer seed_db.close();
+        var seed = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&seed_db, allocator);
+        _ = try seed.storeHeldPointer("bob@localhost", "alice@localhost", "m1", 1000, "<message id='m1'><body>one</body></message>");
+        _ = try seed.storeHeldPointer("bob@localhost", "alice@localhost", "m2", 1001, "<message id='m2'><body>two</body></message>");
+    }
+    var op_db = try op_backend.Backend.open(op_path, .{ .create = false, .read_only = true });
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // The drain stopped rather than moving on to m2.
+    _ = session.conn.flushSend() catch {};
+    var buf: [1024]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "two") == null);
+    // Both pointers survive, so the retry can deliver them in order.
+    try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(session.offline_pending);
 }
 
 // S13 regression test: an offline backlog larger than the connection write
