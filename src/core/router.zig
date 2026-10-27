@@ -32,6 +32,9 @@ const log = std.log.scoped(.router);
 /// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so
 /// this buffer holds every valid key in full (S4).
 pub const BARE_JID_MAX = 512;
+/// Worst-case full JID from bind: two 256-byte parts, the separators, and the
+/// server host. A shorter buffer silently dropped the stanza on overflow.
+pub const FULL_JID_MAX = 1024;
 
 /// Build a bare JID "local@domain" into out. A JID that does not fit returns
 /// NoSpaceLeft rather than a truncated prefix (S4).
@@ -110,11 +113,16 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         return;
     };
 
-    // Build the from string (full JID: local@domain/resource)
-    var from_buf: [256]u8 = undefined;
+    // Build the from string (full JID: local@domain/resource). Bind caps the
+    // localpart and resource at 256 bytes each, so the full JID can exceed
+    // 256 and a smaller buffer would drop the stanza with no answer.
+    var from_buf: [FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const from_w = from_fbs.writer();
-    from_w.writeAll(from_jid.local) catch return;
+    from_w.writeAll(from_jid.local) catch {
+        log.warn("connection {d} sender JID exceeds {d} bytes, stanza dropped", .{ session.conn.id, FULL_JID_MAX });
+        return;
+    };
     from_w.writeByte('@') catch return;
     from_w.writeAll(from_jid.domain) catch return;
     if (from_jid.resource.len > 0) {
@@ -301,9 +309,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    // Build sender bare JID for archive
+    // Build sender bare JID for archive. A bare JID over the store-key limit
+    // cannot be a key anywhere, but it must not cost the stanza its delivery:
+    // null here only disables the archive and offline branches.
     var sender_bare_buf: [BARE_JID_MAX]u8 = undefined;
-    const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf) catch return;
+    const sender_bare: ?[]const u8 = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf) catch blk: {
+        log.warn("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
+        break :blk null;
+    };
 
     // Single timestamp for all archive operations in this dispatch (T123)
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
@@ -321,7 +334,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // truncated bytes would otherwise be written to the archive and replayed
     // to the recipient on the next drain (E2d).
     var archive_stanza: []const u8 = "";
-    if (is_archivable) {
+    if (is_archivable and sender_bare != null) {
         if (server.archive != null) {
             archive_stanza = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, archive_stanza_id, server.server_host) orelse blk: {
                 log.warn("connection {d} archive form for {s} exceeds the serialization buffer, not archived", .{ session.conn.id, to_str });
@@ -330,9 +343,12 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
             if (archive_stanza.len > 0) {
                 var recip_buf: [BARE_JID_MAX]u8 = undefined;
-                const recipient_bare = buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch return;
-                server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, archive_stanza);
-                server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
+                if (buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch null) |recipient_bare| {
+                    server.archiveStore(recipient_bare, sender_bare.?, archive_stanza_id, archive_timestamp, archive_stanza);
+                    server.archiveStore(sender_bare.?, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
+                } else {
+                    log.warn("connection {d} recipient bare JID exceeds {d} bytes, not archived", .{ session.conn.id, BARE_JID_MAX });
+                }
             }
         }
     }
@@ -355,45 +371,58 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             }
         }
 
-        // Offline storage for messages
+        // Offline storage for messages. Both keys must fit the store-key limit;
+        // when either does not, fall through to the bounce below instead of
+        // dropping the stanza with no answer to the sender.
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
                 var recip_buf2: [BARE_JID_MAX]u8 = undefined;
-                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2) catch return;
+                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2) catch null;
 
-                // The payload goes down with the pointer: the archive row this
-                // stanza was also handed to may still be sitting in the async
-                // writer queue, and a drain that read the archive alone would
-                // see a dangling pointer and delete a message that is merely
-                // in flight (S13).
-                var stored_form: []const u8 = "";
-                var stored_id: []const u8 = "";
-                if (is_archivable and archive_stanza_id.len > 0) {
-                    // Empty here means the archived form did not fit the
-                    // scratch bank, and a payloadless pointer would replay
-                    // nothing (E2d).
-                    stored_form = archive_stanza;
-                    stored_id = archive_stanza_id;
-                } else if (server.archive != null) {
-                    // Not archivable, so no stanza-id was minted and the
-                    // stored form carries none.
-                    stored_form = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, "", server.server_host) orelse "";
-                    stored_id = if (id_str.len > 0) id_str else "offline";
-                    if (stored_form.len > 0) {
-                        // archiveStore counts failures and rate-limits its log;
-                        // a per-stanza log line here would be unbounded.
-                        server.archiveStore(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form);
-                    }
-                }
-
-                if (stored_form.len > 0) {
-                    if (store.storeHeldPointer(recipient_bare2, sender_bare, stored_id, archive_timestamp, stored_form) catch false) {
-                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                        return;
-                    }
-                } else {
+                // A bare JID over the store-key limit cannot key a row, so the
+                // stanza is not stored. It still reaches the bounce below: an
+                // unanswered drop loses the message silently.
+                if (sender_bare == null or recipient_bare2 == null) {
                     _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
-                    log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
+                    log.warn("connection {d} message to {s} has a JID over the store-key limit, not stored offline", .{ session.conn.id, to_str });
+                } else {
+                    const sender_key = sender_bare.?;
+                    const recipient_key = recipient_bare2.?;
+
+                    // The payload goes down with the pointer: the archive row
+                    // this stanza was also handed to may still be sitting in
+                    // the async writer queue, and a drain that read the archive
+                    // alone would see a dangling pointer and delete a message
+                    // that is merely in flight (S13).
+                    var stored_form: []const u8 = "";
+                    var stored_id: []const u8 = "";
+                    if (is_archivable and archive_stanza_id.len > 0) {
+                        // Empty here means the archived form did not fit the
+                        // scratch bank, and a payloadless pointer would replay
+                        // nothing (E2d).
+                        stored_form = archive_stanza;
+                        stored_id = archive_stanza_id;
+                    } else if (server.archive != null) {
+                        // Not archivable, so no stanza-id was minted and the
+                        // stored form carries none.
+                        stored_form = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, "", server.server_host) orelse "";
+                        stored_id = if (id_str.len > 0) id_str else "offline";
+                        if (stored_form.len > 0) {
+                            // archiveStore counts failures and rate-limits its
+                            // log; a per-stanza line here would be unbounded.
+                            server.archiveStore(recipient_key, sender_key, stored_id, archive_timestamp, stored_form);
+                        }
+                    }
+
+                    if (stored_form.len > 0) {
+                        if (store.storeHeldPointer(recipient_key, sender_key, stored_id, archive_timestamp, stored_form) catch false) {
+                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
+                            return;
+                        }
+                    } else {
+                        _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
+                        log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
+                    }
                 }
             }
         }
@@ -446,7 +475,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 id_str
             else
                 "offline";
-            if (server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare, hold_id, archive_timestamp, sent_data)) {
+            if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data)) {
                 local_delivery_succeeded = true;
                 log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
                 continue;

@@ -6515,6 +6515,62 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     }
 }
 
+test "Server: an over-long sender bare JID still delivers live" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    // The localpart parses, but local@domain overflows the 512-byte bare JID
+    // that keys the archive and the offline store. Dispatch used to return
+    // here, so the stanza reached nobody and the sender heard nothing.
+    var long_local: [600]u8 = undefined;
+    @memset(&long_local, 'l');
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = .{ .local = &long_local, .domain = "localhost", .resource = "mobile" };
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>long</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    _ = target.conn.flushSend() catch {};
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>long</body>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "to='bob@localhost'") != null);
+
+    // The sender got no error: the stanza was delivered.
+    _ = alice.conn.flushSend() catch {};
+    var abuf: [512]u8 = undefined;
+    const an = posix.read(alice_fds[1], &abuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), an);
+}
+
 test "Server: S13 message held behind a draining offline tail" {
     const allocator = std.testing.allocator;
 
