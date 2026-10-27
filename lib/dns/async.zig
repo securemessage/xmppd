@@ -1513,10 +1513,12 @@ pub const Resolver = struct {
                     const rec = dns.parseTlsaRdata(rr.rdata, self.alloc) catch continue;
                     tlsa_recs.append(self.alloc, rec) catch continue;
                 }
-                // An answer that carried TLSA records is .present even
-                // when none parsed: unusable records fail closed in the
-                // session rather than falling back to PKIX.
-                self.emitAndAdvance(job, tlsa_recs.items, if (saw) .present else .absent);
+                // Parsed records are .present; an answer whose TLSA
+                // records all failed to parse is lookup_failed (the
+                // lookup produced nothing usable), and a NOERROR
+                // answer with no TLSA records at all is .absent.
+                const status: TlsaStatus = if (tlsa_recs.items.len > 0) .present else if (saw) .lookup_failed else .absent;
+                self.emitAndAdvance(job, tlsa_recs.items, status);
             },
             .fallback_tlsa => {
                 var tlsa_recs: std.ArrayList(dns.TlsaRecord) = .{};
@@ -1532,8 +1534,10 @@ pub const Resolver = struct {
                     tlsa_recs.append(self.alloc, rec) catch continue;
                 }
                 // The fallback targets share one host: the same TLSA
-                // owner name covers every emitted address.
-                const status: TlsaStatus = if (saw) .present else .absent;
+                // owner name covers every emitted address. As above:
+                // parsed records .present, all-unparsable
+                // lookup_failed, no records .absent.
+                const status: TlsaStatus = if (tlsa_recs.items.len > 0) .present else if (saw) .lookup_failed else .absent;
                 self.emitFallbackTargets(job, tlsa_recs.items, status) catch return self.dropJob(job, .failed);
                 self.complete(job);
             },
@@ -1945,6 +1949,10 @@ const FakeDns = struct {
     tlsa_nodata: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, TLSA queries are received but never answered.
     tlsa_silent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, TLSA queries are answered NXDOMAIN with the shared SOA.
+    tlsa_nxdomain: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// When set, the TLSA answer carries a record too short to parse.
+    tlsa_garbage: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// When set, AAAA queries are answered with ::1 so dual-stack
     /// paths have real data.
     a_aaaa: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -2048,7 +2056,8 @@ const FakeDns = struct {
         const family_fail = (q.qtype == wire.TYPE_A and self.a_fail.load(.monotonic)) or
             (q.qtype == wire.TYPE_AAAA and self.aaaa_fail.load(.monotonic));
         const family_nx = (q.qtype == wire.TYPE_A and self.a_nxdomain.load(.monotonic)) or
-            (q.qtype == wire.TYPE_AAAA and self.aaaa_nxdomain.load(.monotonic));
+            (q.qtype == wire.TYPE_AAAA and self.aaaa_nxdomain.load(.monotonic)) or
+            (q.qtype == wire.TYPE_TLSA and self.tlsa_nxdomain.load(.monotonic));
         const nx = self.nxdomain_all.load(.monotonic) or family_nx;
         var named_fail = false;
         if (self.a_servfail_idx.load(.monotonic) != 255 and is_addr_q) {
@@ -2174,8 +2183,13 @@ const FakeDns = struct {
             }
             if (!self.tlsa_nodata.load(.monotonic)) {
                 ancount = 1;
-                appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 7);
-                answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
+                if (self.tlsa_garbage.load(.monotonic)) {
+                    appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 2);
+                    answers.appendSlice(alloc, &.{ 3, 0 }) catch {};
+                } else {
+                    appendAnswerHdr(alloc, &answers, wire.TYPE_TLSA, 60, 7);
+                    answers.appendSlice(alloc, &.{ 3, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF }) catch {};
+                }
             }
         }
 
@@ -4403,6 +4417,158 @@ test "dns-async: a nameserver past the first kilobyte is still found" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.54", 53)));
+}
+
+test "dns-async: a TLSA NXDOMAIN marks the target absent (per-target path)" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_nxdomain.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // NXDOMAIN is authenticated absence, not a lookup failure.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a fallback TLSA NXDOMAIN marks the targets absent" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+    srv.tlsa_nxdomain.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a fallback TLSA SERVFAIL marks the targets lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+    srv.tlsa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a fallback TLSA answer marks the targets present" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    try std.testing.expect(res.targets[0].tlsa.len >= 1);
+}
+
+test "dns-async: an unparsable TLSA answer is lookup_failed, not absent" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.srv_many = 1;
+    srv.tlsa_garbage.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    // A TLSA RRset that cannot be parsed gave the lookup nothing
+    // usable: temporary failure, never PKIX.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a TLSA send failure in finishTarget is lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.aaaa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // The target host alone fits the wire limit, but the TLSA owner
+    // "_5222._tcp.<host>" does not: the send fails and the target is
+    // a lookup failure, not a silent no-DANE emit.
+    const long_host = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 50 ++ ".test";
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer rdata.deinit(std.testing.allocator);
+    try rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x14, 0x36 });
+    appendEncodedName(std.testing.allocator, &rdata, long_host);
+    var srv_rrs = [1]wire.Rr{.{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = rdata.items }};
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
 test "dns-async: a SERVFAIL is never cached and hits the wire again" {

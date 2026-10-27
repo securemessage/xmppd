@@ -535,6 +535,14 @@ pub const Session = struct {
         self.write_registered = true;
     }
 
+    /// DANE drives verification only under dane_first and only when
+    /// the target's TLSA lookup returned records (ADR-13): .absent
+    /// falls back to PKIX, and .lookup_failed never reaches here (the
+    /// target is skipped in connectNextTarget).
+    fn useDane(self: *const Session) bool {
+        return self.tls_policy == .dane_first and self.currentTlsaStatus() == .present;
+    }
+
     /// DANE state of the current connection target (ADR-13): the test
     /// seam's override reads as present; a resolution target reports
     /// its own status word.
@@ -1046,8 +1054,7 @@ pub const Session = struct {
                 //   dane_first, no records   -> PKIX ctx (system CA) +
                 //     hostname check on the stream domain;
                 //   none                     -> lab path, no verification.
-                const use_dane = self.tls_policy == .dane_first and
-                    self.currentTlsaStatus() == .present;
+                const use_dane = self.useDane();
                 var sni_buf: [256]u8 = undefined;
                 const sni = domainZ(&sni_buf, self.domain);
                 const ctx = if (use_dane or self.tls_policy == .none)
@@ -1400,6 +1407,42 @@ test "connect: pkix_only dials a lookup_failed TLSA target" {
     s.connectNextTarget(true);
     try std.testing.expect(!s.isDead());
     try std.testing.expect(s.fd >= 0);
+}
+
+test "tls policy: only dane_first with a present TLSA set uses DANE" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "absent.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5223),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = &.{},
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    // An authenticated absence of TLSA falls back to PKIX; it must
+    // never be read as DANE.
+    s.tls_policy = .dane_first;
+    s.target_index = 0;
+    try std.testing.expect(!s.useDane());
+    s.target_index = 1;
+    try std.testing.expect(s.useDane());
+    s.tls_policy = .pkix_only;
+    try std.testing.expect(!s.useDane());
 }
 
 test "connect: none dials a lookup_failed TLSA target" {
