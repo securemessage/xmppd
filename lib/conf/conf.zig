@@ -76,6 +76,8 @@ pub const Error = error{
     MissingValue,
     FlagTakesNoValue,
     UnexpectedPositional,
+    /// A serialized field did not fit the serializer's scratch buffer.
+    ValueTooLong,
     OutOfMemory,
 };
 
@@ -114,7 +116,17 @@ pub const Diag = struct {
 
     fn into(dst: []u8, s: []const u8) []const u8 {
         const n = @min(dst.len, s.len);
-        @memcpy(dst[0..n], s[0..n]);
+        if (n == 0) return dst[0..0];
+        const ds = @intFromPtr(dst.ptr);
+        const ss = @intFromPtr(s.ptr);
+        if (ss >= ds and ss < ds + dst.len) {
+            // s aliases dst, e.g. set() fed a Diag field back into its
+            // own buffer; the source sits above the destination, so a
+            // forward copy is shift-safe where @memcpy would panic.
+            std.mem.copyForwards(u8, dst[0..n], s[0..n]);
+        } else {
+            @memcpy(dst[0..n], s[0..n]);
+        }
         return dst[0..n];
     }
 
@@ -127,6 +139,17 @@ pub const Diag = struct {
         self.key = into(&self.key_buf, parts.key);
         self.value = into(&self.value_buf, parts.value);
         self.detail = into(&self.detail_buf, parts.detail);
+    }
+
+    /// Repoints every field slice into this Diag's own buffers. A plain
+    /// struct copy leaves the slices addressing the original's storage;
+    /// call this once after copying so the two Diags are independent.
+    pub fn rebind(self: *Diag) void {
+        self.path = into(&self.path_buf, self.path);
+        self.section = into(&self.section_buf, self.section);
+        self.key = into(&self.key_buf, self.key);
+        self.value = into(&self.value_buf, self.value);
+        self.detail = into(&self.detail_buf, self.detail);
     }
 
     pub fn format(self: Diag, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -678,7 +701,7 @@ pub fn Loader(
         /// bare "--name") so a master can forward it to children. Allocates
         /// the argv array and formatted values from `arena`. A formatted
         /// value past the 4 KiB scratch is FileTooLarge, not a panic.
-        pub fn forwardArgs(self: *const Self, arena: Allocator) Error![]const []const u8 {
+        pub fn forwardArgs(self: *const Self, arena: Allocator, diag: *Diag) Error![]const []const u8 {
             var list = std.ArrayList([]const u8).empty;
             var buf: [4096]u8 = undefined;
             inline for (cli, 0..) |c, i| {
@@ -689,7 +712,10 @@ pub fn Loader(
                     }
                 } else {
                     var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch return error.FileTooLarge;
+                    writeValue(field_types[cli_targets[i]], &w, v) catch {
+                        diag.set(.{ .key = c.name, .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                        return error.ValueTooLong;
+                    };
                     try list.append(arena, try std.fmt.allocPrint(arena, "--{s}={s}", .{ c.name, w.buffered() }));
                 }
             }
@@ -713,7 +739,10 @@ pub fn Loader(
                     }
                 } else {
                     var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch return error.FileTooLarge;
+                    writeValue(field_types[cli_targets[i]], &w, v) catch {
+                        diag.set(.{ .key = c.name, .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                        return error.ValueTooLong;
+                    };
                     const val = w.buffered();
                     if (std.mem.indexOfScalar(u8, val, '\n') != null) {
                         var kbuf: [160]u8 = undefined;
@@ -1486,7 +1515,7 @@ test "forwardArgs round-trips the resolved config" {
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const argv = try parent.forwardArgs(arena.allocator());
+    const argv = try parent.forwardArgs(arena.allocator(), &diag);
 
     var child = MasterLoader.init(testing.allocator);
     defer child.deinit();
@@ -1591,6 +1620,38 @@ test "a forwarded value beats the file but loses to the child CLI" {
     try testing.expectEqual(@as(u16, 3000), l.values.server.c2s_port);
     try testing.expectEqual(.forwarded, l.provenanceOf("server", "hostname"));
     try testing.expectEqual(.cli, l.provenanceOf("server", "c2s_port"));
+}
+
+test "Diag set tolerates its own fields; a copy rebinds to its storage" {
+    var d: Diag = .{};
+    d.set(.{ .key = "hostname", .value = "old.test", .detail = "invalid value" });
+    // Feeding the Diag's own slices back must not panic on aliased copy.
+    d.set(.{ .key = d.key, .value = d.value, .detail = "again" });
+    try testing.expectEqualStrings("hostname", d.key);
+    try testing.expectEqualStrings("old.test", d.value);
+    try testing.expectEqualStrings("again", d.detail);
+    // A plain copy shares the original's buffers; rebind() detaches it.
+    var d2 = d;
+    d2.rebind();
+    d.set(.{ .key = "other", .value = "new.test", .detail = "x" });
+    try testing.expectEqualStrings("hostname", d2.key);
+    try testing.expectEqualStrings("old.test", d2.value);
+}
+
+test "serializers report ValueTooLong with a filled Diag on overflow" {
+    var d0: Diag = .{};
+    var l: MasterLoader = try .load(testing.allocator, .{
+        .args = &.{ "--host", "x" },
+    }, &d0);
+    defer l.deinit();
+    const huge = "h" ++ ("a" ** 5000);
+    l.values.server.hostname = huge;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    try testing.expectError(error.ValueTooLong, l.forwardBlob(arena.allocator(), &diag));
+    try testing.expectEqualStrings("host", diag.key);
+    try testing.expect(diag.detail.len != 0);
 }
 
 test "forwardBlob rejects a value containing LF and names the key" {
