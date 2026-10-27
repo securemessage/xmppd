@@ -219,7 +219,8 @@ pub fn main() !void {
     // Resolve the unprivileged user for child processes. A root master
     // without a run user would start every child as root, and a run user
     // that resolves to uid 0 does not drop privileges: refuse both.
-    const ids = decideRunUser(run_user, posix.geteuid()) catch |err| {
+    const euid = posix.geteuid();
+    const ids = decideRunUser(run_user, euid) catch |err| {
         switch (err) {
             error.RunUserRequired => log.err("running as root requires a run user; refusing to start", .{}),
             error.RunUserIsRoot => log.err("run user '{s}' resolves to root; refusing to start", .{run_user orelse ""}),
@@ -501,18 +502,9 @@ pub fn main() !void {
     }
 
     // Initialize supervisors for all children
-    var auth_sup = if (child_uid != 0)
-        Supervisor.initWithUser(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid)
-    else
-        Supervisor.init(auth_path, auth_args_buf[0..auth_argc]);
-    var s2s_sup = if (child_uid != 0)
-        Supervisor.initWithUser(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid)
-    else
-        Supervisor.init(s2s_path, s2s_args_buf[0..s2s_argc]);
-    var core_sup = if (child_uid != 0)
-        Supervisor.initWithUser(core_path, core_args_buf[0..core_argc], child_uid, child_gid)
-    else
-        Supervisor.init(core_path, core_args_buf[0..core_argc]);
+    var auth_sup = try initSupervisor(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid, euid);
+    var s2s_sup = try initSupervisor(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid, euid);
+    var core_sup = try initSupervisor(core_path, core_args_buf[0..core_argc], child_uid, child_gid, euid);
 
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
     // listener, auth nothing; everything else in the master's table closes.
@@ -666,6 +658,32 @@ pub fn main() !void {
     removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"));
 
     log.info("xmppd master shutdown complete", .{});
+}
+
+/// Build a supervisor for one child. A root process without a run user is
+/// refused by the Supervisor itself; log that refusal at err here so a
+/// disagreement between decideRunUser and the Supervisor is not silent.
+fn initSupervisor(
+    exe_path: []const u8,
+    args: []const []const u8,
+    uid: posix.uid_t,
+    gid: posix.gid_t,
+    euid: posix.uid_t,
+) !Supervisor {
+    if (uid != 0) {
+        return Supervisor.initWithUser(exe_path, args, uid, gid, euid) catch |err| {
+            if (err == error.RunUserRequired) {
+                log.err("running as root requires a run user; refusing to start", .{});
+            }
+            return err;
+        };
+    }
+    return Supervisor.init(exe_path, args, euid) catch |err| {
+        if (err == error.RunUserRequired) {
+            log.err("running as root requires a run user; refusing to start", .{});
+        }
+        return err;
+    };
 }
 
 /// The uid and gid a child runs as.
@@ -1014,6 +1032,30 @@ test "resolveRunUser: a configured user resolves to its passwd entry (C5)" {
     const ids = try resolveRunUser("root");
     try std.testing.expectEqual(@as(posix.uid_t, 0), ids.uid);
     try std.testing.expectEqual(@as(posix.gid_t, 0), ids.gid);
+}
+
+test "initSupervisor logs a root refusal at err" {
+    const fds = try posix.pipe();
+    const pid = try posix.fork();
+    if (pid == 0) {
+        _ = posix.close(fds[0]);
+        posix.dup2(fds[1], 2) catch std.c._exit(125);
+        _ = posix.close(fds[1]);
+        const result = initSupervisor("/unused", &.{}, 0, 0, 0);
+        std.c._exit(if (result) |_| 1 else |err| if (err == error.RunUserRequired) 0 else 2);
+    }
+    _ = posix.close(fds[1]);
+    var buf: [512]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    _ = posix.close(fds[0]);
+    const res = posix.waitpid(pid, 0);
+    try std.testing.expect(posix.W.IFEXITED(res.status));
+    try std.testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(res.status));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        buf[0..n],
+        "(err): running as root requires a run user; refusing to start",
+    ) != null);
 }
 
 test "decideRunUser: root without a run user is refused" {
