@@ -157,8 +157,29 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == []const u8) return s;
     if (T == bool) return parseBool(s);
     if (T == Duration) return Duration.parse(s);
-    if (T == std.net.Address) return std.net.Address.parseIpAndPort(s) catch
-        std.net.Address.parseIp(s, 0) catch error.BadValue;
+    if (T == std.net.Address) {
+        if (std.net.Address.parseIpAndPort(s)) |a| {
+            return a;
+        } else |_| {}
+        const a = std.net.Address.parseIp(s, 0) catch return error.BadValue;
+        // A "::"-compressed literal ending in :digits is ambiguous with
+        // an unbracketed v6:port ("::1:5222"); require "[v6]:port".
+        if (std.mem.indexOf(u8, s, "::") != null) {
+            if (std.mem.lastIndexOfScalar(u8, s, ':')) |i| {
+                const last = s[i + 1 ..];
+                var digits = last.len != 0;
+                for (last) |c| {
+                    if (!std.ascii.isDigit(c)) digits = false;
+                }
+                if (digits) {
+                    if (std.net.Address.parseIp(s[0..i], 0)) |_| {
+                        return error.BadValue;
+                    } else |_| {}
+                }
+            }
+        }
+        return a;
+    }
     switch (@typeInfo(T)) {
         .int => |i| {
             _ = i;
@@ -272,7 +293,16 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, v: T) std.Io.Writer.Error!voi
     if (T == []const u8) return w.writeAll(v);
     if (T == bool) return w.writeAll(if (v) "true" else "false");
     if (T == Duration) return w.print("{f}", .{v});
-    if (T == std.net.Address) return w.print("{f}", .{v});
+    if (T == std.net.Address) {
+        if (v.getPort() != 0) return w.print("{f}", .{v});
+        // Port 0 means "no port": emit the bare literal, which parses
+        // back as port 0 (parsePort rejects an explicit :0).
+        var b: [64]u8 = undefined;
+        var bw: std.Io.Writer = .fixed(&b);
+        try bw.print("{f}", .{v});
+        const s = bw.buffered();
+        return w.writeAll(s[0 .. s.len - 2]);
+    }
     if (T == [][]const u8) {
         for (v, 0..) |item, i| {
             if (i != 0) try w.writeByte(',');
@@ -1755,7 +1785,8 @@ test "parseValue covers ints, bools, enums, strings, address, durations" {
     try testing.expectError(error.BadValue, parseValue(std.net.Address, "not-an-ip"));
 
     // Port-bearing forms round-trip: "ip:port" and "[v6]:port" keep
-    // their port, a bare literal formats as :0 and parses back.
+    // their port; a port-0 address writes as the bare literal so a
+    // default re-serializes and re-parses instead of failing on ":0".
     const ap = try parseValue(std.net.Address, "127.0.0.1:5222");
     try testing.expectEqual(@as(u16, 5222), ap.getPort());
     const a6p = try parseValue(std.net.Address, "[::1]:5269");
@@ -1765,4 +1796,14 @@ test "parseValue covers ints, bools, enums, strings, address, durations" {
     try writeValue(std.net.Address, &w, ap);
     const back = try parseValue(std.net.Address, w.buffered());
     try testing.expect(back.eql(ap));
+    w = .fixed(&buf);
+    try writeValue(std.net.Address, &w, a); // 127.0.0.1, port 0
+    try testing.expectEqualStrings("127.0.0.1", w.buffered());
+    try testing.expect((try parseValue(std.net.Address, w.buffered())).eql(a));
+    w = .fixed(&buf);
+    try writeValue(std.net.Address, &w, a6);
+    try testing.expectEqualStrings("[::1]", w.buffered());
+    // Ambiguous or meaningless forms are rejected, not re-interpreted.
+    try testing.expectError(error.BadValue, parseValue(std.net.Address, "::1:5222"));
+    try testing.expectError(error.BadValue, parseValue(std.net.Address, "0.0.0.0:0"));
 }
