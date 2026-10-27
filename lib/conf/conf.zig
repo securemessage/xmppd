@@ -7,7 +7,8 @@
 //! (the same file key may be `--socket` to one daemon and `--auth-socket`
 //! to another).
 //!
-//! Precedence is default < file < CLI, recorded per field as provenance.
+//! Precedence is default < file < forwarded < CLI, recorded per field
+//! as provenance.
 //! An unknown section, unknown key, bad value or malformed line is an
 //! operating error carrying file:line (or the CLI spelling) in Diag;
 //! nothing ever falls back silently to a default.
@@ -632,6 +633,10 @@ pub fn Loader(
                 const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
                 if (key.len == 0) {
                     diag.set(.{ .path = path, .line = line_no, .detail = "empty key" });
+                    return error.MalformedLine;
+                }
+                if (value.len == 0) {
+                    diag.set(.{ .path = path, .line = line_no, .detail = "empty value" });
                     return error.MalformedLine;
                 }
                 keys_seen += 1;
@@ -1773,6 +1778,29 @@ test "readForwarded caps the blob at 256 KiB and still closes the fd" {
     var diag: Diag = .{};
     try testing.expectError(error.FileTooLarge, readForwarded(fd, testing.allocator, &diag));
     try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+}
+
+test "readForwarded accepts a blob of exactly the cap and reports an empty value" {
+    const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
+    try testing.expect(fd >= 0);
+    try posix.ftruncate(fd, forward_max); // exact cap is inside the bound
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    try testing.expect(std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) == 0);
+    var diag: Diag = .{};
+    const blob = try readForwarded(fd, testing.allocator, &diag);
+    defer testing.allocator.free(blob);
+    try testing.expectEqual(forward_max, blob.len);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "ev.ini",
+        \\[server]
+        \\hostname = #x
+        \\
+    , &path_buf);
+    try testing.expectError(error.MalformedLine, MasterLoader.load(testing.allocator, .{ .path = path }, &diag));
+    try testing.expectEqualStrings("empty value", diag.detail);
 }
 
 test "readForwarded refuses low, unsealed and dead fds without panicking" {
