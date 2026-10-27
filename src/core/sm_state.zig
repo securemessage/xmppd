@@ -357,8 +357,8 @@ test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
     try std.testing.expectEqual(@as(u32, 5), queue.count);
 
     // A replayed `<resume h='0'/>` (or any backwards h) must not touch the
-    // replay queue — before S24 this wrapped acked_count above count and
-    // discardAll() dropped everything.
+    // replay queue: the ack would wrap acked_count above count and discardAll
+    // would drop everything (S24).
     _ = queue.ack(0);
     try std.testing.expectEqual(@as(u32, 5), queue.count);
     try std.testing.expectEqual(@as(u32, 6), queue.base_seq);

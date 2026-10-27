@@ -543,8 +543,8 @@ pub const Scanner = struct {
 ///
 /// Supports the 5 predefined XML entities (required by all XML parsers)
 /// and numeric character references (&#NNN; and &#xHH;). Numeric values
-/// must satisfy the XML 1.0 Char production and are UTF-8 encoded (S21:
-/// previously truncated to a lone low byte, producing invalid UTF-8).
+/// must satisfy the XML 1.0 Char production and are encoded as UTF-8, so a
+/// reference above U+007F does not truncate to a lone low byte (S21).
 ///
 /// Custom/undeclared entity references return error — XMPP forbids DTDs
 /// so there is no mechanism to define custom entities (RFC 6120 §11.1).

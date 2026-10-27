@@ -8053,8 +8053,8 @@ test "G7: a single quote in the id cannot break the bounce attribute" {
     try std.testing.expect(std.mem.indexOf(u8, out, "id='x&apos;y'") != null);
 }
 
-// G7: an inbound id carrying an XML entity is bounced with the entity escaped
-// exactly once, through the real parse and bounce path (not a double escape).
+// G7: an inbound id carrying an XML entity is escaped exactly once through the
+// real parse and bounce path.
 test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     const allocator = std.testing.allocator;
 
@@ -8107,9 +8107,8 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "a&amp;amp;") == null);
 }
 
-// G7: a storage error (not just a full queue) still bounces the inbound stanza
-// instead of returning silently. An over-long recipient makes the offline hold
-// fail with KeyTooLong.
+// G7: a storage error, not only a full queue, bounces the inbound stanza. An
+// over-long recipient makes the offline hold fail with KeyTooLong.
 test "Server: G7 a storage error on the offline hold still bounces" {
     const allocator = std.testing.allocator;
 
@@ -10180,9 +10179,8 @@ test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
     try std.testing.expect(!server.s2s_reconnect_pending);
 }
 
-// G6: the auth half of the reconnect-timer guarantee needs its own gates, or a
-// revert that only touches the auth staging or the auth re-arm would pass the
-// suite on the strength of the S2S tests alone.
+// G6: the auth half of the reconnect-timer guarantee is gated on its own, so
+// the S2S tests alone cannot cover a regression in auth staging or re-arm.
 test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
