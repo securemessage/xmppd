@@ -123,7 +123,10 @@ pub const StreamAction = union(enum) {
 /// Parameters for the server's stream opening response.
 pub const StreamOpenParams = struct {
     from: []const u8,
-    to: []const u8,
+    /// The peer's requested host, echoed back. Null when we never accepted one
+    /// (no stream open seen yet, or the open was rejected): RFC 6120 4.9.1
+    /// allows omitting it, which is right because there is nothing to echo.
+    to: ?[]const u8,
     id: []const u8,
     version: []const u8 = "1.0",
 };
@@ -373,13 +376,17 @@ pub fn writeStreamOpen(writer: anytype, params: StreamOpenParams) !void {
     try writer.writeAll("<?xml version='1.0'?>");
     try writer.writeAll("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'");
     try writer.writeAll(" from='");
-    try writer.writeAll(params.from);
-    try writer.writeAll("' to='");
-    try writer.writeAll(params.to);
-    try writer.writeAll("' id='");
-    try writer.writeAll(params.id);
+    try xml.escapeWrite(writer, params.from);
+    try writer.writeAll("'");
+    if (params.to) |to| {
+        try writer.writeAll(" to='");
+        try xml.escapeWrite(writer, to);
+        try writer.writeAll("'");
+    }
+    try writer.writeAll(" id='");
+    try xml.escapeWrite(writer, params.id);
     try writer.writeAll("' version='");
-    try writer.writeAll(params.version);
+    try xml.escapeWrite(writer, params.version);
     try writer.writeAll("'>");
 }
 
@@ -620,6 +627,36 @@ test "writeFeatures: bind features do not include register" {
     const result = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, result, "<bind") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "iq-register") == null);
+}
+
+test "writeStreamOpen: attributes are escaped, and to= is omitted when absent" {
+    // A quote in any attribute would otherwise close it and let the peer (or
+    // whatever supplied the value) inject attributes into the header.
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeStreamOpen(fbs.writer(), .{
+        .from = "exa'mple.com",
+        .to = "t\"o.com",
+        .id = "i&d",
+    });
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "from='exa&apos;mple.com'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "to='t&quot;o.com'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "id='i&amp;d'") != null);
+    // No raw quote survives inside an attribute value.
+    try std.testing.expect(std.mem.indexOf(u8, out, "t\"o.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "exa'mple.com") == null);
+
+    var buf2: [512]u8 = undefined;
+    var fbs2 = std.io.fixedBufferStream(&buf2);
+    try writeStreamOpen(fbs2.writer(), .{ .from = "example.com", .to = null, .id = "x" });
+    const out2 = fbs2.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out2, " to=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "from='example.com'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "id='x'") != null);
+
+    // The version default is still emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out2, "version='1.0'") != null);
 }
 
 test "writeStreamError" {

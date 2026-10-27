@@ -1666,9 +1666,7 @@ pub const Server = struct {
                     // Client-side protocol violation, not a server fault.
                     log.warn("connection {d} XML parse error: {}", .{ id, err });
                     // Resource limits are policy violations, not malformed XML.
-                    self.sendStreamError(session, if (err == error.TokenTooLong or
-                        err == error.ItemTooLong or
-                        err == error.TooManyAttributes)
+                    self.sendStreamError(session, if (xml.isResourceLimit(err))
                         .policy_violation
                     else
                         .not_well_formed);
@@ -3719,9 +3717,13 @@ pub const Server = struct {
 
     pub fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.StreamError) void {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
+        // RFC 6120 4.9.1: open the stream before the error, so the client can
+        // parse it. `to` is the peer's requested host and is omitted when we
+        // never accepted one - echoing our own hostname would claim the client
+        // asked for something it did not, and the rejected open is not stored.
         const open_params: ?xmpp.stream.StreamOpenParams = if (session.stream.response_opened) null else .{
             .from = self.server_host,
-            .to = self.server_host,
+            .to = null,
             .id = &session.stream.stream_id_hex,
         };
         xmpp.stream.writeStreamError(fbs.writer(), err, open_params) catch return;
