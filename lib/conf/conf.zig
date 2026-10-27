@@ -1813,14 +1813,31 @@ test "readForwarded refuses low, unsealed and dead fds without panicking" {
     try testing.expectEqualStrings("conf fd is not fully sealed", diag.detail);
     // An already-closed fd errors instead of panicking through close.
     try testing.expectError(error.ReadFailed, readForwarded(99, testing.allocator, &diag));
-    // Slot 0 is below the remap range. Last: the reader owns and closes
-    // the fd even on refusal, so this takes stdin with it; a /dev/null
-    // open reoccupies slot 0 for the rest of the suite.
-    try testing.expectError(error.UnsealedFd, readForwarded(0, testing.allocator, &diag));
-    try testing.expectEqualStrings("conf fd is below the remap slot range", diag.detail);
-    // Deliberately left open: it holds slot 0 for the rest of the run.
-    const keep = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
-    try testing.expectEqual(@as(posix.fd_t, 0), keep);
+    // Slot 0 is below the remap range. The reader closes even a refused
+    // fd, and stdin is the test runner's message channel, so the check
+    // runs in a forked child where slot 0 is expendable.
+    var sp: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp) != 0) return error.Socketpair;
+    defer posix.close(sp[0]);
+    defer posix.close(sp[1]);
+    const pid = try posix.fork();
+    if (pid == 0) {
+        const mfd = std.c.memfd_create("xmppd-conf", 0);
+        _ = std.c.dup2(mfd, 0);
+        var d0: Diag = .{};
+        var v: [1]u8 = .{'N'};
+        if (readForwarded(0, testing.allocator, &d0)) |buf| {
+            testing.allocator.free(buf);
+        } else |e| {
+            if (e == error.UnsealedFd) v[0] = 'Y';
+        }
+        _ = std.c.write(sp[1], &v, 1);
+        std.c._exit(0);
+    }
+    var v: [1]u8 = undefined;
+    _ = try posix.read(sp[0], &v);
+    _ = posix.waitpid(pid, 0);
+    try testing.expectEqual(@as(u8, 'Y'), v[0]);
 }
 
 test "the line limit is exactly 1024 bytes, not off by one" {
