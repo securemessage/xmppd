@@ -1049,10 +1049,12 @@ pub const Session = struct {
                 const tp = if (self.tport) |*t| t else return error.TlsMissing;
                 // T202 verification decision (before the handshake, since
                 // the PKIX path must verify during it):
-                //   dane_first + TLSA records  -> VERIFY_NONE ctx, manual
-                //     TLSA match at completion (fail closed on mismatch);
-                //   dane_first, no records   -> PKIX ctx (system CA) +
-                //     hostname check on the stream domain;
+                //   dane_first + tlsa_status .present -> VERIFY_NONE ctx,
+                //     manual TLSA match at completion (fail closed);
+                //   dane_first + tlsa_status .absent  -> PKIX ctx (system
+                //     CA) + hostname check on the stream domain;
+                //   tlsa_status .lookup_failed        -> never reaches
+                //     here; the target is skipped in connectNextTarget;
                 //   none                     -> lab path, no verification.
                 const use_dane = self.useDane();
                 var sni_buf: [256]u8 = undefined;

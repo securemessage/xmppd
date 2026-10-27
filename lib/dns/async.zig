@@ -848,7 +848,8 @@ pub const Resolver = struct {
             },
             // A per-target failure costs only the phase that failed:
             // one dead address family still lets the other answer,
-            // and a failed TLSA lookup degrades the target to no-DANE.
+            // and a failed TLSA lookup marks the target lookup_failed
+            // (a temporary failure, never PKIX).
             .addr => {
                 job.phase = .addr6;
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
