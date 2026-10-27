@@ -185,6 +185,10 @@ pub const Session = struct {
     /// Freed in destroy.
     resolution: ?Resolution = null,
     target_index: usize = 0,
+    /// Any target skipped for a failed TLSA lookup during this
+    /// resolution. Stays set across connectNextTarget calls so a
+    /// later connect failure cannot mask the more informative reason.
+    tlsa_failed: bool = false,
 
     host: []const u8 = "",
     domain: []const u8 = "",
@@ -479,6 +483,7 @@ pub const Session = struct {
                 if (r.targets.len == 0) return self.fail(self.engine.allocator, "resolve-failed");
                 self.resolution = r;
                 self.target_index = 0;
+                self.tlsa_failed = false;
                 self.connectNextTarget(true);
             },
             .nxdomain, .service_unavailable, .failed => self.fail(self.engine.allocator, "resolve-failed"),
@@ -490,7 +495,6 @@ pub const Session = struct {
     fn connectNextTarget(self: *Session, first: bool) void {
         const engine = self.engine;
         const res = &(self.resolution.?);
-        var tlsa_failed = false;
         while (self.target_index < res.targets.len) {
             const t = res.targets[self.target_index];
             // ADR-13 applies to dane_first: a failed TLSA lookup is a
@@ -498,7 +502,7 @@ pub const Session = struct {
             // checked and PKIX fallback is not allowed, so the target
             // is never dialed. Other policies do not consult TLSA.
             if (t.tlsa_status == .lookup_failed and self.tls_policy == .dane_first) {
-                tlsa_failed = true;
+                self.tlsa_failed = true;
                 self.target_index += 1;
                 continue;
             }
@@ -526,7 +530,7 @@ pub const Session = struct {
             self.write_registered = true;
             return;
         }
-        self.fail(engine.allocator, if (tlsa_failed) "tlsa-lookup-failed" else "connect-failed");
+        self.fail(engine.allocator, if (self.tlsa_failed) "tlsa-lookup-failed" else "connect-failed");
     }
 
     fn armWrite(self: *Session, engine: *Engine) void {
@@ -1409,6 +1413,47 @@ test "connect: pkix_only dials a lookup_failed TLSA target" {
     s.connectNextTarget(true);
     try std.testing.expect(!s.isDead());
     try std.testing.expect(s.fd >= 0);
+}
+
+test "connect: a later connect failure keeps the tlsa-lookup-failed reason" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .dane_first;
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "dead.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    // A live listener keeps the second target's connect alive through
+    // the first pass, so the second pass reports the exhaustion - and
+    // the temporary TLSA failure remains the informative reason.
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "live.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    // The connect-failure path advances the index before retrying.
+    s.target_index += 1;
+    s.connectNextTarget(false);
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
 }
 
 test "tls policy: only dane_first with a present TLSA set uses DANE" {
