@@ -143,7 +143,6 @@ pub fn PepStore(comptime Backend: type) type {
     };
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -269,7 +268,6 @@ test "PepStore: removeAll" {
     const item2 = try store.getItem(allocator, "alice@localhost", "storage:bookmarks", "bm1");
     try std.testing.expect(item2 == null);
 }
-
 
 test "S4: oversized PEP keys fail with KeyTooLong" {
     var db = try MemoryBackend.open("", .{});

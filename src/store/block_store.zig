@@ -100,7 +100,6 @@ pub fn BlockStore(comptime Backend: type) type {
     };
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -208,7 +207,6 @@ test "BlockStore: block is idempotent" {
     // Should still have exactly 1 entry (not duplicated)
     try std.testing.expectEqual(@as(usize, 1), list.len);
 }
-
 
 test "S4: oversized block keys fail with KeyTooLong" {
     var db = try MemoryBackend.open("", .{});

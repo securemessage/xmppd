@@ -293,7 +293,6 @@ pub fn RosterStore(comptime Backend: type) type {
 // Key/Value helpers
 // ============================================================================
 
-
 fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) []const u8 {
     buf[0] = @intFromEnum(subscription);
     buf[1] = if (ask) 1 else 0;
@@ -479,7 +478,6 @@ test "Subscription: fromString/toString roundtrip" {
     try std.testing.expectEqual(Subscription.remove, Subscription.fromString("remove"));
     try std.testing.expectEqualStrings("both", Subscription.both.toString());
 }
-
 
 test "S4: oversized keys fail with KeyTooLong instead of overflowing the buffer" {
     var db = try MemoryBackend.open("", .{});
