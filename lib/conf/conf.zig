@@ -241,9 +241,16 @@ pub fn IntOr(comptime K: type) type {
         num: i64,
 
         pub fn parse(s: []const u8) ParseError!@This() {
-            if (std.fmt.parseInt(i64, s, 10)) |n| {
+            // Strict plain decimal: digits only, no sign, underscores or
+            // leading zeros; anything else must be a keyword.
+            var numeric = s.len != 0;
+            for (s) |c| {
+                if (!std.ascii.isDigit(c)) numeric = false;
+            }
+            if (numeric and (s.len == 1 or s[0] != '0')) {
+                const n = std.fmt.parseInt(i64, s, 10) catch return error.BadValue;
                 return .{ .num = n };
-            } else |_| {}
+            }
             const kw = std.meta.stringToEnum(K, s) orelse return error.BadValue;
             return .{ .kw = kw };
         }
@@ -257,14 +264,21 @@ pub fn IntOr(comptime K: type) type {
     };
 }
 
+/// Max items in one comma-separated list value (matches the 64-fd
+/// --listen-fd ceiling).
+pub const list_max_items: usize = 64;
+
 /// Splits a comma list into trimmed item slices; the array comes from
 /// `arena`, the items borrow the source text like scalar strings do.
+/// Empty items ("a,,b") and lists past list_max_items are errors.
 fn parseList(s: []const u8, arena: Allocator) Error![][]const u8 {
     var items = std.ArrayList([]const u8).empty;
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |item| {
         const t = std.mem.trim(u8, item, " \t");
-        if (t.len != 0) try items.append(arena, t);
+        if (t.len == 0) return error.BadValue;
+        try items.append(arena, t);
+        if (items.items.len > list_max_items) return error.BadValue;
     }
     return items.toOwnedSlice(arena);
 }
@@ -992,8 +1006,8 @@ const TestSections = struct {
         max_sessions: u32 = 10000,
         fan_out_batch_size: u32 = 64,
         max_resources_per_account: u32 = 16,
-        workers: u16 = 0,
-        listen_fd: i32 = -1,
+        workers: IntOr(enum { auto }) = .{ .kw = .auto },
+        listen_fd: [][]const u8 = &.{},
         log_level: enum { debug, info, warn, err } = .info,
     } = .{},
     oidc: struct {
@@ -1275,7 +1289,10 @@ test "full file-key inventory parses with typed values" {
     try testing.expectEqual(@as(u32, 20000), v.core.max_sessions);
     try testing.expectEqual(@as(u32, 128), v.core.fan_out_batch_size);
     try testing.expectEqual(@as(u32, 32), v.core.max_resources_per_account);
-    try testing.expectEqual(@as(u16, 8), v.core.workers);
+    switch (v.core.workers) {
+        .num => |n| try testing.expectEqual(@as(i64, 8), n),
+        else => return error.TestUnexpectedResult,
+    }
     try testing.expectEqual(.debug, v.core.log_level);
     try testing.expectEqualStrings("https://auth.example.test/", v.oidc.issuer);
     try testing.expectEqualStrings("xmppd", v.oidc.client_id);
@@ -1334,7 +1351,7 @@ test "every daemon CLI flag maps and parses" {
     try testing.expectEqualStrings("k.pem", core.values.tls.key);
     try testing.expectEqualStrings("a.sock", core.values.auth.socket);
     try testing.expectEqualStrings("s.sock", core.values.s2s.socket);
-    try testing.expectEqual(@as(i32, 7), core.values.core.listen_fd);
+    try testing.expectEqualStrings("7", core.values.core.listen_fd[0]);
     try testing.expectEqualStrings("d.db", core.values.server.db_path);
     try testing.expectEqualStrings("m.test", core.values.muc.host);
     try testing.expectEqualStrings("y.ini", core.values.meta.config_path);
@@ -1376,7 +1393,7 @@ test "every daemon CLI flag maps and parses" {
     try testing.expectEqualStrings("c.sock", s2s.values.s2s.socket);
     try testing.expectEqualStrings("c.pem", s2s.values.tls.cert);
     try testing.expectEqualStrings("k.pem", s2s.values.tls.key);
-    try testing.expectEqual(@as(i32, 9), s2s.values.core.listen_fd);
+    try testing.expectEqualStrings("9", s2s.values.core.listen_fd[0]);
     try testing.expectEqualStrings("s.ini", s2s.values.meta.config_path);
     try testing.expect(s2s.values.meta.help);
 
@@ -1760,6 +1777,28 @@ test "comma-list and int-or-keyword field types parse and serialize" {
 
     // A bad keyword and a bad list item are rejected, not clamped.
     try testing.expectError(error.BadValue, parseValue(IntOr(enum { auto }), "sometimes"));
+
+    // IntOr takes plain decimal only: no sign, underscores or leading
+    // zeros, and it must be digits end to end.
+    const Workers = IntOr(enum { auto });
+    try testing.expectError(error.BadValue, Workers.parse("+8"));
+    try testing.expectError(error.BadValue, Workers.parse("1_0"));
+    try testing.expectError(error.BadValue, Workers.parse("08"));
+    try testing.expectError(error.BadValue, Workers.parse(""));
+    try testing.expectEqual(Workers{ .num = 0 }, try Workers.parse("0"));
+    try testing.expectEqual(Workers{ .num = 8 }, try Workers.parse("8"));
+
+    // Empty items and over-long lists are errors, not silent drops.
+    var diag3: Diag = .{};
+    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator, .{ .args = &.{"--addrs=a,,b"} }, &diag3));
+    var over = std.ArrayList(u8).empty;
+    defer over.deinit(testing.allocator);
+    try over.appendSlice(testing.allocator, "--addrs=");
+    for (0..list_max_items + 1) |i| {
+        if (i != 0) try over.append(testing.allocator, ',');
+        try over.append(testing.allocator, 'a');
+    }
+    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator, .{ .args = &.{over.items} }, &diag3));
 }
 
 const capped_sections = struct {
