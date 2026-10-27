@@ -8350,6 +8350,10 @@ test "Server: G2 two workers cannot exceed the shared offline quota" {
         successes: *std.atomic.Value(usize),
         errors: *std.atomic.Value(usize),
         worker: usize,
+        /// Message index of each successful store, in the order this worker
+        /// made them. The store must hand them back in that order.
+        accepted: [150]usize = undefined,
+        accepted_len: usize = 0,
 
         fn run(ctx: *@This()) void {
             ctx.ready.post();
@@ -8364,7 +8368,11 @@ test "Server: G2 two workers cannot exceed the shared offline quota" {
                     _ = ctx.errors.fetchAdd(1, .monotonic);
                     return;
                 };
-                if (stored) _ = ctx.successes.fetchAdd(1, .monotonic);
+                if (stored) {
+                    _ = ctx.successes.fetchAdd(1, .monotonic);
+                    ctx.accepted[ctx.accepted_len] = i;
+                    ctx.accepted_len += 1;
+                }
             }
         }
     };
@@ -8391,6 +8399,40 @@ test "Server: G2 two workers cannot exceed the shared offline quota" {
     try std.testing.expectEqual(@as(usize, 0), errors.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 100), successes.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 100), try first_store.countMessages("bob@localhost"));
+
+    // Two workers storing at once must still get one sequence per accepted
+    // message, all distinct: a shared counter read and written without the
+    // lock hands two rows the same sequence and one overwrites the other.
+    const pointers = try first_store.getPointers("bob@localhost");
+    defer first_store.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 100), pointers.len);
+
+    var seen = try allocator.alloc(bool, 151);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    for (pointers) |ptr| {
+        try std.testing.expect(ptr.sequence != 0);
+        try std.testing.expect(ptr.sequence <= 100);
+        try std.testing.expect(!seen[ptr.sequence]);
+        seen[ptr.sequence] = true;
+    }
+
+    // Each worker's own messages must come back in the order it stored them,
+    // interleaved with the other worker's but never reordered within a worker.
+    for (0..2) |worker| {
+        var expected_next: usize = 0;
+        const accepted = contexts[worker].accepted[0..contexts[worker].accepted_len];
+        var from_buf: [48]u8 = undefined;
+        for (pointers) |ptr| {
+            const prefix = std.fmt.bufPrint(&from_buf, "alice@localhost/worker-{d}-", .{worker}) catch unreachable;
+            if (!std.mem.startsWith(u8, ptr.from_jid, prefix)) continue;
+            const index = std.fmt.parseInt(usize, ptr.from_jid[prefix.len..], 10) catch unreachable;
+            if (expected_next >= accepted.len) continue;
+            try std.testing.expectEqual(accepted[expected_next], index);
+            expected_next += 1;
+        }
+        try std.testing.expectEqual(accepted.len, expected_next);
+    }
 }
 
 // S13: the writable handler must resume a stalled offline drain once the
