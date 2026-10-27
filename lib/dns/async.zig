@@ -4005,6 +4005,26 @@ test "dns-async: disarming a fired retry timer still removes the chain timer" {
     }
 }
 
+test "dns-async: a delete of a missing knote is fine, other receipts still error" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    try r.ensureOpen();
+
+    // ENOENT on a delete receipt is success (the knote is already in
+    // the state the delete asked for); keventApply still reports it.
+    var del = [1]posix.Kevent{.{
+        .ident = 0xDEAD,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.DELETE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    try r.keventDelete(&del);
+    try std.testing.expectError(error.KeventChange, r.keventApply(&del));
+}
+
 test "dns-async: a failed registration change reports per entry" {
     const sink = try startUdpSink();
     defer posix.close(sink.fd);
