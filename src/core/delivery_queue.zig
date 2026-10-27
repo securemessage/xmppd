@@ -32,8 +32,9 @@ pub const MAX_PAYLOAD_SIZE = 4080;
 /// worker increments it; the M1 metrics task can export it later.
 pub var cross_worker_drops = std.atomic.Value(u64).init(0);
 
-/// Delivery outcomes exported by the R5 metrics gate. All are process-wide and
-/// incremented by multiple workers.
+/// Delivery outcomes for the metrics work that follows this release (M1,
+/// PR #13). Nothing exports them yet. All are process-wide and incremented by
+/// multiple workers.
 pub var s2s_bounces = std.atomic.Value(u64).init(0);
 pub var offline_not_stored = std.atomic.Value(u64).init(0);
 pub var offline_hold_bounces = std.atomic.Value(u64).init(0);

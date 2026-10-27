@@ -492,21 +492,26 @@ pub const RocksDbBackend = struct {
 // Tests
 // ============================================================================
 
-fn freshTestDir() []const u8 {
-    const path = "/tmp/xmppd-test-rocksdb";
-    std.fs.cwd().deleteTree(path) catch {};
-    return path;
+/// A path unique to this process and call, so two suites running at once do
+/// not open and delete each other's database.
+fn freshTestDir(buf: []u8) []const u8 {
+    test_dir_seq += 1;
+    return std.fmt.bufPrint(buf, "/tmp/xmppd-test-rocksdb-{d}-{d}", .{ std.c.getpid(), test_dir_seq }) catch unreachable;
 }
 
+var test_dir_seq: u32 = 0;
+
 test "RocksDbBackend: open and close" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     db.close();
 }
 
 test "RocksDbBackend: put and get" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -523,7 +528,8 @@ test "RocksDbBackend: put and get" {
 }
 
 test "RocksDbBackend: delete" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -539,7 +545,8 @@ test "RocksDbBackend: delete" {
 }
 
 test "RocksDbBackend: overwrite value" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -553,7 +560,8 @@ test "RocksDbBackend: overwrite value" {
 }
 
 test "RocksDbBackend: separate namespaces" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -571,7 +579,8 @@ test "RocksDbBackend: separate namespaces" {
 }
 
 test "RocksDbBackend: iterator prefix-bounded" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -592,7 +601,8 @@ test "RocksDbBackend: iterator prefix-bounded" {
 }
 
 test "RocksDbBackend: iterator returns key and value" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -608,7 +618,8 @@ test "RocksDbBackend: iterator returns key and value" {
 }
 
 test "RocksDbBackend: writeBatch commit" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -628,7 +639,8 @@ test "RocksDbBackend: writeBatch commit" {
 }
 
 test "RocksDbBackend: writeBatch abort" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -642,7 +654,8 @@ test "RocksDbBackend: writeBatch abort" {
 }
 
 test "RocksDbBackend: abort after a commit attempt is a no-op" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -660,7 +673,8 @@ test "RocksDbBackend: abort after a commit attempt is a no-op" {
 }
 
 test "RocksDbBackend: a failed write ends the batch" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -684,7 +698,8 @@ test "RocksDbBackend: a failed write ends the batch" {
 }
 
 test "RocksDbBackend: reopen preserves data" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     {
         var db = try RocksDbBackend.open(path, .{});
