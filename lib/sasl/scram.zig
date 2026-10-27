@@ -642,6 +642,8 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
 
             // ClientSignature := HMAC(StoredKey, AuthMessage)
             var client_signature: [mac_len]u8 = undefined;
+            // The proof is public; a leftover signature would recover ClientKey.
+            defer std.crypto.secureZero(u8, &client_signature);
             Hmac.create(&client_signature, auth_message, &stored_key);
 
             // ClientProof := ClientKey XOR ClientSignature
