@@ -756,20 +756,19 @@ fn pbkdf2Sha256(password: []const u8, salt: []const u8, iterations: u32, output:
 
     // U2..Ui: clone the precomputed inner and outer states per block.
     var i: u32 = 1;
+    var next: [32]u8 = undefined;
     while (i < iterations) : (i += 1) {
-        var next: [32]u8 = undefined;
         hmac.mac(&u, &next);
         u = next;
         for (&result, u) |*r, x| {
             r.* ^= x;
         }
-        // Wipe the per-iteration U block after it is folded into result.
-        std.crypto.secureZero(u8, std.mem.asBytes(&next));
     }
 
     output.* = result;
     std.crypto.secureZero(u8, std.mem.asBytes(&u));
     std.crypto.secureZero(u8, std.mem.asBytes(&result));
+    std.crypto.secureZero(u8, std.mem.asBytes(&next));
 }
 
 /// PBKDF2 over a comptime HMAC, dkLen = mac_length (one block). SHA-256 uses
