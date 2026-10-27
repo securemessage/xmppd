@@ -707,6 +707,19 @@ pub fn Loader(
                     }
                     try self.setField(cli_targets[ci], value.?, .{ .key = arg }, diag);
                     self.provenance[cli_targets[ci]] = prov;
+                } else if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+                    // Canonical forwarded form: --section.key=value,
+                    // spelled the same for every loader.
+                    const idx = findField(name[0..dot], name[dot + 1 ..]) orelse {
+                        diag.set(.{ .key = arg, .detail = "unknown argument" });
+                        return error.UnknownArgument;
+                    };
+                    if (value == null) {
+                        diag.set(.{ .key = arg, .detail = "option requires a value" });
+                        return error.MissingValue;
+                    }
+                    try self.setField(idx, value.?, .{ .key = arg }, diag);
+                    self.provenance[idx] = prov;
                 } else {
                     diag.set(.{ .key = arg, .detail = "unknown argument" });
                     return error.UnknownArgument;
@@ -714,68 +727,59 @@ pub fn Loader(
             }
         }
 
-        /// Serializes the resolved config as "--name=value" pairs (flags as
-        /// bare "--name") so a master can forward it to children. Allocates
-        /// the argv array and formatted values from `arena`. A formatted
-        /// value past the 4 KiB scratch is FileTooLarge, not a panic.
+        /// Serializes the resolved config in the canonical forwarding
+        /// form, one "--section.key=value" element per file-schema
+        /// field, so every loader accepts it. Meta and CLI-only fields
+        /// (config_path, run_dir, help, --) are not forwarded. A
+        /// formatted value past the 4 KiB scratch is ValueTooLong.
         pub fn forwardArgs(self: *const Self, arena: Allocator, diag: *Diag) Error![]const []const u8 {
             var list = std.ArrayList([]const u8).empty;
             var buf: [4096]u8 = undefined;
-            inline for (cli, 0..) |c, i| {
-                const v = @field(@field(self.values, fields[cli_targets[i]].section), fields[cli_targets[i]].field);
-                if (c.flag) |sets| {
-                    if (v == sets) {
-                        try list.append(arena, try std.fmt.allocPrint(arena, "--{s}", .{c.name}));
-                    }
-                } else {
-                    var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch {
-                        diag.set(.{ .key = c.name, .detail = "serialized value exceeds the 4 KiB scratch buffer" });
-                        return error.ValueTooLong;
-                    };
-                    try list.append(arena, try std.fmt.allocPrint(arena, "--{s}={s}", .{ c.name, w.buffered() }));
-                }
+            inline for (fields, 0..) |f, i| {
+                if (!f.in_file) continue;
+                const v = @field(@field(self.values, f.section), f.field);
+                var w: std.Io.Writer = .fixed(&buf);
+                writeValue(field_types[i], &w, v) catch {
+                    diag.set(.{ .key = keyOf(f), .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                    return error.ValueTooLong;
+                };
+                try list.append(arena, try std.fmt.allocPrint(arena, "--{s}.{s}={s}", .{ f.section, keyOf(f), w.buffered() }));
             }
             return list.toOwnedSlice(arena);
         }
 
         /// Serializes the resolved config as the forwarding blob: one
-        /// canonical "--name=value" (or bare "--name") line per CLI option,
+        /// canonical "--section.key=value" line per file-schema field,
         /// LF-terminated. A value containing LF cannot survive the line
         /// form and is rejected with a diagnostic naming the key.
         pub fn forwardBlob(self: *const Self, arena: Allocator, diag: *Diag) Error![]u8 {
             var blob = std.ArrayList(u8).empty;
             var buf: [4096]u8 = undefined;
-            inline for (cli, 0..) |c, i| {
-                const v = @field(@field(self.values, fields[cli_targets[i]].section), fields[cli_targets[i]].field);
-                if (c.flag) |sets| {
-                    if (v == sets) {
-                        try blob.appendSlice(arena, "--");
-                        try blob.appendSlice(arena, c.name);
-                        try blob.append(arena, '\n');
-                    }
-                } else {
-                    var w: std.Io.Writer = .fixed(&buf);
-                    writeValue(field_types[cli_targets[i]], &w, v) catch {
-                        diag.set(.{ .key = c.name, .detail = "serialized value exceeds the 4 KiB scratch buffer" });
-                        return error.ValueTooLong;
-                    };
-                    const val = w.buffered();
-                    if (std.mem.indexOfScalar(u8, val, '\n') != null) {
-                        var kbuf: [160]u8 = undefined;
-                        diag.set(.{
-                            .key = std.fmt.bufPrint(&kbuf, "--{s}", .{c.name}) catch c.name,
-                            .value = val,
-                            .detail = "value contains a newline and cannot be forwarded",
-                        });
-                        return error.BadValue;
-                    }
-                    try blob.appendSlice(arena, "--");
-                    try blob.appendSlice(arena, c.name);
-                    try blob.append(arena, '=');
-                    try blob.appendSlice(arena, val);
-                    try blob.append(arena, '\n');
+            inline for (fields, 0..) |f, i| {
+                if (!f.in_file) continue;
+                const v = @field(@field(self.values, f.section), f.field);
+                var w: std.Io.Writer = .fixed(&buf);
+                writeValue(field_types[i], &w, v) catch {
+                    diag.set(.{ .key = keyOf(f), .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                    return error.ValueTooLong;
+                };
+                const val = w.buffered();
+                if (std.mem.indexOfScalar(u8, val, '\n') != null) {
+                    var kbuf: [160]u8 = undefined;
+                    diag.set(.{
+                        .key = std.fmt.bufPrint(&kbuf, "--{s}.{s}", .{ f.section, keyOf(f) }) catch keyOf(f),
+                        .value = val,
+                        .detail = "value contains a newline and cannot be forwarded",
+                    });
+                    return error.BadValue;
                 }
+                try blob.appendSlice(arena, "--");
+                try blob.appendSlice(arena, f.section);
+                try blob.append(arena, '.');
+                try blob.appendSlice(arena, keyOf(f));
+                try blob.append(arena, '=');
+                try blob.appendSlice(arena, val);
+                try blob.append(arena, '\n');
             }
             return blob.toOwnedSlice(arena);
         }
@@ -1537,6 +1541,33 @@ test "generated help lists every cli option and file key" {
     try testing.expect(std.mem.indexOf(u8, help, "rate_max_per_account") != null);
 }
 
+test "the canonical blob parses identically across two different loaders" {
+    var d0: Diag = .{};
+    var parent = try MasterLoader.load(testing.allocator, .{
+        .args = &.{ "--host", "h.test", "--no-s2s" },
+    }, &d0);
+    defer parent.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diag = .{};
+    const blob = try parent.forwardBlob(arena.allocator(), &diag);
+    // Canonical lines name every file-schema field as --section.key=.
+    try testing.expect(std.mem.indexOf(u8, blob, "--server.hostname=h.test\n") != null);
+    try testing.expect(std.mem.indexOf(u8, blob, "--s2s.enabled=false\n") != null);
+    // Meta and cli-only fields are never forwarded.
+    try testing.expect(std.mem.indexOf(u8, blob, "config_path") == null);
+    try testing.expect(std.mem.indexOf(u8, blob, "run_dir") == null);
+    var core = try CoreLoader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob) }, &diag);
+    defer core.deinit();
+    var auth = try AuthLoader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob) }, &diag);
+    defer auth.deinit();
+    try testing.expectEqualStrings("h.test", core.values.server.hostname);
+    try testing.expectEqualStrings("h.test", auth.values.server.hostname);
+    try testing.expect(!core.values.s2s.enabled);
+    // A master-only spelling never leaks through: --core-path had no
+    // file field, so nothing in the blob can fail an auth load.
+}
+
 test "forwardArgs round-trips the resolved config" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1693,7 +1724,7 @@ test "serializers report ValueTooLong with a filled Diag on overflow" {
     defer arena.deinit();
     var diag: Diag = .{};
     try testing.expectError(error.ValueTooLong, l.forwardBlob(arena.allocator(), &diag));
-    try testing.expectEqualStrings("host", diag.key);
+    try testing.expectEqualStrings("hostname", diag.key);
     try testing.expect(diag.detail.len != 0);
 }
 
@@ -1706,7 +1737,7 @@ test "forwardBlob rejects a value containing LF and names the key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.BadValue, l.forwardBlob(arena.allocator(), &diag));
-    try testing.expectEqualStrings("--host", diag.key);
+    try testing.expectEqualStrings("--server.hostname", diag.key);
 }
 
 test "readForwarded caps the blob at 256 KiB and still closes the fd" {
