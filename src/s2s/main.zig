@@ -1315,7 +1315,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
     }
 }
 
-/// Domainpart of a JID (RFC 7622 §3.1): cut at the resource separator
+/// Domainpart of a JID (RFC 7622 section 3.1): cut at the resource separator
 /// FIRST, then split off the localpart. Cutting at '@' first would let
 /// "victim.example/x@them.example" resolve to "them.example" (S2).
 fn jidDomain(jid: []const u8) []const u8 {
@@ -1324,7 +1324,7 @@ fn jidDomain(jid: []const u8) []const u8 {
     return bare;
 }
 
-/// RFC 6120 §4.9.3.9 / §4.9.3.6: an inbound stanza's from= domain must be
+/// RFC 6120 sections 4.9.3.9 and 4.9.3.6: an inbound stanza's from= domain must be
 /// authenticated for the session (dialback or EXTERNAL+DANE; auth_ok is the
 /// caller's set lookup), and to= must be a host we serve (bare domain or the
 /// MUC host).
@@ -1360,7 +1360,7 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     }
 
     if (from.len == 0 or to.len == 0) {
-        // RFC 6120 §4.9.3.10: missing from/to on an established stream.
+        // RFC 6120 section 4.9.3.10: missing from/to on an established stream.
         log.warn("inbound stanza missing from/to (improper-addressing)", .{});
         sendStreamError(session, .improper_addressing);
         _ = session.flushWrite() catch {};
