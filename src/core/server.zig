@@ -6571,6 +6571,58 @@ test "Server: an over-long sender bare JID still delivers live" {
     try std.testing.expectEqual(@as(usize, 0), an);
 }
 
+// The MUC fan-out tears down a session whose buffer is genuinely full rather
+// than leaving it wedged. c2s delivery now answers the same condition the same
+// way, so one stuck peer cannot be told two different stories depending on
+// whether the stanza came from a room.
+test "Server: a full recipient buffer is marked for teardown like the MUC path" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+    // Room enough for a short stanza, not for this one.
+    target.conn.write_end = connection_mod.WRITE_BUF_SIZE - 16;
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ("x" ** 64) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    try std.testing.expect(target.sm_overflow);
+
+    // The sender is told rather than left to guess.
+    _ = alice.conn.flushSend() catch {};
+    var buf: [1024]u8 = undefined;
+    const n = posix.read(alice_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "service-unavailable") != null);
+}
+
 test "Server: a non-archivable message stores offline with no archive" {
     const allocator = std.testing.allocator;
 
