@@ -903,13 +903,15 @@ fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, val
     w.writeAll("</value></field>") catch return;
 }
 
-/// Parse a boolean value from a form field in XML.
+/// Parse a boolean value from a form field in XML. Absent is null; anything
+/// present that is not a boolean literal is an error, so a typo cannot be
+/// mistaken for "leave this setting alone".
 fn parseFormBool(xml_data: []const u8, field_var: []const u8) !?bool {
     var buf: [16]u8 = undefined;
     const value = (try parseFormValue(xml_data, field_var, &buf)) orelse return null;
     if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
-    return null;
+    return error.FormValueInvalid;
 }
 
 /// Apply a submitted room config form to `config`. Any overflowing or
@@ -3022,6 +3024,24 @@ test "G1: applyConfigForm rejects an overflowing or over-wide secret" {
     const ok_form = "<field var='muc#roomconfig_roomsecret'><value>s&amp;cr</value></field>";
     try applyConfigForm(&config, ok_form);
     try std.testing.expectEqualStrings("s&cr", config.getPassword());
+}
+
+test "G1: an invalid boolean literal rejects the whole config form" {
+    var config = RoomConfig{};
+    config.persistent = false;
+    // A typo must not read as "field absent", which would silently keep the
+    // previous value and report the form as accepted.
+    const bad = "<field var='muc#roomconfig_persistentroom'><value>yes</value></field>";
+    try std.testing.expectError(error.FormValueInvalid, applyConfigForm(&config, bad));
+    try std.testing.expect(!config.persistent);
+
+    // Absent still means "leave alone".
+    try applyConfigForm(&config, "<field var='muc#roomconfig_roomname'><value>r</value></field>");
+    try std.testing.expect(!config.persistent);
+
+    const good = "<field var='muc#roomconfig_persistentroom'><value>1</value></field>";
+    try applyConfigForm(&config, good);
+    try std.testing.expect(config.persistent);
 }
 
 test "G1: an overflowing room secret rejects the whole config form" {
