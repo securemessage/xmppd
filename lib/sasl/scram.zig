@@ -610,12 +610,17 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
         pub fn clientFinal(self: *Self, salted_password: [mac_len]u8) ![]const u8 {
             if (self.state != .awaiting_server_first or !self.server_first_parsed) return error.InvalidState;
 
+            // The SaltedPassword is passed by value; work on a local copy so
+            // it can be wiped on every exit path.
+            var sp: [mac_len]u8 = salted_password;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&sp));
+
             const alloc = self.arena.allocator();
 
             // ClientKey := HMAC(SaltedPassword, "Client Key")
             var client_key: [mac_len]u8 = undefined;
             defer std.crypto.secureZero(u8, std.mem.asBytes(&client_key));
-            Hmac.create(&client_key, "Client Key", &salted_password);
+            Hmac.create(&client_key, "Client Key", &sp);
 
             // StoredKey := H(ClientKey)
             var stored_key: [mac_len]u8 = undefined;
@@ -656,7 +661,7 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             // checked against the server-final-message (mutual authentication).
             var server_key: [mac_len]u8 = undefined;
             defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key));
-            Hmac.create(&server_key, "Server Key", &salted_password);
+            Hmac.create(&server_key, "Server Key", &sp);
             Hmac.create(&self.server_signature, auth_message, &server_key);
 
             const proof_b64 = try base64Encode(alloc, &client_proof);
