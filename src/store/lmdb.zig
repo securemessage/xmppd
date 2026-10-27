@@ -51,6 +51,10 @@ pub const LmdbBackend = struct {
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    /// A read runs inside its own read txn, which LMDB pins to an MVCC
+    /// snapshot, so it cannot observe a half-applied write and does not need
+    /// the store's compound lock (S9).
+    pub const reads_are_snapshot = true;
 
     comptime {
         backend.assertBackend(LmdbBackend);

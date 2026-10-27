@@ -42,6 +42,15 @@ pub const NS_OFFLINE_SEQ = backend.registered("offline_seq");
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;
 
+/// LMDB and RocksDB serve a read from an MVCC snapshot, so a commit on another
+/// thread cannot tear it and a read need not queue behind that commit's fsync
+/// on the loop thread. A backend without that guarantee keeps the compound
+/// lock on its reads. Writes always take it: a compound operation (count, then
+/// store) is only atomic across the lock.
+pub fn readsNeedLock(comptime Backend: type) bool {
+    return if (@hasDecl(Backend, "reads_are_snapshot")) !Backend.reads_are_snapshot else true;
+}
+
 /// An offline delivery pointer — references a message in the archive.
 pub const OfflinePointer = struct {
     /// Bare JID of the intended recipient.
@@ -69,6 +78,16 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
         pub fn init(db: *Backend, allocator: std.mem.Allocator) Self {
             return .{ .db = db, .allocator = allocator };
+        }
+
+        const read_needs_lock = readsNeedLock(Backend);
+
+        fn lockRead(self: *Self) void {
+            if (read_needs_lock) self.db.compound_mutex.lock();
+        }
+
+        fn unlockRead(self: *Self) void {
+            if (read_needs_lock) self.db.compound_mutex.unlock();
         }
 
         /// Store a delivery pointer for an offline message.
@@ -99,8 +118,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// Read back a payload stored by `storeHeldPointer`. Null when this
         /// pointer carries no held copy.
         pub fn getHeldStanza(self: *Self, ptr: OfflinePointer) !?[]u8 {
-            self.db.compound_mutex.lock();
-            defer self.db.compound_mutex.unlock();
+            self.lockRead();
+            defer self.unlockRead();
             const is_v2 = ptr.sequence != 0;
             const key = if (is_v2)
                 try self.buildV2Key(ptr.recipient, ptr.sequence)
@@ -112,8 +131,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
         /// Count pending offline messages for a recipient.
         pub fn countMessages(self: *Self, recipient: []const u8) !usize {
-            self.db.compound_mutex.lock();
-            defer self.db.compound_mutex.unlock();
+            self.lockRead();
+            defer self.unlockRead();
             return self.countMessagesLocked(recipient);
         }
 
@@ -121,8 +140,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// first by timestamp and id; sequenced rows follow in insertion order.
         /// Caller owns the returned slice and each pointer's fields.
         pub fn getPointers(self: *Self, recipient: []const u8) ![]OfflinePointer {
-            self.db.compound_mutex.lock();
-            defer self.db.compound_mutex.unlock();
+            self.lockRead();
+            defer self.unlockRead();
             const prefix = try self.buildRecipientPrefix(recipient);
             defer self.allocator.free(prefix);
 
@@ -405,7 +424,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 // Tests
 // ============================================================================
 
-const MemoryBackend = backend.MemoryBackend;
+pub const MemoryBackend = backend.MemoryBackend;
 const FailBatchBackend = backend.FailBatchBackend;
 
 test "GenericOfflineStore: a failed clearAll batch aborts the write txn" {

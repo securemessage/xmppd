@@ -81,3 +81,51 @@ test "GenericOfflineStore: the fixture pairs really do share their first 256 byt
     try std.testing.expect(std.mem.eql(u8, long_a[0..256], long_b[0..256]));
     try std.testing.expect(!std.mem.startsWith(u8, long_b, long_a));
 }
+
+// A read must not queue behind the compound lock on a snapshot backend: the
+// lock is held across a write batch commit and fsync, so a drain read on the
+// loop thread would otherwise wait for another worker disk flush.
+// MemoryBackend is the control and must keep taking the lock.
+test "GenericOfflineStore: LMDB reads skip the compound lock held by a commit" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(!offline_store_mod.readsNeedLock(lmdb_backend.Backend));
+    try std.testing.expect(!offline_store_mod.readsNeedLock(rocksdb_backend.Backend));
+    try std.testing.expect(offline_store_mod.readsNeedLock(offline_store_mod.MemoryBackend));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("readlock");
+    const path = try tmp.dir.realpathAlloc(alloc, "readlock");
+    defer alloc.free(path);
+
+    var db = try lmdb_backend.Backend.open(path, .{});
+    defer db.close();
+    var store = offline_store_mod.GenericOfflineStore(lmdb_backend.Backend).init(&db, alloc);
+    _ = try store.storePointer("bob@example.com", "alice@example.com", "m1", 1000);
+
+    const Reader = struct {
+        store: *@TypeOf(store),
+        done: *std.Thread.Semaphore,
+        count: *usize,
+
+        fn run(ctx: *@This()) void {
+            ctx.count.* = ctx.store.countMessages("bob@example.com") catch 0;
+            ctx.done.post();
+        }
+    };
+    var done: std.Thread.Semaphore = .{};
+    var count: usize = 0;
+    var reader = Reader{ .store = &store, .done = &done, .count = &count };
+
+    // The read runs on its own thread so a read that wrongly takes the lock
+    // shows up as a timeout instead of hanging the test.
+    db.compound_mutex.lock();
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    const timed_out = if (done.timedWait(5 * std.time.ns_per_s)) |_| false else |_| true;
+    db.compound_mutex.unlock();
+    thread.join();
+
+    try std.testing.expect(!timed_out);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}

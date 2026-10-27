@@ -33,6 +33,9 @@ pub const RocksDbBackend = struct {
     /// Guards cf_cache lookups/appends (S9): canonical column families are
     /// created at open(); the lock covers only test/unknown names.
     cf_lock: std.Thread.Mutex = .{},
+    /// RocksDB reads are MVCC snapshots and cannot observe a half-applied
+    /// write, so they do not need the store's compound lock (S9).
+    pub const reads_are_snapshot = true;
 
     comptime {
         backend.assertBackend(RocksDbBackend);
