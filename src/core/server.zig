@@ -1695,6 +1695,19 @@ pub const Server = struct {
                 self.processXmlEvent(session, event.?, changes);
 
                 if (self.sessions[id] == null) return;
+
+                // A stanza the accumulation buffer could not hold is already
+                // undescribable: the rest of the element would only append to a
+                // partial stanza the peer thinks is complete (H6). Fail now
+                // instead of waiting for the close tag, so a peer that never
+                // closes the stanza cannot hold the session open.
+                if (session.stanza_overflow) {
+                    log.warn("connection {d} stanza exceeds {d} bytes: policy-violation", .{ id, session.stanza_buf.len });
+                    self.sendStreamError(session, .policy_violation);
+                    session.conn.flushSync();
+                    session_lifecycle.forceCloseSession(self, id, changes);
+                    return;
+                }
                 // T215: anything past the complete <starttls/> element is
                 // plaintext read-ahead — a protocol violation (RFC 6120
                 // 5.4.3.2).
@@ -5705,6 +5718,68 @@ test "H6: a stanza the accumulator can deliver is accepted after auth" {
         xml.max_item_bytes_authenticated,
         session.reader.scan.max_item_bytes,
     );
+}
+
+// Close on the overflow, not on the close tag: a peer that opens an over-long
+// stanza and never closes it would otherwise keep its session and the reader's
+// arena alive for as long as it stays connected. The stanza arrives in chunks
+// so the parser sees it unterminated, the way a hostile peer would send it.
+test "H6: a broken stanza closes the stream before its close tag arrives" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    // Bound and active: a pre-bind message is refused by the RFC 6120 7.1
+    // policy before its accumulation could overflow, so the stanza has to be
+    // one the server would otherwise route.
+    session.stream.authenticated = true;
+    session.stream.state = .active;
+    session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // A stanza whose children pass the 16 KiB accumulator with no
+    // </message> ever sent. Each child carries a 200-byte text run, so the
+    // accumulator grows about as fast as the reader's own accounting and is
+    // what gives out first; the stanza is still incomplete when it does.
+    _ = try posix.write(fds[1], "<message to='localhost' type='chat'>");
+    var chunk: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&chunk);
+    while (fbs.pos + 208 <= chunk.len) {
+        try fbs.writer().writeAll("<a>");
+        try fbs.writer().writeByteNTimes('x', 200);
+        try fbs.writer().writeAll("</a>");
+    }
+    var fed: usize = 0;
+    const limit = 64 * 1024;
+    while (fed < limit and server.sessions[1] != null) : (fed += fbs.pos) {
+        _ = try posix.write(fds[1], fbs.getWritten());
+        server.handleReadable(1, &changes);
+    }
+
+    // Closed on the accumulator overflow, well before the children ran out and
+    // with no close tag ever sent. The accumulator is what a stanza is
+    // delivered through, so it must be the bound the peer hits first: reaching
+    // the reader's larger item cap instead would mean the session survived the
+    // first overflow and kept buffering.
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(fed < limit);
+    try std.testing.expect(fed < xml.max_item_bytes_authenticated);
+
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "policy-violation") != null);
 }
 
 test "Server: stream open produces response" {
