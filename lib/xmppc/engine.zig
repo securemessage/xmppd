@@ -1013,7 +1013,7 @@ pub const Engine = struct {
         // the engine's resolver (built at init). Nothing blocks.
         self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         s.phase = .resolving;
-        self.resolver.?.resolve(s.host, .client, s.port, h.encode(), true) catch {
+        self.resolver.?.resolve(s.host, .client, s.port, h.encode(), s.tls_policy == .dane_first) catch {
             s.fail(self.allocator, "resolve-error");
             return;
         };

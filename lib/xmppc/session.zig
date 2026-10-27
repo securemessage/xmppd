@@ -493,10 +493,11 @@ pub const Session = struct {
         var tlsa_failed = false;
         while (self.target_index < res.targets.len) {
             const t = res.targets[self.target_index];
-            // ADR-13: a failed TLSA lookup is a temporary failure of
-            // the target itself - DANE cannot be checked and PKIX
-            // fallback is not allowed, so the target is never dialed.
-            if (t.tlsa_status == .lookup_failed) {
+            // ADR-13 applies to dane_first: a failed TLSA lookup is a
+            // temporary failure of the target itself - DANE cannot be
+            // checked and PKIX fallback is not allowed, so the target
+            // is never dialed. Other policies do not consult TLSA.
+            if (t.tlsa_status == .lookup_failed and self.tls_policy == .dane_first) {
                 tlsa_failed = true;
                 self.target_index += 1;
                 continue;
@@ -1360,5 +1361,69 @@ test "connect: a lookup_failed target falls through to the next target" {
     s.connectNextTarget(true);
     try std.testing.expect(!s.isDead());
     try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    try std.testing.expect(s.fd >= 0);
+}
+
+fn loopbackListener() !struct { fd: posix.fd_t, port: u16 } {
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(lfd);
+    const laddr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &laddr.any, laddr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &alen);
+    try posix.listen(lfd, 4);
+    return .{ .fd = lfd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+test "connect: pkix_only dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .pkix_only;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expect(s.fd >= 0);
+}
+
+test "connect: none dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .none;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
     try std.testing.expect(s.fd >= 0);
 }
