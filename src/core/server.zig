@@ -9705,8 +9705,10 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
     }
 
     // An alias must not hide an additional timer arm from the exact-name
-    // checks above. Split the needle so this test does not count itself.
-    const any_timer_needle = "add" ++ "Timer(";
+    // checks above: binding the method to a local and calling that through the
+    // alias never spells the call form. Count the bare name instead. Split the
+    // needle so this test does not count itself.
+    const any_timer_needle = "add" ++ "Timer";
     const src = @embedFile("server.zig");
     var total: usize = 0;
     var pos: usize = 0;
