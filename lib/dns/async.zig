@@ -1867,11 +1867,30 @@ fn readResolvConf(alloc: std.mem.Allocator, path: []const u8) !net.Address {
         if (line.len == 0 or line[0] == ';' or line[0] == '#') continue;
         if (!std.mem.startsWith(u8, line, "nameserver")) continue;
         const rest = line["nameserver".len..];
+        // libc MATCH(): a blank or tab must follow the keyword, so
+        // "nameserver9.9.9.9" is not a nameserver line.
+        if (rest.len == 0 or (rest[0] != ' ' and rest[0] != '\t')) continue;
         const start = std.mem.indexOfNone(u8, rest, " \t") orelse continue;
         const tail = rest[start..];
         const tok = tail[0 .. std.mem.indexOfAny(u8, tail, ";# \t") orelse tail.len];
         if (tok.len == 0) continue;
-        return net.Address.parseIp(tok, 53) catch continue;
+        if (net.Address.parseIp(tok, 53)) |addr| {
+            return addr;
+        } else |_| {
+            // libc accepts scoped v6 ("fe80::1%lo0"): resolve the zone
+            // name with if_nametoindex.
+            const pct = std.mem.indexOfScalar(u8, tok, '%') orelse continue;
+            var addr = net.Address.parseIp(tok[0..pct], 53) catch continue;
+            const zname = tok[pct + 1 ..];
+            var zbuf: [16]u8 = undefined;
+            if (zname.len == 0 or zname.len >= zbuf.len) continue;
+            @memcpy(zbuf[0..zname.len], zname);
+            zbuf[zname.len] = 0;
+            const idx = std.c.if_nametoindex(zbuf[0..zname.len :0]);
+            if (idx <= 0) continue;
+            addr.in6.sa.scope_id = @intCast(idx);
+            return addr;
+        }
     }
     return error.NoNameserver;
 }
@@ -4417,6 +4436,47 @@ test "dns-async: a nameserver past the first kilobyte is still found" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.54", 53)));
+}
+
+test "dns-async: resolv.conf needs a blank after the keyword and ends tokens at ; or #" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // libc MATCH() requires blank/tab after "nameserver"; the address
+    // token ends at the first blank, ';', or '#'.
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "nameserver9.9.9.9\nnameserver 127.0.0.61;inline\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.61", 53)));
+
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try tmp2.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "nameserver 127.0.0.62#tag\n" });
+    const path2 = try tmp2.dir.realpath("resolv.conf", &pbuf);
+    r.resolv_conf_path = path2;
+    r.loadResolvConf();
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.62", 53)));
+}
+
+test "dns-async: a scoped v6 nameserver (fe80::1%lo0) is accepted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "nameserver fe80::1%lo0\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET6), r.server.any.family);
+    try std.testing.expect(r.server.in6.sa.scope_id != 0);
 }
 
 test "dns-async: a TLSA NXDOMAIN marks the target absent (per-target path)" {
