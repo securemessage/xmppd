@@ -2748,6 +2748,48 @@ test "S2sDaemon: G5 the pre-auth cap covers an unterminated stream header" {
     try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
 }
 
+test "S2sDaemon: an overflowed stanza closes the stream before the item ends" {
+    // Closing at the end of an item is not enough on its own: the peer would
+    // still get to send, and the server to parse, everything up to the reader's
+    // item cap. This item is never terminated and stays under that cap, so only
+    // a close driven by the accumulator overflow closes the stream.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='b.example' to='alice@a.example'>");
+
+    // Complete child elements, so each one is accumulated as it is parsed and
+    // the total crosses the 16 KiB accumulator while the item source stays
+    // under the reader's cap. The message is never closed.
+    var unit: [907]u8 = undefined;
+    const unit_open = "<b>";
+    const unit_close = "</b>";
+    @memcpy(unit[0..unit_open.len], unit_open);
+    @memset(unit[unit_open.len..][0 .. unit.len - unit_open.len - unit_close.len], 'x');
+    @memcpy(unit[unit.len - unit_close.len ..], unit_close);
+    var fed: usize = 0;
+    while (fed < xml.max_item_bytes_authenticated and daemon.getInbound(0) != null) : (fed += unit.len) {
+        try feedInboundForTest(&daemon, &batch, peer_fd, &unit);
+    }
+    // Closed before the reader's cap was reached, i.e. on the overflow and not
+    // on the end of an item that never came.
+    try std.testing.expect(fed < xml.max_item_bytes_authenticated);
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
 test "S2sDaemon: G4 an oversized accumulated stanza is rejected whole" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "a.example");
