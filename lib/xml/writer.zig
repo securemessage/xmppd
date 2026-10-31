@@ -301,6 +301,18 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
     const c = bytes[i.*];
     i.* += 1;
     if (c != '&') {
+        // Attribute-value normalization: a literal TAB, LF or CR in
+        // the source is a space in the value, and a literal CRLF is a
+        // single space. A reference to the same character is not
+        // normalized, so '&#9;' stays U+0009.
+        switch (c) {
+            '\t', '\n' => return ' ',
+            '\r' => {
+                if (i.* < r.end and bytes[i.*] == '\n') i.* += 1;
+                return ' ';
+            },
+            else => {},
+        }
         if (c < 0x80) return c;
         // validateChars already proved the slice well-formed UTF-8, so
         // a decode failure here means the range split a sequence.
@@ -1640,6 +1652,35 @@ test "expanded-name URIs decode literal UTF-8 to code points (R6-1)" {
         testing.allocator,
         "<a xmlns:p='urn:\xc3\xa9' xmlns:q='urn:&#195;&#169;' p:x='1' q:x='2'/>",
     );
+}
+
+test "literal whitespace normalizes in the expanded-name compare (R6-3)" {
+    // Attribute-value normalization maps a literal TAB, LF, CR and
+    // CRLF to spaces, so each of these binds the same URI as 'urn:a b'
+    // and the expanded names collide.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\tb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\nb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\r\nb' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // A reference is not normalized: '&#9;' is U+0009, not a space,
+    // so these URIs stay distinct from the normalized literals.
+    const distinct = [_][]const u8{
+        "<a xmlns:p='urn:a&#9;b' xmlns:q='urn:a\tb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#10;b' xmlns:q='urn:a\nb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#13;b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#13;&#10;b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+    };
+    for (distinct) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
