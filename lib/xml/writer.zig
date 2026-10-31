@@ -1728,6 +1728,36 @@ test "the decoded compare rejects malformed references (R6-6)" {
     try testing.expectEqual(@as(bool, false), try eql("u&#65;", "u&#66;"));
 }
 
+test "expanded-name compare pins: lengths and entity names (R6-5)" {
+    // D9: URIs of different decoded lengths are different URIs; a
+    // compare that stops when the shorter range is exhausted wrongly
+    // calls them equal.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:u' xmlns:q='urn:uv' p:x='1' q:x='2'/>",
+    );
+    // D3-D6: each predefined entity decodes to its character, so a
+    // URI written with the entity collides with the same URI written
+    // with the numeric reference.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:a&lt;b' xmlns:q='urn:a&#60;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&gt;b' xmlns:q='urn:a&#62;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&apos;b' xmlns:q='urn:a&#39;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&quot;b' xmlns:q='urn:a&#34;b' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // And different entities stay different URIs.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:a&lt;b' xmlns:q='urn:a&gt;b' p:x='1' q:x='2'/>",
+    );
+}
+
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
