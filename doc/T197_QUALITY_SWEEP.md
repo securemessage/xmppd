@@ -157,6 +157,9 @@ is still done first so the fix ships even if that ADR is rejected.
 | S30 | data loss, high | **Same-nick resource takeover orphans the room `jid_map`** (Phorge T413; production incident 2026-10-08, daniel@morante.dev/NaplesTB could not join, send, or see messages). `handleJoin` collapse overwrote the occupant's `real_jid_buf` in place; `jid_map` keys alias that buffer, so every `findByRealJid` missed from then on: takeover resource got no roster/history/subject, groupchat send bounced `not-acceptable` (sender lookup miss), and on disconnect `removeByRealJid` missed too, so the ghost occupant collapsed every later join. `sendSelfPresence` also hardcoded `affiliation='owner' role='moderator'`. | `muc_handler.zig:954-977`; `room_registry.zig:117-119 (keys alias inline buffers)` [V]; production log `info(muc): ... collapsed into existing occupant` repeated across rebinds [V] | FIXED on master (`270dda8`, deployed to production 2026-10-17): `Room.retargetOccupant` removes the old index key before overwriting the buffer, takeover resource gets the full join response minus the join broadcast, `sendSelfPresence` uses real role/affiliation. e2e `e2e-muc-nick-takeover.py` red 5/10 on old build, green 10/10 at workers=1/4; unit tests double-retarget. S1 hotfix must escape the `sendSelfPresence` attribute writes. T413 stays open until S31 explains the archive gap. |
 | S31 | data loss, high | **Archive writes fail silently** (Phorge T414). Production RocksDB archive has no MUC or 1:1 rows from 2026-06-24 to 2026-10-08 despite months of traffic; the LOG history shows zero table deletions and every WAL recovered in that window was empty, so nothing was written. `Server.archiveStore` swallows store errors (`catch {}`) and the archive queue `enqueue` returns void: no counter, no log line. | `server.zig` `archiveStore`; `archive_queue.zig` [V]; RocksDB `LOG`/`LOG.old.*` in the production jail [V] | Count and log every archive write failure (R5); find the cause by comparing the binaries deployed Jun 24 to Oct 8 with later ones (null archive store in core, column-family cache at open, queue missed wakeup V15); regression test that a groupchat and a 1:1 message reach the store and survive a restart. |
 | S32 | data loss, medium | **MAM `by_contact` index overwrites same-second messages from one contact** (Phorge T415). The key is `owner\0with\0timestamp_be(8)` with a timestamp in seconds, so a later message from the same contact in the same second replaces the index entry, and a `with`-filtered MAM query loses the earlier one. Primary rows survive (the key carries the stanza id). | `store/archive_store.zig` `buildContactKey`; `core/router.zig:304` [V] | With D3: unique ordered key (append the stanza id, or a per-owner sequence shared with the by_id index) plus `xmppctl reindex` migration; regression test with two same-second messages from one contact. Offline-row collisions are PR #9 G2, not this item. |
+| S33 | correctness, medium | **Disco and caps advertise `pubsub#subscribe` with no handler** (forge issue #22). `caps.SERVER_FEATURES` drives both disco#info and the XEP-0115 `ver`, and no code handles a pubsub `<subscribe/>`; PEP notifications come from presence subscriptions (XEP-0163 auto-subscribe). Clients that trust disco or caps send a subscribe that fails. Same family as T163/T164/T169. | `src/core/caps.zig:252`; `iq_handler.zig` pubsub dispatch [V] | Remove `pubsub#subscribe`; audit the other five pubsub claims; consistency test that every advertised `pubsub#*` feature has a dispatch branch. Lands after PR #9 (caps.zig overlap). |
+| S34 | interop, medium | **XEP-0220 conformance** (forge issue #23). (1) `type='error'` dialback verdicts are treated as `invalid`: auth fails and the connection closes, taking every other domain pair with it; XEP-0220 sections 2.1.1 and 2.5 make them non-fatal (queued stanzas bounce with `remote-server-timeout`, Step 3 answers `remote-server-not-found`, the `<error/>` child is parsed). (2) The stream feature `<db:features><db:dialback/>` is defined by no spec; the standard one is `<dialback xmlns='urn:xmpp:features:dialback'><errors/></dialback>` (section 2.4.2). | `src/s2s/main.zig` db:result and db:verify verdict handling; `src/s2s/session.zig:519` [V] | Part 2 (remove the non-standard feature, `buildFeatures` test) lands with S33 after PR #9. Part 1 lands with X1 and the post-PR #8 s2s teardown task, which build the per-stanza bounce it needs; advertise the standard feature only once part 1 works. |
+| S35 | interop, low | **Offline delivery omits XEP-0203 delay stamps** (forge issue #25). XEP-0160 section 3 RECOMMENDS a `<delay/>` on offline delivery; xmppd stamps only MUC history and MAM replay, so clients show queued messages at delivery time. The queue timestamp already sits in the offline pointer key. | `src/core/session_lifecycle.zig` offline delivery; `src/store/offline_store.zig` key schema [V] | Stamp from the pointer timestamp with the MUC history formatter, written in the same pass as the stanza; no duplicate of our own stamp, keep foreign stamps; every route PR #9 adds (cross-worker, SM resume). Lands after PR #9 (offline path rewrite). Flips README footnote 6 and the DOAP XEP-0203 status. |
 
 ### 3.2 First-pass P1s that stay in Phase 0
 
@@ -506,6 +509,51 @@ src/core/
 
 - **Cost.** L (mostly mechanical). **Recommendation: approve.**
 
+### ADR-13: DNS failure policy, retry and cache (operator decision 2026-10-26)
+
+Applies to every consumer of `lib/dns/async.zig` (xmppc today, outbound and
+inbound s2s after X1/X2).
+
+| TLSA result for a connect target | Verification |
+|---|---|
+| Records, a usable one matches | DANE |
+| Records, none match | Fail; no PKIX fallback (RFC 7671) |
+| Authenticated absence: NXDOMAIN or NODATA | PKIX (system CA + hostname) |
+| Lookup failed: SERVFAIL, REFUSED, timeout, or the chain deadline expired with TLSA pending | **Temporary failure of that target** (RFC 7672 section 2.2). Try the next SRV target; when none remain the resolve fails as temporary. Never PKIX. |
+
+- The resolver reports per target `tlsa_status = absent | present |
+  lookup_failed`; an empty record list never means "no TLSA" on its own.
+- **Retry (s2s, v0.9.1).** Today any outbound failure bounces every queued
+  stanza at once (`failOutboundInitiation`). A temporary failure instead keeps
+  the domain's pending queue and retries on lifecycle-timer deadlines with
+  backoff; stanzas bounce with `remote-server-timeout` only when the queue
+  lifetime ends. New stanzas for a domain in backoff join the queue and do not
+  start new attempts. Permanent failures (DANE mismatch, NXDOMAIN for every
+  SRV and A/AAAA) bounce at once with `remote-server-not-found`. Initial
+  values, constants in v0.9.1: retries at 5 s, 15 s, 45 s; queue lifetime
+  120 s; queue bounds from X1.
+- **Cache (v0.9.1).** The resolver cache (X2) serves s2s as well as xmppc:
+  positive and NXDOMAIN/NODATA entries, TTL honored with a ceiling, SERVFAIL
+  and timeouts never cached. Sized for federation (hash map, bounded entries
+  with LRU eviction, not a 64-entry linear FIFO).
+- **Serve-stale (RFC 8767, v0.9.1, approved 2026-10-26).** An expired entry is
+  used only after a refresh attempt fails: timeout, SERVFAIL, REFUSED or any
+  RCODE other than NOERROR/NXDOMAIN (section 4). NOERROR and NXDOMAIN always
+  replace the entry. Failed refreshes are retried no more often than every
+  30 s (section 5 failure recheck timer); a refresh still in flight when the
+  per-query timeout passes returns the stale answer and keeps resolving.
+  Maximum stale age 1 day (section 5 suggests 1 to 3 days). 0-TTL records are
+  never cached, so never served stale (section 7). A CNAME at an owner
+  evicts other cached types for that owner (section 7). Under memory pressure
+  stale entries are evicted before fresh ones (section 6). Stale answers of
+  every type are served, TLSA and negative answers included: each was a real
+  answer when received, and the TLS check (DANE or PKIX) still authenticates
+  the peer, so a stale address that now points elsewhere fails closed.
+  Stale serves are counted and logged per name.
+- **Later (v0.10.x or v0.12.x).** Operator-configurable case-4 policy;
+  remembered-DANE domains (fail closed for domains seen with TLSA, configurable
+  for unknown ones).
+
 ---
 
 ## 5. Work plan
@@ -640,8 +688,8 @@ recorded.
 
 | ID | Task | Depends | Size |
 |----|------|---------|------|
-| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
-| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
+| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); ADR-13 retry with backoff on temporary failures instead of bouncing at once; non-fatal XEP-0220 dialback errors and the standard dialback errors feature (S34 part 1); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
+| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache sized for federation (ADR-13); per-target `tlsa_status` with lookup failure as a temporary target failure (ADR-13); s2s outbound and inbound moved off blocking `getaddrinfo` (IPv4 only today) and the blocking TLSA lookup onto it; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
 | X3 | Master: readiness pipes per child (T282), loop-driven shutdown with SIGKILL escalation on a one-shot timer, SIGHUP to all children, pid files on respawn and identity-checked orphan kill (T259, T336, T337), shared `bindTcp` honoring `bind_address` and IPv6 (V16) | F2 | M |
 | X4 | All daemons on `lib/conf` (ADR-9), master first | F5 | M |
 
@@ -1027,6 +1075,9 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | S30 | T-2CE71D47 | T413 |
 | S31 | T-A112F53F | T414 |
 | S32 | T-7531B1E1 | T415 |
+| S33 | T-578F76C8 (forge #22) | pending |
+| S34 | T-53D82879 (forge #23; part 1 with X1 T-8D056B55) | pending |
+| S35 | T-ABAFD7B2 (forge #25) | pending |
 | First-pass P1 batch (3.2) | T-96F6A8B5 | T211, T215, T250-T254, T256-T261, T263, T275, T277, T279 |
 | V1 .. V19 verify-then-fix | T-3FE08568 | T371 |
 | M1 .. M5 | T-2B49596E, T-E7096DCE, T-61BC40BB, T-4D163119, T-9213A076 | T372-T376 |
