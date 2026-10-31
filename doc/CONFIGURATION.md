@@ -118,11 +118,11 @@ ca_file = /usr/local/etc/xmppd/ca-bundle.pem
 All binaries accept `--config PATH` to specify the config file location.
 The master additionally accepts:
 
-- `--background` / `-b` — daemonize (fork + setsid)
-- `--help` / `-h` — usage
+- `--background` / `-b` - daemonize (fork + setsid)
+- `--help` / `-h` - usage
 
 `xmppctl` accepts:
-- `--db PATH` — database directory
-- `--auth-socket PATH` — auth daemon IPC socket (tries IPC first, falls back to direct DB)
-- `--password VALUE` — non-interactive password
-- `--password-file PATH` — read password from file
+- `--db PATH` - database directory
+- `--auth-socket PATH` - auth daemon IPC socket (tries IPC first, falls back to direct DB)
+- `--password VALUE` - non-interactive password
+- `--password-file PATH` - read password from file

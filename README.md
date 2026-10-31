@@ -7,18 +7,18 @@ A carrier-grade XMPP server written in Zig, inspired by Postfix's architecture.
 ## Overview
 
 xmppd is a modern XMPP server designed for carrier-grade deployments. It draws
-architectural inspiration from Postfix — separation of concerns, privilege
-separation, sensible defaults — while leveraging Zig's async I/O and compile-time
+architectural inspiration from Postfix - separation of concerns, privilege
+separation, sensible defaults - while leveraging Zig's async I/O and compile-time
 polymorphism for performance at scale.
 
 ### Key Features
 
-- **Hybrid process model** — master daemon supervises isolated components
-- **Async I/O** — kqueue/kevent event loop handles millions of concurrent connections
-- **DANE-first** — TLSA certificate validation as primary trust path for S2S federation
-- **Pluggable storage** — RocksDB (default), PostgreSQL, MariaDB, LDAP
-- **Pluggable auth** — internal, LDAP, OIDC, PAM
-- **Postfix admin UX** — one package, one config, one service
+- **Hybrid process model** - master daemon supervises isolated components
+- **Async I/O** - kqueue/kevent event loop handles millions of concurrent connections
+- **DANE-first** - TLSA certificate validation as primary trust path for S2S federation
+- **Pluggable storage** - RocksDB (default), PostgreSQL, MariaDB, LDAP
+- **Pluggable auth** - internal, LDAP, OIDC, PAM
+- **Postfix admin UX** - one package, one config, one service
 
 ### Target Platforms
 
@@ -31,6 +31,7 @@ polymorphism for performance at scale.
 |----------|-------------|---------|--------|
 | RFC 6120 | XMPP Core (STARTTLS, SASL, resource binding) | Full | E2E, Unit |
 | RFC 6121 | XMPP IM (roster, presence, messaging) | Partial¹ | Interop, E2E, Unit |
+| XEP-0004 | Data Forms | Full | E2E |
 | XEP-0012 | Last Activity | Full⁵ | E2E, Unit |
 | XEP-0030 | Service Discovery | Full | Interop |
 | XEP-0045 | Multi-User Chat | Partial² | Interop, E2E, Unit |
@@ -46,7 +47,8 @@ polymorphism for performance at scale.
 | XEP-0191 | Blocking Command | Full | E2E, Unit |
 | XEP-0198 | Stream Management | Full | Interop, E2E, Unit |
 | XEP-0199 | XMPP Ping | Full | Interop |
-| XEP-0220 | Server Dialback | Partial | E2E |
+| XEP-0203 | Delayed Delivery | Partial⁶ | E2E |
+| XEP-0220 | Server Dialback | Partial⁷ | E2E |
 | XEP-0280 | Message Carbons | Full | E2E, Unit |
 | XEP-0308 | Last Message Correction | Pass-through | E2E |
 | XEP-0313 | Message Archive Management | Full | E2E, Unit |
@@ -55,7 +57,7 @@ polymorphism for performance at scale.
 | XEP-0352 | Client State Indication | Full | E2E |
 | XEP-0359 | Unique and Stable Stanza IDs | Full | Unit |
 | XEP-0402 | PEP Native Bookmarks | Full | E2E |
-| XEP-0440 | SASL Channel-Binding Type Negotiation | Full | Unit |
+| XEP-0440 | SASL Channel-Binding Type Negotiation | Planned⁸ | - |
 
 **Interop** = automated [smack-sint-server-extensions](https://github.com/XMPP-Interop-Testing/smack-sint-server-extensions) v1.7.2 (495 tests available),
 **E2E** = verified with Gajim, Conversations, and/or Dino,
@@ -73,8 +75,9 @@ plus persistent rooms, owner configuration forms (XEP-0045 §10 via XEP-0004),
 password-protected rooms, outcast enforcement, and moderator voice grant/revoke.
 Missing: invitations (§7.8) and occupant voice requests (§7.13).
 
-³ PEP supports publish, subscribe, auto-subscribe, auto-create, persistent items, and
-avatar metadata notifications. Not a full XEP-0060 PubSub service.
+³ PEP supports publish, item retrieval, auto-create, persistent items, and metadata
+notifications to presence subscribers (auto-subscribe model: no explicit
+subscribe/unsubscribe elements are handled). Not a full XEP-0060 PubSub service.
 
 ⁴ SM supports enable, ack requests (`<r/>`), ack responses (`<a/>`), and full session
 resume: sessions detach on abnormal disconnect and resume on reconnect without
@@ -86,9 +89,21 @@ queries answer 0 while the account is online and seconds since its last session
 teardown while offline (durable record in the ops DB, consistent across
 workers), gated to presence-sharing contacts (roster from/both, else
 `forbidden`). Full-JID queries forward to the addressed resource per RFC 6121
-§8.5.3 — per XEP-0012 the client answers its own idle time; a server-side
+§8.5.3 - per XEP-0012 the client answers its own idle time; a server-side
 proxy answer would risk double results against XEP-aware clients. Shipped in
 v0.9.0 (T164).
+
+⁶ Delay stamps are written on MAM replay and MUC history. Missing: stamps on
+offline-delivered messages (the primary XEP-0160 + XEP-0203 offline case).
+
+⁷ Core dialback (db:result / db:verify in both directions) is complete and
+Prosody interop-tested, used where SASL EXTERNAL or DANE is unavailable.
+Missing: graceful dialback errors (XEP-0220 §2.5 type='error' handling).
+
+⁸ Channel binding is plumbed (gs2 flag, tls-server-end-point retrieval) but
+never negotiated: no `urn:xmpp:sasl-cb:0` feature is announced and no
+`SCRAM-SHA-256-PLUS` mechanism is offered. Tracked in issue
+[#24](https://pacyworld.dev/securemessage/xmppd/issues/24).
 
 ## Building
 
