@@ -133,6 +133,35 @@ fn isXmlChar(c: u21) bool {
         (c >= 0x10000 and c <= 0x10FFFF);
 }
 
+/// A '#...' body (the text between '&' and ';') parsed as a code
+/// point: decimal digits, or a lowercase 'x' followed by hex digits.
+/// Anything else, an empty body, or a value past U+10FFFF is not a
+/// reference. Only digits count, so the '+' sign and '_' separators
+/// that fmt.parseInt would accept are malformed here.
+fn parseCharref(name: []const u8) ?u21 {
+    var i: usize = 1;
+    var value: u21 = 0;
+    var digits: usize = 0;
+    if (i < name.len and name[i] == 'x') {
+        i += 1;
+        while (i < name.len and std.ascii.isHex(name[i])) : (i += 1) {
+            const c = std.ascii.toLower(name[i]);
+            const digit: u21 = if (std.ascii.isDigit(c)) c - '0' else c - 'a' + 10;
+            value = std.math.mul(u21, value, 16) catch return null;
+            value = std.math.add(u21, value, digit) catch return null;
+            digits += 1;
+        }
+    } else {
+        while (i < name.len and std.ascii.isDigit(name[i])) : (i += 1) {
+            value = std.math.mul(u21, value, 10) catch return null;
+            value = std.math.add(u21, value, name[i] - '0') catch return null;
+            digits += 1;
+        }
+    }
+    if (digits == 0 or i != name.len) return null;
+    return value;
+}
+
 /// Every &#...; reference in the raw span must name a legal XML Char
 /// and end in ';'. Checked on the raw bytes because the scanner's u8
 /// decode cannot express references above U+00FF; those still error
@@ -141,27 +170,12 @@ fn spanCheckCharrefs(bytes: []const u8) Error!void {
     var i: usize = 0;
     while (i + 2 < bytes.len) : (i += 1) {
         if (bytes[i] != '&' or bytes[i + 1] != '#') continue;
-        var j = i + 2;
-        var value: u21 = 0;
-        var digits: usize = 0;
-        if (j < bytes.len and bytes[j] == 'x') {
-            j += 1;
-            while (j < bytes.len and std.ascii.isHex(bytes[j])) : (j += 1) {
-                const c = std.ascii.toLower(bytes[j]);
-                const digit: u21 = if (std.ascii.isDigit(c)) c - '0' else c - 'a' + 10;
-                value = std.math.mul(u21, value, 16) catch return error.NotWellFormed;
-                value = std.math.add(u21, value, digit) catch return error.NotWellFormed;
-                digits += 1;
-            }
-        } else {
-            while (j < bytes.len and std.ascii.isDigit(bytes[j])) : (j += 1) {
-                value = std.math.mul(u21, value, 10) catch return error.NotWellFormed;
-                value = std.math.add(u21, value, bytes[j] - '0') catch return error.NotWellFormed;
-                digits += 1;
-            }
-        }
-        if (digits == 0 or j >= bytes.len or bytes[j] != ';') return error.NotWellFormed;
+        const semi = std.mem.indexOfScalarPos(u8, bytes, i + 2, ';') orelse
+            return error.NotWellFormed;
+        const value = parseCharref(bytes[i + 1 .. semi]) orelse
+            return error.NotWellFormed;
         if (!isXmlChar(value)) return error.NotWellFormed;
+        i = semi;
     }
 }
 
@@ -323,20 +337,21 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
         i.* += len - 1;
         return cp;
     }
-    const semi = std.mem.indexOfScalarPos(u8, bytes, i.*, ';') orelse return null;
-    const name = bytes[i.*..semi];
-    i.* = semi + 1;
+    // The ';' search stays inside the range: a terminator past the
+    // end belongs to another value, and a missing one or a malformed
+    // reference is malformed input, not end of range.
+    const semi = std.mem.indexOfScalar(u8, bytes[i.*..r.end], ';') orelse
+        return error.NotWellFormed;
+    const name = bytes[i.* .. i.* + semi];
+    i.* += semi + 1;
     if (std.mem.eql(u8, name, "amp")) return '&';
     if (std.mem.eql(u8, name, "lt")) return '<';
     if (std.mem.eql(u8, name, "gt")) return '>';
     if (std.mem.eql(u8, name, "apos")) return '\'';
     if (std.mem.eql(u8, name, "quot")) return '"';
-    if (name.len > 1 and name[0] == '#') {
-        if (name[1] == 'x')
-            return std.fmt.parseInt(u21, name[2..], 16) catch return null;
-        return std.fmt.parseInt(u21, name[1..], 10) catch return null;
-    }
-    return null;
+    if (name.len > 1 and name[0] == '#')
+        return parseCharref(name) orelse return error.NotWellFormed;
+    return error.NotWellFormed;
 }
 
 /// Two raw ranges are equal once decoded when they yield the same
@@ -1681,6 +1696,36 @@ test "literal whitespace normalizes in the expanded-name compare (R6-3)" {
     for (distinct) |probe| {
         _ = try ValidatedSpan.fromReader(testing.allocator, probe);
     }
+}
+
+test "the decoded compare rejects malformed references (R6-6)" {
+    // fromReader cannot reach these: the raw charref scan and the
+    // scanner reject bad references first. The pins call the compare
+    // directly: an invalid reference is an error, never end of
+    // range, so 'u&zz;A' and 'u&yy;B' must not compare equal.
+    const eql = struct {
+        fn f(a_lit: []const u8, b_lit: []const u8) Error!bool {
+            var buf: [128]u8 = undefined;
+            @memcpy(buf[0..a_lit.len], a_lit);
+            @memcpy(buf[a_lit.len .. a_lit.len + b_lit.len], b_lit);
+            const bytes = buf[0 .. a_lit.len + b_lit.len];
+            return spanDecodedEql(bytes, .{ .start = 0, .end = a_lit.len }, .{
+                .start = a_lit.len,
+                .end = bytes.len,
+            });
+        }
+    }.f;
+    try testing.expectError(error.NotWellFormed, eql("u&zz;A", "u&yy;B"));
+    try testing.expectError(error.NotWellFormed, eql("u&;A", "u&;B"));
+    // The ';' search is bounded by the range: 'u&zz' has no
+    // terminator even though b's ';' sits just past the range end.
+    try testing.expectError(error.NotWellFormed, eql("u&zz", "u;yy"));
+    // '+' and '_' are not digits: fmt.parseInt would take both.
+    try testing.expectError(error.NotWellFormed, eql("u&#+65;", "u&#65;"));
+    try testing.expectError(error.NotWellFormed, eql("u&#6_5;", "u&#65;"));
+    // Legal references still compare by code point.
+    try testing.expectEqual(@as(bool, true), try eql("u&#65;", "u&#x41;"));
+    try testing.expectEqual(@as(bool, false), try eql("u&#65;", "u&#66;"));
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
