@@ -292,14 +292,25 @@ fn spanResolveRange(bytes: []const u8, prefix: []const u8, decls: []const SpanDe
 }
 
 /// The next character in a raw attribute value, resolving one entity
-/// or character reference at '&' to its codepoint. The scanner already
-/// accepted every reference in the value, so a null result only means
-/// the range is exhausted.
-fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) ?u21 {
+/// or character reference at '&' to its codepoint; literal bytes are
+/// decoded as UTF-8 so both sides of a compare yield code points.
+/// The scanner already accepted every reference in the value, so a
+/// null result only means the range is exhausted.
+fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
     if (i.* >= r.end) return null;
     const c = bytes[i.*];
     i.* += 1;
-    if (c != '&') return c;
+    if (c != '&') {
+        if (c < 0x80) return c;
+        // validateChars already proved the slice well-formed UTF-8, so
+        // a decode failure here means the range split a sequence.
+        const len = std.unicode.utf8ByteSequenceLength(c) catch return error.InvalidUtf8;
+        if (i.* - 1 + len > r.end) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(bytes[i.* - 1 .. i.* - 1 + len]) catch
+            return error.InvalidUtf8;
+        i.* += len - 1;
+        return cp;
+    }
     const semi = std.mem.indexOfScalarPos(u8, bytes, i.*, ';') orelse return null;
     const name = bytes[i.*..semi];
     i.* = semi + 1;
@@ -317,13 +328,13 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) ?u21 {
 }
 
 /// Two raw ranges are equal once decoded when they yield the same
-/// character sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
-fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) bool {
+/// code point sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
+fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) Error!bool {
     var ai = a.start;
     var bi = b.start;
     while (true) {
-        const ac = spanNextDecoded(bytes, a, &ai);
-        const bc = spanNextDecoded(bytes, b, &bi);
+        const ac = try spanNextDecoded(bytes, a, &ai);
+        const bc = try spanNextDecoded(bytes, b, &bi);
         if (ac == null or bc == null) return ac == null and bc == null;
         if (ac.? != bc.?) return false;
     }
@@ -376,7 +387,7 @@ fn spanCheckPrefixes(
                 std.mem.eql(u8, b_prefix, "xml")) continue;
             if (!std.mem.eql(u8, spanSlice(bytes, aq.local), spanSlice(bytes, bq.local))) continue;
             const b_uri = spanResolveRange(bytes, b_prefix, decls) orelse continue;
-            if (spanDecodedEql(bytes, a_uri, b_uri)) return error.NotWellFormed;
+            if (try spanDecodedEql(bytes, a_uri, b_uri)) return error.NotWellFormed;
         }
     }
 }
@@ -1607,6 +1618,28 @@ test "a hex character reference needs a lowercase x (R6-4)" {
     }
     _ = try ValidatedSpan.fromReader(testing.allocator, "<a>&#x75;</a>");
     _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&#x75;'/>");
+}
+
+test "expanded-name URIs decode literal UTF-8 to code points (R6-1)" {
+    // A literal multi-byte character must yield its code point, not
+    // its lead byte: U+00E9 equals '&#233;' and U+20AC equals
+    // '&#x20AC;', so these expanded names collide.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:\xc3\xa9' xmlns:q='urn:&#233;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:\xe2\x82\xac' xmlns:q='urn:&#x20AC;' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // '&#195;&#169;' decodes to U+00C3 U+00A9: the UTF-8 bytes of
+    // U+00E9 as two separate code points, a different URI.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:\xc3\xa9' xmlns:q='urn:&#195;&#169;' p:x='1' q:x='2'/>",
+    );
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
