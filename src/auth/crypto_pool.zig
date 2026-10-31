@@ -213,6 +213,12 @@ fn completionCount(pool: *CryptoPool) usize {
     return pool.completions.items.len;
 }
 
+fn reservedCount(pool: *CryptoPool) usize {
+    pool.completion_mutex.lock();
+    defer pool.completion_mutex.unlock();
+    return pool.reserved_completions;
+}
+
 /// Keep the password out of a literal first argument; the D7 source ratchet
 /// cannot distinguish this pool's put from a backend put at the call site.
 fn putTestJob(pool: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
@@ -355,4 +361,54 @@ test "CryptoPool: queue is bounded" {
         accepted += 1;
     }
     try std.testing.expectEqual(MAX_JOBS, accepted);
+}
+
+test "CryptoPool: a full queue releases the failed reservation" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    // No start(): nothing drains, so the cap is hit deterministically.
+    defer {
+        for (pool.jobs.items) |j| std.heap.c_allocator.free(j.password);
+        pool.jobs.deinit(std.testing.allocator);
+        pool.completions.deinit(std.testing.allocator);
+    }
+
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 4096);
+    for (0..MAX_JOBS) |_| {
+        _ = try putTestJob(&pool, "x", @splat(2), 4096, creds.stored_key);
+    }
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), reservedCount(&pool));
+
+    // The rejected put reserved a slot before the queue check and must
+    // release it, or every full-queue rejection leaks one reservation.
+    err: {
+        _ = putTestJob(&pool, "x", @splat(2), 4096, creds.stored_key) catch |e| switch (e) {
+            error.QueueFull => break :err,
+            else => return e,
+        };
+        return error.ExpectedQueueFull;
+    }
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), reservedCount(&pool));
+}
+
+test "CryptoPool: finished jobs release their reservation" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(4);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("burst", @splat(3), 4096);
+    const n: usize = 8;
+    for (0..n) |_| {
+        _ = try putTestJob(&pool, "burst", @splat(3), 4096, creds.stored_key);
+    }
+
+    // Every accepted job publishes exactly one completion and releases its
+    // reservation; the counter must be back to zero once the burst drains.
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (completionCount(&pool) < n and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    for (0..n) |_| {
+        _ = pool.popCompletion() orelse return error.NoCompletion;
+    }
+    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
