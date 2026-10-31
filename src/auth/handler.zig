@@ -2617,6 +2617,84 @@ test "AuthHandler: an alias failure charges the typed name" {
     try std.testing.expectEqualStrings("account-disabled", handler.policy.check("a.smith", "") orelse return error.ExpectedDenial);
 }
 
+test "AuthHandler: an alias failure does not charge the locked identity" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(416, "10.0.0.9", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // The locked identity is left alone: once the permanent lock is lifted,
+    // no limiter failure may remain on it, or a failure arrived through the
+    // alias and re-armed the identity's lock.
+    try locks.unlock(allocator, "alice");
+    try std.testing.expect(handler.policy.check("alice", "") == null);
+}
+
+test "AuthHandler: an alias failure charges the IP once" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(417, "10.0.0.7", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // One alias failure charged the IP exactly once: with an IP lockout
+    // threshold of two, a second charge would have locked the egress.
+    try std.testing.expect(handler.policy.check("", "10.0.0.7") == null);
+}
+
 test "AuthHandler: a failed crypto-pool completion leaves no pending entry" {
     const allocator = std.testing.allocator;
 
