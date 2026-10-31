@@ -144,7 +144,7 @@ fn spanCheckCharrefs(bytes: []const u8) Error!void {
         var j = i + 2;
         var value: u21 = 0;
         var digits: usize = 0;
-        if (j < bytes.len and (bytes[j] == 'x' or bytes[j] == 'X')) {
+        if (j < bytes.len and bytes[j] == 'x') {
             j += 1;
             while (j < bytes.len and std.ascii.isHex(bytes[j])) : (j += 1) {
                 const c = std.ascii.toLower(bytes[j]);
@@ -309,7 +309,7 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) ?u21 {
     if (std.mem.eql(u8, name, "apos")) return '\'';
     if (std.mem.eql(u8, name, "quot")) return '"';
     if (name.len > 1 and name[0] == '#') {
-        if (name[1] == 'x' or name[1] == 'X')
+        if (name[1] == 'x')
             return std.fmt.parseInt(u21, name[2..], 16) catch return null;
         return std.fmt.parseInt(u21, name[1..], 10) catch return null;
     }
@@ -1590,6 +1590,23 @@ test "expanded-name duplicates compare decoded URIs (R5-1)" {
     }
     // Distinct decoded URIs still pass.
     _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>");
+}
+
+test "a hex character reference needs a lowercase x (R6-4)" {
+    // The CharRef production is '&#x', never '&#X'.
+    const bad = [_][]const u8{
+        "<a>&#X75;</a>",
+        "<a x='&#X75;'/>",
+        "<a xmlns:p='urn:u&#X75;' xmlns:q='urn:u&#117;' p:x='1' q:x='2'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a>&#x75;</a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&#x75;'/>");
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
