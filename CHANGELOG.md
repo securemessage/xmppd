@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.9.0 — 2026-10-04
+## v0.9.0 - 2026-10-04
 
 ### Features
 
@@ -9,11 +9,11 @@
   to Partial for this). Server-directed queries now answer real domain
   uptime; other-account queries are server-answered with 0 while online
   and seconds-since-last-teardown while offline (durable record in the
-  ops DB written when an account's final resource unbinds — consistent
+  ops DB written when an account's final resource unbinds - consistent
   across workers with no new actor traffic). Disclosure follows presence
   visibility (target's roster entry for the requester must be from/both,
   else forbidden; nonexistent accounts are indistinguishable). Full-JID
-  queries forward to the addressed resource per RFC 6121 §8.5.3 — the
+  queries forward to the addressed resource per RFC 6121 §8.5.3 - the
   resource's client answers its own idle time (XEP-0012 §2.1), so no
   server-side idle clock is kept (9d6daff).
 - T177 MUC occupant migration: cross-worker XEP-0198 resume now works for
@@ -22,7 +22,7 @@
   list; after the resuming worker re-binds (generation known), it replays
   one `room_occupant_move` actor message per room's owning worker, which
   updates the canonical occupant record's (worker, session, generation)
-  triple in place and syncs shadow copies — a move, not a join/part: no
+  triple in place and syncs shadow copies - a move, not a join/part: no
   presence fan-out, no new-member handling. Ghost-leak safety: if the
   resumed connection dies before the moves apply, the session_close
   broadcast still removes the occupant by full JID everywhere. Occupancy
@@ -36,7 +36,7 @@
   remote worker's MPSC queue gets ONE pipe wake per chunk instead of one
   per target session; presence probes use the same batching (52d6896).
 - T110 client-side backpressure: when a connection's write buffer crosses
-  75%, its EVFILT_READ is disabled — the server stops consuming stanzas it
+  75%, its EVFILT_READ is disabled - the server stops consuming stanzas it
   cannot forward and TCP flow control pushes back on the sender; reading
   resumes at 50% (8e6fb7c).
 - T121 auth crypto pool: PLAIN credential derivation (PBKDF2) runs on a
@@ -56,9 +56,9 @@
   (307a717).
 - T198: per-account resource cap raised from hardcoded 16 to
   `[core] max_resources_per_account` (default 256) backed by a heap-grown
-  entry list — multi-resource accounts (agent/bot deployments) no longer
+  entry list - multi-resource accounts (agent/bot deployments) no longer
   hit the wall (a3babac).
-- lib/xmppc client library: reusable client core in `lib/xmppc` — one
+- lib/xmppc client library: reusable client core in `lib/xmppc` - one
   kqueue engine driving N sessions (generational slot handles, threaded or
   inline loop, thread-safe `startSession`/`postStanza`/`stopSession`),
   async DNS resolution with SRV chain, DANE-first TLS with PKIX fallback,
@@ -96,27 +96,27 @@
   and remote answers are identical (e2e-muc-mam-routing 82/82 at
   workers=4, wired into the CI multiworker lane) (c1f53e9).
 - T198: a bind whose session-map registration failed (e.g. over the
-  resource cap) previously sent the success IQ first and only logged —
+  resource cap) previously sent the success IQ first and only logged -
   the client believed itself bound while inbound stanzas were silently
   unroutable. Registration now precedes the result; over-cap binds get a
   stanza error (resource-constraint) and may retry with another resource
   (a3babac). Also rolled back partial full_map/bare_map registration on
   mid-bind failures (latent inconsistency).
 - T152/T154: evicted sessions got their <conflict/> stream error queued
-  but never flushed before the teardown closed the fd — the client closed
+  but never flushed before the teardown closed the fd - the client closed
   with no explanation. Now flushed synchronously before teardown
   (307a717).
 - SM resume restored the session resource from the transient bind
-  accumulator, which is zeroed after a successful bind — resumed sessions
+  accumulator, which is zeroed after a successful bind - resumed sessions
   ended up with an EMPTY resource (`user@host/`). The resource now comes
-  from the detached session's bound JID — MUC fan-in and fan-out stay
+  from the detached session's bound JID - MUC fan-in and fan-out stay
   correct after resume (T177 work, 02893d9).
 - Auth rate limiting vs SCRAM concurrency under load: the slot table's
   home-slot probing now scales to 8192 entries with lazy stale reclaim
   (54c5ccb/a293b02), a connection that dies mid-exchange is dropped
   daemon-side via the auth_abort IPC message (3104120), and both growable
   IPC backlogs no longer lie not-authorized under SASL bursts
-  (05a455c/6cf6b6c — overflow answers temporary-auth-failure).
+  (05a455c/6cf6b6c - overflow answers temporary-auth-failure).
 - Core loop churn (w4/N=5000 class): closers purge their staged kqueue
   entries instead of staging EV_DELETEs of soon-closed fds (same-iteration
   fd reuse would disarm a fresh connection) and kevent per-entry batch
@@ -125,7 +125,7 @@
   busy workers for minutes); kevent batch hardening + real listen backlog
   (18e24ce).
 - Auth-IPC resilience: a dead xmppd-auth no longer leaves workers
-  unable to authenticate until restart — each worker fails in-flight SASL
+  unable to authenticate until restart - each worker fails in-flight SASL
   with retryable temporary-auth-failure and re-links on a 1 s reconnect
   timer (228827d).
 - xmppc client library fixes: PBKDF2 salt truncation past 252 bytes
@@ -156,7 +156,7 @@
   (low-level modular stress loss), T246 (XEP-0410 self-ping), T247
   (PEP disco identity), T248 (pre-bind policy vs Smack modular).
 
-## v0.8.11 — 2026-09-30
+## v0.8.11 - 2026-09-30
 
 Hardening release. **Operationally significant:** the authentication
 rate limiter was silently inert in all previous releases and now actually
@@ -195,7 +195,7 @@ live 25-attempt single-IP auth hammer: unlimited when disabled, exactly
 5× `not-authorized` then `policy-violation` with defaults; seven e2e
 suites at workers=1, cross-worker subset at workers=4.
 
-## v0.8.10 — 2026-08-31
+## v0.8.10 - 2026-08-31
 
 Bugfix release: cross-worker delivery, a v0.8.9 regression, and four
 stanza error-handling correctness fixes found by the first full-spec
@@ -204,7 +204,7 @@ SINT runs (T175 follow-ups).
 ### Fixes
 
 - T173 (High): MUC admin IQ results (kick/ban/voice) were dropped when
-  the room shard lived on a different worker than the requester — the
+  the room shard lived on a different worker than the requester - the
   cross-worker reply carried a hardcoded generation 0 and the ABA-guarded
   drain discarded it. The admin actor message now carries the requester's
   generation (bf77eae)
@@ -221,15 +221,15 @@ SINT runs (T175 follow-ups).
   detached sessions are destroyed, so a later `<resume/>` fails
   `item-not-found` and the client resyncs via MAM (cc70366). The server
   also now sends `<r/>` ack requests once the queue crosses half capacity
-  (4c54410) — XEP-0198 only obliges clients to ack on request, so without
+  (4c54410) - XEP-0198 only obliges clients to ack on request, so without
   this the overflow policy would kill compliant clients that never ack
   unsolicited (SINT-proven with Smack: busy SM sessions died after ~256
   unacked stanzas in ~20s of presence flood)
-- T180: XEP-0054 §3.3 (v1.3.0) — vCard GET for another user now returns
+- T180: XEP-0054 §3.3 (v1.3.0) - vCard GET for another user now returns
   `service-unavailable` for both no-vCard and no-such-user
   (anti-harvesting; the two cases must be indistinguishable). The
   own-vCard path keeps its empty-vCard/Gravatar behavior (cc70366)
-- T181: RFC 6121 §8.5.2.2.1 — groupchat to a bare JID with no available
+- T181: RFC 6121 §8.5.2.2.1 - groupchat to a bare JID with no available
   resources bounces `service-unavailable` instead of being stored
   offline; type='error' stanzas are silently dropped instead of stored
   (cc70366)
@@ -245,7 +245,7 @@ SINT runs (T175 follow-ups).
 - New multi-worker e2e lane (`.forgejo/workflows/multiworker.yml`,
   `test/integration/run-multiworker.sh`): spins a workers=4 throwaway
   instance so the cross-worker surface (room sharding, actor messages,
-  MPSC delivery with generation validation) is exercised — at workers=1
+  MPSC delivery with generation validation) is exercised - at workers=1
   every route is local, which is how T173 shipped
 
 Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps;
@@ -253,24 +253,24 @@ e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins
 12/12; e2e-mam 7/7; e2e-subscription 29/29; e2e-register-invite 6/6;
 multi-worker lane (workers=4) green; SINT XEP-0198 10/10.
 
-## v0.8.9 — 2026-08-30
+## v0.8.9 - 2026-08-30
 
 Bugfix/doc-consistency release (T163–T170 audit batch + T160/T161/T151).
 
 ### Fixes
 
 - T163 (High): XEP-0115 caps `ver` omitted `jabber:iq:register` which
-  disco#info advertised — the hash could never verify (clients doing §5
+  disco#info advertised - the hash could never verify (clients doing §5
   verification discarded the caps). disco#info now iterates
   `caps.SERVER_FEATURES` via `caps.writeDiscoFeatures`, one list by
   construction
-- T165: invite-gated IBR (XEP-0077, the secure default) could never succeed —
+- T165: invite-gated IBR (XEP-0077, the secure default) could never succeed -
   the invite code in the `jabber:x:data` form was never parsed. The
   invite/token field is now passed through to the auth daemon, and the
   registration form advertises an optional `invite` field
 - T166: directed presence to remote domains was silently dropped; it now
   routes through the S2S outbound path like subscription/broadcast presence
-- T167: listener bind address parsing — any IPv4 dotted-quad and IPv6 literals
+- T167: listener bind address parsing - any IPv4 dotted-quad and IPv6 literals
   now work (was: only `0.0.0.0`/`127.0.0.1`); accept() no longer truncates
   IPv6 peers
 - T168: XEP-0092 Software Version reported a hardcoded `0.1.0`; single
@@ -281,15 +281,15 @@ Bugfix/doc-consistency release (T163–T170 audit batch + T160/T161/T151).
   still limited to the first 16 client slots (workers 17+ never received
   federated stanzas)
 - T160: TLS ClientHello on the STARTTLS port now logs "TLS handshake on the
-  STARTTLS port — client is configured for direct TLS" and closes, instead of
+  STARTTLS port - client is configured for direct TLS" and closes, instead of
   a misleading `error.InvalidEntityReference` XML parse failure
 
 ### Docs / CI
 
 - T170: CI feature-matrix consistency check (`.forgejo/workflows/consistency.yml`,
-  `test/consistency/`, base-system sh+awk on the FreeBSD runner) — guards
+  `test/consistency/`, base-system sh+awk on the FreeBSD runner) - guards
   caps/disco#info/README drift; adapted to the single-source disco features
-- T169/T164: README XEP matrix corrections — RFC 6121 footnote 1 stale clauses
+- T169/T164: README XEP matrix corrections - RFC 6121 footnote 1 stale clauses
   removed (roster push and roster set validation are implemented; remaining
   gap is roster versioning §2.6), XEP-0012 downgraded to Partial (online-self
   stub; full implementation deferred to v0.9.0)
@@ -301,7 +301,7 @@ Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` all steps;
 e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins 12/12;
 e2e-mam 7/7; e2e-subscription 29/29; e2e-register-invite 6/6.
 
-## v0.8.8 — 2026-08-30
+## v0.8.8 - 2026-08-30
 
 Bugfix/hardening release on top of v0.8.7 (8 commits). Tagged from `95e9c5c`;
 deployed to the freebsd-dev1 test jail (10.10.219.38).
@@ -313,7 +313,7 @@ deployed to the freebsd-dev1 test jail (10.10.219.38).
   disco#info (when registration enabled)
 - T156: `MAX_IPC_CLIENTS` 16 → 80; reject pre-auth SM enable with `<failed/>`
 - T155: `Connection.close()` resets `fd` to −1 and `queueSend()` rejects closed
-  connections with `error.ConnectionClosed` — turns the stale-fd hazard class
+  connections with `error.ConnectionClosed` - turns the stale-fd hazard class
   from silent kqueue corruption into a loud, harmless error
 - T153 follow-up: single session-delivery primitive
   (`fanout.deliverToSession()` / `deliverPrebuiltToSession()`) across 21 call
@@ -328,38 +328,38 @@ deployed to the freebsd-dev1 test jail (10.10.219.38).
 
 - Integration suites ported to slixmpp 1.17; parameterised via `XMPP_*` env
   vars (default: local throwaway instance, no longer the shared test jail)
-- New `doc/TESTING.md` — throwaway-instance e2e procedure
+- New `doc/TESTING.md` - throwaway-instance e2e procedure
 - README/ROADMAP corrections; ROADMAP gained a forward-looking "Next Up"
 
 Verified on freebsd-dev1 (Zig 0.15.2): `zig build test` 105/105 steps;
 e2e-sm-resume 29/29; e2e-chat all pass; muc-test 12/12; e2e-quick-wins 12/12;
 e2e-mam 7/7; e2e-subscription 29/29.
 
-## v0.8.7 — 2026-07-01
+## v0.8.7 - 2026-07-01
 
-- T152: stale-bind eviction — reconnecting with the same resource before the
+- T152: stale-bind eviction - reconnecting with the same resource before the
   old session was cleaned up got `AlreadyBound` and was left unregistered in
   SessionMap; fixed with RFC 6120 §7.7.3-style eviction (`<conflict/>` + retry)
-- T153: detached-session delivery corruption — stanzas routed to a detached
+- T153: detached-session delivery corruption - stanzas routed to a detached
   (SM resume pending) session were written to its dead connection; guarded at
   the router and MPSC unicast delivery sites
 - New `e2e-sm-resume.py` regression suite (29 assertions)
 
-## v0.8.6 — 2026-07-01
+## v0.8.6 - 2026-07-01
 
 - SM resume silently dropped at features_bind: the pre-bind IQ catch-all in
   `handleElementStart` consumed `<resume/>`; clients timed out waiting for a
   reply
 - Stream ID reuse fix (RFC 6120)
 
-## v0.8.5 — 2026-06-19
+## v0.8.5 - 2026-06-19
 
 - XEP-0115 Entity Capabilities: server caps hash (SHA-1 over disco features),
   pre-built `<c>` element for presence injection, node-based disco#info
   response for caps verification (§5.3), disco query mechanism
 - OIDC profile photo import
 
-## v0.6.0 — 2026-06-14
+## v0.6.0 - 2026-06-14
 
 RFC 6121 interop compliance and XEP-0198 session resumption.
 
@@ -396,7 +396,7 @@ RFC 6121 interop compliance and XEP-0198 session resumption.
 | Unit tests | 744 (was 738) |
 | SINT interop | 360/367 RFC 6121 |
 
-## v0.5.0 — 2026-06-11
+## v0.5.0 - 2026-06-11
 
 Functional XMPP server with real client interop. Multi-process architecture,
 thread-per-core scaling, and zero external runtime dependencies beyond OpenSSL
@@ -432,10 +432,10 @@ contact notifications, HTTP File Upload, documentation.
 ### Storage
 
 - Comptime generic `StorageBackend` trait with `assertBackend()`
-- **LMDB** backend — operational data (users, roster, vcard, rooms, offline)
-- **RocksDB** backend — message archive (MAM)
-- **SQLite** backend — lightweight alternative
-- **Memory** backend — test double
+- **LMDB** backend - operational data (users, roster, vcard, rooms, offline)
+- **RocksDB** backend - message archive (MAM)
+- **SQLite** backend - lightweight alternative
+- **Memory** backend - test double
 - Build flag `-Dop-storage=lmdb|rocksdb|sqlite`
 - Auto-resize on LMDB MDB_MAP_FULL (3 retries, double map size)
 
@@ -528,11 +528,11 @@ contact notifications, HTTP File Upload, documentation.
 ### Client Compatibility
 
 Tested and verified with:
-- **slixmpp** — 23/23 automated tests
-- **Profanity** — 14/14 tests (FreeBSD terminal client)
-- **Gajim** — full session (Windows/Linux desktop)
-- **Dino** — full session (FreeBSD/Linux desktop)
-- **Conversations** — SCRAM-SHA-256, multi-resource, MUC (Android)
+- **slixmpp** - 23/23 automated tests
+- **Profanity** - 14/14 tests (FreeBSD terminal client)
+- **Gajim** - full session (Windows/Linux desktop)
+- **Dino** - full session (FreeBSD/Linux desktop)
+- **Conversations** - SCRAM-SHA-256, multi-resource, MUC (Android)
 
 ### Metrics
 

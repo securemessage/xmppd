@@ -1,7 +1,7 @@
 # xmppd Roadmap
 
 This document tracks the development roadmap for xmppd. Each phase builds on
-the previous one. Phases are not versioned — they represent implementation
+the previous one. Phases are not versioned - they represent implementation
 milestones, not releases.
 
 Last updated: 2026-08-30
@@ -19,7 +19,7 @@ Last updated: 2026-08-30
 | 7. Messaging + IM | ✅ Complete | Routing, presence, roster, offline, MAM (XEP-0313) |
 | 8. S2S Hardening | ✅ Complete | DANE-EE, SASL EXTERNAL, dialback, Prosody interop |
 | 9. Auth Hardening | ✅ Complete | Rate limiting, lockout, registration, passwd, delete, channel binding |
-| 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) — rooms, join/part, groupchat, kick |
+| 10. MUC | ✅ Complete | Multi-User Chat (XEP-0045) - rooms, join/part, groupchat, kick |
 | 11. External Auth | ✅ Complete (OIDC) | OAUTHBEARER + PLAIN-to-IdP, EdDSA + RS256, introspection |
 | 12. Polish & Deploy | ✅ Complete (MVP) | Fan-out, config, privsep, port, V1 pre-reqs. Tagged v0.1.0 |
 | 13. Session Robustness Hardening | ✅ Complete | SM resume dispatch bug, stream ID reuse, stale-bind eviction, detached-session delivery. Tagged v0.8.6 |
@@ -42,18 +42,18 @@ tracks the release-level shape.
 
 ### Immediate
 
-- [x] Tag **v0.8.11** — SHIPPED 2026-09-30: hardening patch: auth rate limiting
+- [x] Tag **v0.8.11** - SHIPPED 2026-09-30: hardening patch: auth rate limiting
       was silently inert in every prior release (empty-username checks +
       8-slot ring < 20-attempt default). Fixed and verified with a live
       single-IP hammer; SASL failure reasons (policy-violation/
       account-disabled) now reach the wire. New `[auth] rate_limit = false`
       switch for benchmark rigs.
 - [x] Verify the T155 fix (`zig build test`) on the FreeBSD host, then tag **v0.8.8**
-      — verified and tagged 2026-08-30 (see Phase 13 Deferred Follow-ups for the
+      (verified and tagged 2026-08-30; see Phase 13 Deferred Follow-ups for the
       full test matrix), deployed to the test jail the same day
-- [x] T153 follow-up — detached-session guards in MUC/presence/IQ fan-out
+- [x] T153 follow-up - detached-session guards in MUC/presence/IQ fan-out
       (shipped in v0.8.8; see Phase 13 Deferred Follow-ups)
-- [x] Integration-harness rot — the six slixmpp suites had rotted against
+- [x] Integration-harness rot - the six slixmpp suites had rotted against
       slixmpp 1.17 and could not run at all. Ported on branch
       `fix/integration-suite-slixmpp-1.17`: `connect()` takes `(host, port)`
       rather than a tuple (a tuple silently falls back to DNS and hits
@@ -64,7 +64,7 @@ tracks the release-level shape.
       a plaintext path that modern slixmpp cannot open. All six are
       parameterised via `XMPP_HOST`/`XMPP_PORT`/`XMPP_DOMAIN` and no longer
       default at the shared test jail.
-- [x] SINT full XEP-0198 run — **DONE 2026-08-31: 10/10 pass** against a
+- [x] SINT full XEP-0198 run - **DONE 2026-08-31: 10/10 pass** against a
       throwaway instance (domain xmppd.test via the existing SRV override,
       workers=1, IBR with `[auth] registration=true require_invite=false`).
       Invocation: `java -Dsinttest.service=xmppd.test -Dsinttest.dnsResolver=javax
@@ -76,106 +76,106 @@ tracks the release-level shape.
       `required`. The run also caught the T179 regression (v0.8.9's malformed
       registration form broke SINT's IBR account provisioning).
 
-### v0.8.10 — Bugfix (cross-worker + regression) — SHIPPED 2026-08-31
+### v0.8.10 - Bugfix (cross-worker + regression) - SHIPPED 2026-08-31
 
-- [x] **T173** — MUC admin IQ result dropped cross-worker (generation carried
-      in actor replies) — merged 2026-08-31 (bf77eae)
-- [x] **T176** — cross-worker subscription-cache invalidation — merged
+- [x] **T173** - MUC admin IQ result dropped cross-worker (generation carried
+      in actor replies) - merged 2026-08-31 (bf77eae)
+- [x] **T176** - cross-worker subscription-cache invalidation - merged
       2026-08-31 (c6fc287); found by the new multi-worker lane
 - [x] Multi-worker e2e lane in CI (`.forgejo/workflows/multiworker.yml`,
       `test/integration/run-multiworker.sh`, `--run-dir` flag, build.zig
-      same-backend module sharing) — merged 2026-08-31
-- [x] **T179** — v0.8.9 regression: malformed registration form XML (stray
-      `</field>`) breaks strict parsers (Smack proven) — merged 2026-08-31
+      same-backend module sharing) - merged 2026-08-31
+- [x] **T179** - v0.8.9 regression: malformed registration form XML (stray
+      `</field>`) breaks strict parsers (Smack proven) - merged 2026-08-31
       (7bc5980), verified incl. SINT 10/10
-- [x] **T178** — XEP-0198 unacked-queue overflow: fail the session instead of
+- [x] **T178** - XEP-0198 unacked-queue overflow: fail the session instead of
       silently discarding stanzas (live: resource-constraint stream error;
       detached: destroyed so resume fails item-not-found), plus `<r/>` ack
       requests at half capacity so ack-on-request clients are never killed
-      (SINT-proven necessity) — merged 2026-08-31 (cc70366, 4c54410)
-- [x] **T180** — XEP-0054 §3.3: another user's missing vCard returns
+      (SINT-proven necessity) - merged 2026-08-31 (cc70366, 4c54410)
+- [x] **T180** - XEP-0054 §3.3: another user's missing vCard returns
       `service-unavailable` for both no-vCard and no-such-user (spec v1.3.0
-      anti-harvesting) — merged 2026-08-31 (cc70366)
-- [x] **T181** — RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
+      anti-harvesting) - merged 2026-08-31 (cc70366)
+- [x] **T181** - RFC 6121 §8.5.2.2.1: groupchat to bare JID with no available
       resources bounces `service-unavailable`; type='error' silently dropped;
-      neither stored offline — merged 2026-08-31 (cc70366)
-- [x] **T182** — pre-auth/pre-bind stanzas: third-party message/IQ close the
+      neither stored offline - merged 2026-08-31 (cc70366)
+- [x] **T182** - pre-auth/pre-bind stanzas: third-party message/IQ close the
       stream with `not-authorized` (RFC 6120 §7.1 MUST; supersedes the
       task's stanza-error sketch after SINT verification);
       server/account-addressed IQs get a stanza error and the connection
-      stays open; presence pre-bind stays ignored — merged 2026-08-31
+      stays open; presence pre-bind stays ignored - merged 2026-08-31
 
-### v0.8.9 — Bugfix + Doc-Consistency — SHIPPED 2026-08-30
+### v0.8.9 - Bugfix + Doc-Consistency - SHIPPED 2026-08-30
 
 A code audit at `e922681` (v0.8.8+2) filed T163–T170: feature-list drift,
 stubbed features with overclaiming docs, and small operational gaps. All
 eleven items landed; see CHANGELOG for details:
 
-- [x] **T163** (High) — caps/disco drift: disco#info now iterates
+- [x] **T163** (High) - caps/disco drift: disco#info now iterates
       `caps.SERVER_FEATURES` (single source; `writeDiscoFeatures`) + unit tests
-- [x] **T165** — invite code parsed from the `jabber:x:data` registration form
+- [x] **T165** - invite code parsed from the `jabber:x:data` registration form
       and passed to the auth daemon; form advertises the invite field;
       new `e2e-register-invite.py` (6/6)
-- [x] **T166** — remote directed presence routes via the S2S outbound path
-- [x] **T167** — `std.net.Address.parseIp4/parseIp6` bind parsing + IPv6-safe
+- [x] **T166** - remote directed presence routes via the S2S outbound path
+- [x] **T167** - `std.net.Address.parseIp4/parseIp6` bind parsing + IPv6-safe
       accept() + tests
-- [x] **T168** — single build-time version constant in `build.zig`; XEP-0092
+- [x] **T168** - single build-time version constant in `build.zig`; XEP-0092
       and new `xmppd --version` both consume it
-- [x] **T169** — README footnote ¹ corrected (roster push + roster set
+- [x] **T169** - README footnote ¹ corrected (roster push + roster set
       validation both verified implemented; remaining gap: §2.6 versioning)
-- [x] **T164** — README XEP-0012 downgraded to Partial; full implementation
+- [x] **T164** - README XEP-0012 downgraded to Partial; full implementation
       stays open on the task for v0.9.0
-- [x] **T170** — CI consistency check landed (sh+awk on the FreeBSD runner),
+- [x] **T170** - CI consistency check landed (sh+awk on the FreeBSD runner),
       adapted to the single-source disco wiring
-- [x] **T161** — `IpcServer` heap-allocated in all three daemons; s2s IPC
+- [x] **T161** - `IpcServer` heap-allocated in all three daemons; s2s IPC
       fan-out de-hardcoded from 16 slots to `MAX_IPC_CLIENTS`
-- [x] **T160** — TLS ClientHello on the STARTTLS port gets a clear log line
+- [x] **T160** - TLS ClientHello on the STARTTLS port gets a clear log line
       and close instead of an XML parse error
-- [x] **T151** — evaluated: keep eager `flushSend()` (verdict recorded on the
+- [x] **T151** - evaluated: keep eager `flushSend()` (verdict recorded on the
       task; no code change)
 
-### v0.9.0 — Performance + Refactor
+### v0.9.0 - Performance + Refactor
 
 Deferred out of the v0.8.0 feature release:
 
 Execution order (agreed 2026-09-30): T177 MUC occupant migration first
 (LANDED 2026-10-01), then the perf backlog T130/T121/T110/T87, T154
-opportunistically (its delivery pattern now exists — Sonya request); T32
+opportunistically (its delivery pattern now exists - Sonya request); T32
 stays blocked on the lib/xmppc delivery, T31 gated on T32 measurements.
-T198 (per-account resource cap + silent bind failure) joins this release —
+T198 (per-account resource cap + silent bind failure) joins this release -
 Sonya needs hundreds of resources per account. T197 is the exit gate: the
 release is not tagged until the codebase-wide quality sweep has run and its
 findings are triaged.
 
-- [x] T112 — MUC MAM routing: cross-worker queries now carry the IQ stanza
+- [x] T112 - MUC MAM routing: cross-worker queries now carry the IQ stanza
       id separately from the MAM queryid, full RSM (max/after/before), and
-      answer no-archive with item-not-found like the local path — merged
+      answer no-archive with item-not-found like the local path - merged
       2026-10-01 (c1f53e9)
-- [x] **T130** — batch presence delivery: session-map batch resolve
+- [x] **T130** - batch presence delivery: session-map batch resolve
       (one lock hold per 32-JID chunk) + one MPSC pipe wake per remote
-      worker — merged 2026-10-01 (52d6896)
-- [x] **T121** — auth crypto pool: PBKDF2 derives run on worker threads
-      off the event loop; `[auth] crypto_threads` (default 4) — merged
+      worker - merged 2026-10-01 (52d6896)
+- [x] **T121** - auth crypto pool: PBKDF2 derives run on worker threads
+      off the event loop; `[auth] crypto_threads` (default 4) - merged
       2026-10-01 (39e7e6d)
-- [x] **T110** — client-side backpressure: EVFILT_READ suppressed when a
-      connection's write buffer crosses 75%, re-enabled at 50% — merged
+- [x] **T110** - client-side backpressure: EVFILT_READ suppressed when a
+      connection's write buffer crosses 75%, re-enabled at 50% - merged
       2026-10-01 (8e6fb7c)
-- [x] **T87** — async archive writer: single writer thread + bounded deep-
+- [x] **T87** - async archive writer: single writer thread + bounded deep-
       copy queue; event loops never block on storage; archive writes are
-      single-threaded now — merged 2026-10-01 (c0a9223)
-- [x] **T154** — cross-worker resource eviction: session_kick actor
+      single-threaded now - merged 2026-10-01 (c0a9223)
+- [x] **T154** - cross-worker resource eviction: session_kick actor
       round-trip (park bind, holding worker destroys old session per RFC
       6120 §7.7.3, retry on reply; 3-round cap); evicted clients now get
       the conflict stream error flushed before disconnect. Same fix on the
-      local eviction path (T152) — merged 2026-10-01 (307a717)
-- [x] **T198** — per-account resource cap raised to configurable
+      local eviction path (T152) - merged 2026-10-01 (307a717)
+- [x] **T198** - per-account resource cap raised to configurable
       `[core] max_resources_per_account` (default 256); bind failures now
-      client-visible (stanza error, success IQ only after registration) —
+      client-visible (stanza error, success IQ only after registration) -
       merged 2026-10-01 (a3babac)
-- [x] **T196** — auth rate-limit defaults relaxed (60/account, 200/IP per
-      120s; lockout unchanged at 10 consecutive failures) — merged
+- [x] **T196** - auth rate-limit defaults relaxed (60/account, 200/IP per
+      120s; lockout unchanged at 10 consecutive failures) - merged
       2026-10-02 (e19f17a)
-- [x] **T177** — cross-worker SM resume: Option A state handoff landed
+- [x] **T177** - cross-worker SM resume: Option A state handoff landed
       2026-09-30 (feature/t177-sm-cross-worker): SM-ID worker prefix routing,
       MPSC request/reply, mutex-guarded handoff store for the unacked queue,
       ABA epoch guard, e2e-sm-resume passes at workers=4. MUC occupant
@@ -187,46 +187,46 @@ findings are triaged.
       37/37 at workers=4 x4 runs with handoff log evidence. Micro-window
       study done 2026-10-01 (Phorge comment): measured <=1 ms; 1:1 traffic
       diverts to offline store (delayed, not lost), in-flight + MUC
-      generation-drops are lost client-side inside the window — accepted for
+      generation-drops are lost client-side inside the window - accepted for
       0.9.0; atomic-transfer fix specified as T199 (v0.10.0 candidate)
-- [x] T164 (full) — XEP-0012 last-activity tracking (per-user `last_online`
-      store, offline elapsed seconds, privacy rules) — merged 2026-10-01
+- [x] T164 (full) - XEP-0012 last-activity tracking (per-user `last_online`
+      store, offline elapsed seconds, privacy rules) - merged 2026-10-01
       (9d6daff)
-- [x] T32 (rescoped 2026-09-29) — load harness + benchmarks: `lib/xmppc`
+- [x] T32 (rescoped 2026-09-29) - load harness + benchmarks: `lib/xmppc`
       client core (PR #3/#4), the `xmppc-load` driver with engine stats,
       paced engine-first ramps, per-phase histograms, hold true-loss
       accounting, `-engines` sharding, and the full matrix of fixes found
       by it (wake-pipe, SCRAM slot table, IPC backlogs, kevent churn,
-      change-purge, accept-id leak, auth-IPC reconnect — merged 2026-10-03/04
+      change-purge, accept-id leak, auth-IPC reconnect - merged 2026-10-03/04
       as T235–T243). Matrix v2 (T-BC27B154 board key
       XMPPD/load-driver-measurements-v2): 10k sessions at ~480
       establishments/s, zero hold loss at 1.0–1.4 ms median.
-- [x] T31 — thread-local allocation — DECIDED 2026-10-04: rejected for
+- [x] T31 - thread-local allocation - DECIDED 2026-10-04: rejected for
       v0.9.0 with data (T242): engine stalls were a driver herd artifact;
       the envelope is the auth/IPC pipeline, not allocator contention.
       Rescope recorded on the task (auth-pipeline scaling when >600
       logins/s becomes a goal).
-- [x] **T197** — codebase-wide quality sweep — EXIT GATE satisfied
+- [x] **T197** - codebase-wide quality sweep - EXIT GATE satisfied
       2026-10-04: the sweep surfaced through the T32 measurement program
       (zed review batch T235–T244 all landed): event-loop fd-reuse purge,
       wake-pipe deadlock + teardown livelock, mailbox accounting,
       thread-safe session splicing, ramp-corruption rule-out (T244).
       Deferred findings documented as T245–T248.
 
-### v0.10.0 — Feature: Web Transport
+### v0.10.0 - Feature: Web Transport
 
 Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
 
-- [ ] **T40** — `xmppd-ws` — RFC 7395 XMPP-over-WebSocket process (`src/ws/`, `[ws]` config
+- [ ] **T40** - `xmppd-ws` - RFC 7395 XMPP-over-WebSocket process (`src/ws/`, `[ws]` config
       section, port 5280). Not yet scaffolded.
-- [ ] **T37** — XEP-0363 HTTP File Upload — slot-allocation IQ handler in core plus an
+- [ ] **T37** - XEP-0363 HTTP File Upload - slot-allocation IQ handler in core plus an
       `xmppd-httpupload` binary (~1100–1500 LOC)
-- [ ] **T162** — XEP-0049 Private XML Storage
-- [ ] **T184** — XEP-0060 PubSub, enough to legitimately claim the
+- [ ] **T162** - XEP-0049 Private XML Storage
+- [ ] **T184** - XEP-0060 PubSub, enough to legitimately claim the
       `pubsub/service` disco identity (service identity + node
       create/publish/subscribe beyond the PEP subset; do NOT advertise the
       identity before the implementation exists)
-- [ ] **T199** — atomic cross-worker session transfer: close the T177
+- [ ] **T199** - atomic cross-worker session transfer: close the T177
       unbind→re-bind micro-window (study + design 2026-10-01): step-2
       SessionMap.transfer using requester coordinates, parked-session
       migration stash riding the replay, earlier MUC occupant moves; the
@@ -234,38 +234,38 @@ Per `xmppd-marketing-webclient-ae17e5.md`, the one plan with open items:
 
 ### Non-code
 
-- [x] xmppd.org refresh — HydePHP site live at xmppd.org, repo
+- [x] xmppd.org refresh - HydePHP site live at xmppd.org, repo
       `pacyworld.dev/xmppd/website`, CI deploy to web03 via Fabrix. Keep
       version references current as releases ship (v0.8.8 latest)
-- [ ] `securemessage/chat` web client — repo exists on pacyworld but is scaffold
+- [ ] `securemessage/chat` web client - repo exists on pacyworld but is scaffold
       only (last touched 2026-06-19)
 
 
 ---
 
-## Phase 13 — Session Robustness Hardening (v0.8.6) ✅
+## Phase 13 - Session Robustness Hardening (v0.8.6) ✅
 
 Critical reconnection-stability fixes discovered via real-world client testing
 (Conversations Android) and a new comprehensive E2E regression suite
 (`test/integration/e2e-sm-resume.py`). Full investigation writeup:
 BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnection".
 
-- [x] **SM resume silently dropped** — `handleElementStart`'s pre-bind IQ
+- [x] **SM resume silently dropped** - `handleElementStart`'s pre-bind IQ
   catch-all had an unconditional `return` that consumed ALL elements at
   `features_bind` state, including `<resume/>`. Fixed by reordering the
   SM resume check before the catch-all.
-- [x] **Stream ID reuse across restarts** — same stream ID reused across
+- [x] **Stream ID reuse across restarts** - same stream ID reused across
   STARTTLS/SASL stream restarts, violating RFC 6120 §4.7.3. Fixed via
   `regenerateStreamId()` called on every `handleStreamOpen()`.
-- [x] **T152 — stale resource not evicted on rebind conflict** — a
+- [x] **T152 - stale resource not evicted on rebind conflict** - a
   reconnect racing ahead of the old session's cleanup got `AlreadyBound`
   and was silently left unregistered in `SessionMap` despite the client
   believing it was bound. Fixed via `evictStaleResource()` (RFC 6120
-  §7.7.3 — evict old resource, send `<conflict/>`, retry bind). New
+  §7.7.3 - evict old resource, send `<conflict/>`, retry bind). New
   `conflict` `StreamError` variant added (was missing from the enum).
   Cross-worker eviction deferred (T154).
-- [x] **T153 — message to detached session corrupts kqueue via stale fd
-  reuse** — found via the new E2E suite's stanza-replay test. Delivering
+- [x] **T153 - message to detached session corrupts kqueue via stale fd
+  reuse** - found via the new E2E suite's stanza-replay test. Delivering
   a stanza to a detached (SM-resume-pending) session used the session's
   stale, already-`close()`d fd for `changes.addWrite()`. If the OS
   recycled that fd for an unrelated connection, this misrouted kqueue
@@ -278,26 +278,26 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
 
 ### Test Verification (T158)
 
-- [x] SM detach-timer (300s) correctness — unit tests added
+- [x] SM detach-timer (300s) correctness - unit tests added
   (`session_lifecycle.zig`): boundary checks at 299s (survive), 300s (expire),
-  and mixed-set selective expiry. No clock injection needed — tests set
+  and mixed-set selective expiry. No clock injection needed - tests set
   `sm_detach_time` directly to simulate elapsed time.
-- [x] SINT full run with `enabledSpecifications="XEP-0198"` — DONE 2026-08-31:
+- [x] SINT full run with `enabledSpecifications="XEP-0198"` - DONE 2026-08-31:
   10/10 against a throwaway IBR instance (invocation in Next Up → v0.8.10
   preamble). The full-spec SINT run also happened (twice): see T175 and the
   T180/T181/T182 follow-ups it produced.
 
 ### Deferred Follow-ups
 
-- [ ] T154 — cross-worker resource eviction (needs new cross-thread kick
+- [ ] T154 - cross-worker resource eviction (needs new cross-thread kick
   message type; only relevant with `[core] workers > 1`)
-- [x] T155 — `Connection.close()` now resets `fd` to -1, and
+- [x] T155 - `Connection.close()` now resets `fd` to -1, and
   `Connection.queueSend()` rejects writes to a closed connection with
   `error.ConnectionClosed` (mirroring `S2sSession.queueSend`). Together these
   turn the stale-fd hazard from silent kqueue corruption into a loud, harmless
   error at every delivery site. Verified on freebsd-dev1: `zig build test`
   105/105 steps, 809/809 tests pass (master baseline 795).
-- [x] T153 follow-up — the detached-session guard had only been applied at two
+- [x] T153 follow-up - the detached-session guard had only been applied at two
   delivery sites (`router.zig` unicast, `server.zig` MPSC unicast); every other
   fan-out path wrote to `target.conn` unguarded. Introduced
   `fanout.deliverToSession()` / `fanout.deliverPrebuiltToSession()` as the single
@@ -312,37 +312,37 @@ BookStack → xmppd → "v0.8.6 Bug Investigation: SM Resume Stall on Reconnecti
   broadcast and S2S inbound never called `smTrackOutbound()`, so `sm_out_seq`
   ran behind the client's count. `SmUnackedQueue.ack()` treats an `h` larger
   than the buffered range as "client acked more than we have" and calls
-  `discardAll()` — silently dropping genuinely unacked *unicast* stanzas from
+  `discardAll()` - silently dropping genuinely unacked *unicast* stanzas from
   the replay queue. All delivery paths now count.
 
   Verified on freebsd-dev1 against a throwaway single-worker instance on port
   15222 (built from this branch, local `xmppd-auth` backend):
-  - `zig build test` — 105/105 steps, 809/809 tests pass, no pre-existing test
+  - `zig build test` - 105/105 steps, 809/809 tests pass, no pre-existing test
     changed count (master baseline 795)
-  - `e2e-sm-resume.py` — **29/29 assertions, 0 failed**, matching the v0.8.6
+  - `e2e-sm-resume.py` - **29/29 assertions, 0 failed**, matching the v0.8.6
     baseline. Test 6 (stanza replay to a detached session) is the test that
     originally caught T153 and exercises the rewritten path directly.
-  - `e2e-chat.py` — all pass (routing, full stanza forwarding)
-  - `muc-test.py` — 12/12, covering groupchat fan-out, occupant join/leave
-    presence and kick — 9 of the 21 rerouted sites
+  - `e2e-chat.py` - all pass (routing, full stanza forwarding)
+  - `muc-test.py` - 12/12, covering groupchat fan-out, occupant join/leave
+    presence and kick - 9 of the 21 rerouted sites
 
-  - `e2e-subscription.py` — 29/29, covering the `presence_handler` sites
+  - `e2e-subscription.py` - 29/29, covering the `presence_handler` sites
     (available/unavailable broadcast, directed presence, roster-subscriber
     routing)
-  - `e2e-quick-wins.py` — 12/12 and `e2e-mam.py` — 7/7, covering the
+  - `e2e-quick-wins.py` - 12/12 and `e2e-mam.py` - 7/7, covering the
     `iq_handler` sites (PEP notification, roster push) plus MUC history and MAM
 
   All six suites match the master baseline exactly, with zero server-side
   errors logged across the run. Still not exercised: the two S2S sites in
   `server.zig`, which need a federation peer (`s2s-federation.py` expects a
   Prosody instance).
-- [x] T151 — evaluated 2026-08-30 (v0.8.9 batch): KEEP the eager flushSend —
+- [x] T151 - evaluated 2026-08-30 (v0.8.9 batch): KEEP the eager flushSend -
   it is strictly fewer syscalls in the common request/response case; verdict
   recorded on the task, closed.
 
 ---
 
-## Phase 1 — Protocol Library ✅
+## Phase 1 - Protocol Library ✅
 
 Reusable XMPP protocol library under `lib/`.
 
@@ -354,7 +354,7 @@ Reusable XMPP protocol library under `lib/`.
 - [x] DANE/TLSA verification
 - [x] DNS SRV + TLSA resolution (res_query FFI)
 
-## Phase 2 — Core Daemon ✅
+## Phase 2 - Core Daemon ✅
 
 Multi-process XMPP server that handles C2S connections.
 
@@ -376,7 +376,7 @@ Multi-process XMPP server that handles C2S connections.
 
 **Binaries:** `xmppd`, `xmppd-core`, `xmppd-auth`, `xmppctl`
 
-## Phase 3 — S2S Federation ✅
+## Phase 3 - S2S Federation ✅
 
 Server-to-server federation for cross-domain messaging.
 
@@ -393,7 +393,7 @@ Server-to-server federation for cross-domain messaging.
 - [x] XEP-0220 dialback: inbound db:result verification (outbound callback)
 - [x] Inbound stanza forwarding (S2S→core IPC pipeline)
 - [x] Offline delivery across federation
-- [x] E2E integration test (`test/integration/s2s-federation.py` — 9/9)
+- [x] E2E integration test (`test/integration/s2s-federation.py` - 9/9)
 - [x] Interop tested against Prosody 13.0.6 (DANE + EXTERNAL path)
 
 **Binaries:** `xmppd-s2s`
@@ -407,76 +407,76 @@ Server-to-server federation for cross-domain messaging.
 | Outbound (no DANE) | Dialback | ✅ Key sent + verified |
 | Inbound (no DANE) | Dialback | ✅ Callback verification |
 
-## Phase 4 — Client Interop ✅
+## Phase 4 - Client Interop ✅
 
 Validate the server against real XMPP clients before adding features.
 
-- [x] slixmpp library (23/23 tests — see `test/integration/client-interop.py`)
+- [x] slixmpp library (23/23 tests - see `test/integration/client-interop.py`)
   - [x] STARTTLS + SASL PLAIN authentication
   - [x] STARTTLS + SASL SCRAM-SHA-256 authentication
   - [x] Wrong password rejection
   - [x] Resource binding
-  - [x] Service Discovery — disco#info (identity + 7 features)
-  - [x] Service Discovery — disco#items
+  - [x] Service Discovery - disco#info (identity + 7 features)
+  - [x] Service Discovery - disco#items
   - [x] XMPP Ping (XEP-0199)
   - [x] Software Version (XEP-0092)
   - [x] vCard-temp (XEP-0054)
   - [x] Roster get + set
   - [x] Initial presence
   - [x] Two-way messaging (alice↔bob with body verification)
-- [x] Profanity (terminal client, FreeBSD native — 14/14 tests)
-- [x] Gajim (desktop, GTK — connected via Windows, full session)
-- [x] Dino (desktop, GTK — connected via FreeBSD, full session)
-- [x] Conversations (Android — SCRAM-SHA-256, multi-resource, MUC join, reconnection)
+- [x] Profanity (terminal client, FreeBSD native - 14/14 tests)
+- [x] Gajim (desktop, GTK - connected via Windows, full session)
+- [x] Dino (desktop, GTK - connected via FreeBSD, full session)
+- [x] Conversations (Android - SCRAM-SHA-256, multi-resource, MUC join, reconnection)
 
 ### Bugs Found and Fixed
 
-- **MUC room name case-sensitivity** — Conversations lowercases room
+- **MUC room name case-sensitivity** - Conversations lowercases room
   names per RFC 7622, but xmppd stored/matched them case-sensitively.
   `FirstRoom` (Thunderbird) vs `firstroom` (Conversations) created two
   separate rooms instead of joining the same one. Fix: case-fold the
   localpart in `buildRoomJid()` before lookup/creation.
-- **IPC recv buffer use-after-compact** — `nextMessage()` compacted the
+- **IPC recv buffer use-after-compact** - `nextMessage()` compacted the
   receive buffer before returning, corrupting borrowed Message slices
   when two IPC responses arrived simultaneously (concurrent SASL auth).
   Fix: deferred compaction to the start of the next `nextMessage()` or
   `recv()` call.
-- **Post-SASL SSL drain** — Added `SSL_pending()` check after SASL
+- **Post-SASL SSL drain** - Added `SSL_pending()` check after SASL
   success to drain OpenSSL-buffered data that kqueue won't fire for.
 
 This phase gates further feature work. No point building on a foundation
 that doesn't interoperate with real clients.
 
-## Phase 5 — Storage ✅
+## Phase 5 - Storage ✅
 
 Pluggable storage subsystem with comptime generic stores and multiple
 backends. Build flag `-Dop-storage` selects the operational backend.
 
 - [x] Comptime `StorageBackend` trait (`src/store/backend.zig`) with `assertBackend()`
-- [x] `MemoryBackend` — reference implementation and test double
-- [x] `LmdbBackend` — LMDB via zig-lmdb v0.3.2, auto-resize on MDB_MAP_FULL
-- [x] `RocksDbBackend` — RocksDB via system librocksdb C API
-- [x] `SqliteBackend` — SQLite3 via system libsqlite3
-- [x] `UserStore(Backend)` — SCRAM credential storage (binary format)
-- [x] `RosterStore(Backend)` — composite key, subscription state machine
-- [x] `VCardStore(Backend)` — raw XML blob storage
-- [x] `OfflineStore(Backend)` — offline message queue with per-user cap
-- [x] `ArchiveStore(Backend)` — MAM archive with paginated query + retention
-- [x] `MamHandler` — XEP-0313 IQ handler wired into core
+- [x] `MemoryBackend` - reference implementation and test double
+- [x] `LmdbBackend` - LMDB via zig-lmdb v0.3.2, auto-resize on MDB_MAP_FULL
+- [x] `RocksDbBackend` - RocksDB via system librocksdb C API
+- [x] `SqliteBackend` - SQLite3 via system libsqlite3
+- [x] `UserStore(Backend)` - SCRAM credential storage (binary format)
+- [x] `RosterStore(Backend)` - composite key, subscription state machine
+- [x] `VCardStore(Backend)` - raw XML blob storage
+- [x] `OfflineStore(Backend)` - offline message queue with per-user cap
+- [x] `ArchiveStore(Backend)` - MAM archive with paginated query + retention
+- [x] `MamHandler` - XEP-0313 IQ handler wired into core
 - [x] Auth daemon migrated to `UserStore(LmdbBackend)`
 - [x] Core daemon wired with generic RosterStore, VCardStore, OfflineStore, ArchiveStore
 - [x] `-Dop-storage` build flag (lmdb, rocksdb, sqlite)
 
 **Key files:** `src/store/` (10 files, ~3,663 LOC)
 
-## Phase 6 — Auth Daemon + IPC ✅
+## Phase 6 - Auth Daemon + IPC ✅
 
 Separate auth daemon with binary IPC protocol and kqueue event loop.
 
-- [x] IPC framework (`src/ipc/`) — length-prefixed binary framing
+- [x] IPC framework (`src/ipc/`) - length-prefixed binary framing
 - [x] 5 auth message types: AuthRequest, AuthChallenge, AuthSuccess, AuthFailure, SaslResponse
 - [x] `xmppd-auth` daemon with kqueue event loop, SIGHUP, graceful shutdown
-- [x] `AuthHandler(Store)` — generic over store type, SCRAM + PLAIN dispatch
+- [x] `AuthHandler(Store)` - generic over store type, SCRAM + PLAIN dispatch
 - [x] SCRAM-SHA-256 multi-step exchange (256 concurrent sessions)
 - [x] PLAIN single-step authentication
 - [x] `xmppctl` admin CLI (adduser, deluser, passwd, listusers)
@@ -484,7 +484,7 @@ Separate auth daemon with binary IPC protocol and kqueue event loop.
 
 **Binaries:** `xmppd-auth`, `xmppctl`
 
-## Phase 7 — Messaging + IM ✅
+## Phase 7 - Messaging + IM ✅
 
 Core XMPP instant messaging functionality.
 
@@ -495,12 +495,12 @@ Core XMPP instant messaging functionality.
 - [x] Offline message storage and delivery (XEP-0160)
 - [x] Message Archive Management / MAM (XEP-0313)
 - [x] IQ dispatch framework (`src/core/iq_handler.zig`)
-- [x] Service Discovery — disco#info/items (XEP-0030)
+- [x] Service Discovery - disco#info/items (XEP-0030)
 - [x] vCard-temp (XEP-0054)
 - [x] Software Version (XEP-0092)
 - [x] XMPP Ping (XEP-0199)
 
-## Phase 8 — S2S Hardening ✅
+## Phase 8 - S2S Hardening ✅
 
 Server-to-server federation hardening and interop.
 
@@ -522,10 +522,10 @@ Server-to-server federation hardening and interop.
 | Outbound (no DANE) | Dialback | ✅ Key sent + verified |
 | Inbound (no DANE) | Dialback | ✅ Callback verification |
 
-## Phase 9 — Auth Hardening
+## Phase 9 - Auth Hardening
 
 Harden the authentication subsystem within `xmppd-auth`. All new auth
-logic lives in the auth daemon — core remains a pure XML/IPC relay.
+logic lives in the auth daemon - core remains a pure XML/IPC relay.
 
 Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 
@@ -533,21 +533,21 @@ Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 
 | Step | Feature | Status |
 |------|---------|--------|
-| 9a | Rate limiting — per-IP + per-account, fixed-size hash tables | ✅ |
-| 9b | Account lockout — temp (rate-based) + permanent (LockStore) | ✅ |
-| 9c | In-band registration (XEP-0077) — invitation codes, InviteStore | ✅ |
-| 9d | Password change (XEP-0077 §3.3) — IPC tags 0x08/0x09 | ✅ |
-| 9e | Account deletion (XEP-0077 §3.2) — cascade cleanup | ✅ |
-| 9f | Channel binding (XEP-0440) — tls-server-end-point + tls-exporter | ✅ |
+| 9a | Rate limiting - per-IP + per-account, fixed-size hash tables | ✅ |
+| 9b | Account lockout - temp (rate-based) + permanent (LockStore) | ✅ |
+| 9c | In-band registration (XEP-0077) - invitation codes, InviteStore | ✅ |
+| 9d | Password change (XEP-0077 §3.3) - IPC tags 0x08/0x09 | ✅ |
+| 9e | Account deletion (XEP-0077 §3.2) - cascade cleanup | ✅ |
+| 9f | Channel binding (XEP-0440) - tls-server-end-point + tls-exporter | ✅ |
 
 ### Key Design Decisions
 
-- **LockStore** — permanent locks stored in separate `locks` namespace
+- **LockStore** - permanent locks stored in separate `locks` namespace
   (not embedded in credential format). Works for both local and future
   external auth users. No breaking schema change.
-- **Single IPC breaking change** — `client_ip`, `cb_type`, `cb_data`
+- **Single IPC breaking change** - `client_ip`, `cb_type`, `cb_data`
   added to AuthRequest (0x01) in step 9a.
-- **Forward-compatible** — all designs work with future Phase 11
+- **Forward-compatible** - all designs work with future Phase 11
   external auth backends.
 
 ### Deferred to Phase 11
@@ -563,10 +563,10 @@ Design document: `~/.windsurf/plans/xmppd-phase9-auth-hardening-809458.md`
 
 ### Dependencies
 
-- Phase 5 (Storage) — LockStore, InviteStore use storage backend
-- Phase 6 (Auth Daemon) — IPC protocol gains 6 new message types
+- Phase 5 (Storage) - LockStore, InviteStore use storage backend
+- Phase 6 (Auth Daemon) - IPC protocol gains 6 new message types
 
-## Phase 10 — Multi-User Chat (MUC) ✅
+## Phase 10 - Multi-User Chat (MUC) ✅
 
 XEP-0045 implementation for group messaging. MUC lives inline in
 xmppd-core (not a separate process) since it's fundamentally routing/fan-out,
@@ -579,13 +579,13 @@ Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 | Step | Feature | Status |
 |------|---------|--------|
 | 10a | XML namespace constants (muc_user, muc_admin, muc_owner) | ✅ |
-| 10b | RoomStore(Backend) — room config + affiliation persistence | ✅ |
-| 10c | RoomRegistry — in-memory room + occupant tracking (heap-alloc) | ✅ |
-| 10d | MUC handler — join, part, groupchat fan-out, disco, kick | ✅ |
-| 10e | server.zig — MUC subdomain routing, closeSession cleanup | ✅ |
-| 10f | iq_handler.zig — MUC IQ dispatch (disco, admin) | ✅ |
-| 10g | main.zig — --muc-host CLI flag, RoomRegistry init | ✅ |
-| 10h | build.zig — room_store + room_registry modules | ✅ |
+| 10b | RoomStore(Backend) - room config + affiliation persistence | ✅ |
+| 10c | RoomRegistry - in-memory room + occupant tracking (heap-alloc) | ✅ |
+| 10d | MUC handler - join, part, groupchat fan-out, disco, kick | ✅ |
+| 10e | server.zig - MUC subdomain routing, closeSession cleanup | ✅ |
+| 10f | iq_handler.zig - MUC IQ dispatch (disco, admin) | ✅ |
+| 10g | main.zig - --muc-host CLI flag, RoomRegistry init | ✅ |
+| 10h | build.zig - room_store + room_registry modules | ✅ |
 | 10i | Unit tests (28 tests for RoomStore + RoomRegistry) | ✅ |
 | 10j | Integration test (slixmpp, 12 assertions) | ✅ |
 
@@ -608,7 +608,7 @@ Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 - [ ] Room history on join (wire ArchiveStore query)
 - [ ] Persistent affiliation lookup on join (RoomStore.getAffiliation)
 - [ ] Load persistent rooms from RoomStore on startup
-- [x] Room name case-folding (RFC 7622 — JID localpart is case-insensitive)
+- [x] Room name case-folding (RFC 7622 - JID localpart is case-insensitive)
 - [ ] Room configuration form (XEP-0045 §10.1 dataforms)
 - [ ] Ban (outcast affiliation + persist)
 - [ ] Password-protected rooms
@@ -616,12 +616,12 @@ Design document: `~/.windsurf/plans/xmppd-phase10-muc-design.md`
 
 ### Key Files
 
-- `src/store/room_store.zig` — ~620 LOC
-- `src/core/room_registry.zig` — ~500 LOC
-- `src/core/muc_handler.zig` — ~900 LOC
-- `test/integration/muc-test.py` — slixmpp integration test
+- `src/store/room_store.zig` - ~620 LOC
+- `src/core/room_registry.zig` - ~500 LOC
+- `src/core/muc_handler.zig` - ~900 LOC
+- `test/integration/muc-test.py` - slixmpp integration test
 
-## Phase 11 — External Auth (OIDC) ✅
+## Phase 11 - External Auth (OIDC) ✅
 
 Pluggable authentication via external Identity Providers. Multi-binary
 architecture: each auth backend is a separate executable selected by
@@ -633,21 +633,21 @@ Design document: `~/.windsurf/plans/xmppd-phase11-external-auth-4f6f38.md`
 
 | Step | Feature | Status |
 |------|---------|--------|
-| 11a | `src/config/parser.zig` — INI config parser (sections, key=value, #comments) | ✅ |
+| 11a | `src/config/parser.zig` - INI config parser (sections, key=value, #comments) | ✅ |
 | 11b | Master passes `--config` to children via execve argv | ✅ |
 | 11c | `MechanismId.oauthbearer` (0x03) + IPC tag 0x0C (MechanismList) | ✅ |
 | 11d | Auth sends MechanismList on IPC connect → core uses for stream features | ✅ |
-| 11e | `lib/http/client.zig` — blocking HTTPS GET/POST over OpenSSL | ✅ |
-| 11f | `lib/jwt/jwt.zig` — JWT parse + RS256/EdDSA signature verification | ✅ |
-| 11g | `src/auth/oidc.zig` — OidcStore (JWKS cache, JWT validation, ROPC, introspection) | ✅ |
-| 11h | AuthHandler refactor — comptime `@hasDecl` for validatePassword/validateToken | ✅ |
-| 11i | `src/auth/oidc_main.zig` — xmppd-auth-oidc entry point | ✅ |
-| 11j | Build system — `xmppd-auth-oidc` executable in build.zig | ✅ |
-| 11k | Integration test — OAUTHBEARER + ROPC against Rauthy | ✅ |
+| 11e | `lib/http/client.zig` - blocking HTTPS GET/POST over OpenSSL | ✅ |
+| 11f | `lib/jwt/jwt.zig` - JWT parse + RS256/EdDSA signature verification | ✅ |
+| 11g | `src/auth/oidc.zig` - OidcStore (JWKS cache, JWT validation, ROPC, introspection) | ✅ |
+| 11h | AuthHandler refactor - comptime `@hasDecl` for validatePassword/validateToken | ✅ |
+| 11i | `src/auth/oidc_main.zig` - xmppd-auth-oidc entry point | ✅ |
+| 11j | Build system - `xmppd-auth-oidc` executable in build.zig | ✅ |
+| 11k | Integration test - OAUTHBEARER + ROPC against Rauthy | ✅ |
 
 ### Implemented Features
 
-- [x] OAUTHBEARER SASL mechanism (RFC 7628) — JWT validation
+- [x] OAUTHBEARER SASL mechanism (RFC 7628) - JWT validation
 - [x] PLAIN-to-IdP delegation via ROPC (Resource Owner Password Credentials)
 - [x] Token introspection fallback (RFC 7662) for opaque tokens
 - [x] JWKS key cache with 1-hour TTL + kid-miss refresh
@@ -660,23 +660,23 @@ Design document: `~/.windsurf/plans/xmppd-phase11-external-auth-4f6f38.md`
 
 ### Key Files
 
-- `src/auth/oidc.zig` — ~460 LOC (OidcStore, JWKS, introspection)
-- `src/auth/oidc_main.zig` — ~240 LOC (entry point, event loop)
-- `lib/http/client.zig` — ~360 LOC (HTTPS client)
-- `lib/jwt/jwt.zig` — ~410 LOC (JWT parse + RS256 + EdDSA verify)
-- `src/config/parser.zig` — ~190 LOC (shared INI parser)
+- `src/auth/oidc.zig` - ~460 LOC (OidcStore, JWKS, introspection)
+- `src/auth/oidc_main.zig` - ~240 LOC (entry point, event loop)
+- `lib/http/client.zig` - ~360 LOC (HTTPS client)
+- `lib/jwt/jwt.zig` - ~410 LOC (JWT parse + RS256 + EdDSA verify)
+- `src/config/parser.zig` - ~190 LOC (shared INI parser)
 
 **Binaries:** `xmppd-auth-oidc` (4.3MB)
 
 ### Future Backends (Not This Phase)
 
-- **LDAP/AD** — bind authentication, group-based authorization
-- **SQL** — external database credential lookup (PostgreSQL/MariaDB)
-- **Token auth** — HT-SHA-256 for mobile clients
-- **SASL EXTERNAL for C2S** — client certificate authentication (mTLS)
-- **PAM** — system-level auth integration
+- **LDAP/AD** - bind authentication, group-based authorization
+- **SQL** - external database credential lookup (PostgreSQL/MariaDB)
+- **Token auth** - HT-SHA-256 for mobile clients
+- **SASL EXTERNAL for C2S** - client certificate authentication (mTLS)
+- **PAM** - system-level auth integration
 
-## Phase 12 — Polish & Deploy (MVP Complete)
+## Phase 12 - Polish & Deploy (MVP Complete)
 
 Production readiness. The "Giant Thread" problem (event loop starvation
 during MUC fan-out) was solved as part of this phase. FreeBSD port
@@ -685,9 +685,9 @@ hardened. Tagged `v0.1.0`.
 
 ### Fan-out Scalability (Done)
 
-- [x] Bounded continuation — yield after N occupants per event loop tick (`src/core/fanout.zig`)
-- [x] Pre-built common stanza — prefix/JID/suffix assembly eliminates per-occupant serialization
-- [x] Configurable `max_sessions` — heap-allocated, default 4096 (was hard-coded 1024)
+- [x] Bounded continuation - yield after N occupants per event loop tick (`src/core/fanout.zig`)
+- [x] Pre-built common stanza - prefix/JID/suffix assembly eliminates per-occupant serialization
+- [x] Configurable `max_sessions` - heap-allocated, default 4096 (was hard-coded 1024)
 
 ### Configuration (Done)
 
@@ -699,45 +699,45 @@ hardened. Tagged `v0.1.0`.
 
 ### Deployment (Done)
 
-- [x] FreeBSD RC script (`etc/rc.d/xmppd`) — no daemon(8), master self-daemonizes
-- [x] FreeBSD port (`net-im/xmppd` in deluxe ports tree) — builds all 6 binaries
+- [x] FreeBSD RC script (`etc/rc.d/xmppd`) - no daemon(8), master self-daemonizes
+- [x] FreeBSD port (`net-im/xmppd` in deluxe ports tree) - builds all 6 binaries
 - [x] Jail installation and end-to-end testing (xmppd jail on freebsd-dev1)
 - [x] `v0.1.0` tagged and pushed to all 3 remotes
 
 ### Privilege Separation (Done)
 
-- [x] `user` config option in `[server]` section — children drop to unprivileged user
+- [x] `user` config option in `[server]` section - children drop to unprivileged user
 - [x] Master resolves user via `getpwnam()`, passes uid/gid to Supervisor
-- [x] `Supervisor.initWithUser()` — `setgid()`/`setuid()` in child fork before `execve()`
-- [x] Signal mask reset in child fork — children don't inherit parent's blocked signals
+- [x] `Supervisor.initWithUser()` - `setgid()`/`setuid()` in child fork before `execve()`
+- [x] Signal mask reset in child fork - children don't inherit parent's blocked signals
 
 ### Process Lifecycle (Done)
 
-- [x] Self-daemonizing master (`--background`/`-b`) — `fork()` + `setsid()` + stdio → `/dev/null`
-- [x] Single-instance via PID file `flock(LOCK_EX|LOCK_NB)` — refuses to start if locked
+- [x] Self-daemonizing master (`--background`/`-b`) - `fork()` + `setsid()` + stdio → `/dev/null`
+- [x] Single-instance via PID file `flock(LOCK_EX|LOCK_NB)` - refuses to start if locked
 - [x] Child PID files (`auth.pid`, `core.pid`) written after spawn
-- [x] Orphan cleanup on startup — SIGTERM → 2s grace → SIGKILL for stale children
+- [x] Orphan cleanup on startup - SIGTERM → 2s grace → SIGKILL for stale children
 - [x] Clean PID file removal on graceful shutdown
 
 ### V1 Pre-requisites (Done)
 
-- [x] S2S supervisor wiring — master spawns xmppd-s2s as third child (auth → s2s → core)
-- [x] Privileged port binding — master binds 5222/5269 while root, passes fds via `--listen-fd`
-- [x] xmppctl IPC-based management — tries auth daemon IPC first, falls back to direct DB
-- [x] Auth-OIDC cosmetic fix — master skips `--db` for OIDC backend
+- [x] S2S supervisor wiring - master spawns xmppd-s2s as third child (auth → s2s → core)
+- [x] Privileged port binding - master binds 5222/5269 while root, passes fds via `--listen-fd`
+- [x] xmppctl IPC-based management - tries auth daemon IPC first, falls back to direct DB
+- [x] Auth-OIDC cosmetic fix - master skips `--db` for OIDC backend
 
 ### Standards (Post-MVP)
 
-- [x] XEP-0198: Stream Management (mobile reconnection) — v0.6.0, hardened v0.8.6
+- [x] XEP-0198: Stream Management (mobile reconnection) - v0.6.0, hardened v0.8.6
 - [x] XEP-0280: Message Carbons (multi-device)
-- [ ] XEP-0363: HTTP File Upload (media sharing) — planned for v0.10.0
+- [ ] XEP-0363: HTTP File Upload (media sharing) - planned for v0.10.0
 
 ### Documentation (Post-MVP)
 
-- [x] `doc/ARCHITECTURE.md` — multi-process design, IPC protocol
-- [x] `doc/CONFIGURATION.md` — all config options
-- [x] `doc/DEPLOYMENT.md` — FreeBSD setup guide
-- [ ] `doc/FEDERATION.md` — S2S setup, DANE, dialback
+- [x] `doc/ARCHITECTURE.md` - multi-process design, IPC protocol
+- [x] `doc/CONFIGURATION.md` - all config options
+- [x] `doc/DEPLOYMENT.md` - FreeBSD setup guide
+- [ ] `doc/FEDERATION.md` - S2S setup, DANE, dialback
 - [ ] Man pages for all binaries
 
 ### Testing (Post-MVP)
@@ -753,7 +753,7 @@ hardened. Tagged `v0.1.0`.
 
 ---
 
-## V1 — Thread-Per-Core ✅ (shipped v0.5.0)
+## V1 - Thread-Per-Core ✅ (shipped v0.5.0)
 
 **Status:** Shipped in v0.5.0 (SO_REUSEPORT_LB, per-worker kqueue loops, MPSC
 cross-thread delivery, shared SessionMap) and superseded by the v0.6.0 actor
@@ -767,7 +767,7 @@ Design document: `windsurf-plans/xmppd-giant-thread-fix-1e17cd.md`
 
 All completed in commit a24fa94:
 
-- [x] S2S supervisor wiring — master spawns xmppd-s2s as third child
+- [x] S2S supervisor wiring - master spawns xmppd-s2s as third child
 - [x] Privileged port binding + fd passing (`--listen-fd`)
 - [x] xmppctl IPC-based management (IPC first, DB fallback)
 - [x] Auth-OIDC `--db` cosmetic fix
@@ -779,11 +779,11 @@ avatar via standard XEPs; the server handles sourcing transparently.
 
 **Resolution order (highest priority wins):**
 
-1. **Client-set** — user uploads via XEP-0084 (User Avatar / PEP) or XEP-0153
+1. **Client-set** - user uploads via XEP-0084 (User Avatar / PEP) or XEP-0153
    (vCard-Based Avatars). Overrides everything. Updates external auth if supported.
-2. **External auth (OIDC)** — on first login, fetch `picture` claim from IdP
+2. **External auth (OIDC)** - on first login, fetch `picture` claim from IdP
    userinfo. Cache locally. Only used if no client-set avatar exists.
-3. **Gravatar** — hash user's email (MD5 per Gravatar spec), fetch from
+3. **Gravatar** - hash user's email (MD5 per Gravatar spec), fetch from
    `gravatar.com/avatar/{hash}`. Enabled by default, toggle via
    `[avatar] gravatar = true|false` in xmppd.conf.
 
@@ -816,39 +816,39 @@ one storage handle, one session registry. This dramatically simplifies storage
 invalidation) and routing (direct pointer lookup, no serialization).
 
 **Why single-process for V1:**
-- Storage — LMDB/RocksDB handle shared across threads. No exclusive lock
+- Storage - LMDB/RocksDB handle shared across threads. No exclusive lock
   conflicts. One thread writes, all threads see it immediately.
-- Session routing — shared in-memory registry with mutex/lock-free access.
+- Session routing - shared in-memory registry with mutex/lock-free access.
   Cross-thread message delivery is MPSC push + kqueue wakeup, not IPC.
-- MUC fan-out — occupants on different threads reached via MPSC, not
+- MUC fan-out - occupants on different threads reached via MPSC, not
   Unix socket marshaling.
-- Simpler to implement — delete more IPC code than you add thread sync code.
+- Simpler to implement - delete more IPC code than you add thread sync code.
 
 **Trade-off:** A crash takes down all threads (no fault isolation). Acceptable
 at V1 scale. Multi-process + multi-thread is the Post-V1 evolution.
 
-**Stage 1 — PoC (fd inheritance, isolate threading from fd-passing):**
+**Stage 1 - PoC (fd inheritance, isolate threading from fd-passing):**
 
 Use existing `--listen-fd` mechanism. Master creates N SO_REUSEPORT sockets,
 passes all N fds to one xmppd-core child. xmppd-core spawns N threads,
 each taking one fd. Proves threading works before changing fd-passing mechanism.
 
-- [x] SO_REUSEPORT_LB — master creates N sockets, passes via `--listen-fd 5,6,7,8`
-- [x] Per-thread kqueue event loop — each thread owns one listener fd + its sessions
-- [x] MPSC channels — lock-free cross-thread stanza delivery (pipe wakeup, always-wake)
-- [x] Shared SessionMap — JID-keyed hash table with RwLock, resource inline in entry
-- [x] Two-pass event processing — drain MPSC before socket events (prevents ABA races)
+- [x] SO_REUSEPORT_LB - master creates N sockets, passes via `--listen-fd 5,6,7,8`
+- [x] Per-thread kqueue event loop - each thread owns one listener fd + its sessions
+- [x] MPSC channels - lock-free cross-thread stanza delivery (pipe wakeup, always-wake)
+- [x] Shared SessionMap - JID-keyed hash table with RwLock, resource inline in entry
+- [x] Two-pass event processing - drain MPSC before socket events (prevents ABA races)
 - [x] Cross-thread presence, subscription, MUC fan-out via MPSC
-- [x] S2S presence broadcast — available/unavailable/probes forwarded to remote domains
-- [x] S2S subscription forwarding — subscribe/subscribed/unsubscribe/unsubscribed via S2S
-- [x] S2S inbound round-robin — single-worker delivery (was N-duplicate broadcast)
-- [x] Integration tested — 8 clients, 4 workers, 64/64 messages delivered
-- [x] MUC per-room worker-level multicast (T62 — Option A worker_mask)
+- [x] S2S presence broadcast - available/unavailable/probes forwarded to remote domains
+- [x] S2S subscription forwarding - subscribe/subscribed/unsubscribe/unsubscribed via S2S
+- [x] S2S inbound round-robin - single-worker delivery (was N-duplicate broadcast)
+- [x] Integration tested - 8 clients, 4 workers, 64/64 messages delivered
+- [x] MUC per-room worker-level multicast (T62 - Option A worker_mask)
 - [ ] Thread-local allocation (per-event scratch arena + session-lifetime slab pool)
 - [ ] Optional CPU affinity (cpuset_setaffinity, configurable)
 - [ ] Testing + benchmarks
 
-**Stage 2 — SCM_RIGHTS migration (after Stage 1 is stable):**
+**Stage 2 - SCM_RIGHTS migration (after Stage 1 is stable):**
 
 Replace fd inheritance with explicit fd passing over Unix socketpair.
 Enables hot restart, zero-downtime upgrades, and Post-V1 multi-process.
@@ -886,7 +886,7 @@ zero-copy stanza delivery.
 
 **Cross-worker routing** requires IPC (Unix socket or shared memory
 ring buffer). Intra-worker routing is a pointer dereference through
-the shared registry — no serialization.
+the shared registry - no serialization.
 
 **Topology tuning:** On a 32-core box, run 4 workers × 8 threads.
 More processes = better fault isolation. More threads per process =
@@ -894,14 +894,14 @@ fewer IPC hops for routing. The sweet spot depends on workload.
 
 **fd passing works for both topologies:** Master creates N SO_REUSEPORT
 sockets, distributes them. Whether a given fd goes to a different
-process or a different thread is transparent — the `--listen-fd`
+process or a different thread is transparent - the `--listen-fd`
 infrastructure from V1 pre-requisites is reused unchanged.
 
 **Storage complexity (the reason V1 is single-process first):**
 - LMDB supports concurrent readers across processes (OK).
 - RocksDB needs shared-nothing (separate DB dir per worker) or a
   dedicated storage service process.
-- Single-process avoids this entirely — one handle, all threads see
+- Single-process avoids this entirely - one handle, all threads see
   writes immediately via shared memory.
 
 **Prior art:** Nginx (multi-process, per-worker threads for async I/O),
@@ -910,18 +910,18 @@ one process). The hybrid model is where large servers converge.
 
 ### Other Post-V1
 
-- **Clustering** — multi-node via shared storage + message bus
-- **epoll backend** — Linux support (secondary platform)
-- **WebSocket** (RFC 7395) — web client connectivity
-- **BOSH** (XEP-0124/0206) — legacy web client support
-- **Push Notifications** (XEP-0357) — mobile background delivery
-- **A/V Calling** — Jingle (XEP-0166) + TURN/STUN
-- **OMEMO key distribution** — PEP for end-to-end encryption
-- **Admin Web UI** — monitoring dashboard
-- **Prometheus metrics** — observability
-- **S2S dialback error recovery** — retry/backoff on callback connection failure
-- **S2S async DNS + probe throttling** — blocking DNS stalls event loop; batch probes (T65)
-- **Sharded SessionMap** — reduce RwLock contention at 64+ cores (T56)
+- **Clustering** - multi-node via shared storage + message bus
+- **epoll backend** - Linux support (secondary platform)
+- **WebSocket** (RFC 7395) - web client connectivity
+- **BOSH** (XEP-0124/0206) - legacy web client support
+- **Push Notifications** (XEP-0357) - mobile background delivery
+- **A/V Calling** - Jingle (XEP-0166) + TURN/STUN
+- **OMEMO key distribution** - PEP for end-to-end encryption
+- **Admin Web UI** - monitoring dashboard
+- **Prometheus metrics** - observability
+- **S2S dialback error recovery** - retry/backoff on callback connection failure
+- **S2S async DNS + probe throttling** - blocking DNS stalls event loop; batch probes (T65)
+- **Sharded SessionMap** - reduce RwLock contention at 64+ cores (T56)
 
 ---
 
