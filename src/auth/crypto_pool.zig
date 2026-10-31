@@ -158,6 +158,12 @@ pub const CryptoPool = struct {
         self.pipe_rd = -1;
         self.pipe_wr = -1;
 
+        // The dropped queued jobs never publish; their reservations die
+        // with the pool.
+        self.completion_mutex.lock();
+        self.reserved_completions = 0;
+        self.completion_mutex.unlock();
+
         for (self.jobs.items) |j| std.heap.c_allocator.free(j.password);
         self.jobs.deinit(self.allocator);
         self.completions.deinit(self.allocator);
@@ -410,5 +416,17 @@ test "CryptoPool: finished jobs release their reservation" {
     for (0..n) |_| {
         _ = pool.popCompletion() orelse return error.NoCompletion;
     }
+    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
+}
+
+test "CryptoPool: stop releases the dropped jobs' reservations" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    // No start(): the queued jobs are dropped by stop() without completing.
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 4096);
+    _ = try putTestJob(&pool, "x", @splat(2), 4096, creds.stored_key);
+    _ = try putTestJob(&pool, "x", @splat(2), 4096, creds.stored_key);
+    try std.testing.expectEqual(@as(usize, 2), reservedCount(&pool));
+
+    pool.stop();
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
