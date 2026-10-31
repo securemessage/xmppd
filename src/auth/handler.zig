@@ -378,27 +378,20 @@ pub fn AuthHandler(comptime Store: type) type {
                     // "Alice" resolve to the same "alice" admission every
                     // mechanism enforces).
                     const identity = localpartOf(validated_user);
-                    // The IdP may resolve an alias to a different account
-                    // than the typed name. If that identity is locked, reply
-                    // exactly as for a wrong password and charge both keys;
-                    // otherwise the alias is an oracle and gets its own
-                    // failure budget.
-                    var typed_buf: [policy_mod.account_key_max]u8 = undefined;
-                    var identity_buf: [policy_mod.account_key_max]u8 = undefined;
-                    const typed_key = policy_mod.accountKey(username, &typed_buf);
-                    const identity_key = policy_mod.accountKey(identity, &identity_buf);
-                    if (!std.mem.eql(u8, typed_key, identity_key)) {
-                        if (self.policy.check(identity, "")) |reason| {
-                            if (std.mem.eql(u8, reason, "account-disabled")) {
-                                log.info("PLAIN auth failed (IdP alias): '{s}' maps to locked '{s}'", .{ username, identity });
-                                // Same bookkeeping as a wrong password: the
-                                // typed name and the IP, never the already
-                                // locked identity.
-                                self.policy.recordOutcome(username, req.client_ip, .failure);
-                                return .{ .reply = authFailure(req.conn_id, "not-authorized") };
-                            }
-                            return .{ .reply = authFailure(req.conn_id, reason) };
+                    // The pre-check ran on the typed name, which the IdP may
+                    // resolve to a different identity. Check the identity's
+                    // own lock now and answer it exactly like a wrong
+                    // password, so a right password for a locked identity is
+                    // indistinguishable from a wrong one.
+                    if (self.policy.check(identity, "")) |reason| {
+                        if (std.mem.eql(u8, reason, "account-disabled")) {
+                            log.info("PLAIN auth failed (IdP): '{s}' maps to a locked identity", .{username});
+                            // Same bookkeeping as a wrong password: the typed
+                            // name and the IP, never the locked identity.
+                            self.policy.recordOutcome(username, req.client_ip, .failure);
+                            return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                         }
+                        return .{ .reply = authFailure(req.conn_id, reason) };
                     }
                     if (self.policy.admitAccount(identity)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
@@ -2682,6 +2675,35 @@ test "AuthHandler: PLAIN-IdP pre-check sees a temporary lock" {
     var buf: [64]u8 = undefined;
     const right_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
     const wrong_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: a permanently locked IdP identity rejects the Kelvin-sign alias" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("kate", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "kate@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    // "<U+212A>ate" and "kate" are the same identity: the pre-check must
+    // see the permanent lock through the folded key and reject before the
+    // IdP call, so the right password gets the same reply as the wrong one.
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(440, "127.0.0.1", plainPayload(&buf, "\u{212A}ate", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(440, "127.0.0.1", plainPayload(&buf, "\u{212A}ate", "wrong"))) orelse return error.NoResponse;
 
     if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
     try std.testing.expectEqualDeep(right_reply, wrong_reply);

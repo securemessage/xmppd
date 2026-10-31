@@ -30,13 +30,9 @@ pub const LockCheckResult = enum {
     store_error,
 };
 
-/// Normalize an IdP-issued identity to its localpart for lock storage: the
-/// IdP's own claim ("Alice@morante.dev", "alice") resolves to the row the
-/// admission check enforces for every other mechanism (S3).
-pub fn localpartOf(identity: []const u8) []const u8 {
-    const cut = if (std.mem.indexOfScalar(u8, identity, '@')) |p| identity[0..p] else identity;
-    return cut;
-}
+/// The identity's localpart, shared with the lock store so the admission key
+/// and the lock row always resolve to the same name (S3).
+pub const localpartOf = lock_store_mod.localpartOf;
 
 /// Interface for permanent lock checking. The auth daemon sets this to
 /// a closure over the LockStore.
@@ -75,23 +71,11 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
 pub const account_key_max = rate_limiter.max_key_len;
 
 /// Canonical account key: the identity localpart, ASCII-lowercased, with
-/// U+212A KELVIN SIGN folded to "k" to match the IdP's case folding.
+/// U+212A KELVIN SIGN folded to "k" to match the IdP's case folding. The one
+/// function the limiter and the permanent lock store share. An untrackable
+/// (overlong) key is returned unfolded so admission fails closed on it.
 pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
-    const local = localpartOf(identity);
-    if (local.len > buf.len) return local;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < local.len) {
-        if (i + 3 <= local.len and local[i] == 0xE2 and local[i + 1] == 0x84 and local[i + 2] == 0xAA) {
-            buf[n] = 'k';
-            i += 3;
-        } else {
-            buf[n] = std.ascii.toLower(local[i]);
-            i += 1;
-        }
-        n += 1;
-    }
-    return buf[0..n];
+    return lock_store_mod.canonicalKey(identity, buf[0..]) orelse localpartOf(identity);
 }
 
 fn permanentLockReason(checker: LockChecker, username: []const u8) ?[]const u8 {
