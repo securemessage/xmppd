@@ -70,7 +70,10 @@ const SpanRange = struct { start: usize, end: usize };
 const SpanQName = struct { prefix: SpanRange, local: SpanRange };
 
 const SpanAttr = struct { name: SpanRange };
-const SpanDecl = struct { depth: usize, prefix: SpanRange, uri: SpanRange };
+/// class is the equivalence-class id of the decoded URI: declarations
+/// whose URIs decode equal share a class, so the expanded-name
+/// duplicate check compares ids instead of decoding URIs per pair.
+const SpanDecl = struct { depth: usize, prefix: SpanRange, uri: SpanRange, class: usize };
 
 fn spanSlice(bytes: []const u8, r: SpanRange) []const u8 {
     return bytes[r.start..r.end];
@@ -305,6 +308,18 @@ fn spanResolveRange(bytes: []const u8, prefix: []const u8, decls: []const SpanDe
     return null;
 }
 
+/// The URI equivalence class a prefix expands to, newest declaration
+/// first; unresolved prefixes return null (the declared-prefix check
+/// rejects them first).
+fn spanResolveClass(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?usize {
+    var i = decls.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix)) return decls[i].class;
+    }
+    return null;
+}
+
 /// The next character in a raw attribute value, resolving one entity
 /// or character reference at '&' to its codepoint; literal bytes are
 /// decoded as UTF-8 so both sides of a compare yield code points.
@@ -400,21 +415,23 @@ fn spanCheckPrefixes(
     // no namespace and are skipped; xml: cannot collide because the
     // XML URI may never be bound to another prefix, and same-name
     // xml: duplicates already failed the qualified-name check. URIs
-    // compare after entity decoding so 'urn:&#117;' equals 'urn:u'.
+    // compare by the equivalence class assigned when their
+    // declaration was pushed (decoding runs once per declaration, not
+    // once per attribute pair), so 'urn:&#117;' equals 'urn:u'.
     for (attrs, 0..) |a, i| {
         const aq = spanQName(bytes, a.name);
         const a_prefix = spanSlice(bytes, aq.prefix);
         if (a_prefix.len == 0 or std.mem.eql(u8, a_prefix, "xmlns") or
             std.mem.eql(u8, a_prefix, "xml")) continue;
-        const a_uri = spanResolveRange(bytes, a_prefix, decls) orelse continue;
+        const a_class = spanResolveClass(bytes, a_prefix, decls) orelse continue;
         for (attrs[i + 1 ..]) |b| {
             const bq = spanQName(bytes, b.name);
             const b_prefix = spanSlice(bytes, bq.prefix);
             if (b_prefix.len == 0 or std.mem.eql(u8, b_prefix, "xmlns") or
                 std.mem.eql(u8, b_prefix, "xml")) continue;
             if (!std.mem.eql(u8, spanSlice(bytes, aq.local), spanSlice(bytes, bq.local))) continue;
-            const b_uri = spanResolveRange(bytes, b_prefix, decls) orelse continue;
-            if (try spanDecodedEql(bytes, a_uri, b_uri)) return error.NotWellFormed;
+            const b_class = spanResolveClass(bytes, b_prefix, decls) orelse continue;
+            if (a_class == b_class) return error.NotWellFormed;
         }
     }
 }
@@ -456,6 +473,7 @@ pub const ValidatedSpan = struct {
         var attr_count: usize = 0;
         var decls: [span_max_decls]SpanDecl = undefined;
         var decl_count: usize = 0;
+        var next_class: usize = 0;
         var pending_name: SpanRange = .{ .start = 0, .end = 0 };
         // tag_cursor is where the next tag's '<' is searched from;
         // attr_cursor is where the next attribute name may start.
@@ -529,7 +547,27 @@ pub const ValidatedSpan = struct {
                             return error.NotWellFormed;
                         if (oq >= pos - 1) return error.NotWellFormed;
                         const uri: SpanRange = .{ .start = oq + 1, .end = pos - 1 };
-                        decls[decl_count] = .{ .depth = depth, .prefix = prefix, .uri = uri };
+                        // The decoded URI is compared once, against
+                        // the live declarations, to assign its
+                        // equivalence class: the expanded-name check
+                        // then compares class ids, never URIs.
+                        var class: ?usize = null;
+                        for (decls[0..decl_count]) |d| {
+                            if (try spanDecodedEql(bytes, d.uri, uri)) {
+                                class = d.class;
+                                break;
+                            }
+                        }
+                        if (class == null) {
+                            class = next_class;
+                            next_class += 1;
+                        }
+                        decls[decl_count] = .{
+                            .depth = depth,
+                            .prefix = prefix,
+                            .uri = uri,
+                            .class = class.?,
+                        };
                         decl_count += 1;
                     }
                 },
