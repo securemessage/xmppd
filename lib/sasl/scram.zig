@@ -40,9 +40,9 @@ const HmacSha256Precomputed = struct {
         inner.update(&ipad);
         var outer = Sha256.init(.{});
         outer.update(&opad);
-        std.crypto.secureZero(u8, std.mem.asBytes(&block));
-        std.crypto.secureZero(u8, std.mem.asBytes(&ipad));
-        std.crypto.secureZero(u8, std.mem.asBytes(&opad));
+        std.crypto.secureZero(u8, &block);
+        std.crypto.secureZero(u8, &ipad);
+        std.crypto.secureZero(u8, &opad);
         return .{ .inner = inner, .outer = outer };
     }
 
@@ -62,7 +62,7 @@ const HmacSha256Precomputed = struct {
         inner.update(part2);
         var digest: [Sha256.digest_length]u8 = undefined;
         inner.final(&digest);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&digest));
+        defer std.crypto.secureZero(u8, &digest);
         var outer = self.outer;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&outer));
         outer.update(&digest);
@@ -152,17 +152,17 @@ pub const StoredCredentials = struct {
         var prep_cps: [3072]u21 = undefined;
         var prep_cccs: [3072]u8 = undefined;
         if (password.len > prep_buf.len / 2) return error.NoSpaceLeft;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_buf));
+        defer std.crypto.secureZero(u8, &prep_buf);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_cps));
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_cccs));
+        defer std.crypto.secureZero(u8, &prep_cccs);
         const prepped = try stringprep.prepareOpaqueString(password, &prep_buf, &prep_cps, &prep_cccs);
         var salted_password: [32]u8 = undefined;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&salted_password));
+        defer std.crypto.secureZero(u8, &salted_password);
         pbkdf2(prepped, &salt, iteration_count, &salted_password);
 
         // ClientKey := HMAC(SaltedPassword, "Client Key")
         var client_key: [32]u8 = undefined;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&client_key));
+        defer std.crypto.secureZero(u8, &client_key);
         HmacSha256.create(&client_key, "Client Key", &salted_password);
 
         // StoredKey := H(ClientKey)
@@ -553,7 +553,7 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
         pub fn handleServerFirst(self: *Self, message: []const u8) ![]const u8 {
             try self.parseServerFirst(message);
             var salted_password: [mac_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&salted_password));
+            defer std.crypto.secureZero(u8, &salted_password);
             pbkdf2With(Hmac, self.password, self.salt_raw[0..self.salt_raw_len], self.iteration_count, &salted_password);
             return self.clientFinal(salted_password);
         }
@@ -613,18 +613,18 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             // The SaltedPassword is passed by value; work on a local copy so
             // it can be wiped on every exit path.
             var sp: [mac_len]u8 = salted_password;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&sp));
+            defer std.crypto.secureZero(u8, &sp);
 
             const alloc = self.arena.allocator();
 
             // ClientKey := HMAC(SaltedPassword, "Client Key")
             var client_key: [mac_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&client_key));
+            defer std.crypto.secureZero(u8, &client_key);
             Hmac.create(&client_key, "Client Key", &sp);
 
             // StoredKey := H(ClientKey)
             var stored_key: [mac_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&stored_key));
+            defer std.crypto.secureZero(u8, &stored_key);
             HashFn.hash(&client_key, &stored_key, .{});
 
             // c= is base64(gs2-header [+ channel-binding-data]) (RFC 5802 §7)
@@ -660,7 +660,7 @@ pub fn ScramClientWith(comptime Hmac: type, comptime HashFn: type) type {
             // ServerSignature := HMAC(HMAC(SaltedPassword, "Server Key"), AuthMessage),
             // checked against the server-final-message (mutual authentication).
             var server_key: [mac_len]u8 = undefined;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&server_key));
+            defer std.crypto.secureZero(u8, &server_key);
             Hmac.create(&server_key, "Server Key", &sp);
             Hmac.create(&self.server_signature, auth_message, &server_key);
 
@@ -766,9 +766,9 @@ fn pbkdf2Sha256(password: []const u8, salt: []const u8, iterations: u32, output:
     }
 
     output.* = result;
-    std.crypto.secureZero(u8, std.mem.asBytes(&u));
-    std.crypto.secureZero(u8, std.mem.asBytes(&result));
-    std.crypto.secureZero(u8, std.mem.asBytes(&next));
+    std.crypto.secureZero(u8, &u);
+    std.crypto.secureZero(u8, &result);
+    std.crypto.secureZero(u8, &next);
 }
 
 /// PBKDF2 over a comptime HMAC, dkLen = mac_length (one block). SHA-256 uses
