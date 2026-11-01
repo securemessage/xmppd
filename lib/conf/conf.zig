@@ -135,14 +135,20 @@ pub const Diag = struct {
     }
 
     /// Copies every field into the Diag's own buffers (truncating past
-    /// the bound) so no slice ever borrows caller memory.
+    /// the bound) so no slice ever borrows caller memory. The copies
+    /// stage in a temporary: a parts slice may point into this Diag's
+    /// own buffers, and writing any buffer before all reads finish
+    /// would feed the copy clobbered or undefined bytes. rebind() then
+    /// repoints the field slices at this Diag's storage.
     pub fn set(self: *Diag, parts: Parts) void {
-        self.* = .{ .line = parts.line };
-        self.path = into(&self.path_buf, parts.path);
-        self.section = into(&self.section_buf, parts.section);
-        self.key = into(&self.key_buf, parts.key);
-        self.value = into(&self.value_buf, parts.value);
-        self.detail = into(&self.detail_buf, parts.detail);
+        var tmp: Diag = .{ .line = parts.line };
+        tmp.path = into(&tmp.path_buf, parts.path);
+        tmp.section = into(&tmp.section_buf, parts.section);
+        tmp.key = into(&tmp.key_buf, parts.key);
+        tmp.value = into(&tmp.value_buf, parts.value);
+        tmp.detail = into(&tmp.detail_buf, parts.detail);
+        self.* = tmp;
+        self.rebind();
     }
 
     /// Repoints every field slice into this Diag's own buffers. A plain
@@ -1755,6 +1761,16 @@ test "Diag set tolerates its own fields; a copy rebinds to its storage" {
     d.set(.{ .key = "other", .value = "new.test", .detail = "x" });
     try testing.expectEqualStrings("hostname", d2.key);
     try testing.expectEqualStrings("old.test", d2.value);
+}
+
+test "Diag.set copies from slices that point into its own buffers" {
+    var d: Diag = .{};
+    d.set(.{ .key = "hostname", .value = "old.test", .detail = "invalid value" });
+    // Sources may alias another field's buffer; a set() that resets
+    // storage first would read undefined bytes.
+    d.set(.{ .key = d.value, .value = d.key });
+    try testing.expectEqualStrings("old.test", d.key);
+    try testing.expectEqualStrings("hostname", d.value);
 }
 
 test "serializers report ValueTooLong with a filled Diag on overflow" {
