@@ -338,14 +338,23 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, v: T) std.Io.Writer.Error!voi
     if (T == bool) return w.writeAll(if (v) "true" else "false");
     if (T == Duration) return w.print("{f}", .{v});
     if (T == std.net.Address) {
-        if (v.getPort() != 0) return w.print("{f}", .{v});
-        // Port 0 means "no port": emit the bare literal, which parses
-        // back as port 0 (parsePort rejects an explicit :0).
-        var b: [64]u8 = undefined;
+        // Address.format drops a v6 scope id (fe80::1%1), so emit the
+        // bracketed form ourselves. Port 0 means "no port": omit it,
+        // since parsePort rejects an explicit :0.
+        var b: [80]u8 = undefined;
         var bw: std.Io.Writer = .fixed(&b);
         try bw.print("{f}", .{v});
         const s = bw.buffered();
-        return w.writeAll(s[0 .. s.len - 2]);
+        if (v.any.family != posix.AF.INET6) {
+            return w.writeAll(if (v.getPort() == 0) s[0 .. s.len - 2] else s);
+        }
+        const inner = s[1..std.mem.indexOfScalar(u8, s, ']').?];
+        try w.writeByte('[');
+        try w.writeAll(inner);
+        if (v.in6.sa.scope_id != 0) try w.print("%{d}", .{v.in6.sa.scope_id});
+        try w.writeByte(']');
+        if (v.getPort() != 0) try w.print(":{d}", .{v.getPort()});
+        return;
     }
     if (T == [][]const u8) {
         for (v, 0..) |item, i| {
@@ -2237,6 +2246,20 @@ test "parseValue covers ints, bools, enums, strings, address, durations" {
     w = .fixed(&buf);
     try writeValue(std.net.Address, &w, a6);
     try testing.expectEqualStrings("[::1]", w.buffered());
+    // A v6 scope id survives the round trip: Address.format drops it,
+    // so writeValue emits the bracketed %[scope] form itself.
+    const sc = try parseValue(std.net.Address, "fe80::1%1");
+    try testing.expectEqual(@as(u32, 1), sc.in6.sa.scope_id);
+    w = .fixed(&buf);
+    try writeValue(std.net.Address, &w, sc);
+    try testing.expectEqualStrings("[fe80::1%1]", w.buffered());
+    const sc2 = try parseValue(std.net.Address, w.buffered());
+    try testing.expect(sc2.eql(sc));
+    const scp = try parseValue(std.net.Address, "[fe80::1%1]:5269");
+    w = .fixed(&buf);
+    try writeValue(std.net.Address, &w, scp);
+    try testing.expectEqualStrings("[fe80::1%1]:5269", w.buffered());
+    try testing.expect((try parseValue(std.net.Address, w.buffered())).eql(scp));
     // Ambiguous or meaningless forms are rejected, not re-interpreted.
     try testing.expectError(error.BadValue, parseValue(std.net.Address, "::1:5222"));
     try testing.expectError(error.BadValue, parseValue(std.net.Address, "0.0.0.0:0"));
