@@ -1876,19 +1876,26 @@ fn readResolvConf(alloc: std.mem.Allocator, path: []const u8) !net.Address {
         const tok = tail[0 .. std.mem.indexOfAny(u8, tail, ";# \t") orelse tail.len];
         if (tok.len == 0) continue;
         if (net.Address.parseIp(tok, 53)) |addr| {
+            // A '%' belongs to the scoped path below; libc rejects a
+            // lone zone marker ("fe80::1%").
+            if (std.mem.indexOfScalar(u8, tok, '%') != null) continue;
             return addr;
         } else |_| {
-            // libc accepts scoped v6 ("fe80::1%lo0"): resolve the zone
-            // name with if_nametoindex.
+            // libc accepts a zone only on a link-local v6 address
+            // ("fe80::1%lo0"): resolve the zone name with
+            // if_nametoindex.
             const pct = std.mem.indexOfScalar(u8, tok, '%') orelse continue;
             var addr = net.Address.parseIp(tok[0..pct], 53) catch continue;
+            if (addr.any.family != posix.AF.INET6) continue;
+            const ab = &addr.in6.sa.addr;
+            if (ab[0] != 0xfe or (ab[1] & 0xc0) != 0x80) continue;
             const zname = tok[pct + 1 ..];
             var zbuf: [16]u8 = undefined;
             if (zname.len == 0 or zname.len >= zbuf.len) continue;
             @memcpy(zbuf[0..zname.len], zname);
             zbuf[zname.len] = 0;
             const idx = std.c.if_nametoindex(zbuf[0..zname.len :0]);
-            if (idx <= 0) continue;
+            if (idx == 0) continue;
             addr.in6.sa.scope_id = @intCast(idx);
             return addr;
         }
@@ -4497,7 +4504,26 @@ test "dns-async: a scoped v6 nameserver (fe80::1%lo0) is accepted" {
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expectEqual(@as(u16, posix.AF.INET6), r.server.any.family);
-    try std.testing.expect(r.server.in6.sa.scope_id != 0);
+    // if_nametoindex("lo0") is 2 on this host.
+    try std.testing.expectEqual(@as(u32, 2), r.server.in6.sa.scope_id);
+}
+
+test "dns-async: resolv.conf scopes follow libc (link-local v6 only, tab separator)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // libc takes a zone only on a link-local v6 nameserver: a scope on
+    // a global v6 address, on an IPv4 address, and an empty zone are
+    // each skipped; a tab after the keyword is a valid separator.
+    try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = "nameserver 2001:db8::1%lo0\nnameserver 127.0.0.1%lo0\nnameserver fe80::1%\nnameserver\t127.0.0.65\n" });
+    var pbuf: [512]u8 = undefined;
+    const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.resolv_conf_path = path;
+    r.loadResolvConf();
+    try std.testing.expect(r.server_configured);
+    try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.65", 53)));
 }
 
 test "dns-async: a TLSA NXDOMAIN marks the target absent (per-target path)" {
