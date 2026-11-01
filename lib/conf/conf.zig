@@ -505,13 +505,12 @@ pub fn Loader(
         /// Effective values; defaults live in the section initializers.
         values: Sections,
         /// Per-field provenance, indexed like `fields`.
+        provenance: [fields.len]Source,
         /// Positional arguments collected when options.positional_cap
-        /// allows them (ctl subcommands). Borrowed from the caller's
-        /// argv, like string field values.
-        positionals: []const []const u8 = &.{},
+        /// allows them (ctl subcommands), read via positionals(). The
+        /// slices borrow the caller's argv, like string field values.
         pos_buf: [options.positional_cap][]const u8 = undefined,
         pos_len: usize = 0,
-        provenance: [fields.len]Source,
         /// File line a field was set at (0 when not set from a file).
         lines: [fields.len]u32,
         arena_state: std.heap.ArenaAllocator,
@@ -529,6 +528,13 @@ pub fn Loader(
         /// them).
         pub fn deinit(self: *Self) void {
             self.arena_state.deinit();
+        }
+
+        /// Collected positional arguments. A method, not a stored slice:
+        /// load() returns self by value, so a slice stored during parsing
+        /// would address the dead stack frame's pos_buf, not this one's.
+        pub fn positionals(self: *const Self) []const []const u8 {
+            return self.pos_buf[0..self.pos_len];
         }
 
         /// Loads file then CLI per the LoadOpts; one call is one load.
@@ -692,7 +698,6 @@ pub fn Loader(
                         }
                         self.pos_buf[self.pos_len] = arg;
                         self.pos_len += 1;
-                        self.positionals = self.pos_buf[0..self.pos_len];
                         continue;
                     }
                 }
@@ -1887,14 +1892,34 @@ test "ctl defaults match the code and positionals collect through --" {
         .args = &.{ "--db", "d.db", "--", "adduser", "alice" },
     }, &diag);
     defer d2.deinit();
-    try testing.expectEqual(@as(usize, 2), d2.positionals.len);
-    try testing.expectEqualStrings("adduser", d2.positionals[0]);
-    try testing.expectEqualStrings("alice", d2.positionals[1]);
+    try testing.expectEqual(@as(usize, 2), d2.positionals().len);
+    try testing.expectEqualStrings("adduser", d2.positionals()[0]);
+    try testing.expectEqualStrings("alice", d2.positionals()[1]);
     var d3 = try CtlLoader.load(testing.allocator, .{
         .args = &.{ "passwd", "--db", "d.db" },
     }, &diag);
     defer d3.deinit();
-    try testing.expectEqual(@as(usize, 1), d3.positionals.len);
+    try testing.expectEqual(@as(usize, 1), d3.positionals().len);
+}
+
+/// Overwrites the stack region load() ran in, so a positional slice
+/// pointing at the dead frame reads garbage instead of argv.
+fn clobberStack() void {
+    var junk: [8192]u8 = undefined;
+    @memset(&junk, 0x5a);
+    std.mem.doNotOptimizeAway(&junk);
+}
+
+test "positionals() reads live storage after the load frame is gone" {
+    var diag: Diag = .{};
+    var d = try CtlLoader.load(testing.allocator, .{
+        .args = &.{ "--db", "d.db", "--", "adduser", "alice" },
+    }, &diag);
+    defer d.deinit();
+    clobberStack();
+    try testing.expectEqual(@as(usize, 2), d.positionals().len);
+    try testing.expectEqualStrings("adduser", d.positionals()[0]);
+    try testing.expectEqualStrings("alice", d.positionals()[1]);
 }
 
 test "inline comments end a value only after whitespace; quoting is literal" {
