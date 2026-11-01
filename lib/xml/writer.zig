@@ -1796,6 +1796,26 @@ test "expanded-name compare pins: lengths and entity names (R6-5)" {
     );
 }
 
+test "&apos; and &quot; decode inside declaration URIs (R7-2)" {
+    // Accept pins: 'urn:'' and 'urn:"' are real, distinct URIs, so
+    // these spans validate and the expanded names do not collide. A
+    // compare that leaves the entity undecoded errors out, and one
+    // that decodes it to the wrong byte can call them duplicates.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:x' xmlns:q='urn:&apos;' p:x='1' q:x='2'/>",
+    );
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:x' xmlns:q='urn:&quot;' p:x='1' q:x='2'/>",
+    );
+    // 'urn:a'b' and 'urn:a"b' differ only in the decoded entity.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:a&apos;b' xmlns:q='urn:a&quot;b' p:x='1' q:x='2'/>",
+    );
+}
+
 test "the URI class match sees declarations on every live scope (R7-1)" {
     // q on <c> decodes to the URI p bound on <r>: a class match that
     // skips outer-scope declarations misses the collision and wrongly
