@@ -260,6 +260,8 @@ pub const Resolver = struct {
     malformed_replies: usize = 0,
     unmatched_replies: usize = 0,
     stale_icmp: usize = 0,
+    /// Test seam: report every UDP send as failed (see sendUdp).
+    fail_sends: bool = false,
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -713,6 +715,9 @@ pub const Resolver = struct {
     /// error belongs to the earlier packet, so it is consumed and the
     /// send retried once instead of failing the wrong job.
     fn sendUdp(self: *Resolver, pkt: []const u8) !void {
+        // Test seam: report a wire send failure without touching the
+        // socket (a closed fd is UB territory, not a failure path).
+        if (self.fail_sends) return error.SendFailed;
         _ = posix.send(self.fd, pkt, 0) catch |err| switch (err) {
             error.ConnectionRefused => {
                 self.stale_icmp += 1;
@@ -784,7 +789,14 @@ pub const Resolver = struct {
         }
         var buf: [512]u8 = undefined;
         const id = try self.nextId();
-        const q = try wire.buildQuery(&buf, id, qname, qtype);
+        const q = wire.buildQuery(&buf, id, qname, qtype) catch |err| switch (err) {
+            // A name that cannot be encoded cannot exist on the wire,
+            // so the answer is the negative one the cache would have
+            // given: run the NXDOMAIN path (raw jobs report .nxdomain,
+            // a TLSA phase reads it as absent).
+            error.InvalidName => return self.onNxdomain(job),
+            else => return err,
+        };
         const pkt = try self.alloc.dupe(u8, buf[0..q]);
         if (job.request.len > 0) self.alloc.free(job.request);
         job.request = pkt;
@@ -4667,10 +4679,40 @@ test "dns-async: an unparsable TLSA answer is lookup_failed, not absent" {
     try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
-test "dns-async: a TLSA send failure in finishTarget is lookup_failed" {
+test "dns-async: a real TLSA send failure in finishTarget is lookup_failed" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // Every stage before TLSA is answered from cache, so the only
+    // wire send is the TLSA query, and it fails for real.
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer rdata.deinit(std.testing.allocator);
+    try rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x14, 0x76 });
+    appendEncodedName(std.testing.allocator, &rdata, "t.test");
+    var srv_rrs = [1]wire.Rr{.{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = rdata.items }};
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+    var a_rrs = [1]wire.Rr{.{ .name = "t.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cacheInsert("t.test", KIND_A, &a_rrs, .none, 60);
+    r.cacheInsert("t.test", KIND_AAAA, &.{}, .nxdomain, 60);
+
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    r.fail_sends = true;
+
+    try r.resolve("svc.test", .client, 5222, 3, true);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: names over 255 wire octets behave as NXDOMAIN" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
-    srv.aaaa_fail.store(true, .monotonic);
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
@@ -4678,27 +4720,60 @@ test "dns-async: a TLSA send failure in finishTarget is lookup_failed" {
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    // The target host alone fits the wire limit, but the TLSA owner
-    // "_5222._tcp.<host>" does not: the send fails and the target is
-    // a lookup failure, not a silent no-DANE emit.
-    const long_host = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 50 ++ ".test";
-    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
-    var rdata: std.ArrayListUnmanaged(u8) = .{};
-    defer rdata.deinit(std.testing.allocator);
-    try rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x14, 0x36 });
-    appendEncodedName(std.testing.allocator, &rdata, long_host);
-    var srv_rrs = [1]wire.Rr{.{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = rdata.items }};
-    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
-
-    try r.resolve("svc.test", .client, 5222, 3, true);
+    // 235 octets: _xmpps overflows but _xmpp (253) is a legal name.
+    const d235 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 43;
+    try std.testing.expectEqual(@as(usize, 235), d235.len);
+    try r.resolve(d235, .client, 5222, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
-
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
-    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    res.deinitOn(std.testing.allocator);
+
+    // 240 octets: both SRV prefixes overflow; the bare-name fallback
+    // A still resolves, and its TLSA owner (251) is legal.
+    ctx.status = null;
+    ctx.res = null;
+    const d240 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 48;
+    try std.testing.expectEqual(@as(usize, 240), d240.len);
+    try r.resolve(d240, .client, 5222, 4, true);
+    spins = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    res = ctx.res.?;
     try std.testing.expectEqual(@as(usize, 1), res.targets.len);
-    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    res.deinitOn(std.testing.allocator);
+
+    // 253 octets: the bare A is at the wire limit; the TLSA owner
+    // overflows, which reads as absent, not a lookup failure.
+    ctx.status = null;
+    ctx.res = null;
+    const d253 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 61;
+    try std.testing.expectEqual(@as(usize, 253), d253.len);
+    try r.resolve(d253, .client, 5222, 5, true);
+    spins = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    res = ctx.res.?;
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
+    res.deinitOn(std.testing.allocator);
+}
+
+test "dns-async: an over-long raw query reports nxdomain" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    // 254 octets exceeds the 255-octet wire limit (RFC 1035 2.3.4).
+    try r.query("a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 62, .a, 7);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
 }
 
 test "dns-async: a SERVFAIL is never cached and hits the wire again" {
