@@ -515,6 +515,16 @@ pub fn Loader(
             if (c.flag != null and field_types[targets[i]] != bool) {
                 @compileError("conf: flag '" ++ c.name ++ "' targets non-bool " ++ c.target);
             }
+            // A '.' would make a spelling look canonical: "--a.b=x" is
+            // resolved as section.key before any cli name lookup.
+            if (std.mem.indexOfScalar(u8, c.name, '.') != null) {
+                @compileError("conf: cli '--" ++ c.name ++ "' must not contain '.'");
+            }
+            for (c.aliases) |a| {
+                if (std.mem.indexOfScalar(u8, a, '.') != null) {
+                    @compileError("conf: cli alias '--" ++ a ++ "' must not contain '.'");
+                }
+            }
             for (seen[0..n]) |prev| {
                 if (prev == targets[i]) @compileError("conf: two cli options target " ++ c.target);
             }
