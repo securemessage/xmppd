@@ -208,6 +208,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const wire_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/dns/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wire_test_mod.addImport("dns", dns_mod);
+
     const xmppc_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmppc/xmppc.zig"),
         .target = target,
@@ -253,6 +261,11 @@ pub fn build(b: *std.Build) void {
         .root_module = dns_test_mod,
     });
 
+    const wire_tests = b.addTest(.{
+        .name = "wire-tests",
+        .root_module = wire_test_mod,
+    });
+
     const xmppc_tests = b.addTest(.{
         .name = "xmppc-tests",
         .root_module = xmppc_test_mod,
@@ -284,6 +297,7 @@ pub fn build(b: *std.Build) void {
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
     const run_dns_tests = b.addRunArtifact(dns_tests);
+    const run_wire_tests = b.addRunArtifact(wire_tests);
     const run_xmppc_tests = b.addRunArtifact(xmppc_tests);
 
     // X2: dns-async tests run against a local fake nameserver (UDP+TCP).
@@ -1707,6 +1721,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);
     test_step.dependOn(&run_dns_tests.step);
+    test_step.dependOn(&run_wire_tests.step);
     test_step.dependOn(&run_dns_async_tests.step);
     test_step.dependOn(&run_xmppc_tests.step);
     test_step.dependOn(&run_socketpair_tests.step);
