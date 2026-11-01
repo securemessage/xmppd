@@ -73,7 +73,25 @@ const SpanAttr = struct { name: SpanRange };
 /// class is the equivalence-class id of the decoded URI: declarations
 /// whose URIs decode equal share a class, so the expanded-name
 /// duplicate check compares ids instead of decoding URIs per pair.
-const SpanDecl = struct { depth: usize, prefix: SpanRange, uri: SpanRange, class: usize };
+/// decoded_len and uri_hash summarize the decoded URI once per push
+/// so the pairwise decode-compare only runs on a full match.
+const SpanDecl = struct {
+    depth: usize,
+    prefix: SpanRange,
+    uri: SpanRange,
+    class: usize,
+    decoded_len: usize,
+    uri_hash: u64,
+};
+
+/// Per-process seed for the declaration URI hash; a fixed seed would
+/// let a hostile peer precompute decoded-URI collisions.
+var uri_hash_seed: u64 = 0;
+
+fn uriHashSeed() u64 {
+    if (uri_hash_seed == 0) uri_hash_seed = std.crypto.random.int(u64);
+    return uri_hash_seed;
+}
 
 fn spanSlice(bytes: []const u8, r: SpanRange) []const u8 {
     return bytes[r.start..r.end];
@@ -369,6 +387,29 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
     return error.NotWellFormed;
 }
 
+/// The decoded UTF-8 length and seeded hash of a raw range; ranges
+/// equal after decoding always share both, so a declaration push can
+/// skip the pairwise decode-compare on either mismatch. With no '&'
+/// and no literal whitespace the decoded form is the raw range
+/// itself, which is hashed in place; otherwise one decode pass
+/// re-encodes each code point.
+fn spanDecodedStats(bytes: []const u8, r: SpanRange) Error!struct { len: usize, hash: u64 } {
+    const raw = bytes[r.start..r.end];
+    const seed = uriHashSeed();
+    if (std.mem.indexOfAny(u8, raw, "&\t\n\r") == null)
+        return .{ .len = raw.len, .hash = std.hash.Wyhash.hash(seed, raw) };
+    var h = std.hash.Wyhash.init(seed);
+    var len: usize = 0;
+    var i = r.start;
+    var enc: [4]u8 = undefined;
+    while (try spanNextDecoded(bytes, r, &i)) |cp| {
+        const n = std.unicode.utf8Encode(cp, &enc) catch return error.InvalidUtf8;
+        h.update(enc[0..n]);
+        len += n;
+    }
+    return .{ .len = len, .hash = h.final() };
+}
+
 /// Two raw ranges are equal once decoded when they yield the same
 /// code point sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
 fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) Error!bool {
@@ -550,9 +591,15 @@ pub const ValidatedSpan = struct {
                         // The decoded URI is compared once, against
                         // the live declarations, to assign its
                         // equivalence class: the expanded-name check
-                        // then compares class ids, never URIs.
+                        // then compares class ids, never URIs. Each
+                        // declaration carries its decoded length and
+                        // seeded hash, so the pairwise decode runs
+                        // only on a full match.
+                        const uri_stats = try spanDecodedStats(bytes, uri);
                         var class: ?usize = null;
                         for (decls[0..decl_count]) |d| {
+                            if (d.decoded_len != uri_stats.len or
+                                d.uri_hash != uri_stats.hash) continue;
                             if (try spanDecodedEql(bytes, d.uri, uri)) {
                                 class = d.class;
                                 break;
@@ -567,6 +614,8 @@ pub const ValidatedSpan = struct {
                             .prefix = prefix,
                             .uri = uri,
                             .class = class.?,
+                            .decoded_len = uri_stats.len,
+                            .uri_hash = uri_stats.hash,
                         };
                         decl_count += 1;
                     }
