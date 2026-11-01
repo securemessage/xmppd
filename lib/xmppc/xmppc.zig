@@ -39,7 +39,7 @@
 //!     against the stream domain, which is also the SNI); .lookup_failed
 //!     (SERVFAIL, REFUSED, timeout, or a chain deadline with TLSA pending)
 //!     is a temporary failure of the target and never falls back to PKIX.
-//!   * pkix_only — always PKIX, TLSA is never consulted.
+//!   * pkix_only - always PKIX, TLSA is never consulted.
 //!   * none — lab rigs only: SSL_VERIFY_NONE, no hostname check. Never use
 //!     against untrusted networks.
 
