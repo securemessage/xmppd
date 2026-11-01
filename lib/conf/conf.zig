@@ -1908,6 +1908,19 @@ test "Diag set tolerates its own fields; a copy rebinds to its storage" {
     try testing.expectEqualStrings("old.test", d2.value);
 }
 
+test "a second rebind copies each field onto its own buffer safely" {
+    var d: Diag = .{};
+    d.set(.{ .key = "hostname", .value = "h.test", .detail = "x" });
+    // The first rebind detaches from borrowed storage; the second copies
+    // each field slice onto the buffer it already points into, which is
+    // the alias path in into() and must not trip @memcpy's overlap check.
+    d.rebind();
+    d.rebind();
+    try testing.expectEqualStrings("hostname", d.key);
+    try testing.expectEqualStrings("h.test", d.value);
+    try testing.expectEqualStrings("x", d.detail);
+}
+
 test "Diag.set copies from slices that point into its own buffers" {
     var d: Diag = .{};
     d.set(.{ .key = "hostname", .value = "old.test", .detail = "invalid value" });
