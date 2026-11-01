@@ -2515,9 +2515,18 @@ test "dns-async: a failed query build leaves no freed job in the list" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
 
-    try std.testing.expectError(error.InvalidName, r.resolve("bad..name", .client, 5222, 1, true));
-    try std.testing.expectError(error.InvalidName, r.query("bad..name", .a, 2));
+    // An unencodable name cannot exist on the wire: the chain reports
+    // nxdomain through the callback instead of erroring, and neither
+    // path leaves a freed job on the list (J1).
+    try r.resolve("bad..name", .client, 5222, 1, true);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    ctx.status = null;
+    try r.query("bad..name", .a, 2);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
