@@ -165,7 +165,8 @@ pub const Supervisor = struct {
         var result: ?*std.c.passwd = null;
         const rc = std.c.getpwuid_r(self.uid, &pw, &pw_buf, pw_buf.len, &result);
         if (rc != 0 or result == null) {
-            log.err("uid {d} has no passwd entry; refusing to spawn with root's groups", .{self.uid});
+            log.err("uid {d} has no passwd entry; refusing to spawn with root's groups",
+                    .{self.uid});
             return error.PasswdLookupFailed;
         }
         try self.adoptRunGid(result.?.gid);
@@ -191,7 +192,8 @@ pub const Supervisor = struct {
     /// The child receives argv[0] = exe_path, followed by self.args.
     pub fn spawnChild(self: *Supervisor) !posix.pid_t {
         if (self.exe_path.len == 0 or self.exe_path[0] != '/') {
-            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary", .{self.exe_path});
+            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary",
+                .{self.exe_path});
         }
 
         try self.resolveRunGid();
@@ -355,7 +357,8 @@ test "Supervisor: init and basic state" {
 
 test "Supervisor: init refuses root without a run user" {
     try std.testing.expectError(error.RunUserRequired, Supervisor.init("/unused", &.{}, 0));
-    try std.testing.expectError(error.RunUserRequired, Supervisor.initWithUser("/unused", &.{}, 0, 0, 0));
+    try std.testing.expectError(error.RunUserRequired, Supervisor.initWithUser("/unused",
+            &.{}, 0, 0, 0));
 
     const with_user = try Supervisor.initWithUser("/unused", &.{}, 65534, 65534, 0);
     try std.testing.expectEqual(@as(posix.uid_t, 65534), with_user.uid);
@@ -473,7 +476,8 @@ fn testSealedFd(blob: []const u8) !posix.fd_t {
     if (fd < 0) return error.MemfdFailed;
     errdefer posix.close(fd);
     _ = try posix.write(fd, blob);
-    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW |
+        std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
     if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
     return fd;
 }
@@ -490,6 +494,10 @@ fn readVerdict(fd: posix.fd_t, buf: *[3]u8) !void {
             _ = try posix.read(fd, buf);
             return;
         }
+        // ERR and NVAL may arrive without IN: bail instead of spinning
+        // on a 1 ms poll until the deadline budget runs out.
+        if (pfd[0].revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0)
+            return error.ChildGone;
         left = 1;
     }
 }
@@ -522,7 +530,8 @@ test "Supervisor: two children each hold only their own conf fd slot" {
         var b: [16]u8 = undefined;
         const rn = std.c.pread(4, &b, 16, 0);
         if (rn == 14 and std.mem.eql(u8, b[0..14], "--host=a.test\n")) verdict[0] = 'Y';
-        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
+        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and
+            std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
         // CLOEXEC is cleared only in this child's remap slot.
         const fl = std.c.fcntl(4, std.c.F.GETFD);
         if (fl >= 0 and fl & FD_CLOEXEC == 0) verdict[2] = 'Y';
@@ -538,7 +547,8 @@ test "Supervisor: two children each hold only their own conf fd slot" {
         var b: [16]u8 = undefined;
         const rn = std.c.pread(4, &b, 16, 0);
         if (rn == 14 and std.mem.eql(u8, b[0..14], "--host=b.test\n")) verdict[0] = 'Y';
-        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
+        if (std.c.fcntl(5, std.c.F.GETFD) < 0 and
+            std.c._errno().* == @intFromEnum(std.c.E.BADF)) verdict[1] = 'Y';
         const fl = std.c.fcntl(4, std.c.F.GETFD);
         if (fl >= 0 and fl & FD_CLOEXEC == 0) verdict[2] = 'Y';
         _ = std.c.write(3, &verdict, verdict.len);
@@ -754,7 +764,8 @@ test "Supervisor: uid-only drop resolves the run user's gid" {
     // and logs the refusal at err (D8).
     const captured = try runCaptured(childResolveUnknownUid);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
+            "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 test "Supervisor: spawnChild refuses to start when the run user has no passwd entry" {
@@ -764,7 +775,8 @@ test "Supervisor: spawnChild refuses to start when the run user has no passwd en
     // untouched state in its exit code.
     const captured = try runCaptured(childSpawnNoPasswd);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
+            "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 fn childKillSelf() callconv(.c) u8 {
@@ -916,7 +928,8 @@ test "Supervisor: a run gid of 0 is refused" {
     // exit code.
     const captured = try runCaptured(childAdoptGidZero);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
+            "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
 
     // A real primary gid is adopted.
     var sup = try Supervisor.init("/unused", &.{}, 1);

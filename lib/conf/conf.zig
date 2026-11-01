@@ -251,7 +251,8 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
         .@"union" => {
             // IntOr(K) and friends must bring their own parser; the check
             // stays inline because a helper call loses comptime decls.
-            if (!@hasDecl(T, "parse")) @compileError("conf.parseValue: unsupported union " ++ @typeName(T));
+            if (!@hasDecl(T, "parse")) @compileError("conf.parseValue: unsupported union " 
+                    ++ @typeName(T));
             return T.parse(s);
         },
         else => @compileError("conf.parseValue: unsupported type " ++ @typeName(T)),
@@ -276,7 +277,11 @@ fn parseBool(s: []const u8) ParseError!bool {
 /// union.
 pub fn IntOr(comptime K: type, comptime T: type) type {
     if (@typeInfo(K) != .@"enum") @compileError("conf.IntOr: keyword set must be an enum");
-    if (@typeInfo(T) != .int) @compileError("conf.IntOr: numeric arm must be an int");
+    // The numeric arm is unsigned: the digits-only rule can never spell
+    // a negative, so a signed T would only pretend to accept one.
+    if (@typeInfo(T) != .int or @typeInfo(T).int.signedness != .unsigned) {
+        @compileError("conf.IntOr: numeric arm must be an unsigned int");
+    }
     return union(enum) {
         kw: K,
         num: T,
@@ -284,7 +289,7 @@ pub fn IntOr(comptime K: type, comptime T: type) type {
         pub fn parse(s: []const u8) ParseError!@This() {
             // Strict plain decimal: digits only, no sign, underscores or
             // leading zeros; anything else must be a keyword. The number
-            // must fit T: an unbounded i64 accepted 99999999999.
+            // must fit T.
             var numeric = s.len != 0;
             for (s) |c| {
                 if (!std.ascii.isDigit(c)) numeric = false;
@@ -459,11 +464,14 @@ pub fn Loader(
             types[i] = fieldTypeOf(sec, f.field);
             // Every field type must be parseable.
             const T = types[i];
-            if (T != []const u8 and T != bool and T != Duration and T != std.net.Address and T != [][]const u8) {
+            if (T != []const u8 and T != bool and T != Duration and
+                T != std.net.Address and T != [][]const u8)
+            {
                 switch (@typeInfo(T)) {
                     .int, .@"enum" => {},
                     .@"union" => {
-                        if (!@hasDecl(T, "parse")) @compileError("conf: unsupported union type " ++ @typeName(T) ++
+                        if (!@hasDecl(T, "parse"))
+                            @compileError("conf: unsupported union type " ++ @typeName(T) ++
                             " for " ++ f.section ++ "." ++ f.field);
                     },
                     else => @compileError("conf: unparseable field type " ++ @typeName(T) ++
@@ -489,7 +497,8 @@ pub fn Loader(
                     if (j != i and std.mem.eql(u8, f.section, g.section) and
                         std.mem.eql(u8, a, keyOf(g)))
                     {
-                        @compileError("conf: alias '" ++ a ++ "' shadows key " ++ g.section ++ "." ++ keyOf(g));
+                        @compileError("conf: alias '" ++ a ++ "' shadows key " ++ g.section 
+                                ++ "." ++ keyOf(g));
                     }
                 }
             }
@@ -549,7 +558,8 @@ pub fn Loader(
             for (c.aliases) |a| {
                 for (cli) |d| {
                     if (std.mem.eql(u8, a, d.name)) {
-                        @compileError("conf: cli alias '--" ++ a ++ "' shadows '--" ++ d.name ++ "'");
+                        @compileError("conf: cli alias '--" ++ a ++ "' shadows '--" 
+                                ++ d.name ++ "'");
                     }
                 }
             }
@@ -625,11 +635,13 @@ pub fn Loader(
             @compileError("conf: no field " ++ section ++ "." ++ field);
         }
 
-        pub fn provenanceOf(self: *const Self, comptime section: []const u8, comptime field: []const u8) Source {
+        pub fn provenanceOf(self: *const Self, comptime section: []const u8,
+                comptime field: []const u8) Source {
             return self.provenance[comptime fieldIndex(section, field)];
         }
 
-        pub fn lineOf(self: *const Self, comptime section: []const u8, comptime field: []const u8) u32 {
+        pub fn lineOf(self: *const Self, comptime section: []const u8,
+                comptime field: []const u8) u32 {
             return self.lines[comptime fieldIndex(section, field)];
         }
 
@@ -665,7 +677,8 @@ pub fn Loader(
                 line_no += 1;
                 // The byte cap covers content: a CRLF line's \r is part
                 // of the terminator, not the line.
-                const content_len = raw.len - @intFromBool(raw.len != 0 and raw[raw.len - 1] == '\r');
+                const crlf = raw.len != 0 and raw[raw.len - 1] == '\r';
+                const content_len = raw.len - @intFromBool(crlf);
                 if (content_len > max_line_bytes) {
                     diag.set(.{ .path = path, .line = line_no, .detail = "line too long" });
                     return error.LineTooLong;
@@ -686,12 +699,14 @@ pub fn Loader(
                 if (line[0] == '#' or line[0] == ';') continue;
                 if (line[0] == '[') {
                     if (line.len < 3 or line[line.len - 1] != ']') {
-                        diag.set(.{ .path = path, .line = line_no, .detail = "malformed section header" });
+                        diag.set(.{ .path = path, .line = line_no,
+                                .detail = "malformed section header" });
                         return error.MalformedLine;
                     }
                     section = line[1 .. line.len - 1];
                     if (!sectionKnown(section)) {
-                        diag.set(.{ .path = path, .line = line_no, .section = section, .detail = "unknown section" });
+                        diag.set(.{ .path = path, .line = line_no, .section = section,
+                                .detail = "unknown section" });
                         return error.UnknownSection;
                     }
                     continue;
@@ -716,11 +731,13 @@ pub fn Loader(
                     return error.TooManyKeys;
                 }
                 const idx = findField(section, key) orelse {
-                    diag.set(.{ .path = path, .line = line_no, .section = section, .key = key, .detail = "unknown key" });
+                    diag.set(.{ .path = path, .line = line_no, .section = section,
+                            .key = key, .detail = "unknown key" });
                     return error.UnknownKey;
                 };
                 if (self.provenance[idx] == .file) {
-                    diag.set(.{ .path = path, .line = self.lines[idx], .section = section, .key = key, .detail = "duplicate key (first set here)" });
+                    diag.set(.{ .path = path, .line = self.lines[idx], .section = section,
+                            .key = key, .detail = "duplicate key (first set here)" });
                     return error.DuplicateKey;
                 }
                 try self.setField(idx, value, .{ .path = path, .line = line_no }, diag);
@@ -754,7 +771,8 @@ pub fn Loader(
                     break :blk dot != 0 and dot != name.len - 1;
                 };
                 if (!ok) {
-                    diag.set(.{ .key = line, .detail = "forwarded line is not --section.key=value" });
+                    diag.set(.{ .key = line,
+                            .detail = "forwarded line is not --section.key=value" });
                     return error.UnknownArgument;
                 }
                 try self.applyArgv(&.{line}, .forwarded, diag);
@@ -801,7 +819,8 @@ pub fn Loader(
                             diag.set(.{ .key = arg, .detail = "flag takes no value" });
                             return error.FlagTakesNoValue;
                         }
-                        try self.setField(cli_targets[ci], if (sets) "true" else "false", .{}, diag);
+                        try self.setField(cli_targets[ci], if (sets) "true" else "false",
+                                .{}, diag);
                         self.provenance[cli_targets[ci]] = prov;
                         continue;
                     }
@@ -840,7 +859,8 @@ pub fn Loader(
         /// field, so every loader accepts it. Meta and CLI-only fields
         /// (config_path, run_dir, help, --) are not forwarded. A
         /// formatted value past the 4 KiB scratch is ValueTooLong.
-        pub fn forwardArgs(self: *const Self, arena: Allocator, diag: *Diag) Error![]const []const u8 {
+        pub fn forwardArgs(self: *const Self, arena: Allocator,
+                diag: *Diag) Error![]const []const u8 {
             var list = std.ArrayList([]const u8).empty;
             var buf: [4096]u8 = undefined;
             inline for (fields, 0..) |f, i| {
@@ -848,10 +868,12 @@ pub fn Loader(
                 const v = @field(@field(self.values, f.section), f.field);
                 var w: std.Io.Writer = .fixed(&buf);
                 writeValue(field_types[i], &w, v) catch {
-                    diag.set(.{ .key = keyOf(f), .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                    diag.set(.{ .key = keyOf(f),
+                            .detail = "serialized value exceeds the 4 KiB scratch buffer" });
                     return error.ValueTooLong;
                 };
-                try list.append(arena, try std.fmt.allocPrint(arena, "--{s}.{s}={s}", .{ f.section, keyOf(f), w.buffered() }));
+                try list.append(arena, try std.fmt.allocPrint(arena, "--{s}.{s}={s}",
+                        .{ f.section, keyOf(f), w.buffered() }));
             }
             return list.toOwnedSlice(arena);
         }
@@ -868,14 +890,16 @@ pub fn Loader(
                 const v = @field(@field(self.values, f.section), f.field);
                 var w: std.Io.Writer = .fixed(&buf);
                 writeValue(field_types[i], &w, v) catch {
-                    diag.set(.{ .key = keyOf(f), .detail = "serialized value exceeds the 4 KiB scratch buffer" });
+                    diag.set(.{ .key = keyOf(f),
+                            .detail = "serialized value exceeds the 4 KiB scratch buffer" });
                     return error.ValueTooLong;
                 };
                 const val = w.buffered();
                 if (std.mem.indexOfScalar(u8, val, '\n') != null) {
                     var kbuf: [160]u8 = undefined;
                     diag.set(.{
-                        .key = std.fmt.bufPrint(&kbuf, "--{s}.{s}", .{ f.section, keyOf(f) }) catch keyOf(f),
+                        .key = std.fmt.bufPrint(&kbuf, "--{s}.{s}", .{ f.section,
+                                keyOf(f) }) catch keyOf(f),
                         .value = val,
                         .detail = "value contains a newline and cannot be forwarded",
                     });
@@ -899,9 +923,11 @@ pub fn Loader(
             inline for (cli, 0..) |c, i| {
                 const f = fields[cli_targets[i]];
                 if (c.flag) |sets| {
-                    try w.print("  --{s:<24} sets {s}.{s} {s}", .{ c.name, f.section, f.field, if (sets) "true" else "false" });
+                    try w.print("  --{s:<24} sets {s}.{s} {s}", .{ c.name, f.section,
+                            f.field, if (sets) "true" else "false" });
                 } else {
-                    try w.print("  --{s} <{s}>", .{ c.name, @typeName(field_types[cli_targets[i]]) });
+                    try w.print("  --{s} <{s}>", .{ c.name,
+                            @typeName(field_types[cli_targets[i]]) });
                 }
                 if (c.help.len != 0) try w.print("  {s}", .{c.help});
                 try w.writeByte('\n');
@@ -956,11 +982,13 @@ pub fn Loader(
             key: []const u8 = "",
         };
 
-        fn setField(self: *Self, idx: usize, s: []const u8, ctx: LoadContext, diag: *Diag) Error!void {
+        fn setField(self: *Self, idx: usize, s: []const u8, ctx: LoadContext,
+                diag: *Diag) Error!void {
             inline for (fields, 0..) |f, i| {
                 if (idx == i) {
                     if (field_types[i] == [][]const u8) {
-                        @field(@field(self.values, f.section), f.field) = parseList(s, self.arena_state.allocator()) catch |err| {
+                        @field(@field(self.values, f.section), f.field) = parseList(s,
+                                self.arena_state.allocator()) catch |err| {
                             switch (err) {
                                 error.OutOfMemory => return error.OutOfMemory,
                                 else => {
@@ -1022,7 +1050,8 @@ pub const ConfFd = struct {
 
     /// Creates the sealed blob object (CLOEXEC). Only a child's remap
     /// slot clears that flag.
-    pub fn create(blob: []const u8) error{ BlobTooLarge, MemfdFailed, WriteFailed, SealFailed }!ConfFd {
+    pub fn create(blob: []const u8) error{ BlobTooLarge, MemfdFailed, WriteFailed,
+            SealFailed }!ConfFd {
         if (blob.len > forward_max) return error.BlobTooLarge;
         const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
         if (fd < 0) return error.MemfdFailed;
@@ -1031,7 +1060,8 @@ pub const ConfFd = struct {
         while (off < blob.len) {
             off += posix.write(fd, blob[off..]) catch return error.WriteFailed;
         }
-        const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+        const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW |
+            std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
         if (std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) < 0) return error.SealFailed;
         return .{ .fd = fd };
     }
@@ -1092,7 +1122,8 @@ pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
         if (n == 0) break;
         if (blob.items.len + n > forward_max) {
             var mb: [96]u8 = undefined;
-            const msg = std.fmt.bufPrint(&mb, "forwarded configuration exceeds {d} bytes", .{forward_max}) catch "forwarded configuration too large";
+            const msg = std.fmt.bufPrint(&mb, "forwarded configuration exceeds {d} bytes",
+                    .{forward_max}) catch "forwarded configuration too large";
             diag.set(.{ .detail = msg });
             return error.FileTooLarge;
         }
@@ -1202,8 +1233,10 @@ const file_spec = [_]FieldSpec{
     .{ .section = "tls", .field = "key", .help = "TLS private key" },
     .{ .section = "tls", .field = "enabled", .help = "enable STARTTLS" },
     .{ .section = "auth", .field = "socket", .help = "auth IPC socket" },
-    .{ .section = "auth", .field = "max_per_account", .aliases = &.{"rate_max_per_account"}, .help = "auth attempts per account per window" },
-    .{ .section = "auth", .field = "max_per_ip", .aliases = &.{"rate_max_per_ip"}, .help = "auth attempts per IP per window" },
+    .{ .section = "auth", .field = "max_per_account", .aliases = &.{"rate_max_per_account"},
+            .help = "auth attempts per account per window" },
+    .{ .section = "auth", .field = "max_per_ip", .aliases = &.{"rate_max_per_ip"},
+            .help = "auth attempts per IP per window" },
     .{ .section = "auth", .field = "window_seconds", .help = "rate window in seconds" },
     .{ .section = "auth", .field = "lockout_duration", .help = "lockout duration" },
     .{ .section = "auth", .field = "lockout_threshold", .help = "failures before lockout" },
@@ -1446,7 +1479,8 @@ test "full file-key inventory parses with typed values" {
     try testing.expectEqualStrings("https://auth.example.test/token", v.oidc.token_endpoint);
     try testing.expectEqualStrings("https://auth.example.test/jwks", v.oidc.jwks_uri);
     try testing.expectEqualStrings("/etc/ssl/ca.pem", v.oidc.ca_file);
-    try testing.expectEqualStrings("https://auth.example.test/introspect", v.oidc.introspection_endpoint);
+    try testing.expectEqualStrings("https://auth.example.test/introspect",
+            v.oidc.introspection_endpoint);
     try testing.expectEqualStrings("example.test", v.oidc.user_domain);
     try testing.expectEqualStrings("/run/oidc.sock", v.oidc.socket);
     try testing.expectEqual(@as(u32, 9), v.oidc.max_per_account);
@@ -1466,7 +1500,11 @@ test "every daemon CLI flag maps and parses" {
     var diag: Diag = .{};
 
     var master = try MasterLoader.load(testing.allocator, .{
-        .args = &.{ "--host", "h.test", "--port", "5225", "--cert", "c.pem", "--key", "k.pem", "--core-path", "cp", "--auth-path", "ap", "--s2s-path", "sp", "--no-s2s", "--auth-socket", "as.sock", "--db", "d.db", "--config", "x.ini", "--log-file", "l.log", "--run-dir", "/run/x", "--background", "--version", "-h" },
+        .args = &.{ "--host", "h.test", "--port", "5225", "--cert", "c.pem", "--key",
+                "k.pem", "--core-path", "cp", "--auth-path", "ap", "--s2s-path", "sp",
+                        "--no-s2s", "--auth-socket", "as.sock", "--db", "d.db",
+                        "--config", "x.ini", "--log-file", "l.log", "--run-dir", "/run/x",
+                        "--background", "--version", "-h" },
     }, &diag);
     defer master.deinit();
     try testing.expectEqualStrings("h.test", master.values.server.hostname);
@@ -1487,7 +1525,10 @@ test "every daemon CLI flag maps and parses" {
     try testing.expect(master.values.meta.help);
 
     var core = try CoreLoader.load(testing.allocator, .{
-        .args = &.{ "--host", "h.test", "--address", "1.2.3.4", "--bind", "5.6.7.8", "--port", "5226", "--cert", "c.pem", "--key", "k.pem", "--auth-socket", "a.sock", "--s2s-socket", "s.sock", "--listen-fd", "7", "--db", "d.db", "--muc-host", "m.test", "-c", "y.ini", "--no-tls", "-h" },
+        .args = &.{ "--host", "h.test", "--address", "1.2.3.4", "--bind", "5.6.7.8",
+                "--port", "5226", "--cert", "c.pem", "--key", "k.pem", "--auth-socket",
+                        "a.sock", "--s2s-socket", "s.sock", "--listen-fd", "7", "--db",
+                        "d.db", "--muc-host", "m.test", "-c", "y.ini", "--no-tls", "-h" },
     }, &diag);
     defer core.deinit();
     try testing.expectEqualStrings("h.test", core.values.server.hostname);
@@ -1505,7 +1546,10 @@ test "every daemon CLI flag maps and parses" {
     try testing.expect(core.values.meta.help);
 
     var auth = try AuthLoader.load(testing.allocator, .{
-        .args = &.{ "--config", "a.ini", "--db", "d.db", "--socket", "a.sock", "--max-auth-per-account", "9", "--max-auth-per-ip", "30", "--auth-window", "90", "--lockout-duration", "900", "--lockout-threshold", "3", "--no-rate-limit", "--enable-registration", "--no-require-invite", "-h" },
+        .args = &.{ "--config", "a.ini", "--db", "d.db", "--socket", "a.sock",
+                "--max-auth-per-account", "9", "--max-auth-per-ip", "30", "--auth-window",
+                        "90", "--lockout-duration", "900", "--lockout-threshold", "3",
+                        "--no-rate-limit", "--enable-registration", "--no-require-invite", "-h" },
     }, &diag);
     defer auth.deinit();
     try testing.expectEqualStrings("a.ini", auth.values.meta.config_path);
@@ -1530,7 +1574,9 @@ test "every daemon CLI flag maps and parses" {
     try testing.expect(oidc.values.meta.help);
 
     var s2s = try S2sLoader.load(testing.allocator, .{
-        .args = &.{ "--host", "h.test", "--address", "1.2.3.4", "--port", "5271", "--core-socket", "c.sock", "--cert", "c.pem", "--key", "k.pem", "--listen-fd", "9", "--config", "s.ini", "-h" },
+        .args = &.{ "--host", "h.test", "--address", "1.2.3.4", "--port", "5271",
+                "--core-socket", "c.sock", "--cert", "c.pem", "--key", "k.pem",
+                        "--listen-fd", "9", "--config", "s.ini", "-h" },
     }, &diag);
     defer s2s.deinit();
     try testing.expectEqualStrings("h.test", s2s.values.server.hostname);
@@ -1544,7 +1590,8 @@ test "every daemon CLI flag maps and parses" {
     try testing.expect(s2s.values.meta.help);
 
     var ctl = try CtlLoader.load(testing.allocator, .{
-        .args = &.{ "--db", "d.db", "--auth-socket", "a.sock", "--password", "pw", "--password-file", "pf", "--max-uses", "5", "--expires", "48" },
+        .args = &.{ "--db", "d.db", "--auth-socket", "a.sock", "--password", "pw",
+                "--password-file", "pf", "--max-uses", "5", "--expires", "48" },
     }, &diag);
     defer ctl.deinit();
     try testing.expectEqualStrings("d.db", ctl.values.server.db_path);
@@ -1608,14 +1655,16 @@ test "unknown section, key, bad value and duplicates report file:line" {
     try testing.expectEqual(@as(u32, 2), diag.line);
     try testing.expectEqualStrings("abc", diag.value);
 
-    const p4 = try writeTempConfig(&tmp.dir, "d.ini", "[server]\nc2s_port = 1\nc2s_port = 2\n", &path_buf);
+    const p4 = try writeTempConfig(&tmp.dir, "d.ini",
+            "[server]\nc2s_port = 1\nc2s_port = 2\n", &path_buf);
     try testing.expectError(error.DuplicateKey, l.loadFile(p4, &diag));
     try testing.expectEqual(@as(u32, 2), diag.line);
 
     const p5 = try writeTempConfig(&tmp.dir, "e.ini", "[server]\nno-equals-sign\n", &path_buf);
     try testing.expectError(error.MalformedLine, l.loadFile(p5, &diag));
 
-    const p6 = try writeTempConfig(&tmp.dir, "f.ini", "[server]\nhostname = ok\nbad line\n", &path_buf);
+    const p6 = try writeTempConfig(&tmp.dir, "f.ini", "[server]\nhostname = ok\nbad line\n",
+            &path_buf);
     try testing.expectError(error.MalformedLine, l.loadFile(p6, &diag));
     try testing.expectEqual(@as(u32, 3), diag.line);
 
@@ -1688,7 +1737,8 @@ test "the canonical blob parses identically across two different loaders" {
     }, &d0);
     defer p2.deinit();
     const blob2 = try p2.forwardBlob(arena.allocator(), &diag);
-    var core2 = try CoreLoader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob2) }, &diag);
+    var core2 = try CoreLoader.load(testing.allocator,
+            .{ .conf_fd = try testConfFd(blob2) }, &diag);
     defer core2.deinit();
     try testing.expectEqual(@as(u32, 7), core2.values.core.max_sessions);
     // A master-only spelling never leaks through: --core-path had no
@@ -1749,7 +1799,8 @@ test "keys before any section are rejected" {
         \\c2s_port = 5222
         \\
     , &path_buf);
-    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator, .{ .path = bad }, &diag));
+    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator,
+            .{ .path = bad }, &diag));
     try testing.expectEqual(@as(u32, 1), diag.line);
 }
 
@@ -1799,7 +1850,8 @@ test "ConfFd creates a fully sealed CLOEXEC blob and rebuild swaps it" {
     defer c.deinit();
     const fl = std.c.fcntl(c.fd, std.c.F.GETFD);
     try testing.expect(fl >= 0 and fl & 1 != 0); // FD_CLOEXEC set on the master copy
-    try testing.expectEqual(@as(c_int, 0xf), @as(c_int, @intCast(std.c.fcntl(c.fd, std.c.F.GET_SEALS))));
+    try testing.expectEqual(@as(c_int, 0xf), @as(c_int, @intCast(std.c.fcntl(c.fd,
+            std.c.F.GET_SEALS))));
     var b: [32]u8 = undefined;
     try testing.expectEqual(@as(isize, 25), std.c.pread(c.fd, &b, 32, 0));
     try testing.expectEqualStrings("--server.hostname=x.test\n", b[0..25]);
@@ -1853,7 +1905,8 @@ test "forwarded blob round-trips through a sealed memfd with .forwarded provenan
     try testing.expectEqual(.forwarded, child.provenanceOf("s2s", "enabled"));
     try testing.expectEqual(.cli, child.provenanceOf("server", "c2s_port"));
     // The loader closed the fd after reading.
-    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+    try testing.expect(std.c.fcntl(fd,
+            std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
 }
 
 test "a forwarded value beats the file but loses to the child CLI" {
@@ -1979,19 +2032,22 @@ test "readForwarded caps the blob at 256 KiB and still closes the fd" {
     const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
     try testing.expect(fd >= 0);
     try posix.ftruncate(fd, forward_max + 1);
-    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW |
+        std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
     try testing.expect(std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) == 0);
 
     var diag: Diag = .{};
     try testing.expectError(error.FileTooLarge, readForwarded(fd, testing.allocator, &diag));
-    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
+    try testing.expect(std.c.fcntl(fd,
+            std.c.F.GETFD) < 0 and std.c._errno().* == @intFromEnum(std.c.E.BADF));
 }
 
 test "readForwarded accepts a blob of exactly the cap and reports an empty value" {
     const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
     try testing.expect(fd >= 0);
     try posix.ftruncate(fd, forward_max); // exact cap is inside the bound
-    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW | std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
+    const seals: c_int = std.c.F.SEAL_WRITE | std.c.F.SEAL_GROW |
+        std.c.F.SEAL_SHRINK | std.c.F.SEAL_SEAL;
     try testing.expect(std.c.fcntl(fd, std.c.F.ADD_SEALS, seals) == 0);
     var diag: Diag = .{};
     const blob = try readForwarded(fd, testing.allocator, &diag);
@@ -2006,7 +2062,8 @@ test "readForwarded accepts a blob of exactly the cap and reports an empty value
         \\hostname = #x
         \\
     , &path_buf);
-    try testing.expectError(error.MalformedLine, MasterLoader.load(testing.allocator, .{ .path = path }, &diag));
+    try testing.expectError(error.MalformedLine, MasterLoader.load(testing.allocator,
+            .{ .path = path }, &diag));
     try testing.expectEqualStrings("empty value", diag.detail);
 }
 
@@ -2092,7 +2149,8 @@ test "load closes the conf fd even when the file fails" {
     const fd = try testConfFd("--server.hostname=x.test\n");
     try testing.expectError(
         error.FileNotFound,
-        MasterLoader.load(testing.allocator, .{ .path = "/nonexistent/x.ini", .conf_fd = fd }, &diag),
+        MasterLoader.load(testing.allocator, .{ .path = "/nonexistent/x.ini",
+                .conf_fd = fd }, &diag),
     );
     try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0);
 }
@@ -2128,7 +2186,8 @@ test "diag fields stay readable after a failed load frees the arena" {
         \\
     , &path_buf);
     var diag: Diag = .{};
-    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator, .{ .path = path }, &diag));
+    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator,
+            .{ .path = path }, &diag));
     // load() already freed its arena; Diag slices must address its own
     // buffers, not that freed memory.
     try testing.expectEqualStrings("nosuchkey", diag.key);
@@ -2164,7 +2223,8 @@ test "the line limit is exactly 1024 bytes, not off by one" {
     try testing.expectEqual(@as(usize, vlen), l_cr.values.server.hostname.len);
     try body.insert(testing.allocator, body.items.len - 1, 'b');
     const over = try writeTempConfig(&tmp.dir, "edge2.ini", body.items, &path_buf);
-    try testing.expectError(error.LineTooLong, MasterLoader.load(testing.allocator, .{ .path = over }, &diag));
+    try testing.expectError(error.LineTooLong, MasterLoader.load(testing.allocator,
+            .{ .path = over }, &diag));
 }
 
 test "forwarded values containing spaces round-trip untouched" {
@@ -2322,7 +2382,8 @@ test "comma-list and int-or-keyword field types parse and serialize" {
 
     // Empty items and over-long lists are errors, not silent drops.
     var diag3: Diag = .{};
-    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator, .{ .args = &.{"--addrs=a,,b"} }, &diag3));
+    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator,
+            .{ .args = &.{"--addrs=a,,b"} }, &diag3));
     var over = std.ArrayList(u8).empty;
     defer over.deinit(testing.allocator);
     try over.appendSlice(testing.allocator, "--addrs=");
@@ -2330,7 +2391,8 @@ test "comma-list and int-or-keyword field types parse and serialize" {
         if (i != 0) try over.append(testing.allocator, ',');
         try over.append(testing.allocator, 'a');
     }
-    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator, .{ .args = &.{over.items} }, &diag3));
+    try testing.expectError(error.BadValue, M6Loader.load(testing.allocator,
+            .{ .args = &.{over.items} }, &diag3));
 }
 
 test "an empty list default forwards through the blob" {
