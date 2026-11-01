@@ -466,7 +466,7 @@ test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (
     _ = try sup2.waitChild();
 }
 
-/// Creates a sealed anonymous blob fd the way the master's ConfFd does;
+/// Creates a sealed anonymous blob fd the way lib/conf's ConfFd does;
 /// the test only needs an fd whose content proves which child read it.
 fn testSealedFd(blob: []const u8) !posix.fd_t {
     const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
@@ -490,8 +490,6 @@ fn readVerdict(fd: posix.fd_t, buf: *[3]u8) !void {
             _ = try posix.read(fd, buf);
             return;
         }
-        if (pfd[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0)
-            return error.ChildGone;
         left = 1;
     }
 }

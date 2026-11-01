@@ -622,7 +622,10 @@ pub fn Loader(
             var it = std.mem.splitScalar(u8, content, '\n');
             while (it.next()) |raw| {
                 line_no += 1;
-                if (raw.len > max_line_bytes) {
+                // The byte cap covers content: a CRLF line's \r is part
+                // of the terminator, not the line.
+                const content_len = raw.len - @intFromBool(raw.len != 0 and raw[raw.len - 1] == '\r');
+                if (content_len > max_line_bytes) {
                     diag.set(.{ .path = path, .line = line_no, .detail = "line too long" });
                     return error.LineTooLong;
                 }
@@ -1045,7 +1048,9 @@ pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
         };
         if (n == 0) break;
         if (blob.items.len + n > forward_max) {
-            diag.set(.{ .detail = "forwarded configuration exceeds 256 KiB" });
+            var mb: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&mb, "forwarded configuration exceeds {d} bytes", .{forward_max}) catch "forwarded configuration too large";
+            diag.set(.{ .detail = msg });
             return error.FileTooLarge;
         }
         try blob.appendSlice(gpa, buf[0..n]);
@@ -2048,6 +2053,17 @@ test "the line limit is exactly 1024 bytes, not off by one" {
     var l = try MasterLoader.load(testing.allocator, .{ .path = ok }, &diag);
     defer l.deinit();
     try testing.expectEqual(@as(usize, vlen), l.values.server.hostname.len);
+    // The same 1024 content bytes ending CRLF must parse too: the \r
+    // belongs to the terminator, not the line.
+    var body_cr = std.ArrayList(u8).empty;
+    defer body_cr.deinit(testing.allocator);
+    try body_cr.appendSlice(testing.allocator, "[server]\r\nhostname = ");
+    for (0..vlen) |_| try body_cr.append(testing.allocator, 'a');
+    try body_cr.appendSlice(testing.allocator, "\r\n");
+    const ok_cr = try writeTempConfig(&tmp.dir, "edgecr.ini", body_cr.items, &path_buf);
+    var l_cr = try MasterLoader.load(testing.allocator, .{ .path = ok_cr }, &diag);
+    defer l_cr.deinit();
+    try testing.expectEqual(@as(usize, vlen), l_cr.values.server.hostname.len);
     try body.insert(testing.allocator, body.items.len - 1, 'b');
     const over = try writeTempConfig(&tmp.dir, "edge2.ini", body.items, &path_buf);
     try testing.expectError(error.LineTooLong, MasterLoader.load(testing.allocator, .{ .path = over }, &diag));
