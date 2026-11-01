@@ -1704,11 +1704,12 @@ test "engine: loopOnce with a stale generation returns before the wait (T252)" {
 }
 
 /// Minimal UDP DNS fake for the policy tests: answers _xmpps SRV with
-/// NODATA, _xmpp SRV with one t.test:5222 target, A with 127.0.0.1, and
+/// NODATA, _xmpp SRV with one t.test:target_port target, A with 127.0.0.1, and
 /// everything else (AAAA, TLSA) NODATA. TLSA queries are only counted.
 const PolicyDns = struct {
     udp_fd: posix.fd_t,
     port: u16,
+    target_port: u16 = 5222,
     alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
@@ -1771,6 +1772,7 @@ const PolicyDns = struct {
                 1,    't',  4,    't', 'e', 's', 't', 0,
             };
             @memcpy(out[pos..][0..rr.len], &rr);
+            std.mem.writeInt(u16, out[pos + 14 ..][0..2], self.target_port, .big);
             pos += rr.len;
             ancount = 1;
         } else if (qtype == wire.TYPE_A) {
@@ -1819,6 +1821,17 @@ test "engine: pkix_only resolution sends zero TLSA queries" {
 
     const srv = try startPolicyDns();
     defer stopPolicyDns(srv);
+
+    // The session dials the SRV target's port: use an ephemeral
+    // listener, not 5222 where a live xmppd answers on this host.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    try posix.bind(lfd, &(try std.net.Address.parseIp("127.0.0.1", 0)).any, @sizeOf(posix.sockaddr.in));
+    var laddr: posix.sockaddr = undefined;
+    var llen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &laddr, &llen);
+    try posix.listen(lfd, 1);
+    srv.target_port = std.net.Address.initPosix(@alignCast(&laddr)).getPort();
 
     eng.resolver = Resolver.init(alloc);
     eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", srv.port));
