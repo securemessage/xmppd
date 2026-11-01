@@ -1796,6 +1796,29 @@ test "expanded-name compare pins: lengths and entity names (R6-5)" {
     );
 }
 
+test "the URI class match sees declarations on every live scope (R7-1)" {
+    // q on <c> decodes to the URI p bound on <r>: a class match that
+    // skips outer-scope declarations misses the collision and wrongly
+    // accepts the duplicate expanded name.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(
+            testing.allocator,
+            "<r xmlns:p='urn:a'><c xmlns:q='urn:&#97;' p:x='1' q:x='2'/></r>",
+        ),
+    );
+    // The match must see intermediate scopes, not only the current tag
+    // or the outermost element: <c>'s declarations are popped, d's q
+    // and e's p both decode to urn:a and the expanded names collide.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(
+            testing.allocator,
+            "<r><c xmlns:p='urn:a' xmlns:q='urn:b'/><d xmlns:q='urn:a'><e xmlns:p='urn:&#97;' p:x='1' q:x='2'/></d></r>",
+        ),
+    );
+}
+
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
