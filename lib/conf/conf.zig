@@ -1848,6 +1848,83 @@ test "readForwarded refuses low, unsealed and dead fds without panicking" {
     try testing.expectEqual(@as(u8, 'Y'), v[0]);
 }
 
+test "readForwarded rejects an unsealed fd in the remap range" {
+    // The seal check on its own: a remap-slot fd whose object carries
+    // no seals at all.
+    const fd = std.c.memfd_create("xmppd-conf", std.c.MFD.CLOEXEC | std.c.MFD.ALLOW_SEALING);
+    try testing.expect(fd >= 3);
+    var diag: Diag = .{};
+    try testing.expectError(error.UnsealedFd, readForwarded(fd, testing.allocator, &diag));
+    try testing.expectEqualStrings("conf fd is not fully sealed", diag.detail);
+    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0);
+}
+
+test "readForwarded rejects a sealed fd below the remap range" {
+    // The fd<3 check on its own: the object IS fully sealed, so only
+    // the range check can refuse it.
+    var sp: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sp) != 0) return error.Socketpair;
+    defer posix.close(sp[0]);
+    defer posix.close(sp[1]);
+    const pid = try posix.fork();
+    if (pid == 0) {
+        const c = ConfFd.create("--server.hostname=x.test\n") catch std.c._exit(125);
+        if (std.c.dup2(c.fd, 0) < 0) std.c._exit(125);
+        var d0: Diag = .{};
+        var v: [1]u8 = .{'N'};
+        if (readForwarded(0, testing.allocator, &d0)) |buf| {
+            testing.allocator.free(buf);
+        } else |e| {
+            if (e == error.UnsealedFd and
+                std.mem.eql(u8, d0.detail, "conf fd is below the remap slot range")) v[0] = 'Y';
+        }
+        _ = std.c.write(sp[1], &v, 1);
+        std.c._exit(0);
+    }
+    var v: [1]u8 = undefined;
+    _ = try posix.read(sp[0], &v);
+    _ = posix.waitpid(pid, 0);
+    try testing.expectEqual(@as(u8, 'Y'), v[0]);
+}
+
+test "ConfFd.create accepts a blob of exactly the cap" {
+    var exact: [forward_max]u8 = undefined;
+    @memset(&exact, 'x');
+    var c = try ConfFd.create(&exact);
+    c.deinit();
+}
+
+test "a list of exactly the item cap parses" {
+    var items = std.ArrayList(u8).empty;
+    defer items.deinit(testing.allocator);
+    try items.appendSlice(testing.allocator, "--addrs=");
+    for (0..list_max_items) |i| {
+        if (i != 0) try items.append(testing.allocator, ',');
+        try items.append(testing.allocator, 'a');
+    }
+    var diag: Diag = .{};
+    var l = try M6Loader.load(testing.allocator, .{ .args = &.{items.items} }, &diag);
+    defer l.deinit();
+    try testing.expectEqual(list_max_items, l.values.srv.addrs.len);
+}
+
+test "diag fields stay readable after a failed load frees the arena" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "badkey.ini",
+        \\[server]
+        \\nosuchkey = 1
+        \\
+    , &path_buf);
+    var diag: Diag = .{};
+    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator, .{ .path = path }, &diag));
+    // load() already freed its arena; Diag slices must address its own
+    // buffers, not that freed memory.
+    try testing.expectEqualStrings("nosuchkey", diag.key);
+    try testing.expectEqualStrings("server", diag.section);
+}
+
 test "the line limit is exactly 1024 bytes, not off by one" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
