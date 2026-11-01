@@ -4593,6 +4593,29 @@ test "dns-async: a fallback TLSA answer marks the targets present" {
     try std.testing.expect(res.targets[0].tlsa.len >= 1);
 }
 
+test "dns-async: a fallback unparsable TLSA answer is lookup_failed" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.empty_srv.store(true, .monotonic);
+    srv.tlsa_garbage.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("dual.test", .client, 5222, 3, true);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
 test "dns-async: an unparsable TLSA answer is lookup_failed, not absent" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
