@@ -274,9 +274,12 @@ pub const list_max_items: usize = 64;
 
 /// Splits a comma list into trimmed item slices; the array comes from
 /// `arena`, the items borrow the source text like scalar strings do.
-/// Empty items ("a,,b") and lists past list_max_items are errors.
+/// An empty value is an empty list (a forwarded empty default arrives
+/// as "--section.key="). Empty items ("a,,b") and lists past
+/// list_max_items are errors.
 fn parseList(s: []const u8, arena: Allocator) Error![][]const u8 {
     var items = std.ArrayList([]const u8).empty;
+    if (s.len == 0) return items.toOwnedSlice(arena);
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |item| {
         const t = std.mem.trim(u8, item, " \t");
@@ -2026,6 +2029,30 @@ test "comma-list and int-or-keyword field types parse and serialize" {
         try over.append(testing.allocator, 'a');
     }
     try testing.expectError(error.BadValue, M6Loader.load(testing.allocator, .{ .args = &.{over.items} }, &diag3));
+}
+
+test "an empty list default forwards through the blob" {
+    var diag: Diag = .{};
+    var parent = try M6Loader.load(testing.allocator, .{ .args = &.{} }, &diag);
+    defer parent.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const blob = try parent.forwardBlob(arena.allocator(), &diag);
+    // The empty default serializes as a bare --srv.addrs= line.
+    try testing.expect(std.mem.indexOf(u8, blob, "--srv.addrs=\n") != null);
+    var child = try M6Loader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob) }, &diag);
+    defer child.deinit();
+    try testing.expectEqual(@as(usize, 0), child.values.srv.addrs.len);
+
+    // A populated list forwards as a comma-joined value.
+    var p2 = try M6Loader.load(testing.allocator, .{ .args = &.{"--addrs=one,two"} }, &diag);
+    defer p2.deinit();
+    const blob2 = try p2.forwardBlob(arena.allocator(), &diag);
+    try testing.expect(std.mem.indexOf(u8, blob2, "--srv.addrs=one,two\n") != null);
+    var child2 = try M6Loader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob2) }, &diag);
+    defer child2.deinit();
+    try testing.expectEqual(@as(usize, 2), child2.values.srv.addrs.len);
+    try testing.expectEqualStrings("two", child2.values.srv.addrs[1]);
 }
 
 const capped_sections = struct {
