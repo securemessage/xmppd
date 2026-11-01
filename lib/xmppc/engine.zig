@@ -38,6 +38,7 @@ const Transport = @import("transport.zig").Transport;
 const Resolver = @import("dns_async").Resolver;
 const Resolution = @import("dns_async").Resolution;
 const DnsStatus = @import("dns_async").Status;
+const wire = @import("wire");
 
 const log = std.log.scoped(.xmppc);
 
@@ -1700,4 +1701,144 @@ test "engine: loopOnce with a stale generation returns before the wait (T252)" {
     try std.testing.expectError(error.Stopping, eng.loopOnce(gen));
     try std.testing.expect(eng.stats.wakes_read.load(.monotonic) > wakes_before);
     try std.testing.expectEqual(@as(usize, 0), fired);
+}
+
+/// Minimal UDP DNS fake for the policy tests: answers _xmpps SRV with
+/// NODATA, _xmpp SRV with one t.test:5222 target, A with 127.0.0.1, and
+/// everything else (AAAA, TLSA) NODATA. TLSA queries are only counted.
+const PolicyDns = struct {
+    udp_fd: posix.fd_t,
+    port: u16,
+    alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    thread: std.Thread = undefined,
+
+    fn run(self: *PolicyDns) void {
+        var buf: [2048]u8 = undefined;
+        var out: [2048]u8 = undefined;
+        while (self.alive.load(.acquire)) {
+            var pfd = [1]posix.pollfd{.{ .fd = self.udp_fd, .events = std.c.POLL.IN, .revents = 0 }};
+            _ = posix.poll(&pfd, 50) catch return;
+            if (pfd[0].revents == 0) continue;
+            var peer: posix.sockaddr = undefined;
+            var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+            const n = posix.recvfrom(self.udp_fd, &buf, 0, &peer, &plen) catch continue;
+            const resp_len = self.answer(&out, buf[0..n]);
+            if (resp_len > 0) _ = posix.sendto(self.udp_fd, out[0..resp_len], 0, &peer, plen) catch {};
+        }
+    }
+
+    fn answer(self: *PolicyDns, out: []u8, pkt: []const u8) usize {
+        // Question name in dotted form; query packets carry one question.
+        var name_buf: [255]u8 = undefined;
+        var name_len: usize = 0;
+        var i: usize = 12;
+        while (i < pkt.len and pkt[i] != 0) {
+            const llen: usize = pkt[i];
+            i += 1;
+            if (i + llen > pkt.len or name_len + llen + 1 > name_buf.len) return 0;
+            if (name_len != 0) {
+                name_buf[name_len] = '.';
+                name_len += 1;
+            }
+            @memcpy(name_buf[name_len..][0..llen], pkt[i..][0..llen]);
+            name_len += llen;
+            i += llen;
+        }
+        i += 1; // root zero
+        if (i + 4 > pkt.len) return 0;
+        const qname = name_buf[0..name_len];
+        const qtype = std.mem.readInt(u16, pkt[i..][0..2], .big);
+        const q_end = i + 4;
+        if (qtype == wire.TYPE_TLSA) _ = self.tlsa_recvd.fetchAdd(1, .monotonic);
+
+        @memcpy(out[0..12], pkt[0..12]);
+        out[2] = 0x81; // standard response, NOERROR
+        out[3] = 0x80;
+        @memset(out[8..12], 0);
+        @memcpy(out[12..q_end], pkt[12..q_end]);
+        var pos = q_end;
+        var ancount: u16 = 0;
+        if (qtype == wire.TYPE_SRV and !std.mem.startsWith(u8, qname, "_xmpps")) {
+            const rr = [_]u8{
+                0xC0, 0x0C, // name -> question
+                0,    wire.TYPE_SRV, 0, 1, // type, class IN
+                0,    0,    0,    60, // ttl
+                0,    14, // rdlength
+                0,    0, // priority
+                0,    0, // weight
+                0x14, 0x76, // port 5222
+                1,    't',  4,    't', 'e', 's', 't', 0,
+            };
+            @memcpy(out[pos..][0..rr.len], &rr);
+            pos += rr.len;
+            ancount = 1;
+        } else if (qtype == wire.TYPE_A) {
+            const rr = [_]u8{
+                0xC0, 0x0C, 0,    1,    0,   1,
+                0,    0,    0,    60,   0,   4,
+                127,  0,    0,    1,
+            };
+            @memcpy(out[pos..][0..rr.len], &rr);
+            pos += rr.len;
+            ancount = 1;
+        }
+        std.mem.writeInt(u16, out[6..8], ancount, .big);
+        return pos;
+    }
+};
+
+fn startPolicyDns() !*PolicyDns {
+    const srv = try std.testing.allocator.create(PolicyDns);
+    srv.* = .{
+        .udp_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0),
+        .port = 0,
+    };
+    const bind_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(srv.udp_fd, &bind_addr.any, bind_addr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(srv.udp_fd, &actual, &slen);
+    srv.port = std.net.Address.initPosix(@alignCast(&actual)).getPort();
+    srv.thread = try std.Thread.spawn(.{}, PolicyDns.run, .{srv});
+    return srv;
+}
+
+fn stopPolicyDns(srv: *PolicyDns) void {
+    srv.alive.store(false, .release);
+    srv.thread.join();
+    posix.close(srv.udp_fd);
+    std.testing.allocator.destroy(srv);
+}
+
+test "engine: pkix_only resolution sends zero TLSA queries" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    eng.default_tls_policy = .pkix_only;
+
+    const srv = try startPolicyDns();
+    defer stopPolicyDns(srv);
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", srv.port));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "x.test",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    const s = eng.sessionAt(h).?;
+
+    // Resolve through the real chain (_xmpps NODATA -> _xmpp SRV -> A/AAAA).
+    var spins: usize = 0;
+    while (s.phase == .resolving and spins < 400) : (spins += 1)
+        eng.resolver.?.step(10);
+
+    try std.testing.expect(s.resolution != null);
+    try std.testing.expectEqual(@as(u32, 0), srv.tlsa_recvd.load(.monotonic));
 }
