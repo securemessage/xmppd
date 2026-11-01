@@ -191,25 +191,54 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == bool) return parseBool(s);
     if (T == Duration) return Duration.parse(s);
     if (T == std.net.Address) {
-        if (std.net.Address.parseIpAndPort(s)) |a| {
-            return a;
-        } else |_| {}
-        const a = std.net.Address.parseIp(s, 0) catch return error.BadValue;
-        // A "::"-compressed literal ending in :digits is ambiguous with
-        // an unbracketed v6:port ("::1:5222"); require "[v6]:port".
-        if (std.mem.indexOf(u8, s, "::") != null) {
-            if (std.mem.lastIndexOfScalar(u8, s, ':')) |i| {
-                const last = s[i + 1 ..];
-                var digits = last.len != 0;
-                for (last) |c| {
-                    if (!std.ascii.isDigit(c)) digits = false;
-                }
-                if (digits) {
-                    if (std.net.Address.parseIp(s[0..i], 0)) |_| {
-                        return error.BadValue;
-                    } else |_| {}
+        // A v6 zone suffix "%scope" (bare or inside []) is refused by
+        // std's parsers in the uncompressed form, so strip it first and
+        // set scope_id after. The suffix also disambiguates a literal
+        // ending in :digits: "fe80::1:2:3:4:5:6%1" can never carry a
+        // port, so the ::-ambiguity rule below does not apply to it.
+        var buf: [80]u8 = undefined;
+        var work = s;
+        var scope: u32 = 0;
+        var had_scope = false;
+        if (std.mem.indexOfScalar(u8, s, '%')) |pct| {
+            const beg = pct + 1;
+            var end = beg;
+            while (end < s.len and std.ascii.isDigit(s[end])) end += 1;
+            if (end == beg or (end < s.len and s[end] != ']')) return error.BadValue;
+            scope = std.fmt.parseInt(u32, s[beg..end], 10) catch return error.BadValue;
+            had_scope = true;
+            var bw: std.Io.Writer = .fixed(&buf);
+            bw.writeAll(s[0..pct]) catch return error.BadValue;
+            bw.writeAll(s[end..]) catch return error.BadValue;
+            work = bw.buffered();
+        }
+        var a: std.net.Address = undefined;
+        parsed: {
+            if (std.net.Address.parseIpAndPort(work)) |ok| {
+                a = ok;
+                break :parsed;
+            } else |_| {}
+            a = std.net.Address.parseIp(work, 0) catch return error.BadValue;
+            // A "::"-compressed literal ending in :digits is ambiguous
+            // with an unbracketed v6:port ("::1:5222"); require "[v6]:port".
+            if (!had_scope and std.mem.indexOf(u8, work, "::") != null) {
+                if (std.mem.lastIndexOfScalar(u8, work, ':')) |i| {
+                    const last = work[i + 1 ..];
+                    var digits = last.len != 0;
+                    for (last) |c| {
+                        if (!std.ascii.isDigit(c)) digits = false;
+                    }
+                    if (digits) {
+                        if (std.net.Address.parseIp(work[0..i], 0)) |_| {
+                            return error.BadValue;
+                        } else |_| {}
+                    }
                 }
             }
+        }
+        if (scope != 0) {
+            if (a.any.family != posix.AF.INET6) return error.BadValue;
+            a.in6.sa.scope_id = scope;
         }
         return a;
     }
@@ -1652,7 +1681,7 @@ test "the canonical blob parses identically across two different loaders" {
     // file field, so nothing in the blob can fail an auth load.
 }
 
-test "pidfile parses and keys before any section are rejected" {
+test "pidfile parses from the file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [4096]u8 = undefined;
@@ -1665,7 +1694,39 @@ test "pidfile parses and keys before any section are rejected" {
     var l = try MasterLoader.load(testing.allocator, .{ .path = path }, &diag);
     defer l.deinit();
     try testing.expectEqualStrings("/run/xmppd.pid", l.values.server.pidfile);
+}
 
+test "a scoped full-length IPv6 address round-trips through forwarding" {
+    var diag: Diag = .{};
+    var d0: Diag = .{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Bare form on the CLI. writeValue emits the uncompressed
+    // [fe80:0:1:2:3:4:5:6%1] spelling, which must parse back.
+    for ([_][]const u8{
+        "--server.bind_address=fe80::1:2:3:4:5:6%1",
+        "--server.bind_address=[fe80:0:1:2:3:4:5:6%1]:5269",
+    }) |arg| {
+        var parent = try MasterLoader.load(testing.allocator, .{ .args = &.{arg} }, &d0);
+        defer parent.deinit();
+        const blob = try parent.forwardBlob(arena.allocator(), &diag);
+        var child = try MasterLoader.load(
+            testing.allocator,
+            .{ .conf_fd = try testConfFd(blob) },
+            &diag,
+        );
+        defer child.deinit();
+        const v = child.values.server.bind_address;
+        try testing.expectEqual(posix.AF.INET6, v.any.family);
+        try testing.expectEqual(@as(u32, 1), v.in6.sa.scope_id);
+    }
+}
+
+test "keys before any section are rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    var diag: Diag = .{};
     // Today's parser accepts keys before the first [section]; lib/conf
     // rejects them instead of silently binding to an empty section.
     const bad = try writeTempConfig(&tmp.dir, "nosec.ini",
