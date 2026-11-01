@@ -690,12 +690,26 @@ pub fn Loader(
         }
 
         /// Applies a forwarded configuration blob: the memfd contents are
-        /// canonical CLI lines, one per line, parsed exactly like real
-        /// arguments but recorded with provenance .forwarded.
+        /// canonical "--section.key=value" lines, one per line, recorded
+        /// with provenance .forwarded. Anything else -- a CLI flag, a
+        /// daemon spelling, a positional, a bare "--" -- is an error,
+        /// so a blob can only write schema fields and cannot smuggle
+        /// behavior like --no-tls or ctl subcommands.
         pub fn applyForwarded(self: *Self, blob: []const u8, diag: *Diag) Error!void {
             var lines = std.mem.splitScalar(u8, blob, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
+                const ok = blk: {
+                    if (!std.mem.startsWith(u8, line, "--")) break :blk false;
+                    const eq = std.mem.indexOfScalar(u8, line, '=') orelse break :blk false;
+                    const name = line[2..eq];
+                    const dot = std.mem.indexOfScalar(u8, name, '.') orelse break :blk false;
+                    break :blk dot != 0 and dot != name.len - 1;
+                };
+                if (!ok) {
+                    diag.set(.{ .key = line, .detail = "forwarded line is not --section.key=value" });
+                    return error.UnknownArgument;
+                }
                 try self.applyArgv(&.{line}, .forwarded, diag);
             }
         }
@@ -1736,7 +1750,7 @@ test "a forwarded value beats the file but loses to the child CLI" {
 
     var l = try MasterLoader.load(testing.allocator, .{
         .path = path,
-        .conf_fd = try testConfFd("--port=2000\n--host=fwd.test\n"),
+        .conf_fd = try testConfFd("--server.c2s_port=2000\n--server.hostname=fwd.test\n"),
         .args = &.{ "--port", "3000" },
     }, &diag);
     defer l.deinit();
@@ -1745,6 +1759,31 @@ test "a forwarded value beats the file but loses to the child CLI" {
     try testing.expectEqual(@as(u16, 3000), l.values.server.c2s_port);
     try testing.expectEqual(.forwarded, l.provenanceOf("server", "hostname"));
     try testing.expectEqual(.cli, l.provenanceOf("server", "c2s_port"));
+}
+
+test "a forwarded blob may only carry canonical --section.key=value lines" {
+    var diag: Diag = .{};
+    // A flag, a daemon CLI spelling, a positional and a bare -- would
+    // all parse as real arguments; as forwarded lines they are refused.
+    for ([_][]const u8{
+        "--no-s2s\n",
+        "--host=x.test\n",
+        "adduser\n",
+        "--\n",
+        "--server.hostname\n",
+        "--.hostname=x\n",
+        "--server.=x\n",
+    }) |blob| {
+        var l = MasterLoader.init(testing.allocator);
+        defer l.deinit();
+        try testing.expectError(error.UnknownArgument, l.applyForwarded(blob, &diag));
+        try testing.expectEqualStrings("forwarded line is not --section.key=value", diag.detail);
+    }
+    // An unknown field still fails inside applyArgv, not in the
+    // shape check.
+    var l = MasterLoader.init(testing.allocator);
+    defer l.deinit();
+    try testing.expectError(error.UnknownArgument, l.applyForwarded("--server.nosuch=x\n", &diag));
 }
 
 test "Diag set tolerates its own fields; a copy rebinds to its storage" {
