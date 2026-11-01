@@ -1632,8 +1632,45 @@ test "the canonical blob parses identically across two different loaders" {
     try testing.expectEqualStrings("h.test", core.values.server.hostname);
     try testing.expectEqualStrings("h.test", auth.values.server.hostname);
     try testing.expect(!core.values.s2s.enabled);
+    // Fields the master never names still arrive: the parent default
+    // for max_sessions forwards and lands typed in the child.
+    try testing.expectEqual(@as(u32, 10000), core.values.core.max_sessions);
+    var p2 = try MasterLoader.load(testing.allocator, .{
+        .args = &.{"--core.max_sessions=7"},
+    }, &d0);
+    defer p2.deinit();
+    const blob2 = try p2.forwardBlob(arena.allocator(), &diag);
+    var core2 = try CoreLoader.load(testing.allocator, .{ .conf_fd = try testConfFd(blob2) }, &diag);
+    defer core2.deinit();
+    try testing.expectEqual(@as(u32, 7), core2.values.core.max_sessions);
     // A master-only spelling never leaks through: --core-path had no
     // file field, so nothing in the blob can fail an auth load.
+}
+
+test "pidfile parses and keys before any section are rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "pid.ini",
+        \\[server]
+        \\pidfile = /run/xmppd.pid
+        \\
+    , &path_buf);
+    var diag: Diag = .{};
+    var l = try MasterLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+    try testing.expectEqualStrings("/run/xmppd.pid", l.values.server.pidfile);
+
+    // Today's parser accepts keys before the first [section]; lib/conf
+    // rejects them instead of silently binding to an empty section.
+    const bad = try writeTempConfig(&tmp.dir, "nosec.ini",
+        \\hostname = h.test
+        \\[server]
+        \\c2s_port = 5222
+        \\
+    , &path_buf);
+    try testing.expectError(error.UnknownKey, MasterLoader.load(testing.allocator, .{ .path = bad }, &diag));
+    try testing.expectEqual(@as(u32, 1), diag.line);
 }
 
 test "forwardArgs round-trips the resolved config" {
