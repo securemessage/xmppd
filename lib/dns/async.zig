@@ -1888,22 +1888,39 @@ fn readResolvConf(alloc: std.mem.Allocator, path: []const u8) !net.Address {
         const tok = tail[0 .. std.mem.indexOfAny(u8, tail, ";# \t") orelse tail.len];
         if (tok.len == 0) continue;
         if (net.Address.parseIp(tok, 53)) |addr| {
-            // A '%' belongs to the scoped path below; libc rejects a
-            // lone zone marker ("fe80::1%").
-            if (std.mem.indexOfScalar(u8, tok, '%') != null) continue;
+            // std accepts a lone zone marker ("fe80::1%") and numeric
+            // zones; libc rejects the empty zone and any zone on a
+            // non-v6 address.
+            if (std.mem.indexOfScalar(u8, tok, '%')) |pct| {
+                if (pct + 1 == tok.len) continue;
+                if (addr.any.family != posix.AF.INET6) continue;
+            }
             return addr;
         } else |_| {
-            // libc accepts a zone only on a link-local v6 address
-            // ("fe80::1%lo0"): resolve the zone name with
-            // if_nametoindex.
+            // libc ip6_str2scopeid: a numeric zone applies to any IPv6
+            // address; a named zone applies to link-local (fe80::/10)
+            // and ffx1/ffx2 multicast, resolved via if_nametoindex.
             const pct = std.mem.indexOfScalar(u8, tok, '%') orelse continue;
             var addr = net.Address.parseIp(tok[0..pct], 53) catch continue;
             if (addr.any.family != posix.AF.INET6) continue;
-            const ab = &addr.in6.sa.addr;
-            if (ab[0] != 0xfe or (ab[1] & 0xc0) != 0x80) continue;
             const zname = tok[pct + 1 ..];
             var zbuf: [16]u8 = undefined;
             if (zname.len == 0 or zname.len >= zbuf.len) continue;
+            var numeric = true;
+            for (zname) |c| {
+                if (!std.ascii.isDigit(c)) {
+                    numeric = false;
+                    break;
+                }
+            }
+            if (numeric) {
+                addr.in6.sa.scope_id = std.fmt.parseInt(u32, zname, 10) catch continue;
+                return addr;
+            }
+            const ab = &addr.in6.sa.addr;
+            const linklocal = ab[0] == 0xfe and (ab[1] & 0xc0) == 0x80;
+            const mc_named = ab[0] == 0xff and (ab[1] == 0x01 or ab[1] == 0x02);
+            if (!linklocal and !mc_named) continue;
             @memcpy(zbuf[0..zname.len], zname);
             zbuf[zname.len] = 0;
             const idx = std.c.if_nametoindex(zbuf[0..zname.len :0]);
@@ -4536,6 +4553,34 @@ test "dns-async: resolv.conf scopes follow libc (link-local v6 only, tab separat
     r.loadResolvConf();
     try std.testing.expect(r.server_configured);
     try std.testing.expect(r.server.eql(try net.Address.parseIp("127.0.0.65", 53)));
+}
+
+test "dns-async: resolv.conf zones follow libc ip6_str2scopeid" {
+    // libc: a numeric zone applies to any IPv6 address; a named zone
+    // applies to link-local (fe80::/10) and ffx1/ffx2 multicast only.
+    const cases = [_]struct { conf: []const u8, scope: ?u32 }{
+        .{ .conf = "nameserver fe80::1%1\n", .scope = 1 },
+        .{ .conf = "nameserver 2001:db8::1%2\n", .scope = 2 },
+        .{ .conf = "nameserver ff02::1%lo0\n", .scope = 2 },
+        .{ .conf = "nameserver ff01::1%lo0\n", .scope = 2 },
+        .{ .conf = "nameserver fec0::1%3\n", .scope = 3 },
+        .{ .conf = "nameserver febf::1%lo0\n", .scope = 2 },
+        .{ .conf = "nameserver 2001:db8::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver 127.0.0.1%lo0\n", .scope = null },
+        .{ .conf = "nameserver fe80::1%\n", .scope = null },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(.{ .sub_path = "resolv.conf", .data = c.conf });
+        var pbuf: [512]u8 = undefined;
+        const path = try tmp.dir.realpath("resolv.conf", &pbuf);
+        const got = readResolvConf(std.testing.allocator, path) catch null;
+        if (c.scope) |want| {
+            try std.testing.expect(got != null);
+            try std.testing.expectEqual(want, got.?.in6.sa.scope_id);
+        } else try std.testing.expect(got == null);
+    }
 }
 
 test "dns-async: a TLSA NXDOMAIN marks the target absent (per-target path)" {
