@@ -974,16 +974,18 @@ pub const ConfFd = struct {
 };
 
 /// pread a sealed conf fd from offset 0 to EOF into a buffer the caller
-/// frees, then close the fd. The fd is always closed, error or not, and
-/// must be an inherited remap slot (>= 3) carrying all four seals;
-/// anything else is refused before a byte is read. std.c.close is used
-/// so a bad fd cannot trip posix.close's EBADF assertion.
+/// frees, then close the fd. The fd must be an inherited remap slot
+/// (>= 3) carrying all four seals; anything else is refused before a
+/// byte is read. A refused fd below the remap range is NOT closed: it
+/// may be the caller's own stdin/out/err. A refused slot fd (>= 3) is
+/// closed like a read one, since the remap handed it to us. std.c.close
+/// is used so a bad fd cannot trip posix.close's EBADF assertion.
 pub fn readForwarded(fd: posix.fd_t, gpa: Allocator, diag: *Diag) Error![]u8 {
-    defer _ = std.c.close(fd);
     if (fd < 3) {
         diag.set(.{ .detail = "conf fd is below the remap slot range" });
         return error.UnsealedFd;
     }
+    defer _ = std.c.close(fd);
     const seals = std.c.fcntl(fd, std.c.F.GET_SEALS);
     if (seals < 0) {
         // EINVAL means the object simply carries no seals; a dead fd
@@ -1876,7 +1878,8 @@ test "readForwarded rejects a sealed fd below the remap range" {
             testing.allocator.free(buf);
         } else |e| {
             if (e == error.UnsealedFd and
-                std.mem.eql(u8, d0.detail, "conf fd is below the remap slot range")) v[0] = 'Y';
+                std.mem.eql(u8, d0.detail, "conf fd is below the remap slot range") and
+                std.c.fcntl(0, std.c.F.GETFD) >= 0) v[0] = 'Y'; // refused fd stays open
         }
         _ = std.c.write(sp[1], &v, 1);
         std.c._exit(0);
