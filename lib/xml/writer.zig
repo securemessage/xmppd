@@ -1804,9 +1804,10 @@ test "the decoded compare rejects malformed references (R6-6)" {
     }.f;
     try testing.expectError(error.NotWellFormed, eql("u&zz;A", "u&yy;B"));
     try testing.expectError(error.NotWellFormed, eql("u&;A", "u&;B"));
-    // The ';' search is bounded by the range: 'u&zz' has no
-    // terminator even though b's ';' sits just past the range end.
-    try testing.expectError(error.NotWellFormed, eql("u&zz", "u;yy"));
+    // The ';' search is bounded by the range: a's '&amp' has no
+    // terminator inside a, but an unbounded search finds b's ';' and
+    // decodes '&', returning false instead of an error.
+    try testing.expectError(error.NotWellFormed, eql(";&amp", ";x"));
     // '+' and '_' are not digits: fmt.parseInt would take both.
     try testing.expectError(error.NotWellFormed, eql("u&#+65;", "u&#65;"));
     try testing.expectError(error.NotWellFormed, eql("u&#6_5;", "u&#65;"));
