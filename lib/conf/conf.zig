@@ -601,14 +601,16 @@ pub fn Loader(
         pub fn load(gpa: Allocator, opts: LoadOpts, diag: *Diag) Error!Self {
             var self = Self.init(gpa);
             errdefer self.deinit();
-            if (opts.path) |p| try self.loadFile(p, diag);
-            // Order is precedence: file < forwarded < real CLI. The blob
-            // lives in the load arena because forwarded values borrow it
-            // the way file values borrow the file bytes.
+            // The fd is consumed first so it is closed even when the
+            // file fails to load; values still apply file < forwarded <
+            // CLI. The blob lives in the load arena because forwarded
+            // values borrow it the way file values borrow file bytes.
+            var blob: ?[]u8 = null;
             if (opts.conf_fd) |fd| {
-                const blob = try readForwarded(fd, self.arena_state.allocator(), diag);
-                try self.applyForwarded(blob, diag);
+                blob = try readForwarded(fd, self.arena_state.allocator(), diag);
             }
+            if (opts.path) |p| try self.loadFile(p, diag);
+            if (blob) |b| try self.applyForwarded(b, diag);
             try self.applyArgs(opts.args, diag);
             return self;
         }
@@ -998,8 +1000,10 @@ pub fn Loader(
 
 pub const LoadOpts = struct {
     path: ?[]const u8 = null,
-    /// Inherited sealed conf blob fd (-1/none when absent): pread to EOF
-    /// and closed by the loader, applied between file and real CLI args.
+    /// Inherited sealed conf blob fd: the loader preads it to EOF and
+    /// closes it on every outcome, including a failed file load. An fd
+    /// below the remap range (0-2) is refused and left open, since it
+    /// may be the caller's own stdin/out/err.
     conf_fd: ?posix.fd_t = null,
     args: []const []const u8 = &.{},
 };
@@ -2081,6 +2085,16 @@ test "readForwarded rejects a sealed fd below the remap range" {
     _ = try posix.read(sp[0], &v);
     _ = posix.waitpid(pid, 0);
     try testing.expectEqual(@as(u8, 'Y'), v[0]);
+}
+
+test "load closes the conf fd even when the file fails" {
+    var diag: Diag = .{};
+    const fd = try testConfFd("--server.hostname=x.test\n");
+    try testing.expectError(
+        error.FileNotFound,
+        MasterLoader.load(testing.allocator, .{ .path = "/nonexistent/x.ini", .conf_fd = fd }, &diag),
+    );
+    try testing.expect(std.c.fcntl(fd, std.c.F.GETFD) < 0);
 }
 
 test "ConfFd.create accepts a blob of exactly the cap" {
