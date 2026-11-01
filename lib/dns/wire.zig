@@ -55,6 +55,9 @@ pub const Message = struct {
 /// Returns bytes written (fixed 12-byte header + question).
 pub fn buildQuery(buf: []u8, id: u16, qname: []const u8, qtype: u16) !usize {
     if (buf.len < 12 + qname.len + 16) return error.BufferTooSmall;
+    // RFC 1035 2.3.4: a wire-format name is at most 255 octets (label
+    // length bytes included, root zero included): qname.len + 2.
+    if (qname.len + 2 > 255) return error.InvalidName;
 
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
@@ -214,6 +217,15 @@ test "buildQuery encodes a question" {
     // Question tail: qtype SRV + class IN
     try std.testing.expectEqual(TYPE_SRV, std.mem.readInt(u16, pkt[pkt.len - 4 ..][0..2], .big));
     try std.testing.expectEqual(CLASS_IN, std.mem.readInt(u16, pkt[pkt.len - 2 ..][0..2], .big));
+}
+
+test "buildQuery enforces the 255-octet name limit (RFC 1035 2.3.4)" {
+    var buf: [512]u8 = undefined;
+    // 253 dotted octets encode to exactly 255 wire octets: accepted.
+    const max_name = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 61;
+    _ = try buildQuery(&buf, 1, max_name, TYPE_A);
+    // 254 dotted octets need 256 on the wire: rejected before send.
+    try std.testing.expectError(error.InvalidName, buildQuery(&buf, 1, max_name ++ "e", TYPE_A));
 }
 
 test "decompressName handles plain labels and pointer compression" {
