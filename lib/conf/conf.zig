@@ -241,24 +241,27 @@ fn parseBool(s: []const u8) ParseError!bool {
     return error.BadValue;
 }
 
-/// A field type that is either an integer or one keyword from K, e.g.
-/// `workers = auto` or `workers = 8`. Carries its own parse/write so
-/// parseValue needs no comptime introspection of the union.
-pub fn IntOr(comptime K: type) type {
+/// A field type that is either an integer in T's range or one keyword
+/// from K, e.g. `workers = auto` or `workers = 8`. Carries its own
+/// parse/write so parseValue needs no comptime introspection of the
+/// union.
+pub fn IntOr(comptime K: type, comptime T: type) type {
     if (@typeInfo(K) != .@"enum") @compileError("conf.IntOr: keyword set must be an enum");
+    if (@typeInfo(T) != .int) @compileError("conf.IntOr: numeric arm must be an int");
     return union(enum) {
         kw: K,
-        num: i64,
+        num: T,
 
         pub fn parse(s: []const u8) ParseError!@This() {
             // Strict plain decimal: digits only, no sign, underscores or
-            // leading zeros; anything else must be a keyword.
+            // leading zeros; anything else must be a keyword. The number
+            // must fit T: an unbounded i64 accepted 99999999999.
             var numeric = s.len != 0;
             for (s) |c| {
                 if (!std.ascii.isDigit(c)) numeric = false;
             }
             if (numeric and (s.len == 1 or s[0] != '0')) {
-                const n = std.fmt.parseInt(i64, s, 10) catch return error.BadValue;
+                const n = std.fmt.parseInt(T, s, 10) catch return error.BadValue;
                 return .{ .num = n };
             }
             const kw = std.meta.stringToEnum(K, s) orelse return error.BadValue;
@@ -1100,7 +1103,7 @@ const TestSections = struct {
         max_sessions: u32 = 10000,
         fan_out_batch_size: u32 = 64,
         max_resources_per_account: u32 = 16,
-        workers: IntOr(enum { auto }) = .{ .kw = .auto },
+        workers: IntOr(enum { auto }, u16) = .{ .kw = .auto },
         listen_fd: [][]const u8 = &.{},
         log_level: enum { debug, info, warn, err } = .info,
     } = .{},
@@ -1385,7 +1388,7 @@ test "full file-key inventory parses with typed values" {
     try testing.expectEqual(@as(u32, 128), v.core.fan_out_batch_size);
     try testing.expectEqual(@as(u32, 32), v.core.max_resources_per_account);
     switch (v.core.workers) {
-        .num => |n| try testing.expectEqual(@as(i64, 8), n),
+        .num => |n| try testing.expectEqual(@as(u16, 8), n),
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(.debug, v.core.log_level);
@@ -2095,7 +2098,7 @@ test "inline comments end a value only after whitespace; quoting is literal" {
 const m6_sections = struct {
     srv: struct {
         addrs: [][]const u8 = &.{},
-        workers: IntOr(enum { auto }) = .{ .kw = .auto },
+        workers: IntOr(enum { auto }, u16) = .{ .kw = .auto },
     } = .{},
 };
 const m6_fields = [_]FieldSpec{
@@ -2125,7 +2128,7 @@ test "comma-list and int-or-keyword field types parse and serialize" {
     try testing.expectEqual(@as(usize, 3), l.values.srv.addrs.len);
     try testing.expectEqualStrings("::1", l.values.srv.addrs[1]);
     switch (l.values.srv.workers) {
-        .num => |n| try testing.expectEqual(@as(i64, 8), n),
+        .num => |n| try testing.expectEqual(@as(u16, 8), n),
         else => return error.TestUnexpectedResult,
     }
 
@@ -2150,17 +2153,21 @@ test "comma-list and int-or-keyword field types parse and serialize" {
     try testing.expectEqualStrings("auto", w2.buffered());
 
     // A bad keyword and a bad list item are rejected, not clamped.
-    try testing.expectError(error.BadValue, parseValue(IntOr(enum { auto }), "sometimes"));
+    try testing.expectError(error.BadValue, parseValue(IntOr(enum { auto }, u16), "sometimes"));
 
     // IntOr takes plain decimal only: no sign, underscores or leading
-    // zeros, and it must be digits end to end.
-    const Workers = IntOr(enum { auto });
+    // zeros, and it must be digits end to end within the field's
+    // integer range.
+    const Workers = IntOr(enum { auto }, u16);
     try testing.expectError(error.BadValue, Workers.parse("+8"));
     try testing.expectError(error.BadValue, Workers.parse("1_0"));
     try testing.expectError(error.BadValue, Workers.parse("08"));
     try testing.expectError(error.BadValue, Workers.parse(""));
+    try testing.expectError(error.BadValue, Workers.parse("99999999999"));
+    try testing.expectError(error.BadValue, Workers.parse("65536"));
     try testing.expectEqual(Workers{ .num = 0 }, try Workers.parse("0"));
     try testing.expectEqual(Workers{ .num = 8 }, try Workers.parse("8"));
+    try testing.expectEqual(Workers{ .num = 65535 }, try Workers.parse("65535"));
 
     // Empty items and over-long lists are errors, not silent drops.
     var diag3: Diag = .{};
