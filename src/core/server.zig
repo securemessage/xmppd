@@ -7098,6 +7098,68 @@ test "Re-review 5.4: a stuck delete retry deletes without resending" {
     try std.testing.expect(!session.offline_pending);
 }
 
+// A drain that hands a stanza to the connection and then fails its delete has
+// to remember which row it already sent, or the retry puts a second copy on the
+// wire. Recording the sequence is the only thing that keeps the retry to the
+// delete alone, so a drain that forgets it shows up here as two copies.
+test "Re-review 6.2: a real delete failure records the sequence, the retry does not resend" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "d1", 1001, "<message id='d1'><body>once</body></message>");
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+    const sent_sequence = ptrs[0].sequence;
+
+    // The first delete fails, after the stanza reached the connection.
+    offline_store.test_fail_deletes = 1;
+    session.offline_pending = true;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const first = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..first], "<body>once</body>") != null);
+    try std.testing.expectEqual(sent_sequence, session.offline_last_sent_sequence);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+
+    // The retry redoes the delete and must not put a second copy on the wire.
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    _ = session.conn.flushSend() catch {};
+    const second = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), second);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
+    try std.testing.expect(!session.offline_pending);
+}
+
 test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

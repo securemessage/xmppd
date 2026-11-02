@@ -108,6 +108,11 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         const Self = @This();
         db: *Backend,
         allocator: std.mem.Allocator,
+        /// Test seam: fail this many `deletePointer` calls before letting one
+        /// through. A drain that hands a stanza to the connection and then
+        /// fails its delete is reachable in production (a full map) but no
+        /// test can arrange it. Never set in production.
+        test_fail_deletes: u32 = 0,
 
         pub fn init(db: *Backend, allocator: std.mem.Allocator) Self {
             return .{ .db = db, .allocator = allocator };
@@ -225,6 +230,10 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// Delete a specific offline pointer after successful delivery.
         /// Also drops any held payload stored with it.
         pub fn deletePointer(self: *Self, ptr: OfflinePointer) !void {
+            if (self.test_fail_deletes > 0) {
+                self.test_fail_deletes -= 1;
+                return error.MapFull;
+            }
             self.db.compound_mutex.lock();
             defer self.db.compound_mutex.unlock();
             const is_v2 = ptr.sequence != 0;
