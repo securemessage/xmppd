@@ -1805,8 +1805,26 @@ test "zone suffix rejects: v4 zone, junk after zone, empty and overflowing zones
         "fe80::1%", // empty zone
         "fe80::1%4294967296", // zone past u32
     }) |bad| {
+        errdefer std.debug.print("accepted: {s}\n", .{bad});
         try testing.expectError(error.BadValue, parseValue(std.net.Address, bad));
     }
+    // Both strip-buffer overflow paths reject: dropping either catch
+    // would let the leftover tail parse as a valid literal.
+    var long_buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&long_buf);
+    // 83 bytes: "::" + 77 zeros + "1z%1"; the pre-zone part alone
+    // exceeds the 80-byte scratch.
+    w.writeAll("::") catch unreachable;
+    w.splatByteAll('0', 77) catch unreachable;
+    w.writeAll("1z%1") catch unreachable;
+    try testing.expectError(error.BadValue, parseValue(std.net.Address, w.buffered()));
+    // 87 bytes: "[::" + 75 zeros + "1%1]:5269"; the post-zone tail
+    // overflows the remaining scratch byte.
+    w = .fixed(&long_buf);
+    w.writeAll("[::") catch unreachable;
+    w.splatByteAll('0', 75) catch unreachable;
+    w.writeAll("1%1]:5269") catch unreachable;
+    try testing.expectError(error.BadValue, parseValue(std.net.Address, w.buffered()));
     // %0 is still a zone on v6: accepted, resolving to scope 0.
     const a = try parseValue(std.net.Address, "fe80::1%0");
     try testing.expectEqual(@as(u32, 0), a.in6.sa.scope_id);
