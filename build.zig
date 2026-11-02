@@ -206,6 +206,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const precis_username_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/precis/username.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    precis_username_test_mod.addImport("unicode", unicode_mod);
+
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
         .target = target,
@@ -283,6 +290,11 @@ pub fn build(b: *std.Build) void {
         .root_module = precis_tables_test_mod,
     });
 
+    const precis_username_tests = b.addTest(.{
+        .name = "precis-username-tests",
+        .root_module = precis_username_test_mod,
+    });
+
     const sasl_tests = b.addTest(.{
         .name = "sasl-tests",
         .root_module = sasl_test_mod,
@@ -356,6 +368,7 @@ pub fn build(b: *std.Build) void {
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_unicode_tests = b.addRunArtifact(unicode_tests);
     const run_precis_tables_tests = b.addRunArtifact(precis_tables_tests);
+    const run_precis_username_tests = b.addRunArtifact(precis_username_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
@@ -1783,6 +1796,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_unicode_tests.step);
     test_step.dependOn(&run_precis_tables_tests.step);
+    test_step.dependOn(&run_precis_username_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);

@@ -4,9 +4,11 @@
 //! NFC; the tables are generated (see nfc_tables.zig).
 //!
 //! The engine reads the whole input into codepoint scratch before writing
-//! output, so the output buffer may overlap the input. Worst case expansion
-//! is 3x the input codepoint count (a precomposed syllable decomposing to
-//! three jamo).
+//! output, so the output buffer may overlap the input. The scratch holds
+//! the fully decomposed form: at most 4x the input codepoint count
+//! (U+1F82 decomposes to four code points), at most one code point per
+//! input byte. The output is at most 3x the input codepoint count (U+FB2C
+//! prepares to three code points).
 
 const std = @import("std");
 const tables = @import("nfc_tables.zig");
@@ -103,9 +105,10 @@ fn decomposeInto(seq: *Seq, cp: u21) error{NoSpaceLeft}!void {
 }
 
 /// NFC-normalize `input` into `buf`. Intermediate codepoint scratch uses
-/// `scratch_cps`/`scratch_cccs` (parallel arrays, worst case 3x expansion).
-/// `buf` may overlap `input`; it must hold at most 3x the input codepoint
-/// count.
+/// `scratch_cps`/`scratch_cccs` (parallel arrays; the fully decomposed
+/// form is at most 4x the input codepoint count, at most one code point
+/// per input byte). `buf` may overlap `input`; it must hold the output,
+/// at most 3x the input codepoint count.
 pub fn nfc(
     input: []const u8,
     buf: []u8,
