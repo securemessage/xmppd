@@ -507,9 +507,9 @@ pub const ValidatedSpan = struct {
     /// value, non-Char character references, undeclared prefixes other
     /// than xml:, and truncated input. Elements are capped at 32
     /// attributes each and at 64 in-scope namespace declarations; a
-    /// span needing more is rejected. A
-    /// dedicated zero-cost reader-produced constructor arrives with
-    /// C5; until then callers pay one scan per span.
+    /// span needing more is rejected. A dedicated zero-cost
+    /// reader-produced constructor arrives with C5; until then
+    /// callers pay one scan per span.
     pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
         try validateChars(bytes);
         try spanCheckCharrefs(bytes);
