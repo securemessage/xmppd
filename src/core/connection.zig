@@ -260,8 +260,9 @@ pub const Connection = struct {
 
     /// Queue `data`, first making room with one non-blocking flush when the
     /// buffer is full. Data already buffered is deliverable, so a buffer the
-    /// server filled itself is not a slow reader: only a flush that frees
-    /// nothing means the peer really is not reading.
+    /// server filled itself is not by itself a slow reader: a single flush
+    /// buys another attempt. The caller still treats a second WriteBufferFull
+    /// as a slow reader, whatever the flush freed.
     pub fn queueSendWithFlush(self: *Connection, data: []const u8) !void {
         self.queueSend(data) catch |err| {
             if (err != error.WriteBufferFull) return err;

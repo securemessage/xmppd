@@ -6730,8 +6730,8 @@ test "Server: an over-long sender bare JID still delivers live" {
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // The localpart parses, but local@domain overflows the 512-byte bare JID
-    // that keys the archive and the offline store. Dispatch used to return
-    // here, so the stanza reached nobody and the sender heard nothing.
+    // that keys the archive and the offline store. Dispatch must still deliver
+    // live rather than return, or the stanza reaches nobody silently.
     var long_local: [600]u8 = undefined;
     @memset(&long_local, 'l');
 
@@ -6770,10 +6770,9 @@ test "Server: an over-long sender bare JID still delivers live" {
 // than leaving it wedged. c2s delivery now answers the same condition the same
 // way, so one stuck peer cannot be told two different stories depending on
 // whether the stanza came from a room.
-// Item 3, re-review 5: f693e7b's teardown fired on a buffer the server itself
-// had filled earlier in the same pass. Everything buffered was deliverable, so
-// the client was healthy and one non-blocking flush made room. A buffer only
-// means a slow reader when the flush frees nothing.
+// A buffer the server filled itself earlier in the same pass is not a slow
+// reader: everything buffered is deliverable there. queueSendWithFlush makes
+// one non-blocking attempt before the caller decides the peer stopped reading.
 test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down" {
     const allocator = std.testing.allocator;
 
@@ -7037,11 +7036,10 @@ test "Server: S13 message held behind a draining offline tail" {
     }
 }
 
-// Item 2, re-review 5: the tail is per bare JID but the drain flag is per
-// session, so one resource draining the tail leaves every other resource of
-// that JID still marked pending. With the tail empty the drain returned before
-// touching the flag, so those sessions parked every later message behind a
-// tail that no longer existed.
+// The tail is per bare JID but the drain flag is per session, so one resource
+// draining the tail leaves every other resource of that JID marked pending.
+// The empty-tail branch clears the flag, or that session parks every later
+// message behind a tail that no longer exists.
 test "Re-review 5.2: an empty tail clears offline_pending instead of stranding it" {
     const allocator = std.testing.allocator;
 
@@ -7109,10 +7107,9 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
 }
 
-// Item 4, re-review 5: a delete that keeps failing used to resend the same
-// stanza on every retry. The pointer survives the failed delete, so the drain
-// handed it to the connection again. Recording the sequence that reached the
-// wire makes the retry redo only the delete.
+// A delete that keeps failing leaves the pointer behind. Recording the
+// sequence that reached the wire makes the retry redo only the delete, instead
+// of handing the same stanza to the connection again.
 test "Re-review 5.4: a stuck delete retry deletes without resending" {
     const allocator = std.testing.allocator;
 
@@ -7900,9 +7897,8 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 }
 
-// H2: the c2s router bounces (and counts) a message it cannot hold behind a
-// draining offline tail. The cross-worker and S2S inbound paths used to drop
-// it with a log line only, so the sender was told nothing.
+// H2: a message that cannot be held behind a draining offline tail has to
+// bounce (and count) on every path, so the sender is never told nothing.
 test "Server: H2 a cross-worker hold failure bounces to the sender on the same worker" {
     const allocator = std.testing.allocator;
 
@@ -8183,9 +8179,9 @@ test "Server: H3 a resume carries the stalled offline tail" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-1") != null);
 }
 
-// The count runs before anything is armed, so a failure there used to leave the
-// session pending with no timer, no staged write, and no sweep. The tail then
-// waited for the next login even after the store recovered.
+// The count runs before anything is armed, so a failure there must stage its
+// own retry. Otherwise the session stays pending with no timer, no staged
+// write, and no sweep, and the tail waits for the next login.
 test "Re-review 6.4: a failed count arms a retry instead of parking the session" {
     const allocator = std.testing.allocator;
 
@@ -11374,13 +11370,11 @@ test "every store namespace constant is registered and every registry entry is o
     }
 }
 
-// N1: the offline tail is per bare JID, but the hold decision is per session.
-// Two resources of bob still draining made the router store one copy per
-// resource, and the drain then delivered each copy to each of them.
-// The offline tail is one per bare JID, so a message held behind it is a single
-// row and reaches whichever resource drains first. The other resource finds the
-// tail empty and gets nothing, which is the intended shape: the tail is shared,
-// not per resource.
+// N1: the offline tail is per bare JID, but the hold decision is per session,
+// so every draining resource asks to hold the same message. The store keeps one
+// row per dispatch, and that row reaches whichever resource drains first. The
+// other resource finds the tail empty and gets nothing: the tail is shared, not
+// per resource.
 test "N1: two draining resources hold a bare-JID message once" {
     const allocator = std.testing.allocator;
 
