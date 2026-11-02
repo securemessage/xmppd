@@ -1768,11 +1768,11 @@ const PolicyDns = struct {
                 0,    14, // rdlength
                 0,    0, // priority
                 0,    0, // weight
-                0x14, 0x76, // port 5222
+                0x14, 0x76, // port, overwritten below
                 1,    't',  4,    't', 'e', 's', 't', 0,
             };
             @memcpy(out[pos..][0..rr.len], &rr);
-            std.mem.writeInt(u16, out[pos + 14 ..][0..2], self.target_port, .big);
+            std.mem.writeInt(u16, out[pos + 16 ..][0..2], self.target_port, .big);
             pos += rr.len;
             ancount = 1;
         } else if (qtype == wire.TYPE_A) {
@@ -1854,4 +1854,8 @@ test "engine: pkix_only resolution sends zero TLSA queries" {
 
     try std.testing.expect(s.resolution != null);
     try std.testing.expectEqual(@as(u32, 0), srv.tlsa_recvd.load(.monotonic));
+    // The resolved target must carry the ephemeral listener's port,
+    // not the rdata's placeholder; the session dials what it resolved.
+    try std.testing.expect(s.resolution.?.targets.len >= 1);
+    try std.testing.expectEqual(srv.target_port, s.resolution.?.targets[0].addr.getPort());
 }
