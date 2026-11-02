@@ -414,6 +414,13 @@ fn spanDecodedStats(bytes: []const u8, r: SpanRange, seed: u64) Error!struct { l
     return .{ .len = len, .hash = h.final() };
 }
 
+/// A live declaration is a decode-compare candidate only when its
+/// decoded length and seeded hash both match the pushed URI; a
+/// match on either alone is not enough.
+fn spanStatsMatch(d: SpanDecl, len: usize, hash: u64) bool {
+    return d.decoded_len == len and d.uri_hash == hash;
+}
+
 /// Two raw ranges are equal once decoded when they yield the same
 /// code point sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
 fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) Error!bool {
@@ -608,8 +615,7 @@ pub const ValidatedSpan = struct {
                         const uri_stats = try spanDecodedStats(bytes, uri, seed);
                         var class: ?usize = null;
                         for (decls[0..decl_count]) |d| {
-                            if (d.decoded_len != uri_stats.len or
-                                d.uri_hash != uri_stats.hash) continue;
+                            if (!spanStatsMatch(d, uri_stats.len, uri_stats.hash)) continue;
                             if (try spanDecodedEql(bytes, d.uri, uri)) {
                                 class = d.class;
                                 break;
@@ -1925,6 +1931,41 @@ test "concurrent first use hashes every declaration under one seed (R8-1)" {
         for (threads) |t| t.join();
     }
     try testing.expectEqual(@as(u32, 0), accepted.load(.monotonic));
+}
+
+test "the compare and the stats gate are pinned directly (R8-2)" {
+    // The length prefilter keeps 'urn:u' vs 'urn:uv' from reaching
+    // the compare at span level, so pin it here: an exhausted range
+    // is not equality.
+    const eql = struct {
+        fn f(a_lit: []const u8, b_lit: []const u8) Error!bool {
+            var buf: [128]u8 = undefined;
+            @memcpy(buf[0..a_lit.len], a_lit);
+            @memcpy(buf[a_lit.len .. a_lit.len + b_lit.len], b_lit);
+            const bytes = buf[0 .. a_lit.len + b_lit.len];
+            return spanDecodedEql(bytes, .{ .start = 0, .end = a_lit.len }, .{
+                .start = a_lit.len,
+                .end = bytes.len,
+            });
+        }
+    }.f;
+    try testing.expectEqual(@as(bool, false), try eql("urn:u", "urn:uv"));
+    try testing.expectEqual(@as(bool, true), try eql("urn:u", "urn:u"));
+
+    // The stats gate admits a decode-compare only on a full match:
+    // equal length or equal hash alone is not a candidate.
+    const d: SpanDecl = .{
+        .depth = 0,
+        .prefix = .{ .start = 0, .end = 0 },
+        .uri = .{ .start = 0, .end = 5 },
+        .class = 0,
+        .decoded_len = 5,
+        .uri_hash = 42,
+    };
+    try testing.expect(spanStatsMatch(d, 5, 42));
+    try testing.expect(!spanStatsMatch(d, 6, 42));
+    try testing.expect(!spanStatsMatch(d, 5, 43));
+    try testing.expect(!spanStatsMatch(d, 6, 43));
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
