@@ -1787,6 +1787,23 @@ test "a scoped full-length IPv6 address round-trips through forwarding" {
     }
 }
 
+test "zone suffix rejects: v4 zone, junk after zone, empty and overflowing zones" {
+    for ([_][]const u8{
+        "127.0.0.1%1", // a v4 literal can never carry a zone
+        "127.0.0.1%0",
+        "1.2.3.4%00",
+        "fe80::1%1:80", // junk after the zone digits
+        "[fe80::1]%1:80", // zone outside the brackets
+        "fe80::1%1%2",
+        "fe80::1%", // empty zone
+        "fe80::1%4294967296", // zone past u32
+    }) |bad| {
+        try testing.expectError(error.BadValue, parseValue(std.net.Address, bad));
+    }
+    // %0 is still a zone on v6: accepted, resolving to scope 0.
+    const a = try parseValue(std.net.Address, "fe80::1%0");
+    try testing.expectEqual(@as(u32, 0), a.in6.sa.scope_id);
+}
 
 test "keys before any section are rejected" {
     var tmp = testing.tmpDir(.{});
