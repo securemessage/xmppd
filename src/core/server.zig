@@ -4372,6 +4372,7 @@ pub const Server = struct {
         session.roster_interested = detached.roster_interested;
         session.carbons_enabled = detached.carbons_enabled;
         session.offline_pending = detached.offline_pending;
+        session.offline_last_sent_sequence = detached.offline_last_sent_sequence;
         @memcpy(
             session.last_presence_inner[0..detached.last_presence_inner_len],
             detached.last_presence_inner[0..detached.last_presence_inner_len],
@@ -4594,6 +4595,7 @@ pub const Server = struct {
             .base_seq = if (detached.sm_unacked) |q| q.base_seq else 1,
             .last_h = if (detached.sm_unacked) |q| q.last_h else 0,
             .offline_pending = detached.offline_pending,
+            .offline_last_sent_sequence = detached.offline_last_sent_sequence,
             .created = std.time.timestamp(),
         };
         @memcpy(&bundle.previd, req.previd[0..sm_state.SM_ID_HEX_LEN]);
@@ -4762,6 +4764,7 @@ pub const Server = struct {
         session.carbons_enabled = bundle.carbons_enabled;
         session.csi_active = bundle.csi_active;
         session.offline_pending = bundle.offline_pending;
+        session.offline_last_sent_sequence = bundle.offline_last_sent_sequence;
         @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
         session.last_presence_inner_len = bundle.last_presence.len;
 
@@ -8115,6 +8118,183 @@ test "Server: H3 a resume carries the stalled offline tail" {
     const n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-1") != null);
+}
+
+// The drain had handed this row to the connection and then failed its delete.
+// Resume must carry that sequence, or it resends the row the client already
+// has on top of the SM replay of the same stanza.
+test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.offline = &offline_store;
+    sm_handoff.resetForTesting();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    const previd = "dddddddddddddddddddddddddddddddd";
+    session.sm_resume_pending = true;
+    session.sm_resume_epoch = 3;
+    @memcpy(&session.sm_resume_previd, previd);
+
+    _ = try offline_store.storeHeldPointer(
+        "alice@localhost",
+        "bob@localhost/res",
+        "tail-3",
+        1000,
+        "<message from='bob@localhost/res' to='alice@localhost' id='tail-3'><body>tail</body></message>",
+    );
+    const ptrs = try offline_store.getPointers("alice@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+    const sent_sequence = ptrs[0].sequence;
+
+    const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch unreachable;
+    bundle.* = .{
+        .previd = undefined,
+        .sm_in_h = 0,
+        .sm_out_seq = 1,
+        .sm_out_h = 0,
+        .r_outstanding = false,
+        .roster_interested = false,
+        .carbons_enabled = false,
+        .csi_active = false,
+        .username = sm_handoff.allocator.dupe(u8, "alice") catch unreachable,
+        .resource = sm_handoff.allocator.dupe(u8, "res") catch unreachable,
+        .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
+        .base_seq = 1,
+        .last_h = 0,
+        .offline_pending = true,
+        .offline_last_sent_sequence = sent_sequence,
+        .created = std.time.timestamp(),
+    };
+    @memcpy(&bundle.previd, previd);
+    try sm_handoff.put(previd, bundle);
+
+    server.handleSmResumeReply(.{
+        .previd = previd,
+        .req_session = 1,
+        .req_epoch = 3,
+        .status = "ok",
+    }, &changes);
+
+    // Carried, then consumed by the retry: the row is deleted, not resent.
+    try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-3") == null);
+}
+
+// The local resume path restores the same per-session drain state as the
+// cross-worker one, and losing the sequence there resends the stanza too.
+test "Re-review 6.3: a local resume carries the recorded sequence" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    _ = try offline_store.storeHeldPointer(
+        "alice@localhost",
+        "bob@localhost/res",
+        "tail-4",
+        1000,
+        "<message from='bob@localhost/res' to='alice@localhost' id='tail-4'><body>tail</body></message>",
+    );
+    const ptrs = try offline_store.getPointers("alice@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+    const sent_sequence = ptrs[0].sequence;
+
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    const detached = try allocator.create(Session);
+    detached.* = Session.init(det_fds[0], 2, "localhost", false, allocator);
+    @memcpy(detached.auth_username_buf[0..5], "alice");
+    detached.auth_username_len = 5;
+    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.sm_detached = true;
+    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_resume_enabled = true;
+    detached.offline_pending = true;
+    detached.offline_last_sent_sequence = sent_sequence;
+    const det_queue = try allocator.create(sm_state.SmUnackedQueue);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    det_queue.base_seq = 1;
+    detached.sm_unacked = det_queue;
+    server.sessions[2] = detached;
+
+    var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+    sm_state.generateSmId(server.worker_id, &previd);
+    server.smIdMapInsert(&previd, 2);
+    server.detached_count = 1;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    var drain_buf: [4096]u8 = undefined;
+    _ = posix.read(fds[1], &drain_buf) catch 0;
+
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = xmpp.Jid.parse("alice@localhost") catch null;
+    while (true) {
+        const wrote = session.conn.flushSend() catch break;
+        while (posix.read(fds[1], &drain_buf)) |dn| {
+            if (dn == 0) break;
+        } else |_| {}
+        if (wrote == 0 or !session.conn.hasPendingWrite()) break;
+    }
+
+    var resume_buf: [128]u8 = undefined;
+    const resume_xml = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{previd}) catch unreachable;
+    _ = try posix.write(fds[1], resume_xml);
+    server.handleReadable(1, &changes);
+
+    // The retry deletes the row instead of resending it.
+    try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-4") == null);
 }
 
 test "Server: H3 a local resume carries the stalled offline tail" {

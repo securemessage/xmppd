@@ -64,6 +64,10 @@ pub const ResumeBundle = struct {
     /// (H3). Resume sends no initial presence, so without this the target
     /// worker clears the flag and the tail is stranded until the next login.
     offline_pending: bool = false,
+    /// Sequence the drain last handed to the connection but could not delete.
+    /// A resumed session that lost it resends that row alongside the SM replay
+    /// of the same stanza, so the client sees it twice.
+    offline_last_sent_sequence: u64 = 0,
     created: i64,
 
     pub fn deinit(self: *ResumeBundle) void {
