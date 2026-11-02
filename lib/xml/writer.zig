@@ -85,12 +85,17 @@ const SpanDecl = struct {
 };
 
 /// Per-process seed for the declaration URI hash; a fixed seed would
-/// let a hostile peer precompute decoded-URI collisions.
-var uri_hash_seed: u64 = 0;
+/// let a hostile peer precompute decoded-URI collisions. Zero means
+/// uninitialized; the first caller stores its seed through the
+/// compare-exchange and every other caller takes the winner's, so a
+/// span can never hash two declarations under different seeds.
+var uri_hash_seed = std.atomic.Value(u64).init(0);
 
 fn uriHashSeed() u64 {
-    if (uri_hash_seed == 0) uri_hash_seed = std.crypto.random.int(u64);
-    return uri_hash_seed;
+    const seen = uri_hash_seed.load(.acquire);
+    if (seen != 0) return seen;
+    const fresh = std.crypto.random.int(u64);
+    return uri_hash_seed.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
 }
 
 fn spanSlice(bytes: []const u8, r: SpanRange) []const u8 {
@@ -393,9 +398,8 @@ fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
 /// and no literal whitespace the decoded form is the raw range
 /// itself, which is hashed in place; otherwise one decode pass
 /// re-encodes each code point.
-fn spanDecodedStats(bytes: []const u8, r: SpanRange) Error!struct { len: usize, hash: u64 } {
+fn spanDecodedStats(bytes: []const u8, r: SpanRange, seed: u64) Error!struct { len: usize, hash: u64 } {
     const raw = bytes[r.start..r.end];
-    const seed = uriHashSeed();
     if (std.mem.indexOfAny(u8, raw, "&\t\n\r") == null)
         return .{ .len = raw.len, .hash = std.hash.Wyhash.hash(seed, raw) };
     var h = std.hash.Wyhash.init(seed);
@@ -507,6 +511,10 @@ pub const ValidatedSpan = struct {
         // raw scan is exact.
         if (std.mem.indexOf(u8, bytes, "<!") != null) return error.NotWellFormed;
         try spanCheckLex(bytes);
+        // One seed per call: every declaration pushed below hashes
+        // under this value, so the stats stay comparable with each
+        // other whatever other threads do to the global.
+        const seed = uriHashSeed();
         var sc = scanner_mod.Scanner.init(alloc);
         defer sc.deinit();
         var pos: usize = 0;
@@ -597,7 +605,7 @@ pub const ValidatedSpan = struct {
                         // declaration carries its decoded length and
                         // seeded hash, so the pairwise decode runs
                         // only on a full match.
-                        const uri_stats = try spanDecodedStats(bytes, uri);
+                        const uri_stats = try spanDecodedStats(bytes, uri, seed);
                         var class: ?usize = null;
                         for (decls[0..decl_count]) |d| {
                             if (d.decoded_len != uri_stats.len or
@@ -1889,6 +1897,34 @@ test "the URI class match sees declarations on every live scope (R7-1)" {
             "<r><c xmlns:p='urn:a' xmlns:q='urn:b'/><d xmlns:q='urn:a'><e xmlns:p='urn:&#97;' p:x='1' q:x='2'/></d></r>",
         ),
     );
+}
+
+test "concurrent first use hashes every declaration under one seed (R8-1)" {
+    // Threads reaching first use together must not split the seed:
+    // if a span's declarations hash under different seeds, equal URIs
+    // miss the prefilter and a duplicate expanded name is accepted.
+    // Each round resets to a fresh seed and starts 16 threads on a
+    // released flag, so the seeds race the way they will under C5.
+    const span = "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>";
+    var go = std.atomic.Value(u32).init(0);
+    var accepted = std.atomic.Value(u32).init(0);
+    const Worker = struct {
+        fn run(probe: []const u8, flag: *std.atomic.Value(u32), acc: *std.atomic.Value(u32)) void {
+            while (flag.load(.acquire) == 0) std.atomic.spinLoopHint();
+            if (ValidatedSpan.fromReader(std.heap.smp_allocator, probe)) |_| {
+                _ = acc.fetchAdd(1, .monotonic);
+            } else |_| {}
+        }
+    };
+    for (0..100) |_| {
+        uri_hash_seed.store(0, .release);
+        go.store(0, .release);
+        var threads: [16]std.Thread = undefined;
+        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ span, &go, &accepted });
+        go.store(1, .release);
+        for (threads) |t| t.join();
+    }
+    try testing.expectEqual(@as(u32, 0), accepted.load(.monotonic));
 }
 
 test "ValidatedSpan accepts depth 64 and rejects depth 65" {
