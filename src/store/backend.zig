@@ -64,6 +64,7 @@ pub const canonical_namespaces = [_][]const u8{
     "offline_v2",
     "offline_hold_v2",
     "offline_seq",
+    "offline_hold_token",
     "rooms",
     "messages",
     "by_contact",
@@ -619,7 +620,7 @@ test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted
             try std.testing.expect(!std.mem.eql(u8, ns, other));
         }
     }
-    try std.testing.expectEqual(@as(usize, 18), canonical_namespaces.len);
+    try std.testing.expectEqual(@as(usize, 19), canonical_namespaces.len);
 }
 
 const TokenKind = enum { str, chr, comment };

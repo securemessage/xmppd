@@ -463,6 +463,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     var hold_bounced = false;
+    var hold_stored = false;
     var local_delivery_succeeded = false;
     // Forward to each local target session
     for (local_ids[0..target_count]) |tid| {
@@ -476,6 +477,13 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         if (target_session.offline_pending and session.stanza_kind == .message and
             !std.mem.eql(u8, type_str, "error"))
         {
+            // The tail is per bare JID, so one message is held once however
+            // many local resources are draining it. A second hold here would
+            // add a second row, and the drain would then deliver both.
+            if (hold_stored) {
+                local_delivery_succeeded = true;
+                continue;
+            }
             const hold_id = if (is_archivable)
                 archive_stanza_id
             else if (id_str.len > 0)
@@ -483,6 +491,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             else
                 "offline";
             if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data)) {
+                hold_stored = true;
                 local_delivery_succeeded = true;
                 log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
                 continue;

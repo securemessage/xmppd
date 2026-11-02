@@ -38,6 +38,32 @@ pub const NS_OFFLINE_HOLD = backend.registered("offline_hold");
 pub const NS_OFFLINE_V2 = backend.registered("offline_v2");
 pub const NS_OFFLINE_HOLD_V2 = backend.registered("offline_hold_v2");
 pub const NS_OFFLINE_SEQ = backend.registered("offline_seq");
+/// Per-pointer dedup token for held stanzas. Keyed like the v2 pointer it
+/// belongs to (`recipient\x00sequence_be(8)`), so a pointer delete removes it
+/// with no scan. The tail is per bare JID while the hold request is per
+/// session, so several resources (and several workers) ask to hold the same
+/// message; the token collapses them into one row.
+pub const NS_OFFLINE_HOLD_TOKEN = backend.registered("offline_hold_token");
+
+/// Stable identity of the bytes a hold request would store. Every copy of one
+/// dispatch carries the same serialized stanza, so the hash is equal on every
+/// worker that sees it, which makes the once-only store atomic without a
+/// cross-worker protocol. An identical retransmission of the same bytes to the
+/// same bare JID collapses too, which is the intent: it is one message.
+pub fn holdToken(stanza_xml: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x6f66666c696e65, stanza_xml);
+}
+
+/// Result of `storeHeldPointerOnce`.
+pub const HeldOutcome = enum {
+    /// This call created the pointer.
+    stored,
+    /// The same bytes are already held for this recipient, by this worker or
+    /// another one. Nothing was written.
+    already_held,
+    /// The recipient's queue is at quota.
+    full,
+};
 
 /// Maximum offline messages per user.
 const MAX_PER_USER = 100;
@@ -115,6 +141,36 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             return self.storeInternal(recipient, from_jid, stanza_id, timestamp, stanza_xml);
         }
 
+        /// Store a held pointer unless these exact bytes are already held for
+        /// this recipient.
+        ///
+        /// The offline tail is per bare JID, but the decision to hold is made
+        /// per session: every local resource still draining asks to hold the
+        /// same message, and so does every worker holding a resource of that
+        /// bare JID. Without dedup one message becomes one row per resource
+        /// and is then delivered once per row.
+        ///
+        /// The check and the store share the compound lock, which the process
+        /// shares across workers, so two workers racing on the same message
+        /// still produce one row.
+        pub fn storeHeldPointerOnce(
+            self: *Self,
+            recipient: []const u8,
+            from_jid: []const u8,
+            stanza_id: []const u8,
+            timestamp: u64,
+            stanza_xml: []const u8,
+        ) !HeldOutcome {
+            self.db.compound_mutex.lock();
+            defer self.db.compound_mutex.unlock();
+
+            const token = holdToken(stanza_xml);
+            if (try self.heldTokenPresentLocked(recipient, token)) return .already_held;
+
+            const sequence = try self.storeLocked(recipient, from_jid, stanza_id, timestamp, stanza_xml, token);
+            return if (sequence == 0) .full else .stored;
+        }
+
         /// Read back a payload stored by `storeHeldPointer`. Null when this
         /// pointer carries no held copy.
         pub fn getHeldStanza(self: *Self, ptr: OfflinePointer) !?[]u8 {
@@ -174,6 +230,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
                 errdefer batch.abort();
                 try batch.delete(if (is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, key);
                 try batch.delete(if (is_v2) NS_OFFLINE_V2 else NS_OFFLINE, key);
+                if (is_v2) try batch.delete(NS_OFFLINE_HOLD_TOKEN, key);
             }
             try batch.commit();
         }
@@ -202,6 +259,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
                 for (keys.items) |item| {
                     try batch.delete(if (item.is_v2) NS_OFFLINE_HOLD_V2 else NS_OFFLINE_HOLD, item.key);
                     try batch.delete(if (item.is_v2) NS_OFFLINE_V2 else NS_OFFLINE, item.key);
+                    if (item.is_v2) try batch.delete(NS_OFFLINE_HOLD_TOKEN, item.key);
                 }
             }
             try batch.commit();
@@ -227,7 +285,25 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         ) !bool {
             self.db.compound_mutex.lock();
             defer self.db.compound_mutex.unlock();
-            if (try self.countMessagesLocked(recipient) >= MAX_PER_USER) return false;
+            // A plain store has no dedup identity; pass 0 to skip the token.
+            return (try self.storeLocked(recipient, from_jid, stanza_id, timestamp, stanza_xml, 0)) != 0;
+        }
+
+        /// Store inside an already-held compound lock. Returns the minted
+        /// sequence, or 0 when the recipient's queue is at quota.
+        ///
+        /// A non-zero `token` records the dedup identity under the new
+        /// pointer's key in the same batch, so it disappears with the pointer.
+        fn storeLocked(
+            self: *Self,
+            recipient: []const u8,
+            from_jid: []const u8,
+            stanza_id: []const u8,
+            timestamp: u64,
+            stanza_xml: ?[]const u8,
+            token: u64,
+        ) !u64 {
+            if (try self.countMessagesLocked(recipient) >= MAX_PER_USER) return 0;
 
             const sequence = try self.nextSequenceLocked(recipient);
             const key = try self.buildV2Key(recipient, sequence);
@@ -236,6 +312,8 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             defer self.allocator.free(value);
             var sequence_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &sequence_bytes, sequence, .big);
+            var token_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &token_bytes, token, .big);
 
             var batch = try self.db.writeBatch();
             {
@@ -243,9 +321,31 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
                 try batch.put(NS_OFFLINE_SEQ, recipient, &sequence_bytes);
                 try batch.put(NS_OFFLINE_V2, key, value);
                 if (stanza_xml) |xml| try batch.put(NS_OFFLINE_HOLD_V2, key, xml);
+                if (token != 0) try batch.put(NS_OFFLINE_HOLD_TOKEN, key, &token_bytes);
             }
             try batch.commit();
-            return true;
+            return sequence;
+        }
+
+        /// True when these bytes are already held for this recipient, whatever
+        /// resource or worker asked. Scans only this recipient's tokens.
+        ///
+        /// The token lives in the value: the key is the v2 pointer key, so the
+        /// row is found by prefix and removed with the pointer. Token and
+        /// pointer are written and deleted in the same batch, so a token
+        /// always has its pointer and needs no separate existence check.
+        fn heldTokenPresentLocked(self: *Self, recipient: []const u8, token: u64) !bool {
+            const prefix = try self.buildRecipientPrefix(recipient);
+            defer self.allocator.free(prefix);
+
+            var iter = try self.db.iterator(NS_OFFLINE_HOLD_TOKEN, prefix);
+            defer iter.deinit();
+            while (iter.next()) |entry| {
+                if (!keyHasPrefix(entry.key, prefix)) continue;
+                if (entry.value.len != 8) continue;
+                if (std.mem.readInt(u64, entry.value[0..8], .big) == token) return true;
+            }
+            return false;
         }
 
         fn nextSequenceLocked(self: *Self, recipient: []const u8) !u64 {
@@ -739,4 +839,29 @@ test "GenericOfflineStore: G2 stores sharing a backend preserve insertion order"
         try std.testing.expectEqualStrings(expected_a, pointers[i * 2].from_jid);
         try std.testing.expectEqualStrings(expected_b, pointers[i * 2 + 1].from_jid);
     }
+}
+
+test "GenericOfflineStore: storeHeldPointerOnce collapses identical bytes once" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    const stanza = "<message from='alice@us.example/phone' to='bob@us.example' type='chat' id='m1'><body>once</body></message>";
+
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza));
+    try std.testing.expectEqual(HeldOutcome.already_held, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza));
+    try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@us.example"));
+
+    // Different bytes for the same recipient are a different message.
+    const other = "<message from='alice@us.example/phone' to='bob@us.example' type='chat' id='m2'><body>twice</body></message>";
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m2", 1001, other));
+    try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
+
+    // Delivering the first lets the identical bytes be held again.
+    const ptrs = try store.getPointers("bob@us.example");
+    defer store.freePointers(ptrs);
+    try store.deletePointer(ptrs[0]);
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1002, stanza));
+    try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
 }
