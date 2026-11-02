@@ -56,6 +56,21 @@ fn compFor(a: u21, b: u21) ?u21 {
     return null;
 }
 
+/// Algorithmic Hangul composition (UAX #15): jamo L + V compose to a
+/// syllable LV, and LV + trailing jamo T compose to LVT. The composition
+/// table holds no Hangul pairs; both steps are arithmetic.
+fn hangulCompFor(a: u21, b: u21) ?u21 {
+    if (a >= 0x1100 and a <= 0x1112 and b >= 0x1161 and b <= 0x1175) {
+        return 0xAC00 + (a - 0x1100) * 588 + (b - 0x1161) * 28;
+    }
+    if (a >= 0xAC00 and a <= 0xD7A3 and b >= 0x11A8 and b <= 0x11C2 and
+        (a - 0xAC00) % 28 == 0)
+    {
+        return a + (b - 0x11A7);
+    }
+    return null;
+}
+
 const Seq = struct {
     cps: []u21,
     cccs: []u8,
@@ -70,6 +85,15 @@ const Seq = struct {
 };
 
 fn decomposeInto(seq: *Seq, cp: u21) error{NoSpaceLeft}!void {
+    // Algorithmic Hangul decomposition (UAX #15): a precomposed syllable
+    // decomposes to jamo L V (T).
+    if (cp >= 0xAC00 and cp <= 0xD7A3) {
+        const s = cp - 0xAC00;
+        try seq.push(0x1100 + s / 588);
+        try seq.push(0x1161 + (s % 588) / 28);
+        if (s % 28 != 0) try seq.push(0x11A7 + s % 28);
+        return;
+    }
     if (decompFor(cp)) |d| {
         try decomposeInto(seq, d.a);
         if (d.b != 0) try decomposeInto(seq, d.b);
@@ -110,8 +134,10 @@ pub fn nfc(
             seq.cccs[j] = c;
         }
     }
-    // Composition: each non-starter combines with the last starter unless
-    // blocked by an intervening char of equal or higher ccc.
+    // Composition (UAX #15 canonical composition): each character combines
+    // with the current starter unless blocked. A non-starter is blocked by
+    // an intervening mark of equal or higher ccc; a starter is blocked by
+    // any intervening character (it must be directly adjacent).
     var out_len: usize = 0;
     var starter_idx: ?usize = null;
     var prev_ccc: u8 = 0;
@@ -120,8 +146,11 @@ pub fn nfc(
         const cp = seq.cps[i];
         const c = seq.cccs[i];
         if (starter_idx) |si| {
-            if (c != 0 and prev_ccc < c) {
-                if (compFor(seq.cps[si], cp)) |merged| {
+            const unblocked = if (c == 0) out_len == si + 1 else prev_ccc < c;
+            if (unblocked) {
+                if (compFor(seq.cps[si], cp) orelse
+                    hangulCompFor(seq.cps[si], cp)) |merged|
+                {
                     seq.cps[si] = merged;
                     continue; // consumed; prev_ccc unchanged (blocking keeps it)
                 }
@@ -194,4 +223,63 @@ test "cccOf: starters and known combining marks" {
     try testing.expectEqual(@as(u8, 230), cccOf(0x0300));
     try testing.expectEqual(@as(u8, 232), cccOf(0x0315));
     try testing.expectEqual(@as(u8, 9), cccOf(0x094D)); // Devanagari virama
+}
+
+test "nfc: hangul jamo compose to a syllable" {
+    // U+1100 U+1161 -> U+AC00
+    const out = try nfcOf("\u{1100}\u{1161}");
+    try testing.expectEqualStrings("\u{AC00}", out);
+}
+
+test "nfc: hangul L V T compose through two steps" {
+    // U+1100 U+1161 U+11A8 -> U+AC01 (L+V then LV+T)
+    const out = try nfcOf("\u{1100}\u{1161}\u{11A8}");
+    try testing.expectEqualStrings("\u{AC01}", out);
+}
+
+test "nfc: hangul LV and T compose to LVT" {
+    // U+AC00 U+11A8 -> U+AC01
+    const out = try nfcOf("\u{AC00}\u{11A8}");
+    try testing.expectEqualStrings("\u{AC01}", out);
+}
+
+test "nfc: hangul partial compose keeps the tail jamo" {
+    // U+1100 U+1161 U+1162 -> U+AC00 U+1162 (the second vowel has no pair)
+    const out = try nfcOf("\u{1100}\u{1161}\u{1162}");
+    try testing.expectEqualStrings("\u{AC00}\u{1162}", out);
+}
+
+test "nfc: hangul syllable round-trips through its jamo" {
+    const a = try nfcOf("\u{AC01}");
+    const b = try nfcOf("\u{1100}\u{1161}\u{11A8}");
+    try testing.expectEqualStrings(a, b);
+}
+
+test "nfc: hangul syllable consumes decomposition scratch" {
+    // U+AC00 decomposes to two jamo in scratch before recomposing, so a
+    // one-code-point scratch cannot hold it (UAX #15 is decompose then
+    // compose; the syllable is not passed through untouched)
+    var buf: [64]u8 = undefined;
+    var cps: [1]u21 = undefined;
+    var cccs: [1]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, nfc("\u{AC00}", &buf, &cps, &cccs));
+}
+
+test "nfc: intervening mark blocks hangul starter composition" {
+    // U+1100 U+0301 U+1161: the mark blocks L+V
+    const out = try nfcOf("\u{1100}\u{0301}\u{1161}");
+    try testing.expectEqualStrings("\u{1100}\u{0301}\u{1161}", out);
+}
+
+test "nfc: starter-second pair composes (Bengali vowel signs)" {
+    // U+09C7 U+09BE -> U+09CB: both have ccc 0 but the pair has a
+    // canonical composition
+    const out = try nfcOf("\u{09C7}\u{09BE}");
+    try testing.expectEqualStrings("\u{09CB}", out);
+}
+
+test "nfc: intervening mark blocks starter-second composition" {
+    // U+09C7 U+0301 U+09BE: the mark blocks the pair
+    const out = try nfcOf("\u{09C7}\u{0301}\u{09BE}");
+    try testing.expectEqualStrings("\u{09C7}\u{0301}\u{09BE}", out);
 }
