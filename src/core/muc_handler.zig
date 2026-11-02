@@ -3677,3 +3677,89 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     const n = posix.read(bob_fds[1], &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
 }
+
+// H5 sizing must use the escaped recipient JID, not its raw length. A real
+// JID with characters that expand when escaped makes the emitted stanza wider
+// than its stored form, so sizing on the raw length accepts a stanza that then
+// fails `queueSend` for that occupant and tears down the whole room. The
+// existing H5 tests use plain JIDs, where both lengths agree, so they cannot
+// tell the two apart.
+test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("quotaroom@conference.localhost", .{ .persistent = false });
+
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    server.sessions[0] = alice;
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+
+    // Two characters that each grow from 1 to 4 bytes under escaping, so the
+    // emitted recipient JID is 6 bytes wider than the one the room stores.
+    var wide_buf: [256]u8 = undefined;
+    var wide_fbs = std.io.fixedBufferStream(&wide_buf);
+    const wide_w = wide_fbs.writer();
+    wide_w.writeByte('<') catch unreachable;
+    wide_w.writeAll(&([_]u8{'a'} ** 120)) catch unreachable;
+    wide_w.writeAll("@localhost/") catch unreachable;
+    wide_w.writeByte('<') catch unreachable;
+    wide_w.writeAll(&([_]u8{'b'} ** 120)) catch unreachable;
+    const wide = wide_fbs.getWritten();
+    _ = try room.addOccupant("wide", wide, "wide@localhost", 1, 0, 1, .participant, .member);
+
+    try std.testing.expectEqual(wide.len + 6, fanout.escapedLen(wide));
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // Measure the framing rather than hard-coding it, so a change to either
+    // builder shows up here as a sizing mismatch instead of a silent gap.
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
+    const from_str = "quotaroom@conference.localhost/alice";
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse unreachable;
+    var suffix_buf: [fanout.SUFFIX_CAPACITY]u8 = undefined;
+    const probe_inner = "<body></body>";
+    const probe_suffix_len = fanout.buildSuffix(&suffix_buf, "h5gap", probe_inner) orelse unreachable;
+    // Suffix framing around the inner XML is constant for a fixed id.
+    const suffix_overhead = probe_suffix_len - probe_inner.len;
+
+    // Largest body whose raw framing still fits, so only the escaped width can
+    // push it over the limit.
+    const body_overhead = "<body>".len + "</body>".len;
+    const body_len = connection_mod.WRITE_BUF_SIZE - prefix_len - suffix_overhead - wide.len - body_overhead;
+    const raw_total = prefix_len + wide.len + suffix_overhead + body_overhead + body_len;
+    const escaped_total = prefix_len + fanout.escapedLen(wide) + suffix_overhead + body_overhead + body_len;
+    try std.testing.expectEqual(connection_mod.WRITE_BUF_SIZE, raw_total);
+    try std.testing.expect(escaped_total > connection_mod.WRITE_BUF_SIZE);
+    try std.testing.expect(!fanout.exceedsWriteBuffer(prefix_len, suffix_overhead + body_overhead + body_len, wide.len, connection_mod.WRITE_BUF_SIZE));
+    try std.testing.expect(fanout.exceedsWriteBuffer(prefix_len, suffix_overhead + body_overhead + body_len, fanout.escapedLen(wide), connection_mod.WRITE_BUF_SIZE));
+
+    const inner = try allocator.alloc(u8, body_overhead + body_len);
+    defer allocator.free(inner);
+    @memset(inner, 'x');
+    @memcpy(inner[0..6], "<body>");
+    @memcpy(inner[inner.len - 7 ..], "</body>");
+
+    handleMucGroupchat(&server, alice, "quotaroom", inner, "h5gap", &changes);
+
+    // Rejected at ingress: the sender is told and no session is torn down.
+    try std.testing.expect(!alice.sm_overflow);
+    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
+}
