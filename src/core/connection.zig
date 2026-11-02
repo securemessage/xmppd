@@ -258,6 +258,18 @@ pub const Connection = struct {
         self.write_end += data.len;
     }
 
+    /// Queue `data`, first making room with one non-blocking flush when the
+    /// buffer is full. Data already buffered is deliverable, so a buffer the
+    /// server filled itself is not a slow reader: only a flush that frees
+    /// nothing means the peer really is not reading.
+    pub fn queueSendWithFlush(self: *Connection, data: []const u8) !void {
+        self.queueSend(data) catch |err| {
+            if (err != error.WriteBufferFull) return err;
+            _ = self.flushSend() catch 0;
+            return self.queueSend(data);
+        };
+    }
+
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {

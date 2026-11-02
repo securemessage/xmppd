@@ -522,17 +522,19 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             local_delivery_succeeded = true;
             continue;
         }
-        target_session.conn.queueSend(sent_data) catch |err| {
+        // Apply the MUC fan-out policy here too. A stanza that fits an empty
+        // buffer but not the current one means the peer is not reading, so
+        // mark it for the slow-reader teardown, as the MUC path does. A stanza
+        // larger than the whole buffer can never be delivered to anyone.
+        target_session.conn.queueSendWithFlush(sent_data) catch |err| {
             delivery_failed = true;
-            // Apply the MUC fan-out policy here too. A stanza that fits an
-            // empty buffer but not the current one means the peer is not
-            // reading, so mark it for the slow-reader teardown, as the MUC
-            // path does. A stanza larger than the whole buffer can never be
-            // delivered to anyone and is answered with a bounce instead.
-            const can_ever_fit = sent_data.len <= connection_mod.WRITE_BUF_SIZE;
-            if (err == error.WriteBufferFull and can_ever_fit) {
-                target_session.sm_overflow = true;
-                log.warn("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
+            if (err == error.WriteBufferFull) {
+                if (sent_data.len <= connection_mod.WRITE_BUF_SIZE) {
+                    target_session.sm_overflow = true;
+                    log.warn("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
+                } else {
+                    log.warn("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
+                }
             } else {
                 log.warn("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
             }

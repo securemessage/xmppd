@@ -6573,7 +6573,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "connection.zig", @embedFile("connection.zig"), 14 }, // Connection layer self-tests; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
-        .{ "router.zig", @embedFile("router.zig"), 2 }, // comment; sendCarbons tracked pair.
+        .{ "router.zig", @embedFile("router.zig"), 1 }, // comment only; delivery is tracked.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
         .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
@@ -6677,7 +6677,11 @@ test "Server: an over-long sender bare JID still delivers live" {
 // than leaving it wedged. c2s delivery now answers the same condition the same
 // way, so one stuck peer cannot be told two different stories depending on
 // whether the stanza came from a room.
-test "Server: a full recipient buffer is marked for teardown like the MUC path" {
+// Item 3, re-review 5: f693e7b's teardown fired on a buffer the server itself
+// had filled earlier in the same pass. Everything buffered was deliverable, so
+// the client was healthy and one non-blocking flush made room. A buffer only
+// means a slow reader when the flush frees nothing.
+test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down" {
     const allocator = std.testing.allocator;
 
     var sm = SessionMap.init(allocator, true, 0);
@@ -6696,8 +6700,87 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     server.sessions[5] = target;
     _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-    // Room enough for a short stanza, not for this one.
+
+    // The buffer is nearly full, but the peer's socket is empty: a flush frees
+    // all of it.
     target.conn.write_end = connection_mod.WRITE_BUF_SIZE - 16;
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ("x" ** 64) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Delivered, not torn down, and the sender got no bounce. The buffer was
+    // pre-filled, so drain every writable pass to reach the stanza at the end.
+    try std.testing.expect(!target.sm_overflow);
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        _ = target.conn.flushSend() catch {};
+        while (true) {
+            const n = posix.read(target_fds[1], &buf) catch break;
+            if (n == 0) break;
+            try wire.appendSlice(allocator, buf[0..n]);
+        }
+        if (!target.conn.hasPendingWrite()) break;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, wire.items, "id='m1'") != null);
+
+    _ = alice.conn.flushSend() catch {};
+    const sender_n = posix.read(alice_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), sender_n);
+}
+
+test "Server: a full recipient buffer is marked for teardown like the MUC path" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    // A peer that is not reading: the receive buffer is tiny and the send side
+    // is packed until the kernel refuses more, so a flush cannot make progress.
+    var tiny: c_int = 1024;
+    _ = std.c.setsockopt(target_fds[1], std.c.SOL.SOCKET, std.c.SO.RCVBUF, &tiny, @sizeOf(c_int));
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+    // Pack the kernel's send side until it refuses more, so the flush below
+    // cannot free anything. That is the genuine slow-reader case the teardown
+    // is for, as opposed to a buffer the server itself filled.
+    {
+        const chunk = [_]u8{'x'} ** 4096;
+        while (true) {
+            _ = posix.write(target.conn.fd, &chunk) catch break;
+        }
+    }
+    @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    target.conn.write_start = 0;
+    target.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expectError(error.WouldBlock, target.conn.flushSend());
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
