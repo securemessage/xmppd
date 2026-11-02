@@ -4571,6 +4571,7 @@ test "dns-async: resolv.conf zones follow libc ip6_str2scopeid" {
     const cases = [_]struct { conf: []const u8, scope: ?u32 }{
         .{ .conf = "nameserver fe80::1%1\n", .scope = 1 },
         .{ .conf = "nameserver 2001:db8::1%2\n", .scope = 2 },
+        .{ .conf = "nameserver ::ffff:127.0.0.1%1\n", .scope = 1 },
         .{ .conf = "nameserver ff02::1%lo0\n", .scope = 2 },
         .{ .conf = "nameserver ff01::1%lo0\n", .scope = 2 },
         .{ .conf = "nameserver ff12::1%lo0\n", .scope = 2 },
