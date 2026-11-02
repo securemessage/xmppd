@@ -1709,7 +1709,7 @@ test "engine: loopOnce with a stale generation returns before the wait (T252)" {
 const PolicyDns = struct {
     udp_fd: posix.fd_t,
     port: u16,
-    target_port: u16 = 5222,
+    target_port: std.atomic.Value(u16) = std.atomic.Value(u16).init(5222),
     alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: std.Thread = undefined,
@@ -1772,7 +1772,7 @@ const PolicyDns = struct {
                 1,    't',  4,    't', 'e', 's', 't', 0,
             };
             @memcpy(out[pos..][0..rr.len], &rr);
-            std.mem.writeInt(u16, out[pos + 16 ..][0..2], self.target_port, .big);
+            std.mem.writeInt(u16, out[pos + 16 ..][0..2], self.target_port.load(.monotonic), .big);
             pos += rr.len;
             ancount = 1;
         } else if (qtype == wire.TYPE_A) {
@@ -1831,7 +1831,7 @@ test "engine: pkix_only resolution sends zero TLSA queries" {
     var llen: posix.socklen_t = @sizeOf(posix.sockaddr);
     try posix.getsockname(lfd, &laddr, &llen);
     try posix.listen(lfd, 1);
-    srv.target_port = std.net.Address.initPosix(@alignCast(&laddr)).getPort();
+    srv.target_port.store(std.net.Address.initPosix(@alignCast(&laddr)).getPort(), .monotonic);
 
     eng.resolver = Resolver.init(alloc);
     eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", srv.port));
@@ -1857,5 +1857,5 @@ test "engine: pkix_only resolution sends zero TLSA queries" {
     // The resolved target must carry the ephemeral listener's port,
     // not the rdata's placeholder; the session dials what it resolved.
     try std.testing.expect(s.resolution.?.targets.len >= 1);
-    try std.testing.expectEqual(srv.target_port, s.resolution.?.targets[0].addr.getPort());
+    try std.testing.expectEqual(srv.target_port.load(.monotonic), s.resolution.?.targets[0].addr.getPort());
 }

@@ -19,6 +19,7 @@
 //! timers without blocking so any event loop can drive it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const dns = @import("dns");
 const wire = @import("wire");
@@ -261,7 +262,7 @@ pub const Resolver = struct {
     unmatched_replies: usize = 0,
     stale_icmp: usize = 0,
     /// Test seam: report every UDP send as failed (see sendUdp).
-    fail_sends: bool = false,
+    fail_sends: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -605,7 +606,9 @@ pub const Resolver = struct {
 
     fn sendSrv(self: *Resolver, job: *Job, prefix: []const u8) !void {
         var buf: [280]u8 = undefined;
-        const qname = std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, job.name }) catch return error.NameTooLong;
+        // A prefixed name that cannot even be staged cannot exist on
+        // the wire: same NXDOMAIN answer as an over-long buildQuery.
+        const qname = std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, job.name }) catch return self.onNxdomain(job);
         try self.sendQuery(job, qname, KIND_SRV);
     }
 
@@ -717,7 +720,9 @@ pub const Resolver = struct {
     fn sendUdp(self: *Resolver, pkt: []const u8) !void {
         // Test seam: report a wire send failure without touching the
         // socket (a closed fd is UB territory, not a failure path).
-        if (self.fail_sends) return error.SendFailed;
+        if (builtin.is_test) {
+            if (self.fail_sends) return error.SendFailed;
+        }
         _ = posix.send(self.fd, pkt, 0) catch |err| switch (err) {
             error.ConnectionRefused => {
                 self.stale_icmp += 1;
@@ -1692,14 +1697,14 @@ pub const Resolver = struct {
     fn sendAddr(self: *Resolver, job: *Job, qtype: u16) !void {
         const ent = &job.srv_list.items[job.srv_pos];
         var buf: [280]u8 = undefined;
-        const qname = std.fmt.bufPrint(&buf, "{s}", .{ent.host}) catch return error.NameTooLong;
+        const qname = std.fmt.bufPrint(&buf, "{s}", .{ent.host}) catch return self.onNxdomain(job);
         try self.sendQuery(job, qname, qtype);
     }
 
     fn sendTlsa(self: *Resolver, job: *Job) !void {
         const ent = &job.srv_list.items[job.srv_pos];
         var buf: [280]u8 = undefined;
-        const qname = dns.tlsaQueryName(&buf, ent.port, ent.host) catch return error.NameTooLong;
+        const qname = dns.tlsaQueryName(&buf, ent.port, ent.host) catch return self.onNxdomain(job);
         try self.sendQuery(job, qname, KIND_TLSA);
     }
 
@@ -1707,7 +1712,7 @@ pub const Resolver = struct {
     /// once per family so a dual-stack host yields both targets.
     fn sendFallback(self: *Resolver, job: *Job, qtype: u16) !void {
         var buf: [280]u8 = undefined;
-        const qname = std.fmt.bufPrint(&buf, "{s}", .{job.name}) catch return error.NameTooLong;
+        const qname = std.fmt.bufPrint(&buf, "{s}", .{job.name}) catch return self.onNxdomain(job);
         try self.sendQuery(job, qname, qtype);
     }
 
@@ -4849,6 +4854,22 @@ test "dns-async: names over 255 wire octets behave as NXDOMAIN" {
     try std.testing.expectEqual(@as(usize, 1), res.targets.len);
     try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
     res.deinitOn(std.testing.allocator);
+}
+
+test "dns-async: a 262+ character name reports async nxdomain" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // Too long to stage with an SRV prefix and too long for the wire:
+    // the answer is the async nxdomain, not a synchronous NameTooLong.
+    const d262 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 70;
+    try std.testing.expectEqual(@as(usize, 262), d262.len);
+    try r.resolve(d262, .client, 5222, 3, true);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
 test "dns-async: an over-long raw query reports nxdomain" {
