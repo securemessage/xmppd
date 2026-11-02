@@ -39,7 +39,7 @@ const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
 const Parser = @import("parser.zig").Parser;
 const Transport = @import("transport.zig").Transport;
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("dns_async");
 const Resolution = resolver_mod.Resolution;
 
 const Jid = xmpp.Jid;
@@ -185,6 +185,10 @@ pub const Session = struct {
     /// Freed in destroy.
     resolution: ?Resolution = null,
     target_index: usize = 0,
+    /// Any target skipped for a failed TLSA lookup during this
+    /// resolution. Stays set across connectNextTarget calls so a
+    /// later connect failure cannot mask the more informative reason.
+    tlsa_failed: bool = false,
 
     host: []const u8 = "",
     domain: []const u8 = "",
@@ -311,6 +315,9 @@ pub const Session = struct {
     pub fn fail(self: *Session, allocator: std.mem.Allocator, reason: []const u8) void {
         _ = allocator;
         if (self.failed) return;
+        // A death mid-resolve releases the resolver job before the
+        // phase flag flips; no DNS callback may land afterwards.
+        if (self.phase == .resolving) self.engine.cancelResolve(self.handle);
         self.failed = true;
         self.alive = false;
         self.phase = .dead;
@@ -476,9 +483,10 @@ pub const Session = struct {
                 if (r.targets.len == 0) return self.fail(self.engine.allocator, "resolve-failed");
                 self.resolution = r;
                 self.target_index = 0;
+                self.tlsa_failed = false;
                 self.connectNextTarget(true);
             },
-            .nxdomain, .failed => self.fail(self.engine.allocator, "resolve-failed"),
+            .nxdomain, .service_unavailable, .failed => self.fail(self.engine.allocator, "resolve-failed"),
         }
     }
 
@@ -489,6 +497,15 @@ pub const Session = struct {
         const res = &(self.resolution.?);
         while (self.target_index < res.targets.len) {
             const t = res.targets[self.target_index];
+            // ADR-13 applies to dane_first: a failed TLSA lookup is a
+            // temporary failure of the target itself - DANE cannot be
+            // checked and PKIX fallback is not allowed, so the target
+            // is never dialed. Other policies do not consult TLSA.
+            if (t.tlsa_status == .lookup_failed and self.tls_policy == .dane_first) {
+                self.tlsa_failed = true;
+                self.target_index += 1;
+                continue;
+            }
             if (!first and self.fd >= 0) posix.close(self.fd);
 
             self.fd = posix.socket(t.addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
@@ -513,13 +530,32 @@ pub const Session = struct {
             self.write_registered = true;
             return;
         }
-        self.fail(engine.allocator, "connect-failed");
+        self.fail(engine.allocator, if (self.tlsa_failed) "tlsa-lookup-failed" else "connect-failed");
     }
 
     fn armWrite(self: *Session, engine: *Engine) void {
         if (self.write_registered) return;
         engine.addWrite(self.fd, self.handle);
         self.write_registered = true;
+    }
+
+    /// DANE drives verification only under dane_first and only when
+    /// the target's TLSA lookup returned records (ADR-13): .absent
+    /// falls back to PKIX, and .lookup_failed never reaches here (the
+    /// target is skipped in connectNextTarget).
+    fn useDane(self: *const Session) bool {
+        return self.tls_policy == .dane_first and self.currentTlsaStatus() == .present;
+    }
+
+    /// DANE state of the current connection target (ADR-13): the test
+    /// seam's override reads as present; a resolution target reports
+    /// its own status word.
+    fn currentTlsaStatus(self: *const Session) resolver_mod.TlsaStatus {
+        if (self.dane_records.len > 0) return .present;
+        if (self.resolution) |*r| {
+            if (self.target_index < r.targets.len) return r.targets[self.target_index].tlsa_status;
+        }
+        return .absent;
     }
 
     /// TLSA records authenticating the current connection target: the test
@@ -1017,13 +1053,14 @@ pub const Session = struct {
                 const tp = if (self.tport) |*t| t else return error.TlsMissing;
                 // T202 verification decision (before the handshake, since
                 // the PKIX path must verify during it):
-                //   dane_first + TLSA records  -> VERIFY_NONE ctx, manual
-                //     TLSA match at completion (fail closed on mismatch);
-                //   dane_first, no records   -> PKIX ctx (system CA) +
-                //     hostname check on the stream domain;
+                //   dane_first + tlsa_status .present -> VERIFY_NONE ctx,
+                //     manual TLSA match at completion (fail closed);
+                //   dane_first + tlsa_status .absent  -> PKIX ctx (system
+                //     CA) + hostname check on the stream domain;
+                //   tlsa_status .lookup_failed        -> never reaches
+                //     here; the target is skipped in connectNextTarget;
                 //   none                     -> lab path, no verification.
-                const records = self.currentTlsa();
-                const use_dane = self.tls_policy == .dane_first and records.len > 0;
+                const use_dane = self.useDane();
                 var sni_buf: [256]u8 = undefined;
                 const sni = domainZ(&sni_buf, self.domain);
                 const ctx = if (use_dane or self.tls_policy == .none)
@@ -1269,4 +1306,214 @@ test "establishment: allocator failure fails the session (T233)" {
     try std.testing.expect(s.isDead());
     try std.testing.expectEqualStrings("alloc-failed", s.fail_reason_buf[0..s.fail_reason_len]);
     try std.testing.expect(s.phase == .dead);
+}
+
+test "connect: a lookup_failed TLSA target is never dialed" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "t1.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    // The target was skipped before socket(): no fd was opened, and
+    // the failure reports the temporary TLSA reason, not PKIX dialing.
+    try std.testing.expectEqual(@as(posix.fd_t, -1), s.fd);
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+}
+
+test "connect: a lookup_failed target falls through to the next target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    // A live listener gives the second target an instant connect so
+    // the walk provably reached it without dialing the dead one.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    const laddr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &laddr.any, laddr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &alen);
+    const port = std.net.Address.initPosix(@alignCast(&actual)).getPort();
+    try posix.listen(lfd, 4);
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "dead.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", port),
+        .host = try a.dupe(u8, "live.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    try std.testing.expect(s.fd >= 0);
+}
+
+fn loopbackListener() !struct { fd: posix.fd_t, port: u16 } {
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(lfd);
+    const laddr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &laddr.any, laddr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &alen);
+    try posix.listen(lfd, 4);
+    return .{ .fd = lfd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+test "connect: pkix_only dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .pkix_only;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expect(s.fd >= 0);
+}
+
+test "connect: a later connect failure keeps the tlsa-lookup-failed reason" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .dane_first;
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "dead.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    // A live listener keeps the second target's connect alive through
+    // the first pass, so the second pass reports the exhaustion - and
+    // the temporary TLSA failure remains the informative reason.
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "live.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    // The connect-failure path advances the index before retrying.
+    s.target_index += 1;
+    s.connectNextTarget(false);
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+}
+
+test "tls policy: only dane_first with a present TLSA set uses DANE" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "absent.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5223),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = &.{},
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    // An authenticated absence of TLSA falls back to PKIX; it must
+    // never be read as DANE.
+    s.tls_policy = .dane_first;
+    s.target_index = 0;
+    try std.testing.expect(!s.useDane());
+    s.target_index = 1;
+    try std.testing.expect(s.useDane());
+    s.tls_policy = .pkix_only;
+    try std.testing.expect(!s.useDane());
+}
+
+test "connect: none dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .none;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expect(s.fd >= 0);
 }

@@ -35,9 +35,10 @@ const Session = @import("session.zig").Session;
 const SessionConfig = @import("session.zig").SessionConfig;
 const Event = @import("session.zig").Event;
 const Transport = @import("transport.zig").Transport;
-const Resolver = @import("resolver.zig").Resolver;
-const Resolution = @import("resolver.zig").Resolution;
-const DnsStatus = @import("resolver.zig").Status;
+const Resolver = @import("dns_async").Resolver;
+const Resolution = @import("dns_async").Resolution;
+const DnsStatus = @import("dns_async").Status;
+const wire = @import("wire");
 
 const log = std.log.scoped(.xmppc);
 
@@ -64,14 +65,13 @@ pub const Handle = packed struct {
 
 /// One kqueue registration change, staged until the waiting kevent() call.
 const Change = Kevent;
-// ============================================================================
+// ======================================================================
 // Engine
-// ============================================================================
+// ======================================================================
 
 pub const Engine = struct {
     const WAKE_UDATA: usize = std.math.maxInt(usize);
     const DNS_UDATA: usize = std.math.maxInt(usize) - 1;
-    const TICK_UDATA: usize = std.math.maxInt(usize) - 2;
     /// Consumer-timer udata range base: token N rides as TIMER_UDATA - N.
     /// The range sits below the reserved sentinels and far above any Handle
     /// encode, so loopOnce routes it to onTimerEvent before Handle decode.
@@ -294,9 +294,8 @@ pub const Engine = struct {
     trace: bool,
     /// Async DNS engine (lazy-open on first resolve).
     resolver: ?Resolver = null,
-    /// One-second housekeeping tick (resolver retransmits/timeouts). The
-    /// single allowed periodic timer on this loop.
-    resolver_tick_armed: bool = false,
+    /// Set once the resolver's kqueue fd is registered on this loop.
+    resolver_watch_armed: bool = false,
 
     tls_ctx: ?ssl.SslContext = null,
     /// PKIX-verifying client context (lazy): system CA store, per-connection
@@ -500,11 +499,16 @@ pub const Engine = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Engine {
         const kq = posix.kqueue() catch return error.KqueueInit;
-        return .{
+        var self = Engine{
             .kq = kq,
             .allocator = allocator,
             .trace = std.posix.getenv("XMPPC_EVTRACE") != null,
         };
+        // The resolver reads resolv.conf at construction: create it
+        // here, off the event loop, so a first session's launchSession
+        // never does file I/O inline.
+        self.resolver = Resolver.init(allocator);
+        return self;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -1007,17 +1011,14 @@ pub const Engine = struct {
         } else |_| {}
 
         // Hostname: park the session in .resolving and hand the lookup to
-        // the async resolver on THIS engine. Nothing blocks.
-        if (self.resolver == null) {
-            self.resolver = Resolver.init(self.allocator);
-            self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
-        }
+        // the engine's resolver (built at init). Nothing blocks.
+        self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         s.phase = .resolving;
-        self.resolver.?.resolve(s.host, s.port, h.encode()) catch {
+        self.resolver.?.resolve(s.host, .client, s.port, h.encode(), s.tls_policy == .dane_first) catch {
             s.fail(self.allocator, "resolve-error");
             return;
         };
-        self.armResolverTick();
+        self.armResolverWatch();
     }
 
     /// Wire a connected fd into an already-slotted session (engine thread):
@@ -1057,28 +1058,46 @@ pub const Engine = struct {
 
     // ---- DNS completion ---------------------------------------------------
 
-    fn armResolverTick(self: *Engine) void {
-        if (self.resolver == null or self.resolver_tick_armed) return;
-        self.resolver_tick_armed = true;
-        // Register the resolver socket + a 1 s housekeeping tick.
-        const dns_fd = self.resolver.?.sockFd();
-        if (dns_fd >= 0) {
-            const dev = kev(@intCast(dns_fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, DNS_UDATA);
+    /// Register the resolver's kqueue on this loop: the child kqueue
+    /// reports readable while it has pending knotes, covering the DNS
+    /// socket, TCP fallbacks and every resolver deadline in one fd.
+    /// All resolver progress reaches the loop through that one fd.
+    fn armResolverWatch(self: *Engine) void {
+        if (self.resolver == null or self.resolver_watch_armed) return;
+        self.resolver_watch_armed = true;
+        const kq_fd = self.resolver.?.kqFd();
+        if (kq_fd >= 0) {
+            const dev = kev(@intCast(kq_fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, DNS_UDATA);
             self.stage(dev);
         }
-        const tick = kev(1, std.c.EVFILT.TIMER, std.c.EV.ADD | std.c.EV.ENABLE, TICK_UDATA);
-        // NOTE: kev() here carries data=0; EVFILT_TIMER's interval must go in
-        // `data` (ms). kev() doesn't expose it — write the record directly.
-        var tev = tick;
-        tev.data = 1000;
-        self.stage(tev);
+    }
+
+    /// Drop a dead session's resolve interest so its job is freed
+    /// instead of completing into a reaped slot.
+    pub fn cancelResolve(self: *Engine, h: Handle) void {
+        if (self.resolver) |*r| r.cancel(h.encode());
     }
 
     /// Completion callback for the resolver (engine thread). static per Cb.
     fn onDnsResult(ctx: ?*anyopaque, session_key: usize, status: DnsStatus, res: ?Resolution) void {
         const self: *Engine = @ptrCast(@alignCast(ctx orelse return));
         const h = Handle.decode(session_key);
-        const s = self.sessionAt(h) orelse return;
+        const s = self.sessionAt(h) orelse {
+            // The session was reaped before the answer landed; the
+            // resolver still delivers it, so the orphan is freed here.
+            if (res) |*r| {
+                var v = r.*;
+                v.deinitOn(self.allocator);
+            }
+            return;
+        };
+        if (s.isDead()) {
+            if (res) |*r| {
+                var v = r.*;
+                v.deinitOn(self.allocator);
+            }
+            return;
+        }
         s.onResolution(res, status);
     }
 
@@ -1254,11 +1273,7 @@ pub const Engine = struct {
         for (evbuf[0..n]) |ev| {
             if (ev.udata == WAKE_UDATA) continue;
             if (ev.udata == DNS_UDATA) {
-                if (self.resolver) |*r| r.onReadable();
-                continue;
-            }
-            if (ev.udata == TICK_UDATA) {
-                if (self.resolver) |*r| r.tick();
+                if (self.resolver) |*r| r.step(0);
                 continue;
             }
             // Consumer timer window: dispatch the callback and consume the
@@ -1507,6 +1522,109 @@ test "engine: timer EV_ERROR receipt drops the timer without firing it" {
     try std.testing.expectEqual(@as(usize, 0), eng.timersPending());
 }
 
+test "engine: the resolver is built at init, never on the loop" {
+    // Resolver construction reads resolv.conf from disk; doing it in
+    // Engine.init keeps that file I/O off the event loop for every
+    // later launchSession.
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    try std.testing.expect(eng.resolver != null);
+}
+
+test "engine: the resolver watch registers its kqueue, not a tick" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "watchme.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    try std.testing.expect(eng.resolver_watch_armed);
+
+    const kq_fd = eng.resolver.?.kqFd();
+    var saw_kq = false;
+    var saw_timer = false;
+    for (eng.changes.items) |ch| {
+        if (ch.filter == std.c.EVFILT.TIMER) saw_timer = true;
+        if (ch.filter == std.c.EVFILT.READ and ch.ident == @as(usize, @intCast(kq_fd))) saw_kq = true;
+    }
+    try std.testing.expect(saw_kq);
+    try std.testing.expect(!saw_timer);
+
+    eng.sessionAt(h).?.fail(alloc, "test-done");
+    eng.reapDead();
+}
+test "engine: a session that dies mid-resolve frees the resolver job" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "resolveme.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    const s = eng.sessionAt(h).?;
+    try std.testing.expect(s.phase == .resolving);
+    try std.testing.expectEqual(@as(usize, 1), eng.resolver.?.jobs.items.len);
+
+    s.fail(alloc, "test-stop");
+    try std.testing.expectEqual(@as(usize, 0), eng.resolver.?.jobs.items.len);
+    eng.reapDead();
+}
+
+test "engine: a DNS answer for a reaped session is freed, not leaked" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "gone.invalid",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    eng.sessionAt(h).?.fail(alloc, "test-stop");
+    eng.reapDead();
+
+    // The slot is reaped and its generation advanced; a late answer
+    // decodes to no session. If the orphan path forgot deinitOn the
+    // testing allocator reports the leaked host and slice.
+    const host = try alloc.dupe(u8, "gone.invalid");
+    const targets = try alloc.alloc(@import("dns_async").Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = host,
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    Engine.onDnsResult(&eng, h.encode(), .resolved, .{ .targets = targets });
+}
+
 test "engine: a generation bump right after run stops the loop (T252)" {
     const alloc = std.testing.allocator;
     var eng = try Engine.init(alloc);
@@ -1583,4 +1701,161 @@ test "engine: loopOnce with a stale generation returns before the wait (T252)" {
     try std.testing.expectError(error.Stopping, eng.loopOnce(gen));
     try std.testing.expect(eng.stats.wakes_read.load(.monotonic) > wakes_before);
     try std.testing.expectEqual(@as(usize, 0), fired);
+}
+
+/// Minimal UDP DNS fake for the policy tests: answers _xmpps SRV with
+/// NODATA, _xmpp SRV with one t.test:target_port target, A with 127.0.0.1, and
+/// everything else (AAAA, TLSA) NODATA. TLSA queries are only counted.
+const PolicyDns = struct {
+    udp_fd: posix.fd_t,
+    port: u16,
+    target_port: std.atomic.Value(u16) = std.atomic.Value(u16).init(5222),
+    alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    tlsa_recvd: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    thread: std.Thread = undefined,
+
+    fn run(self: *PolicyDns) void {
+        var buf: [2048]u8 = undefined;
+        var out: [2048]u8 = undefined;
+        while (self.alive.load(.acquire)) {
+            var pfd = [1]posix.pollfd{.{ .fd = self.udp_fd, .events = std.c.POLL.IN, .revents = 0 }};
+            _ = posix.poll(&pfd, 50) catch return;
+            if (pfd[0].revents == 0) continue;
+            var peer: posix.sockaddr = undefined;
+            var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+            const n = posix.recvfrom(self.udp_fd, &buf, 0, &peer, &plen) catch continue;
+            const resp_len = self.answer(&out, buf[0..n]);
+            if (resp_len > 0) _ = posix.sendto(self.udp_fd, out[0..resp_len], 0, &peer, plen) catch {};
+        }
+    }
+
+    fn answer(self: *PolicyDns, out: []u8, pkt: []const u8) usize {
+        // Question name in dotted form; query packets carry one question.
+        var name_buf: [255]u8 = undefined;
+        var name_len: usize = 0;
+        var i: usize = 12;
+        while (i < pkt.len and pkt[i] != 0) {
+            const llen: usize = pkt[i];
+            i += 1;
+            if (i + llen > pkt.len or name_len + llen + 1 > name_buf.len) return 0;
+            if (name_len != 0) {
+                name_buf[name_len] = '.';
+                name_len += 1;
+            }
+            @memcpy(name_buf[name_len..][0..llen], pkt[i..][0..llen]);
+            name_len += llen;
+            i += llen;
+        }
+        i += 1; // root zero
+        if (i + 4 > pkt.len) return 0;
+        const qname = name_buf[0..name_len];
+        const qtype = std.mem.readInt(u16, pkt[i..][0..2], .big);
+        const q_end = i + 4;
+        if (qtype == wire.TYPE_TLSA) _ = self.tlsa_recvd.fetchAdd(1, .monotonic);
+
+        @memcpy(out[0..12], pkt[0..12]);
+        out[2] = 0x81; // standard response, NOERROR
+        out[3] = 0x80;
+        @memset(out[8..12], 0);
+        @memcpy(out[12..q_end], pkt[12..q_end]);
+        var pos = q_end;
+        var ancount: u16 = 0;
+        if (qtype == wire.TYPE_SRV and !std.mem.startsWith(u8, qname, "_xmpps")) {
+            const rr = [_]u8{
+                0xC0, 0x0C, // name -> question
+                0,    wire.TYPE_SRV, 0, 1, // type, class IN
+                0,    0,    0,    60, // ttl
+                0,    14, // rdlength
+                0,    0, // priority
+                0,    0, // weight
+                0x14, 0x76, // port, overwritten below
+                1,    't',  4,    't', 'e', 's', 't', 0,
+            };
+            @memcpy(out[pos..][0..rr.len], &rr);
+            std.mem.writeInt(u16, out[pos + 16 ..][0..2], self.target_port.load(.monotonic), .big);
+            pos += rr.len;
+            ancount = 1;
+        } else if (qtype == wire.TYPE_A) {
+            const rr = [_]u8{
+                0xC0, 0x0C, 0,    1,    0,   1,
+                0,    0,    0,    60,   0,   4,
+                127,  0,    0,    1,
+            };
+            @memcpy(out[pos..][0..rr.len], &rr);
+            pos += rr.len;
+            ancount = 1;
+        }
+        std.mem.writeInt(u16, out[6..8], ancount, .big);
+        return pos;
+    }
+};
+
+fn startPolicyDns() !*PolicyDns {
+    const srv = try std.testing.allocator.create(PolicyDns);
+    srv.* = .{
+        .udp_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0),
+        .port = 0,
+    };
+    const bind_addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(srv.udp_fd, &bind_addr.any, bind_addr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(srv.udp_fd, &actual, &slen);
+    srv.port = std.net.Address.initPosix(@alignCast(&actual)).getPort();
+    srv.thread = try std.Thread.spawn(.{}, PolicyDns.run, .{srv});
+    return srv;
+}
+
+fn stopPolicyDns(srv: *PolicyDns) void {
+    srv.alive.store(false, .release);
+    srv.thread.join();
+    posix.close(srv.udp_fd);
+    std.testing.allocator.destroy(srv);
+}
+
+test "engine: pkix_only resolution sends zero TLSA queries" {
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    eng.default_tls_policy = .pkix_only;
+
+    const srv = try startPolicyDns();
+    defer stopPolicyDns(srv);
+
+    // The session dials the SRV target's port: use an ephemeral
+    // listener, not 5222 where a live xmppd answers on this host.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    try posix.bind(lfd, &(try std.net.Address.parseIp("127.0.0.1", 0)).any, @sizeOf(posix.sockaddr.in));
+    var laddr: posix.sockaddr = undefined;
+    var llen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &laddr, &llen);
+    try posix.listen(lfd, 1);
+    srv.target_port.store(std.net.Address.initPosix(@alignCast(&laddr)).getPort(), .monotonic);
+
+    eng.resolver = Resolver.init(alloc);
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", srv.port));
+    eng.resolver.?.setCallback(.{ .ctx = &eng, .fun = Engine.onDnsResult });
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "x.test",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    const s = eng.sessionAt(h).?;
+
+    // Resolve through the real chain (_xmpps NODATA -> _xmpp SRV -> A/AAAA).
+    var spins: usize = 0;
+    while (s.phase == .resolving and spins < 400) : (spins += 1)
+        eng.resolver.?.step(10);
+
+    try std.testing.expect(s.resolution != null);
+    try std.testing.expectEqual(@as(u32, 0), srv.tlsa_recvd.load(.monotonic));
+    // The resolved target must carry the ephemeral listener's port,
+    // not the rdata's placeholder; the session dials what it resolved.
+    try std.testing.expect(s.resolution.?.targets.len >= 1);
+    try std.testing.expectEqual(srv.target_port.load(.monotonic), s.resolution.?.targets[0].addr.getPort());
 }
