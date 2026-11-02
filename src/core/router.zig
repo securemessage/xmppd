@@ -462,8 +462,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Serialize the delivery copy once: every branch below sends or stores the
     // same bytes. RFC 6121 section 8.5.2.1.1 omits type='normal' on messages.
-    const emit_type = type_str.len > 0 and
-        !(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"));
+    const emit_type = emitTypeFor(session.stanza_kind, type_str);
     const built = buildDeliveryStanza(out_buf, tag_name, from_str, to_str, type_str, emit_type, id_str, delivery_inner_xml);
     if (built == null) {
         log.warn("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
@@ -633,6 +632,13 @@ fn buildStoredStanza(
 /// bytes written or null when they do not fit. `emit_type` is decided by the
 /// caller because type='normal' is omitted on messages (RFC 6121 section
 /// 8.5.2.1.1) but carried on other stanza kinds.
+/// RFC 6121 section 8.5.2.1.1 omits type='normal' on messages. Both the local
+/// and the cross-worker form must agree on this, or one dispatch becomes two.
+fn emitTypeFor(kind: StanzaKind, type_str: []const u8) bool {
+    return type_str.len > 0 and
+        !(kind == .message and std.mem.eql(u8, type_str, "normal"));
+}
+
 fn buildDeliveryStanza(
     buf: []u8,
     tag_name: []const u8,
@@ -771,42 +777,24 @@ fn enqueueCrossThreadStanza(
         .none => return false,
     };
 
+    // The same serializer as the local path: the receiving worker holds this
+    // message under the token below, and a byte that differs between the two
+    // forms would split one dispatch into two rows.
     var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
-
-    w.writeByte('<') catch return dropOversize(inner_xml.len, route);
-    w.writeAll(tag_name) catch return dropOversize(inner_xml.len, route);
-    w.writeAll(" from='") catch return dropOversize(inner_xml.len, route);
-    xml.escapeWrite(w, from_str) catch return dropOversize(inner_xml.len, route);
-    w.writeAll("' to='") catch return dropOversize(inner_xml.len, route);
-    xml.escapeWrite(w, to_str) catch return dropOversize(inner_xml.len, route);
-    w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
-    if (type_str.len > 0) {
-        if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-            w.writeAll(" type='") catch return dropOversize(inner_xml.len, route);
-            xml.escapeWrite(w, type_str) catch return dropOversize(inner_xml.len, route);
-            w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
-        }
-    }
-    if (id_str.len > 0) {
-        w.writeAll(" id='") catch return dropOversize(inner_xml.len, route);
-        xml.escapeWrite(w, id_str) catch return dropOversize(inner_xml.len, route);
-        w.writeByte('\'') catch return dropOversize(inner_xml.len, route);
-    }
-    if (inner_xml.len == 0) {
-        w.writeAll("/>") catch return dropOversize(inner_xml.len, route);
-    } else {
-        w.writeByte('>') catch return dropOversize(inner_xml.len, route);
-        w.writeAll(inner_xml) catch return dropOversize(inner_xml.len, route);
-        w.writeAll("</") catch return dropOversize(inner_xml.len, route);
-        w.writeAll(tag_name) catch return dropOversize(inner_xml.len, route);
-        w.writeByte('>') catch return dropOversize(inner_xml.len, route);
-    }
+    const payload = buildDeliveryStanza(
+        &buf,
+        tag_name,
+        from_str,
+        to_str,
+        type_str,
+        emitTypeFor(kind, type_str),
+        id_str,
+        inner_xml,
+    ) orelse return dropOversize(inner_xml.len, route);
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, fbs.getWritten(), hold_token) catch |err| {
+    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;

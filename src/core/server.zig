@@ -11522,6 +11522,87 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     try std.testing.expectEqual(@as(usize, 2), got_rows);
 }
 
+// Cross-worker dedupe relies on the local and the cross-worker forms being
+// byte-identical: the token identifies the dispatch, so a difference in the
+// serialized bytes would make one message look like two or make the two
+// holders disagree about what is on the wire.
+test "Router: the local and cross-worker delivery forms are byte-identical" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    // bob has one resource here and one on worker 1, so this dispatch takes
+    // both the local send and the cross-worker enqueue.
+    const local_fds = try makeSocketPair();
+    defer posix.close(local_fds[1]);
+    const local = try allocator.create(Session);
+    local.* = Session.init(local_fds[0], 5, "localhost", false, allocator);
+    local.stream.state = .active;
+    local.stream.authenticated = true;
+    local.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desk") catch null;
+    server.sessions[5] = local;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    sm.setPresenceAvailable("bob", "localhost", "desk", true);
+
+    const remote_fds = try makeSocketPair();
+    defer posix.close(remote_fds[1]);
+    const remote = try allocator.create(Session);
+    remote.* = Session.init(remote_fds[0], 6, "localhost", false, allocator);
+    remote.stream.state = .active;
+    remote.stream.authenticated = true;
+    remote.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch null;
+    server.sessions[6] = remote;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    // A JID that needs escaping, so the two forms would differ if either
+    // serializer handled it differently.
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "normal";
+    alice.stanza_id = "a&b<c>";
+    const body = "<body>same bytes</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    _ = local.conn.flushSend() catch {};
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(local_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+
+    var captured = struct {
+        buf: [8192]u8 = undefined,
+        len: usize = 0,
+        fn onDelivery(self: *@This(), _: u32, _: u32, payload: []const u8) void {
+            @memcpy(self.buf[0..payload.len], payload);
+            self.len = payload.len;
+        }
+    }{};
+    const queue = delivery_sys.getQueue(1);
+    _ = queue.drain(&captured, @TypeOf(captured).onDelivery);
+    try std.testing.expect(captured.len > 0);
+
+    try std.testing.expectEqualStrings(wire[0..wire_len], captured.buf[0..captured.len]);
+}
+
 test "N1: two workers draining one bare JID hold a message once" {
     const allocator = std.testing.allocator;
 
