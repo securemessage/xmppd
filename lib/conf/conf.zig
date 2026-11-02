@@ -1809,6 +1809,8 @@ test "zone suffix rejects: v4 zone, junk after zone, empty and overflowing zones
         "[::1]%1", // a zone never follows ]
         "[fe80::1]%1", // a zone never follows ]
         "[fe80::1]%1:80", // a zone never follows ]
+        "[::1]:5222%1", // and never follows the port either
+        "[fe80::1]:80%0", // and never follows the port either
         "fe80::1%1%2",
         "fe80::1%", // empty zone
         "fe80::1%4294967296", // zone past u32
