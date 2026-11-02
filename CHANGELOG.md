@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.1 - unreleased
+
+### Upgrade notes
+
+- **Passwords with conjoining jamo or a composable vowel-sign pair prepare
+  differently than in v0.9.0.** The shared Unicode NFC engine gained
+  algorithmic Hangul composition and starter-second pair composition
+  (canonically equivalent passwords used to prepare to different strings).
+  The same engine prepares SASL credentials (RFC 8265 OpaqueString: SCRAM
+  derivation at registration and `xmppctl`, PLAIN verification, xmppc
+  client preparation). Affected inputs: any password containing conjoining
+  jamo (U+1100..U+11FF) that now composes - e.g. L+V jamo now form a
+  precomposed syllable, and a precomposed syllable followed by a trailing
+  jamo now forms an LVT syllable - or a two-part vowel-sign pair that now
+  composes (e.g. U+09C7 U+09BE -> U+09CB). For such a password the prepared
+  form differs from the v0.9.0 form, so its stored SCRAM credentials
+  (derived under the old preparation) stop matching: PLAIN login fails and
+  server-derived SCRAM material no longer lines up. Remedy: reset the
+  password after upgrading. Precomposed Hangul syllables on their own, and
+  every other input, prepare exactly as in v0.9.0 (c1fe1e2).
+
 ## v0.9.0 - 2026-10-04
 
 ### Features

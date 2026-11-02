@@ -206,6 +206,45 @@ test "OpaqueString: invalid UTF-8 rejected" {
     try testing.expectError(error.InvalidUtf8, prep("pa\xFFss", &buf, &cps, &cccs));
 }
 
+test "OpaqueString: v0.9.1 NFC change is confined to jamo and vowel-sign pairs" {
+    // The v0.9.1 NFC fix (algorithmic Hangul composition, starter-second
+    // composition) changed password preparation for exactly the inputs
+    // below; the "v0.9.0 output" comments are what the old engine produced.
+    // SCRAM credentials derived from the old preparation stop matching for
+    // such passwords; the remedy is a password reset (CHANGELOG v0.9.1).
+    var buf: [64]u8 = undefined;
+    var cps: [64]u21 = undefined;
+    var cccs: [64]u8 = undefined;
+
+    // Affected class 1: conjoining Hangul jamo (U+1100..U+11FF) now
+    // compose. L+V (v0.9.0 output: the two jamo).
+    const lv = try prep("\u{1100}\u{1161}", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("\u{AC00}", lv);
+    try testing.expect(!std.mem.eql(u8, "\u{1100}\u{1161}", lv));
+    // L+V+T (v0.9.0 output: the three jamo).
+    const lvt = try prep("\u{1100}\u{1161}\u{11A8}", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("\u{AC01}", lvt);
+    try testing.expect(!std.mem.eql(u8, "\u{1100}\u{1161}\u{11A8}", lvt));
+    // Precomposed LV + trailing T (v0.9.0 output: U+AC00 then the T jamo).
+    const lvt2 = try prep("\u{AC00}\u{11A8}", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("\u{AC01}", lvt2);
+
+    // Affected class 2: a two-part vowel-sign pair that now composes
+    // (v0.9.0 output: the two signs).
+    const beng = try prep("\u{09C7}\u{09BE}", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("\u{09CB}", beng);
+    try testing.expect(!std.mem.eql(u8, "\u{09C7}\u{09BE}", beng));
+
+    // Unaffected: identical to the v0.9.0 output.
+    try testing.expectEqualStrings("alice-passw0rd!", try prep("alice-passw0rd!", &buf, &cps, &cccs));
+    // A precomposed Hangul syllable: the old engine left it as-is too.
+    try testing.expectEqualStrings("\u{AC00}pass", try prep("\u{AC00}pass", &buf, &cps, &cccs));
+    // A lone jamo has nothing to compose with.
+    try testing.expectEqualStrings("\u{1100}", try prep("\u{1100}", &buf, &cps, &cccs));
+    // Decomposed Latin composed the same way before and after.
+    try testing.expectEqualStrings("p\xC3\xA4ss", try prep("pa\xCC\x88ss", &buf, &cps, &cccs));
+}
+
 test "SCRAM name escape/unescape round trip" {
     var buf: [64]u8 = undefined;
     const esc = try escapeScramName("us,er=na=me", &buf);
