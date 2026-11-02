@@ -1919,7 +1919,8 @@ fn readResolvConf(alloc: std.mem.Allocator, path: []const u8) !net.Address {
             }
             const ab = &addr.in6.sa.addr;
             const linklocal = ab[0] == 0xfe and (ab[1] & 0xc0) == 0x80;
-            const mc_named = ab[0] == 0xff and (ab[1] == 0x01 or ab[1] == 0x02);
+            const mc_scope = ab[1] & 0x0f;
+            const mc_named = ab[0] == 0xff and (mc_scope == 0x01 or mc_scope == 0x02);
             if (!linklocal and !mc_named) continue;
             @memcpy(zbuf[0..zname.len], zname);
             zbuf[zname.len] = 0;
@@ -4572,6 +4573,8 @@ test "dns-async: resolv.conf zones follow libc ip6_str2scopeid" {
         .{ .conf = "nameserver 2001:db8::1%2\n", .scope = 2 },
         .{ .conf = "nameserver ff02::1%lo0\n", .scope = 2 },
         .{ .conf = "nameserver ff01::1%lo0\n", .scope = 2 },
+        .{ .conf = "nameserver ff12::1%lo0\n", .scope = 2 },
+        .{ .conf = "nameserver ff32::1%lo0\n", .scope = 2 },
         .{ .conf = "nameserver fec0::1%3\n", .scope = 3 },
         .{ .conf = "nameserver febf::1%lo0\n", .scope = 2 },
         .{ .conf = "nameserver 2001:db8::1%lo0\n", .scope = null },
