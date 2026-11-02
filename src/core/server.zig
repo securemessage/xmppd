@@ -406,6 +406,11 @@ pub const Session = struct {
     /// Whether the session's one-shot offline retry timer is armed. The flag
     /// rejects a stale timer after the session slot has been reused.
     offline_retry_timer_armed: bool = false,
+    /// Sequence of the last offline pointer handed to this session's
+    /// connection but not yet deleted. A failed delete returns to this pointer
+    /// on the next drain; knowing it was already written means the retry only
+    /// redoes the delete instead of sending the stanza again.
+    offline_last_sent_sequence: u64 = 0,
     /// Set when outbound delivery cannot preserve integrity, either because
     /// the SM unacked queue overflowed or a live write buffer is full. Reaped
     /// at batch end: live sessions get resource-constraint; detached sessions
@@ -6926,6 +6931,61 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     const n = posix.read(target_fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>live</body>") != null);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
+// Item 4, re-review 5: a delete that keeps failing used to resend the same
+// stanza on every retry. The pointer survives the failed delete, so the drain
+// handed it to the connection again. Recording the sequence that reached the
+// wire makes the retry redo only the delete.
+test "Re-review 5.4: a stuck delete retry deletes without resending" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "t1", 1001, "<message id='t1'><body>once</body></message>");
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+
+    // The state a failed delete leaves behind: the stanza went out, the row
+    // did not. The retry must delete it and must not put it on the wire again.
+    session.offline_pending = true;
+    session.offline_last_sent_sequence = ptrs[0].sequence;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    // The delete went through and the retry state is cleared.
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
+    try std.testing.expect(!session.offline_pending);
 }
 
 test "Server: G3 cross-worker delivery parks behind a draining offline tail" {

@@ -490,6 +490,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         cancelOfflineRetryTimer(session, changes);
         session.offline_pending = false;
         session.offline_store_stalls = 0;
+        session.offline_last_sent_sequence = 0;
         return;
     }
 
@@ -531,6 +532,20 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         }
         if (stanza_xml) |xml_data| {
             defer server.allocator.free(xml_data);
+            // A previous pass handed this pointer's stanza to the connection
+            // but could not delete the row. Resend only past that point: a
+            // delete that keeps failing must not redeliver the stanza on every
+            // retry, which no client can deduplicate.
+            if (ptr.sequence != 0 and ptr.sequence == session.offline_last_sent_sequence) {
+                store.deletePointer(ptr) catch |err| {
+                    log.warn("offline pointer delete retry failed for {s}: {s}; stopping the drain", .{ bare_jid, @errorName(err) });
+                    stallOnStoreError(server, session, bare_jid, err, changes);
+                    return;
+                };
+                session.offline_last_sent_sequence = 0;
+                delivered += 1;
+                continue;
+            }
             session.queueSendStanza(xml_data) catch {
                 // Send buffer full: stop here and let the writable handler
                 // drain the tail at the low-water mark. This message and the
@@ -542,15 +557,18 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 break;
             };
             // Only delete what was actually handed to the connection. If the
-            // delete fails the pointer survives, so the next drain would send
-            // this stanza again. Stop here rather than continue: continuing
-            // would also put the later messages in this list ahead of a
-            // retried copy of this one, which no client can reorder.
+            // delete fails the pointer survives, so record its sequence: the
+            // next drain redoes the delete without sending the stanza twice.
+            // Stop here rather than continue: continuing would also put the
+            // later messages in this list ahead of a retried copy of this one,
+            // which no client can reorder.
             store.deletePointer(ptr) catch |err| {
                 log.warn("offline pointer delete failed for {s}: {s}; stopping the drain to keep order", .{ bare_jid, @errorName(err) });
+                session.offline_last_sent_sequence = ptr.sequence;
                 stallOnStoreError(server, session, bare_jid, err, changes);
                 return;
             };
+            session.offline_last_sent_sequence = 0;
             delivered += 1;
         } else {
             // Neither copy exists: the archive entry is genuinely gone. A
