@@ -4767,6 +4767,37 @@ test "dns-async: a real TLSA send failure in finishTarget is lookup_failed" {
     try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
+test "dns-async: an over-long per-target TLSA owner is absent" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // The SRV target resolves, but its TLSA owner
+    // "_5238._tcp.<long_host>" cannot be encoded: the name cannot
+    // exist, so the per-target status is absent, never lookup_failed.
+    const long_host = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 50 ++ ".test";
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer rdata.deinit(std.testing.allocator);
+    try rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x14, 0x76 });
+    appendEncodedName(std.testing.allocator, &rdata, long_host);
+    var srv_rrs = [1]wire.Rr{.{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = rdata.items }};
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+    var a_rrs = [1]wire.Rr{.{ .name = long_host, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cacheInsert(long_host, KIND_A, &a_rrs, .none, 60);
+    r.cacheInsert(long_host, KIND_AAAA, &.{}, .nxdomain, 60);
+
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    try r.resolve("svc.test", .client, 5222, 3, true);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
+}
+
 test "dns-async: names over 255 wire octets behave as NXDOMAIN" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
