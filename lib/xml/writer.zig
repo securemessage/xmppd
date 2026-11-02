@@ -1928,7 +1928,17 @@ test "concurrent first use hashes every declaration under one seed (R8-1)" {
         uri_hash_seed.store(0, .release);
         go.store(0, .release);
         var threads: [16]std.Thread = undefined;
-        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ span, &go, &accepted });
+        var spawned: usize = 0;
+        // Threads already started spin on go and accepted, so a spawn
+        // failure releases them before they outlive this frame.
+        errdefer {
+            go.store(1, .release);
+            for (threads[0..spawned]) |t| t.join();
+        }
+        for (&threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{ span, &go, &accepted });
+            spawned += 1;
+        }
         go.store(1, .release);
         for (threads) |t| t.join();
     }
