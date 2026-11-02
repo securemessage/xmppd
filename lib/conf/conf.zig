@@ -194,14 +194,19 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == std.net.Address) {
         // A v6 zone suffix "%scope" (bare or inside []) is refused by
         // std's parsers in the uncompressed form, so strip it first and
-        // set scope_id after. The suffix also disambiguates a literal
-        // ending in :digits: "fe80::1:2:3:4:5:6%1" can never carry a
-        // port, so the ::-ambiguity rule below does not apply to it.
+        // set scope_id after. A zone never follows ']': that would be a
+        // suffix on a bracketed literal, not part of the address. The
+        // suffix also disambiguates a literal ending in :digits:
+        // "fe80::1:2:3:4:5:6%1" can never carry a port, so the
+        // ::-ambiguity rule below does not apply to it.
         var buf: [80]u8 = undefined;
         var work = s;
         var scope: u32 = 0;
         var had_scope = false;
         if (std.mem.indexOfScalar(u8, s, '%')) |pct| {
+            if (std.mem.indexOfScalar(u8, s[0..pct], ']') != null) {
+                return error.BadValue;
+            }
             const beg = pct + 1;
             var end = beg;
             while (end < s.len and std.ascii.isDigit(s[end])) end += 1;
@@ -1800,7 +1805,9 @@ test "zone suffix rejects: v4 zone, junk after zone, empty and overflowing zones
         "127.0.0.1%0",
         "1.2.3.4%00",
         "fe80::1%1:80", // junk after the zone digits
-        "[fe80::1]%1:80", // zone outside the brackets
+        "[::1]%1", // a zone never follows ]
+        "[fe80::1]%1", // a zone never follows ]
+        "[fe80::1]%1:80", // a zone never follows ]
         "fe80::1%1%2",
         "fe80::1%", // empty zone
         "fe80::1%4294967296", // zone past u32
