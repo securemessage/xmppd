@@ -482,7 +482,16 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     const bare_jid = bare_fbs.getWritten();
 
     const count = store.countMessages(bare_jid) catch return;
-    if (count == 0) return;
+    if (count == 0) {
+        // The tail is empty, so this session is no longer waiting on anything.
+        // Another resource of the same bare JID can drain the per-JID tail, so
+        // this session's flag must be cleared here or every later message to
+        // it would be parked with nothing left to drain it.
+        cancelOfflineRetryTimer(session, changes);
+        session.offline_pending = false;
+        session.offline_store_stalls = 0;
+        return;
+    }
 
     const pointers = store.getPointers(bare_jid) catch |err| {
         stallOnStoreError(server, session, bare_jid, err, changes);

@@ -6856,6 +6856,78 @@ test "Server: S13 message held behind a draining offline tail" {
     }
 }
 
+// Item 2, re-review 5: the tail is per bare JID but the drain flag is per
+// session, so one resource draining the tail leaves every other resource of
+// that JID still marked pending. With the tail empty the drain returned before
+// touching the flag, so those sessions parked every later message behind a
+// tail that no longer existed.
+test "Re-review 5.2: an empty tail clears offline_pending instead of stranding it" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.state = .active;
+    target.stream.authenticated = true;
+    target.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    // bob's phone already drained the shared tail; this resource is still
+    // marked pending from its own earlier stall.
+    target.offline_pending = true;
+    target.offline_store_stalls = 3;
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+
+    // The flag is gone, so a later live message is delivered, not parked.
+    try std.testing.expect(!target.offline_pending);
+    try std.testing.expectEqual(@as(u8, 0), target.offline_store_stalls);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "live1";
+    const body = "<body>live</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+    router.dispatchStanza(&server, &alice, &changes);
+
+    _ = target.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>live</body>") != null);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+}
+
 test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
