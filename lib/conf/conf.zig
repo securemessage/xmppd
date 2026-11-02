@@ -236,7 +236,8 @@ pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
                 }
             }
         }
-        if (scope != 0) {
+        if (had_scope) {
+            // A zone on a v4 literal is meaningless even when it is 0.
             if (a.any.family != posix.AF.INET6) return error.BadValue;
             a.in6.sa.scope_id = scope;
         }
@@ -1785,6 +1786,7 @@ test "a scoped full-length IPv6 address round-trips through forwarding" {
         try testing.expectEqual(@as(u32, 1), v.in6.sa.scope_id);
     }
 }
+
 
 test "keys before any section are rejected" {
     var tmp = testing.tmpDir(.{});
