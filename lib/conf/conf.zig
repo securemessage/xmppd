@@ -186,7 +186,8 @@ pub const ParseError = error{BadValue};
 /// Parses one string into a field value. Supported T: []const u8 (borrowed
 /// slice, never copied), bool, any integer type, enum (exact tag), Duration,
 /// std.net.Address (IP literal, optional :port; no DNS). A v6 zone suffix
-/// takes numeric interface indexes only ("%1"), not names.
+/// takes numeric interface indexes only ("%1"), not names; leading zeros
+/// are accepted, and the writer always emits the canonical form.
 pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == []const u8) return s;
     if (T == bool) return parseBool(s);
