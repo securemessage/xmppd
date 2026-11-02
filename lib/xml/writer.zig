@@ -94,7 +94,9 @@ var uri_hash_seed = std.atomic.Value(u64).init(0);
 fn uriHashSeed() u64 {
     const seen = uri_hash_seed.load(.acquire);
     if (seen != 0) return seen;
-    const fresh = std.crypto.random.int(u64);
+    // A low bit keeps the drawn seed out of the sentinel's way: a
+    // zero would look uninitialized and be drawn again.
+    const fresh = std.crypto.random.int(u64) | 1;
     return uri_hash_seed.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
 }
 
