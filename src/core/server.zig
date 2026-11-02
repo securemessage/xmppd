@@ -6592,18 +6592,79 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
     try std.testing.expectEqual(@as(u32, 1), queue.pending());
 }
 
+// The live delivery path enqueues with queueSendWithFlush, which the ratchet
+// now sees. Counting it is not enough: the stanza still has to be tracked for
+// XEP-0198, or the ack window shifts under the client.
+test "S15: live router delivery tracks the stanza for XEP-0198" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.state = .active;
+    target.stream.authenticated = true;
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.sm_enabled = true;
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    target.sm_unacked = queue;
+    server.sessions[5] = target;
+
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "track1";
+    const body = "<body>counted</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Delivered live, and counted exactly once.
+    _ = target.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>counted</body>") != null);
+    try std.testing.expectEqual(@as(u32, 1), target.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 1), queue.pending());
+}
+
 test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     // XEP-0198 acks map stanzas by position, so any stanza sent via raw
     // conn.queueSend shifts the ack window (S15). Nonzas (stream features,
     // SASL, SM elements, stream errors) are the only legitimate raw sends.
     // Counts may only shrink; a new raw site must be justified as a nonza
-    // here. The pattern is split so this test does not match itself.
-    const needle = "conn.queue" ++ "Send(";
+    // here. `queueSendWithFlush` is the same raw enqueue plus a flush, so it
+    // shifts the ack window too and is counted as well. Patterns are split so
+    // this test does not match itself.
+    const needles = [_][]const u8{
+        "conn.queue" ++ "Send(",
+        "conn.queue" ++ "SendWithFlush(",
+    };
     const cases = .{
         .{ "connection.zig", @embedFile("connection.zig"), 14 }, // Connection layer self-tests; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
-        .{ "router.zig", @embedFile("router.zig"), 1 }, // comment only; delivery is tracked.
+        .{ "router.zig", @embedFile("router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
         .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
@@ -6635,10 +6696,12 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         const src = case[1];
         const expected = case[2];
         var count: usize = 0;
-        var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, src, pos, needle)) |hit| {
-            count += 1;
-            pos = hit + needle.len;
+        for (needles) |needle| {
+            var pos: usize = 0;
+            while (std.mem.indexOfPos(u8, src, pos, needle)) |hit| {
+                count += 1;
+                pos = hit + needle.len;
+            }
         }
         if (count != expected) {
             log.err("S15 ratchet: {s} has {d} raw sends, allowlist says {d}", .{ name, count, expected });
