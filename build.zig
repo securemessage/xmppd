@@ -38,11 +38,19 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_mod.addImport("xml", xml_mod);
 
+    // Shared Unicode NFC engine + generated tables (lib/sasl and lib/precis).
+    const unicode_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sasl_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
         .target = target,
         .optimize = optimize,
     });
+    sasl_mod.addImport("unicode", unicode_mod);
 
     // T121: crypto offload thread pool (auth daemon, handler tests). Created
     // early because both binary and test module sections import it.
@@ -186,11 +194,18 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_test_mod.addImport("xml", xml_mod);
 
+    const unicode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
         .target = target,
         .optimize = optimize,
     });
+    sasl_test_mod.addImport("unicode", unicode_mod);
 
     const tls_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
@@ -250,6 +265,11 @@ pub fn build(b: *std.Build) void {
     const xmpp_tests = b.addTest(.{
         .name = "xmpp-tests",
         .root_module = xmpp_test_mod,
+    });
+
+    const unicode_tests = b.addTest(.{
+        .name = "unicode-tests",
+        .root_module = unicode_test_mod,
     });
 
     const sasl_tests = b.addTest(.{
@@ -323,6 +343,7 @@ pub fn build(b: *std.Build) void {
     const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
     bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
+    const run_unicode_tests = b.addRunArtifact(unicode_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
@@ -1748,6 +1769,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
+    test_step.dependOn(&run_unicode_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);

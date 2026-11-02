@@ -9,7 +9,7 @@
 //! RFC 3454 C.2–C.9 prohibited classes.
 
 const std = @import("std");
-const tables = @import("nfc_tables.zig");
+const unicode = @import("unicode");
 
 pub const PrepError = error{
     InvalidUtf8,
@@ -58,136 +58,6 @@ fn isPlaneNonCharacter(cp: u21) bool {
     return low == 0xFFFE or low == 0xFFFF;
 }
 
-fn decompFor(cp: u21) ?tables.Decomp {
-    var lo: usize = 0;
-    var hi: usize = tables.decomps.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        const d = tables.decomps[mid];
-        if (cp < d.cp) hi = mid else if (cp > d.cp) lo = mid + 1 else return d;
-    }
-    return null;
-}
-
-fn cccOf(cp: u21) u8 {
-    var lo: usize = 0;
-    var hi: usize = tables.ccc_ranges.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        const r = tables.ccc_ranges[mid];
-        if (cp < r.lo) hi = mid else if (cp > r.hi) lo = mid + 1 else return r.ccc;
-    }
-    return 0;
-}
-
-fn compFor(a: u21, b: u21) ?u21 {
-    var lo: usize = 0;
-    var hi: usize = tables.comps.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        const c = tables.comps[mid];
-        if (a < c.a or (a == c.a and b < c.b)) {
-            hi = mid;
-        } else if (a == c.a and b == c.b) {
-            return c.cp;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    return null;
-}
-
-const Seq = struct {
-    cps: []u21,
-    cccs: []u8,
-    len: usize,
-
-    fn push(self: *Seq, cp: u21) error{NoSpaceLeft}!void {
-        if (self.len >= self.cps.len) return error.NoSpaceLeft;
-        self.cps[self.len] = cp;
-        self.cccs[self.len] = cccOf(cp);
-        self.len += 1;
-    }
-};
-
-fn decomposeInto(seq: *Seq, cp: u21) error{NoSpaceLeft}!void {
-    if (decompFor(cp)) |d| {
-        try decomposeInto(seq, d.a);
-        if (d.b != 0) try decomposeInto(seq, d.b);
-    } else {
-        try seq.push(cp);
-    }
-}
-
-/// NFC-normalize `input` into `buf`. Intermediate codepoint scratch uses
-/// `scratch_cps`/`scratch_cccs` (parallel arrays, worst case 3x expansion).
-pub fn nfc(
-    input: []const u8,
-    buf: []u8,
-    scratch_cps: []u21,
-    scratch_cccs: []u8,
-) (PrepError)![]const u8 {
-    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
-    var seq = Seq{ .cps = scratch_cps, .cccs = scratch_cccs, .len = 0 };
-    var it = std.unicode.Utf8Iterator{ .bytes = input, .i = 0 };
-    while (it.nextCodepoint()) |cp| {
-        decomposeInto(&seq, cp) catch return error.NoSpaceLeft;
-    }
-    // Canonical ordering: stable insertion sort by ccc per segment.
-    if (seq.len > 1) {
-        var i: usize = 1;
-        while (i < seq.len) : (i += 1) {
-            const cp = seq.cps[i];
-            const c = seq.cccs[i];
-            if (c == 0) continue;
-            var j = i;
-            while (j > 0 and seq.cccs[j - 1] > c) : (j -= 1) {
-                seq.cps[j] = seq.cps[j - 1];
-                seq.cccs[j] = seq.cccs[j - 1];
-            }
-            seq.cps[j] = cp;
-            seq.cccs[j] = c;
-        }
-    }
-    // Composition: each non-starter combines with the last starter unless
-    // blocked by an intervening char of equal or higher ccc.
-    var out_len: usize = 0;
-    var starter_idx: ?usize = null;
-    var prev_ccc: u8 = 0;
-    var i: usize = 0;
-    while (i < seq.len) : (i += 1) {
-        const cp = seq.cps[i];
-        const c = seq.cccs[i];
-        if (starter_idx) |si| {
-            if (c != 0 and prev_ccc < c) {
-                if (compFor(seq.cps[si], cp)) |merged| {
-                    seq.cps[si] = merged;
-                    continue; // consumed; prev_ccc unchanged (blocking keeps it)
-                }
-            }
-        }
-        seq.cps[out_len] = cp;
-        seq.cccs[out_len] = c;
-        if (c == 0) {
-            starter_idx = out_len;
-            prev_ccc = 0;
-        } else {
-            prev_ccc = c;
-        }
-        out_len += 1;
-    }
-    // Encode.
-    var pos: usize = 0;
-    i = 0;
-    while (i < out_len) : (i += 1) {
-        const n = std.unicode.utf8CodepointSequenceLength(seq.cps[i]) catch return error.InvalidUtf8;
-        if (pos + n > buf.len) return error.NoSpaceLeft;
-        _ = std.unicode.utf8Encode(seq.cps[i], buf[pos..][0..n]) catch return error.InvalidUtf8;
-        pos += n;
-    }
-    return buf[0..pos];
-}
-
 /// RFC 8265 §4.2 OpaqueString enforcement. Returns the prepared string in
 /// `buf` (identity for printable ASCII). `buf` must be at least twice
 /// `input.len`: the space-mapped form is staged at buf's tail before NFC.
@@ -216,7 +86,7 @@ pub fn prepareOpaqueString(
     // tail-staged copy keeps input and output non-overlapping.
     const tail = buf.len - mapped_len;
     @memcpy(buf[tail..][0..mapped_len], buf[0..mapped_len]);
-    const normed = try nfc(buf[tail..][0..mapped_len], buf, scratch_cps, scratch_cccs);
+    const normed = try unicode.nfc(buf[tail..][0..mapped_len], buf, scratch_cps, scratch_cccs);
     // Prohibited check on the final form.
     var it = std.unicode.Utf8Iterator{ .bytes = normed, .i = 0 };
     while (it.nextCodepoint()) |cp| {
