@@ -88,7 +88,7 @@ Selected at build time via `-Dop-storage=` and `-Darchive-storage=`:
 - DANE/TLSA first-class for S2S trust
 - Rate limiting per-IP + per-account (fixed-size hash tables, O(1))
 - Account lockout (temporary + permanent via LockStore)
-- Channel binding (XEP-0440: tls-server-end-point + tls-exporter)
+- Channel binding (XEP-0440: tls-server-end-point + tls-exporter, planned - plumbed but not negotiated, #24)
 - Registration gated by invitation codes
 - Privilege separation (master=root, children=jabber)
 

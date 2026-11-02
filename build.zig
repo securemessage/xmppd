@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const xml_writer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -84,6 +90,16 @@ pub fn build(b: *std.Build) void {
     wire_mod.addImport("dns", dns_mod);
     dns_mod.addImport("wire", wire_mod);
 
+    // X2 shared async resolver (lib/dns/async.zig); owns its own kqueue.
+    const dns_async_mod = b.createModule(.{
+        .root_source_file = b.path("lib/dns/async.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dns_async_mod.addImport("dns", dns_mod);
+    dns_async_mod.addImport("wire", wire_mod);
+
     // --- xmppc: client-core library (T32 phase 1) ---
     // Own API boundary from day one: nothing in lib/xmppc imports src/, and
     // src/ does not import lib/xmppc. Reuses the shared protocol primitives
@@ -101,6 +117,7 @@ pub fn build(b: *std.Build) void {
     xmppc_mod.addImport("ssl", ssl_mod);
     xmppc_mod.addImport("dns", dns_mod);
     xmppc_mod.addImport("wire", wire_mod);
+    xmppc_mod.addImport("dns_async", dns_async_mod);
 
     // xmppc-smoke: end-to-end test client for lib/xmppc against a live xmppd
     // rig (doc/TESTING.md). A consumer of the public xmppc module, not part
@@ -203,6 +220,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const wire_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/dns/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wire_test_mod.addImport("dns", dns_mod);
+
     const xmppc_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmppc/xmppc.zig"),
         .target = target,
@@ -216,6 +241,7 @@ pub fn build(b: *std.Build) void {
     xmppc_test_mod.addImport("ssl", ssl_mod);
     xmppc_test_mod.addImport("dns", dns_mod);
     xmppc_test_mod.addImport("wire", wire_mod);
+    xmppc_test_mod.addImport("dns_async", dns_async_mod);
 
     const xml_tests = b.addTest(.{
         .name = "xml-tests",
@@ -225,6 +251,11 @@ pub fn build(b: *std.Build) void {
     const conf_tests = b.addTest(.{
         .name = "conf-tests",
         .root_module = conf_mod,
+    });
+
+    const xml_writer_tests = b.addTest(.{
+        .name = "xml-writer-tests",
+        .root_module = xml_writer_mod,
     });
 
     const xmpp_tests = b.addTest(.{
@@ -250,6 +281,11 @@ pub fn build(b: *std.Build) void {
     const dns_tests = b.addTest(.{
         .name = "dns-tests",
         .root_module = dns_test_mod,
+    });
+
+    const wire_tests = b.addTest(.{
+        .name = "wire-tests",
+        .root_module = wire_test_mod,
     });
 
     const xmppc_tests = b.addTest(.{
@@ -279,12 +315,39 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_conf_tests = b.addRunArtifact(conf_tests);
+    const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
+
+    // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
+    const esc_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/xml_escape_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    esc_bench_mod.addImport("xml-writer", b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const esc_bench = b.addExecutable(.{
+        .name = "xml-escape-bench",
+        .root_module = esc_bench_mod,
+    });
+    const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
+    bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
     const run_dns_tests = b.addRunArtifact(dns_tests);
+    const run_wire_tests = b.addRunArtifact(wire_tests);
     const run_xmppc_tests = b.addRunArtifact(xmppc_tests);
+
+    // X2: dns-async tests run against a local fake nameserver (UDP+TCP).
+    const dns_async_tests = b.addTest(.{
+        .name = "dns-async-tests",
+        .root_module = dns_async_mod,
+    });
+    const run_dns_async_tests = b.addRunArtifact(dns_async_tests);
 
     // --- Core daemon tests ---
 
@@ -1696,11 +1759,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
+    test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);
     test_step.dependOn(&run_dns_tests.step);
+    test_step.dependOn(&run_wire_tests.step);
+    test_step.dependOn(&run_dns_async_tests.step);
     test_step.dependOn(&run_xmppc_tests.step);
     test_step.dependOn(&run_socketpair_tests.step);
     test_step.dependOn(&run_event_loop_tests.step);
