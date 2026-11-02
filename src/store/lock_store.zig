@@ -24,16 +24,43 @@ const log = std.log.scoped(.lock_store);
 pub const NAMESPACE = backend_mod.registered("locks");
 const LOCK_VALUE_SIZE = 5; // lock_type(1) + epoch(4)
 
-/// Lock keys are canonical ASCII-lowercase localparts: XMPP localparts are
-/// case-insensitive, so a lock on "alice" must hold for "Alice" and "ALICE"
-/// alike (S3). Empty or overlong names cannot be valid identities;
-/// the check path maps the error to fail-closed.
-const MAX_KEY_LEN = 256;
+/// Lock keys are canonical localparts: the identity's localpart,
+/// ASCII-lowercased, with U+212A KELVIN SIGN folded to "k". XMPP localparts
+/// are case-insensitive and the IdP folds U+212A to "k", so a lock on "kate"
+/// must hold for "Kate", "KATE" and "<U+212A>ate" alike (S3). This is the
+/// single key function the lock store, the rate limiter and the admission
+/// policy share, so every mechanism enforces the same identity.
+pub const MAX_KEY_LEN = 256;
 
-fn canonicalKey(username: []const u8, buf: *[MAX_KEY_LEN]u8) error{KeyTooLong}![]const u8 {
-    if (username.len == 0 or username.len > MAX_KEY_LEN) return error.KeyTooLong;
-    for (username, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
-    return buf[0..username.len];
+/// The identity's localpart: the bytes before the first "@", or the whole
+/// name when there is no domain.
+pub fn localpartOf(identity: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, identity, '@')) |at| return identity[0..at];
+    return identity;
+}
+
+/// Canonical account key: localpart, ASCII-lowercased, U+212A KELVIN SIGN
+/// folded to "k". Returns the folded key in `buf`, or null when the name is
+/// empty or the folded key does not fit (the caller maps that to fail-closed
+/// or untrackable).
+pub fn canonicalKey(identity: []const u8, buf: []u8) ?[]const u8 {
+    const local = localpartOf(identity);
+    if (local.len == 0) return null;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < local.len) {
+        if (i + 3 <= local.len and local[i] == 0xE2 and local[i + 1] == 0x84 and local[i + 2] == 0xAA) {
+            if (n >= buf.len) return null;
+            buf[n] = 'k';
+            i += 3;
+        } else {
+            if (n >= buf.len) return null;
+            buf[n] = std.ascii.toLower(local[i]);
+            i += 1;
+        }
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 /// Whether a failed backend open means "nothing is stored there yet" (a
@@ -133,7 +160,7 @@ pub fn LockStore(comptime Backend: type) type {
             defer it.deinit();
             while (it.next()) |entry| {
                 var canon_buf: [MAX_KEY_LEN]u8 = undefined;
-                const fold = canonicalKey(entry.key, &canon_buf) catch continue;
+                const fold = canonicalKey(entry.key, canon_buf[0..]) orelse continue;
                 if (std.mem.eql(u8, fold, entry.key)) continue;
                 legacy_any = true;
                 if (std.mem.eql(u8, fold, canon)) {
@@ -146,7 +173,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// Check if a username is locked. Returns the lock record if locked, null otherwise.
         pub fn isLocked(self: *Self, allocator: std.mem.Allocator, username: []const u8) !?LockRecord {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = try canonicalKey(username, &key_buf);
+            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
             const raw = self.backend.get(allocator, NAMESPACE, key) catch |err| {
                 log.err("lock_store lookup failed for '{s}': {}", .{ username, err });
                 return err;
@@ -179,7 +206,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// Lock an account. Overwrites any existing lock.
         pub fn lock(self: *Self, username: []const u8, lock_type: LockType) !void {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = try canonicalKey(username, &key_buf);
+            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
             const now = currentEpoch();
             const value = serialize(lock_type, now);
             try self.backend.put(NAMESPACE, key, &value);
@@ -191,7 +218,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// remove both, or the survivor still reads as locked (S3).
         pub fn unlock(self: *Self, allocator: std.mem.Allocator, username: []const u8) !void {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = try canonicalKey(username, &key_buf);
+            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
             var removed = false;
             if (try self.backend.get(allocator, NAMESPACE, key)) |v| {
                 allocator.free(v);
@@ -231,14 +258,14 @@ pub fn LockStore(comptime Backend: type) type {
                 defer it.deinit();
                 while (it.next()) |entry| {
                     var canon_buf: [MAX_KEY_LEN]u8 = undefined;
-                    const canon = canonicalKey(entry.key, &canon_buf) catch continue;
+                    const canon = canonicalKey(entry.key, canon_buf[0..]) orelse continue;
                     if (std.mem.eql(u8, canon, entry.key)) continue;
                     try legacy.append(allocator, try allocator.dupe(u8, entry.key));
                 }
             }
             for (legacy.items) |k| {
                 var canon_buf: [MAX_KEY_LEN]u8 = undefined;
-                const canon = try canonicalKey(k, &canon_buf);
+                const canon = canonicalKey(k, canon_buf[0..]) orelse continue;
                 const taken = try self.backend.get(allocator, NAMESPACE, canon);
                 if (taken) |v| {
                     allocator.free(v);
@@ -391,6 +418,27 @@ test "LockStore: keys are case-folded on write and check" {
     try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
     try store.unlock(allocator, "BOB");
     try std.testing.expect((try store.isLocked(allocator, "bob")) == null);
+}
+
+test "LockStore: the Kelvin sign folds to the same lock row" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    try store.lock("kate", .permanent);
+    // The U+212A KELVIN SIGN variant of a locked name must hit the same row,
+    // or a permanently locked account is a password oracle through that name.
+    try std.testing.expect((try store.isLocked(allocator, "\u{212A}ate")) != null);
+    try std.testing.expect((try store.isLocked(allocator, "Kate")) != null);
+    try std.testing.expect((try store.isLocked(allocator, "KATE")) != null);
+
+    // Writes fold the sign too, and unlock reaches the folded row.
+    try store.lock("\u{212A}ate", .permanent);
+    try store.unlock(allocator, "kate");
+    try std.testing.expect((try store.isLocked(allocator, "\u{212A}ate")) == null);
 }
 
 test "LockStore: empty and overlong names fail closed" {
