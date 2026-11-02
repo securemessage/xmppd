@@ -8120,6 +8120,65 @@ test "Server: H3 a resume carries the stalled offline tail" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-1") != null);
 }
 
+// The count runs before anything is armed, so a failure there used to leave the
+// session pending with no timer, no staged write, and no sweep. The tail then
+// waited for the next login even after the store recovered.
+test "Re-review 6.4: a failed count arms a retry instead of parking the session" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "c1", 1001, "<message id='c1'><body>once</body></message>");
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    offline_store.test_fail_counts = 1;
+    session.offline_pending = true;
+    session.offline_store_stalls = 0;
+
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // The stall is recorded and a prompt retry is staged on the connection.
+    try std.testing.expect(session.offline_pending);
+    try std.testing.expectEqual(@as(u8, 1), session.offline_store_stalls);
+    var staged_write = false;
+    for (changes.buf[0..changes.len]) |ev| {
+        if (ev.filter == std.c.EVFILT.WRITE and ev.udata == session.conn.id) staged_write = true;
+    }
+    try std.testing.expect(staged_write);
+
+    // With the store recovered the next drain sends the row.
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    _ = session.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>once</body>") != null);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.offline_pending);
+}
+
 // The drain had handed this row to the connection and then failed its delete.
 // Resume must carry that sequence, or it resends the row the client already
 // has on top of the SM replay of the same stanza.

@@ -481,7 +481,12 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    const count = store.countMessages(bare_jid) catch return;
+    // A failed count is a store failure like any other: without a staged
+    // retry the session stays parked with nothing armed to drain it.
+    const count = store.countMessages(bare_jid) catch |err| {
+        stallOnStoreError(server, session, bare_jid, err, changes);
+        return;
+    };
     if (count == 0) {
         // The tail is empty, so this session is no longer waiting on anything.
         // Another resource of the same bare JID can drain the per-JID tail, so

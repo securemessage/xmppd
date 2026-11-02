@@ -113,6 +113,10 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// fails its delete is reachable in production (a full map) but no
         /// test can arrange it. Never set in production.
         test_fail_deletes: u32 = 0,
+        /// Test seam: fail this many `countMessages` calls. A count runs
+        /// before the drain is armed, so a failure there is easy to leave
+        /// unrecoverable. Never set in production.
+        test_fail_counts: u32 = 0,
 
         pub fn init(db: *Backend, allocator: std.mem.Allocator) Self {
             return .{ .db = db, .allocator = allocator };
@@ -203,6 +207,10 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
         /// Count pending offline messages for a recipient.
         pub fn countMessages(self: *Self, recipient: []const u8) !usize {
+            if (self.test_fail_counts > 0) {
+                self.test_fail_counts -= 1;
+                return error.MapFull;
+            }
             self.lockRead();
             defer self.unlockRead();
             return self.countMessagesLocked(recipient);
