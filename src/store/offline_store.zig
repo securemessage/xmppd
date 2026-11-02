@@ -45,20 +45,27 @@ pub const NS_OFFLINE_SEQ = backend.registered("offline_seq");
 /// message; the token collapses them into one row.
 pub const NS_OFFLINE_HOLD_TOKEN = backend.registered("offline_hold_token");
 
-/// Stable identity of the bytes a hold request would store. Every copy of one
-/// dispatch carries the same serialized stanza, so the hash is equal on every
-/// worker that sees it, which makes the once-only store atomic without a
-/// cross-worker protocol. An identical retransmission of the same bytes to the
-/// same bare JID collapses too, which is the intent: it is one message.
-pub fn holdToken(stanza_xml: []const u8) u64 {
-    return std.hash.Wyhash.hash(0x6f66666c696e65, stanza_xml);
-}
+/// Identity of one dispatch, minted once by the server and carried to every
+/// place that may hold the message: the local resources draining the tail, the
+/// other workers holding one, and the cross-worker delivery that reaches them.
+///
+/// It must identify the dispatch and not its bytes. Hashing the stanza would
+/// collapse two distinct messages that happen to serialize identically, which
+/// is reachable whenever no server stanza-id is minted: type='normal',
+/// `headline`, a `no-store` hint, or a reused client id. The second message
+/// would be answered as already held and never stored, so zero means "no
+/// token" and callers must mint one.
+pub const HoldToken = u64;
+
+/// A hold token that was never minted. `storeHeldPointerOnce` treats it as a
+/// programming error rather than silently collapsing.
+pub const HOLD_TOKEN_NONE: HoldToken = 0;
 
 /// Result of `storeHeldPointerOnce`.
 pub const HeldOutcome = enum {
     /// This call created the pointer.
     stored,
-    /// The same bytes are already held for this recipient, by this worker or
+    /// This dispatch is already held for this recipient, by this worker or
     /// another one. Nothing was written.
     already_held,
     /// The recipient's queue is at quota.
@@ -141,14 +148,15 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             return self.storeInternal(recipient, from_jid, stanza_id, timestamp, stanza_xml);
         }
 
-        /// Store a held pointer unless these exact bytes are already held for
-        /// this recipient.
+        /// Store a held pointer unless this dispatch is already held for this
+        /// recipient.
         ///
         /// The offline tail is per bare JID, but the decision to hold is made
         /// per session: every local resource still draining asks to hold the
         /// same message, and so does every worker holding a resource of that
         /// bare JID. Without dedup one message becomes one row per resource
-        /// and is then delivered once per row.
+        /// and is then delivered once per row. The token identifies the
+        /// dispatch, so distinct messages stay distinct.
         ///
         /// The check and the store share the compound lock, which the process
         /// shares across workers, so two workers racing on the same message
@@ -160,11 +168,14 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             stanza_id: []const u8,
             timestamp: u64,
             stanza_xml: []const u8,
+            token: HoldToken,
         ) !HeldOutcome {
+            // An unminted token cannot distinguish dispatches, so accepting it
+            // would reintroduce the content-based collapse it replaces.
+            if (token == HOLD_TOKEN_NONE) return error.HoldTokenNotMinted;
             self.db.compound_mutex.lock();
             defer self.db.compound_mutex.unlock();
 
-            const token = holdToken(stanza_xml);
             if (try self.heldTokenPresentLocked(recipient, token)) return .already_held;
 
             const sequence = try self.storeLocked(recipient, from_jid, stanza_id, timestamp, stanza_xml, token);
@@ -327,7 +338,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             return sequence;
         }
 
-        /// True when these bytes are already held for this recipient, whatever
+        /// True when this dispatch is already held for this recipient, whatever
         /// resource or worker asked. Scans only this recipient's tokens.
         ///
         /// The token lives in the value: the key is the v2 pointer key, so the
@@ -841,7 +852,7 @@ test "GenericOfflineStore: G2 stores sharing a backend preserve insertion order"
     }
 }
 
-test "GenericOfflineStore: storeHeldPointerOnce collapses identical bytes once" {
+test "GenericOfflineStore: storeHeldPointerOnce collapses one dispatch, not identical bytes" {
     const allocator = std.testing.allocator;
     var db = try MemoryBackend.open("", .{});
     defer db.close();
@@ -849,19 +860,49 @@ test "GenericOfflineStore: storeHeldPointerOnce collapses identical bytes once" 
 
     const stanza = "<message from='alice@us.example/phone' to='bob@us.example' type='chat' id='m1'><body>once</body></message>";
 
-    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza));
-    try std.testing.expectEqual(HeldOutcome.already_held, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza));
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza, 0x1111));
+    try std.testing.expectEqual(HeldOutcome.already_held, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1000, stanza, 0x1111));
     try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@us.example"));
 
     // Different bytes for the same recipient are a different message.
     const other = "<message from='alice@us.example/phone' to='bob@us.example' type='chat' id='m2'><body>twice</body></message>";
-    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m2", 1001, other));
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m2", 1001, other, 0x2222));
     try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
 
     // Delivering the first lets the identical bytes be held again.
     const ptrs = try store.getPointers("bob@us.example");
     defer store.freePointers(ptrs);
     try store.deletePointer(ptrs[0]);
-    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1002, stanza));
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "m1", 1002, stanza, 0x3333));
     try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
+}
+
+test "GenericOfflineStore: two dispatches of identical bytes are two rows" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    // A type='normal' message with no stanza-id: both dispatches serialize to
+    // the same bytes. Only the minted token tells them apart.
+    const stanza = "<message from='alice@us.example/phone' to='bob@us.example' type='normal'><body>otr</body></message>";
+
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1000, stanza, 0xa1));
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1001, stanza, 0xb2));
+    try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
+
+    // Repeating one dispatch still collapses.
+    try std.testing.expectEqual(HeldOutcome.already_held, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1000, stanza, 0xa1));
+    try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
+}
+
+test "GenericOfflineStore: an unminted hold token is refused" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    const stanza = "<message type='normal'><body>x</body></message>";
+    try std.testing.expectError(error.HoldTokenNotMinted, store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1, stanza, HOLD_TOKEN_NONE));
+    try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@us.example"));
 }

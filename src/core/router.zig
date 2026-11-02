@@ -26,6 +26,7 @@ const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
 const connection_mod = @import("connection.zig");
+const offline_store = @import("generic_offline_store");
 const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
@@ -280,6 +281,11 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         break :blk aug_fbs.getWritten();
     } else inner_xml;
 
+    // One identity for this dispatch. Every resource and every worker that
+    // holds the message quotes it, so the store collapses the copies of this
+    // dispatch and never two dispatches with identical bytes.
+    const hold_token = server.mintHoldToken();
+
     var delivery_failed = false;
     for (entries_buf[0..route_count]) |entry| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
@@ -300,6 +306,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 id_str,
                 delivery_inner_xml,
                 session.stanza_kind,
+                hold_token,
             )) {
                 remote_delivered = true;
             } else {
@@ -490,7 +497,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 id_str
             else
                 "offline";
-            if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data)) {
+            if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data, hold_token)) {
                 hold_stored = true;
                 local_delivery_succeeded = true;
                 log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
@@ -753,6 +760,7 @@ fn enqueueCrossThreadStanza(
     id_str: []const u8,
     inner_xml: []const u8,
     kind: StanzaKind,
+    hold_token: offline_store.HoldToken,
 ) bool {
     const ds = server.delivery_system orelse return false;
 
@@ -796,7 +804,9 @@ fn enqueueCrossThreadStanza(
         w.writeByte('>') catch return dropOversize(inner_xml.len, route);
     }
 
-    ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
+    // Carry the dispatch identity so the receiving worker holds this message
+    // under the same token every other holder uses.
+    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, fbs.getWritten(), hold_token) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;

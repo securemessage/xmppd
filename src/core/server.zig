@@ -57,6 +57,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const generic_offline = @import("generic_offline_store");
+const offline_store_mod = @import("generic_offline_store");
 const GenericOfflineStore = generic_offline.GenericOfflineStore;
 const OfflinePointer = generic_offline.OfflinePointer;
 const archive_store_mod = @import("archive_store");
@@ -1059,10 +1060,11 @@ pub const Server = struct {
     /// Park a message behind a session's draining offline tail. The held bytes
     /// are authoritative; archive metadata is retained only for fallback reads.
     ///
-    /// Returns true when the message is held, which includes the case where an
-    /// identical copy is already held for this bare JID: the tail is per bare
-    /// JID, so every draining resource and every worker holding one sees the
-    /// same message and must not add a second row for it.
+    /// Returns true when the message is held, which includes the case where this
+    /// dispatch is already held for this bare JID: the tail is per bare JID, so
+    /// every draining resource and every worker holding one sees the same
+    /// message and must not add a second row for it. `token` identifies the
+    /// dispatch, so two messages with identical bytes stay two rows.
     pub fn holdBehindOfflineTail(
         self: *Server,
         target: *Session,
@@ -1072,12 +1074,13 @@ pub const Server = struct {
         stanza_id: []const u8,
         timestamp: u64,
         stanza_xml: []const u8,
+        token: offline_store_mod.HoldToken,
     ) bool {
         if (!target.offline_pending) return false;
         const store = self.offline orelse return false;
         var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
         const recipient = router.buildBareJid(local, domain, &recipient_buf) catch return false;
-        const outcome = store.storeHeldPointerOnce(recipient, from_jid, stanza_id, timestamp, stanza_xml) catch |err| {
+        const outcome = store.storeHeldPointerOnce(recipient, from_jid, stanza_id, timestamp, stanza_xml, token) catch |err| {
             log.warn("message to {s} could not be held behind the offline tail: {s}", .{ recipient, @errorName(err) });
             return false;
         };
@@ -3218,6 +3221,9 @@ pub const Server = struct {
                 }
 
                 var s2s_hold_stored = false;
+                // One token per inbound stanza: identical remote stanzas are
+                // separate dispatches and must not collapse in the store.
+                const s2s_hold_token = self.mintHoldToken();
                 for (s2s_entries[0..target_count]) |entry| {
                     if (entry.worker_id == self.worker_id) {
                         const target_session = self.sessions[entry.local_session_id] orelse continue;
@@ -3226,7 +3232,7 @@ pub const Server = struct {
                             // this worker asks, and the store collapses them.
                             if (s2s_hold_stored) continue;
                             const hold_id = if (live_parts.msg_id.len > 0) live_parts.msg_id else "s2s-offline";
-                            if (self.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, m.from_jid, hold_id, s2s_archive_ts, m.stanza_xml)) {
+                            if (self.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, m.from_jid, hold_id, s2s_archive_ts, m.stanza_xml, s2s_hold_token)) {
                                 s2s_hold_stored = true;
                                 continue;
                             }
@@ -3512,6 +3518,17 @@ pub const Server = struct {
 
     /// Generate a unique XEP-0359 stanza ID. Zero-padded timestamp, worker,
     /// and counter fields keep the representation fixed-width.
+    /// Mint the identity of one dispatch, for `holdBehindOfflineTail`. The
+    /// stanza id generator gives a value unique per worker and call, so the
+    /// hash is unique across workers and never collides with a later dispatch.
+    pub fn mintHoldToken(self: *Server) offline_store_mod.HoldToken {
+        var buf: [32]u8 = undefined;
+        const id = self.generateStanzaId(&buf);
+        // Fold out the zero sentinel; a minted token must never look unminted.
+        const token = std.hash.Wyhash.hash(0x686f6c64746f6b, id) | 1;
+        return token;
+    }
+
     pub fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
         const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         const counter = self.stanza_id_counter;
@@ -3799,8 +3816,9 @@ pub const Server = struct {
             server: *Server,
             changes: *ChangeList,
             session_map: *SessionMap,
+            queue: *delivery_queue_mod.MpscQueue,
         };
-        const ctx = Ctx{ .server = self, .changes = changes, .session_map = sm };
+        const ctx = Ctx{ .server = self, .changes = changes, .session_map = sm, .queue = queue };
 
         _ = queue.drain(ctx, struct {
             fn handle(c: Ctx, local_session_id: u32, generation: u32, payload: []const u8) void {
@@ -3840,7 +3858,16 @@ pub const Server = struct {
                         log.warn("cross-worker message to session {d} has no bound recipient for its offline hold", .{local_session_id});
                         return;
                     };
-                    if (c.server.holdBehindOfflineTail(target_session, bound.local, bound.domain, from_jid, hold_id, timestamp, payload)) return;
+                    // A producer that minted a token (the router, S2S inbound)
+                    // has every worker holding a resource of this bare JID
+                    // collapse the same dispatch. A producer that did not gets
+                    // a token here, so the message is still stored; only the
+                    // cross-worker collapse is lost, never the message.
+                    const token = if (c.queue.current_slot_token != 0)
+                        c.queue.current_slot_token
+                    else
+                        c.server.mintHoldToken();
+                    if (c.server.holdBehindOfflineTail(target_session, bound.local, bound.domain, from_jid, hold_id, timestamp, payload, token)) return;
                     // The stanza can neither be held nor sent without
                     // overtaking the draining tail. Tell the sender rather
                     // than dropping it (H2), as the c2s router does.
@@ -10986,7 +11013,11 @@ test "every store namespace constant is registered and every registry entry is o
 // N1: the offline tail is per bare JID, but the hold decision is per session.
 // Two resources of bob still draining made the router store one copy per
 // resource, and the drain then delivered each copy to each of them.
-test "N1: two draining resources hold a bare-JID message once and each receive it once" {
+// The offline tail is one per bare JID, so a message held behind it is a single
+// row and reaches whichever resource drains first. The other resource finds the
+// tail empty and gets nothing, which is the intended shape: the tail is shared,
+// not per resource.
+test "N1: two draining resources hold a bare-JID message once" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -11050,8 +11081,8 @@ test "N1: two draining resources hold a bare-JID message once and each receive i
     // One message, one row, however many resources are draining it.
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 
-    // Each draining resource drains the shared tail exactly once: the tail is
-    // per bare JID, so the second drain finds it empty and sends nothing.
+    // The tail is per bare JID, so exactly one resource receives the message:
+    // the first to drain. The second finds the tail empty and sends nothing.
     var delivered_copies: usize = 0;
     for ([_]*Session{ desktop, phone }) |session| {
         session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
@@ -11068,6 +11099,71 @@ test "N1: two draining resources hold a bare-JID message once and each receive i
 // N1: the same collapse has to hold across workers. The tail is one bare JID
 // row, so a resource of bob on each worker both ask to hold the same message
 // and the store must write it once, whichever worker wins the race.
+// Two identical messages must stay two rows. A message with no server
+// stanza-id (type='normal', no id) serializes identically on both dispatches,
+// so only the token minted per dispatch can tell them apart.
+test "N1: two identical stanza-less messages to a draining bare JID are two rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.offline = &offline_store;
+
+    const desktop_fds = try makeSocketPair();
+    defer posix.close(desktop_fds[1]);
+    const desktop = try allocator.create(Session);
+    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
+    desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    desktop.offline_pending = true;
+    server.sessions[5] = desktop;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "normal";
+    const body = "<body>otr</body>";
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Two dispatches, byte-identical: type='normal' gets no stanza-id and the
+    // client sent no id.
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        // dispatchStanza consumes the parsed stanza, so each round rebuilds the
+        // identical one from scratch.
+        alice.stanza_kind = .message;
+        alice.stanza_to = "bob@localhost";
+        alice.stanza_type = "normal";
+        alice.stanza_id = "";
+        @memcpy(alice.stanza_buf[0..body.len], body);
+        alice.stanza_buf_len = body.len;
+        router.dispatchStanza(&server, &alice, &changes);
+    }
+
+    const got_rows = try offline_store.countMessages("bob@localhost");
+    try std.testing.expectEqual(@as(usize, 2), got_rows);
+}
+
 test "N1: two workers draining one bare JID hold a message once" {
     const allocator = std.testing.allocator;
 
@@ -11113,10 +11209,11 @@ test "N1: two workers draining one bare JID hold a message once" {
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat' id='n1-2'><body>cross</body></message>";
     const ts: u64 = 1700000000;
 
-    // Both workers see the same dispatch, in order. The second is the race the
-    // per-resource hold used to turn into a second row.
-    try std.testing.expect(server.holdBehindOfflineTail(desk, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza));
-    try std.testing.expect(server.holdBehindOfflineTail(phone, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza));
+    // Both workers hold the same dispatch under the one token the producer
+    // minted, so the store writes one row whichever worker wins.
+    const token = server.mintHoldToken();
+    try std.testing.expect(server.holdBehindOfflineTail(desk, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza, token));
+    try std.testing.expect(server.holdBehindOfflineTail(phone, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza, token));
 
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 }
