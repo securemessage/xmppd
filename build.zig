@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const xml_writer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -236,6 +242,11 @@ pub fn build(b: *std.Build) void {
         .root_module = xml_test_mod,
     });
 
+    const xml_writer_tests = b.addTest(.{
+        .name = "xml-writer-tests",
+        .root_module = xml_writer_mod,
+    });
+
     const xmpp_tests = b.addTest(.{
         .name = "xmpp-tests",
         .root_module = xmpp_test_mod,
@@ -292,6 +303,25 @@ pub fn build(b: *std.Build) void {
     const run_socketpair_tests = b.addRunArtifact(socketpair_tests);
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
+    const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
+
+    // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
+    const esc_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/xml_escape_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    esc_bench_mod.addImport("xml-writer", b.createModule(.{
+        .root_source_file = b.path("lib/xml/writer.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const esc_bench = b.addExecutable(.{
+        .name = "xml-escape-bench",
+        .root_module = esc_bench_mod,
+    });
+    const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
+    bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
@@ -1716,6 +1746,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
+    test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
