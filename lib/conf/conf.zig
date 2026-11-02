@@ -185,7 +185,8 @@ pub const ParseError = error{BadValue};
 
 /// Parses one string into a field value. Supported T: []const u8 (borrowed
 /// slice, never copied), bool, any integer type, enum (exact tag), Duration,
-/// std.net.Address (IP literal, optional :port; no DNS).
+/// std.net.Address (IP literal, optional :port; no DNS). A v6 zone suffix
+/// takes numeric interface indexes only ("%1"), not names.
 pub fn parseValue(comptime T: type, s: []const u8) ParseError!T {
     if (T == []const u8) return s;
     if (T == bool) return parseBool(s);
@@ -1766,13 +1767,17 @@ test "a scoped full-length IPv6 address round-trips through forwarding" {
     var d0: Diag = .{};
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    // Bare form on the CLI. writeValue emits the uncompressed
-    // [fe80:0:1:2:3:4:5:6%1] spelling, which must parse back.
-    for ([_][]const u8{
-        "--server.bind_address=fe80::1:2:3:4:5:6%1",
-        "--server.bind_address=[fe80:0:1:2:3:4:5:6%1]:5269",
-    }) |arg| {
-        var parent = try MasterLoader.load(testing.allocator, .{ .args = &.{arg} }, &d0);
+    // Bare and bracketed-with-port forms on the CLI. writeValue emits
+    // the uncompressed [fe80:0:1:2:3:4:5:6%1] spelling, which must
+    // parse back.
+    const cases = [_]struct { arg: []const u8, port: u16 }{
+        .{ .arg = "--server.bind_address=fe80::1:2:3:4:5:6%1", .port = 0 },
+        .{ .arg = "--server.bind_address=[fe80:0:1:2:3:4:5:6%1]:5269", .port = 5269 },
+    };
+    // fe80:0000:0001:0002:0003:0004:0005:0006 in network order.
+    const want_bytes = [16]u8{ 0xfe, 0x80, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6 };
+    for (cases) |c| {
+        var parent = try MasterLoader.load(testing.allocator, .{ .args = &.{c.arg} }, &d0);
         defer parent.deinit();
         const blob = try parent.forwardBlob(arena.allocator(), &diag);
         var child = try MasterLoader.load(
@@ -1784,6 +1789,8 @@ test "a scoped full-length IPv6 address round-trips through forwarding" {
         const v = child.values.server.bind_address;
         try testing.expectEqual(posix.AF.INET6, v.any.family);
         try testing.expectEqual(@as(u32, 1), v.in6.sa.scope_id);
+        try testing.expectEqual(c.port, v.getPort());
+        try testing.expectEqualSlices(u8, &want_bytes, &v.in6.sa.addr);
     }
 }
 
