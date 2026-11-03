@@ -113,6 +113,9 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// fails its delete is reachable in production (a full map) but no
         /// test can arrange it. Never set in production.
         test_fail_deletes: u32 = 0,
+        /// Counts `storeHeldPointerOnce` calls, so a test can tell a caller
+        /// that short-circuits from one that leans on the token dedupe.
+        test_hold_calls: u32 = 0,
         /// Test seam: fail this many `countMessages` calls. A count runs
         /// before the drain is armed, so a failure there is easy to leave
         /// unrecoverable. Never set in production.
@@ -182,6 +185,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             // An unminted token cannot distinguish dispatches, so accepting it
             // would reintroduce the content-based collapse it replaces.
             if (token == HOLD_TOKEN_NONE) return error.HoldTokenNotMinted;
+            self.test_hold_calls += 1;
             self.db.compound_mutex.lock();
             defer self.db.compound_mutex.unlock();
 
@@ -911,6 +915,27 @@ test "GenericOfflineStore: two dispatches of identical bytes are two rows" {
     // Repeating one dispatch still collapses.
     try std.testing.expectEqual(HeldOutcome.already_held, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1000, stanza, 0xa1));
     try std.testing.expectEqual(@as(usize, 2), try store.countMessages("bob@us.example"));
+}
+
+// A dispatch's token row lives and dies with its pointer, including when the
+// whole tail is cleared at once. A surviving token would answer the next
+// dispatch with the same minted token as already held, losing that message.
+test "Re-review 6.8: clearAll drops the hold tokens with their rows" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = GenericOfflineStore(MemoryBackend).init(&db, allocator);
+
+    const stanza = "<message type='normal'><body>x</body></message>";
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1000, stanza, 0x1111));
+    try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@us.example"));
+
+    try store.clearAll("bob@us.example");
+    try std.testing.expectEqual(@as(usize, 0), try store.countMessages("bob@us.example"));
+
+    // Same dispatch identity, fresh tail: it must be stored again.
+    try std.testing.expectEqual(HeldOutcome.stored, try store.storeHeldPointerOnce("bob@us.example", "alice@us.example/phone", "", 1001, stanza, 0x1111));
+    try std.testing.expectEqual(@as(usize, 1), try store.countMessages("bob@us.example"));
 }
 
 test "GenericOfflineStore: an unminted hold token is refused" {

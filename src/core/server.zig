@@ -7110,6 +7110,270 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
 // A delete that keeps failing leaves the pointer behind. Recording the
 // sequence that reached the wire makes the retry redo only the delete, instead
 // of handing the same stanza to the connection again.
+// The empty-tail branch clears the flag and the timer together. Leaving the
+// timer armed would keep a dead retry in kqueue after the session is healthy.
+test "Re-review 6.8: an empty tail cancels the retry timer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = session;
+
+    // A stalled drain with its retry timer armed, and a tail that is now empty
+    // because another resource drained it.
+    session.offline_pending = true;
+    session.offline_store_stalls = 4;
+    session.offline_retry_timer_armed = true;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    try std.testing.expect(!session.offline_pending);
+    try std.testing.expect(!session.offline_retry_timer_armed);
+    var timers: usize = 0;
+    for (changes.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.TIMER and ev.flags & std.c.EV.DELETE != 0) timers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), timers);
+}
+
+// Two draining resources on one worker ask to hold the same message. The
+// store would collapse them, but the second ask must not happen at all: it
+// would log a second hold and count a second dispatch.
+test "Re-review 6.8: the router holds a bare-JID message once per worker" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+
+    for ([_]struct { id: u32, res: []const u8 }{ .{ .id = 5, .res = "desktop" }, .{ .id = 6, .res = "phone" } }) |r| {
+        const fds = try makeSocketPair();
+        defer posix.close(fds[1]);
+        const sess = try allocator.create(Session);
+        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.offline_pending = true;
+        server.sessions[r.id] = sess;
+        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
+        sm.setPresenceAvailable("bob", "localhost", r.res, true);
+    }
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "r1b";
+    const body = "<body>one hold</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // One row, and exactly one store call: the second resource short-circuits
+    // on the flag instead of asking the store to collapse it.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(u32, 1), offline_store.test_hold_calls);
+}
+
+// The S2S inbound loop keeps its own per-worker flag for the same reason: two
+// draining resources of one bare JID ask once, not twice.
+test "Re-review 6.8: the S2S hold asks the store once per worker" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+
+    for ([_]struct { id: u32, res: []const u8 }{ .{ .id = 5, .res = "desktop" }, .{ .id = 6, .res = "phone" } }) |r| {
+        const fds = try makeSocketPair();
+        defer posix.close(fds[1]);
+        const sess = try allocator.create(Session);
+        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.offline_pending = true;
+        server.sessions[r.id] = sess;
+        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
+        sm.setPresenceAvailable("bob", "localhost", r.res, true);
+    }
+
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r1c' type='chat'><body>one hold</body></message>";
+    var change_buf: [32]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &changes);
+
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(u32, 1), offline_store.test_hold_calls);
+}
+
+// After the retry's delete lands, no row is outstanding for this session, so
+// the recorded sequence must be cleared: it travels in the resume bundle, and
+// a stale value would make a resumed drain delete a row without sending it.
+test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "t1", 1001, "<message id='t1'><body>x</body></message>");
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
+    const seq = ptrs[0].sequence;
+
+    session.offline_pending = true;
+    session.offline_last_sent_sequence = seq;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
+}
+
+// A delivery form can exceed the scratch bank even when the stanza itself fits
+// the parser's 16 KiB buffer: a bound JID full of characters that escape to
+// five bytes adds more than the bank's headroom. Nothing can be delivered, so
+// the sender has to hear it instead of the bytes vanishing.
+test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sender" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.stream.state = .active;
+    bob.stream.authenticated = true;
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[5] = bob;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    sm.setPresenceAvailable("bob", "localhost", "desk", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.state = .active;
+    // The sender's full JID stays inside the 1 KiB form buffer but every byte
+    // of it escapes to five, so the delivery head outgrows the headroom the
+    // 20 KiB scratch bank leaves above a 16 KiB stanza.
+    var local_buf: [500]u8 = undefined;
+    @memset(&local_buf, '&');
+    var res_buf: [400]u8 = undefined;
+    @memset(&res_buf, '&');
+    alice.stream.bound_jid = .{ .local = &local_buf, .domain = "localhost", .resource = &res_buf };
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "big";
+    const body_len = 16384;
+    @memset(alice.stanza_buf[0..body_len], 'x');
+    alice.stanza_buf_len = body_len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    // Nothing was queued for the recipient: there is no delivery form at all.
+    try std.testing.expectEqual(@as(usize, 0), bob.conn.pendingWriteBytes());
+
+    // The sender is told instead.
+    _ = alice.conn.flushSend() catch {};
+    var wire: [4096]u8 = undefined;
+    const n = posix.read(alice_fds[1], &wire) catch 0;
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='big'") != null);
+}
+
 test "Re-review 5.4: a stuck delete retry deletes without resending" {
     const allocator = std.testing.allocator;
 

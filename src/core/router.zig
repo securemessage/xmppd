@@ -988,22 +988,46 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
         else => "message",
     };
 
-    var fbs = std.io.fixedBufferStream(&session.write_scratch);
-    const w = fbs.writer();
-    w.writeByte('<') catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeAll(" type='error'") catch return;
-    if (id_str.len > 0) {
-        w.writeAll(" id='") catch return;
-        xml.escapeWrite(w, id_str) catch return;
-        w.writeByte('\'') catch return;
+    if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, true)) |bounce| {
+        session.queueSendStanza(bounce) catch return;
+        return;
     }
-    w.writeAll(" from='") catch return;
-    xml.escapeWrite(w, to_str) catch return;
-    w.writeAll("' to='") catch return;
-    xml.escapeWrite(w, from_str) catch return;
-    w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeByte('>') catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    // Both JIDs escape wider than the scratch buffer. Echoing them is optional
+    // and being told is not, so answer without them: the reply goes to the
+    // sender's own connection, which already knows who it is and who it wrote
+    // to. Omitted, not truncated, so the result is still a valid stanza.
+    if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, false)) |bounce| {
+        session.queueSendStanza(bounce) catch return;
+    }
+}
+
+fn writeServiceUnavailable(
+    buf: []u8,
+    tag_name: []const u8,
+    id_str: []const u8,
+    to_str: []const u8,
+    from_str: []const u8,
+    echo_jids: bool,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeByte('<') catch return null;
+    w.writeAll(tag_name) catch return null;
+    w.writeAll(" type='error'") catch return null;
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (echo_jids) {
+        w.writeAll(" from='") catch return null;
+        xml.escapeWrite(w, to_str) catch return null;
+        w.writeAll("' to='") catch return null;
+        xml.escapeWrite(w, from_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return null;
+    w.writeAll(tag_name) catch return null;
+    w.writeByte('>') catch return null;
+    return fbs.getWritten();
 }
