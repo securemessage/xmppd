@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.9.1 - unreleased
+
+### Security
+
+- T-FB6FD8B2 OIDC account binding: local XMPP accounts now bind
+  permanently to the `(iss, sub)` pair instead of mutable claims
+  (preferred_username/email/username). Previously an IdP user who could
+  rename a claim could log in as another account's localpart and inherit
+  its roster, MAM archive and MUC affiliations. First logins now claim a
+  localpart through a two-way mapping in `{db}/auth` (namespace
+  `oidc_identities`): an existing mapping always wins, a suggestion
+  collision, a provisioned `users` row, or any existing account data
+  refuses the claim and points the operator at `xmppctl oidc-link`.
+  The introspection path applies the same rules (sub required).
+  `localpart_claim = email` is gated on `email_verified` and documented
+  as the weakest choice. See doc/UPGRADING.md for the required
+  `oidc-unclaimed` / `oidc-link` migration steps.
+
 ## v0.9.0 - 2026-10-04
 
 ### Features

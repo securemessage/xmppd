@@ -73,6 +73,31 @@ in development mode.
 | `ca_file` | no | CA bundle path for IdP TLS verification |
 | `user_domain` | no | Domain appended to bare usernames for ROPC (e.g., `morante.dev`) |
 | `import_avatar` | no | Import IdP `picture` claim into vCard on first login (`true`/`false`, default `false`) |
+| `localpart_claim` | no | Claim supplying the first-login localpart suggestion: `preferred_username` (default), `email`, `sub`, or empty string to disable auto-provisioning |
+| `localpart_claim_prefix` | no | Prefix stripped from the suggestion claim before normalization (e.g., `user:` for identity-oidc handle-form subjects) |
+| `localpart_auto_suffix` | no | When the suggested localpart is taken, try `lp-2` .. `lp-99` (`true`/`false`, default `false`: a taken suggestion is refused, never silently suffixed) |
+
+#### Account binding
+
+XMPP accounts bind permanently to the `(iss, sub)` pair (OIDC Core 5.7):
+once a subject logs in, its mapping in `{db}/auth` (`oidc_identities`
+namespace) decides the account forever, and renamed IdP claims cannot
+re-map it. The `localpart_claim` value is only a first-login
+*suggestion*: it never binds identity, and it is refused when the
+localpart is already bound to another subject, when a provisioned
+`users` row exists, or when the account already owns roster, archive or
+MUC data (upgrade installs must run `xmppctl oidc-unclaimed` and
+`oidc-link` first; see UPGRADING.md). `localpart_claim = email` is
+accepted only when the IdP reports `email_verified = true` and is the
+weakest choice because email is editable at most IdPs. Setting
+`localpart_claim` to an empty string disables auto-provisioning
+entirely: every account then needs an explicit `xmppctl oidc-link`.
+
+| IdP | Recommended keys | Notes |
+|-----|------------------|-------|
+| identity-oidc | `localpart_claim = sub`, `localpart_claim_prefix = user:` | While subject IDs are handle-form (`user:name`), strip the prefix. After identityd issue #52 lands opaque subjects, use an admin-controlled preferred username instead. |
+| Rauthy | `localpart_claim = preferred_username` | Safe only with immutable usernames and controlled provisioning. `email` is unsafe: it is user-editable and `email_fallback` makes it self-selected. |
+| Keycloak | `localpart_claim = preferred_username` | Safe only when username edits are forbidden and provisioning is controlled. Otherwise use `localpart_claim =` (empty) plus operator links. |
 
 ## Example
 
