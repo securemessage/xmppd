@@ -26,6 +26,8 @@ const LockStore = lock_store_mod.LockStore(OpBackendType);
 const invite_store_mod = @import("invite_store");
 const InviteStore = invite_store_mod.InviteStore(OpBackendType);
 const ipc_protocol = @import("ipc_protocol");
+const precis = @import("precis_username");
+const backend_mod = @import("backend");
 
 const log = std.log.scoped(.xmppctl);
 
@@ -152,8 +154,9 @@ pub fn main() !void {
             }
         };
 
-        store.addUser(allocator, username, password) catch |err| {
+        addUserCanonical(&store, allocator, username, password) catch |err| {
             switch (err) {
+                error.InvalidAccountName => printErr("invalid account name\n"),
                 error.UserExists => printErr("user already exists\n"),
                 else => {
                     printErr("failed to add user\n");
@@ -343,6 +346,22 @@ pub fn main() !void {
 
 /// Extract the localpart from a JID (before the @).
 /// If there's no @, return the whole string as the username.
+/// Add a new account under its PRECIS UsernameCaseMapped name (RFC 8265
+/// Section 3.3): account names are stored and compared in canonical form
+/// only, so the direct-DB path agrees with the daemon's IPC registration
+/// path and with xmppd lookups. Error set is the store's plus
+/// error.InvalidAccountName when the name fails the profile.
+fn addUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8, password: []const u8) !void {
+    // Buffer contract of usernameCaseMapped: buf 6x input, scratch 3x
+    // input each; input past max_input_octets fails the profile itself.
+    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+    const canon = precis.usernameCaseMapped(raw, &canon_buf, &scratch_cps, &scratch_cccs) catch
+        return error.InvalidAccountName;
+    try store.addUser(allocator, canon, password);
+}
+
 fn extractLocal(jid: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, jid, '@')) |at| {
         return jid[0..at];
@@ -619,4 +638,36 @@ test "extractLocal: bare username" {
 
 test "extractLocal: JID with resource" {
     try std.testing.expectEqualStrings("alice", extractLocal("alice@example.com/phone"));
+}
+
+test "addUserCanonical: stores the PRECIS canonical name" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
+
+    // Greek capital ODeltaSigma prepares to omicron-delta-omicron-sigma
+    // (U+03A3 folds to U+03C3 unconditionally; no final-sigma rule).
+    try addUserCanonical(&store, allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}", "pw");
+    try std.testing.expect((try store.lookup(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
+    try std.testing.expect((try store.lookup(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) == null);
+}
+
+test "addUserCanonical: invalid names refused; conflicts are on the canonical name" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
+
+    for ([_][]const u8{ "a b", "\u{2603}" }) |bad| {
+        try std.testing.expectError(error.InvalidAccountName, addUserCanonical(&store, allocator, bad, "pw"));
+    }
+
+    // Case variants of one name collide on the canonical form.
+    try addUserCanonical(&store, allocator, "Alice", "pw");
+    try std.testing.expectError(error.UserExists, addUserCanonical(&store, allocator, "ALICE", "pw"));
+
+    // The Kelvin sign folds to 'k' (PR #21 account-key semantics).
+    try addUserCanonical(&store, allocator, "\u{212A}", "pw");
+    try std.testing.expectError(error.UserExists, addUserCanonical(&store, allocator, "k", "pw"));
 }
