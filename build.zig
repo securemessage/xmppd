@@ -617,6 +617,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_lock_store_mod.addImport("backend", server_backend_mod);
+    server_lock_store_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("lock_store", server_lock_store_mod);
     const server_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -696,6 +697,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lock_store_test_mod.addImport("backend", backend_test_mod);
+    lock_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const lock_store_tests = b.addTest(.{
         .name = "lock-store-tests",
@@ -1511,6 +1513,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     auth_lock_store_mod.addImport("backend", auth_backend_mod);
+    auth_lock_store_mod.addImport("precis_username", precis_username_mod);
 
     const auth_policy_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/policy.zig"),
@@ -1732,6 +1735,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ctl_lock_store_mod.addImport("backend", ctl_backend_mod);
+    ctl_lock_store_mod.addImport("precis_username", precis_username_mod);
 
     ctl_mod.addImport("user_store", ctl_user_store_mod);
     const ctl_invite_store_mod = b.createModule(.{

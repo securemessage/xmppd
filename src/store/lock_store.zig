@@ -18,19 +18,17 @@
 
 const std = @import("std");
 const backend_mod = @import("backend");
+const precis = @import("precis_username");
 
 const log = std.log.scoped(.lock_store);
 
 pub const NAMESPACE = backend_mod.registered("locks");
 const LOCK_VALUE_SIZE = 5; // lock_type(1) + epoch(4)
 
-/// Lock keys are canonical localparts: the identity's localpart,
-/// ASCII-lowercased, with U+212A KELVIN SIGN folded to "k". XMPP localparts
-/// are case-insensitive and the IdP folds U+212A to "k", so a lock on "kate"
-/// must hold for "Kate", "KATE" and "<U+212A>ate" alike (S3). This is the
-/// single key function the lock store, the rate limiter and the admission
-/// policy share, so every mechanism enforces the same identity.
-pub const MAX_KEY_LEN = 256;
+/// Lock keys are canonical RFC 7622 Section 3.3 localparts. The lock store,
+/// rate limiter and admission policy all derive them through the same
+/// function, so every mechanism enforces the same identity.
+pub const MAX_KEY_LEN = 511;
 
 /// The identity's localpart: the bytes before the first "@", or the whole
 /// name when there is no domain.
@@ -39,28 +37,31 @@ pub fn localpartOf(identity: []const u8) []const u8 {
     return identity;
 }
 
-/// Canonical account key: localpart, ASCII-lowercased, U+212A KELVIN SIGN
-/// folded to "k". Returns the folded key in `buf`, or null when the name is
-/// empty or the folded key does not fit (the caller maps that to fail-closed
-/// or untrackable).
-pub fn canonicalKey(identity: []const u8, buf: []u8) ?[]const u8 {
+pub const AccountKeyError = error{
+    /// The localpart fails RFC 7622 preparation and can never match an account.
+    InvalidAccountName,
+    /// The prepared localpart exceeds the caller's tracking-key bound.
+    KeyTooLong,
+};
+
+/// Prepare the identity's localpart as the one canonical account key. The
+/// caller owns `buf`; a valid prepared name longer than `buf` is untrackable.
+pub fn prepareAccountKey(identity: []const u8, buf: []u8) AccountKeyError![]const u8 {
     const local = localpartOf(identity);
-    if (local.len == 0) return null;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < local.len) {
-        if (i + 3 <= local.len and local[i] == 0xE2 and local[i + 1] == 0x84 and local[i + 2] == 0xAA) {
-            if (n >= buf.len) return null;
-            buf[n] = 'k';
-            i += 3;
-        } else {
-            if (n >= buf.len) return null;
-            buf[n] = std.ascii.toLower(local[i]);
-            i += 1;
-        }
-        n += 1;
-    }
-    return buf[0..n];
+    var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
+    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+    const prepared = precis.xmppLocalpart(local, &prep_buf, &scratch_cps, &scratch_cccs) catch
+        return error.InvalidAccountName;
+    if (prepared.len > buf.len) return error.KeyTooLong;
+    @memcpy(buf[0..prepared.len], prepared);
+    return buf[0..prepared.len];
+}
+
+/// Optional form used by namespace scans: rows without a trackable canonical
+/// key are skipped and left for the offline migration tool to report.
+fn canonicalKey(identity: []const u8, buf: []u8) ?[]const u8 {
+    return prepareAccountKey(identity, buf) catch null;
 }
 
 /// Whether a failed backend open means "nothing is stored there yet" (a
@@ -173,7 +174,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// Check if a username is locked. Returns the lock record if locked, null otherwise.
         pub fn isLocked(self: *Self, allocator: std.mem.Allocator, username: []const u8) !?LockRecord {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
+            const key = try prepareAccountKey(username, key_buf[0..]);
             const raw = self.backend.get(allocator, NAMESPACE, key) catch |err| {
                 log.err("lock_store lookup failed for '{s}': {}", .{ username, err });
                 return err;
@@ -206,7 +207,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// Lock an account. Overwrites any existing lock.
         pub fn lock(self: *Self, username: []const u8, lock_type: LockType) !void {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
+            const key = try prepareAccountKey(username, key_buf[0..]);
             const now = currentEpoch();
             const value = serialize(lock_type, now);
             try self.backend.put(NAMESPACE, key, &value);
@@ -218,7 +219,7 @@ pub fn LockStore(comptime Backend: type) type {
         /// remove both, or the survivor still reads as locked (S3).
         pub fn unlock(self: *Self, allocator: std.mem.Allocator, username: []const u8) !void {
             var key_buf: [MAX_KEY_LEN]u8 = undefined;
-            const key = canonicalKey(username, key_buf[0..]) orelse return error.KeyTooLong;
+            const key = try prepareAccountKey(username, key_buf[0..]);
             var removed = false;
             if (try self.backend.get(allocator, NAMESPACE, key)) |v| {
                 allocator.free(v);
@@ -441,7 +442,7 @@ test "LockStore: the Kelvin sign folds to the same lock row" {
     try std.testing.expect((try store.isLocked(allocator, "\u{212A}ate")) == null);
 }
 
-test "LockStore: empty and overlong names fail closed" {
+test "LockStore: invalid and untrackable names fail closed" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
 
@@ -449,13 +450,39 @@ test "LockStore: empty and overlong names fail closed" {
     defer db.close();
     var store = LockStore(MemoryBackend).init(&db);
 
-    // A name that cannot be canonical is an error, and callers map lock
-    // store errors to fail-closed.
-    try std.testing.expectError(error.KeyTooLong, store.isLocked(allocator, ""));
-    var big: [300]u8 = undefined;
+    // Empty and otherwise unpreparable names cannot be account keys.
+    try std.testing.expectError(error.InvalidAccountName, store.isLocked(allocator, ""));
+    try std.testing.expectError(error.InvalidAccountName, store.isLocked(allocator, "bad name"));
+    try std.testing.expectError(error.InvalidAccountName, store.lock("a/b", .permanent));
+
+    // Every name up to the tracking bound is lockable; a longer prepared
+    // name remains untrackable and fails closed.
+    var fits: [511]u8 = undefined;
+    @memset(&fits, 'a');
+    try store.lock(&fits, .permanent);
+    try std.testing.expect((try store.isLocked(allocator, &fits)) != null);
+    var big: [512]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expectError(error.KeyTooLong, store.isLocked(allocator, &big));
-    try std.testing.expectError(error.KeyTooLong, store.lock("", .permanent));
+}
+
+test "LockStore: the shared fold is RFC 7622 localpart preparation" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = LockStore(MemoryBackend).init(&db);
+
+    // Greek capitals and an identity's domain fold through xmppLocalpart,
+    // not through the old ASCII-only fold.
+    try store.lock("\u{039F}\u{0394}\u{039F}\u{03A3}@us.example", .permanent);
+    try std.testing.expect((try store.isLocked(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
+    try std.testing.expect((try store.isLocked(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) != null);
+
+    var key_buf: [MAX_KEY_LEN]u8 = undefined;
+    const key = try prepareAccountKey("NaplesTB@us.example", &key_buf);
+    try std.testing.expectEqualStrings("naplestb", key);
 }
 
 test "LockStore: legacy mixed-case rows are enforced and removable" {
