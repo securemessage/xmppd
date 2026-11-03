@@ -4182,6 +4182,231 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (fallback TLSA)
     try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
+test "dns-async: a second close on the same TCP query fails the phase (TLSA lookup_failed)" {
+    // Goal: RFC 7766 close-after-answer permits one resend. A second
+    // close while the resent query is unanswered runs failQuery, so
+    // a TLSA leg keeps lookup_failed - never nxdomain, never a
+    // whole-job drop, and never a third connection.
+    // Method: the chain is fed to .tlsa over injected answers, the
+    // TLSA query upgrades to TCP on a test listener, and both
+    // accepted connections read the frame then close unanswered.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    var accepts: usize = 0;
+    while (accepts < 2 and ctx.status == null) : (accepts += 1) {
+        const cfd = try acceptTcpBounded(&r, lfd);
+        try posix.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        var got: usize = 0;
+        var spins: usize = 0;
+        while (got == 0 and spins < 100 and ctx.status == null) : (spins += 1) {
+            r.step(10);
+            if (readFull(cfd, &hdr) == 2) {
+                const want = std.mem.readInt(u16, &hdr, .big);
+                if (readFull(cfd, fbuf[0..want]) == want) got = want;
+            }
+        }
+        try std.testing.expect(got > 0);
+        // FIN without answering: exercises the recv-0 (FIN) arm of
+        // tcpPeerClosed, not the reset arm.
+        posix.close(cfd);
+    }
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+    try std.testing.expectEqual(@as(usize, 2), accepts);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+
+    // The resend bound held: no third connection was opened.
+    try std.testing.expectError(error.WouldBlock, posix.accept(lfd, null, null, 0));
+}
+
+test "dns-async: a partial frame from a closed connection is dropped, not replayed" {
+    // Goal: tcpClose must clear tcp_buf; a fragment received before
+    // the peer closed must not sit in front of the next connection's
+    // stream, where it would corrupt the frame framing.
+    // Method: the first accepted connection is sent half a frame and
+    // closed; the resent query's connection gets a clean answer.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    const cfd1 = try acceptTcpBounded(&r, lfd);
+    try posix.setsockopt(cfd1, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd1, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd1, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expect(got > 0);
+    // Half a foreign frame, then FIN.
+    const frag = [7]u8{ 0, 20, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE };
+    _ = try posix.send(cfd1, &frag, posix.MSG.NOSIGNAL);
+    posix.close(cfd1);
+
+    // The resent query arrives on a second connection; the fragment
+    // must not precede its answer in tcp_buf.
+    const cfd2 = try acceptTcpBounded(&r, lfd);
+    try posix.setsockopt(cfd2, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    got = 0;
+    spins = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd2, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd2, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    var abuf: [1024]u8 = undefined;
+    const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+    var out_hdr: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+    _ = try posix.send(cfd2, &out_hdr, posix.MSG.NOSIGNAL);
+    _ = try posix.send(cfd2, abuf[0..rlen], posix.MSG.NOSIGNAL);
+    spins = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+    posix.close(cfd2);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.rrs.len);
+}
+
+test "dns-async: a stale TCP event on a recycled fd is ignored" {
+    // Goal: TCP knote udata names the connection by (seq, gen, slot);
+    // an event armed for a dead connection on the same fd number must
+    // not reach the job that owns the fd now.
+    // Method: a pending connect to a blackholed port, then dispatch
+    // fabricated READ and WRITE events carrying the previous seq.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(job.tcp_fd >= 0);
+    try std.testing.expect(!job.tcp_connected);
+
+    const stale_udata = (@as(usize, job.tcp_seq -% 1) << 32) |
+        (@as(usize, job.gen) << 8) | job.slot;
+    var ev = [1]posix.Kevent{.{
+        .ident = @intCast(job.tcp_fd),
+        .filter = std.c.EVFILT.WRITE,
+        .flags = 0,
+        .fflags = 0,
+        .data = 0,
+        .udata = stale_udata,
+    }};
+    r.dispatchEvents(&ev);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expect(!job.tcp_connected);
+
+    ev[0].filter = std.c.EVFILT.READ;
+    r.dispatchEvents(&ev);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+}
+
+test "dns-async: the bare name and its FQDN merge in either order" {
+    // Goal: the merge key is the stripped name, so a bare lookup
+    // started first still shares the FQDN's wire exchange.
+    // Method: bare first, dotted second; one job, two waiters.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    try r.resolve("svc.test.", .client, 5222, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
+
+    var spins: usize = 0;
+    while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+}
+
+test "dns-async: only one trailing dot is stripped" {
+    // Goal: "svc.test.." keeps a trailing dot after one strip, so the
+    // empty label cannot be encoded and the resolve is a synchronous
+    // nxdomain with no wire traffic.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test..", .client, 5222, 1, false);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
