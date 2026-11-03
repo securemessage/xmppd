@@ -29,6 +29,7 @@ const posix = std.posix;
 const http = @import("http");
 const jwt = @import("jwt");
 const ssl = @import("ssl");
+const oidc_ids = @import("oidc_identity_store");
 
 const log = std.log.scoped(.oidc_store);
 
@@ -51,8 +52,16 @@ pub const OidcConfig = struct {
     introspection_endpoint: ?[]const u8 = null,
     /// CA file for TLS verification (null = system default).
     ca_file: ?[]const u8 = null,
-    /// Claim to extract username from (default: preferred_username, fallback: email).
-    username_claim: []const u8 = "preferred_username",
+    /// Claim supplying the first-login localpart suggestion
+    /// ("preferred_username", "email", or "sub"; "" disables
+    /// auto-provisioning: every login needs an operator link).
+    localpart_claim: []const u8 = "preferred_username",
+    /// Prefix stripped from the suggestion claim before normalization
+    /// (e.g. "user:" for identity-oidc handle-form subjects).
+    localpart_claim_prefix: []const u8 = "",
+    /// Try lp-2 .. lp-99 when the suggested localpart is taken. Default
+    /// false: a taken suggestion is refused, never silently suffixed.
+    localpart_auto_suffix: bool = false,
     /// Domain to append to bare usernames for ROPC (e.g., "morante.dev" → alice@morante.dev).
     user_domain: ?[]const u8 = null,
 };
@@ -299,6 +308,11 @@ pub const OidcStore = struct {
     /// this answer instead of doing IdP I/O. Event-loop thread only.
     answer: ?*const Answer = null,
 
+    /// Type-erased (iss, sub) -> localpart resolver wired by the daemon at
+    /// init. Exchanges that reach a verified token without this configured
+    /// report .unavailable, never a guess at identity.
+    bindings: ?oidc_ids.BindingOps = null,
+
     /// Stable buffers holding the replayed identity between validate* and
     /// getPhotoUrl. Event-loop thread only.
     username_buf: [256]u8 = undefined,
@@ -334,24 +348,66 @@ pub const OidcStore = struct {
         return &self.http_client.?;
     }
 
-    /// Derive the local identity from an IdP claim (S3): a claim
-    /// that carries a domain must name the configured user_domain, and the
-    /// localpart is copied into `out`. False on mismatch or oversize.
-    fn claimIdentity(self: *const OidcStore, raw_username: []const u8, out: *Identity) bool {
-        if (raw_username.len == 0) return false;
-        if (self.config.user_domain) |dom| {
-            if (std.mem.indexOfScalar(u8, raw_username, '@')) |at| {
-                if (!std.ascii.eqlIgnoreCase(raw_username[at + 1 ..], dom)) {
-                    log.info("OIDC: claim '{s}' is outside user_domain '{s}'; rejected", .{ raw_username, dom });
-                    return false;
-                }
-            }
+    /// Resolve the verified (iss, sub) pair through the binding store
+    /// (S3/T-FB6FD8B2): an existing mapping wins permanently; the
+    /// suggestion claim is only a first-login localpart hint and never
+    /// binds identity.
+    fn bindIdentity(self: *OidcStore, allocator: Allocator, iss: []const u8, sub: []const u8, suggestion: []const u8, out: *Identity) BindVerdict {
+        const ops = self.bindings orelse {
+            log.err("OIDC: no identity binding store configured", .{});
+            return .unavailable;
+        };
+        var lp: [oidc_ids.max_localpart_len]u8 = undefined;
+        const res = ops.resolve_fn(ops.ctx, allocator, iss, sub, suggestion, &lp) catch |err| {
+            log.warn("OIDC: identity resolution failed for iss='{s}': {s}", .{ iss, @errorName(err) });
+            return .unavailable;
+        };
+        switch (res) {
+            .bound => |len| {
+                @memcpy(out.username_buf[0..len], lp[0..len]);
+                out.username_len = @intCast(len);
+                return .verified;
+            },
+            .refused => |r| {
+                log.info("OIDC: identity refused ({s}) for iss='{s}'", .{ @tagName(r), iss });
+                return .rejected;
+            },
+            .unavailable => return .unavailable,
         }
-        const localpart = extractLocalpart(raw_username);
-        if (localpart.len == 0 or localpart.len > out.username_buf.len) return false;
-        @memcpy(out.username_buf[0..localpart.len], localpart);
-        out.username_len = @intCast(localpart.len);
-        return true;
+    }
+
+    const BindVerdict = enum { verified, rejected, unavailable };
+
+    /// The suggestion claim per localpart_claim config. "email" counts
+    /// only when email_verified is true; it is display data, never
+    /// identity. "" disables the suggestion entirely.
+    fn suggestionClaim(self: *const OidcStore, claims: *const jwt.JwtClaims) []const u8 {
+        const claim = self.config.localpart_claim;
+        if (claim.len == 0) return "";
+        if (std.mem.eql(u8, claim, "preferred_username")) return claims.preferred_username;
+        if (std.mem.eql(u8, claim, "email")) {
+            return if (claims.email_verified) claims.email else "";
+        }
+        if (std.mem.eql(u8, claim, "sub")) return claims.sub;
+        log.warn("OIDC: unknown localpart_claim '{s}'", .{claim});
+        return "";
+    }
+
+    /// Same selection for the introspection body: RFC 7662 reports the
+    /// preferred username as "username"; email needs a verified marker.
+    fn suggestionFromIntrospection(self: *const OidcStore, body: []const u8) []const u8 {
+        const claim = self.config.localpart_claim;
+        if (claim.len == 0) return "";
+        if (std.mem.eql(u8, claim, "preferred_username")) {
+            return extractNamedField(body, "\"username\"") orelse "";
+        }
+        if (std.mem.eql(u8, claim, "email")) {
+            const verified = std.mem.indexOf(u8, body, "\"email_verified\":true") != null or
+                std.mem.indexOf(u8, body, "\"email_verified\": true") != null;
+            return if (verified) (extractNamedField(body, "\"email\"") orelse "") else "";
+        }
+        if (std.mem.eql(u8, claim, "sub")) return extractNamedField(body, "\"sub\"") orelse "";
+        return "";
     }
 
     fn copyPhoto(picture: []const u8, out: *Identity) void {
@@ -455,7 +511,7 @@ pub const OidcStore = struct {
     /// OAUTHBEARER path: JWT validation first, introspection for opaque
     /// tokens.
     fn exchangeToken(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
-        return switch (self.checkJwt(token, options, start_ns, out)) {
+        return switch (self.checkJwt(allocator, token, options, start_ns, out)) {
             .verified => .verified,
             .malformed => self.introspect(allocator, token, options, start_ns, out),
             .invalid => .rejected,
@@ -465,8 +521,9 @@ pub const OidcStore = struct {
     }
 
     /// Full JWT validation against the JWKS cache: parse, exp, iss, aud,
-    /// signature, then the claim identity and picture claim.
-    fn checkJwt(self: *OidcStore, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) JwtCheck {
+    /// signature, then bind (iss, sub) to the account and copy the
+    /// picture claim.
+    fn checkJwt(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) JwtCheck {
         const parsed = jwt.parse(token, &jwt_decode_buf) catch return .malformed;
 
         jwt.validateExpiry(&parsed.claims) catch {
@@ -503,17 +560,16 @@ pub const OidcStore = struct {
             return .invalid;
         }
 
-        const raw_username = if (parsed.claims.preferred_username.len > 0)
-            parsed.claims.preferred_username
-        else
-            parsed.claims.sub;
-        if (raw_username.len == 0) {
-            log.info("JWT: no username in token claims", .{});
-            return .invalid;
-        }
-        if (!self.claimIdentity(raw_username, out)) {
-            log.info("JWT: claim identity rejected for sub='{s}'", .{parsed.claims.sub});
-            return .invalid;
+        // (iss, sub) is the account identity; the suggestion claim only
+        // proposes a first-login localpart.
+        const suggestion = self.suggestionClaim(&parsed.claims);
+        switch (self.bindIdentity(allocator, parsed.claims.iss, parsed.claims.sub, suggestion, out)) {
+            .verified => {},
+            .rejected => {
+                log.info("JWT: identity rejected for sub='{s}'", .{parsed.claims.sub});
+                return .invalid;
+            },
+            .unavailable => return .unavailable,
         }
         copyPhoto(parsed.claims.picture, out);
         return .verified;
@@ -527,7 +583,7 @@ pub const OidcStore = struct {
     fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
         if (extractNamedField(body, "\"id_token\"")) |id_token| {
             if (id_token.len > 0) {
-                return switch (self.checkJwt(id_token, options, start_ns, out)) {
+                return switch (self.checkJwt(allocator, id_token, options, start_ns, out)) {
                     .verified => .verified,
                     .invalid => blk: {
                         log.warn("OIDC: IdP accepted the password but its id_token failed validation", .{});
@@ -591,17 +647,19 @@ pub const OidcStore = struct {
             return .rejected;
         }
 
-        const username_claim = extractNamedField(resp_body, "\"username\"") orelse
-            extractNamedField(resp_body, "\"sub\"") orelse {
-            log.info("introspection: no username in response", .{});
+        // sub is required: it binds the account under the configured
+        // issuer. username/email are localpart suggestions only.
+        const sub = extractNamedField(resp_body, "\"sub\"") orelse {
+            log.info("introspection: no sub in response", .{});
             return .rejected;
         };
+        const suggestion = self.suggestionFromIntrospection(resp_body);
 
-        if (!self.claimIdentity(username_claim, out)) {
-            log.info("introspection: claim identity rejected", .{});
-            return .rejected;
-        }
-        return .verified;
+        return switch (self.bindIdentity(allocator, self.config.issuer, sub, suggestion, out)) {
+            .verified => .verified,
+            .rejected => .rejected,
+            .unavailable => .unavailable,
+        };
     }
 
     /// Classify a non-200 token endpoint response. invalid_grant is a bad
@@ -1271,20 +1329,6 @@ fn isUnreserved(ch: u8) bool {
 }
 
 // ============================================================================
-// Username / JID Extraction
-// ============================================================================
-
-/// Extract the localpart from an email-style identifier.
-/// "alice@morante.dev" → "alice"
-/// "alice" → "alice" (no @, returned as-is)
-fn extractLocalpart(input: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, input, '@')) |at_pos| {
-        return input[0..at_pos];
-    }
-    return input;
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1405,21 +1449,9 @@ test "percentEncode: all reserved form chars" {
     try std.testing.expectEqualStrings("%26%3D%2B%25", w.buffered());
 }
 
-test "extractLocalpart: email" {
-    try std.testing.expectEqualStrings("alice", extractLocalpart("alice@morante.dev"));
-}
+// --- S3 tests: claim selection and the binding verdict -----------------
 
-test "extractLocalpart: bare username" {
-    try std.testing.expectEqualStrings("alice", extractLocalpart("alice"));
-}
-
-test "extractLocalpart: empty" {
-    try std.testing.expectEqualStrings("", extractLocalpart(""));
-}
-
-// --- S3 tests: claim identity and the ROPC identity path ------------
-
-test "OidcStore: claim identity enforces user_domain and keeps the localpart" {
+test "OidcStore: suggestionClaim selects per localpart_claim" {
     const allocator = std.testing.allocator;
     var store = OidcStore.init(allocator, .{
         .issuer = "https://idp.example/",
@@ -1431,26 +1463,99 @@ test "OidcStore: claim identity enforces user_domain and keeps the localpart" {
     });
     defer store.deinit();
 
-    var id: Identity = .{};
-    try std.testing.expect(store.claimIdentity("alice", &id));
-    try std.testing.expectEqualStrings("alice", id.username());
-    id = .{};
-    try std.testing.expect(store.claimIdentity("alice@us.example", &id));
-    try std.testing.expectEqualStrings("alice", id.username());
-    // Claim case is preserved; folding is the lock store's job.
-    id = .{};
-    try std.testing.expect(store.claimIdentity("Alice@US.EXAMPLE", &id));
-    try std.testing.expectEqualStrings("Alice", id.username());
-    // A foreign domain in the claim is rejected when user_domain is set.
-    try std.testing.expect(!store.claimIdentity("alice@other.example", &id));
-    try std.testing.expect(!store.claimIdentity("", &id));
+    const claims = jwt.JwtClaims{
+        .sub = "s-1",
+        .iss = "https://idp.example/",
+        .aud = "xmppd",
+        .exp = 1,
+        .preferred_username = "alice",
+        .email = "alice@us.example",
+        .email_verified = false,
+        .picture = "",
+    };
 
-    // Without user_domain configured any claim domain passes and is stripped.
-    store.config.user_domain = null;
-    id = .{};
-    try std.testing.expect(store.claimIdentity("alice@wherever.example", &id));
+    // Default claim is preferred_username.
+    try std.testing.expectEqualStrings("alice", store.suggestionClaim(&claims));
+
+    // email counts only when verified.
+    store.config.localpart_claim = "email";
+    try std.testing.expectEqualStrings("", store.suggestionClaim(&claims));
+    var verified_claims = claims;
+    verified_claims.email_verified = true;
+    try std.testing.expectEqualStrings("alice@us.example", store.suggestionClaim(&verified_claims));
+
+    // sub is a legal suggestion (identity-oidc handle-form subjects).
+    store.config.localpart_claim = "sub";
+    try std.testing.expectEqualStrings("s-1", store.suggestionClaim(&claims));
+
+    // An empty claim disables auto-provisioning suggestions entirely.
+    store.config.localpart_claim = "";
+    try std.testing.expectEqualStrings("", store.suggestionClaim(&claims));
+}
+
+test "OidcStore: suggestionFromIntrospection gates email on verified" {
+    const allocator = std.testing.allocator;
+    var store = OidcStore.init(allocator, .{
+        .issuer = "https://idp.example/",
+        .client_id = "xmppd",
+        .client_secret = "secret",
+        .token_endpoint = "https://idp.example/token",
+        .jwks_uri = "https://idp.example/certs",
+    });
+    defer store.deinit();
+
+    const body = "{\"active\":true,\"sub\":\"s-9\",\"username\":\"alice\",\"email\":\"a@x.example\"}";
+    try std.testing.expectEqualStrings("alice", store.suggestionFromIntrospection(body));
+
+    store.config.localpart_claim = "email";
+    try std.testing.expectEqualStrings("", store.suggestionFromIntrospection(body));
+    const verified_body = "{\"active\":true,\"sub\":\"s-9\",\"email\":\"a@x.example\",\"email_verified\":true}";
+    try std.testing.expectEqualStrings("a@x.example", store.suggestionFromIntrospection(verified_body));
+
+    store.config.localpart_claim = "sub";
+    try std.testing.expectEqualStrings("s-9", store.suggestionFromIntrospection(body));
+}
+
+test "OidcStore: bindIdentity maps the resolver outcome" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+
+    // No bindings configured: fail closed, never guess an identity.
+    var id: Identity = .{};
+    try std.testing.expectEqual(OidcStore.BindVerdict.unavailable, store.bindIdentity(allocator, "https://idp.example/", "s-1", "alice", &id));
+
+    const Fixture = struct {
+        result: oidc_ids.Resolution,
+        fn resolve(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, lp_out: *[oidc_ids.max_localpart_len]u8) anyerror!oidc_ids.Resolution {
+            _ = lp_out;
+            return .{ .refused = .localpart_taken };
+        }
+    };
+    var fx = Fixture{ .result = .{ .refused = .localpart_taken } };
+    store.bindings = .{ .ctx = &fx, .resolve_fn = Fixture.resolve };
+    try std.testing.expectEqual(OidcStore.BindVerdict.rejected, store.bindIdentity(allocator, "https://idp.example/", "s-1", "alice", &id));
+    try std.testing.expectEqualStrings("", id.username());
+}
+
+/// Bound-fixture resolver: writes "alice" into lp_out.
+fn boundResolve(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, lp_out: *[oidc_ids.max_localpart_len]u8) anyerror!oidc_ids.Resolution {
+    @memcpy(lp_out[0..5], "alice");
+    return .{ .bound = 5 };
+}
+
+test "OidcStore: bindIdentity verified copies the bound localpart" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+
+    var dummy: u8 = 0;
+    store.bindings = .{ .ctx = &dummy, .resolve_fn = boundResolve };
+    var id: Identity = .{};
+    try std.testing.expectEqual(OidcStore.BindVerdict.verified, store.bindIdentity(allocator, "https://idp.example/", "s-1", "ignored", &id));
     try std.testing.expectEqualStrings("alice", id.username());
 }
+
 
 // --- Replay seam tests ------------------------------------------------
 
@@ -1496,7 +1601,8 @@ test "OidcStore: replay returns identity, rejection and temporary failure" {
     const digest = credentialDigest(cred);
 
     var id: Identity = .{};
-    try std.testing.expect(store.claimIdentity("alice", &id));
+    @memcpy(id.username_buf[0..5], "alice");
+    id.username_len = 5;
 
     const verified = Answer{ .verdict = .verified, .identity = id, .input_digest = digest };
     store.answer = &verified;
