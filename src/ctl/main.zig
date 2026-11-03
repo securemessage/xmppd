@@ -18,13 +18,17 @@ const xmppd_log = @import("xmppd_log");
 pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
+const backend_mod = @import("backend");
 const OpBackendType = @import("op_backend").Backend;
+const ArchiveBackendType = @import("archive_backend").Backend;
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const invite_store_mod = @import("invite_store");
 const InviteStore = invite_store_mod.InviteStore(OpBackendType);
+const oidc_ids = @import("oidc_identity_store");
+const BindingStore = oidc_ids.Store(OpBackendType);
 const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.xmppctl);
@@ -104,6 +108,7 @@ pub fn main() !void {
     var store = UserStore.init(&backend);
     var lock_store = LockStore.init(&backend);
     var invite_store = InviteStore.init(&backend);
+    var binding_store = BindingStore.init(&backend);
 
     if (std.mem.eql(u8, command, "adduser")) {
         if (remaining_args.items.len < 2) {
@@ -332,12 +337,215 @@ pub fn main() !void {
             printErr("\n");
             return error.InvalidArgs;
         }
+    } else if (std.mem.eql(u8, command, "oidc-link")) {
+        if (remaining_args.items.len < 4) {
+            printErr("oidc-link requires: <localpart> <issuer> <subject>\n");
+            return error.InvalidArgs;
+        }
+        const lp = remaining_args.items[1];
+        const iss = remaining_args.items[2];
+        const sub = remaining_args.items[3];
+        const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch |err| {
+            printErr("oidc-link failed\n");
+            return err;
+        };
+        switch (claimed) {
+            .bound => {
+                printOut("Bound ");
+                printOut(lp);
+                printOut("\n");
+            },
+            .localpart_taken => {
+                printErr("localpart already bound to another subject\n");
+                return error.Conflict;
+            },
+            .subject_taken => {
+                printErr("subject already bound to another localpart\n");
+                return error.Conflict;
+            },
+        }
+    } else if (std.mem.eql(u8, command, "oidc-unlink")) {
+        if (remaining_args.items.len < 2) {
+            printErr("oidc-unlink requires a localpart\n");
+            return error.InvalidArgs;
+        }
+        const removed = binding_store.unbind(allocator, remaining_args.items[1]) catch |err| {
+            printErr("oidc-unlink failed\n");
+            return err;
+        };
+        if (removed) {
+            printOut("Unbound.\n");
+        } else {
+            printErr("no binding for that localpart\n");
+            return error.NotFound;
+        }
+    } else if (std.mem.eql(u8, command, "oidc-links")) {
+        var it = try binding_store.iterateBindings();
+        defer it.deinit();
+        while (try it.next()) |b| {
+            var line: [1024]u8 = undefined;
+            const s = std.fmt.bufPrint(&line, "{s}\t{s}\t{s}\t{s}\t{d}\n", .{
+                b.localpart, b.iss, b.sub, @tagName(b.source), b.bound_at,
+            }) catch continue;
+            printOut(s);
+        }
+    } else if (std.mem.eql(u8, command, "oidc-link-import")) {
+        if (remaining_args.items.len < 2) {
+            printErr("oidc-link-import requires a file\n");
+            return error.InvalidArgs;
+        }
+        const content = std.fs.cwd().readFileAlloc(allocator, remaining_args.items[1], 16 * 1024 * 1024) catch |err| {
+            printErr("cannot read import file\n");
+            return err;
+        };
+        defer allocator.free(content);
+        var ok: usize = 0;
+        var failed: usize = 0;
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            var fields = std.mem.tokenizeAny(u8, trimmed, " \t");
+            const lp = fields.next() orelse {
+                failed += 1;
+                continue;
+            };
+            const iss = fields.next() orelse {
+                failed += 1;
+                continue;
+            };
+            const sub = fields.rest();
+            if (sub.len == 0) {
+                failed += 1;
+                continue;
+            }
+            const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch {
+                failed += 1;
+                continue;
+            };
+            switch (claimed) {
+                .bound => ok += 1,
+                else => {
+                    failed += 1;
+                    printErr("conflict linking localpart ");
+                    printErr(lp);
+                    printErr("\n");
+                },
+            }
+        }
+        var sum_buf: [128]u8 = undefined;
+        printOut(std.fmt.bufPrint(&sum_buf, "linked {d}, failed {d}\n", .{ ok, failed }) catch "done\n");
+        if (failed > 0) return error.PartialFailure;
+    } else if (std.mem.eql(u8, command, "oidc-unclaimed")) {
+        try cmdOidcUnclaimed(allocator, &binding_store, &backend, db_path);
     } else {
         printErr("unknown command: ");
         printErr(command);
         printErr("\n");
         printUsage();
         return error.InvalidArgs;
+    }
+}
+
+/// Owner set for oidc-unclaimed: deduped localparts drawn from account
+/// namespaces. Bounded so a pathological store cannot grow it forever.
+const max_unclaimed_owners = 1_000_000;
+const OwnerSet = std.StringHashMapUnmanaged(void);
+
+const ROSTERS_NS = backend_mod.registered("rosters");
+const OFFLINE_NS = backend_mod.registered("offline");
+const VCARDS_NS = backend_mod.registered("vcards");
+const LASTACT_NS = backend_mod.registered("lastact");
+const PEP_NS = backend_mod.registered("pep");
+const BLOCKLIST_NS = backend_mod.registered("blocklist");
+const PENDING_SUB_NS = backend_mod.registered("pending_sub");
+const ROOM_AFFIL_NS = backend_mod.registered("room_affiliations");
+const MESSAGES_NS = backend_mod.registered("messages");
+const BY_CONTACT_NS = backend_mod.registered("by_contact");
+
+fn addOwner(owners: *OwnerSet, allocator: std.mem.Allocator, bare: []const u8) !void {
+    const lp = extractLocal(bare);
+    if (lp.len == 0 or lp.len > oidc_ids.max_localpart_len) return;
+    if (owners.count() >= max_unclaimed_owners) return;
+    const copy = try allocator.dupe(u8, lp);
+    const gop = try owners.getOrPut(allocator, copy);
+    if (gop.found_existing) allocator.free(copy);
+}
+
+/// Scan one namespace for owner localparts. Keys are either
+/// `owner_bare_jid`-prefixed rows (rosters, offline, vcards, lastact,
+/// pep, blocklist, pending_sub, messages, by_contact) where the
+/// localpart precedes the first '@', or `room\x00member` rows where the
+/// member bare JID follows the first NUL.
+fn scanOwners(backend: anytype, ns: []const u8, member_suffix: bool, owners: *OwnerSet, allocator: std.mem.Allocator) !void {
+    var it = backend.iterator(ns, "") catch return;
+    defer it.deinit();
+    while (it.next()) |entry| {
+        if (member_suffix) {
+            const at = std.mem.indexOfScalar(u8, entry.key, 0) orelse continue;
+            try addOwner(owners, allocator, entry.key[at + 1 ..]);
+        } else {
+            try addOwner(owners, allocator, entry.key);
+        }
+    }
+}
+
+/// `xmppctl oidc-unclaimed`: list localparts that own account data or a
+/// provisioned users row but have no OIDC binding row. These are the
+/// accounts the first-login rule refuses to auto-claim and must be
+/// linked explicitly.
+fn cmdOidcUnclaimed(allocator: std.mem.Allocator, binding_store: *BindingStore, auth_backend: *OpBackendType, db_path: []const u8) !void {
+    var owners: OwnerSet = .empty;
+    defer {
+        var it = owners.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        owners.deinit(allocator);
+    }
+
+    scanOwners(auth_backend, user_store_mod.NAMESPACE, false, &owners, allocator) catch {};
+
+    var op_path_buf: [1024]u8 = undefined;
+    const op_path = try std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db_path});
+    var op_be = OpBackendType.open(op_path, .{ .read_only = true, .create = false }) catch |err| blk: {
+        if (lock_store_mod.isMissingStoreError(err)) break :blk null;
+        return err;
+    };
+    defer if (op_be) |*b| b.close();
+    if (op_be) |*op| {
+        const probe_nss = [_][]const u8{
+            ROSTERS_NS,    OFFLINE_NS, VCARDS_NS, LASTACT_NS,
+            PEP_NS,        BLOCKLIST_NS, PENDING_SUB_NS,
+        };
+        for (probe_nss) |ns| {
+            try scanOwners(op, ns, false, &owners, allocator);
+        }
+        try scanOwners(op, ROOM_AFFIL_NS, true, &owners, allocator);
+    }
+
+    var archive_path_buf: [1024]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
+    var arch_be = ArchiveBackendType.open(archive_path, .{ .read_only = true, .create = false }) catch |err| blk: {
+        if (lock_store_mod.isMissingStoreError(err)) break :blk null;
+        return err;
+    };
+    defer if (arch_be) |*b| b.close();
+    if (arch_be) |*arch| {
+        try scanOwners(arch, MESSAGES_NS, false, &owners, allocator);
+        try scanOwners(arch, BY_CONTACT_NS, false, &owners, allocator);
+    }
+
+    var it = owners.keyIterator();
+    while (it.next()) |k| {
+        const found = binding_store.lookupLocalpart(allocator, k.*) catch |err| {
+            printErr("binding lookup failed\n");
+            return err;
+        };
+        if (found) |b| {
+            allocator.free(b.value);
+            continue;
+        }
+        printOut(k.*);
+        printOut("\n");
     }
 }
 
@@ -595,6 +803,11 @@ fn printUsage() void {
         \\  invite create   Create invitation code [--max-uses N] [--expires HOURS]
         \\  invite list     List all invitation codes
         \\  invite revoke   Revoke an invitation code
+        \\  oidc-link LP ISS SUB  Bind an XMPP localpart to an OIDC (iss, sub)
+        \\  oidc-unlink LP        Remove an OIDC binding
+        \\  oidc-links            List all OIDC bindings
+        \\  oidc-unclaimed        List data-owning localparts with no OIDC binding
+        \\  oidc-link-import F    Link localparts from a file (LP ISS SUB per line)
         \\
         \\Options:
         \\  --db PATH           Storage directory (default: /var/db/xmppd)

@@ -1720,6 +1720,22 @@ pub fn build(b: *std.Build) void {
     });
 
     const ctl_op_backend_mod = createBackendMod(b, op_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_archive_backend_mod = if (std.mem.eql(u8, archive_storage, op_storage))
+        ctl_op_backend_mod
+    else
+        createBackendMod(b, archive_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+
+    const ctl_ids_lmdb_mod = if (std.mem.eql(u8, op_storage, "lmdb"))
+        ctl_op_backend_mod
+    else
+        createBackendMod(b, "lmdb", target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_ids_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_ids_mod.addImport("backend", ctl_backend_mod);
+    ctl_ids_mod.addImport("lmdb_backend", ctl_ids_lmdb_mod);
 
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -1753,6 +1769,9 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_mod.addImport("backend", ctl_backend_mod);
+    ctl_mod.addImport("oidc_identity_store", ctl_ids_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_mod.addImport("xmppd_log", xmppd_log_mod);
 
@@ -1773,6 +1792,9 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_test_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_test_mod.addImport("backend", ctl_backend_mod);
+    ctl_test_mod.addImport("oidc_identity_store", ctl_ids_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
 
