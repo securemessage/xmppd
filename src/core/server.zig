@@ -35,6 +35,7 @@ const posix = std.posix;
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
+const precis = @import("precis_username");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const Connection = @import("connection.zig").Connection;
@@ -182,7 +183,7 @@ pub const Session = struct {
     /// from applying to a session that reused the same slot.
     auth_ipc_gen: u16 = 0,
     /// Stable copy of authenticated username (IPC message data is transient).
-    auth_username_buf: [256]u8 = undefined,
+    auth_username_buf: [precis.max_username_octets]u8 = undefined,
     auth_username_len: usize = 0,
     /// Which SASL element we're collecting text content for.
     sasl_collecting: SaslCollecting = .none,
@@ -4528,6 +4529,32 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     const msg = try ipc_protocol.decode(ipc_buf[4..total]);
     try std.testing.expect(msg == .register_request);
     try std.testing.expectEqualStrings("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", msg.register_request.username);
+}
+
+test "Server: the bound localpart keeps the full prepared auth username" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A prepared localpart may exceed the old 256-octet session buffer. The
+    // bound identity must contain all of it, without silent truncation.
+    var username: [300]u8 = undefined;
+    @memset(&username, 'n');
+    server.dispatchAuthResponse(.{ .auth_success = .{
+        .conn_id = 1,
+        .username = &username,
+        .server_final = "",
+    } }, &changes);
+    session.stream.state = .features_bind;
+    _ = session.stream.handleBind("res");
+    try std.testing.expectEqualStrings(&username, session.stream.bound_jid.?.local);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
