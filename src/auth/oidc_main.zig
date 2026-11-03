@@ -46,8 +46,13 @@ const config_mod = @import("config");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const OpBackendType = @import("op_backend").Backend;
+const ArchiveBackendType = @import("archive_backend").Backend;
+const backend_mod = @import("backend");
 const lock_store_mod = @import("lock_store");
+const oidc_ids = @import("oidc_identity_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
+const BindingStore = oidc_ids.Store(OpBackendType);
+const BindingResolver = oidc_ids.Resolver(OpBackendType, ArchiveBackendType);
 
 const log = std.log.scoped(.xmppd_auth_oidc);
 
@@ -137,6 +142,9 @@ pub fn main() !void {
     const ca_file = cfg.get("oidc", "ca_file");
     const introspection_endpoint = cfg.get("oidc", "introspection_endpoint");
     const user_domain = cfg.get("oidc", "user_domain");
+    const localpart_claim = cfg.get("oidc", "localpart_claim") orelse "preferred_username";
+    const localpart_claim_prefix = cfg.get("oidc", "localpart_claim_prefix") orelse "";
+    const localpart_auto_suffix = if (cfg.get("oidc", "localpart_auto_suffix")) |v| std.mem.eql(u8, v, "true") else false;
 
     // Override socket path from config if present
     if (cfg.get("oidc", "socket")) |s| {
@@ -207,6 +215,9 @@ pub fn main() !void {
         .introspection_endpoint = introspection_endpoint,
         .ca_file = ca_file,
         .user_domain = user_domain,
+        .localpart_claim = localpart_claim,
+        .localpart_claim_prefix = localpart_claim_prefix,
+        .localpart_auto_suffix = localpart_auto_suffix,
     });
     defer oidc_store.deinit();
     oidc_store.start() catch {
@@ -250,6 +261,46 @@ pub fn main() !void {
     };
     defer lock_backend.close();
     handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
+
+    // The (iss, sub) -> localpart binding map lives in the same {db}/auth
+    // env. It needs the read-write handle: first-login claims write both
+    // index rows, and the users-namespace check shares the env (S3).
+    var binding_backend = openReadWriteProvisioned(OpBackendType, auth_path, .{
+        .map_size = map_size_mb * 1024 * 1024,
+    }) catch |err| {
+        log.err("OIDC binding store open failed for {s}, refusing to start: {}", .{ auth_path, err });
+        return err;
+    };
+    defer binding_backend.close();
+
+    // Upgrade probes: existing account data in {db}/op and {db}/archive
+    // blocks auto-claim. A missing env is a fresh install (no data); any
+    // other open fault refuses startup rather than probing blind.
+    var op_path_buf: [1024]u8 = undefined;
+    const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db_path}) catch return error.InvalidArgs;
+    var op_probe = openProbe(OpBackendType, op_path) catch |err| {
+        log.err("op env open failed for {s}, refusing to start: {}", .{ op_path, err });
+        return err;
+    };
+    defer if (op_probe) |*b| b.close();
+
+    var archive_path_buf: [1024]u8 = undefined;
+    const archive_path = std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path}) catch return error.InvalidArgs;
+    var archive_probe = openProbe(ArchiveBackendType, archive_path) catch |err| {
+        log.err("archive env open failed for {s}, refusing to start: {}", .{ archive_path, err });
+        return err;
+    };
+    defer if (archive_probe) |*b| b.close();
+
+    var binding_resolver = BindingResolver{
+        .store = BindingStore.init(&binding_backend),
+        .op_backend = if (op_probe) |*b| b else null,
+        .archive_backend = if (archive_probe) |*b| b else null,
+        .user_domain = user_domain,
+        .localpart_claim_prefix = localpart_claim_prefix,
+        .auto_suffix = localpart_auto_suffix,
+    };
+    oidc_store.bindings = binding_resolver.bindingOps();
 
     var daemon: Daemon = undefined;
     try daemon.init(allocator, &oidc_store, &handler, socket_path, pool_options);
@@ -783,6 +834,43 @@ fn openLockStore(
     var store = lock_store_mod.LockStore(Backend).init(backend);
     if (canonical) store.learnLegacyFree();
     return store;
+}
+
+/// Open the shared op-storage backend read-write for the OIDC binding
+/// store. Same provisioning rule as the lock store: a missing environment
+/// is provisioned once read-write and reopened; any other failure is a
+/// real fault, never provisioned over. Unlike the lock handle this one
+/// stays writable for first-login claims, and every write goes through
+/// the identity store's oidc_identities-only API.
+fn openReadWriteProvisioned(
+    comptime Backend: type,
+    auth_path: []const u8,
+    opts: backend_mod.OpenOptions,
+) !Backend {
+    var rw = opts;
+    rw.read_only = false;
+    rw.create = false;
+    return Backend.open(auth_path, rw) catch |first_err| blk: {
+        if (!lock_store_mod.isMissingStoreError(first_err)) return first_err;
+        log.warn("auth store at {s} not created yet ({}); provisioning read-write once", .{ auth_path, first_err });
+        var provision_opts = opts;
+        provision_opts.read_only = false;
+        provision_opts.create = true;
+        var provision = try Backend.open(auth_path, provision_opts);
+        provision.close();
+        break :blk Backend.open(auth_path, rw);
+    };
+}
+
+/// Read-only probe handle on an account-data environment: null when the
+/// environment does not exist yet (fresh install means no claimable
+/// data); any other failure propagates so a blind probe never allows a
+/// claim.
+fn openProbe(comptime Backend: type, path: []const u8) !?Backend {
+    return Backend.open(path, .{ .read_only = true, .create = false }) catch |err| blk: {
+        if (lock_store_mod.isMissingStoreError(err)) break :blk null;
+        return err;
+    };
 }
 
 fn printUsage() void {
