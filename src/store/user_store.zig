@@ -14,11 +14,43 @@
 const std = @import("std");
 const sasl = @import("sasl");
 const backend_mod = @import("backend");
+const precis = @import("precis_username");
 
 const log = std.log.scoped(.user_store);
 
 pub const NAMESPACE = backend_mod.registered("users");
 const CRED_SIZE = 32 + 32 + 32 + 4; // 100 bytes
+
+/// Startup certification is deliberately bounded. Exceeding the bound means
+/// the namespace cannot be certified and fails closed just like a bad key.
+pub const max_startup_scan_keys = 100_000;
+
+pub const StartupScanError = error{
+    UnpreparedAccountName,
+    ScanLimitExceeded,
+};
+
+/// Verify once, on the auth daemon's startup path, that every users key is
+/// already in RFC 7622 prepared form. No rows are changed and no read fallback
+/// is provided: an unprepared key makes startup refuse loudly so the operator
+/// runs `xmppctl migrate-precis` instead of users being silently locked out.
+pub fn verifyPreparedUsers(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
+    comptime backend_mod.assertBackend(Backend);
+    var iterator = try backend.iterator(NAMESPACE, "");
+    defer iterator.deinit();
+
+    var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
+    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+    var count: usize = 0;
+    while (iterator.next()) |entry| {
+        if (count == max_keys) return error.ScanLimitExceeded;
+        count += 1;
+        const prepared = precis.xmppLocalpart(entry.key, &prep_buf, &scratch_cps, &scratch_cccs) catch
+            return error.UnpreparedAccountName;
+        if (!std.mem.eql(u8, prepared, entry.key)) return error.UnpreparedAccountName;
+    }
+}
 
 pub fn UserStore(comptime Backend: type) type {
     comptime backend_mod.assertBackend(Backend);
@@ -216,6 +248,33 @@ test "UserStore: credentials verify with SCRAM" {
     const rederived = try sasl.StoredCredentials.derive("testpassword", creds.salt, 4096);
     try std.testing.expectEqualSlices(u8, &creds.stored_key, &rederived.stored_key);
     try std.testing.expectEqualSlices(u8, &creds.server_key, &rederived.server_key);
+}
+
+test "UserStore: startup scan accepts only prepared account names" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    try db.put(NAMESPACE, "alice", "x");
+    try db.put(NAMESPACE, "naplestb", "x");
+    try db.put(NAMESPACE, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}", "x");
+    try db.put(NAMESPACE, "a!", "x");
+    try verifyPreparedUsers(MemoryBackend, &db, 4);
+
+    try db.put(NAMESPACE, "NaplesTB", "x");
+    try std.testing.expectError(error.UnpreparedAccountName, verifyPreparedUsers(MemoryBackend, &db, 5));
+    try db.delete(NAMESPACE, "NaplesTB");
+
+    try db.put(NAMESPACE, "bad name", "x");
+    try std.testing.expectError(error.UnpreparedAccountName, verifyPreparedUsers(MemoryBackend, &db, 5));
+}
+
+test "UserStore: startup scan is bounded and fails closed at the bound" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    try db.put(NAMESPACE, "alice", "x");
+    try db.put(NAMESPACE, "bob", "x");
+    try db.put(NAMESPACE, "carol", "x");
+    try std.testing.expectError(error.ScanLimitExceeded, verifyPreparedUsers(MemoryBackend, &db, 2));
+    try verifyPreparedUsers(MemoryBackend, &db, 3);
 }
 
 test "serializeCredentials roundtrip" {

@@ -610,6 +610,7 @@ pub fn build(b: *std.Build) void {
     });
     server_user_store_mod.addImport("backend", server_backend_mod);
     server_user_store_mod.addImport("sasl", sasl_mod);
+    server_user_store_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("user_store", server_user_store_mod);
     const server_lock_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/lock_store.zig"),
@@ -654,6 +655,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     user_store_test_mod.addImport("sasl", sasl_mod);
+    user_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const user_store_tests = b.addTest(.{
         .name = "user-store-tests",
@@ -670,6 +672,7 @@ pub fn build(b: *std.Build) void {
     });
     generic_user_store_test_mod.addImport("sasl", sasl_mod);
     generic_user_store_test_mod.addImport("backend", backend_test_mod);
+    generic_user_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const generic_user_store_tests = b.addTest(.{
         .name = "generic-user-store-tests",
@@ -1495,6 +1498,7 @@ pub fn build(b: *std.Build) void {
     });
     auth_user_store_mod.addImport("sasl", sasl_mod);
     auth_user_store_mod.addImport("backend", auth_backend_mod);
+    auth_user_store_mod.addImport("precis_username", precis_username_mod);
 
     const auth_rate_limiter_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/rate_limiter.zig"),
@@ -1571,6 +1575,11 @@ pub fn build(b: *std.Build) void {
         .root_module = auth_mod,
     });
     b.installArtifact(auth_exe);
+    const auth_main_tests = b.addTest(.{
+        .name = "auth-main-tests",
+        .root_module = auth_mod,
+    });
+    const run_auth_main_tests = b.addRunArtifact(auth_main_tests);
 
     // xmppd-auth-oidc: the OIDC authentication daemon
     const oidc_ipc_protocol_mod = b.createModule(.{
@@ -1734,6 +1743,7 @@ pub fn build(b: *std.Build) void {
     });
     ctl_user_store_mod.addImport("sasl", sasl_mod);
     ctl_user_store_mod.addImport("backend", ctl_backend_mod);
+    ctl_user_store_mod.addImport("precis_username", precis_username_mod);
 
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
@@ -1902,6 +1912,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
     test_step.dependOn(&run_migrate_precis_tests.step);
+    test_step.dependOn(&run_auth_main_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

@@ -24,6 +24,7 @@ const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;
 const OpBackendType = @import("op_backend").Backend;
 const config_mod = @import("config");
+const backend_mod = @import("backend");
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
 const handler_mod = @import("handler");
@@ -45,6 +46,12 @@ const InviteValidator = handler_mod.InviteValidator;
 const RegistrationConfig = handler_mod.RegistrationConfig;
 
 const log = std.log.scoped(.xmppd_auth);
+
+/// Certify the users namespace before any request is served. There is
+/// deliberately no raw-name read fallback.
+fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend) !void {
+    return user_store_mod.verifyPreparedUsers(Backend, backend, user_store_mod.max_startup_scan_keys);
+}
 
 /// Sentinel value for the listener fd in kqueue udata.
 const LISTENER_UDATA: usize = std.math.maxInt(usize);
@@ -222,6 +229,10 @@ pub fn main() !void {
     var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
     defer backend.close();
     var store = UserStore.init(&backend);
+    verifyUsersAtStartup(OpBackendType, &backend) catch |err| {
+        log.err("users namespace is not in RFC 7622 prepared form ({}); run 'xmppctl migrate-precis --apply' offline before starting xmppd-auth", .{err});
+        return err;
+    };
     var lock_store = LockStore.init(&backend);
     // Rows written before keys were case-folded carry the name as typed and
     // must not survive into service (S3).
@@ -580,6 +591,17 @@ fn makeInviteValidator(is: *InviteStore, alloc: std.mem.Allocator) InviteValidat
 fn parseU32Arg(arg: ?[]const u8) ?u32 {
     const s = arg orelse return null;
     return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+test "auth startup: an unprepared users key refuses startup" {
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    try db.put(user_store_mod.NAMESPACE, "NaplesTB", "x");
+    try std.testing.expectError(error.UnpreparedAccountName, verifyUsersAtStartup(backend_mod.MemoryBackend, &db));
+
+    try db.delete(user_store_mod.NAMESPACE, "NaplesTB");
+    try db.put(user_store_mod.NAMESPACE, "naplestb", "x");
+    try verifyUsersAtStartup(backend_mod.MemoryBackend, &db);
 }
 
 fn printUsage() void {
