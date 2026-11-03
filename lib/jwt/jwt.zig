@@ -44,6 +44,9 @@ pub const JwtClaims = struct {
     aud: []const u8,
     exp: i64,
     preferred_username: []const u8,
+    /// Display data only: email is never an identity claim (OIDC Core 5.7).
+    email: []const u8 = "",
+    email_verified: bool = false,
     picture: []const u8,
 };
 
@@ -266,8 +269,9 @@ fn parseClaims(json: []const u8) ?JwtClaims {
         .iss = extractStringField(json, "\"iss\"") orelse "",
         .aud = extractStringField(json, "\"aud\"") orelse "",
         .exp = extractIntField(json, "\"exp\"") orelse 0,
-        .preferred_username = extractStringField(json, "\"preferred_username\"") orelse
-            extractStringField(json, "\"email\"") orelse "",
+        .preferred_username = extractStringField(json, "\"preferred_username\"") orelse "",
+        .email = extractStringField(json, "\"email\"") orelse "",
+        .email_verified = extractBoolField(json, "\"email_verified\""),
         .picture = extractStringField(json, "\"picture\"") orelse "",
     };
 }
@@ -309,6 +313,21 @@ fn extractIntField(json: []const u8, key: []const u8) ?i64 {
 
     if (i == num_start) return null;
     return std.fmt.parseInt(i64, after_key[num_start..i], 10) catch null;
+}
+
+/// Extract a boolean claim value. Accepts the true literal and the "true"
+/// string form; everything else (false, absent, other values) is false.
+fn extractBoolField(json: []const u8, key: []const u8) bool {
+    const key_pos = std.mem.indexOf(u8, json, key) orelse return false;
+    const after_key = json[key_pos + key.len ..];
+
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+
+    const rest = after_key[i..];
+    if (rest.len >= 4 and std.mem.eql(u8, rest[0..4], "true")) return true;
+    if (rest.len >= 6 and std.mem.eql(u8, rest[0..6], "\"true\"")) return true;
+    return false;
 }
 
 // ============================================================================
@@ -380,6 +399,39 @@ test "parse: claims stay valid after the call returns" {
     try std.testing.expectEqualStrings("alice", jwt.claims.sub);
     try std.testing.expectEqualStrings("https://auth.example.com", jwt.claims.iss);
     try std.testing.expectEqualStrings("alice", jwt.claims.preferred_username);
+}
+
+test "parse: email is never merged into preferred_username" {
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    // {"sub":"s1","iss":"https://idp.example","exp":9999999999,"email":"victim@example.com","email_verified":true}
+    const payload = "eyJzdWIiOiJzMSIsImlzcyI6Imh0dHBzOi8vaWRwLmV4YW1wbGUiLCJleHAiOjk5OTk5OTk5OTksImVtYWlsIjoidmljdGltQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWV9";
+    const sig = "dGVzdA";
+
+    var token_buf: [1024]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+
+    var decode: DecodeBuffer = undefined;
+    const parsed = try parse(token, &decode);
+
+    try std.testing.expectEqualStrings("", parsed.claims.preferred_username);
+    try std.testing.expectEqualStrings("victim@example.com", parsed.claims.email);
+    try std.testing.expect(parsed.claims.email_verified);
+}
+
+test "parse: email_verified absent and false stay false" {
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    // {"sub":"s2","iss":"https://idp.example","exp":9999999999,"email":"mallory@example.com","email_verified":false}
+    const payload = "eyJzdWIiOiJzMiIsImlzcyI6Imh0dHBzOi8vaWRwLmV4YW1wbGUiLCJleHAiOjk5OTk5OTk5OTksImVtYWlsIjoibWFsbG9yeUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjpmYWxzZX0";
+    const sig = "dGVzdA";
+
+    var token_buf: [1024]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+
+    var decode: DecodeBuffer = undefined;
+    const parsed = try parse(token, &decode);
+
+    try std.testing.expectEqualStrings("mallory@example.com", parsed.claims.email);
+    try std.testing.expect(!parsed.claims.email_verified);
 }
 
 test "parse: invalid format" {
