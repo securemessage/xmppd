@@ -1627,6 +1627,7 @@ pub fn build(b: *std.Build) void {
     oidc_policy_mod.addImport("lock_store", auth_lock_store_mod);
 
     oidc_handler_mod.addImport("sasl", sasl_mod);
+    oidc_handler_mod.addImport("precis_username", precis_username_mod);
     oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
