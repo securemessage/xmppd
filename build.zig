@@ -346,6 +346,24 @@ pub fn build(b: *std.Build) void {
     });
     const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
     bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
+
+    // F2 lib/net loop microbenchmark; pinned ReleaseFast per the work item.
+    const net_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/net_loop_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    net_bench_mod.addImport("net", b.createModule(.{
+        .root_source_file = b.path("lib/net/net.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const net_bench = b.addExecutable(.{
+        .name = "net-loop-bench",
+        .root_module = net_bench_mod,
+    });
+    const bench_net_loop_step = b.step("bench-net-loop", "Run the F2 lib/net loop benchmark");
+    bench_net_loop_step.dependOn(&b.addRunArtifact(net_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
