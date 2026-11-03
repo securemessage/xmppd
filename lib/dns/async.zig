@@ -163,6 +163,13 @@ const Job = struct {
     /// when neither family yields an address this decides between
     /// .failed and .nxdomain.
     fallback_err: bool = false,
+    /// A per-target address query that hard-failed (timeout, SERVFAIL,
+    /// a dead TCP leg): when every SRV target is consumed without an
+    /// address this decides between .failed and .nxdomain the way
+    /// fallback_err does for the fallback path. NXDOMAIN is reserved
+    /// for authoritative absences; the s2s retry treats it as
+    /// permanent while a wire failure is temporary.
+    target_err: bool = false,
     /// Addresses collected for the current SRV target across the A
     /// and AAAA phases.
     cur_addr4: ?net.Address = null,
@@ -938,10 +945,14 @@ pub const Resolver = struct {
             // and a failed TLSA lookup marks the target lookup_failed
             // (a temporary failure, never PKIX).
             .addr => {
+                job.target_err = true;
                 job.phase = .addr6;
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
-            .addr6 => self.finishTarget(job),
+            .addr6 => {
+                job.target_err = true;
+                self.finishTarget(job);
+            },
             .tlsa => self.failTargetTlsa(job),
             .fallback_addr => {
                 job.fallback_err = true;
@@ -1647,7 +1658,10 @@ pub const Resolver = struct {
                     }
                 }
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
+                self.sendAddr(job, KIND_AAAA) catch {
+                    job.target_err = true;
+                    return self.finishTarget(job);
+                };
             },
             .addr6 => {
                 const target = &job.srv_list.items[job.srv_pos];
@@ -1776,7 +1790,7 @@ pub const Resolver = struct {
                 for (job.srv_list.items) |e| {
                     if (!e.unavailable) all_dot = false;
                 }
-                return self.dropJob(job, if (all_dot) .service_unavailable else .nxdomain);
+                return self.dropJob(job, if (all_dot) .service_unavailable else if (job.target_err) .failed else .nxdomain);
             }
             return self.complete(job);
         }
@@ -4469,6 +4483,31 @@ test "dns-async: a SERVFAIL on one SRV target skips only that target" {
         try std.testing.expect(!std.mem.eql(u8, t.host, "t0.test"));
     }
     try std.testing.expect(saw_t1 and saw_t2);
+}
+
+test "dns-async: every address family failing is a temporary failure, not nxdomain" {
+    // Goal: when every address query for every SRV target hard-fails
+    // the resolve reports .failed (a temporary failure the s2s retry
+    // may re-attempt), never .nxdomain, which is reserved for
+    // authoritative absences and treated as permanent.
+    // Method: FakeDns answers SERVFAIL for both address families.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_fail.store(true, .monotonic);
+    srv.aaaa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
 }
 
 test "dns-async: an AAAA SERVFAIL keeps the resolved A address" {
