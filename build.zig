@@ -206,12 +206,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const precis_username_test_mod = b.createModule(.{
+    const precis_username_mod = b.createModule(.{
         .root_source_file = b.path("lib/precis/username.zig"),
         .target = target,
         .optimize = optimize,
     });
-    precis_username_test_mod.addImport("unicode", unicode_mod);
+    precis_username_mod.addImport("unicode", unicode_mod);
 
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
@@ -292,7 +292,7 @@ pub fn build(b: *std.Build) void {
 
     const precis_username_tests = b.addTest(.{
         .name = "precis-username-tests",
-        .root_module = precis_username_test_mod,
+        .root_module = precis_username_mod,
     });
 
     const sasl_tests = b.addTest(.{
@@ -550,6 +550,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
+    server_test_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("ssl", ssl_test_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
@@ -737,6 +738,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     auth_handler_test_mod.addImport("sasl", sasl_mod);
+    auth_handler_test_mod.addImport("precis_username", precis_username_mod);
     auth_handler_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     auth_handler_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
     auth_handler_test_mod.addImport("lock_store", lock_store_test_mod);
@@ -1398,6 +1400,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("xml", xml_mod);
     core_mod.addImport("xmpp", xmpp_mod);
     core_mod.addImport("sasl", sasl_mod);
+    core_mod.addImport("precis_username", precis_username_mod);
     core_mod.addImport("ssl", ssl_test_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
@@ -1518,6 +1521,7 @@ pub fn build(b: *std.Build) void {
     auth_policy_mod.addImport("lock_store", auth_lock_store_mod);
 
     auth_handler_mod.addImport("sasl", sasl_mod);
+    auth_handler_mod.addImport("precis_username", precis_username_mod);
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);

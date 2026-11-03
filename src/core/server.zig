@@ -4456,6 +4456,70 @@ test "Server: stream open produces response" {
     try std.testing.expect(std.mem.indexOf(u8, response, "<starttls") != null);
 }
 
+test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Stand-in for xmppd-auth on the other end of the IPC socketpair.
+    const ipc_fds = try makeSocketPair();
+    defer posix.close(ipc_fds[1]);
+    server.ipc.fd = ipc_fds[0];
+    server.ipc.connected = true;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Stream handshake: registration IQs are only taken pre-auth in the
+    // features_sasl state.
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n0 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n0], "<stream:stream") != null);
+
+    // Registration is a pre-auth IQ taken in the features_sasl state; the
+    // test skips the STARTTLS+SASL-feature dance and establishes that
+    // precondition directly.
+    session.stream.state = .features_sasl;
+
+    // An invalid PRECIS name is rejected at the call site with
+    // not-acceptable and never reaches the auth daemon.
+    const bad_reg = "<iq type='set' id='r1'><query xmlns='jabber:iq:register'><username>a b</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], bad_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    const n1 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1], "<not-acceptable") != null);
+    var ipc_buf: [4096]u8 = undefined;
+    try std.testing.expect((posix.read(ipc_fds[1], &ipc_buf) catch 0) == 0);
+
+    // A valid name is forwarded to the auth daemon in canonical form:
+    // "ΟΔΟΣ" (U+039F U+0394 U+039F U+03A3) prepares to "οδοσ" (U+03A3 folds
+    // to U+03C3 unconditionally; no final-sigma rule).
+    const good_reg = "<iq type='set' id='r2'><query xmlns='jabber:iq:register'><username>\u{039F}\u{0394}\u{039F}\u{03A3}</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], good_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+
+    // One length-prefixed frame lands on the IPC socket: a register_request
+    // carrying the prepared name.
+    const total = posix.read(ipc_fds[1], &ipc_buf) catch 0;
+    try std.testing.expect(total > 4);
+    const payload_len = std.mem.readInt(u32, ipc_buf[0..4], .little);
+    try std.testing.expectEqual(@as(usize, payload_len), total - 4);
+    const msg = try ipc_protocol.decode(ipc_buf[4..total]);
+    try std.testing.expect(msg == .register_request);
+    try std.testing.expectEqualStrings("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", msg.register_request.username);
+}
+
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();

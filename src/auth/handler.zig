@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const sasl = @import("sasl");
+const precis = @import("precis_username");
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const policy_mod = @import("policy");
@@ -815,6 +816,30 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            // PRECIS UsernameCaseMapped (RFC 8265 Section 3.3): store and
+            // compare canonical account names only. Core prepares the name
+            // before the IPC hop; preparing again is idempotent (RFC 8264
+            // Section 7 stability), and the xmppctl admin path arrives raw.
+            // Buffer contract of usernameCaseMapped: buf 6x input.len,
+            // scratch 3x input.len each; input over max_input_octets is
+            // rejected by the profile itself.
+            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+            const canon_username = precis.usernameCaseMapped(
+                req.username,
+                &canon_buf,
+                &scratch_cps,
+                &scratch_cccs,
+            ) catch {
+                log.info("registration rejected: '{s}' is not a valid UsernameCaseMapped name", .{req.username});
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
             // Validate invitation code if required (skip for admin)
             if (!is_admin and self.reg_config.require_invite) {
                 if (req.invite_code.len == 0) {
@@ -843,13 +868,14 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
             }
 
-            // Create the user
-            self.store.addUser(self.allocator, req.username, req.password) catch |err| {
+            // Create the user (canonical name: conflicts are canonical-name
+            // conflicts).
+            self.store.addUser(self.allocator, canon_username, req.password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserExists => "conflict",
                     else => "internal-server-error",
                 };
-                log.info("registration failed for '{s}': {s}", .{ req.username, reason });
+                log.info("registration failed for '{s}': {s}", .{ canon_username, reason });
                 return protocol.Message{ .register_result = regResult{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -857,7 +883,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            log.info("user registered: '{s}'", .{req.username});
+            log.info("user registered: '{s}'", .{canon_username});
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -2787,4 +2813,167 @@ test "AuthHandler: a permanently locked IdP identity rejects the Kelvin-sign ali
     try std.testing.expectEqualDeep(right_reply, wrong_reply);
     try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: registration stores the PRECIS canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // "ΟΔΟΣ" prepares to "οδοσ": U+03A3 folds to U+03C3 unconditionally (no
+    // final-sigma rule), so the account is stored under the canonical name
+    // and the typed name is not a key of its own.
+    const reply = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 300,
+        .username = "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.20",
+    } }) orelse return error.NoResponse;
+    if (reply != .register_result or !reply.register_result.success) return error.ExpectedRegisterSuccess;
+
+    try std.testing.expect((try store.lookup(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
+    try std.testing.expect((try store.lookup(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) == null);
+}
+
+test "AuthHandler: registration conflict is on the canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // Case variants of one name collide on the canonical form.
+    const first = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 310,
+        .username = "Alice",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.21",
+    } }) orelse return error.NoResponse;
+    if (first != .register_result or !first.register_result.success) return error.ExpectedRegisterSuccess;
+
+    for ([_][]const u8{ "alice", "ALICE" }) |variant| {
+        const dup = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 311,
+            .username = variant,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.21",
+        } }) orelse return error.NoResponse;
+        if (dup != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!dup.register_result.success);
+        try std.testing.expectEqualStrings("conflict", dup.register_result.reason);
+    }
+
+    // The Kelvin sign folds to 'k' (PR #21 account-key semantics): U+212A
+    // and "k" are one account name.
+    const kelvin = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 312,
+        .username = "\u{212A}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kelvin != .register_result or !kelvin.register_result.success) return error.ExpectedRegisterSuccess;
+    try std.testing.expect((try store.lookup(allocator, "k")) != null);
+
+    const kdup = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 313,
+        .username = "k",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kdup != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!kdup.register_result.success);
+    try std.testing.expectEqualStrings("conflict", kdup.register_result.reason);
+}
+
+test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // A space, a non-ASCII space and a symbol are disallowed in the
+    // IdentifierClass.
+    for ([_][]const u8{ "a b", "\u{2603}", "\u{00A0}x" }) |bad| {
+        const reply = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 320,
+            .username = bad,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.23",
+        } }) orelse return error.NoResponse;
+        if (reply != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!reply.register_result.success);
+        try std.testing.expectEqualStrings("not-acceptable", reply.register_result.reason);
+    }
+    try std.testing.expect((try store.lookup(allocator, "a b")) == null);
+
+    // Printable ASCII punctuation is PVALID (RFC 8264 section 8.2 ASCII7):
+    // "a!" is a valid account name and registers.
+    const ok = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 321,
+        .username = "a!",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (ok != .register_result or !ok.register_result.success) return error.ExpectedRegisterSuccess;
+
+    // An empty name stays a bad request (the form-level check runs first).
+    const empty = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 322,
+        .username = "",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (empty != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!empty.register_result.success);
+    try std.testing.expectEqualStrings("bad-request", empty.register_result.reason);
 }

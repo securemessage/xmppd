@@ -29,6 +29,7 @@ const log = std.log.scoped(.xmppd);
 
 // Types from server.zig — imported via the parent module's compilation unit.
 const server_mod = @import("server.zig");
+const precis = @import("precis_username");
 const Session = server_mod.Session;
 const Server = server_mod.Server;
 const MamCollecting = server_mod.MamCollecting;
@@ -1071,6 +1072,24 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
         return;
     }
 
+    // PRECIS UsernameCaseMapped (RFC 8265 Section 3.3): account names are
+    // stored and compared in canonical form only, so the auth daemon is
+    // asked about the prepared name. Buffer contract of usernameCaseMapped:
+    // buf 6x input.len, scratch 3x input.len each (reg_username_buf caps
+    // the input at 256 bytes).
+    var canon_buf: [6 * 256]u8 = undefined;
+    var scratch_cps: [3 * 256]u21 = undefined;
+    var scratch_cccs: [3 * 256]u8 = undefined;
+    const canon_username = precis.usernameCaseMapped(
+        reg_username,
+        &canon_buf,
+        &scratch_cps,
+        &scratch_cccs,
+    ) catch {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return;
+    };
+
     if (!server.ipc.connected) {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -1084,7 +1103,7 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
     server.ipc.send(.{
         .register_request = .{
             .conn_id = session.ipcConnId(),
-            .username = reg_username,
+            .username = canon_username,
             .password = reg_password,
             .invite_code = reg_invite,
             .client_ip = session.conn.peerAddr(),
