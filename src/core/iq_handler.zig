@@ -1072,15 +1072,14 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
         return;
     }
 
-    // PRECIS UsernameCaseMapped (RFC 8265 Section 3.3): account names are
-    // stored and compared in canonical form only, so the auth daemon is
-    // asked about the prepared name. Buffer contract of usernameCaseMapped:
-    // buf 6x input.len, scratch 3x input.len each (reg_username_buf caps
-    // the input at 256 bytes).
+    // RFC 7622 Section 3.3 localparts are stored and compared in canonical
+    // form only, so the auth daemon is asked about the prepared name.
+    // Buffer contract of xmppLocalpart: buf 6x input.len, scratch 3x
+    // input.len each (reg_username_buf caps the input at 256 bytes).
     var canon_buf: [6 * 256]u8 = undefined;
     var scratch_cps: [3 * 256]u21 = undefined;
     var scratch_cccs: [3 * 256]u8 = undefined;
-    const canon_username = precis.usernameCaseMapped(
+    const canon_username = precis.xmppLocalpart(
         reg_username,
         &canon_buf,
         &scratch_cps,

@@ -816,17 +816,16 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // PRECIS UsernameCaseMapped (RFC 8265 Section 3.3): store and
-            // compare canonical account names only. Core prepares the name
-            // before the IPC hop; preparing again is idempotent (RFC 8264
-            // Section 7 stability), and the xmppctl admin path arrives raw.
-            // Buffer contract of usernameCaseMapped: buf 6x input.len,
-            // scratch 3x input.len each; input over max_input_octets is
-            // rejected by the profile itself.
+            // RFC 7622 Section 3.3: store and compare canonical localparts
+            // only. Core prepares the name before the IPC hop; preparing
+            // again is idempotent (RFC 8264 Section 7 stability), and the
+            // xmppctl admin path arrives raw. Buffer contract of
+            // xmppLocalpart: buf 6x input.len, scratch 3x input.len each;
+            // input over max_input_octets is rejected by the profile itself.
             var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
             var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
             var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-            const canon_username = precis.usernameCaseMapped(
+            const canon_username = precis.xmppLocalpart(
                 req.username,
                 &canon_buf,
                 &scratch_cps,
@@ -2938,9 +2937,9 @@ test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();
 
-    // A space, a non-ASCII space and a symbol are disallowed in the
-    // IdentifierClass.
-    for ([_][]const u8{ "a b", "\u{2603}", "\u{00A0}x" }) |bad| {
+    // Spaces and symbols fail the IdentifierClass; "@" is PVALID there but
+    // excluded from XMPP localparts by RFC 7622 Section 3.3.1.
+    for ([_][]const u8{ "a b", "\u{2603}", "\u{00A0}x", "a@b" }) |bad| {
         const reply = handleSync(&handler, .{ .register_request = .{
             .conn_id = 320,
             .username = bad,

@@ -4501,6 +4501,16 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     var ipc_buf: [4096]u8 = undefined;
     try std.testing.expect((posix.read(ipc_fds[1], &ipc_buf) catch 0) == 0);
 
+    // RFC 7622 Section 3.3.1 additionally excludes "@" even though the
+    // IdentifierClass permits it.
+    const excluded_reg = "<iq type='set' id='r1x'><query xmlns='jabber:iq:register'><username>a@b</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], excluded_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    const n1x = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1x], "<not-acceptable") != null);
+    try std.testing.expect((posix.read(ipc_fds[1], &ipc_buf) catch 0) == 0);
+
     // A valid name is forwarded to the auth daemon in canonical form:
     // "ΟΔΟΣ" (U+039F U+0394 U+039F U+03A3) prepares to "οδοσ" (U+03A3 folds
     // to U+03C3 unconditionally; no final-sigma rule).

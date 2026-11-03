@@ -106,6 +106,28 @@ pub fn usernameCaseMapped(
     return enforce(PrecisMapper, input, buf, scratch_cps, scratch_cccs);
 }
 
+/// Prepare an XMPP localpart (RFC 7622 Section 3.3). This is UsernameCaseMapped
+/// plus the eight additional localpart exclusions of Section 3.3.1, checked on
+/// the prepared output so width-mapped forms are excluded too. The 1023-octet
+/// limit applies to that same prepared output. Buffer contracts are identical
+/// to `usernameCaseMapped`.
+pub fn xmppLocalpart(
+    input: []const u8,
+    buf: []u8,
+    scratch_cps: []u21,
+    scratch_cccs: []u8,
+) PrecisError![]const u8 {
+    const prepared = try usernameCaseMapped(input, buf, scratch_cps, scratch_cccs);
+    for (prepared) |byte| {
+        switch (byte) {
+            '"', '&', '\'', '/', ':', '<', '>', '@' => return error.DisallowedCharacter,
+            else => {},
+        }
+    }
+    if (prepared.len > max_username_octets) return error.TooLong;
+    return prepared;
+}
+
 /// The real width + case mapping (RFC 8265 Section 3.3.1 rules 1 and 3).
 /// Returns up to two code points; the second is 0 when the mapping is a
 /// single code point (code point 0 maps to itself, so the first element is
@@ -373,6 +395,61 @@ fn expectUsernameError(expected: PrecisError, input: []const u8) !void {
     var cps: [2048]u21 = undefined;
     var cccs: [2048]u8 = undefined;
     try testing.expectError(expected, usernameCaseMapped(input, &buf, &cps, &cccs));
+}
+
+fn expectLocalpartError(expected: PrecisError, input: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var cps: [2048]u21 = undefined;
+    var cccs: [2048]u8 = undefined;
+    try testing.expectError(expected, xmppLocalpart(input, &buf, &cps, &cccs));
+}
+
+test "xmppLocalpart: RFC 7622 Section 3.3.1 excludes eight ASCII characters" {
+    // UsernameCaseMapped itself permits all of these under ASCII7; the XMPP
+    // localpart profile excludes exactly these eight.
+    for ([_]u8{ '"', '&', '\'', '/', ':', '<', '>', '@' }) |excluded| {
+        var input = [_]u8{ 'a', excluded, 'b' };
+        try expectLocalpartError(error.DisallowedCharacter, &input);
+        var buf: [64]u8 = undefined;
+        var cps: [32]u21 = undefined;
+        var cccs: [32]u8 = undefined;
+        _ = try usernameCaseMapped(&input, &buf, &cps, &cccs);
+    }
+
+    var buf: [64]u8 = undefined;
+    var cps: [32]u21 = undefined;
+    var cccs: [32]u8 = undefined;
+    const got = try xmppLocalpart("a!", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("a!", got);
+}
+
+test "xmppLocalpart: exclusions apply after width mapping" {
+    // FULLWIDTH QUOTATION MARK decomposes to U+0022 during preparation.
+    try expectLocalpartError(error.DisallowedCharacter, "a\u{FF02}b");
+    // FULLWIDTH COMMERCIAL AT decomposes to U+0040 during preparation.
+    try expectLocalpartError(error.DisallowedCharacter, "a\u{FF20}b");
+}
+
+test "xmppLocalpart: 1023-octet boundary is measured after preparation" {
+    var buf: [12288]u8 = undefined;
+    var cps: [6144]u21 = undefined;
+    var cccs: [6144]u8 = undefined;
+    var in1023: [max_username_octets]u8 = undefined;
+    @memset(&in1023, 'a');
+    const ok = try xmppLocalpart(&in1023, &buf, &cps, &cccs);
+    try testing.expectEqual(@as(usize, max_username_octets), ok.len);
+
+    var in1024: [max_username_octets + 1]u8 = undefined;
+    @memset(&in1024, 'a');
+    try testing.expectError(error.TooLong, xmppLocalpart(&in1024, &buf, &cps, &cccs));
+
+    // Preparation, not the input spelling, determines the boundary: 511
+    // KELVIN SIGNs (1533 input octets) prepare to 511 ASCII "k" octets.
+    var wide: [3 * 511]u8 = undefined;
+    var pos: usize = 0;
+    while (pos < wide.len) : (pos += 3) @memcpy(wide[pos .. pos + 3], "\u{212A}");
+    const folded = try xmppLocalpart(&wide, &buf, &cps, &cccs);
+    try testing.expectEqual(@as(usize, 511), folded.len);
 }
 
 test "usernameCaseMapped: sigma, no final-sigma rule" {

@@ -346,18 +346,18 @@ pub fn main() !void {
 
 /// Extract the localpart from a JID (before the @).
 /// If there's no @, return the whole string as the username.
-/// Add a new account under its PRECIS UsernameCaseMapped name (RFC 8265
-/// Section 3.3): account names are stored and compared in canonical form
-/// only, so the direct-DB path agrees with the daemon's IPC registration
-/// path and with xmppd lookups. Error set is the store's plus
-/// error.InvalidAccountName when the name fails the profile.
+/// Add a new account under its RFC 7622 Section 3.3 localpart: account names
+/// are stored and compared in canonical form only, so the direct-DB path
+/// agrees with the daemon's IPC registration path and with xmppd lookups.
+/// Error set is the store's plus error.InvalidAccountName when the name fails
+/// preparation.
 fn addUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8, password: []const u8) !void {
-    // Buffer contract of usernameCaseMapped: buf 6x input, scratch 3x
-    // input each; input past max_input_octets fails the profile itself.
+    // Buffer contract of xmppLocalpart: buf 6x input, scratch 3x input each;
+    // input past max_input_octets fails the profile itself.
     var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
     var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
     var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const canon = precis.usernameCaseMapped(raw, &canon_buf, &scratch_cps, &scratch_cccs) catch
+    const canon = precis.xmppLocalpart(raw, &canon_buf, &scratch_cps, &scratch_cccs) catch
         return error.InvalidAccountName;
     try store.addUser(allocator, canon, password);
 }
@@ -659,7 +659,7 @@ test "addUserCanonical: invalid names refused; conflicts are on the canonical na
     defer db.close();
     var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
 
-    for ([_][]const u8{ "a b", "\u{2603}" }) |bad| {
+    for ([_][]const u8{ "a b", "\u{2603}", "a@b" }) |bad| {
         try std.testing.expectError(error.InvalidAccountName, addUserCanonical(&store, allocator, bad, "pw"));
     }
 
