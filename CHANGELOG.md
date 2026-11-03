@@ -21,6 +21,33 @@
   password after upgrading. Precomposed Hangul syllables on their own, and
   every other input, prepare exactly as in v0.9.0 (c1fe1e2).
 
+- **Account names are now RFC 7622 localparts.** Registration, login,
+  locks, rate limiting, `xmppctl`, and the bound JID all use one PRECIS
+  UsernameCaseMapped function plus the eight localpart exclusions of RFC
+  7622 section 3.3.1 (`"`, `&`, `'`, `/`, `:`, `<`, `>`, `@`). Printable
+  ASCII such as `a!` remains valid. A client that logs in as `NaplesTB`
+  is bound as `naplestb@domain/resource`; use the JID returned by the
+  server. Existing account-bearing keys must be migrated before starting
+  xmppd-auth, including the archive database:
+  1. Stop every xmppd daemon. `migrate-precis` refuses to run while any
+     daemon pid file is live.
+  2. Dry-run `xmppctl migrate-precis --hosted-domain example.org`
+     (repeat `--hosted-domain` for each hosted domain). It prints every
+     planned rename and every collision or invalid localpart without
+     changing anything.
+  3. Resolve each reported item. Delete an exact stored key with
+     `xmppctl deluser --raw EXACT-KEY`, or preserve it under a new name
+     with `xmppctl migrate-precis --hosted-domain example.org --rename
+     OLD NEW --apply`. Any collision makes `--apply` change nothing.
+  4. Apply with `xmppctl migrate-precis --hosted-domain example.org
+     --apply`, then rerun the dry run; it must report 0 renames. Large
+     migrations write `migrate-precis.plan` and `migrate-precis.journal`
+     in the DB directory and are safe to rerun.
+  5. Start the daemons. xmppd-auth scans the users namespace once at
+     startup and **refuses to start** if any key is not in prepared form,
+     logging one error that names `xmppctl migrate-precis`. There is no
+     raw-name read fallback.
+
 ## v0.9.0 - 2026-10-04
 
 ### Features
