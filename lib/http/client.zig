@@ -357,15 +357,18 @@ fn request(
     var saw_eof = false;
     while (!saw_eof) {
         if (total >= MAX_RESPONSE_SIZE) return HttpError.ResponseTooLarge;
+        if (total > 0) switch (responseComplete(resp_buf[0..total])) {
+            .done => |need| {
+                total = need;
+                break;
+            },
+            .incomplete => {},
+            .err => |herr| return herr,
+        };
         c.ERR_clear_error();
         const ret = c.SSL_read(ssl_ptr, @ptrCast(resp_buf.ptr + total), @intCast(MAX_RESPONSE_SIZE - total));
         if (ret > 0) {
             total += @intCast(ret);
-            // A framed response can complete before the peer closes.
-            if (responseComplete(resp_buf[0..total])) |need| {
-                total = need;
-                break;
-            }
             continue;
         }
         const ssl_err = c.SSL_get_error(ssl_ptr, ret);
@@ -404,9 +407,14 @@ fn request(
     // A declared Content-Length bounds the body; a short body at EOF is a
     // truncated response.
     var body_slice = resp_data[body_start..];
-    if (contentLength(resp_data[0..header_end])) |cl| {
-        if (body_slice.len < cl) return HttpError.InvalidResponse;
-        body_slice = body_slice[0..cl];
+    switch (parseResponseHead(resp_data[0..header_end])) {
+        .invalid => return HttpError.InvalidResponse,
+        .too_large => return HttpError.ResponseTooLarge,
+        .eof_body => {},
+        .length => |cl| {
+            if (body_slice.len < cl) return HttpError.InvalidResponse;
+            body_slice = body_slice[0..cl];
+        },
     }
 
     // Copy body to a right-sized allocation
@@ -420,30 +428,85 @@ fn request(
     };
 }
 
-/// Total bytes a complete response occupies once the head and a declared
-/// Content-Length are known, or null when it is still in flight (or no
-/// Content-Length was declared, in which case EOF terminates the body).
-fn responseComplete(data: []const u8) ?usize {
-    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
-    const cl = contentLength(data[0..header_end]) orelse return null;
-    const need = header_end + 4 + cl;
-    if (data.len >= need) return need;
-    return null;
-}
+/// What a response head declares, once the header terminator is present.
+const HeadParse = union(enum) {
+    /// No Content-Length header: the body runs to EOF.
+    eof_body,
+    /// Declared body length within MAX_RESPONSE_SIZE.
+    length: usize,
+    /// A malformed Content-Length, disagreeing duplicates, or a
+    /// Transfer-Encoding this client does not implement.
+    invalid,
+    /// A declared length above MAX_RESPONSE_SIZE.
+    too_large,
+};
 
-/// Parse the Content-Length header value out of a response head, or null
-/// when absent or malformed.
-fn contentLength(headers: []const u8) ?usize {
-    var it = std.mem.splitScalar(u8, headers, '\n');
+/// Parse the response head: strict Content-Length (decimal digits only,
+/// duplicates must agree) and no Transfer-Encoding at all.
+fn parseResponseHead(head: []const u8) HeadParse {
+    var content_length: ?usize = null;
+    var it = std.mem.splitScalar(u8, head, '\n');
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
-        const prefix = "content-length:";
-        if (line.len <= prefix.len) continue;
-        if (!std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) continue;
-        const value = std.mem.trim(u8, line[prefix.len..], " \t");
-        return std.fmt.parseInt(usize, value, 10) catch null;
+        const te_prefix = "transfer-encoding:";
+        if (line.len > te_prefix.len and
+            std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
+        {
+            return .invalid;
+        }
+        const cl_prefix = "content-length:";
+        if (line.len <= cl_prefix.len) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..cl_prefix.len], cl_prefix)) continue;
+        const value = std.mem.trim(u8, line[cl_prefix.len..], " \t");
+        const cl = parseContentLengthValue(value) catch |err| switch (err) {
+            error.Invalid => return .invalid,
+            error.Overflow => return .too_large,
+        };
+        if (cl > MAX_RESPONSE_SIZE) return .too_large;
+        if (content_length) |prev| {
+            if (prev != cl) return .invalid;
+        } else {
+            content_length = cl;
+        }
     }
-    return null;
+    return if (content_length) |cl| .{ .length = cl } else .eof_body;
+}
+
+/// A Content-Length field value: ASCII digits only. No sign, no
+/// underscores, nothing after the trim. Overflow of usize is reported
+/// apart so the caller can answer ResponseTooLarge.
+fn parseContentLengthValue(value: []const u8) error{ Invalid, Overflow }!usize {
+    if (value.len == 0) return error.Invalid;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.Invalid;
+    }
+    return std.fmt.parseInt(usize, value, 10) catch return error.Overflow;
+}
+
+/// Completeness of a partially read response.
+const Complete = union(enum) {
+    /// Still in flight (or no Content-Length was declared, in which case
+    /// EOF terminates the body).
+    incomplete,
+    /// Total bytes a complete response occupies.
+    done: usize,
+    /// The head is already unusable; stop reading.
+    err: HttpError,
+};
+
+/// Decide whether `data` holds a complete response.
+fn responseComplete(data: []const u8) Complete {
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return .incomplete;
+    const cl = switch (parseResponseHead(data[0..header_end])) {
+        .invalid => return .{ .err = HttpError.InvalidResponse },
+        .too_large => return .{ .err = HttpError.ResponseTooLarge },
+        .eof_body => return .incomplete,
+        .length => |cl| cl,
+    };
+    const need = std.math.add(usize, header_end + 4, cl) catch
+        return .{ .err = HttpError.ResponseTooLarge };
+    if (data.len >= need) return .{ .done = need };
+    return .incomplete;
 }
 
 // ============================================================================
@@ -912,6 +975,216 @@ test "TLS: the in-process server keeps serving across a pause between requests" 
     var resp2 = try client.get(std.testing.allocator, second_url, testOptions(5000, 2000));
     defer resp2.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp2.status);
+}
+
+test "responseComplete: a huge declared length is rejected, not panicked on" {
+    const huge = "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(huge),
+    );
+    // Above usize entirely.
+    const beyond = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nx";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(beyond),
+    );
+    // Above the response cap but parseable.
+    var capped_buf: [160]u8 = undefined;
+    const capped = try std.fmt.bufPrint(&capped_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{MAX_RESPONSE_SIZE + 1});
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(capped),
+    );
+}
+
+test "responseComplete: Content-Length accepts digits only" {
+    const cases = [_][]const u8{ "+5", "1_0", "-1", "abc", "", "0x10" };
+    for (cases) |value| {
+        var buf: [160]u8 = undefined;
+        const head = try std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Length: {s}\r\n\r\n", .{value});
+        try std.testing.expectEqual(
+            Complete{ .err = HttpError.InvalidResponse },
+            responseComplete(head),
+        );
+    }
+}
+
+test "responseComplete: duplicate Content-Length headers must agree" {
+    const agree = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = agree.len }, responseComplete(agree));
+
+    const disagree = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhellow!";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(disagree),
+    );
+}
+
+test "responseComplete: Transfer-Encoding is rejected outright" {
+    const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(chunked),
+    );
+    // Even alongside a Content-Length, the TE wins by rejecting.
+    const both = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(both),
+    );
+}
+
+test "responseComplete: framing ends the body at Content-Length" {
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL";
+    try std.testing.expectEqual(
+        Complete{ .done = resp.len - 4 },
+        responseComplete(resp),
+    );
+    // Declared but not yet arrived: still in flight.
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(partial));
+    // No Content-Length at all: EOF terminates, so never "done".
+    const no_cl = "HTTP/1.1 200 OK\r\n\r\nhello";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(no_cl));
+}
+
+/// Serve one raw HTTP response over TLS (whatever bytes the test asks),
+/// then close. Unlike serveTlsResponses this does not build a correct
+/// header: malformed framing is the point.
+fn serveTlsRawResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, response: []const u8, port_out: *std.atomic.Value(u16)) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn_fd);
+        const ssl_ptr = c.SSL_new(ctx) orelse continue;
+        defer c.SSL_free(ssl_ptr);
+        _ = c.SSL_set_fd(ssl_ptr, conn_fd);
+        if (c.SSL_accept(ssl_ptr) != 1) continue;
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+            if (r <= 0) break;
+            total += @intCast(r);
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+        }
+        _ = c.SSL_write(ssl_ptr, response.ptr, @intCast(response.len));
+        // Close_notify: the client reads a clean EOF, not a transport error.
+        _ = c.SSL_shutdown(ssl_ptr);
+        return;
+    }
+}
+
+const RawStub = struct {
+    thread: std.Thread,
+    port: u16,
+};
+
+/// Spin up a raw-response TLS stub and return it with its bound port.
+fn startRawStub(cert_path: [*:0]const u8, key_path: [*:0]const u8, response: []const u8) !RawStub {
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try std.Thread.spawn(.{}, serveTlsRawResponse, .{ cert_path, key_path, response, &port });
+    errdefer stub.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(port.load(.acquire) != 0);
+    return .{ .thread = stub, .port = port.load(.acquire) };
+}
+
+test "TLS: a huge Content-Length errors instead of panicking the worker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx");
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    try std.testing.expectError(
+        HttpError.ResponseTooLarge,
+        client.get(std.testing.allocator, url, testOptions(5000, 2000)),
+    );
+}
+
+test "TLS: a body shorter than Content-Length is InvalidResponse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    // Declares 100 bytes, delivers 4, then closes.
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nok\r\n");
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    try std.testing.expectError(
+        HttpError.InvalidResponse,
+        client.get(std.testing.allocator, url, testOptions(5000, 2000)),
+    );
+}
+
+test "TLS: bytes past Content-Length are not part of the body" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL");
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("hello", resp.body);
 }
 
 test "TLS: a Content-Length body comes back exactly" {
