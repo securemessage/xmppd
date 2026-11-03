@@ -349,7 +349,8 @@ pub const Resolver = struct {
     }
 
     /// Raw record query: A, AAAA, SRV or TLSA answered via the query
-    /// callback with owned RRs.
+    /// callback with owned RRs. A cache hit or an unencodable name
+    /// fires that callback inside query() before it returns.
     pub fn query(self: *Resolver, name: []const u8, rtype: RType, session_key: usize) !void {
         const qt: u16 = @intFromEnum(rtype);
         if (self.cacheGet(name, qt)) |ent| {
@@ -494,6 +495,9 @@ pub const Resolver = struct {
 
     /// SRV chain resolve. Literal IPs complete synchronously with one
     /// target (no UDP traffic).
+    /// The callback may fire before resolve() returns: literal IPs,
+    /// cache hits, and names that cannot be encoded or staged (the
+    /// "async nxdomain" paths) all complete inside the call.
     /// want_tlsa: fetch TLSA records per target (_port._tcp.<target>)
     /// when the caller can authenticate with them; false callers get
     /// the same addresses without the extra round trips.
@@ -5289,7 +5293,8 @@ test "dns-async: a 262+ character name reports async nxdomain" {
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
     // Too long to stage with an SRV prefix and too long for the wire:
-    // the answer is the async nxdomain, not a synchronous NameTooLong.
+    // the callback reports nxdomain inside resolve() itself rather
+    // than a synchronous NameTooLong error return.
     const d262 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 70;
     try std.testing.expectEqual(@as(usize, 262), d262.len);
     try r.resolve(d262, .client, 5222, 3, true);
