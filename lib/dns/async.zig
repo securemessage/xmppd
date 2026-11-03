@@ -5246,6 +5246,23 @@ test "dns-async: a 262+ character name reports async nxdomain" {
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }
 
+test "dns-async: a name over the staging buffer reports async nxdomain" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // 300 octets overruns the 280-byte staging buffer in sendFallback
+    // itself, so every arm fails staging and the nxdomain completes
+    // inside resolve() with no step needed.
+    const d300 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 63 ++ "." ++ "e" ** 44;
+    try std.testing.expectEqual(@as(usize, 300), d300.len);
+    try r.resolve(d300, .client, 5222, 3, true);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
 test "dns-async: an over-long raw query reports nxdomain" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
