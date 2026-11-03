@@ -16,6 +16,14 @@ comptime {
 pub const Token = @import("token.zig").Token;
 pub const SlotMap = @import("slotmap.zig").SlotMap;
 pub const kevent = @import("kevent.zig");
+pub const loop = @import("loop.zig");
+pub const Loop = loop.Loop;
+pub const Handle = loop.Handle;
+pub const Interest = loop.Interest;
+pub const Filter = loop.Filter;
+pub const Event = loop.Event;
+pub const Io = loop.Io;
+pub const ChangeFailure = loop.ChangeFailure;
 
 test {
     std.testing.refAllDecls(@This());
