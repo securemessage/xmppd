@@ -564,7 +564,7 @@ pub const Resolver = struct {
         }
         const fd = try posix.socket(self.server.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
-        try posix.connect(fd, &self.server.any, self.server.getOsSockLen());
+        try rawConnect(fd, &self.server.any, self.server.getOsSockLen());
         self.fd = fd;
         var ch = [1]posix.Kevent{.{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 }};
         try self.keventApply(&ch);
@@ -576,7 +576,7 @@ pub const Resolver = struct {
         if (self.kq < 0) return;
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
-        const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
+        const n = rawKevent(self.kq, &.{}, &events, &ts) catch return;
         self.dispatchEvents(events[0..n]);
     }
 
@@ -598,7 +598,7 @@ pub const Resolver = struct {
                 // socket arriving here resumes a WouldBlock flush.
                 if (self.tcpJobFromEvent(ev)) |job| {
                     if (!job.tcp_connected) {
-                        posix.getsockoptError(job.tcp_fd) catch {
+                        rawSoError(job.tcp_fd) catch {
                             self.dropJob(job, .failed);
                             continue;
                         };
@@ -772,10 +772,10 @@ pub const Resolver = struct {
         if (builtin.is_test) {
             if (self.fail_sends) return error.SendFailed;
         }
-        _ = posix.send(self.fd, pkt, 0) catch |err| switch (err) {
-            error.ConnectionRefused => {
+        _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
+            error.Refused => {
                 self.stale_icmp += 1;
-                _ = posix.send(self.fd, pkt, 0) catch return error.SendFailed;
+                _ = rawSend(self.fd, pkt, 0) catch return error.SendFailed;
                 return;
             },
             else => return error.SendFailed,
@@ -812,7 +812,7 @@ pub const Resolver = struct {
                 batch[i] = ev;
                 batch[i].flags |= std.c.EV.RECEIPT;
             }
-            const got = try posix.kevent(self.kq, batch[0..n], &evbuf, &nonblock);
+            const got = try rawKevent(self.kq, batch[0..n], &evbuf, &nonblock);
             for (evbuf[0..got]) |ev| {
                 if (ev.data == 0) continue;
                 if (enoent_ok and ev.data == @intFromEnum(std.c.E.NOENT)) continue;
@@ -1046,15 +1046,22 @@ pub const Resolver = struct {
     /// Open the TCP socket and start connect; the WRITE knote drives the
     /// actual send once connect completes.
     fn tcpSend(self: *Resolver, job: *Job) !void {
-        if (job.tcp_fd >= 0) return self.tcpWrite(job);
+        if (job.tcp_fd >= 0) {
+            // A pending connect owns the armed one-shot WRITE knote:
+            // it stages and flushes the frame once SO_ERROR clears.
+            // Writing now would send on an unconnected socket, whose
+            // ENOTCONN is a panic under std.posix, not an error.
+            if (!job.tcp_connected) return;
+            return self.tcpWrite(job);
+        }
         const fd = try posix.socket(self.server.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
         job.tcp_seq +%= 1;
         var ch: [2]posix.Kevent = undefined;
         var connected = true;
-        posix.connect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
+        rawConnect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
             error.WouldBlock => connected = false,
-            else => return e,
+            error.Failed => return error.ConnectFailed,
         };
         ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
         var n: usize = 1;
@@ -1106,9 +1113,9 @@ pub const Resolver = struct {
             try job.tcp_out.appendSlice(self.alloc, job.request);
         }
         while (job.tcp_out_pos < job.tcp_out.items.len) {
-            const n = posix.send(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
+            const n = rawSend(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
                 error.WouldBlock => return self.armTcpWrite(job),
-                error.BrokenPipe, error.ConnectionResetByPeer => return error.PeerClosed,
+                error.Closed => return error.PeerClosed,
                 else => return error.SendFailed,
             };
             job.tcp_out_pos += n;
@@ -1157,11 +1164,11 @@ pub const Resolver = struct {
 
     fn onTcpReadable(self: *Resolver, job: *Job) void {
         var buf: [8192]u8 = undefined;
-        const n = posix.recv(job.tcp_fd, &buf, 0) catch |err| switch (err) {
+        const n = rawRecv(job.tcp_fd, &buf, 0) catch |err| switch (err) {
             error.WouldBlock => return,
             // A reset after the frame was written reports the same
             // close-after-answer condition as the FIN below.
-            error.ConnectionResetByPeer => {
+            error.Closed => {
                 _ = self.tcpPeerClosed(job);
                 return;
             },
@@ -1208,11 +1215,11 @@ pub const Resolver = struct {
     pub fn onReadable(self: *Resolver) void {
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = posix.recv(self.fd, &buf, 0) catch |err| switch (err) {
+            const n = rawRecv(self.fd, &buf, 0) catch |err| switch (err) {
                 error.WouldBlock => return,
                 // A refusal queued by an earlier datagram is consumed,
                 // not charged to whichever job receives next.
-                error.ConnectionRefused => {
+                error.Refused => {
                     self.stale_icmp += 1;
                     continue;
                 },
@@ -1930,6 +1937,79 @@ pub const Resolver = struct {
         self.sendFallback(job, KIND_AAAA) catch return self.dropJob(job, .failed);
     }
 };
+
+// -- raw socket calls -------------------------------------------------------
+//
+// std.posix maps several socket errnos to unreachable (ENOTCONN on
+// send, EBADF/EINVAL on recv and kevent, EISCONN/ECONNABORTED on
+// connect). A wire-level event must never panic the process, so the
+// send/recv/connect paths below use std.c directly and their errno
+// tables have no unreachable arm: anything unmapped is a plain
+// failure the caller already handles.
+
+const SockErr = error{ WouldBlock, Refused, Closed, Failed };
+
+fn rawSend(fd: posix.fd_t, buf: []const u8, flags: u32) SockErr!usize {
+    while (true) {
+        const rc = std.c.sendto(fd, buf.ptr, buf.len, flags, null, 0);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNREFUSED => return error.Refused,
+            .PIPE, .CONNRESET => return error.Closed,
+            else => return error.Failed,
+        }
+    }
+}
+
+fn rawRecv(fd: posix.fd_t, buf: []u8, flags: u32) SockErr!usize {
+    while (true) {
+        const rc = std.c.recvfrom(fd, buf.ptr, buf.len, flags, null, null);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNREFUSED => return error.Refused,
+            .CONNRESET => return error.Closed,
+            else => return error.Failed,
+        }
+    }
+}
+
+fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{ WouldBlock, Failed }!void {
+    while (true) {
+        const rc = std.c.connect(fd, addr, len);
+        if (rc == 0) return;
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN, .INPROGRESS, .ALREADY => return error.WouldBlock,
+            else => return error.Failed,
+        }
+    }
+}
+
+/// SO_ERROR on a pending connect: a nonzero value means the connect
+/// failed (refused, unreachable, dead socket); the getsockopt call
+/// itself failing is the same dead-socket report.
+fn rawSoError(fd: posix.fd_t) error{Failed}!void {
+    var code: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &code, &len) != 0)
+        return error.Failed;
+    if (code != 0) return error.Failed;
+}
+
+fn rawKevent(kq: posix.fd_t, ch: []const posix.Kevent, events: []posix.Kevent, ts: ?*const std.c.timespec) error{KeventFailed}!usize {
+    while (true) {
+        const rc = std.c.kevent(kq, ch.ptr, @intCast(ch.len), events.ptr, @intCast(events.len), ts);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            else => return error.KeventFailed,
+        }
+    }
+}
 
 fn addrFromRdata(rr: wire.Rr, port: u16) !net.Address {
     switch (rr.rtype) {
@@ -3936,6 +4016,70 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
     while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a chain query staged while the TCP connect is pending cannot panic" {
+    // Goal: a TC upgrade whose TCP connect stays pending must not
+    // crash when the next phase's query reuses the socket: send(2)
+    // on a pending connect is ENOTCONN, which std maps to
+    // unreachable. The pending WRITE knote owns the send instead.
+    // Method: TEST-NET-1 nameserver (SYNs go unanswered); feed the
+    // chain a TC answer, run the retry deadlines so failQuery sends
+    // the _xmpp SRV query while the connect is still pending.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+    try std.testing.expect(job.tcp_fd >= 0);
+    try std.testing.expect(!job.tcp_connected);
+
+    // Retry deadlines re-open the connection each time; the connect
+    // to the blackholed port never completes.
+    r.onDeadline(job);
+    try std.testing.expect(!job.tcp_connected);
+    r.onDeadline(job);
+    // tries exhausted: failQuery advances to the _xmpp SRV query,
+    // which stages on the still-pending socket instead of writing.
+    r.onDeadline(job);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.srv_plain, job.phase);
+
+    // The whole-chain bound then ends the lookup as a failure.
+    r.onChainDeadline(job);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+}
+
+test "dns-async: a duplicate TC reply during a pending connect cannot panic" {
+    // Same pending-connect hazard, reached by a second truncated
+    // answer matching the retransmitted UDP query: the phase machine
+    // must never let a send hit the unconnected socket.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+
+    var tbuf: [512]u8 = undefined;
+    const tl = buildTruncated(&tbuf, job.request);
+    r.handleResponse(job, tbuf[0..tl]);
+    try std.testing.expect(!job.tcp_connected);
+    r.handleResponse(job, tbuf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    r.onChainDeadline(job);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
 }
 
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
