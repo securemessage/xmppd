@@ -24,6 +24,8 @@ pub const Filter = loop.Filter;
 pub const Event = loop.Event;
 pub const Io = loop.Io;
 pub const ChangeFailure = loop.ChangeFailure;
+pub const Wake = @import("wake.zig").Wake;
+pub const Broadcast = @import("wake.zig").Broadcast;
 
 test {
     std.testing.refAllDecls(@This());

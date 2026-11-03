@@ -22,12 +22,18 @@ const posix = std.posix;
 const kev = @import("kevent.zig");
 const Token = @import("token.zig").Token;
 const SlotMap = @import("slotmap.zig").SlotMap;
+const wake_mod = @import("wake.zig");
 
 /// Kind values minted by the loop itself. Consumer kinds live only in `ctx`.
 pub const handle_kind: u8 = 0x01;
 pub const wake_kind: u8 = 0x02;
 pub const timer_kind: u8 = 0x03;
 pub const broadcast_kind: u8 = 0x04;
+
+/// Ident and udata of the loop's EVFILT_USER knote.
+pub const wake_ident: usize = 0;
+pub const wake_token: Token = .{ .index = 0, .gen = 1, .kind = wake_kind };
+const broadcast_token: Token = .{ .index = 0, .gen = 1, .kind = broadcast_kind };
 
 pub const Handle = Token;
 pub const Interest = packed struct(u8) { read: bool = false, write: bool = false, _pad: u6 = 0 };
@@ -54,6 +60,8 @@ pub const Event = union(enum) {
     readable: Io,
     writable: Io,
     change_failed: ChangeFailure,
+    wake,
+    broadcast_closed,
 };
 
 pub const Stats = struct {
@@ -67,6 +75,7 @@ pub const Stats = struct {
     paused_resumes: u64 = 0,
     handles_attached: u64 = 0,
     handles_closed: u64 = 0,
+    wakes: u64 = 0,
     last_errno: u32 = 0,
 };
 
@@ -127,6 +136,10 @@ pub const Loop = struct {
     stats_: Stats,
     now_ms_: u64,
     owner_tid: std.Thread.Id,
+    wake_state: wake_mod.Wake,
+    broadcast_fd: posix.fd_t,
+    broadcast_seen: bool,
+    broadcast_disarm: bool,
 
     /// Creates a CLOEXEC kqueue and allocates every buffer; no allocation
     /// happens after init.
@@ -177,6 +190,25 @@ pub const Loop = struct {
             .stats_ = .{},
             .now_ms_ = 0,
             .owner_tid = std.Thread.getCurrentId(),
+            .wake_state = .{ .kq = kq, .pending = std.atomic.Value(bool).init(false) },
+            .broadcast_fd = -1,
+            .broadcast_seen = false,
+            .broadcast_disarm = false,
+        };
+
+        // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
+        // so a delivered trigger resets state and a fresh notify refires.
+        const add_user = kev.Kevent{
+            .ident = wake_ident,
+            .filter = std.c.EVFILT.USER,
+            .flags = std.c.EV.ADD | std.c.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = wake_token.toUdata(),
+        };
+        kev.applyNow(kq, &add_user) catch |err| return switch (err) {
+            error.SystemResources => error.SystemResources,
+            else => error.Unexpected,
         };
     }
 
@@ -336,6 +368,31 @@ pub const Loop = struct {
         return self.now_ms_;
     }
 
+    /// The cross-thread wake handle. Producers join the pointer before the
+    /// loop is torn down; `notify` is the only call made off-thread.
+    pub fn waker(self: *Loop) *wake_mod.Wake {
+        return &self.wake_state;
+    }
+
+    /// Register the shared broadcast pipe's read end (one-time setup,
+    /// immediate): `broadcast.close()` reports `.broadcast_closed` once on
+    /// every watching loop, then the knote is disabled so the persistent
+    /// EV_EOF cannot spin the loop.
+    pub fn watchBroadcast(self: *Loop, broadcast: *const wake_mod.Broadcast) kev.ApplyError!void {
+        self.assertOwner();
+        std.debug.assert(self.broadcast_fd < 0);
+        const add = kev.Kevent{
+            .ident = @intCast(broadcast.read_fd),
+            .filter = std.c.EVFILT.READ,
+            .flags = std.c.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = broadcast_token.toUdata(),
+        };
+        try kev.applyNow(self.kq, &add);
+        self.broadcast_fd = broadcast.read_fd;
+    }
+
     // -- Iteration -----------------------------------------------------------
 
     /// The next `wait()` uses a zero timeout. Set automatically by
@@ -363,6 +420,18 @@ pub const Loop = struct {
             nchanges = self.commitHandle(tok, h, nchanges);
         }
         self.dirty.clearRetainingCapacity();
+        if (self.broadcast_disarm and self.broadcast_fd >= 0) {
+            self.change_buf[nchanges] = .{
+                .ident = @intCast(self.broadcast_fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.DISABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = broadcast_token.toUdata(),
+            };
+            nchanges += 1;
+            self.broadcast_disarm = false;
+        }
         std.debug.assert(nchanges <= self.change_buf.len);
 
         self.requeue_len = self.requeue.items.len;
@@ -543,13 +612,30 @@ pub const Loop = struct {
 
     fn translate(self: *Loop, raw: kev.Kevent) ?Event {
         const token = Token.fromUdata(raw.udata);
-        const h = if (token.kind == handle_kind) self.resolve(token) else null;
-        if (h == null) {
-            // Loop-internal kinds arrive in later commits; anything else is
-            // noise and is dropped, counted.
+        switch (token.kind) {
+            handle_kind => {},
+            wake_kind => {
+                self.wake_state.consume();
+                self.stats_.wakes += 1;
+                self.stats_.delivered_events += 1;
+                return .wake;
+            },
+            broadcast_kind => {
+                if (raw.flags & ev_eof == 0 or self.broadcast_seen) return null;
+                self.broadcast_seen = true;
+                self.broadcast_disarm = true;
+                self.stats_.delivered_events += 1;
+                return .broadcast_closed;
+            },
+            else => {
+                self.stats_.stale_events += 1;
+                return null;
+            },
+        }
+        const h = self.resolve(token) orelse {
             self.stats_.stale_events += 1;
             return null;
-        }
+        };
 
         const filter: Filter = switch (raw.filter) {
             std.c.EVFILT.READ => .read,
@@ -564,12 +650,12 @@ pub const Loop = struct {
             // A change for this handle was rejected: mark it broken so no
             // further changes are generated, and surface the failure. The op
             // is recovered from the staged change it echoes (ident + filter).
-            h.?.broken = true;
+            h.broken = true;
             self.stats_.change_failures += 1;
             self.stats_.delivered_events += 1;
             return .{ .change_failed = .{
                 .handle = token,
-                .ctx = h.?.ctx,
+                .ctx = h.ctx,
                 .filter = filter,
                 .op = self.opOf(raw),
                 .errno = @intCast(@max(0, raw.data)),
@@ -578,12 +664,12 @@ pub const Loop = struct {
 
         if (filter == .write and raw.flags & std.c.EV.DISPATCH != 0) {
             // The kernel disarmed the write knote on delivery.
-            h.?.reg_write = .disabled;
+            h.reg_write = .disabled;
         }
         self.stats_.delivered_events += 1;
         const io: Io = .{
             .handle = token,
-            .ctx = h.?.ctx,
+            .ctx = h.ctx,
             .data = raw.data,
             .eof = raw.flags & ev_eof != 0,
             .errno = raw.fflags,
