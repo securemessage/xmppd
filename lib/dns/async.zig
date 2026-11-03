@@ -4960,6 +4960,13 @@ test "dns-async: resolv.conf zones follow libc ip6_str2scopeid" {
         .{ .conf = "nameserver 2001:db8::1%lo0\n", .scope = null },
         .{ .conf = "nameserver 127.0.0.1%lo0\n", .scope = null },
         .{ .conf = "nameserver fe80::1%\n", .scope = null },
+        // Named zones on non-node/link-local multicast scopes are
+        // rejected: ff09/ff0a also pin the scope mask (& 0x07 would
+        // alias them to scopes 1/2), ff05/ff0e pin scope != 0.
+        .{ .conf = "nameserver ff05::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff0e::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff09::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff0a::1%lo0\n", .scope = null },
     };
     for (cases) |c| {
         var tmp = std.testing.tmpDir(.{});
