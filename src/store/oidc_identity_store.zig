@@ -870,7 +870,8 @@ test "Resolver: concurrent first logins for one localpart bind exactly one" {
     try testing.expectEqual(@as(usize, 1), bound);
 
     // Exactly one reverse row exists.
-    var it = try Store(Lmdb).init(&auth).iterateBindings();
+    var verify_store = Store(Lmdb).init(&auth);
+    var it = try verify_store.iterateBindings();
     defer it.deinit();
     var rows: usize = 0;
     while (try it.next()) |_| rows += 1;

@@ -354,7 +354,7 @@ pub const OidcStore = struct {
     /// binds identity.
     fn bindIdentity(self: *OidcStore, allocator: Allocator, iss: []const u8, sub: []const u8, suggestion: []const u8, out: *Identity) BindVerdict {
         const ops = self.bindings orelse {
-            log.err("OIDC: no identity binding store configured", .{});
+            log.warn("OIDC: no identity binding store configured", .{});
             return .unavailable;
         };
         var lp: [oidc_ids.max_localpart_len]u8 = undefined;
