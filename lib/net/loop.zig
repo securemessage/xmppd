@@ -23,6 +23,7 @@ const kev = @import("kevent.zig");
 const Token = @import("token.zig").Token;
 const SlotMap = @import("slotmap.zig").SlotMap;
 const wake_mod = @import("wake.zig");
+const wheel_mod = @import("timer_wheel.zig");
 
 /// Kind values minted by the loop itself. Consumer kinds live only in `ctx`.
 pub const handle_kind: u8 = 0x01;
@@ -34,6 +35,11 @@ pub const broadcast_kind: u8 = 0x04;
 pub const wake_ident: usize = 0;
 pub const wake_token: Token = .{ .index = 0, .gen = 1, .kind = wake_kind };
 const broadcast_token: Token = .{ .index = 0, .gen = 1, .kind = broadcast_kind };
+pub const timer_ident: usize = 0;
+const timer_token: Token = .{ .index = 0, .gen = 1, .kind = timer_kind };
+
+pub const TimerId = wheel_mod.TimerId;
+pub const Deadline = wheel_mod.Deadline;
 
 pub const Handle = Token;
 pub const Interest = packed struct(u8) { read: bool = false, write: bool = false, _pad: u6 = 0 };
@@ -62,6 +68,7 @@ pub const Event = union(enum) {
     change_failed: ChangeFailure,
     wake,
     broadcast_closed,
+    deadline: Deadline,
 };
 
 pub const Stats = struct {
@@ -100,7 +107,7 @@ pub const AttachError = error{HandleTableFull};
 pub const HandleError = error{StaleHandle};
 pub const PauseError = error{ StaleHandle, PausedListFull };
 pub const DetachError = error{StaleHandle} || kev.ApplyError;
-pub const WaitError = kev.SubmitWaitError;
+pub const WaitError = kev.SubmitWaitError || error{InternalChangeFailed};
 pub const InitError = std.mem.Allocator.Error || error{ SystemResources, Unexpected };
 
 pub const FlushHook = struct {
@@ -140,6 +147,11 @@ pub const Loop = struct {
     broadcast_fd: posix.fd_t,
     broadcast_seen: bool,
     broadcast_disarm: bool,
+    wheel: wheel_mod.TimerWheel,
+    timer_armed: bool,
+    armed_deadline: u64,
+    timer_ready: bool,
+    internal_failed: bool,
 
     /// Creates a CLOEXEC kqueue and allocates every buffer; no allocation
     /// happens after init.
@@ -172,6 +184,10 @@ pub const Loop = struct {
         const paused = try gpa.alloc(Token, options.paused_max);
         errdefer gpa.free(paused);
 
+        var wheel: wheel_mod.TimerWheel = undefined;
+        try wheel.init(gpa, options.timers_max, monotonicMs());
+        errdefer wheel.deinit(gpa);
+
         self.* = .{
             .kq = kq,
             .handles = handles,
@@ -188,12 +204,17 @@ pub const Loop = struct {
             .immediate = false,
             .options = options.*,
             .stats_ = .{},
-            .now_ms_ = 0,
+            .now_ms_ = monotonicMs(),
             .owner_tid = std.Thread.getCurrentId(),
             .wake_state = .{ .kq = kq, .pending = std.atomic.Value(bool).init(false) },
             .broadcast_fd = -1,
             .broadcast_seen = false,
             .broadcast_disarm = false,
+            .wheel = wheel,
+            .timer_armed = false,
+            .armed_deadline = 0,
+            .timer_ready = false,
+            .internal_failed = false,
         };
 
         // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
@@ -219,6 +240,7 @@ pub const Loop = struct {
         }
         posix.close(self.kq);
         self.handles.deinit(gpa);
+        self.wheel.deinit(gpa);
         gpa.free(self.dirty.allocatedSlice());
         gpa.free(self.requeue.allocatedSlice());
         gpa.free(self.paused.allocatedSlice());
@@ -393,6 +415,26 @@ pub const Loop = struct {
         self.broadcast_fd = broadcast.read_fd;
     }
 
+    // -- Timers --------------------------------------------------------------
+
+    /// Deadline `delay_ms` from now; emits `.deadline` once. Lifecycle
+    /// deadlines only; timers never drive I/O.
+    pub fn scheduleIn(self: *Loop, delay_ms: u64, ctx: Token) error{TimerTableFull}!TimerId {
+        self.assertOwner();
+        return self.wheel.schedule(monotonicMs() +| delay_ms, ctx);
+    }
+
+    pub fn scheduleAt(self: *Loop, deadline_ms: u64, ctx: Token) error{TimerTableFull}!TimerId {
+        self.assertOwner();
+        return self.wheel.schedule(deadline_ms, ctx);
+    }
+
+    /// O(1) cancel. False when the id is stale (already fired or cancelled).
+    pub fn cancelTimer(self: *Loop, timer: TimerId) bool {
+        self.assertOwner();
+        return self.wheel.cancel(timer);
+    }
+
     // -- Iteration -----------------------------------------------------------
 
     /// The next `wait()` uses a zero timeout. Set automatically by
@@ -406,6 +448,10 @@ pub const Loop = struct {
     /// harvests the next batch. Asserts the previous batch was fully consumed.
     pub fn wait(self: *Loop) WaitError!void {
         self.assertOwner();
+        if (self.internal_failed) {
+            self.internal_failed = false;
+            return error.InternalChangeFailed;
+        }
         std.debug.assert(self.batch_pos == self.batch_len);
         std.debug.assert(self.requeue_pos == self.requeue_len);
         self.compactRequeue();
@@ -431,6 +477,35 @@ pub const Loop = struct {
             };
             nchanges += 1;
             self.broadcast_disarm = false;
+        }
+
+        // Arm the single one-shot kernel timer to the wheel's next deadline;
+        // EVFILT_TIMER data is milliseconds by default.
+        if (self.wheel.nextDeadline()) |d| {
+            if (!self.timer_armed or self.armed_deadline != d) {
+                self.change_buf[nchanges] = .{
+                    .ident = timer_ident,
+                    .filter = std.c.EVFILT.TIMER,
+                    .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = @intCast(d -| monotonicMs()),
+                    .udata = timer_token.toUdata(),
+                };
+                nchanges += 1;
+                self.timer_armed = true;
+                self.armed_deadline = d;
+            }
+        } else if (self.timer_armed) {
+            self.change_buf[nchanges] = .{
+                .ident = timer_ident,
+                .filter = std.c.EVFILT.TIMER,
+                .flags = std.c.EV.DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = timer_token.toUdata(),
+            };
+            nchanges += 1;
+            self.timer_armed = false;
         }
         std.debug.assert(nchanges <= self.change_buf.len);
 
@@ -464,6 +539,13 @@ pub const Loop = struct {
             const raw = self.event_buf[self.batch_pos];
             self.batch_pos += 1;
             if (self.translate(raw)) |event| return event;
+        }
+        if (self.timer_ready) {
+            if (self.wheel.popExpired(self.now_ms_)) |dl| {
+                self.stats_.delivered_events += 1;
+                return .{ .deadline = dl };
+            }
+            self.timer_ready = false;
         }
         while (self.requeue_pos < self.requeue_len) {
             const entry = self.requeue.items[self.requeue_pos];
@@ -612,8 +694,22 @@ pub const Loop = struct {
 
     fn translate(self: *Loop, raw: kev.Kevent) ?Event {
         const token = Token.fromUdata(raw.udata);
+        if (raw.flags & std.c.EV.ERROR != 0 and token.kind != handle_kind) {
+            // A loop-internal change (timer arm, broadcast disarm) failed;
+            // wait() reports InternalChangeFailed on the next call.
+            self.stats_.change_failures += 1;
+            self.internal_failed = true;
+            return null;
+        }
         switch (token.kind) {
             handle_kind => {},
+            timer_kind => {
+                // One-shot timer consumed; expired entries emit as .deadline
+                // events after the raw batch.
+                self.timer_armed = false;
+                self.timer_ready = true;
+                return null;
+            },
             wake_kind => {
                 self.wake_state.consume();
                 self.stats_.wakes += 1;
@@ -1157,6 +1253,35 @@ test "Loop: flush hook runs once per wait and its changes join the commit" {
     try drain(&loop, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(events.items[0].readable.handle.eql(probe.attached.?));
+}
+
+test "Loop: scheduleIn fires a deadline event and cancel silences it" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const t = try loop.scheduleIn(30, tctx(3));
+    // The kernel timer may fire a tick early while the wheel's deadline is
+    // still 1 ms out; the loop re-arms for the remainder, so retry bounded.
+    var ev: ?Event = null;
+    for (0..5) |_| {
+        try loop.wait();
+        if (loop.next()) |e| {
+            ev = e;
+            break;
+        }
+    }
+    try std.testing.expect(ev.? == .deadline);
+    try std.testing.expect(ev.?.deadline.timer.eql(t));
+    try std.testing.expect(ev.?.deadline.ctx.eql(tctx(3)));
+    try std.testing.expect(loop.next() == null);
+
+    // A cancelled timer emits nothing and the knote is disarmed.
+    const t2 = try loop.scheduleIn(50, tctx(4));
+    try std.testing.expect(loop.cancelTimer(t2));
+    try std.testing.expect(!loop.cancelTimer(t2));
+    loop.requestImmediate();
+    try loop.wait();
+    try std.testing.expect(loop.next() == null);
 }
 
 test "Loop: attach at capacity fails with HandleTableFull" {
