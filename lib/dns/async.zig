@@ -1246,7 +1246,13 @@ pub const Resolver = struct {
         defer arena_state.deinit();
 
         const msg = wire.parse(arena_state.allocator(), pkt) catch return self.dropJob(job, .failed);
-        if (msg.truncated and !job.use_tcp) {
+        if (msg.truncated) {
+            // A TC message is never an answer. On a job already on
+            // TCP it is a late duplicate of the reply that caused
+            // the upgrade; parsing it as NODATA would forge an empty
+            // answer and, on a TLSA leg, downgrade a failed lookup
+            // to absent (ADR-13).
+            if (job.use_tcp) return;
             job.use_tcp = true;
             job.tries = 0;
             // A fresh query entering TCP gets a fresh
@@ -4082,6 +4088,100 @@ test "dns-async: a duplicate TC reply during a pending connect cannot panic" {
     try std.testing.expectEqual(Status.failed, ctx.status.?);
 }
 
+test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLSA)" {
+    // Goal: a truncated UDP reply arriving after the job upgraded to
+    // TCP must be ignored, never parsed as NODATA: on a TLSA leg
+    // that forged absence would permit PKIX under dane_first
+    // (ADR-13). The leg must stay lookup_failed.
+    // Method: TEST-NET-1 nameserver (TCP connect stays pending);
+    // feed the chain into the .tlsa phase, upgrade with a TC reply,
+    // feed the same TC again, then run the retry deadlines.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+
+    // _xmpps SRV NODATA, _xmpp SRV, A record, AAAA NODATA: the job
+    // is now in the .tlsa phase with the TLSA query outstanding.
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+
+    // The TC reply upgrades the query to TCP; the connect to the
+    // blackholed port stays pending.
+    const tl = buildTruncated(&buf, job.request);
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expect(job.use_tcp);
+    try std.testing.expect(!job.tcp_connected);
+
+    // The retransmit's late TC reply must be ignored: the job keeps
+    // its TLSA phase instead of taking the forged empty answer.
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    // The TCP leg can never answer; retry deadlines exhaust into the
+    // ordinary phase failure, which marks the target lookup_failed.
+    r.onDeadline(job);
+    r.onDeadline(job);
+    r.onDeadline(job);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a late TC reply on the TCP leg is not an answer (fallback TLSA)" {
+    // Same forged-NODATA guard as above, on the no-SRV fallback TLSA
+    // leg: the shared TLSA status of the fallback targets must stay
+    // lookup_failed.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+
+    // Both SRV names NODATA, AAAA NODATA, A record: the job is now
+    // in the .fallback_tlsa phase with the TLSA query outstanding.
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_tlsa, job.phase);
+
+    const tl = buildTruncated(&buf, job.request);
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expect(!job.tcp_connected);
+
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.fallback_tlsa, job.phase);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    r.onDeadline(job);
+    r.onDeadline(job);
+    r.onDeadline(job);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
@@ -4639,6 +4739,19 @@ fn buildTruncated(out: []u8, qpkt: []const u8) usize {
     const id = std.mem.readInt(u16, qpkt[0..2], .big);
     std.mem.writeInt(u16, out[0..2], id, .big);
     std.mem.writeInt(u16, out[2..4], 0x8180 | wire.FLAG_TC, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    return 12 + qlen;
+}
+
+/// A NODATA echo of `qpkt`: NOERROR with no answers, used to feed
+/// the chain one phase at a time in tests.
+fn buildNodata(out: []u8, qpkt: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
     std.mem.writeInt(u16, out[4..6], 1, .big);
     @memset(out[6..12], 0);
     const qlen = qpkt.len - 12;
