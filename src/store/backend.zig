@@ -30,7 +30,10 @@ const std = @import("std");
 /// Options for opening a storage backend.
 pub const OpenOptions = struct {
     /// Maximum number of namespaces (LMDB: max_dbs, others: ignored).
-    max_namespaces: u32 = 16,
+    /// Named-container ceiling for engines that need one up front (LMDB
+    /// maxdbs, RocksDB cf cache). Tracks the canonical set plus a spare
+    /// for MAIN_DBI and test-only namespaces.
+    max_namespaces: u32 = canonical_namespaces.len + 3,
 
     /// LMDB map size in bytes (ignored by other backends). Never resized at
     /// runtime (S9: LMDB forbids env resize with concurrent readers); a
@@ -65,6 +68,7 @@ pub const canonical_namespaces = [_][]const u8{
     "by_contact",
     "pending_sub", // presence_handler subscription tracking
     "room_affiliations", // MUC persistent affiliations
+    "oidc_identities", // (iss, sub) -> localpart bindings + reverse index
 };
 
 /// Bind a namespace constant to the registered set. Every store owner
@@ -110,6 +114,7 @@ pub const Entry = struct {
 ///
 /// Required on B.WriteBatch:
 ///   fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void
+///   fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void
 ///   fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void
 ///   fn commit(self: *WriteBatch) !void
 ///   fn abort(self: *WriteBatch) void
@@ -119,6 +124,15 @@ pub const Entry = struct {
 /// is atomic and a failed SQLite COMMIT is rolled back). abort() after a
 /// commit attempt is therefore a no-op: calling it anyway double-ends the
 /// batch (the mdb_txn_abort that frees env->me_txn0, S9).
+///
+/// putIfAbsent() returns error.Conflict when the key exists in committed
+/// state or was already claimed in this batch. Atomicity is per backend:
+/// LMDB and SQLite run it inside the write transaction, so it holds across
+/// processes; Memory and RocksDB serialize against other in-process
+/// putIfAbsent callers via a backend claim lock held until the batch ends
+/// and give no cross-process guarantee. On LMDB and SQLite the check also
+/// sees earlier writes of the same transaction; on Memory and RocksDB only
+/// committed state plus this batch's own putIfAbsent claims are modeled.
 ///
 pub fn assertBackend(comptime B: type) void {
     comptime {
@@ -148,6 +162,8 @@ pub fn assertBackend(comptime B: type) void {
             @compileError("StorageBackend missing: writeBatch(*B) !WriteBatch");
         if (!@hasDecl(B.WriteBatch, "put"))
             @compileError("StorageBackend.WriteBatch missing: put(...)");
+        if (!@hasDecl(B.WriteBatch, "putIfAbsent"))
+            @compileError("StorageBackend.WriteBatch missing: putIfAbsent(...)");
         if (!@hasDecl(B.WriteBatch, "delete"))
             @compileError("StorageBackend.WriteBatch missing: delete(...)");
         if (!@hasDecl(B.WriteBatch, "commit"))
@@ -169,6 +185,9 @@ pub const MemoryBackend = struct {
     namespaces: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
     arena: std.heap.ArenaAllocator,
     backing: std.mem.Allocator,
+    /// Serializes putIfAbsent claim checks in this process; held by a batch
+    /// from its first putIfAbsent until the batch ends.
+    claim_mutex: std.Thread.Mutex = .{},
 
     pub fn open(path: []const u8, opts: OpenOptions) !Self {
         _ = path;
@@ -260,6 +279,8 @@ pub const MemoryBackend = struct {
         /// attempt is a no-op (S9); the count keeps a guard violation
         /// observable instead of a silent double free.
         ends: u8 = 0,
+        /// Set while this batch holds backend.claim_mutex (putIfAbsent).
+        claim_held: bool = false,
         /// Fault hook for tests: commit fails at this op index after the
         /// earlier ops were applied (a partial failure), exercising the
         /// failure cleanup.
@@ -285,6 +306,31 @@ pub const MemoryBackend = struct {
             } });
         }
 
+        /// In-process conditional insert: conflicts on the effective state
+        /// (committed rows plus this batch's own ops replayed in order).
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            if (!self.claim_held) {
+                self.backend.claim_mutex.lock();
+                self.claim_held = true;
+            }
+            var exists = false;
+            if (self.backend.namespaces.get(ns)) |map| {
+                exists = map.contains(key);
+            }
+            for (self.ops.items) |op| {
+                switch (op) {
+                    .put_op => |p| {
+                        if (std.mem.eql(u8, p.ns, ns) and std.mem.eql(u8, p.key, key)) exists = true;
+                    },
+                    .delete_op => |d| {
+                        if (std.mem.eql(u8, d.ns, ns) and std.mem.eql(u8, d.key, key)) exists = false;
+                    },
+                }
+            }
+            if (exists) return error.Conflict;
+            try self.put(ns, key, value);
+        }
+
         pub fn commit(self: *WriteBatch) !void {
             // Ended whether the apply succeeds or not: a partial failure
             // must not leave the op list allocated, and abort() after the
@@ -308,6 +354,10 @@ pub const MemoryBackend = struct {
 
         fn end(self: *WriteBatch) void {
             self.ends += 1;
+            if (self.claim_held) {
+                self.backend.claim_mutex.unlock();
+                self.claim_held = false;
+            }
             self.ops.deinit(self.backend.backing);
             self.ops = .{};
         }
@@ -406,6 +456,13 @@ pub const FailBatchBackend = struct {
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
             _ = ns;
             _ = key;
+            if (self.owner.fail_ops) return error.MapFull;
+        }
+
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            _ = ns;
+            _ = key;
+            _ = value;
             if (self.owner.fail_ops) return error.MapFull;
         }
 
@@ -587,12 +644,50 @@ test "MemoryBackend: separate namespaces" {
 
 test "OpenOptions defaults" {
     const opts = OpenOptions{};
-    try std.testing.expectEqual(@as(u32, 16), opts.max_namespaces);
+    try std.testing.expectEqual(@as(u32, 18), opts.max_namespaces);
     // 8 GiB default (S9): headroom for existing production DBs that
     // already exceed 64 MiB; sparse maps cost address space only.
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
     try std.testing.expect(opts.create);
     try std.testing.expect(!opts.read_only);
+}
+
+test "MemoryBackend WriteBatch.putIfAbsent: claims, conflicts, release" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    try b1.putIfAbsent("users", "alice", "v1");
+    // Same-batch second claim conflicts.
+    try std.testing.expectError(error.Conflict, b1.putIfAbsent("users", "alice", "v2"));
+    // b1 holds claim_mutex until it ends; a second batch's putIfAbsent
+    // would block on it, so cross-batch conflict is exercised post-commit.
+    try b1.commit();
+
+    var b2 = try db.writeBatch();
+    try std.testing.expectError(error.Conflict, b2.putIfAbsent("users", "alice", "v3"));
+    try b2.putIfAbsent("users", "bob", "v4");
+    try b2.commit();
+
+    const got = try db.get(std.testing.allocator, "users", "alice");
+    defer std.testing.allocator.free(got.?);
+    try std.testing.expectEqualStrings("v1", got.?);
+}
+
+test "MemoryBackend WriteBatch.putIfAbsent: batch ops model effective state" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    try db.put("users", "carol", "old");
+
+    // A delete in the same batch clears the key for a later putIfAbsent.
+    var b = try db.writeBatch();
+    try b.delete("users", "carol");
+    try b.putIfAbsent("users", "carol", "new");
+    try b.commit();
+    const got = try db.get(std.testing.allocator, "users", "carol");
+    defer std.testing.allocator.free(got.?);
+    try std.testing.expectEqualStrings("new", got.?);
 }
 
 test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted" {
@@ -608,7 +703,7 @@ test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted
             try std.testing.expect(!std.mem.eql(u8, ns, other));
         }
     }
-    try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
+    try std.testing.expectEqual(@as(usize, 15), canonical_namespaces.len);
 }
 
 const TokenKind = enum { str, chr, comment };
@@ -1067,10 +1162,10 @@ test "D7: source ratchet, no string-literal namespace arguments in src/" {
     // Every other file in src/ is zero.
     const expected = [_]struct { []const u8, usize }{
         .{ "auth/crypto_pool.zig", 3 },
-        .{ "store/backend.zig", 29 },
+        .{ "store/backend.zig", 33 },
         .{ "store/lmdb.zig", 39 },
-        .{ "store/rocksdb.zig", 32 },
-        .{ "store/sqlite.zig", 35 },
+        .{ "store/rocksdb.zig", 33 },
+        .{ "store/sqlite.zig", 36 },
     };
     var seen = [_]bool{false} ** expected.len;
 

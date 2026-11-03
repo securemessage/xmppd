@@ -25,9 +25,23 @@ const MdbEnvInfoC = extern struct {
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
 
+// Raw mdb_put for flags the wrapper does not expose (set() hardcodes
+// flags=0; putIfAbsent needs MDB_NOOVERWRITE).
+const MdbValC = extern struct {
+    mv_size: usize,
+    mv_data: ?*anyopaque,
+};
+const MDB_NOOVERWRITE: c_uint = 0x10;
+const MDB_KEYEXIST: c_int = -30799;
+extern "c" fn mdb_put(txn: ?*anyopaque, dbi: c_uint, key: *MdbValC, data: *MdbValC, flags: c_uint) c_int;
+
 const log = std.log.scoped(.lmdb_store);
 
-const MAX_DBS = 16;
+/// Env maxdbs and the DBI cache size: the canonical namespaces plus spare
+/// slots for test-only names ("scratch", "fresh" style fault hooks).
+/// LMDB counts MAIN_DBI against maxdbs, so usable named DBIs are
+/// maxdbs - 1.
+const MAX_DBS = backend.canonical_namespaces.len + 3;
 
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
@@ -295,6 +309,27 @@ pub const LmdbBackend = struct {
                 if (err == error.MDB_NOTFOUND) return;
                 return err;
             };
+        }
+
+        /// Cross-process conditional insert: MDB_NOOVERWRITE inside the
+        /// batch's write transaction fails MDB_KEYEXIST on any key visible
+        /// in the txn, committed or written earlier in the same batch.
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            const dbi = try self.resolveDbi(ns);
+            var k: MdbValC = .{
+                .mv_size = key.len,
+                .mv_data = @as(?*anyopaque, @ptrFromInt(@intFromPtr(key.ptr))),
+            };
+            var v: MdbValC = .{
+                .mv_size = value.len,
+                .mv_data = @as(?*anyopaque, @ptrFromInt(@intFromPtr(value.ptr))),
+            };
+            const rc = mdb_put(self.txn.ptr, dbi, &k, &v, MDB_NOOVERWRITE);
+            switch (rc) {
+                0 => {},
+                MDB_KEYEXIST => return error.Conflict,
+                else => return error.LmdbWriteFailed,
+            }
         }
 
         pub fn commit(self: *WriteBatch) !void {
@@ -745,6 +780,26 @@ fn countOpenFds() usize {
         count += 1;
     }
     return count;
+}
+
+test "LmdbBackend: putIfAbsent claims once and conflicts on committed keys" {
+    const path = "/tmp/xmppd-test-lmdb-putifabsent";
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+
+    var db = try LmdbBackend.open(path, .{ .create = false, .map_size = 16 * 1024 * 1024 });
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    try b1.putIfAbsent("users", "alice", "v1");
+    // Same-txn second claim sees the write it just made.
+    try std.testing.expectError(error.Conflict, b1.putIfAbsent("users", "alice", "v2"));
+    try b1.commit();
+
+    var b2 = try db.writeBatch();
+    try std.testing.expectError(error.Conflict, b2.putIfAbsent("users", "alice", "v3"));
+    try b2.commit();
 }
 
 test "LmdbBackend: a failed read-only open closes the env it created (D5)" {

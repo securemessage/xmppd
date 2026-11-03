@@ -10,7 +10,9 @@ const c = @cImport(@cInclude("rocksdb/c.h"));
 
 const log = std.log.scoped(.rocksdb_store);
 
-const MAX_COLUMN_FAMILIES = 16;
+/// Column-family cache size: the canonical namespaces plus spare slots for
+/// test-only names.
+const MAX_COLUMN_FAMILIES = backend.canonical_namespaces.len + 2;
 
 const CfCacheEntry = struct {
     name_buf: [64]u8,
@@ -32,6 +34,9 @@ pub const RocksDbBackend = struct {
     /// Guards cf_cache lookups/appends (S9): canonical column families are
     /// created at open(); the lock covers only test/unknown names.
     cf_lock: std.Thread.Mutex = .{},
+    /// Serializes putIfAbsent claim checks in this process; held by a batch
+    /// from its first putIfAbsent until the batch ends.
+    claim_mutex: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(RocksDbBackend);
@@ -376,9 +381,44 @@ pub const RocksDbBackend = struct {
         /// attempt is a no-op (S9); the count keeps a guard violation
         /// observable instead of a silent double destroy.
         ends: u8 = 0,
+        /// Set while this batch holds backend.claim_mutex (putIfAbsent).
+        claim_held: bool = false,
+        /// Keys this batch claimed through putIfAbsent (c_allocator dupes;
+        /// freed by releaseClaims). Bounded by max_claims_per_batch.
+        claimed: std.ArrayListUnmanaged(Claimed) = .empty,
         /// Test-only fault hook (S9): the commit fails the way a RocksDB
         /// write error does, without driving the C layer.
         fail_commit: bool = false,
+
+        const Claimed = struct { ns: []u8, key: []u8 };
+        const max_claims_per_batch = 256;
+
+        /// In-process conditional insert: the committed-state check runs
+        /// under claim_mutex, held until the batch ends, so two batches in
+        /// this process cannot both claim the same key. RocksDB WriteBatch
+        /// cannot express a conditional, so this is not atomic against a
+        /// second process or against writers that do not use putIfAbsent.
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            if (!self.claim_held) {
+                self.backend.claim_mutex.lock();
+                self.claim_held = true;
+            }
+            for (self.claimed.items) |cl| {
+                if (std.mem.eql(u8, cl.ns, ns) and std.mem.eql(u8, cl.key, key)) return error.Conflict;
+            }
+            const existing = try self.backend.get(std.heap.c_allocator, ns, key);
+            if (existing) |v| {
+                std.heap.c_allocator.free(v);
+                return error.Conflict;
+            }
+            if (self.claimed.items.len >= max_claims_per_batch) return error.ClaimLimit;
+            const ns_copy = try std.heap.c_allocator.dupe(u8, ns);
+            errdefer std.heap.c_allocator.free(ns_copy);
+            const key_copy = try std.heap.c_allocator.dupe(u8, key);
+            errdefer std.heap.c_allocator.free(key_copy);
+            try self.claimed.append(std.heap.c_allocator, .{ .ns = ns_copy, .key = key_copy });
+            try self.put(ns, key, value);
+        }
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const cf = try self.backend.getOrCreateCf(ns);
@@ -433,9 +473,23 @@ pub const RocksDbBackend = struct {
         }
 
         fn destroyBatch(self: *WriteBatch) void {
+            self.releaseClaims();
             if (self.batch) |b| {
                 c.rocksdb_writebatch_destroy(b);
                 self.batch = null;
+            }
+        }
+
+        fn releaseClaims(self: *WriteBatch) void {
+            for (self.claimed.items) |cl| {
+                std.heap.c_allocator.free(cl.ns);
+                std.heap.c_allocator.free(cl.key);
+            }
+            self.claimed.deinit(std.heap.c_allocator);
+            self.claimed = .empty;
+            if (self.claim_held) {
+                self.backend.claim_mutex.unlock();
+                self.claim_held = false;
             }
         }
     };
@@ -502,6 +556,26 @@ test "RocksDbBackend: open and close" {
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     db.close();
+}
+
+test "RocksDbBackend: putIfAbsent claims once and conflicts on committed keys" {
+    const path = freshTestDir();
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    try b1.putIfAbsent("users", "alice", "v1");
+    try std.testing.expectError(error.Conflict, b1.putIfAbsent("users", "alice", "v2"));
+    try b1.commit();
+
+    var b2 = try db.writeBatch();
+    try std.testing.expectError(error.Conflict, b2.putIfAbsent("users", "alice", "v3"));
+    try b2.commit();
+
+    const got = try db.get(std.testing.allocator, "users", "alice");
+    defer if (got) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("v1", got.?);
 }
 
 test "RocksDbBackend: put and get" {

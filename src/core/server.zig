@@ -4666,6 +4666,7 @@ test "every store namespace constant is registered and every registry entry is o
     const lock_store = @import("lock_store");
     const invite_store = @import("invite_store");
     const last_activity_store = @import("last_activity_store");
+    const oidc_identity_store = @import("oidc_identity_store");
     const owners = [_][]const u8{
         user_store.NAMESPACE,
         generic_roster.NAMESPACE,
@@ -4681,6 +4682,7 @@ test "every store namespace constant is registered and every registry entry is o
         archive_store_mod.NS_MESSAGES,
         archive_store_mod.NS_BY_CONTACT,
         presence_handler.PENDING_SUB_NS,
+        oidc_identity_store.NAMESPACE,
     };
     const registry = backend_mod.canonical_namespaces;
     try std.testing.expectEqual(registry.len, owners.len);

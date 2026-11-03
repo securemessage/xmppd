@@ -590,6 +590,13 @@ pub fn build(b: *std.Build) void {
     });
     server_invite_store_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("invite_store", server_invite_store_mod);
+    const server_oidc_identity_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_oidc_identity_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("oidc_identity_store", server_oidc_identity_mod);
     server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});

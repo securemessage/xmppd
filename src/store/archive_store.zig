@@ -669,6 +669,8 @@ const FailCommitBackend = struct {
 
         pub fn put(_: *WriteBatch, _: []const u8, _: []const u8, _: []const u8) !void {}
 
+        pub fn putIfAbsent(_: *WriteBatch, _: []const u8, _: []const u8, _: []const u8) !void {}
+
         pub fn delete(_: *WriteBatch, _: []const u8, _: []const u8) !void {}
 
         pub fn commit(_: *WriteBatch) !void {
