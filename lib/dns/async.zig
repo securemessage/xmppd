@@ -4468,10 +4468,22 @@ test "dns-async: a refused TCP connect fails the phase, not the job" {
     // reconnect), so a TLSA leg ends lookup_failed and the resolve
     // completes instead of dropping the whole job.
     // Method: the chain is fed to .tlsa over injected answers, then
-    // the TC upgrade connects to a port nobody listens on.
+    // the TC upgrade connects to a port nobody listens on. The UDP
+    // target is a bound socket that absorbs the queries: an
+    // unbound port's ICMP refusals could latch onto the resolver's
+    // own sends and fail the leg before TCP is reached.
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(ufd);
+    const uaddr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen());
+    var uactual: posix.sockaddr = undefined;
+    var uslen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(ufd, &uactual, &uslen);
+    const port = net.Address.initPosix(@alignCast(&uactual)).getPort();
+
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
