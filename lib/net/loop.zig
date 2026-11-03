@@ -30,6 +30,13 @@ pub const handle_kind: u8 = 0x01;
 pub const wake_kind: u8 = 0x02;
 pub const timer_kind: u8 = 0x03;
 pub const broadcast_kind: u8 = 0x04;
+pub const signal_kind: u8 = 0x05;
+pub const proc_kind: u8 = 0x06;
+
+/// Process-global signal ownership: a signal may have exactly one watching
+/// loop process-wide. SIGCHLD is excluded and keeps SIG_DFL.
+pub const max_signal = 128;
+var signal_owners = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_signal;
 
 /// Ident and udata of the loop's EVFILT_USER knote.
 pub const wake_ident: usize = 0;
@@ -62,6 +69,9 @@ pub const ChangeFailure = struct {
     errno: u32,
 };
 
+pub const SignalEvent = struct { signo: u32, count: i64 };
+pub const ProcessExit = struct { pid: posix.pid_t };
+
 pub const Event = union(enum) {
     readable: Io,
     writable: Io,
@@ -69,6 +79,8 @@ pub const Event = union(enum) {
     wake,
     broadcast_closed,
     deadline: Deadline,
+    signal: SignalEvent,
+    process_exit: ProcessExit,
 };
 
 pub const Stats = struct {
@@ -152,6 +164,7 @@ pub const Loop = struct {
     armed_deadline: u64,
     timer_ready: bool,
     internal_failed: bool,
+    watched_signals: std.StaticBitSet(max_signal),
 
     /// Creates a CLOEXEC kqueue and allocates every buffer; no allocation
     /// happens after init.
@@ -215,6 +228,7 @@ pub const Loop = struct {
             .armed_deadline = 0,
             .timer_ready = false,
             .internal_failed = false,
+            .watched_signals = std.StaticBitSet(max_signal).initEmpty(),
         };
 
         // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
@@ -233,8 +247,13 @@ pub const Loop = struct {
         };
     }
 
-    /// Closes every attached fd and the kqueue.
+    /// Closes every attached fd and the kqueue, releasing owned signals.
     pub fn deinit(self: *Loop, gpa: std.mem.Allocator) void {
+        var it = self.watched_signals.iterator(.{});
+        while (it.next()) |signo| {
+            signal_owners[signo].store(false, .release);
+            restoreDefaultHandler(@intCast(signo));
+        }
         for (self.handles.values[0..self.handles.pool]) |h| {
             if (h.fd >= 0) rawClose(h.fd);
         }
@@ -433,6 +452,91 @@ pub const Loop = struct {
     pub fn cancelTimer(self: *Loop, timer: TimerId) bool {
         self.assertOwner();
         return self.wheel.cancel(timer);
+    }
+
+    // -- Signals and processes ------------------------------------------------
+
+    pub const WatchSignalError = error{
+        InvalidSignal,
+        SignalOwned,
+        KqueueInvalid,
+        BadDescriptor,
+        NotFound,
+        ProcessNotFound,
+        SystemResources,
+        AccessDenied,
+        InvalidArgument,
+        Unexpected,
+    };
+
+    /// Watch `signo` via EVFILT_SIGNAL: claims process-wide ownership (a
+    /// second loop, or a second watch, gets SignalOwned), sets SIG_IGN so the
+    /// process keeps running, and attaches the knote immediately. SIGCHLD is
+    /// rejected: it stays SIG_DFL so wait(2) keeps working.
+    pub fn watchSignal(self: *Loop, signo: u8) WatchSignalError!void {
+        self.assertOwner();
+        if (signo == 0 or signo >= max_signal or signo == posix.SIG.CHLD) return error.InvalidSignal;
+        if (signal_owners[signo].swap(true, .acq_rel)) return error.SignalOwned;
+        errdefer signal_owners[signo].store(false, .release);
+
+        const ign: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .flags = 0,
+            .mask = posix.sigemptyset(),
+        };
+        posix.sigaction(signo, &ign, null);
+        errdefer restoreDefaultHandler(signo);
+
+        const add = kev.Kevent{
+            .ident = signo,
+            .filter = std.c.EVFILT.SIGNAL,
+            .flags = std.c.EV.ADD,
+            .fflags = 0,
+            .data = 0,
+            .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
+        };
+        try kev.applyNow(self.kq, &add);
+        self.watched_signals.set(signo);
+    }
+
+    /// Remove the knote, restore SIG_DFL and release ownership. Stale or
+    /// missing knotes are tolerated.
+    pub fn unwatchSignal(self: *Loop, signo: u8) void {
+        self.assertOwner();
+        if (signo == 0 or signo >= max_signal) return;
+        if (!self.watched_signals.isSet(signo)) return;
+        const del = kev.Kevent{
+            .ident = signo,
+            .filter = std.c.EVFILT.SIGNAL,
+            .flags = std.c.EV.DELETE,
+            .fflags = 0,
+            .data = 0,
+            .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
+        };
+        // Best-effort delete: the knote is either gone already (fine, that is
+        // the wanted state) or dropped with the kqueue at deinit.
+        kev.applyNow(self.kq, &del) catch |err| switch (err) {
+            error.NotFound, error.BadDescriptor => {},
+            else => {},
+        };
+        self.watched_signals.unset(signo);
+        signal_owners[signo].store(false, .release);
+        restoreDefaultHandler(signo);
+    }
+
+    /// Process exit notification via EVFILT_PROC + NOTE_EXIT; emits
+    /// `.process_exit` with the pid. ESRCH means the pid does not exist.
+    pub fn watchProcess(self: *Loop, pid: posix.pid_t) kev.ApplyError!void {
+        self.assertOwner();
+        const add = kev.Kevent{
+            .ident = @intCast(pid),
+            .filter = std.c.EVFILT.PROC,
+            .flags = std.c.EV.ADD,
+            .fflags = std.c.NOTE.EXIT,
+            .data = 0,
+            .udata = (Token{ .index = @truncate(@as(u64, @bitCast(@as(i64, pid)))), .gen = 1, .kind = proc_kind }).toUdata(),
+        };
+        try kev.applyNow(self.kq, &add);
     }
 
     // -- Iteration -----------------------------------------------------------
@@ -710,6 +814,14 @@ pub const Loop = struct {
                 self.timer_ready = true;
                 return null;
             },
+            signal_kind => {
+                self.stats_.delivered_events += 1;
+                return .{ .signal = .{ .signo = token.index, .count = raw.data } };
+            },
+            proc_kind => {
+                self.stats_.delivered_events += 1;
+                return .{ .process_exit = .{ .pid = @intCast(raw.ident) } };
+            },
             wake_kind => {
                 self.wake_state.consume();
                 self.stats_.wakes += 1;
@@ -805,6 +917,15 @@ extern "c" fn kqueuex(flags: c_int) c_int;
 /// (the change_failed path leads consumers here) or already reaped.
 fn rawClose(fd: posix.fd_t) void {
     _ = std.c.close(fd);
+}
+
+fn restoreDefaultHandler(signo: u8) void {
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(signo, &dfl, null);
 }
 
 pub fn monotonicMs() u64 {
@@ -1282,6 +1403,48 @@ test "Loop: scheduleIn fires a deadline event and cancel silences it" {
     loop.requestImmediate();
     try loop.wait();
     try std.testing.expect(loop.next() == null);
+}
+
+test "Loop: watchSignal delivers count and ownership excludes a second watch" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+    var loop2 = try testLoop(null);
+    defer loop2.deinit(std.testing.allocator);
+
+    try loop.watchSignal(posix.SIG.USR1);
+    try std.testing.expectError(error.SignalOwned, loop2.watchSignal(posix.SIG.USR1));
+    try std.testing.expectError(error.SignalOwned, loop.watchSignal(posix.SIG.USR1));
+
+    try posix.raise(posix.SIG.USR1);
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .signal);
+    try std.testing.expectEqual(posix.SIG.USR1, ev.signal.signo);
+    try std.testing.expect(ev.signal.count >= 1);
+
+    loop.unwatchSignal(posix.SIG.USR1);
+    try loop2.watchSignal(posix.SIG.USR1); // ownership was released
+
+    try std.testing.expectError(error.InvalidSignal, loop.watchSignal(posix.SIG.CHLD));
+}
+
+test "Loop: watchProcess reports the child's exit" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        posix.exit(0);
+    }
+    defer _ = posix.waitpid(pid, 0);
+    try loop.watchProcess(pid);
+
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .process_exit);
+    try std.testing.expectEqual(pid, ev.process_exit.pid);
+
+    try std.testing.expectError(error.ProcessNotFound, loop.watchProcess(1 << 22));
 }
 
 test "Loop: attach at capacity fails with HandleTableFull" {
