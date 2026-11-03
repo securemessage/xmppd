@@ -498,8 +498,11 @@ pub const Resolver = struct {
     /// when the caller can authenticate with them; false callers get
     /// the same addresses without the extra round trips.
     pub fn resolve(self: *Resolver, name: []const u8, service: Service, default_port: u16, session_key: usize, want_tlsa: bool) !void {
-        if (net.Address.parseIp(name, default_port)) |addr| {
-            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, name), .tlsa = &.{}, .tlsa_status = .absent, .is_direct_tls = false };
+        // RFC 7622 3.2: a trailing dot on a domainpart is absent, so an
+        // FQDN resolves like the bare name.
+        const fqdn = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+        if (net.Address.parseIp(fqdn, default_port)) |addr| {
+            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, fqdn), .tlsa = &.{}, .tlsa_status = .absent, .is_direct_tls = false };
             const list = try self.alloc.alloc(Target, 1);
             list[0] = t;
             self.cb.fun(self.cb.ctx, session_key, .resolved, .{ .targets = list });
@@ -515,7 +518,7 @@ pub const Resolver = struct {
             if (job.service_idx != @intFromEnum(service)) continue;
             if (job.default_port != default_port) continue;
             if (job.want_tlsa != want_tlsa) continue;
-            if (!std.ascii.eqlIgnoreCase(job.name, name)) continue;
+            if (!std.ascii.eqlIgnoreCase(job.name, fqdn)) continue;
             // A full job takes no more waiters; the lookup starts a
             // fresh job on the wire instead of failing.
             if (job.waiter_count >= MAX_WAITERS) continue;
@@ -524,10 +527,10 @@ pub const Resolver = struct {
             return;
         }
         if (self.jobs.items.len >= MAX_JOBS) {
-            try self.enqueueWait(session_key, name, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
+            try self.enqueueWait(session_key, fqdn, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
             return;
         }
-        const job = try self.allocJob(session_key, name);
+        const job = try self.allocJob(session_key, fqdn);
         job.phase = .srv_tls;
         job.service_idx = @intFromEnum(service);
         job.default_port = default_port;
@@ -2919,11 +2922,13 @@ test "dns-async: the fallback address path honors the requested port" {
 const FreeingCtx = struct {
     calls: usize = 0,
     keys: [8]usize = .{0} ** 8,
+    status: ?Status = null,
 
-    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, status: Status, res: ?Resolution) void {
         const self: *FreeingCtx = @ptrCast(@alignCast(ctx_ptr.?));
         if (self.calls < self.keys.len) self.keys[self.calls] = key;
         self.calls += 1;
+        self.status = status;
         if (res) |r| {
             var v = r;
             v.deinitOn(std.testing.allocator);
@@ -3273,6 +3278,52 @@ test "dns-async: identical resolves merge into one job" {
     try std.testing.expectEqual(@as(usize, 2), ctx.calls);
     // Both session keys were notified exactly once.
     try std.testing.expect((ctx.keys[0] == 1 and ctx.keys[1] == 2) or (ctx.keys[0] == 2 and ctx.keys[1] == 1));
+}
+
+test "dns-async: a trailing dot resolves like the bare name" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // The FQDN must run the same SRV chain as "svc.test" over the wire.
+    try r.resolve("svc.test.", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    try std.testing.expectEqualSlices(u8, "srv.test", res.targets[0].host);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
+test "dns-async: an FQDN and the bare name merge into one job" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    // The stripped name is the merge key, so both lookups share one
+    // wire exchange and each waiter still gets its own callback.
+    try r.resolve("svc.test.", .client, 5222, 1, false);
+    try r.resolve("svc.test", .client, 5222, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
+
+    var spins: usize = 0;
+    while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
 }
 
 test "dns-async: over-cap requests queue and cancel detaches" {
