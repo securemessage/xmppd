@@ -192,6 +192,10 @@ const Job = struct {
     /// socket() reuses fd numbers, so an event queued for an earlier
     /// connection is told apart from the new one by this count.
     tcp_seq: u8 = 0,
+    /// Whether the outstanding query was already re-sent once after
+    /// the peer closed the connection (RFC 7766 close-after-answer);
+    /// a second close on the same query fails the phase instead.
+    tcp_eof_resent: bool = false,
 
     targets: std.ArrayListUnmanaged(Target) = .{},
 };
@@ -593,7 +597,13 @@ pub const Resolver = struct {
                         };
                         job.tcp_connected = true;
                     }
-                    self.tcpWrite(job) catch self.dropJob(job, .failed);
+                    self.tcpWrite(job) catch |err| {
+                        if (err == error.PeerClosed) {
+                            _ = self.tcpPeerClosed(job);
+                        } else {
+                            self.dropJob(job, .failed);
+                        }
+                    };
                 }
             }
         }
@@ -847,14 +857,24 @@ pub const Resolver = struct {
                 // A frame still mid-write cannot share the stream with
                 // a new one: re-open the connection so the new query
                 // stages on an empty tcp_out.
-                try self.tcpRestart(job);
+                self.tcpRestart(job) catch |err| {
+                    if (err == error.PeerClosed) {
+                        if (!self.tcpPeerClosed(job)) return;
+                    } else return err;
+                };
             } else {
                 // A connection surviving from an earlier query is
                 // reused; its fully flushed frame is cleared so the
-                // new query stages and is written.
+                // new query stages and is written. A new query also
+                // re-arms the close-after-answer resend budget.
                 job.tcp_out.clearRetainingCapacity();
                 job.tcp_out_pos = 0;
-                try self.tcpSend(job);
+                job.tcp_eof_resent = false;
+                self.tcpSend(job) catch |err| {
+                    if (err == error.PeerClosed) {
+                        if (!self.tcpPeerClosed(job)) return;
+                    } else return err;
+                };
             }
         } else {
             try self.sendUdp(pkt);
@@ -874,9 +894,13 @@ pub const Resolver = struct {
         }
         job.tries += 1;
         if (job.use_tcp) {
-            self.tcpRestart(job) catch {
-                self.dropJob(job, .failed);
-                return;
+            self.tcpRestart(job) catch |err| {
+                if (err == error.PeerClosed) {
+                    if (!self.tcpPeerClosed(job)) return;
+                } else {
+                    self.dropJob(job, .failed);
+                    return;
+                }
             };
         } else {
             self.sendUdp(job.request) catch {
@@ -991,6 +1015,27 @@ pub const Resolver = struct {
         try self.tcpSend(job);
     }
 
+    /// The peer closed or reset the connection while the outstanding
+    /// query was unanswered: RFC 7766 permits a close after any
+    /// answer, so the query is re-sent once on a fresh connection
+    /// instead of failing. A second close on the same query, or a
+    /// failed reconnect, runs the ordinary failQuery path which costs
+    /// only the failing phase. Returns false once failQuery ran: the
+    /// job may already be freed and must not be touched again.
+    fn tcpPeerClosed(self: *Resolver, job: *Job) bool {
+        self.tcpClose(job);
+        if (job.tcp_eof_resent) {
+            self.failQuery(job);
+            return false;
+        }
+        job.tcp_eof_resent = true;
+        self.tcpSend(job) catch {
+            self.failQuery(job);
+            return false;
+        };
+        return true;
+    }
+
     /// Open the TCP socket and start connect; the WRITE knote drives the
     /// actual send once connect completes.
     fn tcpSend(self: *Resolver, job: *Job) !void {
@@ -1016,7 +1061,14 @@ pub const Resolver = struct {
         try self.keventApply(ch[0..n]);
         job.tcp_fd = fd;
         job.tcp_connected = connected;
-        if (connected) return self.tcpWrite(job);
+        if (connected) self.tcpWrite(job) catch |err| {
+            // The errdefer above closes fd on this error path; detach
+            // it from the job so a later tcpClose cannot close a
+            // recycled fd number.
+            job.tcp_fd = -1;
+            job.tcp_connected = false;
+            return err;
+        };
     }
 
     /// Re-arm the one-shot writable event so a flush that hit
@@ -1035,6 +1087,10 @@ pub const Resolver = struct {
 
     /// TCP DNS frames are length-prefixed; the frame is staged once in
     /// tcp_out and flushed across partial writes and WouldBlock.
+    /// MSG.NOSIGNAL keeps a write to a dead peer an EPIPE error rather
+    /// than a process-killing SIGPIPE; that error and a reset report
+    /// the same close-after-answer condition as a read-side EOF, so
+    /// they surface as error.PeerClosed.
     fn tcpWrite(self: *Resolver, job: *Job) !void {
         if (job.tcp_out.items.len == 0) {
             var hdr: [2]u8 = undefined;
@@ -1043,8 +1099,9 @@ pub const Resolver = struct {
             try job.tcp_out.appendSlice(self.alloc, job.request);
         }
         while (job.tcp_out_pos < job.tcp_out.items.len) {
-            const n = posix.send(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], 0) catch |err| switch (err) {
+            const n = posix.send(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
                 error.WouldBlock => return self.armTcpWrite(job),
+                error.BrokenPipe, error.ConnectionResetByPeer => return error.PeerClosed,
                 else => return error.SendFailed,
             };
             job.tcp_out_pos += n;
@@ -1095,13 +1152,22 @@ pub const Resolver = struct {
         var buf: [8192]u8 = undefined;
         const n = posix.recv(job.tcp_fd, &buf, 0) catch |err| switch (err) {
             error.WouldBlock => return,
+            // A reset after the frame was written reports the same
+            // close-after-answer condition as the FIN below.
+            error.ConnectionResetByPeer => {
+                _ = self.tcpPeerClosed(job);
+                return;
+            },
             else => {
                 self.dropJob(job, .failed);
                 return;
             },
         };
         if (n == 0) {
-            self.dropJob(job, .failed);
+            // RFC 7766 lets a server close after any answer; the
+            // outstanding query is re-sent once on a fresh
+            // connection before the phase is given up.
+            _ = self.tcpPeerClosed(job);
             return;
         }
         job.tcp_buf.appendSlice(self.alloc, buf[0..n]) catch {
@@ -1169,7 +1235,14 @@ pub const Resolver = struct {
         if (msg.truncated and !job.use_tcp) {
             job.use_tcp = true;
             job.tries = 0;
-            self.tcpSend(job) catch return self.dropJob(job, .failed);
+            // A fresh query entering TCP gets a fresh
+            // close-after-answer resend budget.
+            job.tcp_eof_resent = false;
+            self.tcpSend(job) catch |err| {
+                if (err == error.PeerClosed) {
+                    if (!self.tcpPeerClosed(job)) return;
+                } else return self.dropJob(job, .failed);
+            };
             self.armDeadline(job, TCP_TIMEOUT_MS) catch return self.dropJob(job, .failed);
             return;
         }
@@ -4618,6 +4691,77 @@ test "dns-async: a TCP retry resends the query on a fresh connection" {
     try std.testing.expectEqual(@as(usize, 1), raw.rrs.len);
     try std.testing.expectEqual(KIND_A, raw.rrs[0].rtype);
     try std.testing.expectEqualSlices(u8, &[4]u8{ 127, 0, 0, 1 }, raw.rrs[0].rdata);
+}
+
+test "dns-async: a server closing after an answer costs one reconnect, not the job" {
+    // Goal: RFC 7766 lets a server close the connection after any
+    // answer; a chain query written into the dead connection must be
+    // re-sent once on a fresh one instead of failing the resolve.
+    // Method: a test-owned listener answers each chain query on its
+    // own accepted connection and closes it at once, so the resolve
+    // takes one connection per query.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+
+    // The truncated UDP answer upgrades the chain to TCP; the first
+    // connection carries the _xmpps SRV query.
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var accepts: usize = 0;
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    while (ctx.status == null and accepts < 8) {
+        // Each accepted connection gets exactly one query frame:
+        // answer it, then close before the next query is written, so
+        // the resolver must notice the EOF and re-connect.
+        const cfd = acceptTcpBounded(&r, lfd) catch break;
+        accepts += 1;
+        try posix.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        var got: usize = 0;
+        var spins: usize = 0;
+        while (got == 0 and spins < 100 and ctx.status == null) : (spins += 1) {
+            r.step(10);
+            if (readFull(cfd, &hdr) == 2) {
+                const want = std.mem.readInt(u16, &hdr, .big);
+                if (readFull(cfd, fbuf[0..want]) == want) got = want;
+            }
+        }
+        if (got > 0) {
+            var abuf: [1024]u8 = undefined;
+            const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+            var out_hdr: [2]u8 = undefined;
+            std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+            _ = try posix.send(cfd, &out_hdr, posix.MSG.NOSIGNAL);
+            _ = try posix.send(cfd, abuf[0..rlen], posix.MSG.NOSIGNAL);
+        }
+        posix.close(cfd);
+    }
+
+    // _xmpps SRV, _xmpp SRV, A, AAAA: one connection per query; the
+    // resolver opens no connection a live chain does not need.
+    try std.testing.expectEqual(@as(usize, 4), accepts);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
 }
 
 test "dns-async: resolv.conf is read into the resolver, not on the loop" {
