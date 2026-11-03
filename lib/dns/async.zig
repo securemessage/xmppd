@@ -605,11 +605,18 @@ pub const Resolver = struct {
                 // socket arriving here resumes a WouldBlock flush.
                 if (self.tcpJobFromEvent(ev)) |job| {
                     if (!job.tcp_connected) {
-                        rawSoError(job.tcp_fd) catch {
-                            self.dropJob(job, .failed);
+                        if (rawSoError(job.tcp_fd)) |_| {
+                            job.tcp_connected = true;
+                        } else |_| {
+                            // The connect died; the outstanding query
+                            // is unanswered, so it runs the ordinary
+                            // phase-scoped failure path. The dead
+                            // socket is dropped first or the next
+                            // query would stage on it.
+                            self.tcpClose(job);
+                            self.failQuery(job);
                             continue;
-                        };
-                        job.tcp_connected = true;
+                        }
                     }
                     self.tcpWrite(job) catch |err| {
                         if (err == error.PeerClosed) {
@@ -1037,9 +1044,11 @@ pub const Resolver = struct {
     /// query was unanswered: RFC 7766 permits a close after any
     /// answer, so the query is re-sent once on a fresh connection
     /// instead of failing. A second close on the same query, or a
-    /// failed reconnect, runs the ordinary failQuery path which costs
-    /// only the failing phase. Returns false once failQuery ran: the
-    /// job may already be freed and must not be touched again.
+    /// failed reconnect whether it arrives as a send error here or as
+    /// SO_ERROR on the connect's knote, runs the ordinary failQuery
+    /// path which costs only the failing phase. Returns false once
+    /// failQuery ran: the job may already be freed and must not be
+    /// touched again.
     fn tcpPeerClosed(self: *Resolver, job: *Job) bool {
         self.tcpClose(job);
         if (job.tcp_eof_resent) {
@@ -1184,7 +1193,15 @@ pub const Resolver = struct {
                 return;
             },
             else => {
-                self.dropJob(job, .failed);
+                // An error on a socket whose connect never completed
+                // is the refused-connect condition: the outstanding
+                // query runs the ordinary phase failure.
+                if (!job.tcp_connected) {
+                    self.tcpClose(job);
+                    self.failQuery(job);
+                } else {
+                    self.dropJob(job, .failed);
+                }
                 return;
             },
         };
@@ -4419,6 +4436,40 @@ test "dns-async: only one trailing dot is stripped" {
     try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 1), ctx.calls);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a refused TCP connect fails the phase, not the job" {
+    // Goal: a refused connect reports writable with SO_ERROR set; the
+    // outstanding query runs the ordinary phase-scoped failQuery
+    // path (the same condition tcpPeerClosed documents for a failed
+    // reconnect), so a TLSA leg ends lookup_failed and the resolve
+    // completes instead of dropping the whole job.
+    // Method: the chain is fed to .tlsa over injected answers, then
+    // the TC upgrade connects to a port nobody listens on.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
