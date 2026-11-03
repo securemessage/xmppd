@@ -29,6 +29,14 @@ pub const Broadcast = @import("wake.zig").Broadcast;
 pub const TimerWheel = @import("timer_wheel.zig").TimerWheel;
 pub const TimerId = loop.TimerId;
 pub const Deadline = loop.Deadline;
+pub const bindTcp = @import("bind.zig").bindTcp;
+pub const bindUnix = @import("bind.zig").bindUnix;
+pub const TcpOptions = @import("bind.zig").TcpOptions;
+pub const UnixOptions = @import("bind.zig").UnixOptions;
+pub const BindError = @import("bind.zig").BindError;
+pub const Listener = @import("bind.zig").Listener;
+pub const PeerCred = @import("bind.zig").PeerCred;
+pub const peerCred = @import("bind.zig").peerCred;
 
 test {
     std.testing.refAllDecls(@This());

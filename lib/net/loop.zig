@@ -32,6 +32,8 @@ pub const timer_kind: u8 = 0x03;
 pub const broadcast_kind: u8 = 0x04;
 pub const signal_kind: u8 = 0x05;
 pub const proc_kind: u8 = 0x06;
+/// Internal deadline ctx kind: a paused listener's fallback resume.
+pub const resume_kind: u8 = 0x07;
 
 /// Process-global signal ownership: a signal may have exactly one watching
 /// loop process-wide. SIGCHLD is excluded and keeps SIG_DFL.
@@ -342,6 +344,29 @@ pub const Loop = struct {
         self.markDirty(handle, h);
     }
 
+    /// True while `handle`'s read interest is paused.
+    pub fn isPaused(self: *Loop, handle: Handle) bool {
+        const h = self.resolve(handle) orelse return false;
+        return h.paused;
+    }
+
+    /// Undo a `pauseReadUntilClose` early (Listener's fallback deadline and
+    /// any consumer-side resume path). `want.read` was never changed, so this
+    /// just clears the mask and re-commits.
+    pub fn resumePaused(self: *Loop, handle: Handle) HandleError!void {
+        self.assertOwner();
+        const h = self.resolve(handle) orelse return error.StaleHandle;
+        if (!h.paused) return;
+        h.paused = false;
+        for (self.paused.items, 0..) |tok, i| {
+            if (tok.eql(handle)) {
+                _ = self.paused.swapRemove(i);
+                break;
+            }
+        }
+        self.markDirty(handle, h);
+    }
+
     /// Purge the handle's staged changes (dirty-list tombstone, order of the
     /// other handles preserved), free the slot and close the fd. Every paused
     /// listener on this loop resumes read interest.
@@ -645,7 +670,14 @@ pub const Loop = struct {
             if (self.translate(raw)) |event| return event;
         }
         if (self.timer_ready) {
-            if (self.wheel.popExpired(self.now_ms_)) |dl| {
+            while (self.wheel.popExpired(self.now_ms_)) |dl| {
+                // resume_kind deadlines are loop-internal: a paused
+                // listener's fallback timer. Not consumer events.
+                if (dl.ctx.kind == resume_kind) {
+                    const tok: Token = .{ .index = dl.ctx.index, .gen = dl.ctx.gen, .kind = handle_kind };
+                    self.resumePaused(tok) catch continue;
+                    continue;
+                }
                 self.stats_.delivered_events += 1;
                 return .{ .deadline = dl };
             }
