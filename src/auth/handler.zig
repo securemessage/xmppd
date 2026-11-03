@@ -755,12 +755,29 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            self.store.changePassword(self.allocator, req.username, req.new_password) catch |err| {
+            // Resolve the account through the one RFC 7622 localpart function.
+            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+            const account_username = precis.xmppLocalpart(
+                req.username,
+                &canon_buf,
+                &scratch_cps,
+                &scratch_cccs,
+            ) catch {
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
+            self.store.changePassword(self.allocator, account_username, req.new_password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserNotFound => "item-not-found",
                     else => "internal-server-error",
                 };
-                log.info("password change failed for '{s}': {s}", .{ req.username, reason });
+                log.info("password change failed for '{s}': {s}", .{ account_username, reason });
                 return protocol.Message{ .password_change_result = .{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -768,8 +785,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            self.cacheInvalidate(req.username);
-            log.info("password changed for '{s}'", .{req.username});
+            self.cacheInvalidate(account_username);
+            log.info("password changed for '{s}'", .{account_username});
             return protocol.Message{ .password_change_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -794,12 +811,29 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            // Resolve the account through the one RFC 7622 localpart function.
+            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+            const account_username = precis.xmppLocalpart(
+                req.username,
+                &canon_buf,
+                &scratch_cps,
+                &scratch_cccs,
+            ) catch {
+                return protocol.Message{ .account_delete_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
             // Remove from UserStore (ignore UserNotFound — may be external auth)
-            self.store.removeUser(self.allocator, req.username) catch |err| {
+            self.store.removeUser(self.allocator, account_username) catch |err| {
                 switch (err) {
                     error.UserNotFound => {},
                     else => {
-                        log.err("account delete failed for '{s}': store error", .{req.username});
+                        log.err("account delete failed for '{s}': store error", .{account_username});
                         return protocol.Message{ .account_delete_result = .{
                             .conn_id = req.conn_id,
                             .success = false,
@@ -814,7 +848,7 @@ pub fn AuthHandler(comptime Store: type) type {
             // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
             // or naturally don't apply once the account is gone.
 
-            log.info("account deleted (auth): '{s}'", .{req.username});
+            log.info("account deleted (auth): '{s}'", .{account_username});
             return protocol.Message{ .account_delete_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -3103,6 +3137,64 @@ test "AuthHandler: registration conflict is on the canonical name" {
     if (kdup != .register_result) return error.UnexpectedReply;
     try std.testing.expect(!kdup.register_result.success);
     try std.testing.expectEqualStrings("conflict", kdup.register_result.reason);
+}
+
+test "AuthHandler: password change resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "oldpw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const changed = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 330,
+        .username = "NaplesTB",
+        .new_password = "newpw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(changed.password_change_result.success);
+
+    var buf: [64]u8 = undefined;
+    const login = handleSync(&handler, plainRequest(331, "10.0.0.31", plainPayload(&buf, "NAPLESTB", "newpw"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", login.auth_success.username);
+
+    const invalid = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 332,
+        .username = "bad name",
+        .new_password = "pw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.password_change_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.password_change_result.reason);
+}
+
+test "AuthHandler: account delete resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "pw");
+    try store.addUser(allocator, "bad name", "pw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const deleted = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 340,
+        .username = "NaplesTB",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(deleted.account_delete_result.success);
+    try std.testing.expect((try store.lookup(allocator, "naplestb")) == null);
+
+    // An invalid name cannot delete even an exact raw legacy row.
+    const invalid = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 341,
+        .username = "bad name",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.account_delete_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.account_delete_result.reason);
+    try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
 }
 
 test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {

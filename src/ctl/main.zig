@@ -177,8 +177,9 @@ pub fn main() !void {
         const jid = remaining_args.items[1];
         const username = extractLocal(jid);
 
-        store.removeUser(allocator, username) catch |err| {
+        removeUserCanonical(&store, allocator, username) catch |err| {
             switch (err) {
+                error.InvalidAccountName => printErr("invalid account name\n"),
                 error.UserNotFound => printErr("user not found\n"),
                 else => return err,
             }
@@ -205,8 +206,9 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
 
-        store.changePassword(allocator, username, password) catch |err| {
+        changePasswordCanonical(&store, allocator, username, password) catch |err| {
             switch (err) {
+                error.InvalidAccountName => printErr("invalid account name\n"),
                 error.UserNotFound => printErr("user not found\n"),
                 else => return err,
             }
@@ -357,9 +359,29 @@ fn addUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u
     var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
     var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
     var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const canon = precis.xmppLocalpart(raw, &canon_buf, &scratch_cps, &scratch_cccs) catch
-        return error.InvalidAccountName;
+    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
     try store.addUser(allocator, canon, password);
+}
+
+fn prepareAccountName(raw: []const u8, buf: []u8, scratch_cps: []u21, scratch_cccs: []u8) ![]const u8 {
+    return precis.xmppLocalpart(raw, buf, scratch_cps, scratch_cccs) catch
+        return error.InvalidAccountName;
+}
+
+fn changePasswordCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8, password: []const u8) !void {
+    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
+    try store.changePassword(allocator, canon, password);
+}
+
+fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8) !void {
+    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
+    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
+    try store.removeUser(allocator, canon);
 }
 
 fn extractLocal(jid: []const u8) []const u8 {
@@ -651,6 +673,23 @@ test "addUserCanonical: stores the PRECIS canonical name" {
     try addUserCanonical(&store, allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}", "pw");
     try std.testing.expect((try store.lookup(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
     try std.testing.expect((try store.lookup(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) == null);
+}
+
+test "password change and deletion resolve the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
+
+    try addUserCanonical(&store, allocator, "naplestb", "oldpw");
+    try changePasswordCanonical(&store, allocator, "NaplesTB", "newpw");
+    try removeUserCanonical(&store, allocator, "NAPLESTB");
+    try std.testing.expect((try store.lookup(allocator, "naplestb")) == null);
+
+    try store.addUser(allocator, "bad name", "pw");
+    try std.testing.expectError(error.InvalidAccountName, changePasswordCanonical(&store, allocator, "bad name", "pw"));
+    try std.testing.expectError(error.InvalidAccountName, removeUserCanonical(&store, allocator, "bad name"));
+    try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
 }
 
 test "addUserCanonical: invalid names refused; conflicts are on the canonical name" {
