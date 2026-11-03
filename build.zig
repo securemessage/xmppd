@@ -187,6 +187,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const conf_mod = b.createModule(.{
+        .root_source_file = b.path("lib/conf/conf.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -270,6 +276,11 @@ pub fn build(b: *std.Build) void {
         .root_module = xml_test_mod,
     });
 
+    const conf_tests = b.addTest(.{
+        .name = "conf-tests",
+        .root_module = conf_mod,
+    });
+
     const xml_writer_tests = b.addTest(.{
         .name = "xml-writer-tests",
         .root_module = xml_writer_mod,
@@ -346,6 +357,7 @@ pub fn build(b: *std.Build) void {
     const run_socketpair_tests = b.addRunArtifact(socketpair_tests);
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
+    const run_conf_tests = b.addRunArtifact(conf_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
 
     // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
@@ -1847,6 +1859,7 @@ pub fn build(b: *std.Build) void {
     // A green test suite must also prove every install artifact compiles.
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
+    test_step.dependOn(&run_conf_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_unicode_tests.step);
