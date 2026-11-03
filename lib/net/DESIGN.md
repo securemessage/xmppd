@@ -72,7 +72,7 @@ pub fn SlotMap(comptime T: type) type {
         pub const Error = error{Full};
 
         /// Owns `values`, `gens` and the free ring; borrows nothing.
-        pub fn init(self: *Self, gpa: Allocator, capacity: u32, kind: u8) Allocator.Error!void;
+        pub fn init(self: *Self, gpa: Allocator, slot_count_max: u32, kind: u8) Allocator.Error!void;
         pub fn deinit(self: *Self, gpa: Allocator) void;
         pub fn insert(self: *Self, value: T) Error!Token;
         pub fn get(self: *Self, token: Token) ?*T;        // null when stale or wrong kind
