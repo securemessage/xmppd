@@ -173,6 +173,12 @@ const Job = struct {
     pending_qname: []const u8 = "", // owned
     pending_qtype: u16 = 0,
     request: []u8 = &.{},
+    /// Sends of the outstanding query on its current transport. UDP:
+    /// the first send plus one retransmit (MAX_TRIES deadlines at
+    /// TIMEOUT_MS each). A TC upgrade resets it to 0 and arms
+    /// TCP_TIMEOUT_MS, so the TCP leg is the first connection plus
+    /// MAX_TRIES retries, each retry a fresh connection carrying the
+    /// frame again (budget 4 s + 2 s + 2 s).
     tries: u8 = 0,
     use_tcp: bool = false,
     tcp_fd: posix.fd_t = -1,
@@ -182,6 +188,10 @@ const Job = struct {
     tcp_out: std.ArrayListUnmanaged(u8) = .{},
     tcp_out_pos: usize = 0,
     tcp_connected: bool = false,
+    /// Per-socket nonce stamped into TCP knote udata: close() then
+    /// socket() reuses fd numbers, so an event queued for an earlier
+    /// connection is told apart from the new one by this count.
+    tcp_seq: u8 = 0,
 
     targets: std.ArrayListUnmanaged(Target) = .{},
 };
@@ -231,9 +241,9 @@ pub const Resolver = struct {
     /// instead of the host resolver configuration.
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
     jobs: std.ArrayListUnmanaged(*Job) = .{},
-    /// Slot table for timer udata: a queued deadline event carries
-    /// (gen, slot) so a job freed by an earlier event in the same
-    /// kevent batch is recognized as stale and never touched.
+    /// Slot table for event udata: a queued deadline or TCP socket
+    /// event carries (gen, slot) so a job freed by an earlier event in
+    /// the same kevent batch is recognized as stale and never touched.
     slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
     slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
     /// Seeded from the CSPRNG; drives only the RFC 2782 weighted picks
@@ -568,26 +578,22 @@ pub const Resolver = struct {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
                     self.onReadable();
-                } else {
-                    self.onTcpReadable(fd);
+                } else if (self.tcpJobFromEvent(ev)) |job| {
+                    self.onTcpReadable(job);
                 }
             } else if (ev.filter == std.c.EVFILT.WRITE) {
                 // A refused connect also reports writable, so check
                 // SO_ERROR once before the socket is used; a connected
                 // socket arriving here resumes a WouldBlock flush.
-                const fd: posix.fd_t = @intCast(ev.ident);
-                for (self.jobs.items) |job| {
-                    if (job.tcp_fd == fd) {
-                        if (!job.tcp_connected) {
-                            posix.getsockoptError(fd) catch {
-                                self.dropJob(job, .failed);
-                                break;
-                            };
-                            job.tcp_connected = true;
-                        }
-                        self.tcpWrite(job) catch self.dropJob(job, .failed);
-                        break;
+                if (self.tcpJobFromEvent(ev)) |job| {
+                    if (!job.tcp_connected) {
+                        posix.getsockoptError(job.tcp_fd) catch {
+                            self.dropJob(job, .failed);
+                            continue;
+                        };
+                        job.tcp_connected = true;
                     }
+                    self.tcpWrite(job) catch self.dropJob(job, .failed);
                 }
             }
         }
@@ -713,6 +719,32 @@ pub const Resolver = struct {
         return job;
     }
 
+    /// TCP knote udata names the connection as well as the job:
+    /// (seq, gen, slot). Bit 0x40 stays clear; that bit marks the
+    /// chain timer in timer udata.
+    fn tcpUdata(job: *const Job) usize {
+        return (@as(usize, job.tcp_seq) << 32) | (@as(usize, job.gen) << 8) | job.slot;
+    }
+
+    /// Resolve a TCP socket event's (seq, gen, slot) udata back to the
+    /// job that armed it; null when the slot is dead or re-used, or
+    /// when the event names a connection already closed (close() then
+    /// socket() reuses fd numbers, so ident alone cannot tell the old
+    /// knote's event from the new connection's). The u16 cast in
+    /// jobFromUdata cannot carry the seq bits, so TCP events must
+    /// never go through it.
+    fn tcpJobFromEvent(self: *Resolver, ev: posix.Kevent) ?*Job {
+        const slot: usize = ev.udata & 0x3F;
+        const gen: u16 = @truncate(ev.udata >> 8);
+        const seq: u8 = @truncate(ev.udata >> 32);
+        if (slot >= MAX_JOBS) return null;
+        const job = self.slots[slot] orelse return null;
+        if (self.slot_gen[slot] != gen) return null;
+        if (job.tcp_fd != @as(posix.fd_t, @intCast(ev.ident))) return null;
+        if (job.tcp_seq != seq) return null;
+        return job;
+    }
+
     /// Connected-UDP send. An ICMP port-unreachable queued from an
     /// earlier datagram surfaces as ECONNREFUSED on a later send; that
     /// error belongs to the earlier packet, so it is consumed and the
@@ -811,12 +843,19 @@ pub const Resolver = struct {
         job.pending_qtype = qtype;
         job.tries = 1;
         if (job.use_tcp) {
-            // A connection surviving from an earlier query still holds
-            // that query's staged frame; reset it or the new query is
-            // never written and the chain stalls on this socket.
-            job.tcp_out.clearRetainingCapacity();
-            job.tcp_out_pos = 0;
-            try self.tcpSend(job);
+            if (job.tcp_out_pos < job.tcp_out.items.len) {
+                // A frame still mid-write cannot share the stream with
+                // a new one: re-open the connection so the new query
+                // stages on an empty tcp_out.
+                try self.tcpRestart(job);
+            } else {
+                // A connection surviving from an earlier query is
+                // reused; its fully flushed frame is cleared so the
+                // new query stages and is written.
+                job.tcp_out.clearRetainingCapacity();
+                job.tcp_out_pos = 0;
+                try self.tcpSend(job);
+            }
         } else {
             try self.sendUdp(pkt);
         }
@@ -825,17 +864,17 @@ pub const Resolver = struct {
 
     fn onDeadline(self: *Resolver, job: *Job) void {
         if (job.tries >= MAX_TRIES) {
-            // tries counts deadline firings: the initial send plus
-            // each re-armed deadline. On UDP a retry retransmits; on
-            // TCP it only retries connect/write progress and the
-            // staged frame is never resent once written.
+            // tries counts sends of the outstanding query on its
+            // current transport: on UDP a retry retransmits the
+            // datagram, on TCP a retry re-opens the connection and
+            // resends the frame.
             log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
             self.failQuery(job);
             return;
         }
         job.tries += 1;
         if (job.use_tcp) {
-            self.tcpSend(job) catch {
+            self.tcpRestart(job) catch {
                 self.dropJob(job, .failed);
                 return;
             };
@@ -930,25 +969,48 @@ pub const Resolver = struct {
 
     // -- TCP fallback ----------------------------------------------------
 
+    /// Drop the job's TCP connection and staged frame. close() retires
+    /// the socket's knotes at once; the resolver stages no deletes.
+    /// Events already harvested for the old fd are caught by the seq
+    /// check in tcpJobFromEvent.
+    fn tcpClose(self: *Resolver, job: *Job) void {
+        _ = self;
+        if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
+        job.tcp_fd = -1;
+        job.tcp_connected = false;
+        job.tcp_buf.clearRetainingCapacity();
+        job.tcp_out.clearRetainingCapacity();
+        job.tcp_out_pos = 0;
+    }
+
+    /// Re-open the TCP leg from scratch: a retry is a fresh connection
+    /// carrying the frame again, which covers a dead connection and a
+    /// frame stuck mid-write alike.
+    fn tcpRestart(self: *Resolver, job: *Job) !void {
+        self.tcpClose(job);
+        try self.tcpSend(job);
+    }
+
     /// Open the TCP socket and start connect; the WRITE knote drives the
     /// actual send once connect completes.
     fn tcpSend(self: *Resolver, job: *Job) !void {
         if (job.tcp_fd >= 0) return self.tcpWrite(job);
         const fd = try posix.socket(self.server.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
+        job.tcp_seq +%= 1;
         var ch: [2]posix.Kevent = undefined;
         var connected = true;
         posix.connect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
             error.WouldBlock => connected = false,
             else => return e,
         };
-        ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 };
+        ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
         var n: usize = 1;
         if (!connected) {
             // Only a pending connect wants the writable event; arming
             // it after an immediate connect would fire a second write
             // of the same frame later.
-            ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = 0 };
+            ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
             n = 2;
         }
         try self.keventApply(ch[0..n]);
@@ -966,7 +1028,7 @@ pub const Resolver = struct {
             .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
             .fflags = 0,
             .data = 0,
-            .udata = 0,
+            .udata = tcpUdata(job),
         }};
         try self.keventApply(&ch);
     }
@@ -1029,28 +1091,24 @@ pub const Resolver = struct {
         }
     }
 
-    fn onTcpReadable(self: *Resolver, fd: posix.fd_t) void {
-        for (self.jobs.items) |job| {
-            if (job.tcp_fd != fd) continue;
-            var buf: [8192]u8 = undefined;
-            const n = posix.recv(fd, &buf, 0) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => {
-                    self.dropJob(job, .failed);
-                    return;
-                },
-            };
-            if (n == 0) {
+    fn onTcpReadable(self: *Resolver, job: *Job) void {
+        var buf: [8192]u8 = undefined;
+        const n = posix.recv(job.tcp_fd, &buf, 0) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => {
                 self.dropJob(job, .failed);
                 return;
-            }
-            job.tcp_buf.appendSlice(self.alloc, buf[0..n]) catch {
-                self.dropJob(job, .failed);
-                return;
-            };
-            self.pumpTcpFrames(job);
+            },
+        };
+        if (n == 0) {
+            self.dropJob(job, .failed);
             return;
         }
+        job.tcp_buf.appendSlice(self.alloc, buf[0..n]) catch {
+            self.dropJob(job, .failed);
+            return;
+        };
+        self.pumpTcpFrames(job);
     }
 
     // -- responses --------------------------------------------------------
@@ -1765,7 +1823,7 @@ pub const Resolver = struct {
     fn freeJob(self: *Resolver, job: *Job) void {
         if (self.slots[job.slot] == job) self.slots[job.slot] = null;
         self.disarmDeadline(job);
-        if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
+        self.tcpClose(job);
         job.tcp_buf.deinit(self.alloc);
         job.tcp_out.deinit(self.alloc);
         self.alloc.free(job.name);
@@ -3731,6 +3789,8 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
 
     // A non-blocking connect to a closed port reports writable with
     // SO_ERROR set; the engine's EVFILT.WRITE path must drop the job.
+    // The knote carries the (seq, gen, slot) udata the resolver stamps
+    // on its own TCP registrations.
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     var ch = [1]posix.Kevent{.{
         .ident = @intCast(fd),
@@ -3738,7 +3798,7 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
         .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
         .fflags = 0,
         .data = 0,
-        .udata = 0,
+        .udata = Resolver.tcpUdata(job),
     }};
     _ = posix.kevent(r.kq, &ch, &.{}, null) catch {};
     posix.connect(fd, &r.server.any, r.server.getOsSockLen()) catch {};
@@ -4439,6 +4499,125 @@ test "dns-async: a kept-open TCP connection carries every chain query" {
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
     try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+}
+
+/// Accept one connection on a nonblocking listener, pumping the
+/// resolver between retries so a pending connect can complete; gives
+/// up after a bounded number of spins.
+fn acceptTcpBounded(r: *Resolver, lfd: posix.fd_t) !posix.fd_t {
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        r.step(10);
+        return posix.accept(lfd, null, null, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+    }
+    return error.AcceptTimeout;
+}
+
+test "dns-async: a TCP retry resends the query on a fresh connection" {
+    // Goal: a deadline on the TCP leg re-opens the connection and
+    // resends the query frame; a retry that only re-flushes tcp_out
+    // would send nothing once the first frame is fully written.
+    // Method: test-owned listener takes the real TC upgrade, holds
+    // the first connection unanswered, fires the retry deadline via
+    // onDeadline, and answers on the second connection.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+
+    // The truncated UDP answer upgrades the query to TCP; the first
+    // connection carries the request as its one frame.
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+
+    const cfd1 = try acceptTcpBounded(&r, lfd);
+    defer posix.close(cfd1);
+    const tv = posix.timeval{ .sec = 0, .usec = 200_000 };
+    try posix.setsockopt(cfd1, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd1, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd1, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    try std.testing.expectEqualSlices(u8, job.request, fbuf[0..got]);
+
+    // The first frame goes unanswered; the retry deadline re-opens
+    // the connection instead of waiting on the dead one.
+    r.onDeadline(job);
+
+    const cfd2 = try acceptTcpBounded(&r, lfd);
+    defer posix.close(cfd2);
+    try posix.setsockopt(cfd2, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
+    // The abandoned first connection reads EOF.
+    var eof = false;
+    spins = 0;
+    while (!eof and spins < 100) : (spins += 1) {
+        const n = posix.recv(cfd1, &hdr, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        eof = n == 0;
+    }
+    try std.testing.expect(eof);
+
+    // The second connection carries exactly one frame: the same
+    // request again, length-prefixed.
+    got = 0;
+    spins = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd2, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd2, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    try std.testing.expectEqualSlices(u8, job.request, fbuf[0..got]);
+    const extra = posix.recv(cfd2, fbuf[0..1], posix.MSG.DONTWAIT) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), extra);
+
+    // Answering on the second connection resolves the query.
+    var abuf: [1024]u8 = undefined;
+    const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+    var out_hdr: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+    _ = try posix.send(cfd2, &out_hdr, 0);
+    _ = try posix.send(cfd2, abuf[0..rlen], 0);
+    spins = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var raw = ctx.raw.?;
+    defer raw.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), raw.rrs.len);
+    try std.testing.expectEqual(KIND_A, raw.rrs[0].rtype);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 127, 0, 0, 1 }, raw.rrs[0].rdata);
 }
 
 test "dns-async: resolv.conf is read into the resolver, not on the loop" {
