@@ -181,11 +181,10 @@ const Job = struct {
     pending_qtype: u16 = 0,
     request: []u8 = &.{},
     /// Sends of the outstanding query on its current transport. UDP:
-    /// the first send plus one retransmit (MAX_TRIES deadlines at
-    /// TIMEOUT_MS each). A TC upgrade resets it to 0 and arms
-    /// TCP_TIMEOUT_MS, so the TCP leg is the first connection plus
-    /// MAX_TRIES retries, each retry a fresh connection carrying the
-    /// frame again (budget 4 s + 2 s + 2 s).
+    /// the first send plus retransmits, one per deadline at
+    /// TIMEOUT_MS. The TC upgrade to TCP resets it to 0 and arms
+    /// TCP_TIMEOUT_MS; a later chain query on the TCP leg starts at 1
+    /// under TIMEOUT_MS, so it retries once, not the full UDP budget.
     tries: u8 = 0,
     use_tcp: bool = false,
     tcp_fd: posix.fd_t = -1,
@@ -359,8 +358,11 @@ pub const Resolver = struct {
     /// callback with owned RRs. A cache hit or an unencodable name
     /// fires that callback inside query() before it returns.
     pub fn query(self: *Resolver, name: []const u8, rtype: RType, session_key: usize) !void {
+        // RFC 7622 3.2, same as resolve(): a trailing dot on a
+        // domainpart is absent, so an FQDN queries like the bare name.
+        const fqdn = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
         const qt: u16 = @intFromEnum(rtype);
-        if (self.cacheGet(name, qt)) |ent| {
+        if (self.cacheGet(fqdn, qt)) |ent| {
             switch (ent.neg) {
                 .nxdomain => self.qcb.fun(self.qcb.ctx, session_key, .nxdomain, null),
                 .nodata => self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = &.{}, .ttl = 0 }),
@@ -374,10 +376,10 @@ pub const Resolver = struct {
         }
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) {
-            try self.enqueueWait(session_key, name, .{ .kind = .query, .rtype = qt });
+            try self.enqueueWait(session_key, fqdn, .{ .kind = .query, .rtype = qt });
             return;
         }
-        const job = try self.allocJob(session_key, name);
+        const job = try self.allocJob(session_key, fqdn);
         job.phase = .raw;
         job.is_raw = true;
         {
@@ -386,7 +388,7 @@ pub const Resolver = struct {
         }
         // A cache hit inside sendQuery can complete and free the job
         // synchronously; after this call `job` may not be touched.
-        self.sendQuery(job, name, qt) catch |err| {
+        self.sendQuery(job, fqdn, qt) catch |err| {
             self.abortJob(job);
             return err;
         };
@@ -874,6 +876,9 @@ pub const Resolver = struct {
         job.pending_qtype = qtype;
         job.tries = 1;
         if (job.use_tcp) {
+            // A new query re-arms the close-after-answer resend
+            // budget whichever send arm it takes.
+            job.tcp_eof_resent = false;
             if (job.tcp_out_pos < job.tcp_out.items.len) {
                 // A frame still mid-write cannot share the stream with
                 // a new one: re-open the connection so the new query
@@ -886,11 +891,9 @@ pub const Resolver = struct {
             } else {
                 // A connection surviving from an earlier query is
                 // reused; its fully flushed frame is cleared so the
-                // new query stages and is written. A new query also
-                // re-arms the close-after-answer resend budget.
+                // new query stages and is written.
                 job.tcp_out.clearRetainingCapacity();
                 job.tcp_out_pos = 0;
-                job.tcp_eof_resent = false;
                 self.tcpSend(job) catch |err| {
                     if (err == error.PeerClosed) {
                         if (!self.tcpPeerClosed(job)) return;
@@ -1283,9 +1286,6 @@ pub const Resolver = struct {
             if (job.use_tcp) return;
             job.use_tcp = true;
             job.tries = 0;
-            // A fresh query entering TCP gets a fresh
-            // close-after-answer resend budget.
-            job.tcp_eof_resent = false;
             self.tcpSend(job) catch |err| {
                 if (err == error.PeerClosed) {
                     if (!self.tcpPeerClosed(job)) return;
@@ -4420,6 +4420,29 @@ test "dns-async: the bare name and its FQDN merge in either order" {
     while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
     try std.testing.expectEqual(@as(usize, 2), ctx.calls);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
+}
+
+test "dns-async: a raw query strips one trailing dot like resolve" {
+    // Goal: query() takes the same FQDN normalization as resolve();
+    // "host.test." must reach the wire as host.test, not fail on the
+    // empty label an unstripped name would encode.
+    // Method: one dotted A query against FakeDns; resolved not nxdomain.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test.", .a, 7);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.rrs.len);
 }
 
 test "dns-async: only one trailing dot is stripped" {
