@@ -1,4 +1,4 @@
-//! # JWT — JSON Web Token parser + RS256 signature verification
+//! # JWT -- JSON Web Token parser + RS256 signature verification
 //!
 //! Minimal JWT library for OIDC token validation. Supports:
 //! - JWT structure parsing (header.payload.signature)
@@ -47,6 +47,13 @@ pub const JwtClaims = struct {
     picture: []const u8,
 };
 
+/// Caller-owned decode memory for parse(). The returned Jwt borrows these
+/// buffers, so the DecodeBuffer must outlive every use of the parsed claims.
+pub const DecodeBuffer = struct {
+    header: [512]u8 = undefined,
+    payload: [4096]u8 = undefined,
+};
+
 /// A parsed (but not yet verified) JWT.
 pub const Jwt = struct {
     header_b64: []const u8,
@@ -60,9 +67,9 @@ pub const Jwt = struct {
 };
 
 /// Parse a JWT token string into its components.
-/// Does NOT verify the signature — call verifyRs256() after parsing.
-/// The returned Jwt borrows slices from the token string.
-pub fn parse(token: []const u8) JwtError!Jwt {
+/// Does NOT verify the signature -- call verifyRs256() after parsing.
+/// The returned Jwt borrows slices from `token` and `buf`; both must outlive it.
+pub fn parse(token: []const u8, buf: *DecodeBuffer) JwtError!Jwt {
     // Split on dots: header.payload.signature
     var dot1: ?usize = null;
     var dot2: ?usize = null;
@@ -86,16 +93,14 @@ pub fn parse(token: []const u8) JwtError!Jwt {
     const signature_b64 = token[d2 + 1 ..];
 
     // Decode header JSON
-    var header_buf: [512]u8 = undefined;
-    const header_len = b64urlDecode(header_b64, &header_buf) orelse return JwtError.InvalidBase64;
-    const header_json = header_buf[0..header_len];
+    const header_len = b64urlDecode(header_b64, &buf.header) orelse return JwtError.InvalidBase64;
+    const header_json = buf.header[0..header_len];
 
     const header = parseHeader(header_json) orelse return JwtError.InvalidJson;
 
     // Decode payload JSON
-    var payload_buf: [4096]u8 = undefined;
-    const payload_len = b64urlDecode(payload_b64, &payload_buf) orelse return JwtError.InvalidBase64;
-    const payload_json = payload_buf[0..payload_len];
+    const payload_len = b64urlDecode(payload_b64, &buf.payload) orelse return JwtError.InvalidBase64;
+    const payload_json = buf.payload[0..payload_len];
 
     const claims = parseClaims(payload_json) orelse return JwtError.InvalidJson;
 
@@ -117,8 +122,9 @@ pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
     const sig_len = b64urlDecode(jwt.signature_b64, &sig_buf) orelse return false;
     const signature = sig_buf[0..sig_len];
 
-    // Decode RSA modulus (n) and exponent (e)
-    var n_buf: [4096]u8 = undefined;
+    // Decode RSA modulus (n) and exponent (e). 1024 bytes of decoded
+    // modulus covers RSA keys up to 8192 bits.
+    var n_buf: [1024]u8 = undefined;
     const n_len = b64urlDecode(n_b64, &n_buf) orelse return false;
 
     var e_buf: [16]u8 = undefined;
@@ -191,7 +197,7 @@ pub fn verifyEdDSA(jwt_token: *const Jwt, x_b64: []const u8) bool {
     const md_ctx = c.EVP_MD_CTX_new() orelse return false;
     defer c.EVP_MD_CTX_free(md_ctx);
 
-    // Init with NULL md — Ed25519 doesn't use a separate hash
+    // Init with NULL md -- Ed25519 doesn't use a separate hash
     if (c.EVP_DigestVerifyInit(md_ctx, null, null, null, pkey) != 1) return false;
 
     // Ed25519 uses the one-shot EVP_DigestVerify (not Update+Final)
@@ -222,7 +228,7 @@ pub fn validateIssuer(claims: *const JwtClaims, expected: []const u8) JwtError!v
 
 /// Validate audience claim.
 pub fn validateAudience(claims: *const JwtClaims, expected: []const u8) JwtError!void {
-    if (claims.aud.len == 0) return; // No audience claim — skip validation
+    if (claims.aud.len == 0) return; // No audience claim -- skip validation
     if (!std.mem.eql(u8, claims.aud, expected)) {
         return JwtError.InvalidAudience;
     }
@@ -236,35 +242,15 @@ pub fn validateAudience(claims: *const JwtClaims, expected: []const u8) JwtError
 pub fn b64urlDecode(input: []const u8, output: []u8) ?usize {
     if (input.len == 0) return 0;
 
-    // Convert base64url alphabet to standard base64 with padding
-    var padded_buf: [8192]u8 = undefined;
-    const pad_count = (4 - input.len % 4) % 4;
-    const padded_len = input.len + pad_count;
-    if (padded_len > padded_buf.len) return null;
-
-    for (input, 0..) |ch, i| {
-        padded_buf[i] = switch (ch) {
-            '-' => '+',
-            '_' => '/',
-            else => ch,
-        };
-    }
-    for (input.len..padded_len) |i| {
-        padded_buf[i] = '=';
-    }
-
-    const padded = padded_buf[0..padded_len];
-
-    // Exact decoded size: (padded_len / 4) * 3 - padding bytes
-    const exact_len = (padded_len / 4) * 3 - pad_count;
-    if (exact_len > output.len) return null;
-
-    std.base64.standard.Decoder.decode(output[0..exact_len], padded) catch return null;
-    return exact_len;
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(input) catch return null;
+    if (decoded_len > output.len) return null;
+    decoder.decode(output[0..decoded_len], input) catch return null;
+    return decoded_len;
 }
 
 // ============================================================================
-// JSON claim extraction (minimal — no full JSON parser)
+// JSON claim extraction (minimal -- no full JSON parser)
 // ============================================================================
 
 fn parseHeader(json: []const u8) ?JwtHeader {
@@ -286,7 +272,7 @@ fn parseClaims(json: []const u8) ?JwtClaims {
     };
 }
 
-/// Extract a string value from a JSON object by key. Minimal — handles "key":"value" patterns.
+/// Extract a string value from a JSON object by key. Minimal -- handles "key":"value" patterns.
 fn extractStringField(json: []const u8, key: []const u8) ?[]const u8 {
     const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
     const after_key = json[key_pos + key.len ..];
@@ -338,9 +324,6 @@ test "b64urlDecode: basic" {
 
 test "b64urlDecode: with url-safe chars" {
     var buf: [256]u8 = undefined;
-    // base64url uses - and _ instead of + and /
-    // "test?>" in standard base64 is "dGVzdD4+" → base64url is "dGVzdD4-"
-    // But let's just verify a known value with url-safe chars
     // "\xfb\xff\xfe" → standard b64 = "+//+" → base64url = "-__-"
     const len = b64urlDecode("-__-", &buf);
     try std.testing.expect(len != null);
@@ -351,15 +334,16 @@ test "b64urlDecode: with url-safe chars" {
 }
 
 test "parse: JWT structure" {
-    // A minimal test JWT (header.payload.signature — signature won't verify without key)
+    // A minimal test JWT (header.payload.signature -- signature won't verify without key)
     const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0"; // {"alg":"RS256","kid":"test-key"}
     const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
-    const sig = "dGVzdA"; // "test" — won't verify but parses
+    const sig = "dGVzdA"; // "test" -- won't verify but parses
 
     var token_buf: [1024]u8 = undefined;
     const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
 
-    const jwt = try parse(token);
+    var decode: DecodeBuffer = undefined;
+    const jwt = try parse(token, &decode);
     try std.testing.expectEqualStrings("RS256", jwt.header.alg);
     try std.testing.expectEqualStrings("test-key", jwt.header.kid);
     try std.testing.expectEqualStrings("alice", jwt.claims.sub);
@@ -369,9 +353,39 @@ test "parse: JWT structure" {
     try std.testing.expectEqualStrings("alice", jwt.claims.preferred_username);
 }
 
+/// Overwrite an 8 KiB stack frame so any claim slice that borrowed a dead
+/// parse()-local buffer reads back 'Z' instead of the original claim bytes.
+/// noinline so the frame cannot be folded into the caller's.
+noinline fn smashStack() void {
+    var buf: [8192]u8 = undefined;
+    @memset(&buf, 'Z');
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+test "parse: claims stay valid after the call returns" {
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
+    const sig = "dGVzdA";
+
+    var token_buf: [1024]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+
+    // The caller owns the decode memory; clobbering the stack afterwards
+    // must not touch it.
+    var decode: DecodeBuffer = undefined;
+    const jwt = try parse(token, &decode);
+
+    smashStack();
+
+    try std.testing.expectEqualStrings("alice", jwt.claims.sub);
+    try std.testing.expectEqualStrings("https://auth.example.com", jwt.claims.iss);
+    try std.testing.expectEqualStrings("alice", jwt.claims.preferred_username);
+}
+
 test "parse: invalid format" {
-    try std.testing.expectError(JwtError.InvalidFormat, parse("no-dots"));
-    try std.testing.expectError(JwtError.InvalidFormat, parse("one.dot"));
+    var decode: DecodeBuffer = undefined;
+    try std.testing.expectError(JwtError.InvalidFormat, parse("no-dots", &decode));
+    try std.testing.expectError(JwtError.InvalidFormat, parse("one.dot", &decode));
 }
 
 test "validateExpiry: not expired" {
