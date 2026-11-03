@@ -15,6 +15,7 @@ comptime {
 
 pub const Token = @import("token.zig").Token;
 pub const SlotMap = @import("slotmap.zig").SlotMap;
+pub const kevent = @import("kevent.zig");
 
 test {
     std.testing.refAllDecls(@This());
