@@ -1714,6 +1714,18 @@ pub fn build(b: *std.Build) void {
     });
 
     const ctl_op_backend_mod = createBackendMod(b, op_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_archive_backend_mod = if (std.mem.eql(u8, archive_storage, op_storage))
+        ctl_op_backend_mod
+    else
+        createBackendMod(b, archive_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_migrate_precis_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_migrate_precis_mod.addImport("backend", ctl_backend_mod);
+    ctl_migrate_precis_mod.addImport("precis_username", precis_username_mod);
 
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -1748,6 +1760,8 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
     ctl_mod.addImport("precis_username", precis_username_mod);
     ctl_mod.addImport("backend", ctl_backend_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
@@ -1770,6 +1784,8 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_test_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_test_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
     ctl_test_mod.addImport("precis_username", precis_username_mod);
     ctl_test_mod.addImport("backend", ctl_backend_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
@@ -1781,6 +1797,20 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
+
+    const migrate_precis_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_precis_test_mod.addImport("backend", backend_test_mod);
+    migrate_precis_test_mod.addImport("precis_username", precis_username_mod);
+    const migrate_precis_tests = b.addTest(.{
+        .name = "migrate-precis-tests",
+        .root_module = migrate_precis_test_mod,
+    });
+    const run_migrate_precis_tests = b.addRunArtifact(migrate_precis_tests);
 
     // T87: archive write queue tests. A separate module on the same root
     // file carries the store/backend imports; archive_queue_mod itself
@@ -1871,6 +1901,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_oidc_main_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
+    test_step.dependOn(&run_migrate_precis_tests.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

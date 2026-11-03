@@ -19,6 +19,8 @@ pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
 const OpBackendType = @import("op_backend").Backend;
+const ArchiveBackendType = @import("archive_backend").Backend;
+const migrate_precis = @import("migrate_precis");
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
 const lock_store_mod = @import("lock_store");
@@ -43,6 +45,13 @@ pub fn main() !void {
     var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
     var cli_password: ?[]const u8 = null;
     var password_file: ?[]const u8 = null;
+    var apply = false;
+    var raw = false;
+    var run_dir: []const u8 = "/var/run/xmppd";
+    var rename_old: ?[]const u8 = null;
+    var rename_new: ?[]const u8 = null;
+    var hosted_domains: std.ArrayListUnmanaged([]const u8) = .{};
+    defer hosted_domains.deinit(allocator);
 
     _ = args.next(); // Skip argv[0]
 
@@ -71,6 +80,30 @@ pub fn main() !void {
                 printErr("--password-file requires a value\n");
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--apply")) {
+            apply = true;
+        } else if (std.mem.eql(u8, arg, "--raw")) {
+            raw = true;
+        } else if (std.mem.eql(u8, arg, "--run-dir")) {
+            run_dir = args.next() orelse {
+                printErr("--run-dir requires a value\n");
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--hosted-domain")) {
+            const domain = args.next() orelse {
+                printErr("--hosted-domain requires a value\n");
+                return error.InvalidArgs;
+            };
+            try hosted_domains.append(allocator, domain);
+        } else if (std.mem.eql(u8, arg, "--rename")) {
+            rename_old = args.next() orelse {
+                printErr("--rename requires an old and a new localpart\n");
+                return error.InvalidArgs;
+            };
+            rename_new = args.next() orelse {
+                printErr("--rename requires an old and a new localpart\n");
+                return error.InvalidArgs;
+            };
         } else {
             try remaining_args.append(allocator, arg);
         }
@@ -83,9 +116,21 @@ pub fn main() !void {
 
     const command = remaining_args.items[0];
 
+    if (std.mem.eql(u8, command, "migrate-precis")) {
+        const forced: ?migrate_precis.ForcedRename = if (rename_old != null and rename_new != null)
+            .{ .old_localpart = rename_old.?, .new_localpart = rename_new.? }
+        else
+            null;
+        if ((rename_old == null) != (rename_new == null)) {
+            printErr("--rename requires an old and a new localpart\n");
+            return error.InvalidArgs;
+        }
+        return runMigratePrecis(allocator, db_path, run_dir, apply, hosted_domains.items, forced);
+    }
+
     // Try IPC to running auth daemon first for adduser/deluser/passwd.
     // This is required for RocksDB (exclusive lock) and preferred for all backends.
-    if (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd")) {
+    if (!raw and (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd"))) {
         if (tryIpcCommand(command, remaining_args.items, auth_socket, cli_password, password_file)) {
             return; // IPC succeeded
         }
@@ -175,16 +220,23 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
         const jid = remaining_args.items[1];
-        const username = extractLocal(jid);
+        const username = if (raw) jid else extractLocal(jid);
 
-        removeUserCanonical(&store, allocator, username) catch |err| {
-            switch (err) {
-                error.InvalidAccountName => printErr("invalid account name\n"),
-                error.UserNotFound => printErr("user not found\n"),
-                else => return err,
-            }
-            return err;
-        };
+        if (raw) {
+            removeUserRaw(&store, allocator, username) catch |err| {
+                if (err == error.UserNotFound) printErr("user not found\n");
+                return err;
+            };
+        } else {
+            removeUserCanonical(&store, allocator, username) catch |err| {
+                switch (err) {
+                    error.InvalidAccountName => printErr("invalid account name\n"),
+                    error.UserNotFound => printErr("user not found\n"),
+                    else => return err,
+                }
+                return err;
+            };
+        }
         printOut("User ");
         printOut(jid);
         printOut(" removed.\n");
@@ -382,6 +434,99 @@ fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []cons
     var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
     const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
     try store.removeUser(allocator, canon);
+}
+
+fn runMigratePrecis(
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    run_dir: []const u8,
+    apply: bool,
+    hosted_domains: []const []const u8,
+    forced: ?migrate_precis.ForcedRename,
+) !void {
+    if (hosted_domains.len == 0) {
+        printErr("migrate-precis requires at least one --hosted-domain\n");
+        return error.InvalidArgs;
+    }
+    // The master and its children are detected through their pid files. A dry
+    // run is offline too: it must observe a quiescent, complete keyspace.
+    migrate_precis.assertOffline(run_dir) catch |err| {
+        printErr("xmppd is running; stop all daemons before migrate-precis\n");
+        return err;
+    };
+
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = try std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path});
+    var op_path_buf: [1024]u8 = undefined;
+    const op_path = try std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db_path});
+    var archive_path_buf: [1024]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
+
+    var auth = try OpBackendType.open(auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    defer auth.close();
+    var op = try OpBackendType.open(op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    defer op.close();
+    var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
+    defer archive.close();
+
+    var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
+    defer plan.deinit();
+    try printMigrationPlan(allocator, &plan);
+    if (plan.issues.items.len != 0) {
+        printErr("migration blocked; resolve every collision or invalid name and rerun\n");
+        return error.MigrationBlocked;
+    }
+    if (!apply) {
+        printOut("dry run: no changes applied (use --apply to migrate)\n");
+        return;
+    }
+
+    try migrate_precis.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = db_path });
+    var count_buf: [96]u8 = undefined;
+    const line = try std.fmt.bufPrint(&count_buf, "applied {d} renames\n", .{plan.renames.items.len});
+    printOut(line);
+}
+
+fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.Plan) !void {
+    for (plan.renames.items) |rename| {
+        const old_hex = try migrate_precis.hexKey(allocator, rename.old_key);
+        defer allocator.free(old_hex);
+        const new_hex = try migrate_precis.hexKey(allocator, rename.new_key);
+        defer allocator.free(new_hex);
+        printOut("rename ");
+        printOut(@tagName(rename.db));
+        printOut(" ");
+        printOut(rename.namespace);
+        printOut(" ");
+        printOut(old_hex);
+        printOut(" -> ");
+        printOut(new_hex);
+        printOut("\n");
+    }
+    for (plan.issues.items) |issue| {
+        const key_hex = try migrate_precis.hexKey(allocator, issue.key);
+        defer allocator.free(key_hex);
+        const target_hex = try migrate_precis.hexKey(allocator, issue.target);
+        defer allocator.free(target_hex);
+        printErr(@tagName(issue.kind));
+        printErr(" ");
+        printErr(@tagName(issue.db));
+        printErr(" ");
+        printErr(issue.namespace);
+        printErr(" ");
+        printErr(key_hex);
+        if (issue.target.len != 0) {
+            printErr(" -> ");
+            printErr(target_hex);
+        }
+        printErr("\n");
+    }
+}
+
+/// Delete one exact stored users key without preparation. This is the
+/// collision-resolution escape hatch for migrate-precis, not normal deletion.
+fn removeUserRaw(store: anytype, allocator: std.mem.Allocator, stored_key: []const u8) !void {
+    try store.removeUser(allocator, stored_key);
 }
 
 fn extractLocal(jid: []const u8) []const u8 {
@@ -628,11 +773,14 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  adduser JID     Create a user account
-        \\  deluser JID     Remove a user account
+        \\  deluser JID     Remove a user account (--raw deletes the exact stored key)
         \\  passwd  JID     Change a user's password
         \\  listusers       List all users
         \\  lock JID        Permanently lock an account
         \\  unlock JID      Unlock a locked account
+        \\  migrate-precis  Plan RFC 7622 key renames (dry run unless --apply)
+        \\                  Requires --hosted-domain DOMAIN (repeatable)
+        \\                  --rename OLD NEW explicitly renames one stored localpart
         \\  invite create   Create invitation code [--max-uses N] [--expires HOURS]
         \\  invite list     List all invitation codes
         \\  invite revoke   Revoke an invitation code
@@ -642,6 +790,11 @@ fn printUsage() void {
         \\  --auth-socket PATH  Auth daemon IPC socket (default: /var/run/xmppd/auth.sock)
         \\  --password PASS     Provide password on command line (non-interactive)
         \\  --password-file F   Read password from file (first line, trailing newline stripped)
+        \\  --apply             Apply migrate-precis renames (default is a dry run)
+        \\  --raw               deluser: delete the exact stored users key
+        \\  --run-dir PATH      Daemon pid-file directory (default: /var/run/xmppd)
+        \\  --hosted-domain D   Hosted account domain; repeat for each domain
+        \\  --rename OLD NEW    migrate-precis: explicitly rename one localpart
         \\
     );
 }
@@ -690,6 +843,19 @@ test "password change and deletion resolve the RFC 7622 account name" {
     try std.testing.expectError(error.InvalidAccountName, changePasswordCanonical(&store, allocator, "bad name", "pw"));
     try std.testing.expectError(error.InvalidAccountName, removeUserCanonical(&store, allocator, "bad name"));
     try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
+}
+
+test "removeUserRaw deletes the exact stored key for collision resolution" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
+
+    try store.addUser(allocator, "NaplesTB", "pw-a");
+    try addUserCanonical(&store, allocator, "naplestb", "pw-b");
+    try removeUserRaw(&store, allocator, "NaplesTB");
+    try std.testing.expect((try store.lookup(allocator, "NaplesTB")) == null);
+    try std.testing.expect((try store.lookup(allocator, "naplestb")) != null);
 }
 
 test "addUserCanonical: invalid names refused; conflicts are on the canonical name" {
