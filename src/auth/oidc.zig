@@ -162,10 +162,12 @@ pub fn bearerToken(payload: []const u8) ?[]const u8 {
 }
 
 /// Per-request knobs every HTTP call in one exchange shares: the same
-/// absolute deadline, connect budget and cancellation pipe.
+/// absolute deadline, connect budget and cancellation pipe. `deadline_ns`
+/// is stamped when the job is queued, not when a worker picks it up, so
+/// queue time counts against the exchange budget.
 pub const ExchangeOptions = struct {
     connect_timeout_ms: u32,
-    timeout_ms: u32,
+    deadline_ns: u64,
     cancel_fd: posix.fd_t = -1,
 };
 
@@ -259,11 +261,11 @@ fn httpVerdict(err: http.HttpError) Verdict {
     };
 }
 
-/// http.RequestOptions from one exchange start: every call in the exchange
-/// shares the absolute deadline.
-fn requestOptions(options: ExchangeOptions, start_ns: u64) http.RequestOptions {
+/// http.RequestOptions for one HTTP call: every call in the exchange
+/// shares the absolute deadline stamped at queue time.
+fn requestOptions(options: ExchangeOptions) http.RequestOptions {
     return .{
-        .deadline_ns = start_ns + @as(u64, options.timeout_ms) * std.time.ns_per_ms,
+        .deadline_ns = options.deadline_ns,
         .connect_timeout_ms = options.connect_timeout_ms,
         .cancel_fd = options.cancel_fd,
     };
@@ -370,16 +372,15 @@ pub const OidcStore = struct {
     /// Run one credential against the IdP and classify the outcome. Called
     /// on IdpPool workers only; writes `out` on .verified.
     pub fn exchange(self: *OidcStore, allocator: Allocator, cred: Credential, options: ExchangeOptions, out: *Identity) Verdict {
-        const start_ns = http.monotonicNs();
         return switch (cred) {
-            .password => |p| self.exchangePassword(allocator, p.username, p.password, options, start_ns, out),
-            .token => |t| self.exchangeToken(allocator, t, options, start_ns, out),
+            .password => |p| self.exchangePassword(allocator, p.username, p.password, options, out),
+            .token => |t| self.exchangeToken(allocator, t, options, out),
         };
     }
 
     /// ROPC grant: POST the password to the token endpoint and classify the
     /// response.
-    fn exchangePassword(self: *OidcStore, allocator: Allocator, username: []const u8, password: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
+    fn exchangePassword(self: *OidcStore, allocator: Allocator, username: []const u8, password: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
         const body = self.buildRopcBody(allocator, username, password) orelse {
             log.warn("ROPC: could not build the token request body", .{});
             return .unavailable;
@@ -389,7 +390,7 @@ pub const OidcStore = struct {
             allocator.free(body.buf);
         }
 
-        var response = self.httpClient().post(allocator, self.config.token_endpoint, body.slice(), requestOptions(options, start_ns)) catch |err| {
+        var response = self.httpClient().post(allocator, self.config.token_endpoint, body.slice(), requestOptions(options)) catch |err| {
             log.warn("ROPC: token endpoint request failed: {s}", .{@errorName(err)});
             return httpVerdict(err);
         };
@@ -400,7 +401,7 @@ pub const OidcStore = struct {
             return classifyTokenError(response.status, response.body);
         }
 
-        return self.identityFromTokenResponse(allocator, response.body, options, start_ns, out);
+        return self.identityFromTokenResponse(allocator, response.body, options, out);
     }
 
     const RopcBody = struct {
@@ -454,10 +455,10 @@ pub const OidcStore = struct {
 
     /// OAUTHBEARER path: JWT validation first, introspection for opaque
     /// tokens.
-    fn exchangeToken(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
-        return switch (self.checkJwt(token, options, start_ns, out)) {
+    fn exchangeToken(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
+        return switch (self.checkJwt(token, options, out)) {
             .verified => .verified,
-            .malformed => self.introspect(allocator, token, options, start_ns, out),
+            .malformed => self.introspect(allocator, token, options, out),
             .invalid => .rejected,
             .unavailable => .unavailable,
             .timed_out => .timed_out,
@@ -466,7 +467,7 @@ pub const OidcStore = struct {
 
     /// Full JWT validation against the JWKS cache: parse, exp, iss, aud,
     /// signature, then the claim identity and picture claim.
-    fn checkJwt(self: *OidcStore, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) JwtCheck {
+    fn checkJwt(self: *OidcStore, token: []const u8, options: ExchangeOptions, out: *Identity) JwtCheck {
         const parsed = jwt.parse(token, &jwt_decode_buf) catch return .malformed;
 
         jwt.validateExpiry(&parsed.claims) catch {
@@ -482,7 +483,7 @@ pub const OidcStore = struct {
             return .invalid;
         };
 
-        const key = switch (self.signingKey(parsed.header.kid, options, start_ns)) {
+        const key = switch (self.signingKey(parsed.header.kid, options)) {
             .key => |k| k,
             .absent => {
                 log.info("JWT: no matching key for kid='{s}'", .{parsed.header.kid});
@@ -524,10 +525,10 @@ pub const OidcStore = struct {
     /// access_token via introspection when an endpoint is configured. The
     /// IdP accepted the password at this point, so a token that then fails
     /// validation is an IdP fault, not a bad credential: .unavailable.
-    fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
+    fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
         if (extractNamedField(body, "\"id_token\"")) |id_token| {
             if (id_token.len > 0) {
-                return switch (self.checkJwt(id_token, options, start_ns, out)) {
+                return switch (self.checkJwt(id_token, options, out)) {
                     .verified => .verified,
                     .invalid => blk: {
                         log.warn("OIDC: IdP accepted the password but its id_token failed validation", .{});
@@ -544,7 +545,7 @@ pub const OidcStore = struct {
         }
         if (extractNamedField(body, "\"access_token\"")) |access_token| {
             if (access_token.len > 0 and self.config.introspection_endpoint != null) {
-                return self.introspect(allocator, access_token, options, start_ns, out);
+                return self.introspect(allocator, access_token, options, out);
             }
         }
         log.warn("OIDC: IdP accepted the password but returned no usable id_token or access_token", .{});
@@ -552,7 +553,7 @@ pub const OidcStore = struct {
     }
 
     /// Validate a token via the introspection endpoint (RFC 7662).
-    fn introspect(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, start_ns: u64, out: *Identity) Verdict {
+    fn introspect(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
         const endpoint = self.config.introspection_endpoint orelse {
             log.info("OIDC: no introspection endpoint configured", .{});
             return .rejected;
@@ -572,7 +573,7 @@ pub const OidcStore = struct {
         w.writeAll("&client_secret=") catch return .unavailable;
         percentEncode(&w, self.config.client_secret) catch return .unavailable;
 
-        var response = self.httpClient().post(allocator, endpoint, w.buffered(), requestOptions(options, start_ns)) catch |err| {
+        var response = self.httpClient().post(allocator, endpoint, w.buffered(), requestOptions(options)) catch |err| {
             log.warn("introspection: HTTP request failed: {s}", .{@errorName(err)});
             return httpVerdict(err);
         };
@@ -722,14 +723,14 @@ pub const OidcStore = struct {
     /// Signing key for `kid` as a worker-local copy: stale caches refresh
     /// once (a refresh failure still serves cached keys), a kid miss on a
     /// fresh cache refreshes once more for a possible rotation.
-    fn signingKey(self: *OidcStore, kid: []const u8, options: ExchangeOptions, start_ns: u64) KeyFetch {
+    fn signingKey(self: *OidcStore, kid: []const u8, options: ExchangeOptions) KeyFetch {
         self.jwks_mutex.lock();
         defer self.jwks_mutex.unlock();
 
         const now = std.time.timestamp();
         const cache_stale = (now - self.jwks_last_refresh) > JWKS_MAX_AGE_SECONDS;
         if (cache_stale) {
-            self.refreshJwksLocked(options, start_ns) catch |err| {
+            self.refreshJwksLocked(options) catch |err| {
                 log.warn("JWKS stale refresh failed: {s}; serving cached keys", .{@errorName(err)});
             };
         }
@@ -741,7 +742,7 @@ pub const OidcStore = struct {
         }
 
         // Kid miss on a fresh cache: the IdP may have rotated keys.
-        self.refreshJwksLocked(options, start_ns) catch |err| {
+        self.refreshJwksLocked(options) catch |err| {
             return .{ .failed = switch (err) {
                 error.Timeout => .timed_out,
                 error.FetchFailed, error.OutOfMemory => .unavailable,
@@ -779,10 +780,10 @@ pub const OidcStore = struct {
     /// Fetch JWKS from the IdP and replace the key cache. Caller holds
     /// jwks_mutex; the HTTP GET is serialized with every other refresh and
     /// bounded by the request deadline.
-    fn refreshJwksLocked(self: *OidcStore, options: ExchangeOptions, start_ns: u64) JwksError!void {
+    fn refreshJwksLocked(self: *OidcStore, options: ExchangeOptions) JwksError!void {
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
-        var response = self.httpClient().get(self.allocator, self.config.jwks_uri, requestOptions(options, start_ns)) catch |err| {
+        var response = self.httpClient().get(self.allocator, self.config.jwks_uri, requestOptions(options)) catch |err| {
             log.warn("JWKS fetch failed: {s}", .{@errorName(err)});
             return switch (httpVerdict(err)) {
                 .timed_out => JwksError.Timeout,
@@ -893,6 +894,9 @@ pub const IdpJob = struct {
     secret: []u8,
     kind: IdpJobKind,
     username_len: usize,
+    /// Absolute CLOCK_MONOTONIC deadline stamped at put(): queue time
+    /// counts against the exchange budget.
+    deadline_ns: u64,
     answer: Answer,
 };
 
@@ -939,6 +943,10 @@ pub const IdpPool = struct {
 
     stopping: bool = false,
     next_job_id: u64 = 1,
+
+    /// Exchanges a worker actually ran; observability for tests and
+    /// metrics. Written by workers, read by anyone.
+    exchanges_run: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Wake pipe: worker writes one byte per completion; the loop reads.
     wake_rd: posix.fd_t = -1,
@@ -1047,6 +1055,7 @@ pub const IdpPool = struct {
             .secret = secret,
             .kind = kind,
             .username_len = username_len,
+            .deadline_ns = http.monotonicNs() + @as(u64, self.options.timeout_ms) * std.time.ns_per_ms,
             .answer = .{
                 .verdict = .unavailable,
                 .input_digest = credentialDigest(cred),
@@ -1173,7 +1182,7 @@ pub const IdpPool = struct {
 
     fn workerMain(self: *IdpPool) void {
         while (true) {
-            const job = blk: {
+            const entry = blk: {
                 self.job_mutex.lock();
                 defer self.job_mutex.unlock();
                 while (self.jobs_count == 0 and !self.stopping) {
@@ -1183,16 +1192,29 @@ pub const IdpPool = struct {
                 const j = self.jobs[self.jobs_head];
                 self.jobs_head = (self.jobs_head + 1) % self.jobs.len;
                 self.jobs_count -= 1;
-                break :blk j;
+                break :blk .{ .job = j, .stopping = self.stopping };
             } orelse return;
 
-            var owned_job = job;
+            var owned_job = entry.job;
+            if (entry.stopping) {
+                // Shutdown: queued exchanges are cancelled, never run
+                // (no blocking DNS on the way out).
+                releaseJob(&owned_job);
+                continue;
+            }
             var identity: Identity = .{};
-            owned_job.answer.verdict = self.store.exchange(std.heap.c_allocator, jobCredential(&owned_job), .{
-                .connect_timeout_ms = self.options.connect_timeout_ms,
-                .timeout_ms = self.options.timeout_ms,
-                .cancel_fd = self.cancel_rd,
-            }, &identity);
+            if (http.monotonicNs() >= owned_job.deadline_ns) {
+                // The queue time already ate the whole budget: complete
+                // as timed_out without contacting the IdP.
+                owned_job.answer.verdict = .timed_out;
+            } else {
+                _ = self.exchanges_run.fetchAdd(1, .monotonic);
+                owned_job.answer.verdict = self.store.exchange(std.heap.c_allocator, jobCredential(&owned_job), .{
+                    .connect_timeout_ms = self.options.connect_timeout_ms,
+                    .deadline_ns = owned_job.deadline_ns,
+                    .cancel_fd = self.cancel_rd,
+                }, &identity);
+            }
             owned_job.answer.identity = identity;
             self.finish(owned_job);
         }
@@ -1310,7 +1332,7 @@ fn testStore(allocator: Allocator, extra: struct {
 fn testOptions(timeout_ms: u32) ExchangeOptions {
     return .{
         .connect_timeout_ms = @min(timeout_ms, 3000),
-        .timeout_ms = timeout_ms,
+        .deadline_ns = http.monotonicNs() + @as(u64, timeout_ms) * std.time.ns_per_ms,
     };
 }
 
@@ -1809,5 +1831,130 @@ test "IdpPool: stop with jobs in flight cancels them" {
     pool.stop();
     const elapsed_ms = (http.monotonicNs() - t0) / std.time.ns_per_ms;
     try std.testing.expect(elapsed_ms < 1000);
+    try std.testing.expectEqual(@as(usize, 0), pool.outstanding());
+}
+
+/// A loopback listener that counts accepted connections and never answers,
+/// so a test can prove how many exchanges actually reached the IdP.
+fn serveHangingCounting(port_out: *std.atomic.Value(u16), accepted: *std.atomic.Value(usize)) void {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 8) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    var held: [32]posix.fd_t = undefined;
+    var held_len: usize = 0;
+    defer for (held[0..held_len]) |conn_fd| posix.close(conn_fd);
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 250) catch 0;
+        if (pn <= 0) continue;
+        if (held_len >= held.len) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        held[held_len] = conn_fd;
+        held_len += 1;
+        _ = accepted.fetchAdd(1, .monotonic);
+    }
+}
+
+test "IdpPool: queue time counts against the exchange deadline" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    var accepted = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(.{}, serveHangingCounting, .{ &port, &accepted });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    var store = try hangingStore(allocator, port.load(.acquire), &url_buf);
+    defer store.deinit();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 300,
+        .timeout_ms = 300,
+    });
+    defer pool.stop();
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+    const t0 = http.monotonicNs();
+    _ = try pool.put(cred);
+    _ = try pool.put(cred);
+    _ = try pool.put(cred);
+
+    // All three deadlines were stamped at put(): the queued jobs time out
+    // with the first, they do not each burn a fresh budget at pickup, and
+    // an expired queued job never dials the IdP.
+    var done: usize = 0;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (done < 3 and std.time.milliTimestamp() < deadline) {
+        if (pool.popCompletion()) |job_in| {
+            var job = job_in;
+            defer IdpPool.releaseJob(&job);
+            try std.testing.expectEqual(Verdict.timed_out, job.answer.verdict);
+            done += 1;
+        } else {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    const elapsed_ms = (http.monotonicNs() - t0) / std.time.ns_per_ms;
+    try std.testing.expectEqual(@as(usize, 3), done);
+    try std.testing.expect(elapsed_ms < 700);
+    try std.testing.expectEqual(@as(usize, 1), accepted.load(.monotonic));
+}
+
+test "IdpPool: stop never runs the queued exchanges" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    var accepted = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(.{}, serveHangingCounting, .{ &port, &accepted });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    var store = try hangingStore(allocator, port.load(.acquire), &url_buf);
+    defer store.deinit();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 3000,
+        .timeout_ms = 10000,
+    });
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+    _ = try pool.put(cred);
+    // Let the single worker pick up job 1 so the rest stay queued.
+    var spins: usize = 0;
+    while (accepted.load(.monotonic) == 0 and spins < 200) : (spins += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    _ = try pool.put(cred);
+    _ = try pool.put(cred);
+
+    const t0 = http.monotonicNs();
+    pool.stop();
+    const elapsed_ms = (http.monotonicNs() - t0) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms < 1000);
+
+    // Only the exchange already running ran; the two queued jobs were
+    // cancelled before any DNS or connect.
+    try std.testing.expectEqual(@as(usize, 1), pool.exchanges_run.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), pool.outstanding());
 }
