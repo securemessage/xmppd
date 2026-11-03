@@ -5185,6 +5185,50 @@ test "dns-async: an over-long per-target TLSA owner is absent" {
     try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
 }
 
+test "dns-async: an over-long SRV target is skipped for the good one" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // 282 octets cannot be staged into sendAddr's 280-byte qname
+    // buffer: both family sends take the NXDOMAIN arm, the dead
+    // target yields no address, and the chain moves on to the next
+    // SRV target, which resolves normally.
+    const long_host = "x" ** 63 ++ "." ++ "y" ** 63 ++ "." ++ "z" ** 63 ++ "." ++ "w" ** 63 ++ "." ++ "v" ** 30;
+    try std.testing.expect(long_host.len > 280);
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var bad_rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer bad_rdata.deinit(std.testing.allocator);
+    var good_rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer good_rdata.deinit(std.testing.allocator);
+    // RFC 2782 sorts the lower priority first, so the dead target is
+    // the one tried before srv.test.
+    try bad_rdata.appendSlice(std.testing.allocator, &.{ 0, 5, 0, 100, 0x14, 0x76 });
+    appendEncodedName(std.testing.allocator, &bad_rdata, long_host);
+    try good_rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x3B, 0x76 });
+    appendEncodedName(std.testing.allocator, &good_rdata, "srv.test");
+    var srv_rrs = [2]wire.Rr{
+        .{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = bad_rdata.items },
+        .{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = good_rdata.items },
+    };
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+    var a_rrs = [1]wire.Rr{.{ .name = "srv.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cacheInsert("srv.test", KIND_A, &a_rrs, .none, 60);
+    r.cacheInsert("srv.test", KIND_AAAA, &.{}, .nxdomain, 60);
+
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    try r.resolve("svc.test", .client, 5222, 3, false);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[0].addr.any.family);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
 test "dns-async: names over 255 wire octets behave as NXDOMAIN" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
