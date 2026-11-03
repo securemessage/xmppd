@@ -1844,6 +1844,8 @@ pub fn build(b: *std.Build) void {
     // --- Test step ---
 
     const test_step = b.step("test", "Run all library tests");
+    // A green test suite must also prove every install artifact compiles.
+    test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
