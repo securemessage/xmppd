@@ -289,6 +289,9 @@ pub const Resolver = struct {
     /// Test seam: report every knote registration as failed (see
     /// keventApplyChecked); covers the ensureOpen failure ordering.
     fail_kevents: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// kevent() errors seen inside step(); the first is logged so a
+    /// dead kqueue cannot fail silently while the caller's loop spins.
+    kevent_errors: usize = 0,
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -594,7 +597,11 @@ pub const Resolver = struct {
         if (self.kq < 0) return;
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
-        const n = rawKevent(self.kq, &.{}, &events, &ts) catch return;
+        const n = rawKevent(self.kq, &.{}, &events, &ts) catch |err| {
+            self.kevent_errors += 1;
+            if (self.kevent_errors == 1) log.err("dns: kevent failed in step: {}", .{err});
+            return;
+        };
         self.dispatchEvents(events[0..n]);
     }
 
