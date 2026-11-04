@@ -572,6 +572,18 @@ test "peerCred: a full XU_NGROUPS set is flagged possibly truncated" {
     try std.testing.expect(!full.truncated);
 }
 
+test "peerCred: a wrong xucred version is rejected" {
+    // V06c: a mismatched layout version must not decode at all.
+    const xc: xucred = .{
+        .version = xucred_version + 1,
+        .uid = 1001,
+        .ngroups = 3,
+        .groups = @splat(55),
+        .pid_union = .{ .pid = 42 },
+    };
+    try std.testing.expect(credFromXucred(xc) == null);
+}
+
 test "bindTcp: IPv6 literal binds and accepts on ::1" {
     var loop = try testLoop();
     defer loop.deinit(std.testing.allocator);
