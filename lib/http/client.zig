@@ -97,6 +97,8 @@ pub const Response = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *Response) void {
+        // Bodies can carry tokens; never leave them in freed memory.
+        std.crypto.secureZero(u8, @constCast(self.body));
         self.allocator.free(self.body);
     }
 };
@@ -351,7 +353,10 @@ fn request(
 
     // Read the response against the total deadline.
     const resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
-    defer allocator.free(resp_buf);
+    defer {
+        std.crypto.secureZero(u8, resp_buf);
+        allocator.free(resp_buf);
+    }
 
     var total: usize = 0;
     var saw_eof = false;

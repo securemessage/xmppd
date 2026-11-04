@@ -909,7 +909,7 @@ pub const OidcStore = struct {
 // IdpPool -- bounded worker pool for blocking IdP exchanges
 // ============================================================================
 
-/// One queued exchange. `secret` is pool-owned (c_allocator): for .password
+/// One queued exchange. `secret` is pool-owned (secret_alloc): for .password
 /// it is `username ++ 0x00 ++ password` with `username_len` marking the
 /// split; for .token it is the token bytes (username_len unused). Wiped and
 /// freed by releaseJob.
@@ -922,6 +922,9 @@ pub const IdpJob = struct {
     /// counts against the exchange budget.
     deadline_ns: u64,
     answer: Answer,
+    /// Allocator `secret` was allocated with; stamped at put() so every
+    /// releaseJob frees with the same one.
+    secret_alloc: Allocator = std.heap.c_allocator,
 };
 
 pub const IdpJobKind = enum { password, token };
@@ -935,8 +938,9 @@ pub const IdpJobKind = enum { password, token };
 ///
 /// Threads and ownership: the loop thread produces jobs and consumes
 /// completions; workers only read jobs, run exchange and publish. Secrets
-/// are deep-copied with c_allocator so loop and workers share no allocator
-/// state, and are wiped with secureZero before every free.
+/// are deep-copied with the pool's secret allocator (c_allocator by
+/// default, so loop and workers share no allocator state) and are wiped
+/// with secureZero before every free.
 ///
 /// Invariants and bound:
 /// - outstanding (queued + running + completed-not-popped) <= max_outstanding
@@ -947,6 +951,11 @@ pub const IdpPool = struct {
     allocator: Allocator = undefined,
     store: *OidcStore = undefined,
     options: Options = undefined,
+
+    /// Allocator for job secrets; c_allocator by default so workers can
+    /// free without sharing allocator state with the loop thread. May be
+    /// swapped before jobs are queued to observe or bound the copies.
+    secret_alloc: Allocator = std.heap.c_allocator,
 
     /// FIFO job ring (loop produces, workers consume; job_mutex).
     jobs: []IdpJob = &.{},
@@ -1037,10 +1046,10 @@ pub const IdpPool = struct {
         self.started = true;
     }
 
-    /// Queue a credential exchange. The secret is deep-copied with
-    /// c_allocator; the pool owns it until releaseJob or stop. QueueFull
-    /// when outstanding == max_outstanding. Never blocks; allocates nothing
-    /// besides the secret copy.
+    /// Queue a credential exchange. The secret is deep-copied with the
+    /// pool's secret allocator; the pool owns it until releaseJob or
+    /// stop. QueueFull when outstanding == max_outstanding. Never blocks;
+    /// allocates nothing besides the secret copy.
     pub fn put(self: *IdpPool, cred: Credential) error{ QueueFull, OutOfMemory }!u64 {
         var kind: IdpJobKind = undefined;
         var username_len: usize = 0;
@@ -1057,8 +1066,11 @@ pub const IdpPool = struct {
             },
         }
 
-        const secret = std.heap.c_allocator.alloc(u8, secret_len) catch return error.OutOfMemory;
-        errdefer std.heap.c_allocator.free(secret);
+        const secret = self.secret_alloc.alloc(u8, secret_len) catch return error.OutOfMemory;
+        errdefer {
+            std.crypto.secureZero(u8, secret);
+            self.secret_alloc.free(secret);
+        }
         switch (cred) {
             .password => |p| {
                 @memcpy(secret[0..p.username.len], p.username);
@@ -1079,6 +1091,7 @@ pub const IdpPool = struct {
             .secret = secret,
             .kind = kind,
             .username_len = username_len,
+            .secret_alloc = self.secret_alloc,
             .deadline_ns = http.monotonicNs() + @as(u64, self.options.timeout_ms) * std.time.ns_per_ms,
             .answer = .{
                 .verdict = .unavailable,
@@ -1122,7 +1135,7 @@ pub const IdpPool = struct {
     /// Wipe and free a job's secret after its completion was consumed.
     pub fn releaseJob(job: *IdpJob) void {
         std.crypto.secureZero(u8, job.secret);
-        std.heap.c_allocator.free(job.secret);
+        job.secret_alloc.free(job.secret);
         job.secret = undefined;
     }
 
