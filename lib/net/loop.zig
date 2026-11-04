@@ -945,8 +945,11 @@ pub const Loop = struct {
         }
 
         if (filter == .write and raw.flags & std.c.EV.DISPATCH != 0) {
-            // The kernel disarmed the write knote on delivery.
+            // The kernel disarmed the write knote on delivery; if the
+            // consumer still wants write, the next commit re-arms it with
+            // EV_ENABLE (DESIGN 6.3).
             h.reg_write = .disabled;
+            if (h.want.write) self.markDirty(token, h);
         }
         self.stats_.delivered_events += 1;
         const io: Io = .{
@@ -1162,26 +1165,24 @@ test "Loop: write interest is delivered once and re-armed only when wanted" {
     _ = events.items[0].writable;
     events.clearRetainingCapacity();
 
-    // EV_DISPATCH disarmed the knote: an idle pass produces nothing.
+    // EV_DISPATCH disarmed the knote on delivery, but write is still
+    // wanted: the next commit re-arms it and the still-writable socket
+    // fires again without another setInterest call.
     loop.requestImmediate();
-    try loop.wait();
-    try drain(&loop, &events);
-    try std.testing.expectEqual(@as(usize, 0), events.items.len);
-
-    // Wanting write again re-arms it.
-    try loop.setInterest(h, .{ .write = true });
     try loop.wait();
     try drain(&loop, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     _ = events.items[0].writable;
     events.clearRetainingCapacity();
 
-    // After delivery, not wanting write keeps it silent with no changes.
+    // Not wanting write leaves the knote disarmed and produces no change.
     try loop.setInterest(h, .{});
+    const committed = loop.stats().changes_committed;
     loop.requestImmediate();
     try loop.wait();
     try drain(&loop, &events);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
+    try std.testing.expectEqual(committed, loop.stats().changes_committed);
 }
 
 test "Loop: change buffer bound under churn is two entries per dirty handle" {
