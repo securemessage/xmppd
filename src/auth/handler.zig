@@ -371,7 +371,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 // Prepare the supplied name for its lock pre-check. An
                 // unpreparable name gets the wrong-password reply and an
                 // IP-only charge, never a store-error oracle or an IdP call.
-                const typed_username = auth_precis_scratch.localpart(username) catch {
+                const typed_username = auth_precis_scratch.localpart(localpartOf(username)) catch {
                     log.info("PLAIN auth failed (IdP): invalid supplied name", .{});
                     self.policy.recordOutcome("", req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
@@ -1639,6 +1639,25 @@ test "AuthHandler: IdP PLAIN prepares the supplied and returned identities" {
     var good_buf: [64]u8 = undefined;
     const good = handleSync(&handler, plainRequest(45, "10.0.0.45", plainPayload(&good_buf, "alice", "right"))) orelse return error.NoResponse;
     try std.testing.expectEqualStrings("naplestb", good.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN accepts an email or JID authcid" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var buf: [96]u8 = undefined;
+    const result = handleSync(&handler, plainRequest(49, "10.0.0.49", plainPayload(&buf, "alice@idp.example", "right"))) orelse return error.NoResponse;
+
+    // The IdP receives the raw login, while the lock key and bound JID use
+    // only its prepared localpart.
+    try std.testing.expectEqualStrings("alice", result.auth_success.username);
+    try std.testing.expectEqual(@as(u32, 1), store.password_calls);
 }
 
 test "AuthHandler: OAUTHBEARER binds the prepared localpart" {
