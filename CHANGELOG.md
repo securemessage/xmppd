@@ -58,6 +58,15 @@
      logging one error that names `xmppctl migrate-precis`. There is no
      raw-name read fallback.
 
+- **Known gap until PR #9 lands:** local-domain JIDs are not yet prepared
+  at stanza or payload ingress. Mail and presence addressed to the old
+  spelling (for example `NaplesTB@domain`) do not reach the migrated
+  account `naplestb`, including offline delivery. Address accounts by
+  their prepared localpart. Roster items, blocklist items, MUC
+  affiliations and MAM `with` filters can also store the old spelling;
+  PR #9 will prepare those payload JIDs and make the domain comparison
+  case-insensitive.
+
 ## v0.9.0 - 2026-10-04
 
 ### Features
