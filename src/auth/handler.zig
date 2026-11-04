@@ -363,10 +363,18 @@ pub fn AuthHandler(comptime Store: type) type {
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
-                // A lock on the supplied localpart must reject before the
-                // IdP call, or a right password for a locked account is
-                // distinguishable from a wrong one.
-                if (self.policy.check(username, req.client_ip)) |reason| {
+                // Prepare the supplied name for its lock pre-check. An
+                // unpreparable name gets the wrong-password reply and an
+                // IP-only charge, never a store-error oracle or an IdP call.
+                var typed_buf: [6 * precis.max_input_octets]u8 = undefined;
+                var typed_cps: [3 * precis.max_input_octets]u21 = undefined;
+                var typed_cccs: [3 * precis.max_input_octets]u8 = undefined;
+                const typed_username = precis.xmppLocalpart(username, &typed_buf, &typed_cps, &typed_cccs) catch {
+                    log.info("PLAIN auth failed (IdP): invalid supplied name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
+                if (self.policy.check(typed_username, req.client_ip)) |reason| {
                     return .{ .reply = authFailure(req.conn_id, reason) };
                 }
 
@@ -374,11 +382,21 @@ pub fn AuthHandler(comptime Store: type) type {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
-                    // S3: locks bind to the identity the IdP handed
-                    // back, normalized to its localpart ("Alice@domain" and
-                    // "Alice" resolve to the same "alice" admission every
-                    // mechanism enforces).
-                    const identity = localpartOf(validated_user);
+                    // S3: locks and the bound JID use the prepared localpart
+                    // of the identity the IdP handed back, never its domain.
+                    var identity_buf: [6 * precis.max_input_octets]u8 = undefined;
+                    var identity_cps: [3 * precis.max_input_octets]u21 = undefined;
+                    var identity_cccs: [3 * precis.max_input_octets]u8 = undefined;
+                    const identity = precis.xmppLocalpart(
+                        localpartOf(validated_user),
+                        &identity_buf,
+                        &identity_cps,
+                        &identity_cccs,
+                    ) catch {
+                        log.info("PLAIN auth failed (IdP): invalid returned identity", .{});
+                        self.policy.recordOutcome("", req.client_ip, .failure);
+                        return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                    };
                     // The pre-check ran on the typed name, which the IdP may
                     // resolve to a different identity. Check the identity's
                     // own lock now and answer it exactly like a wrong
@@ -389,7 +407,7 @@ pub fn AuthHandler(comptime Store: type) type {
                             log.info("PLAIN auth failed (IdP): '{s}' maps to a locked identity", .{username});
                             // Same bookkeeping as a wrong password: the typed
                             // name and the IP, never the locked identity.
-                            self.policy.recordOutcome(username, req.client_ip, .failure);
+                            self.policy.recordOutcome(typed_username, req.client_ip, .failure);
                             return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                         }
                         return .{ .reply = authFailure(req.conn_id, reason) };
@@ -397,7 +415,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     if (self.policy.admitAccount(identity)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
                     }
-                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ username, identity });
+                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ typed_username, identity });
                     self.policy.recordOutcome(identity, req.client_ip, .success);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
@@ -405,8 +423,8 @@ pub fn AuthHandler(comptime Store: type) type {
                         .server_final = "",
                     } } };
                 } else {
-                    log.info("PLAIN auth failed (IdP): '{s}'", .{username});
-                    self.policy.recordOutcome(username, req.client_ip, .failure);
+                    log.info("PLAIN auth failed (IdP): '{s}'", .{typed_username});
+                    self.policy.recordOutcome(typed_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
             }
@@ -555,12 +573,25 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             if (result) |validated_user| {
-                // Lock check on the IdP-verified identity (S3).
-                const identity = localpartOf(validated_user);
+                // Policy and the bound JID use the prepared localpart of the
+                // IdP-verified identity, never the full IdP-qualified string.
+                var identity_buf: [6 * precis.max_input_octets]u8 = undefined;
+                var identity_cps: [3 * precis.max_input_octets]u21 = undefined;
+                var identity_cccs: [3 * precis.max_input_octets]u8 = undefined;
+                const identity = precis.xmppLocalpart(
+                    localpartOf(validated_user),
+                    &identity_buf,
+                    &identity_cps,
+                    &identity_cccs,
+                ) catch {
+                    log.info("OAUTHBEARER failed: invalid returned identity", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return authFailure(req.conn_id, "not-authorized");
+                };
                 if (self.policy.admitAccount(identity)) |reason| {
                     return authFailure(req.conn_id, reason);
                 }
-                log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
+                log.info("OAUTHBEARER auth success: '{s}'", .{identity});
                 self.policy.recordOutcome(identity, req.client_ip, .success);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
                     self.store.getPhotoUrl()
@@ -568,7 +599,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     "";
                 return protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
-                    .username = validated_user,
+                    .username = identity,
                     .server_final = "",
                     .photo_url = photo_url,
                 } };
@@ -1621,7 +1652,98 @@ test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
         .payload = "n,,\x01auth=Bearer tok123\x01\x01",
     } }) orelse return error.NoResponse;
 
-    try std.testing.expectEqualStrings("bob@idp.example", result.auth_success.username);
+    try std.testing.expectEqualStrings("bob", result.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN prepares the supplied and returned identities" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "NaplesTB@idp.example",
+        .password_secret = "right",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, plainRequest(44, "10.0.0.44", plainPayload(&bad_buf, "bad name", "wrong"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", bad.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.44") orelse return error.ExpectedDenial);
+
+    var good_buf: [64]u8 = undefined;
+    const good = handleSync(&handler, plainRequest(45, "10.0.0.45", plainPayload(&good_buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", good.auth_success.username);
+}
+
+test "AuthHandler: OAUTHBEARER binds the prepared localpart" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "NaplesTB@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 46,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.46",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", result.auth_success.username);
+}
+
+test "AuthHandler: invalid IdP identities get not-authorized with IP-only charge" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "bad name@idp.example",
+        .password_secret = "right",
+        .token_user = "bad name@idp.example",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const plain = handleSync(&handler, plainRequest(47, "10.0.0.47", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", plain.auth_failure.reason);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.47") orelse return error.ExpectedDenial);
+
+    const oauth = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 48,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.48",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", oauth.auth_failure.reason);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.48") orelse return error.ExpectedDenial);
 }
 
 test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER" {
