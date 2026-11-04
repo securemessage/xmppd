@@ -334,6 +334,33 @@ pub fn build(b: *std.Build) void {
     });
     const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
     bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
+
+    // A9 crypto-pool microbenchmark; pool module pinned ReleaseFast per
+    // the work item.
+    const pool_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/crypto_pool_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const pool_bench_sasl_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const pool_bench_pool_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/crypto_pool.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pool_bench_pool_mod.addImport("sasl", pool_bench_sasl_mod);
+    pool_bench_mod.addImport("crypto_pool", pool_bench_pool_mod);
+    pool_bench_mod.addImport("sasl", pool_bench_sasl_mod);
+    const pool_bench = b.addExecutable(.{
+        .name = "crypto-pool-bench",
+        .root_module = pool_bench_mod,
+    });
+    const bench_crypto_pool_step = b.step("bench-crypto-pool", "Run the A9 crypto pool benchmark");
+    bench_crypto_pool_step.dependOn(&b.addRunArtifact(pool_bench).step);
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
