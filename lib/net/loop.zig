@@ -660,8 +660,11 @@ pub const Loop = struct {
         self.batch_pos = 0;
         self.now_ms_ = monotonicMs();
         // Snapshot the due batch for this pass: a deadline scheduled while
-        // the batch drains is collected at the next wait instead.
+        // the batch drains is collected at the next wait instead. Collected
+        // entries must emit even when this pass was woken by I/O, not the
+        // timer knote, or nextDeadline/stranded deadlines get disarmed.
         self.wheel.collectPass(self.now_ms_);
+        if (self.wheel.due_pos < self.wheel.due_len) self.timer_ready = true;
     }
 
     /// Deliver the next event of the current batch, or null. Kernel events in
@@ -1879,6 +1882,29 @@ test "Loop: a deadline scheduled during a pass emits at most once per pass" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), deadline_passes);
+}
+
+test "Loop: a collected deadline emits on a busy loop" {
+    // S1: requestImmediate keeps the pass returning without blocking, so
+    // the timer knote is not what wakes the loop; the collected deadline
+    // must still emit (timer_ready after collectPass).
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    for (0..10) |_| {
+        const t0 = monotonicMs();
+        _ = try loop.scheduleIn(20, tctx(1));
+        var fired_ms: u64 = std.math.maxInt(u64);
+        while (fired_ms == std.math.maxInt(u64)) {
+            loop.requestImmediate();
+            try loop.wait();
+            while (loop.next()) |ev| {
+                if (ev == .deadline) fired_ms = monotonicMs() - t0;
+            }
+            if (monotonicMs() - t0 > 250) break;
+        }
+        try std.testing.expect(fired_ms < 40);
+    }
 }
 
 extern "c" fn pthread_kill(t: std.c.pthread_t, sig: c_int) c_int;
