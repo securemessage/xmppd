@@ -25,9 +25,37 @@ const MdbEnvInfoC = extern struct {
     me_numreaders: c_uint,
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
+extern "c" fn mdb_env_get_fd(env: ?*anyopaque, fd: *c_int) c_int;
+
+// sysctl kern.proc.vmmap record prefix (sys/user.h kinfo_vmentry).
+// Records are walked by kve_structsize: kve_path is truncated on
+// copyout, so sizeof here is only the fixed prefix actually read.
+const KinfoVmentry = extern struct {
+    kve_structsize: c_int,
+    kve_type: c_int,
+    kve_start: u64,
+    kve_end: u64,
+    kve_offset: u64,
+    kve_vn_fileid: u64,
+    kve_vn_fsid_freebsd11: u32,
+    kve_flags: c_int,
+    kve_resident: c_int,
+    kve_private_resident: c_int,
+    kve_protection: c_int,
+    kve_ref_count: c_int,
+    kve_shadow_count: c_int,
+    kve_vn_type: c_int,
+    kve_vn_size: u64,
+    kve_vn_rdev_freebsd11: u32,
+    kve_vn_mode: u16,
+    kve_status: u16,
+    kve_vn_fsid: u64,
+    kve_vn_rdev: u64,
+};
+const KVME_TYPE_VNODE = 2;
 
 // madvise seam: test builds record the arguments instead of advising the
-// kernel, so a test can compare the advised range against mdb_env_info.
+// kernel, so a test can check the advised range covers the env map.
 const madviseCall = if (builtin.is_test) struct {
     var calls: usize = 0;
     var addr: usize = 0;
@@ -53,19 +81,55 @@ const log = std.log.scoped(.lmdb_store);
 
 /// Exclude the env map from core dumps: a crash would otherwise write
 /// every touched LMDB page (SCRAM keys, rosters, archive contents) into
-/// the core file. One call covers the whole map lifetime because the map
-/// size is never resized at runtime (S9, T358), so no re-apply path is
-/// needed. Failure is logged once and does not fail the open.
+/// the core file. LMDB reports me_mapaddr only for MDB_FIXEDMAP envs,
+/// so the map range comes from the process VM map instead: the vnode
+/// entry whose inode is the env's data file (mdb_env_get_fd). One call
+/// covers the map's lifetime because the map is never resized at
+/// runtime (S9, T358); failure is logged once and does not fail the
+/// open.
 fn excludeMapFromCoreDump(env: lmdb.Environment) void {
-    var info: MdbEnvInfoC = undefined;
-    if (mdb_env_info(env.ptr, &info) != 0) {
-        log.warn("mdb_env_info failed: LMDB map stays in core dumps", .{});
+    var fd: c_int = 0;
+    if (mdb_env_get_fd(env.ptr, &fd) != 0) {
+        log.warn("mdb_env_get_fd failed: LMDB map stays in core dumps", .{});
         return;
     }
-    const rc = madviseCall.run(info.me_mapaddr, info.me_mapsize, std.c.MADV.NOCORE);
+    const st = std.posix.fstat(fd) catch {
+        log.warn("fstat on the LMDB data fd failed: map stays in core dumps", .{});
+        return;
+    };
+    const map = findVmEntryByInode(st.ino) orelse {
+        log.warn("LMDB map not found in kern.proc.vmmap: map stays in core dumps", .{});
+        return;
+    };
+    const rc = madviseCall.run(map.start, map.end - map.start, std.c.MADV.NOCORE);
     if (rc != 0) {
         log.warn("madvise MADV_NOCORE on the LMDB map failed (errno {d}): map stays in core dumps", .{@intFromEnum(std.posix.errno(rc))});
     }
+}
+
+const VmRange = struct { start: usize, end: usize };
+
+/// Address range of the VMA backed by the vnode with inode `ino`, or
+/// null when kern.proc.vmmap yields no match.
+fn findVmEntryByInode(ino: u64) ?VmRange {
+    var mib = [_]c_int{ 1, 14, 32, std.c.getpid() }; // CTL_KERN, KERN_PROC, KERN_PROC_VMMAP
+    var len: usize = 0;
+    if (std.c.sysctl(&mib, mib.len, null, &len, null, 0) != 0) return null;
+    const buf = std.heap.page_allocator.alloc(u8, len + 4096) catch return null;
+    defer std.heap.page_allocator.free(buf);
+    var out_len = buf.len;
+    if (std.c.sysctl(&mib, mib.len, buf.ptr, &out_len, null, 0) != 0) return null;
+
+    var off: usize = 0;
+    while (off + @sizeOf(KinfoVmentry) <= out_len) {
+        const rec: *align(1) const KinfoVmentry = @ptrCast(buf.ptr + off);
+        const size: usize = @intCast(rec.kve_structsize);
+        if (size < @sizeOf(KinfoVmentry)) break;
+        if (rec.kve_type == KVME_TYPE_VNODE and rec.kve_vn_fileid == ino)
+            return .{ .start = @intCast(rec.kve_start), .end = @intCast(rec.kve_end) };
+        off += size;
+    }
+    return null;
 }
 
 const MAX_DBS = 16;
@@ -818,10 +882,11 @@ test "LmdbBackend: a failed read-only open closes the env it created (D5)" {
     try std.testing.expectEqual(before, countOpenFds());
 }
 
-test "LmdbBackend: open advises MADV_NOCORE over the mdb_env_info range" {
+test "LmdbBackend: open advises MADV_NOCORE over the env map" {
     // Goal: read-write and read-only opens both exclude exactly the env
-    // map range from core dumps. Method: the test seam records madvise
-    // arguments; compare them against a fresh mdb_env_info call.
+    // map VMA from core dumps. Method: the test seam records the madvise
+    // arguments; the advised range must have the me_mapsize length and
+    // contain a value pointer LMDB returned from inside the map.
     const path = freshTestDir();
     var info: MdbEnvInfoC = undefined;
 
@@ -830,10 +895,15 @@ test "LmdbBackend: open advises MADV_NOCORE over the mdb_env_info range" {
         var db = try LmdbBackend.open(path, .{});
         defer db.close();
         try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
-        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
-        try std.testing.expectEqual(info.me_mapaddr, madviseCall.addr);
-        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
         try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+
+        try db.put("users", "probe-key", "probe-value");
+        var iter = try db.iterator("users", "probe-key");
+        defer iter.deinit();
+        const p = @intFromPtr(iter.next().?.value.ptr);
+        try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
     }
 
     const calls1 = madviseCall.calls;
@@ -841,10 +911,14 @@ test "LmdbBackend: open advises MADV_NOCORE over the mdb_env_info range" {
         var db = try LmdbBackend.open(path, .{ .create = false, .read_only = true });
         defer db.close();
         try std.testing.expectEqual(calls1 + 1, madviseCall.calls);
-        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
-        try std.testing.expectEqual(info.me_mapaddr, madviseCall.addr);
-        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
         try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+
+        var iter = try db.iterator("users", "probe-key");
+        defer iter.deinit();
+        const p = @intFromPtr(iter.next().?.value.ptr);
+        try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
     }
 }
 
