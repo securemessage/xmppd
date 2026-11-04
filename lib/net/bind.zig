@@ -518,7 +518,8 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
     var loop = try testLoop();
     defer loop.deinit(std.testing.allocator);
 
-    const path = "/home/admin/tmp/scratch/devin-net/f2-test.sock";
+    var pbuf: [64]u8 = undefined;
+    const path = testSockPath(&pbuf, "test");
     posix.unlink(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -573,8 +574,15 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
 
 extern "c" fn getegid() posix.gid_t;
 
+/// Cwd-relative, pid-tagged unix socket path for tests: short enough for
+/// sun_path and never tied to a user-specific directory.
+fn testSockPath(buf: []u8, tag: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "xn-{d}-{s}.sock", .{ std.c.getpid(), tag }) catch unreachable;
+}
+
 test "bindUnix: a stale socket path is reclaimed" {
-    const path = "/home/admin/tmp/scratch/devin-net/f2-stale.sock";
+    var pbuf: [64]u8 = undefined;
+    const path = testSockPath(&pbuf, "stale");
     // A dead (unlinked-or-closed) socket path: create and close a listener.
     const dead = try bindUnix(&.{ .path = path, .mode = 0o600 });
     posix.close(dead);
@@ -592,7 +600,8 @@ test "bindUnix: long path refused, live listener and regular file refused, mode 
     const long_path = try std.fmt.bufPrintZ(&long_buf, "/tmp/{s}", .{"x" ** 110});
     try std.testing.expectError(error.PathTooLong, bindUnix(&.{ .path = long_path, .mode = 0o600 }));
 
-    const path = "/home/admin/tmp/scratch/devin-net/f2-live.sock";
+    var pbuf: [64]u8 = undefined;
+    const path = testSockPath(&pbuf, "live");
     const live = try bindUnix(&.{ .path = path, .mode = 0o640 });
     defer posix.close(live);
     defer posix.unlink(path) catch unreachable;
@@ -604,7 +613,8 @@ test "bindUnix: long path refused, live listener and regular file refused, mode 
     try std.testing.expectEqual(0, std.c.stat(path, &st));
     try std.testing.expectEqual(@as(u32, 0o640), @as(u32, @intCast(st.mode & 0o777)));
 
-    const reg = "/home/admin/tmp/scratch/devin-net/f2-regular";
+    var rbuf: [64]u8 = undefined;
+    const reg = testSockPath(&rbuf, "regular");
     {
         const f = try std.fs.cwd().createFile(reg, .{});
         f.close();
