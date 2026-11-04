@@ -85,6 +85,23 @@ pub const max_input_octets = 3 * max_username_octets;
 /// reapplications before the input must be rejected as invalid.
 pub const max_rule_applications = 4;
 
+/// Caller-owned preparation scratch. Subsystems that can nest preparations
+/// (for example PLAIN admission inside an already-prepared authcid) must use
+/// distinct instances so an inner preparation cannot overwrite an outer name.
+pub const Scratch = struct {
+    buf: [6 * max_input_octets]u8 = undefined,
+    cps: [3 * max_input_octets]u21 = undefined,
+    cccs: [3 * max_input_octets]u8 = undefined,
+
+    pub fn caseMapped(self: *Scratch, input: []const u8) PrecisError![]const u8 {
+        return usernameCaseMapped(input, &self.buf, &self.cps, &self.cccs);
+    }
+
+    pub fn localpart(self: *Scratch, input: []const u8) PrecisError![]const u8 {
+        return xmppLocalpart(input, &self.buf, &self.cps, &self.cccs);
+    }
+};
+
 /// Prepare `input` per RFC 8265 Section 3.3 or reject it. The returned
 /// slice points into `buf` and is valid until `buf` is reused.
 ///

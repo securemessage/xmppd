@@ -13,6 +13,11 @@
 const std = @import("std");
 const sasl = @import("sasl");
 const precis = @import("precis_username");
+
+/// Per-thread auth and IdP-identity scratch. The IdP copy is distinct so the
+/// typed authcid remains valid while the returned identity is prepared.
+threadlocal var auth_precis_scratch: precis.Scratch = undefined;
+threadlocal var idp_identity_precis_scratch: precis.Scratch = undefined;
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const policy_mod = @import("policy");
@@ -366,10 +371,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 // Prepare the supplied name for its lock pre-check. An
                 // unpreparable name gets the wrong-password reply and an
                 // IP-only charge, never a store-error oracle or an IdP call.
-                var typed_buf: [6 * precis.max_input_octets]u8 = undefined;
-                var typed_cps: [3 * precis.max_input_octets]u21 = undefined;
-                var typed_cccs: [3 * precis.max_input_octets]u8 = undefined;
-                const typed_username = precis.xmppLocalpart(username, &typed_buf, &typed_cps, &typed_cccs) catch {
+                const typed_username = auth_precis_scratch.localpart(username) catch {
                     log.info("PLAIN auth failed (IdP): invalid supplied name", .{});
                     self.policy.recordOutcome("", req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
@@ -384,14 +386,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 if (result) |validated_user| {
                     // S3: locks and the bound JID use the prepared localpart
                     // of the identity the IdP handed back, never its domain.
-                    var identity_buf: [6 * precis.max_input_octets]u8 = undefined;
-                    var identity_cps: [3 * precis.max_input_octets]u21 = undefined;
-                    var identity_cccs: [3 * precis.max_input_octets]u8 = undefined;
-                    const identity = precis.xmppLocalpart(
+                    const identity = idp_identity_precis_scratch.localpart(
                         localpartOf(validated_user),
-                        &identity_buf,
-                        &identity_cps,
-                        &identity_cccs,
                     ) catch {
                         log.info("PLAIN auth failed (IdP): invalid returned identity", .{});
                         self.policy.recordOutcome("", req.client_ip, .failure);
@@ -436,14 +432,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 // exactly like a wrong password, charge only the IP key, and
                 // create no account key. Buffer contract of xmppLocalpart:
                 // buf 6x input.len, scratch 3x input.len each.
-                var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-                var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-                var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-                const account_username = precis.xmppLocalpart(
+                const account_username = auth_precis_scratch.localpart(
                     username,
-                    &canon_buf,
-                    &scratch_cps,
-                    &scratch_cccs,
                 ) catch {
                     log.info("PLAIN auth failed: invalid account name", .{});
                     self.policy.recordOutcome("", req.client_ip, .failure);
@@ -575,14 +565,8 @@ pub fn AuthHandler(comptime Store: type) type {
             if (result) |validated_user| {
                 // Policy and the bound JID use the prepared localpart of the
                 // IdP-verified identity, never the full IdP-qualified string.
-                var identity_buf: [6 * precis.max_input_octets]u8 = undefined;
-                var identity_cps: [3 * precis.max_input_octets]u21 = undefined;
-                var identity_cccs: [3 * precis.max_input_octets]u8 = undefined;
-                const identity = precis.xmppLocalpart(
+                const identity = idp_identity_precis_scratch.localpart(
                     localpartOf(validated_user),
-                    &identity_buf,
-                    &identity_cps,
-                    &identity_cccs,
                 ) catch {
                     log.info("OAUTHBEARER failed: invalid returned identity", .{});
                     self.policy.recordOutcome("", req.client_ip, .failure);
@@ -647,14 +631,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 // in the SCRAM exchange: client-first remains part of the
                 // AuthMessage. An unpreparable name gets the same reply as a
                 // wrong password, with IP-only bookkeeping and no account key.
-                var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-                var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-                var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-                const account_username = precis.xmppLocalpart(
+                const account_username = auth_precis_scratch.localpart(
                     username,
-                    &canon_buf,
-                    &scratch_cps,
-                    &scratch_cccs,
                 ) catch {
                     log.info("SCRAM auth failed: invalid account name", .{});
                     self.policy.recordOutcome("", req.client_ip, .failure);
@@ -723,14 +701,8 @@ pub fn AuthHandler(comptime Store: type) type {
             const username = session.server.username;
             // The SCRAM proof uses the raw n= name above. Account policy and
             // the bound identity use its RFC 7622 localpart, as at init.
-            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-            const account_username = precis.xmppLocalpart(
+            const account_username = auth_precis_scratch.localpart(
                 username,
-                &canon_buf,
-                &scratch_cps,
-                &scratch_cccs,
             ) catch {
                 self.policy.recordOutcome("", session.clientIp(), .failure);
                 session.deinit();
@@ -787,14 +759,8 @@ pub fn AuthHandler(comptime Store: type) type {
             }
 
             // Resolve the account through the one RFC 7622 localpart function.
-            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-            const account_username = precis.xmppLocalpart(
+            const account_username = auth_precis_scratch.localpart(
                 req.username,
-                &canon_buf,
-                &scratch_cps,
-                &scratch_cccs,
             ) catch {
                 return protocol.Message{ .password_change_result = .{
                     .conn_id = req.conn_id,
@@ -843,14 +809,8 @@ pub fn AuthHandler(comptime Store: type) type {
             }
 
             // Resolve the account through the one RFC 7622 localpart function.
-            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-            const account_username = precis.xmppLocalpart(
+            const account_username = auth_precis_scratch.localpart(
                 req.username,
-                &canon_buf,
-                &scratch_cps,
-                &scratch_cccs,
             ) catch {
                 return protocol.Message{ .account_delete_result = .{
                     .conn_id = req.conn_id,
@@ -941,14 +901,8 @@ pub fn AuthHandler(comptime Store: type) type {
             // xmppctl admin path arrives raw. Buffer contract of
             // xmppLocalpart: buf 6x input.len, scratch 3x input.len each;
             // input over max_input_octets is rejected by the profile itself.
-            var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-            var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-            var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-            const canon_username = precis.xmppLocalpart(
+            const canon_username = auth_precis_scratch.localpart(
                 req.username,
-                &canon_buf,
-                &scratch_cps,
-                &scratch_cccs,
             ) catch {
                 log.info("registration rejected: '{s}' is not a valid UsernameCaseMapped name", .{req.username});
                 return protocol.Message{ .register_result = regResult{

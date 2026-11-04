@@ -9,6 +9,10 @@ const std = @import("std");
 const backend_mod = @import("backend");
 const precis = @import("precis_username");
 
+/// Per-thread migration scratch. Prepared localparts are copied into plan
+/// storage before the next row is read, so reuse never aliases plan data.
+threadlocal var migrate_precis_scratch: precis.Scratch = undefined;
+
 const NS_USERS = backend_mod.registered("users");
 const NS_LOCKS = backend_mod.registered("locks");
 const NS_ROSTERS = backend_mod.registered("rosters");
@@ -159,10 +163,7 @@ fn rewriteLocalpart(allocator: std.mem.Allocator, name: []const u8, ctx: *const 
         }
     }
 
-    var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const prepared = precis.xmppLocalpart(name, &prep_buf, &scratch_cps, &scratch_cccs) catch
+    const prepared = migrate_precis_scratch.localpart(name) catch
         return error.InvalidAccountName;
     try ctx.identities.record(name, prepared);
     if (std.mem.eql(u8, prepared, name)) return null;
@@ -508,15 +509,8 @@ pub fn planMigration(
     errdefer plan.deinit();
 
     if (forced) |rename| {
-        var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
-        var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-        var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-        const prepared = precis.xmppLocalpart(
-            rename.new_localpart,
-            &prep_buf,
-            &scratch_cps,
-            &scratch_cccs,
-        ) catch return error.InvalidAccountName;
+        const prepared = migrate_precis_scratch.localpart(rename.new_localpart) catch
+            return error.InvalidAccountName;
         if (!std.mem.eql(u8, prepared, rename.new_localpart)) return error.InvalidAccountName;
     }
 
@@ -768,10 +762,7 @@ fn entryMatchesRaw(
     if (std.mem.eql(u8, namespace, NS_USERS)) return std.mem.eql(u8, key, raw);
     if (std.mem.eql(u8, namespace, NS_LOCKS)) {
         if (std.mem.eql(u8, key, raw)) return true;
-        var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
-        var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-        var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-        const prepared = precis.xmppLocalpart(raw, &prep_buf, &scratch_cps, &scratch_cccs) catch return false;
+        const prepared = migrate_precis_scratch.localpart(raw) catch return false;
         return std.mem.eql(u8, key, prepared);
     }
     if (std.mem.eql(u8, namespace, NS_ROSTERS) or

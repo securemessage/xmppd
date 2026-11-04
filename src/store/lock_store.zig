@@ -44,14 +44,15 @@ pub const AccountKeyError = error{
     KeyTooLong,
 };
 
+/// Per-thread lock-store preparation scratch. Policy and handler use separate
+/// instances, so nested admission cannot overwrite this prepared name.
+threadlocal var precis_scratch: precis.Scratch = undefined;
+
 /// Prepare the identity's localpart as the one canonical account key. The
 /// caller owns `buf`; a valid prepared name longer than `buf` is untrackable.
 pub fn prepareAccountKey(identity: []const u8, buf: []u8) AccountKeyError![]const u8 {
     const local = localpartOf(identity);
-    var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const prepared = precis.xmppLocalpart(local, &prep_buf, &scratch_cps, &scratch_cccs) catch
+    const prepared = precis_scratch.localpart(local) catch
         return error.InvalidAccountName;
     if (prepared.len > buf.len) return error.KeyTooLong;
     @memcpy(buf[0..prepared.len], prepared);

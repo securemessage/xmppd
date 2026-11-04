@@ -29,6 +29,8 @@ const invite_store_mod = @import("invite_store");
 const InviteStore = invite_store_mod.InviteStore(OpBackendType);
 const ipc_protocol = @import("ipc_protocol");
 const precis = @import("precis_username");
+
+threadlocal var ctl_precis_scratch: precis.Scratch = undefined;
 const backend_mod = @import("backend");
 
 const log = std.log.scoped(.xmppctl);
@@ -413,31 +415,22 @@ pub fn main() !void {
 fn addUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8, password: []const u8) !void {
     // Buffer contract of xmppLocalpart: buf 6x input, scratch 3x input each;
     // input past max_input_octets fails the profile itself.
-    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
+    const canon = try prepareAccountName(raw);
     try store.addUser(allocator, canon, password);
 }
 
-fn prepareAccountName(raw: []const u8, buf: []u8, scratch_cps: []u21, scratch_cccs: []u8) ![]const u8 {
-    return precis.xmppLocalpart(raw, buf, scratch_cps, scratch_cccs) catch
+fn prepareAccountName(raw: []const u8) ![]const u8 {
+    return ctl_precis_scratch.localpart(raw) catch
         return error.InvalidAccountName;
 }
 
 fn changePasswordCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8, password: []const u8) !void {
-    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
+    const canon = try prepareAccountName(raw);
     try store.changePassword(allocator, canon, password);
 }
 
 fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []const u8) !void {
-    var canon_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
-    const canon = try prepareAccountName(raw, &canon_buf, &scratch_cps, &scratch_cccs);
+    const canon = try prepareAccountName(raw);
     try store.removeUser(allocator, canon);
 }
 

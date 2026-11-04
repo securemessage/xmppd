@@ -1593,6 +1593,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_auth_main_tests = b.addRunArtifact(auth_main_tests);
 
+    const precis_frame_check = b.addSystemCommand(&.{ "sh", "tools/check_precis_frames.sh" });
+    precis_frame_check.addArtifactArg(auth_handler_tests);
+    precis_frame_check.addArtifactArg(server_tests);
+
     // xmppd-auth-oidc: the OIDC authentication daemon
     const oidc_ipc_protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),
@@ -1955,6 +1959,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_migrate_precis_tests.step);
     test_step.dependOn(&run_migrate_precis_backend_tests.step);
     test_step.dependOn(&run_auth_main_tests.step);
+    test_step.dependOn(&precis_frame_check.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

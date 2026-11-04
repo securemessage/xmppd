@@ -34,19 +34,18 @@ pub const StartupScanError = error{
 /// already in RFC 7622 prepared form. No rows are changed and no read fallback
 /// is provided: an unprepared key makes startup refuse loudly so the operator
 /// runs `xmppctl migrate-precis` instead of users being silently locked out.
+threadlocal var startup_precis_scratch: precis.Scratch = undefined;
+
 pub fn verifyPreparedUsers(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
     comptime backend_mod.assertBackend(Backend);
     var iterator = try backend.iterator(NAMESPACE, "");
     defer iterator.deinit();
 
-    var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
-    var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
-    var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
     var count: usize = 0;
     while (iterator.next()) |entry| {
         if (count == max_keys) return error.ScanLimitExceeded;
         count += 1;
-        const prepared = precis.xmppLocalpart(entry.key, &prep_buf, &scratch_cps, &scratch_cccs) catch
+        const prepared = startup_precis_scratch.localpart(entry.key) catch
             return error.UnpreparedAccountName;
         if (!std.mem.eql(u8, prepared, entry.key)) return error.UnpreparedAccountName;
     }

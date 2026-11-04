@@ -30,6 +30,10 @@ const log = std.log.scoped(.xmppd);
 // Types from server.zig — imported via the parent module's compilation unit.
 const server_mod = @import("server.zig");
 const precis = @import("precis_username");
+
+/// Per-thread registration preparation scratch, shared by this worker's
+/// sequential registrations without allocating on each request.
+threadlocal var register_precis_scratch: precis.Scratch = undefined;
 const Session = server_mod.Session;
 const Server = server_mod.Server;
 const MamCollecting = server_mod.MamCollecting;
@@ -1074,17 +1078,7 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
 
     // RFC 7622 Section 3.3 localparts are stored and compared in canonical
     // form only, so the auth daemon is asked about the prepared name.
-    // Buffer contract of xmppLocalpart: buf 6x input.len, scratch 3x
-    // input.len each (reg_username_buf caps the input at 256 bytes).
-    var canon_buf: [6 * 256]u8 = undefined;
-    var scratch_cps: [3 * 256]u21 = undefined;
-    var scratch_cccs: [3 * 256]u8 = undefined;
-    const canon_username = precis.xmppLocalpart(
-        reg_username,
-        &canon_buf,
-        &scratch_cps,
-        &scratch_cccs,
-    ) catch {
+    const canon_username = register_precis_scratch.localpart(reg_username) catch {
         sendIqError(server, session, iq_id, "not-acceptable");
         return;
     };
