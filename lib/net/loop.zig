@@ -1437,6 +1437,46 @@ test "Loop: scheduleIn fires a deadline event and cancel silences it" {
     try std.testing.expect(loop.next() == null);
 }
 
+test "Loop: cancelling a collected-but-unemitted deadline loses no other deadline" {
+    // The handler cancels a sibling whose timer was already collected onto
+    // the due list, then fills every level-0 slot. All 64 must fire: the
+    // cancelled entry's stale links must not corrupt the wheel.
+    var options = testOptions(null);
+    options.timers_max = 128;
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, &options);
+    defer loop.deinit(std.testing.allocator);
+
+    const base = loop.nowMs();
+    _ = try loop.scheduleAt(base + 2, tctx(1));
+    const sibling = try loop.scheduleAt(base + 2, tctx(2));
+    var scheduled = false;
+    var fired: usize = 0;
+    var watchdog = false;
+    var iters: usize = 0;
+    while (!watchdog and iters < 500) : (iters += 1) {
+        try loop.wait();
+        while (loop.next()) |e| switch (e) {
+            .deadline => |d| {
+                if (d.ctx.index == 1 and !scheduled) {
+                    _ = loop.cancelTimer(sibling);
+                    const now = loop.nowMs();
+                    for (0..64) |i| _ = try loop.scheduleAt(now + i, tctx(100));
+                    _ = try loop.scheduleIn(500, tctx(999));
+                    scheduled = true;
+                } else if (d.ctx.index == 100) {
+                    fired += 1;
+                } else if (d.ctx.index == 999) {
+                    watchdog = true;
+                }
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(watchdog);
+    try std.testing.expectEqual(@as(usize, 64), fired);
+}
+
 test "Loop: watchSignal delivers count and ownership excludes a second watch" {
     var loop = try testLoop(null);
     defer loop.deinit(std.testing.allocator);

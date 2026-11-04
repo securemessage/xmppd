@@ -21,6 +21,12 @@ pub const Deadline = struct { timer: TimerId, ctx: Token };
 const NIL: u32 = std.math.maxInt(u32);
 const timer_entry_kind: u8 = 0x03;
 
+/// Level marker for entries moved to the due list by collect(). Their slot
+/// chain is already torn down, so cancel() must not unlink them through
+/// lvl/slot/prev/next; it only removes the entry, and popExpired() then
+/// skips the stale due-list token.
+const due_lvl: u8 = 0xFF;
+
 const LEVELS = 4;
 const SLOTS = 64;
 const SHIFT = 6; // log2(SLOTS)
@@ -92,9 +98,11 @@ pub const TimerWheel = struct {
     }
 
     /// O(1) unlink. False when the id is stale (cancelled or already fired).
+    /// True for an entry collected but not yet emitted: the due-list token
+    /// goes stale and popExpired() drops it.
     pub fn cancel(self: *TimerWheel, timer: TimerId) bool {
         const e = self.entries.get(timer) orelse return false;
-        self.unlinkEntry(e);
+        if (e.lvl != due_lvl) self.unlinkEntry(e);
         _ = self.entries.remove(timer);
         return true;
     }
@@ -150,6 +158,7 @@ pub const TimerWheel = struct {
                     const next = e.next;
                     const idx_tok: TimerId = .{ .index = idx, .gen = self.entries.gens[idx], .kind = timer_entry_kind };
                     if (e.deadline <= self.cur_ms) {
+                        e.lvl = due_lvl;
                         self.due[self.due_len] = idx_tok;
                         self.due_len += 1;
                     } else {
@@ -203,6 +212,7 @@ pub const TimerWheel = struct {
     }
 
     fn unlinkEntry(self: *TimerWheel, e: *Entry) void {
+        std.debug.assert(e.lvl != due_lvl and e.lvl < LEVELS);
         const l = e.lvl;
         const s = e.slot;
         if (e.prev == NIL) {
@@ -266,19 +276,38 @@ test "TimerWheel: cancel is O(1) and stale ids cannot cancel a reused entry" {
     try std.testing.expect(wheel.nextDeadline() == null);
 }
 
-test "TimerWheel: cancel after collect drops the pending emission" {
+test "TimerWheel: cancel between collect and emit drops the pending emission" {
+    // collect() moves due entries onto the due list; cancelling one before
+    // it is emitted must drop it without touching the torn-down slot chain.
     var wheel: TimerWheel = undefined;
-    try wheel.init(std.testing.allocator, 4, 0);
+    try wheel.init(std.testing.allocator, 8, 0);
     defer wheel.deinit(std.testing.allocator);
 
-    const t = try wheel.schedule(50, .{ .index = 1, .gen = 1, .kind = 0xEE });
-    // collect() runs inside popExpired; cancel between collect and emit.
-    _ = wheel.popExpired(60);
-    // The first call collected and emitted t... verify semantics: it returns t.
-    const t2 = try wheel.schedule(60, .{ .index = 2, .gen = 1, .kind = 0xEE });
-    _ = wheel.popExpired(70);
-    try std.testing.expect(wheel.cancel(t2) == false); // already emitted
-    try std.testing.expect(!wheel.cancel(t));
+    const a = try wheel.schedule(10, .{ .index = 1, .gen = 1, .kind = 0xEE });
+    const b = try wheel.schedule(10, .{ .index = 2, .gen = 1, .kind = 0xEE });
+    const first = wheel.popExpired(20).?; // collects a and b; a emitted first
+    try std.testing.expect(first.timer.eql(a));
+    try std.testing.expect(wheel.cancel(b)); // collected, not yet emitted
+    try std.testing.expect(wheel.popExpired(20) == null); // b dropped
+    try std.testing.expect(!wheel.cancel(b));
+}
+
+test "TimerWheel: cancel during fire leaves the slot chain usable" {
+    // The collected entry's stale lvl/slot links must not corrupt the slot:
+    // a later deadline hashed into the same level-0 slot still fires.
+    var wheel: TimerWheel = undefined;
+    try wheel.init(std.testing.allocator, 8, 0);
+    defer wheel.deinit(std.testing.allocator);
+
+    _ = try wheel.schedule(10, .{ .index = 1, .gen = 1, .kind = 0xEE });
+    const b = try wheel.schedule(10, .{ .index = 2, .gen = 1, .kind = 0xEE });
+    _ = wheel.popExpired(20); // collect both, emit the first
+    try std.testing.expect(wheel.cancel(b)); // cur_ms is now 20
+    const c = try wheel.schedule(74, .{ .index = 3, .gen = 1, .kind = 0xEE });
+    while (wheel.popExpired(20)) |_| {} // drain the stale due entry for b
+    const d = wheel.popExpired(200).?;
+    try std.testing.expect(d.timer.eql(c));
+    try std.testing.expect(wheel.popExpired(200) == null);
 }
 
 test "TimerWheel: TimerTableFull at capacity" {
