@@ -990,8 +990,7 @@ test "pool options reject out-of-range values" {
     }
 
     // In-range values parse through; absent keys keep the defaults.
-    const path = try writeTmpConfig(allocator, &tmp,
-        "idp_threads = 16\nidp_max_outstanding = 64\nidp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000");
+    const path = try writeTmpConfig(allocator, &tmp, "idp_threads = 16\nidp_max_outstanding = 64\nidp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000");
     defer allocator.free(path);
     var cfg = try config_mod.parse(allocator, path);
     defer cfg.deinit();
@@ -1067,7 +1066,7 @@ const DaemonFixture = struct {
     handler: AuthHandler = undefined,
     daemon: Daemon = undefined,
 
-    fn init(self: *DaemonFixture, allocator: Allocator, token_endpoint: []const u8, ca_file: ?[]const u8, limiter_policy: ?RatePolicy, pool_options: IdpPool.Options) !void {
+    fn init(self: *DaemonFixture, allocator: Allocator, token_endpoint: []const u8, ca_file: ?[]const u8, introspection_endpoint: ?[]const u8, limiter_policy: ?RatePolicy, pool_options: IdpPool.Options) !void {
         self.* = .{ .tmp = std.testing.tmpDir(.{}) };
         errdefer self.tmp.cleanup();
 
@@ -1082,6 +1081,7 @@ const DaemonFixture = struct {
             .client_secret = "secret",
             .token_endpoint = token_endpoint,
             .jwks_uri = token_endpoint,
+            .introspection_endpoint = introspection_endpoint,
             .ca_file = ca_file,
         });
         try self.store.start();
@@ -1257,7 +1257,7 @@ test "a hanging IdP does not stall the loop" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, .{
+    try fx.init(allocator, url, null, null, .{
         .lockout_threshold = 1,
         .max_per_account = 100,
         .max_per_ip = 100,
@@ -1310,7 +1310,7 @@ test "a refusing IdP answers temporary-auth-failure and records no failure" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, .{
+    try fx.init(allocator, url, null, null, .{
         .lockout_threshold = 1,
         .max_per_account = 100,
         .max_per_ip = 100,
@@ -1347,7 +1347,7 @@ test "a full pool answers temporary-auth-failure at once" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, null, .{
+    try fx.init(allocator, url, null, null, null, .{
         .threads = 1,
         .max_outstanding = 2,
         .connect_timeout_ms = 2000,
@@ -1388,7 +1388,7 @@ test "a completion for a closed or reused lane is dropped" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, null, .{
+    try fx.init(allocator, url, null, null, null, .{
         .threads = 1,
         .max_outstanding = 8,
         .connect_timeout_ms = 100,
@@ -1435,7 +1435,7 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, null, .{
+    try fx.init(allocator, url, null, null, null, .{
         .threads = 1,
         .max_outstanding = 8,
         .connect_timeout_ms = 2000,
@@ -1491,7 +1491,7 @@ test "an OOM on the pending copy queues no orphan job" {
     const test_alloc = falloc.allocator();
 
     var fx: DaemonFixture = undefined;
-    try fx.init(test_alloc, url, null, null, .{
+    try fx.init(test_alloc, url, null, null, null, .{
         .threads = 1,
         .max_outstanding = 8,
         .connect_timeout_ms = 500,
@@ -1536,7 +1536,7 @@ test "shutdown with exchanges in flight cancels them" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, null, .{
+    try fx.init(allocator, url, null, null, null, .{
         .threads = 2,
         .max_outstanding = 8,
         .connect_timeout_ms = 5000,
@@ -1653,7 +1653,7 @@ test "a rejected credential replays as not-authorized and records the failure" {
     const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, cert_path, .{
+    try fx.init(allocator, url, cert_path, null, .{
         .lockout_threshold = 1,
         .max_per_account = 100,
         .max_per_ip = 100,
@@ -1690,7 +1690,7 @@ test "a rate-limited or locked request is denied before the IdP is asked" {
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, null, .{
+    try fx.init(allocator, url, null, null, .{
         .max_per_ip = 2,
         .max_per_account = 100,
         .window_seconds = 120,
@@ -1774,7 +1774,7 @@ test "admission is charged at dispatch; the replay does not charge again" {
     const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
 
     var fx: DaemonFixture = undefined;
-    try fx.init(allocator, url, cert_path, .{
+    try fx.init(allocator, url, cert_path, null, .{
         .max_per_ip = 4,
         .max_per_account = 100,
         .window_seconds = 120,
@@ -1835,4 +1835,378 @@ test "admission is charged at dispatch; the replay does not charge again" {
     // Exactly one charge: the counted attempt plus the three window fills
     // is the whole window; the replay added nothing.
     try std.testing.expect(fx.handler.policy.admitIp("10.0.0.9") != null);
+}
+
+test "a completion with a stale lane generation is dropped without a reply" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 3000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, null, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 150,
+        .timeout_ms = 300,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m = plainAuth(1, "alice", "pw", "10.0.0.1");
+    defer allocator.free(m.auth_request.payload);
+    try client.send(m);
+    try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+
+    // A recycled lane bumps ipc_gens: the parked generation no longer
+    // matches, so the exchange's completion drops instead of answering
+    // the wrong connection.
+    var it = fx.daemon.pending.valueIterator();
+    const pend = it.next() orelse return error.NoPending;
+    pend.slot_gen +%= 1;
+
+    const dl = std.time.milliTimestamp() + 2500;
+    while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < dl) {
+        try fx.daemon.step(10);
+        _ = client.conn.recv() catch 0;
+        if (try client.conn.nextMessage()) |_| return error.UnexpectedReply;
+    }
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+
+    // One more beat: the dropped completion must leave no reply behind.
+    const settle = std.time.milliTimestamp() + 200;
+    while (std.time.milliTimestamp() < settle) {
+        try fx.daemon.step(10);
+        _ = client.conn.recv() catch 0;
+        if (try client.conn.nextMessage()) |_| return error.UnexpectedReply;
+    }
+}
+
+test "a closed lane keeps its in-flight cap until the completions drain" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 6000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, null, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 4000,
+    });
+    defer fx.deinit(allocator);
+
+    // Client A fills alice's in-flight cap and then vanishes: the pool
+    // jobs keep running and keep spending the cap.
+    {
+        var client_a = try connectClient(allocator, &fx);
+        for (0..max_inflight_per_account) |i| {
+            const m = plainAuth(@intCast(i + 1), "alice", "pw", "10.0.0.1");
+            defer allocator.free(m.auth_request.payload);
+            try client_a.send(m);
+            try fx.daemon.step(10);
+        }
+        client_a.close();
+        try fx.daemon.step(20);
+    }
+    try std.testing.expectEqual(max_inflight_per_account, fx.daemon.pending.count());
+
+    // A new lane for the same account is backpressured by the orphans.
+    var client_b = try connectClient(allocator, &fx);
+    defer client_b.close();
+    const m = plainAuth(1, "alice", "pw", "10.0.0.2");
+    defer allocator.free(m.auth_request.payload);
+    try client_b.send(m);
+    const reply = (try client_b.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
+    try std.testing.expectEqual(max_inflight_per_account, fx.daemon.pending.count());
+}
+
+test "sixteen in-flight exchanges on one IP deny the seventeenth" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 8000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, null, .{
+        .threads = 4,
+        .max_outstanding = 32,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 6000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    for (0..max_inflight_per_ip) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "u{d}", .{i}) catch unreachable;
+        const m = plainAuth(@intCast(i + 1), name, "pw", "10.0.0.7");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        try fx.daemon.step(10);
+    }
+    try std.testing.expectEqual(max_inflight_per_ip, fx.daemon.pending.count());
+
+    const m17 = plainAuth(17, "zed", "pw", "10.0.0.7");
+    defer allocator.free(m17.auth_request.payload);
+    try client.send(m17);
+    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 17), reply.auth_failure.conn_id);
+    try std.testing.expectEqual(max_inflight_per_ip, fx.daemon.pending.count());
+}
+
+test "four in-flight exchanges on one account deny the fifth" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 8000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, null, .{
+        .threads = 2,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 6000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    for (0..max_inflight_per_account) |i| {
+        var ip_buf: [16]u8 = undefined;
+        const ip = std.fmt.bufPrint(&ip_buf, "10.0.1.{d}", .{i}) catch unreachable;
+        const m = plainAuth(@intCast(i + 1), "alice", "pw", ip);
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        try fx.daemon.step(10);
+    }
+    try std.testing.expectEqual(max_inflight_per_account, fx.daemon.pending.count());
+
+    const m5 = plainAuth(5, "alice", "pw", "10.0.2.1");
+    defer allocator.free(m5.auth_request.payload);
+    try client.send(m5);
+    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 5), reply.auth_failure.conn_id);
+    try std.testing.expectEqual(max_inflight_per_account, fx.daemon.pending.count());
+}
+
+test "a full-pool denial records no outcome" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 5000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, .{
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 2,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 8000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m1 = plainAuth(1, "alice", "pw", "10.0.0.1");
+    defer allocator.free(m1.auth_request.payload);
+    try client.send(m1);
+    const m2 = plainAuth(2, "bob", "pw", "10.0.0.2");
+    defer allocator.free(m2.auth_request.payload);
+    try client.send(m2);
+    try fx.daemon.step(10);
+
+    const m3 = plainAuth(3, "carol", "pw", "10.0.0.3");
+    defer allocator.free(m3.auth_request.payload);
+    try client.send(m3);
+    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 3), reply.auth_failure.conn_id);
+
+    // Backpressure is not a failed credential: with lockout_threshold 1
+    // a recorded outcome would have locked carol or her IP outright.
+    try std.testing.expect(fx.handler.policy.check("carol", "10.0.0.3") == null);
+}
+
+test "cap slots release when the completions drain" {
+    const allocator = std.testing.allocator;
+    const port = try refusedPort();
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port});
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, .{
+        .lockout_threshold = 50,
+        .ip_lockout_threshold = 50,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 2,
+        .max_outstanding = 4,
+        .connect_timeout_ms = 1000,
+        .timeout_ms = 3000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    // Four exchanges for alice run to completion against the refusing
+    // IdP and drain out of both the pool and the pending table.
+    for (0..4) |i| {
+        const m = plainAuth(@intCast(i + 1), "alice", "pw", "10.0.0.4");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        const reply = (try client.nextReply(&fx.daemon, 3000)).?;
+        try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    }
+    const drain = std.time.milliTimestamp() + 2000;
+    while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < drain) {
+        try fx.daemon.step(10);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+    try std.testing.expectEqual(@as(usize, 4), fx.daemon.pool.exchanges_run.load(.monotonic));
+
+    // The fifth must queue and run: a leaked pool slot or a leaked
+    // pending entry would deny it at dispatch and keep the count at 4.
+    const m5 = plainAuth(5, "alice", "pw", "10.0.0.4");
+    defer allocator.free(m5.auth_request.payload);
+    try client.send(m5);
+    const reply5 = (try client.nextReply(&fx.daemon, 3000)).?;
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply5.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 5), reply5.auth_failure.conn_id);
+    const ran5 = fx.daemon.pool.exchanges_run.load(.monotonic);
+    try std.testing.expectEqual(@as(usize, 5), ran5);
+}
+
+test "a correct password answers auth_success end to end" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genIdpTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(allocator, "{s}/cert.pem", .{base}, 0);
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(allocator, "{s}/key.pem", .{base}, 0);
+    defer allocator.free(key_path);
+
+    // The token stub accepts the ROPC grant and returns an opaque
+    // access_token; the introspection stub vouches for alice.
+    var token_port = std.atomic.Value(u16).init(0);
+    const token_stub = try std.Thread.spawn(.{}, serveOneTlsResponse, .{
+        cert_path.ptr,
+        key_path.ptr,
+        "200 OK",
+        "{\"access_token\":\"opaque-at\",\"token_type\":\"Bearer\"}",
+        &token_port,
+    });
+    defer token_stub.join();
+    var intro_port = std.atomic.Value(u16).init(0);
+    const intro_stub = try std.Thread.spawn(.{}, serveOneTlsResponse, .{
+        cert_path.ptr,
+        key_path.ptr,
+        "200 OK",
+        "{\"active\":true,\"username\":\"alice\"}",
+        &intro_port,
+    });
+    defer intro_stub.join();
+
+    const dl = std.time.milliTimestamp() + 3000;
+    while ((token_port.load(.acquire) == 0 or intro_port.load(.acquire) == 0) and
+        std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(token_port.load(.acquire) != 0);
+    try std.testing.expect(intro_port.load(.acquire) != 0);
+
+    var token_buf: [128]u8 = undefined;
+    const token_url = try std.fmt.bufPrint(
+        &token_buf,
+        "https://localhost:{d}/token",
+        .{token_port.load(.acquire)},
+    );
+    var intro_buf: [128]u8 = undefined;
+    const intro_url = try std.fmt.bufPrint(
+        &intro_buf,
+        "https://localhost:{d}/introspect",
+        .{intro_port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, token_url, cert_path, intro_url, .{
+        .lockout_threshold = 1,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 2,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 5000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m = plainAuth(1, "alice", "correct-pw", "10.0.0.9");
+    defer allocator.free(m.auth_request.payload);
+    try client.send(m);
+    const reply = (try client.nextReply(&fx.daemon, 8000)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_success);
+    try std.testing.expectEqual(@as(u32, 1), reply.auth_success.conn_id);
+    try std.testing.expectEqualStrings("alice", reply.auth_success.username);
 }
