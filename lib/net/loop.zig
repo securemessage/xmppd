@@ -1144,7 +1144,10 @@ test "Loop: socket error arrives as eof plus errno" {
 
     const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     posix.connect(cfd, @ptrCast(&bound), blen) catch |err| switch (err) {
-        error.WouldBlock => {},
+        // A refused loopback connect usually pends (EINPROGRESS) but can
+        // report ECONNREFUSED synchronously under load; either way the
+        // socket error is pending and the write knote reports it below.
+        error.WouldBlock, error.ConnectionRefused => {},
         else => return err,
     };
     const h = try loop.attach(cfd, tctx(1), .{ .write = true });
