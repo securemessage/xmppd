@@ -195,7 +195,9 @@ const JWKS_MAX_AGE_SECONDS: i64 = 3600;
 /// copied out under the lock.
 const KeyCopy = struct {
     kty: KeyType,
-    n_buf: [1024]u8 = undefined,
+    /// base64url modulus; 1408 bytes covers an 8192-bit RSA key (1366
+    /// chars) with headroom. Anything larger is unusable, see KeyLookup.
+    n_buf: [1408]u8 = undefined,
     n_len: u16 = 0,
     e_buf: [16]u8 = undefined,
     e_len: u8 = 0,
@@ -222,6 +224,15 @@ const KeyFetch = union(enum) {
     absent,
     /// JWKS fetch failed; carries the transport verdict.
     failed: JwksFail,
+};
+
+/// Result of a direct cache lookup under jwks_mutex.
+const KeyLookup = union(enum) {
+    found: KeyCopy,
+    /// The kid exists but a component exceeds the copy bound: an unusable
+    /// cached key is a service problem, never a bad credential.
+    oversize,
+    absent,
 };
 
 /// JWT validation outcome for exchange callers.
@@ -735,7 +746,11 @@ pub const OidcStore = struct {
             };
         }
 
-        if (self.findKeyLocked(kid)) |k| return .{ .key = k };
+        switch (self.findKeyLocked(kid)) {
+            .found => |k| return .{ .key = k },
+            .oversize => return .{ .failed = .unavailable },
+            .absent => {},
+        }
         if (cache_stale) {
             // The refresh above already ran; the kid is genuinely absent.
             return .absent;
@@ -748,33 +763,42 @@ pub const OidcStore = struct {
                 error.FetchFailed, error.OutOfMemory => .unavailable,
             } };
         };
-        if (self.findKeyLocked(kid)) |k| return .{ .key = k };
-        return .absent;
+        return switch (self.findKeyLocked(kid)) {
+            .found => |k| .{ .key = k },
+            .oversize => .{ .failed = .unavailable },
+            .absent => .absent,
+        };
     }
 
     /// Direct cache lookup; copies the matched key's components so no
     /// jwks_body slice escapes the lock. Caller holds jwks_mutex.
-    fn findKeyLocked(self: *OidcStore, kid: []const u8) ?KeyCopy {
+    fn findKeyLocked(self: *OidcStore, kid: []const u8) KeyLookup {
         for (self.keys[0..self.key_count]) |*k| {
             if (!std.mem.eql(u8, k.kid, kid)) continue;
             var copy: KeyCopy = .{ .kty = k.kty };
             switch (k.kty) {
                 .rsa => {
-                    if (k.n.len > copy.n_buf.len or k.e.len > copy.e_buf.len) return null;
+                    if (k.n.len > copy.n_buf.len or k.e.len > copy.e_buf.len) {
+                        log.warn("JWKS: key '{s}' component exceeds the {d}-byte bound", .{ kid, copy.n_buf.len });
+                        return .oversize;
+                    }
                     @memcpy(copy.n_buf[0..k.n.len], k.n);
                     copy.n_len = @intCast(k.n.len);
                     @memcpy(copy.e_buf[0..k.e.len], k.e);
                     copy.e_len = @intCast(k.e.len);
                 },
                 .okp => {
-                    if (k.x.len > copy.x_buf.len) return null;
+                    if (k.x.len > copy.x_buf.len) {
+                        log.warn("JWKS: key '{s}' component exceeds the {d}-byte bound", .{ kid, copy.x_buf.len });
+                        return .oversize;
+                    }
                     @memcpy(copy.x_buf[0..k.x.len], k.x);
                     copy.x_len = @intCast(k.x.len);
                 },
             }
-            return copy;
+            return .{ .found = copy };
         }
-        return null;
+        return .absent;
     }
 
     /// Fetch JWKS from the IdP and replace the key cache. Caller holds
@@ -1507,6 +1531,35 @@ test "OidcStore: a digest mismatch fails closed" {
         OidcStore.ValidateError.IdpUnavailable,
         store.validatePassword(allocator, "alice", "pw"),
     );
+}
+
+test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+    try store.start();
+
+    // One modulus past the copy bound, one exactly at an 8192-bit RSA
+    // modulus (1366 base64url chars) that must still verify.
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"keys":[{{"kty":"RSA","kid":"huge","n":"{s}","e":"AQAB"}},{{"kty":"RSA","kid":"rsa8k","n":"{s}","e":"AQAB"}}]}}
+    , .{ "A" ** 3000, "A" ** 1366 });
+    store.jwks_body = body; // deinit frees it
+    store.jwks_last_refresh = 0; // stale: a failed refresh still serves the cache
+    store.parseJwksKeys();
+    try std.testing.expectEqual(@as(usize, 2), store.key_count);
+
+    // The oversized kid reads as an IdP outage, so the user attempt is
+    // answered temporary-auth-failure rather than counted as a rejection.
+    switch (store.signingKey("huge", testOptions(5000))) {
+        .failed => |v| try std.testing.expect(v == .unavailable),
+        else => return error.ExpectedUnavailable,
+    }
+    // The 8192-bit key fits the copy bound and is served normally.
+    switch (store.signingKey("rsa8k", testOptions(5000))) {
+        .key => |k| try std.testing.expectEqual(@as(usize, 1366), k.n().len),
+        else => return error.ExpectedKey,
+    }
 }
 
 test "OidcStore: replay returns identity, rejection and temporary failure" {
