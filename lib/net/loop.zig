@@ -274,9 +274,9 @@ pub const Loop = struct {
             posix.sigaction(@intCast(signo), &self.saved_dispositions[signo], null);
         }
         for (self.handles.values[0..self.handles.pool]) |h| {
-            if (h.fd >= 0) rawClose(h.fd);
+            if (h.fd >= 0) rawClose(h.fd, &self.stats_.last_errno);
         }
-        rawClose(self.kq);
+        rawClose(self.kq, &self.stats_.last_errno);
         self.handles.deinit(gpa);
         self.wheel.deinit(gpa);
         gpa.free(self.requeue_list.allocatedSlice());
@@ -398,7 +398,7 @@ pub const Loop = struct {
         self.purgeDirty(h);
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
-        rawClose(fd);
+        rawClose(fd, &self.stats_.last_errno);
         self.stats_.handles_closed += 1;
 
         // Every paused handle resumes: a close frees a descriptor, which is
@@ -440,7 +440,7 @@ pub const Loop = struct {
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         if (first_err) |err| {
-            rawClose(fd);
+            rawClose(fd, &self.stats_.last_errno);
             return err;
         }
         return fd;
@@ -1096,9 +1096,11 @@ const ev_eof: u16 = 0x8000; // EV_EOF, absent from std.c.EV on FreeBSD
 extern "c" fn kqueuex(flags: c_int) c_int;
 
 /// close(2) that tolerates EBADF: the fd may have been closed out-of-band
-/// (the change_failed path leads consumers here) or already reaped.
-fn rawClose(fd: posix.fd_t) void {
-    _ = std.c.close(fd);
+/// (the change_failed path leads consumers here) or already reaped. A real
+/// close error is still recorded in last_errno for observability.
+fn rawClose(fd: posix.fd_t, errno_out: ?*u32) void {
+    if (std.c.close(fd) != 0 and errno_out != null)
+        errno_out.?.* = @intFromEnum(posix.errno(-1));
 }
 
 const w_nohang: c_int = 1; // WNOHANG
@@ -1950,6 +1952,19 @@ test "Loop: cancelTimer disarms the kernel timer" {
     const before = loop.stats().raw_events;
     try loop.wait();
     try std.testing.expectEqual(before, loop.stats().raw_events);
+}
+
+test "Loop: a failed raw close lands in last_errno" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp = try socketpairNb();
+    posix.close(sp[1]);
+    const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
+    posix.close(sp[0]); // out-of-band: the close-time rawClose gets EBADF
+
+    loop.close(h) catch {};
+    try std.testing.expectEqual(@intFromEnum(posix.E.BADF), loop.stats().last_errno);
 }
 
 test "Loop: detach purges the dirty entry immediately" {
