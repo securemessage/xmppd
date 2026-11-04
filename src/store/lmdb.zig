@@ -889,6 +889,7 @@ test "LmdbBackend: open advises MADV_NOCORE over the env map" {
     // contain a value pointer LMDB returned from inside the map.
     const path = freshTestDir();
     var info: MdbEnvInfoC = undefined;
+    const users_ns = comptime backend.registered("users");
 
     const calls0 = madviseCall.calls;
     {
@@ -899,8 +900,8 @@ test "LmdbBackend: open advises MADV_NOCORE over the env map" {
         try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
         try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
 
-        try db.put("users", "probe-key", "probe-value");
-        var iter = try db.iterator("users", "probe-key");
+        try db.put(users_ns, "probe-key", "probe-value");
+        var iter = try db.iterator(users_ns, "probe-key");
         defer iter.deinit();
         const p = @intFromPtr(iter.next().?.value.ptr);
         try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
@@ -915,7 +916,7 @@ test "LmdbBackend: open advises MADV_NOCORE over the env map" {
         try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
         try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
 
-        var iter = try db.iterator("users", "probe-key");
+        var iter = try db.iterator(users_ns, "probe-key");
         defer iter.deinit();
         const p = @intFromPtr(iter.next().?.value.ptr);
         try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
@@ -933,8 +934,9 @@ test "LmdbBackend: a madvise failure does not fail the open" {
     var db = try LmdbBackend.open(path, .{});
     try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
     defer db.close();
-    try db.put("users", "alice", "creds");
-    const val = try db.get(std.testing.allocator, "users", "alice");
+    const users_ns = comptime backend.registered("users");
+    try db.put(users_ns, "alice", "creds");
+    const val = try db.get(std.testing.allocator, users_ns, "alice");
     defer if (val) |v| std.testing.allocator.free(v);
     try std.testing.expectEqualStrings("creds", val.?);
 }
