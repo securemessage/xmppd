@@ -286,6 +286,9 @@ pub const Resolver = struct {
     /// Test seam: report every TCP connect as synchronously refused
     /// (see tcpSend); FreeBSD does this on real wire paths.
     fail_connects: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test seam: report every knote registration as failed (see
+    /// keventApplyChecked); covers the ensureOpen failure ordering.
+    fail_kevents: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -577,9 +580,12 @@ pub const Resolver = struct {
         const fd = try posix.socket(self.server.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
         try rawConnect(fd, &self.server.any, self.server.getOsSockLen());
-        self.fd = fd;
         var ch = [1]posix.Kevent{.{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 }};
         try self.keventApply(&ch);
+        // Publish only once the knote is armed: an early failure
+        // leaves self.fd holding the socket errdefer just closed, and
+        // a later send or deinit would touch whatever reused it.
+        self.fd = fd;
     }
 
     /// One kevent turn on the resolver's kqueue. `timeout_ms` may be 0
@@ -819,6 +825,9 @@ pub const Resolver = struct {
     }
 
     fn keventApplyChecked(self: *Resolver, ch: []const posix.Kevent, enoent_ok: bool) !void {
+        if (builtin.is_test) {
+            if (self.fail_kevents) return error.KeventChange;
+        }
         const nonblock = std.c.timespec{ .sec = 0, .nsec = 0 };
         var evbuf: [8]posix.Kevent = undefined;
         var off: usize = 0;
@@ -5019,6 +5028,39 @@ test "dns-async: applying changes never drains the events a parent watches" {
 
     const got = try posix.kevent(pkq, &.{}, &evs, &zero);
     try std.testing.expect(got >= 1);
+}
+
+test "dns-async: a failed socket registration leaves no dangling fd" {
+    // Goal: when the UDP socket's knote registration fails, self.fd
+    // must not keep the closed descriptor: a stale number would send
+    // on whatever reuses it and deinit would close that stranger's
+    // socket (or panic on EBADF).
+    // Method: fail the registration through the seam, then check the
+    // resolver stays closed and deinit leaves a reused fd alive.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    r.fail_kevents = true;
+
+    try std.testing.expectError(error.KeventChange, r.ensureOpen());
+    try std.testing.expectEqual(@as(posix.fd_t, -1), r.fd);
+
+    // An unrelated socket may now hold the abandoned number; deinit
+    // must not close it.
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    r.deinit();
+    // deinit frees but does not reset the struct; a fresh resolver
+    // keeps the deferred deinit off dangling lists.
+    r = Resolver.init(std.testing.allocator);
+    try posix.getsockname(ufd, &actual, &slen);
+    posix.close(ufd);
+
+    // A retry with the seam cleared opens cleanly.
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    try r.ensureOpen();
+    try std.testing.expect(r.fd >= 0);
 }
 
 var fake_now: i64 = 0;
