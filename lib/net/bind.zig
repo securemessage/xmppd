@@ -380,6 +380,8 @@ pub const Listener = struct {
 
     fn pause(self: *Listener, reason: PauseReason) AcceptError!AcceptOutcome {
         self.pause_reason = reason;
+        // The accept pass is over: the next pass gets the whole budget.
+        self.accepted_this_pass = 0;
         self.loop.pauseReadUntilClose(self.handle) catch |err| return switch (err) {
             error.StaleHandle => error.ListenerInvalid,
             error.PausedListFull => error.Unexpected,
@@ -978,6 +980,40 @@ test "Listener: paused resets the pass's accept budget" {
 
     try loop.pauseReadUntilClose(listener.handle);
     try std.testing.expect(try listener.acceptNext() == .paused);
+    try std.testing.expectEqual(@as(u16, 0), listener.accepted_this_pass);
+}
+
+test "Listener: pause and peer_rejected reset the accept budget" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    const bound = try boundAddr(lfd);
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(cfd);
+    try posix.connect(cfd, @ptrCast(&bound), @sizeOf(posix.sockaddr.in));
+    const c2 = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(c2);
+    try posix.connect(c2, @ptrCast(&bound), @sizeOf(posix.sockaddr.in));
+    try loop.wait();
+    while (loop.next()) |_| {}
+
+    // pause(): an accept-errno pause starts a fresh pass, budget included.
+    const out = try listener.acceptNext();
+    try std.testing.expect(out == .accepted);
+    posix.close(out.accepted.fd);
+    _ = try listener.pause(.emfile);
+    try std.testing.expectEqual(@as(u16, 0), listener.accepted_this_pass);
+    try loop.resumePaused(listener.handle);
+
+    // peer_rejected: a TCP accepted fd cannot carry unix credentials, so
+    // a listener declared unix reports rejection and resets the budget.
+    listener.family = .unix;
+    const out2 = try listener.acceptNext();
+    try std.testing.expect(out2 == .peer_rejected);
     try std.testing.expectEqual(@as(u16, 0), listener.accepted_this_pass);
 }
 
