@@ -430,8 +430,9 @@ pub const AcceptError = error{ ListenerInvalid, Unexpected };   // EBADF, ENOTSO
   served and no backlog is stranded under `EV_CLEAR`.
 - **EMFILE / ENFILE / ENOBUFS / ENOMEM:** `pauseReadUntilClose` disables read interest
   instead of spinning; the next `close()` of any handle on that loop re-enables it, and
-  `EV_ENABLE` reports the queued connections. For ENFILE and ENOBUFS, which this process
-  may not relieve, a fallback deadline of 250 ms resumes the listener too (see Q3).
+  `EV_ENABLE` reports the queued connections. Every exhaustion pause also arms a
+  250 ms fallback deadline: the relieving close may happen on another loop's thread
+  (thread-per-core model), which this loop cannot see (see Q3).
 
 ## 10. Ownership, capacity and threading
 
@@ -617,9 +618,10 @@ Result: **PASS** for the library, with Q7 to settle.
 - **Q2 peer credentials.** The order says `getpeereid` on accept; T258 showed it is not
   enough for the IPC gate. Proposal: `LOCAL_PEERCRED` (`PeerCred` above, includes the
   getpeereid fields).
-- **Q3 ENFILE/ENOBUFS.** Resume on the loop's next close plus a 250 ms fallback deadline,
-  because a system-wide shortage may never be relieved by this loop. This is a backoff
-  deadline, not an I/O driver. Accept, or close-only?
+- **Q3 descriptor-exhaustion pauses.** Resume on the loop's next close plus a 250 ms
+  fallback deadline for every exhaustion reason including EMFILE: the relieving close
+  may land on another loop's thread and never be seen here. This is a backoff
+  deadline, not an I/O driver.
 - **Q4 targets.** FreeBSD 14+ only, comptime error elsewhere. Do any lib/xmppc consumers
   (Kumiko Chat, continuum-xmpp-bridge) need macOS or Linux before WS8? If yes, the
   kqueue core can stay portable to macOS at small cost; Linux would be a separate

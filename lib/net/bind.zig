@@ -364,17 +364,12 @@ pub const Listener = struct {
             error.StaleHandle => error.ListenerInvalid,
             error.PausedListFull => error.Unexpected,
         };
-        // Only ENFILE/ENOBUFS/ENOMEM get the fallback deadline: those may
-        // outlast every close in this process. EMFILE is relieved by a
-        // close, which always resumes the pause. The TimerId, not a ctx
-        // sentinel, identifies it in onDeadline.
-        switch (reason) {
-            .emfile => {},
-            else => {
-                const ms = self.fallback_resume_ms;
-                self.fallback_timer = self.loop.scheduleIn(ms, .none) catch null;
-            },
-        }
+        // Every exhaustion pause gets the fallback deadline: relief may come
+        // from a close on another loop's thread (thread-per-core model), so
+        // this loop cannot rely on its own close() path. The TimerId, not a
+        // ctx sentinel, identifies it in onDeadline.
+        const ms = self.fallback_resume_ms;
+        self.fallback_timer = self.loop.scheduleIn(ms, .none) catch null;
         return .{ .paused = reason };
     }
 
@@ -848,8 +843,9 @@ fn childEmfile() void {
     if (n != 0) posix.exit(15); // accept must have failed
     if (!paused) posix.exit(25);
     if (!loop.isPaused(listener.handle)) posix.exit(16);
-    // EMFILE is relieved by a close: no fallback deadline gets armed.
-    if (listener.fallback_timer != null) posix.exit(27);
+    // The EMFILE pause also arms the fallback deadline: relief may come from
+    // a close on another loop's thread.
+    if (listener.fallback_timer == null) posix.exit(27);
 
     // Back under the quota (a soft limit may be raised to the hard one), the
     // close frees a descriptor and resumes the listener.
@@ -880,5 +876,85 @@ fn childEmfile() void {
     // The EMFILE'd connection stayed in the backlog: it and the fresh one
     // are both accepted after the resume.
     if (n != 2) posix.exit(20);
+    posix.exit(0);
+}
+
+test "Listener: EMFILE relieved outside the loop resumes on the fallback" {
+    // No close on this loop frees the descriptor; only the 250 ms fallback
+    // deadline can lift the pause.
+    const pid = try posix.fork();
+    if (pid == 0) {
+        childEmfileOutsideLoop();
+        posix.exit(1);
+    }
+    const res = posix.waitpid(pid, 0);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @intCast(res.status)));
+}
+
+fn childEmfileOutsideLoop() void {
+    const rl = posix.getrlimit(.NOFILE) catch posix.exit(2);
+
+    var loop = testLoop() catch posix.exit(4);
+    const lfd = bindTcp(&.{ .address = "127.0.0.1", .port = 0 }) catch posix.exit(6);
+    var listener: Listener = undefined;
+    listener.attach(&loop, lfd, test_ctx, .tcp) catch posix.exit(7);
+
+    const bound = boundAddr(lfd) catch posix.exit(10);
+    const st_cx = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const cfd = posix.socket(posix.AF.INET, st_cx, 0) catch posix.exit(11);
+    posix.connect(cfd, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch posix.exit(12);
+
+    const lim2: posix.rlimit = .{ .cur = 4, .max = rl.max };
+    posix.setrlimit(.NOFILE, lim2) catch posix.exit(13);
+
+    loop.wait() catch posix.exit(14);
+    var paused = false;
+    while (loop.next()) |ev| {
+        if (ev == .readable) {
+            while (true) {
+                const out = listener.acceptNext() catch posix.exit(24);
+                switch (out) {
+                    .accepted => |a| posix.close(a.fd),
+                    .paused => {
+                        paused = true;
+                        break;
+                    },
+                    else => break,
+                }
+            }
+        }
+    }
+    if (!paused) posix.exit(25);
+    if (!loop.isPaused(listener.handle)) posix.exit(16);
+    if (listener.fallback_timer == null) posix.exit(27);
+
+    // Descriptors free up with no close on this loop: raise the quota so the
+    // EMFILE condition is gone, but leave the listener paused. Only the
+    // fallback deadline can resume it.
+    const back: posix.rlimit = .{ .cur = rl.max, .max = rl.max };
+    posix.setrlimit(.NOFILE, back) catch posix.exit(21);
+
+    const watchdog = loop.scheduleIn(2000, test_ctx) catch posix.exit(22);
+    var resumed = false;
+    var accepted = false;
+    while (!(resumed and accepted)) {
+        loop.wait() catch posix.exit(19);
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => |d| {
+                    if (d.timer.eql(watchdog)) posix.exit(20); // never resumed
+                    if (listener.onDeadline(d)) resumed = true;
+                },
+                .readable => {
+                    const out = listener.acceptNext() catch posix.exit(26);
+                    if (out == .accepted) {
+                        posix.close(out.accepted.fd);
+                        accepted = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
     posix.exit(0);
 }
