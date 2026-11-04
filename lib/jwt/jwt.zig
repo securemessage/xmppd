@@ -333,6 +333,25 @@ test "b64urlDecode: with url-safe chars" {
     try std.testing.expectEqual(@as(u8, 0xfe), buf[2]);
 }
 
+test "b64urlDecode: strict base64url -- padding and standard alphabet rejected" {
+    var buf: [256]u8 = undefined;
+    // RFC 7515 segments are unpadded base64url: '=' never appears, and the
+    // standard-alphabet '+' and '/' are not the '-' and '_' the wire uses.
+    try std.testing.expect(b64urlDecode("aGVsbG8=", &buf) == null);
+    try std.testing.expect(b64urlDecode("aGVsbG8==", &buf) == null);
+    try std.testing.expect(b64urlDecode("+//+", &buf) == null);
+    try std.testing.expect(b64urlDecode("aGVs+bG8", &buf) == null);
+    try std.testing.expect(b64urlDecode("aGVs/bG8", &buf) == null);
+
+    // parse() applies the same strictness: a padded header segment is a
+    // malformed token, not a tolerated variant.
+    var decode: DecodeBuffer = undefined;
+    try std.testing.expectError(
+        JwtError.InvalidBase64,
+        parse("eyJhbGciOiJSUzI1NiJ9=.eyJzdWIiOiJhIn0.c2ln", &decode),
+    );
+}
+
 test "parse: JWT structure" {
     // A minimal test JWT (header.payload.signature -- signature won't verify without key)
     const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0"; // {"alg":"RS256","kid":"test-key"}
