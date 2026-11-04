@@ -538,16 +538,16 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
-        // The pending check reads before the knote attaches: a signal
-        // posted between attach and sigpending would fire the knote and
-        // still sit in the pending set, reported twice. Installing SIG_IGN
-        // discards pending instances of the signal (POSIX), so the read
-        // must also happen before it lands. Pending signals emit once as
-        // a synthetic `.signal` event.
+        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
+
+        // Installing SIG_IGN discards pending instances of the signal
+        // (POSIX), so the pending check must read before it lands. Pending
+        // signals emit once as a synthetic `.signal` event. Reading after
+        // the attach means a blocked signal posted in the gap fires the
+        // knote and still sits in the pending set, reported twice; for a
+        // coalescing signal a duplicate beats a lost report.
         var pend: posix.sigset_t = posix.sigemptyset();
         const was_pending = sigpending(&pend) == 0 and posix.sigismember(&pend, signo);
-
-        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
 
         const ign: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.IGN },
