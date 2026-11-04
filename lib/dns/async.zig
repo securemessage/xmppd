@@ -40,7 +40,6 @@ const TCP_TIMEOUT_MS: i64 = 4000;
 /// per-query deadline still applies inside it.
 const CHAIN_DEADLINE_MS: i64 = 10_000;
 const MAX_JOBS: usize = 64;
-const CACHE_CAP: usize = 64;
 /// Flattened connect targets per resolution; a hostile SRV answer
 /// cannot grow a job's target list past this.
 const TARGET_CAP: usize = 16;
@@ -50,6 +49,19 @@ const SRV_CAP: usize = 32;
 /// Cache TTL ceiling: positive and negative entries alike are
 /// expired after five minutes regardless of the advertised TTL.
 const CACHE_TTL_CEIL_S: u32 = 300;
+/// Per-worker cache bounds (ADR-13: "sized for federation"): at most
+/// CACHE_ENTRIES_MAX owner names and CACHE_BYTES_MAX accounted bytes
+/// (owner name + rdata + per-entry overhead). Eviction on insert
+/// prefers stale rows over fresh and falls back to the LRU tail.
+const CACHE_ENTRIES_MAX: usize = 4096;
+const CACHE_BYTES_MAX: usize = 4 * 1024 * 1024;
+/// RFC 8767: a stale answer is servable for at most one day past
+/// expiry, and a failed refresh is not retried inside 30 s.
+const STALE_MAX_MS: i64 = 86_400_000;
+const STALE_RECHECK_MS: i64 = 30_000;
+/// The stale-serve log line is emitted at most once per window and
+/// owner name.
+const STALE_LOG_MS: i64 = 60_000;
 
 pub const Service = enum(u8) { client = 0, server = 1 };
 
@@ -221,12 +233,42 @@ const SrvEnt = struct {
 /// exists without records of the asked type (nodata).
 const NegKind = enum { none, nxdomain, nodata };
 
-const CacheEnt = struct {
-    key: []u8, // "folded_qname\0qtype_be2"
-    rrs: []wire.Rr, // names and rdata owned per record; empty when neg
+/// One cached RRset (or negative answer) per owner and qtype.
+/// expires_ms ends the fresh window; stale_ms ends the serve-stale
+/// window at expires_ms + STALE_MAX_MS (RFC 8767 one-day cap).
+/// last_fail_ms stamps the most recent failed refresh for the
+/// STALE_RECHECK_MS suppression rule; refreshing marks a wire refresh
+/// in flight: the row is pinned (a job may hold a borrowed pointer to
+/// it) and a second refresh is never started alongside it.
+const TypeEnt = struct {
+    rtype: u16,
     neg: NegKind = .none,
-    expires_ms: i64,
+    rrs: []wire.Rr = &.{}, // names and rdata owned per record
+    expires_ms: i64 = 0,
+    stale_ms: i64 = 0,
+    last_fail_ms: i64 = 0,
+    refreshing: bool = false,
 };
+
+/// Cache owner: every type row for one folded qname, its LRU node and
+/// its accounted bytes. Type rows are heap objects so a pointer stays
+/// valid across row inserts and removals while a refresh pins it.
+const OwnerEnt = struct {
+    name: []u8, // folded qname, owned; also the map key
+    node: std.DoublyLinkedList.Node = .{},
+    types: std.ArrayListUnmanaged(*TypeEnt) = .{},
+    bytes: usize = 0,
+    /// Rate limiter for the stale-serve log line, per owner name.
+    stale_log_ms: i64 = 0,
+};
+
+/// A located cache row plus its owner, so stale serving can account
+/// and log per owner name.
+const CacheHit = struct { owner: *OwnerEnt, ent: *TypeEnt };
+
+/// cacheGetClass verdicts: a fresh row serves at once; a stale row
+/// serves only through the RFC 8767 refresh rules.
+const CacheClass = union(enum) { fresh: CacheHit, stale: CacheHit };
 
 /// A request waiting for an in-flight job slot.
 const WaitEnt = struct {
@@ -262,15 +304,23 @@ pub const Resolver = struct {
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     cb: Cb = .{ .ctx = null, .fun = noopCallback },
     qcb: QueryCb = .{ .ctx = null, .fun = noopQueryCallback },
-    cache: std.ArrayListUnmanaged(CacheEnt) = .{},
+    /// The RR and negative cache: folded owner name -> OwnerEnt, an
+    /// intrusive owner LRU (MRU head) and the accounted byte total.
+    /// Bounded by CACHE_ENTRIES_MAX and CACHE_BYTES_MAX; a hit hashes
+    /// a stack-folded name and never allocates (ADR-13, RFC 8767).
+    owners: std.StringHashMapUnmanaged(*OwnerEnt) = .{},
+    lru: std.DoublyLinkedList = .{},
+    cache_bytes: usize = 0,
+    /// Stale answers served (RFC 8767); counted for observability.
+    stale_serves: usize = 0,
     /// Requests queued behind a full in-flight set; promoted FIFO as
     /// jobs complete.
     wait_queue: std.ArrayListUnmanaged(WaitEnt) = .{},
     /// Whole-chain deadline for resolve() jobs; a field so tests can
     /// shrink it instead of sleeping ten seconds.
     chain_deadline_ms: i64 = CHAIN_DEADLINE_MS,
-    /// Wall clock for cache expiry; a field so tests can pin time
-    /// instead of sleeping on real TTLs.
+    /// Monotonic clock for cache expiry; a field so tests can pin
+    /// time instead of sleeping on real TTLs.
     now_ms: *const fn () i64 = nowMs,
     /// Requests rejected because the wait queue was full; observability
     /// for a queue that silently dropping would otherwise hide.
@@ -334,8 +384,9 @@ pub const Resolver = struct {
         self.jobs.deinit(self.alloc);
         for (self.wait_queue.items) |e| self.alloc.free(e.name);
         self.wait_queue.deinit(self.alloc);
-        for (self.cache.items) |e| self.freeCacheEnt(e);
-        self.cache.deinit(self.alloc);
+        var owner_it = self.owners.iterator();
+        while (owner_it.next()) |e| self.freeOwner(e.value_ptr.*);
+        self.owners.deinit(self.alloc);
         if (self.fd >= 0) posix.close(self.fd);
         if (self.kq >= 0) posix.close(self.kq);
     }
@@ -1578,50 +1629,156 @@ pub const Resolver = struct {
 
     // -- bounded TTL cache -------------------------------------------------
 
-    /// Cache key: the case-folded qname, a NUL, then the big-endian
-    /// qtype. DNS names compare case-insensitively, so lookups keyed
-    /// on the wire form must fold or a cased duplicate misses.
-    fn cacheKey(buf: []u8, qname: []const u8, qtype: u16) ?[]u8 {
-        if (qname.len + 3 > buf.len) return null;
+    /// Folded owner key: the qname lowercased on the stack. DNS names
+    /// compare case-insensitively, so lookups keyed on the wire form
+    /// must fold or a cased duplicate misses.
+    fn foldName(buf: []u8, qname: []const u8) ?[]u8 {
+        if (qname.len > buf.len) return null;
         for (qname, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-        buf[qname.len] = 0;
-        std.mem.writeInt(u16, buf[qname.len + 1 ..][0..2], qtype, .big);
-        return buf[0 .. qname.len + 3];
+        return buf[0..qname.len];
     }
 
-    fn cacheGet(self: *Resolver, qname: []const u8, qtype: u16) ?*CacheEnt {
-        var key_buf: [280]u8 = undefined;
-        const key = cacheKey(&key_buf, qname, qtype) orelse return null;
-        const now = self.now_ms();
-        for (self.cache.items) |*e| {
-            if (std.mem.eql(u8, e.key, key) and e.expires_ms > now) return e;
+    fn findTypeRow(owner: *OwnerEnt, rtype: u16) ?usize {
+        for (owner.types.items, 0..) |ent, i| {
+            if (ent.rtype == rtype) return i;
         }
         return null;
     }
 
-    /// Shared insert: folded key, CACHE_CAP bound with FIFO eviction.
-    fn cacheInsert(self: *Resolver, qname: []const u8, qtype: u16, rrs: []wire.Rr, neg: NegKind, ttl_s: u32) void {
-        var key_buf: [280]u8 = undefined;
-        const kb = cacheKey(&key_buf, qname, qtype) orelse return;
-        const key = self.alloc.dupe(u8, kb) catch return;
-        const dup = self.dupRrs(rrs) catch {
-            self.alloc.free(key);
-            return;
-        };
-        if (self.cache.items.len >= CACHE_CAP) {
-            const e = self.cache.orderedRemove(0);
-            self.freeCacheEnt(e);
+    /// Classify the cached row for (qname, rtype): fresh below
+    /// expires_ms, stale until stale_ms, and a miss past that (the
+    /// dead row is pruned on the spot). A hit moves the owner to the
+    /// LRU head. No allocation on this path.
+    fn cacheGetClass(self: *Resolver, qname: []const u8, rtype: u16) ?CacheClass {
+        var name_buf: [280]u8 = undefined;
+        const folded = foldName(&name_buf, qname) orelse return null;
+        const owner = self.owners.get(folded) orelse return null;
+        const idx = findTypeRow(owner, rtype) orelse return null;
+        const now = self.now_ms();
+        const ent = owner.types.items[idx];
+        if (now < ent.expires_ms) {
+            self.lru.remove(&owner.node);
+            self.lru.prepend(&owner.node);
+            return .{ .fresh = .{ .owner = owner, .ent = ent } };
         }
-        self.cache.append(self.alloc, .{ .key = key, .rrs = dup, .neg = neg, .expires_ms = self.now_ms() + @as(i64, ttl_s) * 1000 }) catch {
-            self.alloc.free(key);
-            self.freeRrs(dup);
+        if (now < ent.stale_ms) {
+            self.lru.remove(&owner.node);
+            self.lru.prepend(&owner.node);
+            return .{ .stale = .{ .owner = owner, .ent = ent } };
+        }
+        // Past even the serve-stale window: prune the dead row now
+        // rather than waiting for memory pressure to collect it.
+        self.removeTypeRow(owner, idx);
+        if (owner.types.items.len == 0) self.removeOwner(owner);
+        return null;
+    }
+
+    /// Fresh-hit lookup for callers that only want live data.
+    fn cacheGet(self: *Resolver, qname: []const u8, rtype: u16) ?*TypeEnt {
+        const class = self.cacheGetClass(qname, rtype) orelse return null;
+        return switch (class) {
+            .fresh => |h| h.ent,
+            .stale => null,
         };
+    }
+
+    /// Insert or replace the (qname, rtype) row with a deep copy of
+    /// `rrs`. An answer carrying a CNAME record proves the owner is
+    /// an alias: RFC 8767 section 7 then invalidates the owner's
+    /// other cached types, so they are evicted here (a row pinned by
+    /// an in-flight refresh survives - it is replaced or failed out
+    /// when its refresh concludes). Bounds are enforced after the
+    /// insert, stale rows evicting before fresh ones.
+    fn cacheInsert(self: *Resolver, qname: []const u8, rtype: u16, rrs: []const wire.Rr, neg: NegKind, ttl_s: u32) void {
+        var name_buf: [280]u8 = undefined;
+        const folded = foldName(&name_buf, qname) orelse return;
+        const now = self.now_ms();
+        const dup = self.dupRrs(rrs) catch return;
+
+        const owner = self.owners.get(folded) orelse owner: {
+            const name = self.alloc.dupe(u8, folded) catch {
+                self.freeRrs(dup);
+                return;
+            };
+            const o = self.alloc.create(OwnerEnt) catch {
+                self.alloc.free(name);
+                self.freeRrs(dup);
+                return;
+            };
+            o.* = .{ .name = name };
+            self.owners.put(self.alloc, o.name, o) catch {
+                self.alloc.destroy(o);
+                self.alloc.free(name);
+                self.freeRrs(dup);
+                return;
+            };
+            self.lru.prepend(&o.node);
+            o.bytes = @sizeOf(OwnerEnt) + name.len;
+            self.cache_bytes += o.bytes;
+            break :owner o;
+        };
+
+        const expires_ms = now + @as(i64, ttl_s) * 1000;
+        if (findTypeRow(owner, rtype)) |idx| {
+            const ent = owner.types.items[idx];
+            const old_bytes = typeEntBytes(ent);
+            self.freeRrs(ent.rrs);
+            ent.* = .{
+                .rtype = rtype,
+                .neg = neg,
+                .rrs = dup,
+                .expires_ms = expires_ms,
+                .stale_ms = expires_ms + STALE_MAX_MS,
+            };
+            const new_bytes = typeEntBytes(ent);
+            owner.bytes = owner.bytes - old_bytes + new_bytes;
+            self.cache_bytes = self.cache_bytes - old_bytes + new_bytes;
+        } else {
+            const ent = self.alloc.create(TypeEnt) catch {
+                if (owner.types.items.len == 0) self.removeOwner(owner);
+                self.freeRrs(dup);
+                return;
+            };
+            ent.* = .{
+                .rtype = rtype,
+                .neg = neg,
+                .rrs = dup,
+                .expires_ms = expires_ms,
+                .stale_ms = expires_ms + STALE_MAX_MS,
+            };
+            owner.types.append(self.alloc, ent) catch {
+                self.alloc.destroy(ent);
+                if (owner.types.items.len == 0) self.removeOwner(owner);
+                self.freeRrs(dup);
+                return;
+            };
+            const new_bytes = typeEntBytes(ent);
+            owner.bytes += new_bytes;
+            self.cache_bytes += new_bytes;
+        }
+        self.lru.remove(&owner.node);
+        self.lru.prepend(&owner.node);
+
+        for (dup) |rr| {
+            if (rr.rtype != wire.TYPE_CNAME) continue;
+            var i: usize = 0;
+            while (i < owner.types.items.len) {
+                const ent = owner.types.items[i];
+                if (ent.rtype != rtype and !ent.refreshing) {
+                    self.removeTypeRow(owner, i);
+                    continue;
+                }
+                i += 1;
+            }
+            break;
+        }
+        self.cacheEnforceBounds(now);
     }
 
     /// Store a second deep copy of the answer under (qname, qtype) with a
     /// TTL-derived expiry, capped at CACHE_TTL_CEIL_S; TTL 0 is not
     /// cached.
-    fn cachePut(self: *Resolver, qname: []const u8, qtype: u16, rrs: []wire.Rr) void {
+    fn cachePut(self: *Resolver, qname: []const u8, qtype: u16, rrs: []const wire.Rr) void {
         const ttl = @min(minTtl(rrs), CACHE_TTL_CEIL_S);
         if (ttl == 0) return;
         self.cacheInsert(qname, qtype, rrs, .none, ttl);
@@ -1648,9 +1805,92 @@ pub const Resolver = struct {
         return null;
     }
 
-    fn freeCacheEnt(self: *Resolver, e: CacheEnt) void {
-        self.alloc.free(e.key);
-        if (e.rrs.len > 0) self.freeRrs(e.rrs);
+    /// Accounted size of one type row: the row object, its slot in the
+    /// owner's row table, and every record's struct, name and rdata.
+    fn typeEntBytes(ent: *const TypeEnt) usize {
+        var n: usize = @sizeOf(TypeEnt) + @sizeOf(*TypeEnt);
+        for (ent.rrs) |rr| n += @sizeOf(wire.Rr) + rr.name.len + rr.rdata.len;
+        return n;
+    }
+
+    /// An owner with any row still inside its fresh window.
+    fn ownerHasFresh(owner: *const OwnerEnt, now: i64) bool {
+        for (owner.types.items) |ent| {
+            if (now < ent.expires_ms) return true;
+        }
+        return false;
+    }
+
+    /// An owner pinned against eviction: a refreshing row may be
+    /// borrowed by the job refreshing it.
+    fn ownerPinned(owner: *const OwnerEnt) bool {
+        for (owner.types.items) |ent| {
+            if (ent.refreshing) return true;
+        }
+        return false;
+    }
+
+    /// Enforce the entry and byte bounds after an insert, evicting
+    /// until both hold (or only pinned owners remain).
+    fn cacheEnforceBounds(self: *Resolver, now: i64) void {
+        while (self.owners.count() > CACHE_ENTRIES_MAX or self.cache_bytes > CACHE_BYTES_MAX) {
+            if (!self.evictOne(now)) return;
+        }
+    }
+
+    /// Evict one owner, stale rows before fresh ones (ADR-13 /
+    /// RFC 8767 section 6): the LRU tail is walked for the first
+    /// owner holding no fresh row; an all-fresh cache sheds its tail
+    /// instead. Pinned owners are skipped. Returns false when nothing
+    /// can be evicted. O(owners) but only on an insert over budget.
+    fn evictOne(self: *Resolver, now: i64) bool {
+        var tail_fresh: ?*OwnerEnt = null;
+        var node = self.lru.last;
+        while (node) |n| : (node = n.prev) {
+            const owner: *OwnerEnt = @fieldParentPtr("node", n);
+            if (ownerPinned(owner)) continue;
+            if (!ownerHasFresh(owner, now)) {
+                self.removeOwner(owner);
+                return true;
+            }
+            if (tail_fresh == null) tail_fresh = owner;
+        }
+        if (tail_fresh) |owner| {
+            self.removeOwner(owner);
+            return true;
+        }
+        return false;
+    }
+
+    /// Drop one type row and its accounting. The caller must not hold
+    /// a pointer to the row (a refreshing row is never dropped here).
+    fn removeTypeRow(self: *Resolver, owner: *OwnerEnt, idx: usize) void {
+        const ent = owner.types.items[idx];
+        const b = typeEntBytes(ent);
+        self.freeTypeEnt(ent);
+        _ = owner.types.swapRemove(idx);
+        owner.bytes -= b;
+        self.cache_bytes -= b;
+    }
+
+    /// Unlink and free an owner with all its rows and accounting.
+    fn removeOwner(self: *Resolver, owner: *OwnerEnt) void {
+        _ = self.owners.remove(owner.name);
+        self.lru.remove(&owner.node);
+        self.freeOwner(owner);
+    }
+
+    fn freeTypeEnt(self: *Resolver, ent: *TypeEnt) void {
+        if (ent.rrs.len > 0) self.freeRrs(ent.rrs);
+        self.alloc.destroy(ent);
+    }
+
+    fn freeOwner(self: *Resolver, owner: *OwnerEnt) void {
+        for (owner.types.items) |ent| self.freeTypeEnt(ent);
+        owner.types.deinit(self.alloc);
+        self.cache_bytes -= owner.bytes;
+        self.alloc.free(owner.name);
+        self.alloc.destroy(owner);
     }
 
     fn onNxdomain(self: *Resolver, job: *Job) void {
@@ -2177,7 +2417,11 @@ fn orderSrvRfc2782(items: []SrvEnt, rand: std.Random) void {
 }
 
 fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    // Monotonic: a wall-clock step must not prematurely expire or
+    // extend cache entries. The clock id is comptime-fixed, so the
+    // call cannot fail on a conforming kernel.
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
 /// Parse resolv.conf the way FreeBSD libc's res_init does: a ';' or
@@ -3985,7 +4229,7 @@ test "dns-async: a silent server exhausts per-query retries into failed" {
     try std.testing.expect(srv.udp_recvd.load(.monotonic) >= 2);
 }
 
-test "dns-async: the 65th cache entry evicts the oldest, forcing wire" {
+test "dns-async: the cache evicts the LRU tail past the owner bound" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
 
@@ -4000,20 +4244,27 @@ test "dns-async: the 65th cache entry evicts the oldest, forcing wire" {
     const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
     defer std.testing.allocator.free(owned_rdata);
     var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
-    var name_buf: [32]u8 = undefined;
-    for (0..CACHE_CAP + 1) |i| {
+    var name_buf: [40]u8 = undefined;
+    for (0..CACHE_ENTRIES_MAX) |i| {
         const n = std.fmt.bufPrint(&name_buf, "c{d}.test", .{i}) catch unreachable;
         r.cachePut(n, KIND_A, &rrs);
     }
-    try std.testing.expectEqual(@as(usize, CACHE_CAP), r.cache.items.len);
-    try std.testing.expect(r.cacheGet("c0.test", KIND_A) == null);
-    try std.testing.expect(r.cacheGet("c64.test", KIND_A) != null);
+    try std.testing.expectEqual(@as(usize, CACHE_ENTRIES_MAX), r.owners.count());
 
-    // c0 was evicted FIFO: asking for it again costs a wire round trip.
+    // A fresh hit marks c0 most-recently-used, so the one-past-full
+    // insert sheds the untouched tail (c1), not c0.
+    try std.testing.expect(r.cacheGet("c0.test", KIND_A) != null);
+    r.cachePut("c_last.test", KIND_A, &rrs);
+    try std.testing.expectEqual(@as(usize, CACHE_ENTRIES_MAX), r.owners.count());
+    try std.testing.expect(r.cacheGet("c0.test", KIND_A) != null);
+    try std.testing.expect(r.cacheGet("c1.test", KIND_A) == null);
+    try std.testing.expect(r.cacheGet("c_last.test", KIND_A) != null);
+
+    // c1 was evicted: asking for it again costs a wire round trip.
     const wired = srv.udp_recvd.load(.monotonic);
     var ctx = TestCtx{};
     r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
-    try r.query("c0.test", .a, 999);
+    try r.query("c1.test", .a, 999);
     var spins: usize = 0;
     while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
@@ -4022,6 +4273,115 @@ test "dns-async: the 65th cache entry evicts the oldest, forcing wire" {
         v.deinitOn(std.testing.allocator);
     }
     try std.testing.expect(srv.udp_recvd.load(.monotonic) > wired);
+}
+
+test "dns-async: the byte budget evicts until it fits" {
+    // Goal: inserts past CACHE_BYTES_MAX shed owners until the
+    // accounted total fits again. Method: seed 4 KiB rdata records
+    // so each owner counts several KiB, then insert past the budget.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 5_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &([1]u8{0xAB} ** 4096));
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+
+    var name_buf: [40]u8 = undefined;
+    const n_owners = CACHE_BYTES_MAX / 4096 + 64;
+    for (0..n_owners) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "b{d}.test", .{i}) catch unreachable;
+        r.cachePut(n, KIND_A, &rrs);
+    }
+    try std.testing.expect(r.cache_bytes <= CACHE_BYTES_MAX);
+    try std.testing.expect(r.owners.count() < n_owners);
+    // Eviction walked the LRU tail: the earliest inserts are gone.
+    try std.testing.expect(r.cacheGet("b0.test", KIND_A) == null);
+    const last = std.fmt.bufPrint(&name_buf, "b{d}.test", .{n_owners - 1}) catch unreachable;
+    try std.testing.expect(r.cacheGet(last, KIND_A) != null);
+}
+
+test "dns-async: stale owners evict before fresh ones under pressure" {
+    // Goal: RFC 8767 section 6 - an insert over budget evicts a stale
+    // owner even when a fresh owner sits at the LRU tail. Method:
+    // evictOne is walked by hand on a three-owner cache whose tail
+    // is the only fresh entry.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 7_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+
+    // LRU order tail->head: fresh.test, old2.test, old1.test.
+    r.cachePut("fresh.test", KIND_A, &rrs);
+    rrs[0].ttl = 30;
+    r.cachePut("old1.test", KIND_A, &rrs);
+    r.cachePut("old2.test", KIND_A, &rrs);
+    rrs[0].ttl = 60;
+    // Expire only the two older rows.
+    fake_now += 31_000;
+    try std.testing.expectEqual(@as(usize, 3), r.owners.count());
+
+    try std.testing.expect(r.evictOne(r.now_ms()));
+    // old1 was tail-most stale: gone, while the fresh tail survives.
+    try std.testing.expectEqual(@as(usize, 2), r.owners.count());
+    try std.testing.expect(r.owners.get("old1.test") == null);
+    try std.testing.expect(r.cacheGet("fresh.test", KIND_A) != null);
+    try std.testing.expect(r.evictOne(r.now_ms()));
+    try std.testing.expectEqual(@as(usize, 1), r.owners.count());
+    try std.testing.expect(r.cacheGet("fresh.test", KIND_A) != null);
+    // All-fresh cache sheds the tail.
+    try std.testing.expect(r.evictOne(r.now_ms()));
+    try std.testing.expectEqual(@as(usize, 0), r.owners.count());
+    try std.testing.expect(!r.evictOne(r.now_ms()));
+}
+
+test "dns-async: a CNAME answer evicts sibling types at the owner" {
+    // Goal: RFC 8767 section 7 - caching an answer that carries a
+    // CNAME record proves the owner an alias and drops its other
+    // cached types. Method: seed A and SRV rows, then re-put the A
+    // row with a CNAME record in the answer.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 9_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    const a_rr = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    const srv_rr = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    r.cachePut("x.test", KIND_A, &a_rr);
+    r.cachePut("x.test", KIND_SRV, &srv_rr);
+    try std.testing.expect(r.cacheGet("x.test", KIND_SRV) != null);
+
+    const cname_rdata = try std.testing.allocator.dupe(u8, &.{ 3, 'w', 'w', 'w', 0 });
+    defer std.testing.allocator.free(cname_rdata);
+    const alias = [2]wire.Rr{
+        .{ .name = owned_name, .rtype = wire.TYPE_CNAME, .class = wire.CLASS_IN, .ttl = 60, .rdata = cname_rdata },
+        .{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata },
+    };
+    r.cachePut("x.test", KIND_A, &alias);
+
+    // The SRV row is gone; the refreshed (alias) A row remains.
+    try std.testing.expect(r.cacheGet("x.test", KIND_SRV) == null);
+    try std.testing.expect(r.cacheGet("x.test", KIND_A) != null);
+}
+
+test "dns-async: the default cache clock is monotonic" {
+    // A monotonic source sits near uptime (small) while the wall
+    // clock sits near the epoch (large); confusing them would break
+    // every TTL comparison.
+    try std.testing.expect(nowMs() < std.time.milliTimestamp());
 }
 
 test "dns-async: RFC 2782 draws follow weight; weight-0 still gets picked" {
@@ -5409,7 +5769,7 @@ fn fakeNow() i64 {
     return fake_now;
 }
 
-test "dns-async: a cache entry past its TTL is a miss" {
+test "dns-async: a cache entry past its TTL is stale, then gone" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
     r.now_ms = fakeNow;
@@ -5425,7 +5785,18 @@ test "dns-async: a cache entry past its TTL is a miss" {
     fake_now += 59_000;
     try std.testing.expect(r.cacheGet("ttl.test", KIND_A) != null);
     fake_now += 2_000;
+    // Past expiry the row is no longer fresh but stays servable
+    // through the RFC 8767 stale window.
     try std.testing.expect(r.cacheGet("ttl.test", KIND_A) == null);
+    switch (r.cacheGetClass("ttl.test", KIND_A).?) {
+        .stale => {},
+        .fresh => return error.TestUnexpectedResult,
+    }
+    // The stale window closes at expiry + 1 day: past it the dead
+    // row is pruned with its owner.
+    fake_now += STALE_MAX_MS;
+    try std.testing.expect(r.cacheGetClass("ttl.test", KIND_A) == null);
+    try std.testing.expectEqual(@as(usize, 0), r.owners.count());
 }
 
 test "dns-async: SRV targets come back in RFC 2782 priority order" {
