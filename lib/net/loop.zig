@@ -380,7 +380,7 @@ pub const Loop = struct {
         const h = self.resolve(handle) orelse return error.StaleHandle;
         const fd = h.fd;
         h.fd = -1; // freed slots keep their value; deinit skips -1
-        self.purgeDirty(handle);
+        self.purgeDirty(handle, h);
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         rawClose(fd);
@@ -421,7 +421,7 @@ pub const Loop = struct {
             };
         }
         h.fd = -1;
-        self.purgeDirty(handle);
+        self.purgeDirty(handle, h);
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         if (first_err) |err| {
@@ -774,8 +774,12 @@ pub const Loop = struct {
     }
 
     /// Order-preserving removal of `handle`'s staged dirty entry (S20): the
-    /// other handles' entries keep their relative order.
-    fn purgeDirty(self: *Loop, handle: Handle) void {
+    /// other handles' entries keep their relative order. Skipped outright
+    /// when the handle is not dirty, keeping close() O(1) in the common
+    /// case instead of O(dirty list).
+    fn purgeDirty(self: *Loop, handle: Handle, h: *HandleState) void {
+        if (!h.dirty) return;
+        h.dirty = false;
         for (self.dirty.items, 0..) |tok, i| {
             if (tok.eql(handle)) {
                 const tail = self.dirty.items.len - i - 1;
@@ -1243,6 +1247,31 @@ test "Loop: close purges staged changes and preserves the order of the rest" {
     try std.testing.expect(events.items[0].readable.handle.eql(handles[0]));
     try std.testing.expect(events.items[1].readable.handle.eql(handles[2]));
     try std.testing.expectEqual(@as(u64, 0), loop.stats().change_failures);
+}
+
+test "Loop: close leaves other dirty entries and the flag consistent" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const a = try socketpairNb();
+    defer posix.close(a[0]);
+    const b = try socketpairNb();
+    defer posix.close(b[0]);
+    const ha = try loop.attach(a[1], tctx(1), .{ .read = true });
+    const hb = try loop.attach(b[1], tctx(2), .{ .read = true });
+    loop.requestImmediate();
+    try loop.wait(); // commits both; neither handle stays dirty
+
+    // hb is clean: its close must leave ha's dirty entry alone.
+    try loop.setInterest(ha, .{ .read = true, .write = true });
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    try loop.close(hb);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    try std.testing.expect(loop.dirty.items[0].eql(ha));
+
+    // ha is dirty: its close removes exactly its entry.
+    try loop.close(ha);
+    try std.testing.expectEqual(@as(usize, 0), loop.dirty.items.len);
 }
 
 test "Loop: a stale token after slot reuse never resolves" {
