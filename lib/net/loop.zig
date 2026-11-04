@@ -252,7 +252,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = wake_token.toUdata(),
         };
-        kev.applyNow(kq, &add_user) catch |err| return switch (err) {
+        kev.applyNow(kq, &add_user, null) catch |err| return switch (err) {
             error.SystemResources => error.SystemResources,
             else => error.Unexpected,
         };
@@ -268,7 +268,7 @@ pub const Loop = struct {
         for (self.handles.values[0..self.handles.pool]) |h| {
             if (h.fd >= 0) rawClose(h.fd);
         }
-        posix.close(self.kq);
+        rawClose(self.kq);
         self.handles.deinit(gpa);
         self.wheel.deinit(gpa);
         gpa.free(self.dirty.allocatedSlice());
@@ -470,7 +470,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = broadcast_token.toUdata(),
         };
-        try kev.applyNow(self.kq, &add);
+        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
         self.broadcast_fd = broadcast.read_fd;
     }
 
@@ -530,7 +530,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
-        try kev.applyNow(self.kq, &add);
+        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
 
         // Installing SIG_IGN discards pending instances of the signal
         // (POSIX), so the pending check must read before it lands. Pending
@@ -566,7 +566,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
-        kev.applyNow(self.kq, &del) catch |err| switch (err) {
+        kev.applyNow(self.kq, &del, &self.stats_.last_errno) catch |err| switch (err) {
             error.NotFound, error.BadDescriptor => {},
             else => |e| return e,
         };
@@ -589,7 +589,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = @truncate(@as(u64, @bitCast(@as(i64, pid)))), .gen = 1, .kind = proc_kind }).toUdata(),
         };
-        try kev.applyNow(self.kq, &add);
+        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
     }
 
     // -- Iteration -----------------------------------------------------------
@@ -836,7 +836,7 @@ pub const Loop = struct {
             .data = 0,
             .udata = 0,
         };
-        kev.applyNow(self.kq, &del) catch |err| switch (err) {
+        kev.applyNow(self.kq, &del, &self.stats_.last_errno) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
         };
@@ -910,6 +910,7 @@ pub const Loop = struct {
             // still-armed knote left by a failed delete only costs one
             // spurious wakeup).
             self.stats_.change_failures += 1;
+            self.stats_.last_errno = @intCast(@max(0, raw.data));
             self.internal_failure = switch (token.kind) {
                 timer_kind => .timer,
                 else => .broadcast,
@@ -977,6 +978,7 @@ pub const Loop = struct {
             // is recovered from the staged change it echoes (ident + filter).
             h.broken = true;
             self.stats_.change_failures += 1;
+            self.stats_.last_errno = @intCast(@max(0, raw.data));
             self.stats_.delivered_events += 1;
             return .{ .change_failed = .{
                 .handle = token,
@@ -1782,6 +1784,7 @@ test "Loop: watchProcess reports the child's exit" {
     try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(ev.process_exit.status));
 
     try std.testing.expectError(error.ProcessNotFound, loop.watchProcess(1 << 22));
+    try std.testing.expectEqual(@intFromEnum(posix.E.SRCH), loop.stats().last_errno);
 }
 
 test "Loop: attach at capacity fails with HandleTableFull" {

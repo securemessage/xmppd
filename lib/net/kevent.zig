@@ -87,28 +87,32 @@ pub const ApplyError = error{
 
 /// One immediate change with an empty eventlist, for registrations that must
 /// take effect before the next wait (signal watch, process watch, EV_DELETE on
-/// detach, EVFILT_USER trigger). Whole-call errors map one-to-one to ApplyError.
-pub fn applyNow(kq: posix.fd_t, change: *const Kevent) ApplyError!void {
+/// detach, EVFILT_USER trigger). Whole-call errors map one-to-one to ApplyError
+/// and `errno_out`, when given, always carries the raw errno on failure.
+pub fn applyNow(kq: posix.fd_t, change: *const Kevent, errno_out: ?*u32) ApplyError!void {
     var none: [0]Kevent = undefined;
     while (true) {
         const one = [1]Kevent{change.*};
         const rc = std.c.kevent(kq, &one, 1, &none, 0, null);
-        switch (posix.errno(rc)) {
+        const e = posix.errno(rc);
+        switch (e) {
             .SUCCESS => return,
             .INTR => continue,
-            .NOENT => return error.NotFound,
-            .BADF => {
-                // kqueue_register returns EBADF for a bad target fd and for a
-                // bad kqueue; the caller distinguishes by which fd it passed.
-                return error.BadDescriptor;
-            },
-            .INVAL => return error.InvalidArgument,
-            .SRCH => return error.ProcessNotFound,
-            .ACCES => return error.AccessDenied,
-            .NOMEM => return error.SystemResources,
-            .FAULT => return error.InvalidArgument,
-            else => return error.Unexpected,
+            else => {},
         }
+        if (errno_out) |out| out.* = @intFromEnum(e);
+        return switch (e) {
+            .NOENT => error.NotFound,
+            // kqueue_register returns EBADF for a bad target fd and for a bad
+            // kqueue; the caller distinguishes by which fd it passed.
+            .BADF => error.BadDescriptor,
+            .INVAL => error.InvalidArgument,
+            .SRCH => error.ProcessNotFound,
+            .ACCES => error.AccessDenied,
+            .NOMEM => error.SystemResources,
+            .FAULT => error.InvalidArgument,
+            else => error.Unexpected,
+        };
     }
 }
 
@@ -161,7 +165,7 @@ test "applyNow: ENOENT on deleting a missing knote" {
         .data = 0,
         .udata = 0,
     };
-    try std.testing.expectError(error.NotFound, applyNow(kq, &del));
+    try std.testing.expectError(error.NotFound, applyNow(kq, &del, null));
 }
 
 test "applyNow: a valid trigger registers and fires" {
@@ -177,7 +181,7 @@ test "applyNow: a valid trigger registers and fires" {
         .data = 0,
         .udata = 0xAB,
     };
-    try applyNow(kq, &add);
+    try applyNow(kq, &add, null);
     // A trigger change would rewrite the knote's udata unless EV_KEEPUDATA
     // is passed; the kernel honors that flag on non-ADD changes
     // (kern_event.c), but repeating the udata here is simpler and just as
@@ -190,7 +194,7 @@ test "applyNow: a valid trigger registers and fires" {
         .data = 0,
         .udata = 0xAB,
     };
-    try applyNow(kq, &trigger);
+    try applyNow(kq, &trigger, null);
 
     var events: [1]Kevent = undefined;
     var errno_out: u32 = 0;

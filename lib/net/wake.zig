@@ -41,7 +41,7 @@ pub const Wake = struct {
             .data = 0,
             .udata = loop_mod.wake_token.toUdata(),
         };
-        kev.applyNow(self.kq, &trigger) catch |err| {
+        kev.applyNow(self.kq, &trigger, null) catch |err| {
             // Clear so a retry can trigger again; a dead loop surfaces once.
             _ = self.pending.swap(false, .acq_rel);
             return switch (err) {
