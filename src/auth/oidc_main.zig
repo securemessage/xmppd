@@ -568,7 +568,7 @@ pub const Daemon = struct {
                     self.replyAuthFailure(req.conn_id, slot, reason);
                     return true;
                 }
-                if (self.handler.policy.check(creds.username, req.client_ip)) |reason| {
+                if (self.checkAccountAdmission(creds.username, req.client_ip)) |reason| {
                     self.replyAuthFailure(req.conn_id, slot, reason);
                     return true;
                 }
@@ -661,6 +661,14 @@ pub const Daemon = struct {
         // can never exceed it.
         self.pending.putAssumeCapacity(job_id, pend);
         return true;
+    }
+
+    /// The pre-dispatch account admission check: one call site so the
+    /// account identity the policy sees is decided in one place. After
+    /// PR #30 merges this must check the prepared localpart
+    /// (precis.xmppLocalpart), not the raw typed name.
+    fn checkAccountAdmission(self: *Daemon, typed_name: []const u8, client_ip: []const u8) ?[]const u8 {
+        return self.handler.policy.check(typed_name, client_ip);
     }
 
     /// Answer a request with an auth_failure reason without handler
