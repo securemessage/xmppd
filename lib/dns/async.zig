@@ -4861,13 +4861,12 @@ test "dns-async: a kevent error in step is counted" {
     posix.close(ufd);
 }
 
-test "dns-async: a write on a reset connection reports peer close, not a drop" {
-    // A peer that resets makes the next write fail EPIPE; the mapping
-    // to PeerClosed is what lets tcpPeerClosed resend on a fresh
-    // connection instead of dropping the job.
-    // Method: a real loopback connection whose accepted end closes
-    // with unread data (an RST); tcpWrite on the client fd must
-    // report error.PeerClosed.
+test "dns-async: a write on a send-shutdown socket reports peer close, not a drop" {
+    // shutdown(.send) sets SBS_CANTSENDMORE locally and at once, so
+    // the next send fails EPIPE with no peer timing; a peer close
+    // would race FIN-vs-RST on loopback. tcpWrite must map EPIPE to
+    // PeerClosed so tcpPeerClosed resends on a fresh connection
+    // instead of dropping the job.
     const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer posix.close(lfd);
     const la = try net.Address.parseIp("127.0.0.1", 0);
@@ -4876,20 +4875,13 @@ test "dns-async: a write on a reset connection reports peer close, not a drop" {
     var actual: posix.sockaddr = undefined;
     var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
     try posix.getsockname(lfd, &actual, &slen);
-    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+    const sa = net.Address.initPosix(@alignCast(&actual));
 
     const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    const sa = try net.Address.parseIp("127.0.0.1", port);
     try posix.connect(cfd, &sa.any, sa.getOsSockLen());
     const afd = try posix.accept(lfd, null, null, 0);
-    // Unread data at the accept end makes its close an RST.
-    _ = try posix.send(cfd, "x", posix.MSG.NOSIGNAL);
-    posix.close(afd);
-    // Wait for the close to land before writing: loopback delivers
-    // it at once, but a tight write loop can outrun the processing.
-    var pfds = [1]posix.pollfd{.{ .fd = cfd, .events = std.c.POLL.IN, .revents = 0 }};
-    _ = posix.poll(&pfds, 5000) catch 0;
-    var rbuf: [8]u8 = undefined;
+    defer posix.close(afd);
+    try posix.shutdown(cfd, .send);
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
@@ -4900,21 +4892,7 @@ test "dns-async: a write on a reset connection reports peer close, not a drop" {
     const job = r.jobs.items[0];
     job.tcp_fd = cfd;
     job.tcp_connected = true;
-    try job.tcp_out.appendSlice(std.testing.allocator, &.{ 0, 4, 't', 'e', 's', 't' });
-    // A write after the peer's close may still succeed once on a
-    // half-close; the dead connection fails the next one with EPIPE,
-    // which must surface as PeerClosed so the resend path runs.
-    var saw_peer_closed = false;
-    var tries: usize = 0;
-    while (tries < 16 and !saw_peer_closed) : (tries += 1) {
-        job.tcp_out_pos = 0;
-        r.tcpWrite(job) catch |err| {
-            try std.testing.expectEqual(error.PeerClosed, err);
-            saw_peer_closed = true;
-        };
-        _ = posix.recv(cfd, &rbuf, posix.MSG.DONTWAIT) catch {};
-    }
-    try std.testing.expect(saw_peer_closed);
+    try std.testing.expectError(error.PeerClosed, r.tcpWrite(job));
     job.tcp_fd = -1;
     posix.close(cfd);
 }
