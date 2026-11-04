@@ -261,6 +261,10 @@ pub const Listener = struct {
     aborted: u64, // ECONNABORTED/EPROTO: peer reset before accept
     pause_reason: PauseReason,
     fallback_timer: ?loop_mod.TimerId, // armed for ENFILE/ENOBUFS/ENOMEM
+    /// Pauses whose fallback could not be scheduled (timer table full):
+    /// the listener still resumes on a close, but nothing wakes it
+    /// otherwise. Visible so a starved table is observable.
+    fallback_lost: u32,
     fallback_resume_ms: u64,
 
     pub const Family = enum { tcp, unix };
@@ -307,6 +311,7 @@ pub const Listener = struct {
             .family = family,
             .accepted_this_pass = 0,
             .aborted = 0,
+            .fallback_lost = 0,
             .pause_reason = .emfile,
             .fallback_timer = null,
             .fallback_resume_ms = fallback_resume_ms_default,
@@ -391,7 +396,10 @@ pub const Listener = struct {
         // this loop cannot rely on its own close() path. The TimerId, not a
         // ctx sentinel, identifies it in onDeadline.
         const ms = self.fallback_resume_ms;
-        self.fallback_timer = self.loop.scheduleIn(ms, .none) catch null;
+        self.fallback_timer = self.loop.scheduleIn(ms, .none) catch blk: {
+            self.fallback_lost += 1;
+            break :blk null;
+        };
         return .{ .paused = reason };
     }
 
@@ -1040,6 +1048,24 @@ test "Listener: a close-resumed pause cancels the armed fallback" {
     _ = listener.acceptNext() catch {}; // preamble cancels the fallback
     try std.testing.expect(listener.fallback_timer == null);
     try std.testing.expectEqual(@as(usize, 0), loop.wheel.entries.count());
+}
+
+test "Listener: a full timer table is counted, not swallowed" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    // Fill the wheel so the fallback deadline cannot be scheduled.
+    for (0..16) |_| {
+        _ = try loop.scheduleIn(60000, .none);
+    }
+    const out = try listener.pause(.emfile);
+    try std.testing.expect(out == .paused);
+    try std.testing.expect(listener.fallback_timer == null);
+    try std.testing.expectEqual(@as(u32, 1), listener.fallback_lost);
 }
 
 test "Listener: onDeadline claims only the fallback timer" {
