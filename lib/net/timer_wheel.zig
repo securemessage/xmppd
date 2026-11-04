@@ -50,6 +50,7 @@ pub const TimerWheel = struct {
     due: []TimerId,
     due_len: usize,
     due_pos: usize,
+    collected_ms: u64,
     seq: u64,
     cur_ms: u64,
     counters: Counters = .{},
@@ -78,6 +79,7 @@ pub const TimerWheel = struct {
             .due = due,
             .due_len = 0,
             .due_pos = 0,
+            .collected_ms = std.math.maxInt(u64),
             .seq = 0,
             .cur_ms = now_ms,
         };
@@ -133,10 +135,23 @@ pub const TimerWheel = struct {
         return best;
     }
 
+    /// Collect the due batch once at the start of a wait pass. Entries
+    /// scheduled while the batch drains are collected next pass, so one
+    /// pass emits a bounded set. A previous batch still draining is kept.
+    pub fn collectPass(self: *TimerWheel, now_ms: u64) void {
+        if (self.due_pos < self.due_len) return;
+        const d = self.nextDeadline() orelse return;
+        if (d > now_ms) return;
+        self.collect(now_ms);
+    }
+
     /// The next expired entry in deadline order, or null. Lazily cascades the
     /// wheel up to `now_ms` on the first call of each batch.
     pub fn popExpired(self: *TimerWheel, now_ms: u64) ?Deadline {
-        if (self.due_pos >= self.due_len) self.collect(now_ms);
+        // One collect per now_ms: entries scheduled while a batch drains
+        // wait for the next pass even when their deadline already passed.
+        if (self.due_pos >= self.due_len and self.collected_ms != now_ms)
+            self.collect(now_ms);
         while (self.due_pos < self.due_len) {
             const token = self.due[self.due_pos];
             self.due_pos += 1;
@@ -156,6 +171,7 @@ pub const TimerWheel = struct {
     /// to emitted deadlines, bounded by timers_max per batch.
     fn collect(self: *TimerWheel, now_ms: u64) void {
         if (now_ms > self.cur_ms) self.cur_ms = now_ms;
+        self.collected_ms = now_ms;
         self.due_len = 0;
         self.due_pos = 0;
         self.counters.collects += 1;
@@ -301,6 +317,22 @@ test "TimerWheel: entries on one slot chain emit in deadline order" {
     try std.testing.expect(d1.timer.eql(early));
     try std.testing.expect(d2.timer.eql(late));
     try std.testing.expect(wheel.popExpired(110) == null);
+}
+
+test "TimerWheel: a deadline scheduled while a batch drains emits next collect" {
+    // Emission is bounded per pass: a past deadline added mid-drain waits
+    // for the next collect instead of extending this one without bound.
+    var wheel: TimerWheel = undefined;
+    try wheel.init(std.testing.allocator, 4, 0);
+    defer wheel.deinit(std.testing.allocator);
+
+    const first = try wheel.schedule(10, .{ .index = 1, .gen = 1, .kind = 0xEE });
+    try std.testing.expect(wheel.popExpired(10).?.timer.eql(first));
+    try std.testing.expect(wheel.popExpired(10) == null);
+
+    const late = try wheel.schedule(5, .{ .index = 2, .gen = 1, .kind = 0xEE });
+    try std.testing.expect(wheel.popExpired(10) == null); // same pass: no collect
+    try std.testing.expect(wheel.popExpired(11).?.timer.eql(late));
 }
 
 test "TimerWheel: cancel is O(1) and stale ids cannot cancel a reused entry" {

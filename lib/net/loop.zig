@@ -646,6 +646,9 @@ pub const Loop = struct {
         self.stats_.raw_events += self.batch_len;
         self.batch_pos = 0;
         self.now_ms_ = monotonicMs();
+        // Snapshot the due batch for this pass: a deadline scheduled while
+        // the batch drains is collected at the next wait instead.
+        self.wheel.collectPass(self.now_ms_);
     }
 
     /// Deliver the next event of the current batch, or null. Kernel events in
@@ -1811,6 +1814,31 @@ test "Loop: close keeps the dirty order of the survivors" {
     try std.testing.expect(loop.dirty.items[0].eql(handles[0]));
     try std.testing.expect(loop.dirty.items[1].eql(handles[2]));
     try std.testing.expect(loop.dirty.items[2].eql(handles[3]));
+}
+
+test "Loop: a deadline scheduled during a pass emits at most once per pass" {
+    // W2: a handler that re-adds an already-past deadline gets one event
+    // per wait pass, not an unbounded chain inside one next() drain.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    _ = try loop.scheduleIn(1, tctx(1));
+    var deadline_passes: usize = 0;
+    for (0..50) |_| {
+        try loop.wait();
+        var per_pass: usize = 0;
+        while (loop.next()) |ev| {
+            if (ev != .deadline) continue;
+            per_pass += 1;
+            _ = try loop.scheduleIn(0, tctx(2));
+        }
+        if (per_pass > 0) {
+            deadline_passes += 1;
+            try std.testing.expectEqual(@as(usize, 1), per_pass);
+            if (deadline_passes >= 2) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), deadline_passes);
 }
 
 test "Loop: cancelTimer disarms the kernel timer" {
