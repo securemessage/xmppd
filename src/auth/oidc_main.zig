@@ -285,6 +285,10 @@ const Pending = struct {
     /// Canonical account key for the in-flight cap; empty for OAUTHBEARER.
     account_key: [lock_store_mod.MAX_KEY_LEN]u8 = undefined,
     account_key_len: u16 = 0,
+    /// Set by auth_abort or lane close: the pool job still runs and still
+    /// spends the in-flight caps until its completion is consumed; the
+    /// verdict is then discarded without a replay.
+    orphaned: bool = false,
 
     fn clientIp(self: *const Pending) []const u8 {
         return self.owned[0..self.client_ip_len];
@@ -469,8 +473,8 @@ pub const Daemon = struct {
     }
 
     /// Close an IPC client lane: its sessions and staged changes die with
-    /// it, and pending exchanges for it are freed (their completions drop
-    /// later as stale).
+    /// it, and pending exchanges for it are orphaned (their jobs still
+    /// spend the caps until the completions are consumed).
     fn closeLane(self: *Daemon, slot: usize) void {
         self.handler.closeLaneSessions(slot);
         if (self.ipc.getClient(slot)) |conn| self.batch.purgeFd(conn.fd);
@@ -664,6 +668,10 @@ pub const Daemon = struct {
             const pend = kv.value;
             defer self.freePending(pend);
 
+            // An orphaned exchange ran to completion anyway: consume it to
+            // release its cap slot, but never replay or answer it.
+            if (pend.orphaned) continue;
+
             const slot: usize = pend.slot;
             if (slot >= MAX_IPC_CLIENTS or self.ipc_gens[slot] != pend.slot_gen) {
                 log.debug("IdP completion {d} dropped: lane recycled", .{job.id});
@@ -737,25 +745,19 @@ pub const Daemon = struct {
         self.allocator.free(pend.owned);
     }
 
-    /// Free pending entries for a lane, or for one exchange on a lane when
-    /// conn_id is given (auth_abort). Their completions drop later as
-    /// unknown job ids.
+    /// Orphan pending entries for a lane, or one exchange on a lane when
+    /// conn_id is given (auth_abort). Their jobs keep running and keep
+    /// spending the in-flight caps; the completions are consumed without
+    /// a replay.
     fn dropPending(self: *Daemon, slot: u16, conn_id: ?u32) void {
-        var guard: usize = self.pending.count() + 1;
-        while (guard > 0) : (guard -= 1) {
-            var victim: ?u64 = null;
-            var it = self.pending.iterator();
-            while (it.next()) |e| {
-                if (e.value_ptr.slot != slot) continue;
-                if (conn_id) |cid| {
-                    if (e.value_ptr.conn_id != cid) continue;
-                }
-                victim = e.key_ptr.*;
-                break;
+        var it = self.pending.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.slot != slot) continue;
+            if (conn_id) |cid| {
+                if (e.value_ptr.conn_id != cid) continue;
             }
-            const id = victim orelse return;
-            const kv = self.pending.fetchRemove(id).?;
-            self.freePending(kv.value);
+            e.value_ptr.orphaned = true;
+            if (conn_id != null) return;
         }
     }
 };
@@ -1244,10 +1246,10 @@ test "a completion for a closed or reused lane is dropped" {
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
 }
 
-test "an auth_abort drops the pending exchange" {
+test "an auth_abort orphans the exchange but the cap still counts it" {
     const allocator = std.testing.allocator;
     var port = std.atomic.Value(u16).init(0);
-    const stub = try startHangingStub(&port, 3000);
+    const stub = try startHangingStub(&port, 5000);
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
@@ -1257,26 +1259,39 @@ test "an auth_abort drops the pending exchange" {
     try fx.init(allocator, url, null, null, .{
         .threads = 1,
         .max_outstanding = 8,
-        .connect_timeout_ms = 100,
-        .timeout_ms = 200,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 2000,
     });
     defer fx.deinit(allocator);
 
     var client = try connectClient(allocator, &fx);
     defer client.close();
 
-    const m = plainAuth(1, "alice", "pw", "10.0.0.1");
-    defer allocator.free(m.auth_request.payload);
-    try client.send(m);
-    try fx.daemon.step(10);
-    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+    // Fill alice's in-flight cap, then abort every exchange. The jobs keep
+    // running against the hanging IdP and must keep spending the cap.
+    for (0..max_inflight_per_account) |i| {
+        const m = plainAuth(@intCast(i + 1), "alice", "pw", "10.0.0.1");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        try fx.daemon.step(10);
+        try client.send(.{ .auth_abort = .{ .conn_id = @intCast(i + 1) } });
+        try fx.daemon.step(10);
+    }
+    try std.testing.expectEqual(max_inflight_per_account, fx.daemon.pending.count());
 
-    try client.send(.{ .auth_abort = .{ .conn_id = 1 } });
-    try fx.daemon.step(10);
-    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+    // A further request for alice is backpressured even though every
+    // earlier exchange was aborted.
+    const m5 = plainAuth(9, "alice", "pw", "10.0.0.9");
+    defer allocator.free(m5.auth_request.payload);
+    try client.send(m5);
+    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 9), reply.auth_failure.conn_id);
 
-    // The completion lands later and drops as stale: no reply may arrive.
-    const dl = std.time.milliTimestamp() + 1500;
+    // The orphaned completions are consumed, never answered, and release
+    // their cap slots.
+    const dl = std.time.milliTimestamp() + 3500;
     while (std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
         _ = client.conn.recv() catch 0;
@@ -1284,6 +1299,7 @@ test "an auth_abort drops the pending exchange" {
             return error.UnexpectedReply;
         }
     }
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
 }
 
 test "shutdown with exchanges in flight cancels them" {
