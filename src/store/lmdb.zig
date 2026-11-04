@@ -54,6 +54,58 @@ const KinfoVmentry = extern struct {
 };
 const KVME_TYPE_VNODE = 2;
 const KVME_FLAG_NOCOREDUMP = 0x4;
+const VMMAP_ATTEMPTS_MAX = 3;
+const VMMAP_BUF_SLACK = 4096;
+
+// kern.proc.vmmap seam: tests can substitute synthetic records and ENOMEM
+// failures so the bounded retry can be checked without racing mappings.
+const vmmapCall = if (builtin.is_test) struct {
+    var stub = false;
+    var size_calls: usize = 0;
+    var read_calls: usize = 0;
+    var read_fails: usize = 0;
+    var read_error: std.posix.SysCtlError = error.SystemResources;
+    var records: []const u8 = &.{};
+
+    fn reset() void {
+        stub = false;
+        size_calls = 0;
+        read_calls = 0;
+        read_fails = 0;
+        read_error = error.SystemResources;
+        records = &.{};
+    }
+
+    fn size(mib: []const c_int, len: *usize) std.posix.SysCtlError!void {
+        if (!stub) return std.posix.sysctl(mib, null, len, null, 0);
+        size_calls += 1;
+        len.* = records.len;
+    }
+
+    fn read(mib: []const c_int, buf: []u8, len: *usize) std.posix.SysCtlError!void {
+        if (!stub) {
+            len.* = buf.len;
+            return std.posix.sysctl(mib, buf.ptr, len, null, 0);
+        }
+        read_calls += 1;
+        if (read_fails != 0) {
+            read_fails -= 1;
+            return read_error;
+        }
+        if (records.len > buf.len) return error.SystemResources;
+        @memcpy(buf[0..records.len], records);
+        len.* = records.len;
+    }
+} else struct {
+    fn size(mib: []const c_int, len: *usize) std.posix.SysCtlError!void {
+        return std.posix.sysctl(mib, null, len, null, 0);
+    }
+
+    fn read(mib: []const c_int, buf: []u8, len: *usize) std.posix.SysCtlError!void {
+        len.* = buf.len;
+        return std.posix.sysctl(mib, buf.ptr, len, null, 0);
+    }
+};
 
 // madvise seam: test builds record the arguments instead of advising the
 // kernel, so a test can check the advised range covers the env map.
@@ -115,16 +167,37 @@ fn excludeMapFromCoreDump(env: lmdb.Environment) void {
 }
 
 /// Fixed prefix of the VMA record backed by the vnode (ino, fsid), or
-/// null when kern.proc.vmmap yields no match.
+/// null when kern.proc.vmmap yields no match. Other threads can add
+/// mappings between the size query and the read, so ENOMEM retries are
+/// bounded by VMMAP_ATTEMPTS_MAX.
 fn findVmEntry(ino: u64, fsid: u64) ?KinfoVmentry {
     var mib = [_]c_int{ 1, 14, 32, std.c.getpid() }; // CTL_KERN, KERN_PROC, KERN_PROC_VMMAP
-    var len: usize = 0;
-    if (std.c.sysctl(&mib, mib.len, null, &len, null, 0) != 0) return null;
-    const buf = std.heap.page_allocator.alloc(u8, len + 4096) catch return null;
-    defer std.heap.page_allocator.free(buf);
-    var out_len = buf.len;
-    if (std.c.sysctl(&mib, mib.len, buf.ptr, &out_len, null, 0) != 0) return null;
-    return findVmRecord(buf[0..out_len], ino, fsid);
+    var attempt: usize = 0;
+    while (attempt < VMMAP_ATTEMPTS_MAX) : (attempt += 1) {
+        var len: usize = 0;
+        vmmapCall.size(&mib, &len) catch |err| {
+            switch (err) {
+                error.SystemResources => continue,
+                else => return null,
+            }
+        };
+
+        const buf_len = std.math.add(usize, len, VMMAP_BUF_SLACK) catch return null;
+        const buf = std.heap.page_allocator.alloc(u8, buf_len) catch return null;
+        var out_len = buf.len;
+        vmmapCall.read(&mib, buf, &out_len) catch |err| {
+            std.heap.page_allocator.free(buf);
+            switch (err) {
+                error.SystemResources => continue,
+                else => return null,
+            }
+        };
+
+        const rec = findVmRecord(buf[0..out_len], ino, fsid);
+        std.heap.page_allocator.free(buf);
+        return rec;
+    }
+    return null;
 }
 
 /// First vnode record in a kern.proc.vmmap buffer whose inode and
@@ -976,6 +1049,50 @@ test "LmdbBackend: the env map VMA match requires inode and filesystem" {
     try std.testing.expectEqual(@as(u64, 0x3000), rec.kve_start);
     try std.testing.expect(findVmRecord(buf, 4242, 0xAAAA) != null);
     try std.testing.expect(findVmRecord(buf, 4242, 0xCCCC) == null);
+}
+
+test "LmdbBackend: the vmmap lookup retries ENOMEM and re-queries the size" {
+    // Goal: mappings added between the size query and the read do not lose
+    // the VMA. Method: the seam fails one read with ENOMEM, then returns
+    // one matching record.
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = 1;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_start = 0x7000;
+    recs[0].kve_end = 0x9000;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const rec = findVmEntry(4242, 0xAAAA) orelse return error.VmEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 0x7000), rec.kve_start);
+    try std.testing.expectEqual(@as(usize, 2), vmmapCall.size_calls);
+    try std.testing.expectEqual(@as(usize, 2), vmmapCall.read_calls);
+}
+
+test "LmdbBackend: the vmmap ENOMEM retry is bounded" {
+    // Goal: repeated ENOMEM does not loop forever. Method: the seam fails
+    // every read and the lookup must stop at VMMAP_ATTEMPTS_MAX.
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = VMMAP_ATTEMPTS_MAX;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    try std.testing.expect(findVmEntry(4242, 0xAAAA) == null);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.size_calls);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
 }
 
 test "LmdbBackend: the real madvise marks the env VMA nocore" {
