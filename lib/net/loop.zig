@@ -1245,11 +1245,13 @@ test "Loop: socket error arrives as eof plus errno" {
     posix.close(lfd);
 
     const cfd = try posix.socket(posix.AF.INET, loop_stream_nb, 0);
+    // A refused loopback connect usually pends (EINPROGRESS) but can
+    // report ECONNREFUSED synchronously under load; record which shape
+    // this run took so the errno check below can be exact.
+    var sync_refused = false;
     posix.connect(cfd, @ptrCast(&bound), blen) catch |err| switch (err) {
-        // A refused loopback connect usually pends (EINPROGRESS) but can
-        // report ECONNREFUSED synchronously under load; either way the
-        // socket error is pending and the write knote reports it below.
-        error.WouldBlock, error.ConnectionRefused => {},
+        error.WouldBlock => {},
+        error.ConnectionRefused => sync_refused = true,
         else => return err,
     };
     const h = try loop.attach(cfd, tctx(1), .{ .write = true });
@@ -1263,9 +1265,14 @@ test "Loop: socket error arrives as eof plus errno" {
     try std.testing.expect(ev.handle.eql(h));
     try std.testing.expect(ev.eof);
     // A synchronous refusal clears so_error (uipc_syscalls.c): the write
-    // knote then reports EV_EOF with fflags = 0. The async path keeps it.
+    // knote then reports EV_EOF with fflags = 0. A pended connect keeps
+    // the error, so the async path must report ECONNREFUSED.
     const refused = @intFromEnum(posix.E.CONNREFUSED);
-    try std.testing.expect(ev.errno == refused or ev.errno == 0);
+    if (sync_refused) {
+        try std.testing.expect(ev.errno == 0 or ev.errno == refused);
+    } else {
+        try std.testing.expectEqual(refused, ev.errno);
+    }
 }
 
 test "Loop: write interest is delivered once and re-armed only when wanted" {
