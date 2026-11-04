@@ -283,6 +283,9 @@ pub const Resolver = struct {
     stale_icmp: usize = 0,
     /// Test seam: report every UDP send as failed (see sendUdp).
     fail_sends: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test seam: report every TCP connect as synchronously refused
+    /// (see tcpSend); FreeBSD does this on real wire paths.
+    fail_connects: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -886,7 +889,7 @@ pub const Resolver = struct {
                 self.tcpRestart(job) catch |err| {
                     if (err == error.PeerClosed) {
                         if (!self.tcpPeerClosed(job)) return;
-                    } else return err;
+                    } else if (self.tcpConnectFailed(job, err)) return else return err;
                 };
             } else {
                 // A connection surviving from an earlier query is
@@ -897,7 +900,7 @@ pub const Resolver = struct {
                 self.tcpSend(job) catch |err| {
                     if (err == error.PeerClosed) {
                         if (!self.tcpPeerClosed(job)) return;
-                    } else return err;
+                    } else if (self.tcpConnectFailed(job, err)) return else return err;
                 };
             }
         } else {
@@ -921,6 +924,10 @@ pub const Resolver = struct {
             self.tcpRestart(job) catch |err| {
                 if (err == error.PeerClosed) {
                     if (!self.tcpPeerClosed(job)) return;
+                } else if (err == error.ConnectFailed) {
+                    self.tcpClose(job);
+                    self.failQuery(job);
+                    return;
                 } else {
                     self.dropJob(job, .failed);
                     return;
@@ -1043,6 +1050,19 @@ pub const Resolver = struct {
         try self.tcpSend(job);
     }
 
+    /// A synchronous connect refusal is the same wire failure the
+    /// pending-connect SO_ERROR arm reports: the dead socket is
+    /// dropped and the per-phase failure runs, so a refusal costs
+    /// only the failing phase. Returns true when `err` was the
+    /// refusal (and handled); the job may be freed, so callers must
+    /// not touch it afterwards.
+    fn tcpConnectFailed(self: *Resolver, job: *Job, err: anyerror) bool {
+        if (err != error.ConnectFailed) return false;
+        self.tcpClose(job);
+        self.failQuery(job);
+        return true;
+    }
+
     /// The peer closed or reset the connection while the outstanding
     /// query was unanswered: RFC 7766 permits a close after any
     /// answer, so the query is re-sent once on a fresh connection
@@ -1082,6 +1102,12 @@ pub const Resolver = struct {
         job.tcp_seq +%= 1;
         var ch: [2]posix.Kevent = undefined;
         var connected = true;
+        if (builtin.is_test) {
+            // FreeBSD refuses connects synchronously on real paths
+            // (loopback ~1%, pf EACCES on a source-port collision), so
+            // the refusal arm is exercised here, not only probed.
+            if (self.fail_connects) return error.ConnectFailed;
+        }
         rawConnect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
             error.WouldBlock => connected = false,
             error.Failed => return error.ConnectFailed,
@@ -1289,7 +1315,7 @@ pub const Resolver = struct {
             self.tcpSend(job) catch |err| {
                 if (err == error.PeerClosed) {
                     if (!self.tcpPeerClosed(job)) return;
-                } else return self.dropJob(job, .failed);
+                } else if (self.tcpConnectFailed(job, err)) return else return self.dropJob(job, .failed);
             };
             self.armDeadline(job, TCP_TIMEOUT_MS) catch return self.dropJob(job, .failed);
             return;
@@ -4495,6 +4521,43 @@ test "dns-async: a refused TCP connect fails the phase, not the job" {
     r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
     r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
     try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a synchronous connect refusal fails the phase, not the job" {
+    // Goal: a connect refused inside connect(2) - FreeBSD does this on
+    // real paths (loopback ~1%, pf EACCES on a source-port collision) -
+    // runs the same per-phase failQuery the asynchronous SO_ERROR arm
+    // runs, so a TLSA leg ends lookup_failed and the resolve completes.
+    // Method: the chain is fed to .tlsa over injected answers, then the
+    // TC upgrade hits the fail_connects seam inside tcpSend.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.fail_connects = true;
     r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
 
     var spins: usize = 0;
