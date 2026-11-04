@@ -283,9 +283,13 @@ pub const Resolver = struct {
     stale_icmp: usize = 0,
     /// Test seam: report every UDP send as failed (see sendUdp).
     fail_sends: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
-    /// Test seam: report every TCP connect as synchronously refused
-    /// (see tcpSend); FreeBSD does this on real wire paths.
-    fail_connects: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test seam: refuse the next N TCP connects synchronously (see
+    /// tcpSend); FreeBSD does this on real wire paths.
+    fail_connects: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    /// Test seam: leave every TCP connect pending (see tcpSend); an
+    /// unconnected stream socket is never writable, so the armed
+    /// WRITE knote stays quiet and the connect never races a refusal.
+    pend_connects: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Test seam: report every knote registration as failed (see
     /// keventApplyChecked); covers the ensureOpen failure ordering.
     fail_kevents: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
@@ -1122,12 +1126,21 @@ pub const Resolver = struct {
             // FreeBSD refuses connects synchronously on real paths
             // (loopback ~1%, pf EACCES on a source-port collision), so
             // the refusal arm is exercised here, not only probed.
-            if (self.fail_connects) return error.ConnectFailed;
+            if (self.fail_connects > 0) {
+                self.fail_connects -= 1;
+                return error.ConnectFailed;
+            }
+            // Skip connect(2): the socket stays unconnected, so the
+            // armed WRITE knote never fires and the connect stays
+            // pending for as long as the test needs it.
+            if (self.pend_connects) connected = false;
         }
-        rawConnect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
-            error.WouldBlock => connected = false,
-            error.Failed => return error.ConnectFailed,
-        };
+        if (connected) {
+            rawConnect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
+                error.WouldBlock => connected = false,
+                error.Failed => return error.ConnectFailed,
+            };
+        }
         ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
         var n: usize = 1;
         if (!connected) {
@@ -4102,11 +4115,14 @@ test "dns-async: a chain query staged while the TCP connect is pending cannot pa
     // crash when the next phase's query reuses the socket: send(2)
     // on a pending connect is ENOTCONN, which std maps to
     // unreachable. The pending WRITE knote owns the send instead.
-    // Method: TEST-NET-1 nameserver (SYNs go unanswered); feed the
-    // chain a TC answer, run the retry deadlines so failQuery sends
-    // the _xmpp SRV query while the connect is still pending.
+    // Method: the pend_connects seam holds every connect pending
+    // without calling connect(2), so the test cannot race a
+    // synchronous refusal; feed the chain a TC answer and run the
+    // retry deadlines so failQuery sends the _xmpp SRV query while
+    // the connect is still pending.
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
+    r.pend_connects = true;
     r.setServer(try net.Address.parseIp("192.0.2.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
@@ -4119,8 +4135,8 @@ test "dns-async: a chain query staged while the TCP connect is pending cannot pa
     try std.testing.expect(job.tcp_fd >= 0);
     try std.testing.expect(!job.tcp_connected);
 
-    // Retry deadlines re-open the connection each time; the connect
-    // to the blackholed port never completes.
+    // Retry deadlines re-open the connection each time; the seam
+    // keeps every connect pending.
     r.onDeadline(job);
     try std.testing.expect(!job.tcp_connected);
     r.onDeadline(job);
@@ -4128,7 +4144,7 @@ test "dns-async: a chain query staged while the TCP connect is pending cannot pa
     // which stages on the still-pending socket instead of writing.
     r.onDeadline(job);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
-    try std.testing.expectEqual(Phase.srv_plain, job.phase);
+    try std.testing.expectEqual(Phase.srv_plain, r.jobs.items[0].phase);
 
     // The whole-chain bound then ends the lookup as a failure.
     r.onChainDeadline(job);
@@ -4139,9 +4155,11 @@ test "dns-async: a chain query staged while the TCP connect is pending cannot pa
 test "dns-async: a duplicate TC reply during a pending connect cannot panic" {
     // Same pending-connect hazard, reached by a second truncated
     // answer matching the retransmitted UDP query: the phase machine
-    // must never let a send hit the unconnected socket.
+    // must never let a send hit the unconnected socket. The
+    // pend_connects seam keeps the connect pending deterministically.
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
+    r.pend_connects = true;
     r.setServer(try net.Address.parseIp("192.0.2.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
@@ -4157,7 +4175,15 @@ test "dns-async: a duplicate TC reply during a pending connect cannot panic" {
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.calls);
 
-    r.onChainDeadline(job);
+    // The next phase's sendQuery reuses the still-pending socket: the
+    // guard in tcpSend leaves the frame to the armed WRITE knote
+    // rather than writing to the unconnected socket.
+    r.handleResponse(job, tbuf[0..answerTcpQuery(&tbuf, job.request)]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.srv_plain, r.jobs.items[0].phase);
+    try std.testing.expect(!r.jobs.items[0].tcp_connected);
+
+    r.onChainDeadline(r.jobs.items[0]);
     try std.testing.expectEqual(Status.failed, ctx.status.?);
 }
 
@@ -4166,11 +4192,12 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLS
     // TCP must be ignored, never parsed as NODATA: on a TLSA leg
     // that forged absence would permit PKIX under dane_first
     // (ADR-13). The leg must stay lookup_failed.
-    // Method: TEST-NET-1 nameserver (TCP connect stays pending);
+    // Method: the pend_connects seam holds the TCP connect pending;
     // feed the chain into the .tlsa phase, upgrade with a TC reply,
     // feed the same TC again, then run the retry deadlines.
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
+    r.pend_connects = true;
     r.setServer(try net.Address.parseIp("192.0.2.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
@@ -4187,8 +4214,8 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLS
     r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
     try std.testing.expectEqual(Phase.tlsa, job.phase);
 
-    // The TC reply upgrades the query to TCP; the connect to the
-    // blackholed port stays pending.
+    // The TC reply upgrades the query to TCP; the connect stays
+    // pending.
     const tl = buildTruncated(&buf, job.request);
     r.handleResponse(job, buf[0..tl]);
     try std.testing.expect(job.use_tcp);
@@ -4198,14 +4225,17 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLS
     // its TLSA phase instead of taking the forged empty answer.
     r.handleResponse(job, buf[0..tl]);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
-    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    try std.testing.expectEqual(Phase.tlsa, r.jobs.items[0].phase);
     try std.testing.expectEqual(@as(usize, 0), ctx.calls);
 
     // The TCP leg can never answer; retry deadlines exhaust into the
     // ordinary phase failure, which marks the target lookup_failed.
-    r.onDeadline(job);
-    r.onDeadline(job);
-    r.onDeadline(job);
+    // Each deadline may free the job, so it is re-fetched from the
+    // list instead of trusting the stale pointer.
+    for (0..MAX_TRIES + 2) |_| {
+        if (r.jobs.items.len == 0 or ctx.status != null) break;
+        r.onDeadline(r.jobs.items[0]);
+    }
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 1), ctx.calls);
     var res = ctx.res.?;
@@ -4217,9 +4247,10 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLS
 test "dns-async: a late TC reply on the TCP leg is not an answer (fallback TLSA)" {
     // Same forged-NODATA guard as above, on the no-SRV fallback TLSA
     // leg: the shared TLSA status of the fallback targets must stay
-    // lookup_failed.
+    // lookup_failed. The pend_connects seam holds the connect pending.
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
+    r.pend_connects = true;
     r.setServer(try net.Address.parseIp("192.0.2.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
@@ -4242,12 +4273,14 @@ test "dns-async: a late TC reply on the TCP leg is not an answer (fallback TLSA)
 
     r.handleResponse(job, buf[0..tl]);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
-    try std.testing.expectEqual(Phase.fallback_tlsa, job.phase);
+    try std.testing.expectEqual(Phase.fallback_tlsa, r.jobs.items[0].phase);
     try std.testing.expectEqual(@as(usize, 0), ctx.calls);
 
-    r.onDeadline(job);
-    r.onDeadline(job);
-    r.onDeadline(job);
+    // Each deadline may free the job; re-fetch it from the list.
+    for (0..MAX_TRIES + 2) |_| {
+        if (r.jobs.items.len == 0 or ctx.status != null) break;
+        r.onDeadline(r.jobs.items[0]);
+    }
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
@@ -4405,10 +4438,12 @@ test "dns-async: a stale TCP event on a recycled fd is ignored" {
     // Goal: TCP knote udata names the connection by (seq, gen, slot);
     // an event armed for a dead connection on the same fd number must
     // not reach the job that owns the fd now.
-    // Method: a pending connect to a blackholed port, then dispatch
-    // fabricated READ and WRITE events carrying the previous seq.
+    // Method: a pending connect held by the pend_connects seam, then
+    // dispatch fabricated READ and WRITE events carrying the previous
+    // seq.
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
+    r.pend_connects = true;
     r.setServer(try net.Address.parseIp("192.0.2.1", 53));
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
@@ -4573,7 +4608,7 @@ test "dns-async: a synchronous connect refusal fails the phase, not the job" {
     r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
     r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
     try std.testing.expectEqual(Phase.tlsa, job.phase);
-    r.fail_connects = true;
+    r.fail_connects = 4;
     r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
 
     var spins: usize = 0;
