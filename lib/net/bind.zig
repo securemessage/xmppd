@@ -64,29 +64,39 @@ const sun_path_max = 104; // sizeof(sockaddr_un.sun_path)
 fn socketError(err: posix.SocketError) error{ AccessDenied, SystemResources, Unexpected } {
     return switch (err) {
         error.AccessDenied => error.AccessDenied,
-        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        => error.SystemResources,
         else => error.Unexpected,
     };
 }
+
+const stream_nb = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
 
 /// Non-blocking CLOEXEC TCP listener on an IPv4 or IPv6 literal (including
 /// bind_address hosts); names are rejected instead of resolved. The caller
 /// attaches the fd to a loop via `Listener.attach`.
 pub fn bindTcp(options: *const TcpOptions) BindTcpError!posix.fd_t {
-    const addr = std.net.Address.parseIp(options.address, options.port) catch return error.InvalidAddress;
-    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch |err| return socketError(err);
+    const addr = std.net.Address.parseIp(options.address, options.port) catch
+        return error.InvalidAddress;
+    const fd = posix.socket(addr.any.family, stream_nb, 0) catch |err| return socketError(err);
     errdefer posix.close(fd);
 
     const one: c_int = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch return error.Unexpected;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch
+        return error.Unexpected;
     if (options.reuse_port_lb) {
-        posix.setsockopt(fd, posix.SOL.SOCKET, so_reuseport_lb, std.mem.asBytes(&one)) catch return error.Unexpected;
+        posix.setsockopt(fd, posix.SOL.SOCKET, so_reuseport_lb, std.mem.asBytes(&one)) catch
+            return error.Unexpected;
     }
     if (options.nodelay) {
-        posix.setsockopt(fd, std.c.IPPROTO.TCP, tcp_nodelay, std.mem.asBytes(&one)) catch return error.Unexpected;
+        posix.setsockopt(fd, std.c.IPPROTO.TCP, tcp_nodelay, std.mem.asBytes(&one)) catch
+            return error.Unexpected;
     }
     if (addr.any.family == posix.AF.INET6 and options.v6_only) {
-        posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one)) catch return error.Unexpected;
+        posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one)) catch
+            return error.Unexpected;
     }
 
     posix.bind(fd, &addr.any, addr.getOsSockLen()) catch |err| return switch (err) {
@@ -118,7 +128,7 @@ pub fn bindUnix(options: *const UnixOptions) BindUnixError!posix.fd_t {
     un.len = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
     const salen: posix.socklen_t = @intCast(@sizeOf(posix.sockaddr.un));
 
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch |err| return socketError(err);
+    const fd = posix.socket(posix.AF.UNIX, stream_nb, 0) catch |err| return socketError(err);
     errdefer posix.close(fd);
 
     posix.bind(fd, @ptrCast(&un), salen) catch |err| switch (err) {
@@ -137,8 +147,14 @@ pub fn bindUnix(options: *const UnixOptions) BindUnixError!posix.fd_t {
 
 /// EADDRINUSE probe with raw connect(2): std.posix.connect maps ENOTSOCK
 /// (the regular-file case this probe exists for) to unreachable.
-fn reclaimStale(path: [:0]const u8, un: *const posix.sockaddr.un, salen: posix.socklen_t, fd: posix.fd_t) BindUnixError!void {
-    const probe = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| return socketError(err);
+fn reclaimStale(
+    path: [:0]const u8,
+    un: *const posix.sockaddr.un,
+    salen: posix.socklen_t,
+    fd: posix.fd_t,
+) BindUnixError!void {
+    const stream_cx = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const probe = posix.socket(posix.AF.UNIX, stream_cx, 0) catch |err| return socketError(err);
     defer posix.close(probe);
 
     if (std.c.connect(probe, @ptrCast(un), salen) == 0) return error.AddressInUse;
@@ -258,7 +274,13 @@ pub const Listener = struct {
     /// Takes ownership of a listening fd (from bindTcp/bindUnix or inherited
     /// from the master); sets O_NONBLOCK and FD_CLOEXEC on it, then registers
     /// read interest with consumer token `ctx`.
-    pub fn attach(self: *Listener, loop: *Loop, fd: posix.fd_t, ctx: Token, family: Family) AttachError!void {
+    pub fn attach(
+        self: *Listener,
+        loop: *Loop,
+        fd: posix.fd_t,
+        ctx: Token,
+        family: Family,
+    ) AttachError!void {
         // An adopted fd (master-spawned listener) may arrive blocking and
         // inheritable; accept must never block the loop.
         try adoptFlags(fd);
@@ -349,7 +371,8 @@ pub const Listener = struct {
         switch (reason) {
             .emfile => {},
             else => {
-                self.fallback_timer = self.loop.scheduleIn(self.fallback_resume_ms, .none) catch null;
+                const ms = self.fallback_resume_ms;
+                self.fallback_timer = self.loop.scheduleIn(ms, .none) catch null;
             },
         }
         return .{ .paused = reason };
@@ -391,7 +414,9 @@ fn adoptFlags(fd: posix.fd_t) error{Unexpected}!void {
 fn peerAddress(sa: *const posix.sockaddr.storage) std.net.Address {
     const base: *const posix.sockaddr = @ptrCast(@alignCast(sa));
     return switch (base.family) {
-        posix.AF.INET6 => .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(sa))).* } },
+        posix.AF.INET6 => .{ .in6 = .{
+            .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(sa))).*,
+        } },
         else => .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(sa))).* } },
     };
 }
@@ -421,7 +446,11 @@ const AcceptDrain = struct {
     last: Listener.AcceptOutcome = .drained,
 
     /// acceptNext() until a terminal outcome; accepted fds land in `fds`.
-    fn drain(self: *AcceptDrain, l: *Listener, fds: []posix.fd_t) Listener.AcceptError!Listener.AcceptOutcome {
+    fn drain(
+        self: *AcceptDrain,
+        l: *Listener,
+        fds: []posix.fd_t,
+    ) Listener.AcceptError!Listener.AcceptOutcome {
         self.n = 0;
         while (true) {
             const out = try l.acceptNext();
@@ -470,7 +499,10 @@ test "bindTcp: listener accepts a non-blocking connection" {
     try std.testing.expectError(error.WouldBlock, posix.read(accepted[0], &buf));
     var nd: c_int = 0;
     var ndlen: posix.socklen_t = @sizeOf(c_int);
-    try std.testing.expectEqual(0, std.c.getsockopt(accepted[0], std.c.IPPROTO.TCP, tcp_nodelay, &nd, &ndlen));
+    try std.testing.expectEqual(
+        0,
+        std.c.getsockopt(accepted[0], std.c.IPPROTO.TCP, tcp_nodelay, &nd, &ndlen),
+    );
     try std.testing.expect(nd != 0);
 }
 
@@ -510,8 +542,14 @@ test "bindTcp: IPv6 literal binds and accepts on ::1" {
 }
 
 test "bindTcp: a DNS name is rejected, a bad literal is rejected" {
-    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{ .address = "localhost", .port = 80 }));
-    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{ .address = "999.0.0.1", .port = 80 }));
+    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{
+        .address = "localhost",
+        .port = 80,
+    }));
+    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{
+        .address = "999.0.0.1",
+        .port = 80,
+    }));
 }
 
 test "bindUnix: accepts and reports LOCAL_PEERCRED" {
@@ -598,7 +636,10 @@ test "bindUnix: a stale socket path is reclaimed" {
 test "bindUnix: long path refused, live listener and regular file refused, mode applied" {
     var long_buf: [128]u8 = undefined;
     const long_path = try std.fmt.bufPrintZ(&long_buf, "/tmp/{s}", .{"x" ** 110});
-    try std.testing.expectError(error.PathTooLong, bindUnix(&.{ .path = long_path, .mode = 0o600 }));
+    try std.testing.expectError(error.PathTooLong, bindUnix(&.{
+        .path = long_path,
+        .mode = 0o600,
+    }));
 
     var pbuf: [64]u8 = undefined;
     const path = testSockPath(&pbuf, "live");
@@ -639,7 +680,8 @@ test "Listener: bad descriptor and non-listener surface as ListenerInvalid" {
 
     // A valid but non-listening fd: accept4 gives EINVAL, same error.
     var pair: [2]posix.fd_t = undefined;
-    try std.testing.expectEqual(0, std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &pair));
+    const sp_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    try std.testing.expectEqual(0, std.c.socketpair(posix.AF.UNIX, sp_flags, 0, &pair));
     defer posix.close(pair[0]);
     var listener2: Listener = undefined;
     try listener2.attach(&loop, pair[1], test_ctx, .tcp);
@@ -765,13 +807,14 @@ fn childEmfile() void {
 
     // Spare handle the child closes to free a descriptor for the resume.
     var pair: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0, &pair) != 0)
-        posix.exit(8);
+    const sp_nb = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, sp_nb, 0, &pair) != 0) posix.exit(8);
     const spare = loop.attach(pair[1], test_ctx, .{ .read = true }) catch posix.exit(9);
     posix.close(pair[0]);
 
     const bound = boundAddr(lfd) catch posix.exit(10);
-    const cfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch posix.exit(11);
+    const st_cx = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const cfd = posix.socket(posix.AF.INET, st_cx, 0) catch posix.exit(11);
     posix.connect(cfd, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch posix.exit(12);
 
     const lim2: posix.rlimit = .{ .cur = 4, .max = rl.max };
@@ -812,7 +855,8 @@ fn childEmfile() void {
     if (loop.isPaused(listener.handle)) posix.exit(18);
 
     // A fresh connection proves read interest fired again after the resume.
-    const cfd2 = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch posix.exit(22);
+    const st_cx2 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const cfd2 = posix.socket(posix.AF.INET, st_cx2, 0) catch posix.exit(22);
     posix.connect(cfd2, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch posix.exit(23);
     loop.wait() catch posix.exit(19);
     while (loop.next()) |ev| {

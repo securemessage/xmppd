@@ -34,7 +34,12 @@ pub fn SlotMap(comptime T: type) type {
         kind: u8,
 
         /// Owns `values`, `gens` and `free` (all `slot_count_max` long); deinit frees them.
-        pub fn init(self: *Self, gpa: std.mem.Allocator, slot_count_max: u32, kind: u8) std.mem.Allocator.Error!void {
+        pub fn init(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            slot_count_max: u32,
+            kind: u8,
+        ) std.mem.Allocator.Error!void {
             std.debug.assert(slot_count_max >= 1 and slot_count_max <= std.math.maxInt(u32) - 1);
             const values = try gpa.alloc(T, slot_count_max);
             errdefer gpa.free(values);

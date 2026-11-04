@@ -59,7 +59,12 @@ pub const TimerWheel = struct {
     pub const Counters = struct { collects: u64 = 0, scanned: u64 = 0 };
 
     /// Owns the entry table (timers_max x 40 B) and the due list; borrows nothing.
-    pub fn init(self: *TimerWheel, gpa: std.mem.Allocator, timers_max: u32, now_ms: u64) std.mem.Allocator.Error!void {
+    pub fn init(
+        self: *TimerWheel,
+        gpa: std.mem.Allocator,
+        timers_max: u32,
+        now_ms: u64,
+    ) std.mem.Allocator.Error!void {
         std.debug.assert(timers_max >= 1);
         try self.entries.init(gpa, timers_max, timer_entry_kind);
         errdefer self.entries.deinit(gpa);
@@ -168,7 +173,11 @@ pub const TimerWheel = struct {
                     self.counters.scanned += 1;
                     const e = &self.entries.values[idx];
                     const next = e.next;
-                    const idx_tok: TimerId = .{ .index = idx, .gen = self.entries.gens[idx], .kind = timer_entry_kind };
+                    const idx_tok: TimerId = .{
+                        .index = idx,
+                        .gen = self.entries.gens[idx],
+                        .kind = timer_entry_kind,
+                    };
                     if (e.deadline <= self.cur_ms) {
                         e.lvl = due_lvl;
                         self.due[self.due_len] = idx_tok;
@@ -190,7 +199,12 @@ pub const TimerWheel = struct {
                 return ea.seq < eb.seq;
             }
         };
-        std.sort.pdq(TimerId, self.due[0..self.due_len], Ctx{ .values = self.entries.values }, Ctx.lessThan);
+        std.sort.pdq(
+            TimerId,
+            self.due[0..self.due_len],
+            Ctx{ .values = self.entries.values },
+            Ctx.lessThan,
+        );
     }
 
     fn levelFor(self: *const TimerWheel, deadline_ms: u64) usize {
@@ -328,7 +342,8 @@ test "TimerWheel: TimerTableFull at capacity" {
     defer wheel.deinit(std.testing.allocator);
 
     _ = try wheel.schedule(10, .{ .index = 1, .gen = 1, .kind = 0xEE });
-    try std.testing.expectError(error.TimerTableFull, wheel.schedule(20, .{ .index = 2, .gen = 1, .kind = 0xEE }));
+    const over: TimerId = .{ .index = 2, .gen = 1, .kind = 0xEE };
+    try std.testing.expectError(error.TimerTableFull, wheel.schedule(20, over));
 }
 
 test "TimerWheel: deadline in the past expires immediately" {

@@ -518,7 +518,8 @@ pub const Loop = struct {
     /// keeps working.
     pub fn watchSignal(self: *Loop, signo: u8) WatchSignalError!void {
         self.assertOwner();
-        if (signo == 0 or signo >= max_signal or signo == posix.SIG.CHLD) return error.InvalidSignal;
+        if (signo == 0 or signo >= max_signal or signo == posix.SIG.CHLD)
+            return error.InvalidSignal;
         if (signal_owners[signo].swap(true, .acq_rel)) return error.SignalOwned;
         errdefer signal_owners[signo].store(false, .release);
 
@@ -587,7 +588,11 @@ pub const Loop = struct {
             .flags = std.c.EV.ADD,
             .fflags = std.c.NOTE.EXIT,
             .data = 0,
-            .udata = (Token{ .index = @truncate(@as(u64, @bitCast(@as(i64, pid)))), .gen = 1, .kind = proc_kind }).toUdata(),
+            .udata = (Token{
+                .index = @truncate(@as(u64, @bitCast(@as(i64, pid)))),
+                .gen = 1,
+                .kind = proc_kind,
+            }).toUdata(),
         };
         try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
     }
@@ -618,63 +623,7 @@ pub const Loop = struct {
 
         if (self.options.on_flush) |hook| hook.func(hook.ctx);
 
-        var nchanges: usize = 0;
-        for (self.dirty.items) |tok| {
-            const h = self.handles.get(tok) orelse continue; // closed: tombstone
-            h.dirty = false;
-            if (h.broken) continue;
-            nchanges = self.commitHandle(tok, h, nchanges);
-        }
-        self.dirty.clearRetainingCapacity();
-        if (self.broadcast_disarm and self.broadcast_fd >= 0) {
-            self.change_buf[nchanges] = .{
-                .ident = @intCast(self.broadcast_fd),
-                .filter = std.c.EVFILT.READ,
-                .flags = std.c.EV.DISABLE,
-                .fflags = 0,
-                .data = 0,
-                .udata = broadcast_token.toUdata(),
-            };
-            nchanges += 1;
-            self.broadcast_disarm = false;
-        }
-
-        // Arm the single one-shot kernel timer to the wheel's next deadline;
-        // EVFILT_TIMER data is milliseconds by default. A deadline already
-        // in the past never needs the kernel: emit it in this pass instead
-        // of arming a zero-length timer.
-        if (self.wheel.nextDeadline()) |d| {
-            const now = monotonicMs();
-            if (d <= now) {
-                // Due already: emit in this pass instead of arming a
-                // zero-length kernel timer, and do not let kevent block.
-                self.timer_ready = true;
-                self.immediate = true;
-            } else if (!self.timer_armed or self.armed_deadline != d) {
-                self.change_buf[nchanges] = .{
-                    .ident = timer_ident,
-                    .filter = std.c.EVFILT.TIMER,
-                    .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                    .fflags = 0,
-                    .data = @intCast(d - now),
-                    .udata = timer_token.toUdata(),
-                };
-                nchanges += 1;
-                self.timer_armed = true;
-                self.armed_deadline = d;
-            }
-        } else if (self.timer_armed) {
-            self.change_buf[nchanges] = .{
-                .ident = timer_ident,
-                .filter = std.c.EVFILT.TIMER,
-                .flags = std.c.EV.DELETE,
-                .fflags = 0,
-                .data = 0,
-                .udata = timer_token.toUdata(),
-            };
-            nchanges += 1;
-            self.timer_armed = false;
-        }
+        const nchanges = self.stageChanges();
         std.debug.assert(nchanges <= self.change_buf.len);
 
         self.requeue_len = self.requeue_list.items.len;
@@ -728,7 +677,13 @@ pub const Loop = struct {
             }
             self.stats_.synthetic_events += 1;
             self.stats_.delivered_events += 1;
-            const io: Io = .{ .handle = entry.token, .ctx = h.ctx, .data = 0, .eof = false, .errno = 0 };
+            const io: Io = .{
+                .handle = entry.token,
+                .ctx = h.ctx,
+                .data = 0,
+                .eof = false,
+                .errno = 0,
+            };
             return switch (entry.filter) {
                 .read => .{ .readable = io },
                 .write => .{ .writable = io },
@@ -743,6 +698,63 @@ pub const Loop = struct {
             return .{ .signal = .{ .signo = @intCast(signo), .count = 1 } };
         }
         return null;
+    }
+
+    /// Stage every pending change: dirty handle commits, the broadcast
+    /// disarm, and the one-shot kernel timer arm/disarm. A deadline already
+    /// in the past emits directly (timer_ready) instead of a zero-length arm.
+    fn stageChanges(self: *Loop) usize {
+        var nchanges: usize = 0;
+        for (self.dirty.items) |tok| {
+            const h = self.handles.get(tok) orelse continue; // closed: tombstone
+            h.dirty = false;
+            if (h.broken) continue;
+            nchanges = self.commitHandle(tok, h, nchanges);
+        }
+        self.dirty.clearRetainingCapacity();
+        if (self.broadcast_disarm and self.broadcast_fd >= 0) {
+            self.change_buf[nchanges] = .{
+                .ident = @intCast(self.broadcast_fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.DISABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = broadcast_token.toUdata(),
+            };
+            nchanges += 1;
+            self.broadcast_disarm = false;
+        }
+        if (self.wheel.nextDeadline()) |d| {
+            const now = monotonicMs();
+            if (d <= now) {
+                self.timer_ready = true;
+                self.immediate = true;
+            } else if (!self.timer_armed or self.armed_deadline != d) {
+                self.change_buf[nchanges] = .{
+                    .ident = timer_ident,
+                    .filter = std.c.EVFILT.TIMER,
+                    .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = @intCast(d - now),
+                    .udata = timer_token.toUdata(),
+                };
+                nchanges += 1;
+                self.timer_armed = true;
+                self.armed_deadline = d;
+            }
+        } else if (self.timer_armed) {
+            self.change_buf[nchanges] = .{
+                .ident = timer_ident,
+                .filter = std.c.EVFILT.TIMER,
+                .flags = std.c.EV.DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = timer_token.toUdata(),
+            };
+            nchanges += 1;
+            self.timer_armed = false;
+        }
+        return nchanges;
     }
 
     pub fn stats(self: *const Loop) *const Stats {
@@ -944,7 +956,10 @@ pub const Loop = struct {
                 // Reap when it is our child so the event carries the exit
                 // status; a non-child or already-reaped pid reports 0.
                 var st: c_int = 0;
-                const status: u32 = if (std.c.waitpid(pid, &st, w_nohang) == pid) @bitCast(st) else 0;
+                const status: u32 = if (std.c.waitpid(pid, &st, w_nohang) == pid)
+                    @bitCast(st)
+                else
+                    0;
                 self.stats_.delivered_events += 1;
                 return .{ .process_exit = .{ .pid = pid, .status = status } };
             },
@@ -966,6 +981,13 @@ pub const Loop = struct {
                 return null;
             },
         }
+        return self.translateHandle(raw, token);
+    }
+
+    /// Handle-kind event: resolve the token, surface a rejected change as
+    /// `change_failed`, or emit the read/write readiness (re-arming an
+    /// EV_DISPATCH write the consumer still wants).
+    fn translateHandle(self: *Loop, raw: kev.Kevent, token: Token) ?Event {
         const h = self.resolve(token) orelse {
             self.stats_.stale_events += 1;
             return null;
@@ -1071,9 +1093,12 @@ fn testLoop(on_flush: ?FlushHook) !Loop {
     return loop;
 }
 
+const loop_stream_nb = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+
 fn socketpairNb() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0, &fds) != 0)
+    const sp_flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, sp_flags, 0, &fds) != 0)
         return error.SocketPairFailed;
     return fds;
 }
@@ -1152,7 +1177,7 @@ fn tcpPair() !struct { server: posix.fd_t, client: posix.fd_t } {
     var blen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
     try std.testing.expectEqual(0, std.c.getsockname(lfd, @ptrCast(&bound), &blen));
 
-    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const cfd = try posix.socket(posix.AF.INET, loop_stream_nb, 0);
     errdefer posix.close(cfd);
     posix.connect(cfd, @ptrCast(&bound), blen) catch |err| switch (err) {
         error.WouldBlock => {},
@@ -1178,7 +1203,7 @@ test "Loop: socket error arrives as eof plus errno" {
     try std.testing.expectEqual(0, std.c.getsockname(lfd, @ptrCast(&bound), &blen));
     posix.close(lfd);
 
-    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const cfd = try posix.socket(posix.AF.INET, loop_stream_nb, 0);
     posix.connect(cfd, @ptrCast(&bound), blen) catch |err| switch (err) {
         // A refused loopback connect usually pends (EINPROGRESS) but can
         // report ECONNREFUSED synchronously under load; either way the
@@ -1827,5 +1852,9 @@ test "Loop: attach at capacity fails with HandleTableFull" {
     defer posix.close(p3[1]);
     _ = try loop.attach(p1[1], tctx(1), .{ .read = true });
     _ = try loop.attach(p2[1], tctx(2), .{ .read = true });
-    try std.testing.expectError(error.HandleTableFull, loop.attach(p3[1], tctx(3), .{ .read = true }));
+    try std.testing.expectError(error.HandleTableFull, loop.attach(
+        p3[1],
+        tctx(3),
+        .{ .read = true },
+    ));
 }

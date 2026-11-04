@@ -67,7 +67,9 @@ pub const Broadcast = struct {
     pub fn init(self: *Broadcast) error{ SystemResources, Unexpected }!void {
         const flags: posix.O = .{ .NONBLOCK = true, .CLOEXEC = true };
         const fds = posix.pipe2(flags) catch |err| switch (err) {
-            error.SystemFdQuotaExceeded, error.ProcessFdQuotaExceeded => return error.SystemResources,
+            error.SystemFdQuotaExceeded,
+            error.ProcessFdQuotaExceeded,
+            => return error.SystemResources,
             else => return error.Unexpected,
         };
         self.* = .{

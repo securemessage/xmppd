@@ -122,12 +122,18 @@ test "submitWait: EBADF and EINVAL are errors, not panics" {
     var events: [1]Kevent = undefined;
     var errno_out: u32 = 0;
     var ts: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    try std.testing.expectError(error.KqueueInvalid, submitWait(bad_kq, &.{}, &events, &ts, &errno_out));
+    try std.testing.expectError(
+        error.KqueueInvalid,
+        submitWait(bad_kq, &.{}, &events, &ts, &errno_out),
+    );
 
     const kq = try posix.kqueue();
     defer posix.close(kq);
     ts.nsec = -1; // invalid timeout
-    try std.testing.expectError(error.InvalidArgument, submitWait(kq, &.{}, &events, &ts, &errno_out));
+    try std.testing.expectError(
+        error.InvalidArgument,
+        submitWait(kq, &.{}, &events, &ts, &errno_out),
+    );
 }
 
 test "submitWait: a bad change returns an EV_ERROR record, not a failure" {
