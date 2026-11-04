@@ -538,13 +538,16 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
-        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
-
-        // Installing SIG_IGN discards pending instances of the signal
-        // (POSIX), so the pending check must read before it lands. Pending
-        // signals emit once as a synthetic `.signal` event.
+        // The pending check reads before the knote attaches: a signal
+        // posted between attach and sigpending would fire the knote and
+        // still sit in the pending set, reported twice. Installing SIG_IGN
+        // discards pending instances of the signal (POSIX), so the read
+        // must also happen before it lands. Pending signals emit once as
+        // a synthetic `.signal` event.
         var pend: posix.sigset_t = posix.sigemptyset();
         const was_pending = sigpending(&pend) == 0 and posix.sigismember(&pend, signo);
+
+        try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
 
         const ign: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.IGN },
@@ -574,6 +577,10 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
+        // Restore before the knote delete, mirroring watch: a signal in
+        // the gap is seen by the still-registered knote instead of being
+        // dropped by the not-yet-restored disposition.
+        posix.sigaction(signo, &self.saved_dispositions[signo], null);
         kev.applyNow(self.kq, &del, &self.stats_.last_errno) catch |err| switch (err) {
             error.NotFound, error.BadDescriptor => {},
             else => |e| return e,
@@ -581,7 +588,6 @@ pub const Loop = struct {
         self.watched_signals.unset(signo);
         self.pending_signals.unset(signo);
         signal_owners[signo].store(false, .release);
-        posix.sigaction(signo, &self.saved_dispositions[signo], null);
     }
 
     /// Process exit notification via EVFILT_PROC + NOTE_EXIT; emits

@@ -13,7 +13,8 @@
 //! so a listener also recovers when nothing closes.
 //!
 //! peerCred returns the LOCAL_PEERCRED credentials of an accepted Unix
-//! socket (uid, gid).
+//! socket: uid, gid, the group set the kernel reports (XU_NGROUPS=16 cap,
+//! flagged truncated beyond it) and pid.
 
 const std = @import("std");
 const posix = std.posix;
@@ -318,9 +319,12 @@ pub const Listener = struct {
     /// (read interest resumes on a close or the fallback deadline),
     /// `peer_rejected` when LOCAL_PEERCRED fails on a unix accept. EINTR
     /// retries, ECONNABORTED/EPROTO are counted and skipped, and every other
-    /// errno is an explicit outcome or error — nothing spins.
+    /// errno is an explicit outcome or error; nothing spins.
     pub fn acceptNext(self: *Listener) AcceptError!AcceptOutcome {
-        if (self.loop.isPaused(self.handle)) return .{ .paused = self.pause_reason };
+        if (self.loop.isPaused(self.handle)) {
+            self.accepted_this_pass = 0;
+            return .{ .paused = self.pause_reason };
+        }
         // The pause ended through a close or a resume: the fallback deadline
         // is no longer needed; cancel it so it cannot resume a later pause
         // early (cancel returns false once it already fired).
@@ -365,6 +369,7 @@ pub const Listener = struct {
                 var cred_errno: u32 = 0;
                 const cred = peerCred(fd, &cred_errno) catch {
                     posix.close(fd);
+                    self.accepted_this_pass = 0;
                     return .{ .peer_rejected = cred_errno };
                 };
                 return .{ .accepted = .{ .fd = fd, .peer = .{ .unix = cred } } };
@@ -947,6 +952,32 @@ fn childEmfile() void {
     // are both accepted after the resume.
     if (n != 2) posix.exit(20);
     posix.exit(0);
+}
+
+test "Listener: paused resets the pass's accept budget" {
+    // A pause mid-drain must not shrink the next pass's batch budget.
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    const bound = try boundAddr(lfd);
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(cfd);
+    try posix.connect(cfd, @ptrCast(&bound), @sizeOf(posix.sockaddr.in));
+    try loop.wait();
+    while (loop.next()) |_| {}
+
+    const out = try listener.acceptNext();
+    try std.testing.expect(out == .accepted);
+    posix.close(out.accepted.fd);
+    try std.testing.expectEqual(@as(u16, 1), listener.accepted_this_pass);
+
+    try loop.pauseReadUntilClose(listener.handle);
+    try std.testing.expect(try listener.acceptNext() == .paused);
+    try std.testing.expectEqual(@as(u16, 0), listener.accepted_this_pass);
 }
 
 test "Listener: a close-resumed pause cancels the armed fallback" {
