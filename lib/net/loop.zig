@@ -122,7 +122,7 @@ pub const AttachError = error{HandleTableFull};
 pub const HandleError = error{StaleHandle};
 pub const PauseError = error{ StaleHandle, PausedListFull };
 pub const DetachError = error{StaleHandle} || kev.ApplyError;
-pub const WaitError = kev.SubmitWaitError || error{InternalChangeFailed};
+pub const WaitError = kev.SubmitWaitError || error{ TimerArmFailed, BroadcastDisarmFailed };
 pub const InitError = std.mem.Allocator.Error || error{ SystemResources, Unexpected };
 
 pub const FlushHook = struct {
@@ -166,8 +166,10 @@ pub const Loop = struct {
     timer_armed: bool,
     armed_deadline: u64,
     timer_ready: bool,
-    internal_failed: bool,
+    internal_failure: ?InternalFailure,
     watched_signals: std.StaticBitSet(max_signal),
+
+    const InternalFailure = enum { timer, broadcast };
 
     /// Creates a CLOEXEC kqueue and allocates every buffer; no allocation
     /// happens after init.
@@ -230,7 +232,7 @@ pub const Loop = struct {
             .timer_armed = false,
             .armed_deadline = 0,
             .timer_ready = false,
-            .internal_failed = false,
+            .internal_failure = null,
             .watched_signals = std.StaticBitSet(max_signal).initEmpty(),
         };
 
@@ -584,9 +586,12 @@ pub const Loop = struct {
     /// harvests the next batch. Asserts the previous batch was fully consumed.
     pub fn wait(self: *Loop) WaitError!void {
         self.assertOwner();
-        if (self.internal_failed) {
-            self.internal_failed = false;
-            return error.InternalChangeFailed;
+        if (self.internal_failure) |f| {
+            self.internal_failure = null;
+            return switch (f) {
+                .timer => error.TimerArmFailed,
+                .broadcast => error.BroadcastDisarmFailed,
+            };
         }
         std.debug.assert(self.batch_pos == self.batch_len);
         std.debug.assert(self.requeue_pos == self.requeue_len);
@@ -871,10 +876,18 @@ pub const Loop = struct {
     fn translate(self: *Loop, raw: kev.Kevent) ?Event {
         const token = Token.fromUdata(raw.udata);
         if (raw.flags & std.c.EV.ERROR != 0 and token.kind != handle_kind) {
-            // A loop-internal change (timer arm, broadcast disarm) failed;
-            // wait() reports InternalChangeFailed on the next call.
+            // A loop-internal change (timer arm/disarm, broadcast disarm)
+            // failed; the next wait() reports the named error. The kernel
+            // did not apply it: mark the timer disarmed so the next commit
+            // re-arms rather than trusting the stale optimistic flag (a
+            // still-armed knote left by a failed delete only costs one
+            // spurious wakeup).
             self.stats_.change_failures += 1;
-            self.internal_failed = true;
+            self.internal_failure = switch (token.kind) {
+                timer_kind => .timer,
+                else => .broadcast,
+            };
+            if (token.kind == timer_kind) self.timer_armed = false;
             return null;
         }
         switch (token.kind) {
@@ -1247,6 +1260,39 @@ test "Loop: close purges staged changes and preserves the order of the rest" {
     try std.testing.expect(events.items[0].readable.handle.eql(handles[0]));
     try std.testing.expect(events.items[1].readable.handle.eql(handles[2]));
     try std.testing.expectEqual(@as(u64, 0), loop.stats().change_failures);
+}
+
+test "Loop: a failed internal timer change disarms the flag and names the error" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    // The kernel echoes a rejected EVFILT_TIMER change as an EV_ERROR
+    // record: the knote was not applied, so the optimistic armed flag must
+    // reset and the next wait() must name TimerArmFailed.
+    loop.timer_armed = true;
+    const raw: kev.Kevent = .{
+        .ident = timer_ident,
+        .filter = std.c.EVFILT.TIMER,
+        .flags = std.c.EV.ERROR,
+        .fflags = 0,
+        .data = @intFromEnum(posix.E.NOMEM),
+        .udata = timer_token.toUdata(),
+    };
+    try std.testing.expect(loop.translate(raw) == null);
+    try std.testing.expect(!loop.timer_armed);
+    try std.testing.expectError(error.TimerArmFailed, loop.wait());
+    try std.testing.expectEqual(@as(u64, 1), loop.stats().change_failures);
+
+    const raw_bcast: kev.Kevent = .{
+        .ident = 0,
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ERROR,
+        .fflags = 0,
+        .data = @intFromEnum(posix.E.BADF),
+        .udata = broadcast_token.toUdata(),
+    };
+    try std.testing.expect(loop.translate(raw_bcast) == null);
+    try std.testing.expectError(error.BroadcastDisarmFailed, loop.wait());
 }
 
 test "Loop: close leaves other dirty entries and the flag consistent" {
