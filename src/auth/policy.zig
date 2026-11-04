@@ -16,6 +16,7 @@
 const std = @import("std");
 const rate_limiter = @import("rate_limiter");
 const lock_store_mod = @import("lock_store");
+const backend_mod = @import("backend");
 
 const log = std.log.scoped(.auth_policy);
 
@@ -56,7 +57,12 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
         var ctx: Ctx = undefined;
 
         fn check(_: *anyopaque, username: []const u8) LockCheckResult {
-            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return .store_error;
+            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch |err| switch (err) {
+                // An unpreparable name cannot have a lock row; that is not a
+                // storage fault and must not become a temporary-auth oracle.
+                error.InvalidAccountName => return .unlocked,
+                else => return .store_error,
+            };
             return if (result != null) .locked else .unlocked;
         }
     };
@@ -397,6 +403,19 @@ test "Policy: an untrackable prepared key fails closed" {
     var big: [account_key_max + 1]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expectEqualStrings("temporary-auth-failure", policy.admitAccount(&big) orelse return error.ExpectedDenial);
+}
+
+test "Policy: an unpreparable name is unlocked, not a store error" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var locks = lock_store_mod.LockStore(backend_mod.MemoryBackend).init(&db);
+    const checker = makeLockChecker(backend_mod.MemoryBackend, &locks, allocator);
+    const policy = Policy{ .lock_checker = checker };
+
+    // A raw invalid name cannot own a lock row, so policy.check must not
+    // surface temporary-auth-failure.
+    try std.testing.expect(policy.check("bad name", "10.0.0.1") == null);
 }
 
 test "Policy: account keys fold case and domain to one localpart" {

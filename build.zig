@@ -742,6 +742,7 @@ pub fn build(b: *std.Build) void {
     });
     policy_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
     policy_test_mod.addImport("lock_store", lock_store_test_mod);
+    policy_test_mod.addImport("backend", backend_test_mod);
 
     const policy_tests = b.addTest(.{
         .name = "policy-tests",
@@ -1538,6 +1539,7 @@ pub fn build(b: *std.Build) void {
     });
     auth_policy_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_policy_mod.addImport("lock_store", auth_lock_store_mod);
+    auth_policy_mod.addImport("backend", auth_backend_mod);
 
     auth_handler_mod.addImport("sasl", sasl_mod);
     auth_handler_mod.addImport("precis_username", precis_username_mod);
@@ -1641,6 +1643,7 @@ pub fn build(b: *std.Build) void {
     });
     oidc_policy_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_policy_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_policy_mod.addImport("backend", auth_backend_mod);
 
     oidc_handler_mod.addImport("sasl", sasl_mod);
     oidc_handler_mod.addImport("precis_username", precis_username_mod);
