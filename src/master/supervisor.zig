@@ -272,13 +272,16 @@ pub const Supervisor = struct {
     /// Updates state and backoff. Returns true if the supervisor should
     /// restart the child (i.e., not shutting down).
     pub fn handleChildExit(self: *Supervisor, status: u32) bool {
-        const exit_code = (status >> 8) & 0xFF;
-        const signal = status & 0x7F;
-
-        if (signal != 0) {
-            log.warn("child pid={?d} killed by signal {d}", .{ self.child_pid, signal });
+        // WIFEXITED gates the exit-status read and WIFSIGNALED the signal
+        // read: a stop or continue report is neither, and treating its
+        // 0x7f marker as a signal would restart over a live child.
+        if (posix.W.IFEXITED(status)) {
+            log.info("child pid={?d} exited with code {d}", .{ self.child_pid, posix.W.EXITSTATUS(status) });
+        } else if (posix.W.IFSIGNALED(status)) {
+            log.warn("child pid={?d} killed by signal {d}", .{ self.child_pid, posix.W.TERMSIG(status) });
         } else {
-            log.info("child pid={?d} exited with code {d}", .{ self.child_pid, exit_code });
+            log.warn("child pid={?d} wait status 0x{x} is not a termination", .{ self.child_pid, status });
+            return false;
         }
 
         if (self.state == .shutting_down) {
@@ -423,8 +426,40 @@ test "Supervisor: fork and wait" {
     sup.state = .running;
 
     const status = try sup.waitChild();
-    const exit_code = (status >> 8) & 0xFF;
-    try std.testing.expectEqual(@as(u32, 0), exit_code);
+    try std.testing.expect(posix.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(status));
+}
+
+test "Supervisor: a signal kill is a termination, a stop report is not" {
+    // A child that raises SIGKILL leaves a signaled wait status: the
+    // supervisor restarts on it. A stopped/continued report (0x7f low
+    // byte) is not a death; reading its marker as a signal would restart
+    // over a live child.
+    const pid = try posix.fork();
+    if (pid == 0) {
+        posix.raise(posix.SIG.KILL) catch std.c._exit(125);
+        std.c._exit(0);
+    }
+
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    sup.child_pid = pid;
+    sup.state = .running;
+    sup.last_start = std.time.nanoTimestamp();
+
+    const status = try sup.waitChild();
+    try std.testing.expect(posix.W.IFSIGNALED(status));
+    try std.testing.expectEqual(@as(u32, posix.SIG.KILL), posix.W.TERMSIG(status));
+    try std.testing.expect(sup.handleChildExit(status));
+    try std.testing.expect(sup.state == .exited);
+
+    var sup2 = try Supervisor.init("/nonexistent", &.{}, 1);
+    sup2.state = .running;
+    sup2.child_pid = 12345;
+    const stopped_status: u32 = (@as(u32, posix.SIG.STOP) << 8) | 0x7f;
+    try std.testing.expect(!posix.W.IFEXITED(stopped_status));
+    try std.testing.expect(!posix.W.IFSIGNALED(stopped_status));
+    try std.testing.expect(!sup2.handleChildExit(stopped_status));
+    try std.testing.expect(sup2.state == .running);
 }
 
 test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356)" {
@@ -764,8 +799,7 @@ test "Supervisor: uid-only drop resolves the run user's gid" {
     // and logs the refusal at err (D8).
     const captured = try runCaptured(childResolveUnknownUid);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
-            "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 test "Supervisor: spawnChild refuses to start when the run user has no passwd entry" {
@@ -775,8 +809,7 @@ test "Supervisor: spawnChild refuses to start when the run user has no passwd en
     // untouched state in its exit code.
     const captured = try runCaptured(childSpawnNoPasswd);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
-            "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
 fn childKillSelf() callconv(.c) u8 {
@@ -919,7 +952,8 @@ test "Supervisor: spawnChild drops the child into the run user's primary group" 
 
     try std.testing.expectEqual(pid, sup.child_pid.?);
     const status = try sup.waitChild();
-    try std.testing.expectEqual(@as(u32, 0), (status >> 8) & 0xFF);
+    try std.testing.expect(posix.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(status));
 }
 
 test "Supervisor: a run gid of 0 is refused" {
@@ -928,8 +962,7 @@ test "Supervisor: a run gid of 0 is refused" {
     // exit code.
     const captured = try runCaptured(childAdoptGidZero);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
-    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len],
-            "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): run user uid 65534 has gid 0; refusing to drop into group root") != null);
 
     // A real primary gid is adopted.
     var sup = try Supervisor.init("/unused", &.{}, 1);
