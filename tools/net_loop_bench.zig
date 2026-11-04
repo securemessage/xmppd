@@ -3,13 +3,14 @@
 //! Run pinned for the second column: `cpuset -l 4 zig-out/bin/bench-net-loop`.
 //!
 //! Matrix (DESIGN 13.10):
-//!   idle N       N in {0, 1k, 10k, 50k} attached handles, no events: one
-//!                commit + zero-timeout kevent pass.
+//!   idle N       N in {0, 1k, 10k, 50k} idle handles plus one active
+//!                socketpair: commit + scan + one delivery per pass.
 //!   event A      A in {1, 64, 1k} handles with a byte pending that is never
 //!                read(2): harvest + delivery cost per iteration, no I/O.
 //!   active A     same, but one read(2) per event (real handler cost).
-//!   wake 1|8     cross-thread producers spamming notify() while the
-//!                consumer measures wait -> .wake delivery.
+//!   wake 1|8     cross-thread notify() -> .wake delivery latency: each
+//!                producer stamps the time before notify() and the consumer
+//!                reports event time minus the earliest stamp.
 //!
 //! Five samples per row; min/median/max reported (spread). CLOCK_MONOTONIC.
 
@@ -71,7 +72,7 @@ fn report(name: []const u8, unit: []const u8, samples: *const [runs]i128) void {
 }
 
 fn benchIdle(n: u32) ![runs]i128 {
-    var loop = try makeLoop(@max(n, 1));
+    var loop = try makeLoop(@max(n + 1, 1));
     defer loop.deinit(std.heap.page_allocator);
     const alloc = std.heap.page_allocator;
     var fds = try alloc.alloc(posix.fd_t, n);
@@ -80,17 +81,27 @@ fn benchIdle(n: u32) ![runs]i128 {
         fds[i] = try pairFd();
         _ = try loop.attach(fds[i], ctx_tok, .{ .read = true });
     }
-    loop.requestImmediate();
+    // One active socketpair among the idle registrations: each timed pass
+    // commits, scans and delivers a real read event (I/O cost is constant
+    // across N, so the row still isolates the idle-handle overhead).
+    var peer: posix.fd_t = undefined;
+    const active = try pendingPair(&peer);
+    _ = try loop.attach(active, ctx_tok, .{ .read = true });
+    var byte: [1]u8 = undefined;
     try loop.wait();
-    while (loop.next() != null) {}
+    while (loop.next()) |ev| {
+        if (ev == .readable) _ = posix.read(active, &byte) catch 0;
+    }
 
     var samples: [runs]i128 = undefined;
     for (&samples) |*s| {
         const t0 = nowNs();
         for (0..iters) |_| {
-            loop.requestImmediate();
+            _ = try posix.write(peer, "x");
             try loop.wait();
-            while (loop.next() != null) {}
+            while (loop.next()) |ev| {
+                if (ev == .readable) _ = posix.read(active, &byte) catch 0;
+            }
         }
         s.* = @divTrunc(nowNs() - t0, iters);
     }
@@ -167,11 +178,17 @@ fn benchActive(a: u32) ![runs]i128 {
     return samples;
 }
 
+const WakeShared = struct {
+    earliest: std.atomic.Value(i128) = .init(std.math.maxInt(i128)),
+    done: std.atomic.Value(bool) = .init(false),
+};
+
 const Producer = struct {
     wake: *net.Wake,
-    done: *const std.atomic.Value(bool),
+    shared: *WakeShared,
     fn run(self: *const Producer) void {
-        while (!self.done.load(.acquire)) {
+        while (!self.shared.done.load(.acquire)) {
+            _ = self.shared.earliest.fetchMin(nowNs(), .acq_rel);
             self.wake.notify() catch return;
             std.Thread.yield() catch {};
         }
@@ -181,26 +198,34 @@ const Producer = struct {
 fn benchWake(producers: usize) ![runs]i128 {
     var loop = try makeLoop(1);
     defer loop.deinit(std.heap.page_allocator);
-    var done = std.atomic.Value(bool).init(false);
+    var shared: WakeShared = .{};
     var threads: [8]std.Thread = undefined;
-    const ctx: Producer = .{ .wake = loop.waker(), .done = &done };
+    const ctx: Producer = .{ .wake = loop.waker(), .shared = &shared };
     for (threads[0..producers]) |*t| t.* = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
     defer {
-        done.store(true, .release);
+        shared.done.store(true, .release);
         for (threads[0..producers]) |t| t.join();
     }
 
+    // Latency per .wake: event delivery time minus the earliest notify
+    // stamp since the previous delivery. A stamp consumed by an earlier
+    // wake clamps the sample to zero; the median stays meaningful.
     var samples: [runs]i128 = undefined;
     for (&samples) |*s| {
-        const t0 = nowNs();
+        var total: i128 = 0;
         var wakes: u64 = 0;
         while (wakes < iters) {
             try loop.wait();
             while (loop.next()) |ev| {
-                if (ev == .wake) wakes += 1;
+                if (ev != .wake) continue;
+                const t1 = nowNs();
+                const t0 = shared.earliest.swap(std.math.maxInt(i128), .acq_rel);
+                if (t0 == std.math.maxInt(i128)) continue;
+                total += @max(0, t1 - t0);
+                wakes += 1;
             }
         }
-        s.* = @divTrunc(nowNs() - t0, @as(i128, @intCast(wakes)));
+        s.* = @divTrunc(total, @as(i128, @intCast(wakes)));
     }
     return samples;
 }
