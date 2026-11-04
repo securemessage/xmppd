@@ -7,15 +7,16 @@
 //! ## Discipline
 //!
 //! Workers do crypto ONLY: no sockets, no store access, no loop-thread
-//! memory. Job passwords are deep-copied with the C allocator (loop and
-//! worker share no allocator state). Jobs and completions live in
-//! preallocated bounded rings, so the queue structure itself never
-//! allocates. put() refuses when MAX_JOBS jobs are outstanding (accepted
-//! but their completion not yet popped), which is what keeps both rings
-//! within capacity. The workers wait on a condition variable over the job
-//! ring; completions are drained by the event loop, which is woken with
-//! the classic one-byte pipe write (the pipe's read end is registered in
-//! kqueue).
+//! memory. Jobs and completions live in preallocated bounded rings, so no
+//! heap allocation happens per job. Password bytes sit in a fixed inline
+//! buffer per job slot and are wiped with `secureZero` on every exit path:
+//! after a worker pops the slot, after the derived copy is consumed, and
+//! for jobs still queued when the pool stops. put() refuses when MAX_JOBS
+//! jobs are outstanding (accepted but their completion not yet popped),
+//! which is what keeps both rings within capacity. The workers wait on a
+//! condition variable over the job ring; completions are drained by the
+//! event loop, which is woken with the classic one-byte pipe write (the
+//! pipe's read end is registered in kqueue).
 
 const std = @import("std");
 const posix = std.posix;
@@ -30,13 +31,22 @@ const log = std.log.scoped(.crypto_pool);
 /// slot (the reservation is structural).
 pub const MAX_JOBS: usize = 256;
 
-/// One derivation task. `password` is pool-owned (freed on completion).
+/// Maximum password bytes a job slot can hold. SASL passwords beyond this
+/// are a DoS surface, not a credential: put() rejects them with
+/// error.PasswordTooLong, which the handler maps to
+/// temporary-auth-failure like any other pool refusal.
+pub const PASSWORD_LEN_MAX: usize = 1024;
+
+/// One derivation task. `password` is a fixed inline buffer holding
+/// `password_len` bytes; it is `secureZero`'d when the job leaves the
+/// pool, so no plaintext survives in pool memory.
 pub const Job = struct {
     id: u64,
-    password: []u8,
+    password_len: u16,
     salt: [32]u8,
     iteration_count: u32,
     expected_stored_key: [32]u8,
+    password: [PASSWORD_LEN_MAX]u8,
 };
 
 /// Result of a derivation: did the derived key match the stored one.
@@ -49,8 +59,7 @@ pub const Completion = struct {
 /// collected with popCompletion() after the wake pipe fires.
 pub const CryptoPool = struct {
     /// Retained for the construction contract (`.{ .allocator = ... }`).
-    /// The pool's queue storage is fully inline: nothing allocates
-    /// through it.
+    /// The pool's storage is fully inline: nothing allocates through it.
     allocator: std.mem.Allocator,
 
     /// Bounded FIFO of queued jobs. `job_head` is the next slot a worker
@@ -90,12 +99,13 @@ pub const CryptoPool = struct {
 
     pub const MAX_THREADS = 8;
 
-    /// Pool owns job.password after a successful put. Outstanding jobs
+    /// Copy the password into a job slot and queue it. Outstanding jobs
     /// are capped at MAX_JOBS, which is also the completion ring
-    /// capacity, so a worker can always publish its completion.
+    /// capacity, so a worker can always publish its result. A full ring
+    /// is an explicit error.QueueFull; an over-long password is
+    /// error.PasswordTooLong and nothing of it is copied.
     pub fn put(self: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
-        const copy = std.heap.c_allocator.dupe(u8, password) catch return error.OutOfMemory;
-        errdefer std.heap.c_allocator.free(copy);
+        if (password.len > PASSWORD_LEN_MAX) return error.PasswordTooLong;
 
         {
             self.completion_mutex.lock();
@@ -109,13 +119,16 @@ pub const CryptoPool = struct {
         std.debug.assert(self.job_tail - self.job_head < MAX_JOBS);
         const id = self.next_job_id;
         self.next_job_id +%= 1;
-        self.job_slots[self.job_tail % MAX_JOBS] = .{
+        const slot = &self.job_slots[self.job_tail % MAX_JOBS];
+        slot.* = .{
             .id = id,
-            .password = copy,
+            .password_len = @intCast(password.len),
             .salt = salt,
             .iteration_count = iteration_count,
             .expected_stored_key = expected_stored_key,
+            .password = undefined,
         };
+        @memcpy(slot.password[0..password.len], password);
         self.job_tail += 1;
         self.job_cond.signal();
         return id;
@@ -166,8 +179,9 @@ pub const CryptoPool = struct {
     }
 
     /// Stop workers and close the pipe. Queued-but-unstarted jobs are
-    /// dropped and freed; shutdown abandons their pending auths (the core
-    /// side times out; nothing here outlives the daemon).
+    /// dropped: their passwords are wiped and shutdown abandons their
+    /// pending auths (the core side times out; nothing here outlives the
+    /// daemon).
     pub fn stop(self: *CryptoPool) void {
         {
             self.job_mutex.lock();
@@ -183,11 +197,12 @@ pub const CryptoPool = struct {
         self.pipe_rd = -1;
         self.pipe_wr = -1;
 
-        // Free the queued jobs that never ran; their outstanding
-        // reservations die with the pool.
+        // Wipe the queued jobs that never ran: their slots hold
+        // plaintext until zeroed, and their outstanding reservations
+        // die with the pool.
         self.job_mutex.lock();
         while (self.job_head < self.job_tail) {
-            std.heap.c_allocator.free(self.job_slots[self.job_head % MAX_JOBS].password);
+            std.crypto.secureZero(u8, &self.job_slots[self.job_head % MAX_JOBS].password);
             self.job_head += 1;
         }
         self.job_mutex.unlock();
@@ -215,22 +230,24 @@ pub const CryptoPool = struct {
 
     fn workerMain(self: *CryptoPool) void {
         while (true) {
-            const job = blk: {
+            var job = blk: {
                 self.job_mutex.lock();
                 defer self.job_mutex.unlock();
                 while (self.job_tail == self.job_head and !self.stopping) {
                     self.job_cond.wait(&self.job_mutex);
                 }
                 if (self.stopping) break :blk null; // in-flight job finishes; queue dropped by stop()
-                const j = self.job_slots[self.job_head % MAX_JOBS];
+                const slot = &self.job_slots[self.job_head % MAX_JOBS];
+                const j = slot.*;
+                std.crypto.secureZero(u8, &slot.password);
                 self.job_head += 1;
                 break :blk j;
             } orelse return;
 
-            defer std.heap.c_allocator.free(job.password);
+            defer std.crypto.secureZero(u8, &job.password);
             // Prep failure means the presented password can never match a
             // prepped stored credential: report as a mismatch.
-            const test_creds = sasl.StoredCredentials.derive(job.password, job.salt, job.iteration_count) catch {
+            const test_creds = sasl.StoredCredentials.derive(job.password[0..job.password_len], job.salt, job.iteration_count) catch {
                 self.finish(job.id, false);
                 continue;
             };
@@ -303,8 +320,8 @@ test "CryptoPool: the wake follows a visible completion" {
     const creds = try sasl.StoredCredentials.derive("visible", @splat(4), 1);
     const id = try putTestJob(&pool, "visible", @splat(4), 1, creds.stored_key);
 
-    // Hold the completion lock and poll for a wake. A worker that writes the
-    // wake before publishing leaves the ring empty at that moment.
+    // Hold the completion lock and poll for a wake. A worker that writes
+    // the wake before publishing leaves the ring empty at that moment.
     pool.completion_mutex.lock();
     var saw_wake = false;
     var bad = false;
@@ -457,10 +474,9 @@ test "CryptoPool: stop releases the dropped jobs' reservations" {
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
 
-test "CryptoPool: the job path never calls the pool allocator" {
+test "CryptoPool: the job path needs no heap allocation" {
     // The rings are inline: put() and completion publish must succeed with
-    // a pool allocator that fails every request. (This revision still
-    // deep-copies the password through the C allocator directly.)
+    // an allocator that fails every request.
     var pool = CryptoPool{ .allocator = std.testing.failing_allocator };
     try pool.start(1);
     defer pool.stop();
@@ -478,4 +494,52 @@ test "CryptoPool: the job path never calls the pool allocator" {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     return error.NoCompletion;
+}
+
+test "CryptoPool: a password over the inline bound is rejected" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    defer pool.stop();
+
+    var too_long: [PASSWORD_LEN_MAX + 1]u8 = @splat('x');
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 1);
+    try std.testing.expectError(
+        error.PasswordTooLong,
+        pool.put(&too_long, @splat(2), 1, creds.stored_key),
+    );
+    // The refusal reserved nothing and copied nothing.
+    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
+
+    // A password exactly at the bound is accepted.
+    _ = try putTestJob(&pool, too_long[0..PASSWORD_LEN_MAX], @splat(2), 1, creds.stored_key);
+}
+
+test "CryptoPool: completed and dropped jobs leave no password bytes" {
+    // A worker wipes the slot's inline password when it pops the job, and
+    // stop() wipes every queued slot it drops. Scan the ring for the
+    // submitted marker after each exit path.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("wipe-marker-a1", @splat(6), 1);
+    _ = try putTestJob(&pool, "wipe-marker-a1", @splat(6), 1, creds.stored_key);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (pool.popCompletion()) |_| break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    } else {
+        return error.NoCompletion;
+    }
+    for (&pool.job_slots) |*slot| {
+        try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-a1") == null);
+    }
+
+    var pool2 = CryptoPool{ .allocator = std.testing.allocator };
+    // No start(): the job stays queued and stop() must wipe its slot.
+    _ = try putTestJob(&pool2, "wipe-marker-b2", @splat(7), 1, @splat(8));
+    pool2.stop();
+    for (&pool2.job_slots) |*slot| {
+        try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-b2") == null);
+    }
 }
