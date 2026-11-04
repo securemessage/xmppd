@@ -354,6 +354,13 @@ pub const TimerWheel = struct {
   order (FIFO lists per slot, exact level-0 slots after cascading). A deadline in the
   past expires at the next `wait`. Deadlines beyond the horizon park in the top level and
   are re-placed when it cascades.
+- **Collect cost:** one collect walks every chain whose `slot_min` says it can hold a
+  due entry. Worst batch is O(longest chain), O(`timers_max`) when all timers share one
+  chain (a reconnect storm); amortized cost is a few entries per fired timer. A
+  cancelled minimum leaves `slot_min` stale-low and costs one empty O(chain) rescan;
+  the walk rebuilds the minimum, so it is charged once, not once per pass. Emission is
+  bounded per pass: a deadline scheduled while a batch drains is collected at the next
+  wait, so a handler re-adding a past deadline yields one event per pass.
 - **Capacity:** `timers_max` entries of 32 B (deadline, ctx, prev, next) plus 8 B of
   slot-map overhead; `TimerTableFull` when exhausted.
 

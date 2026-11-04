@@ -7,9 +7,10 @@
 //! are appended, expirations are sorted by (deadline, seq)).
 //!
 //! The owning Loop arms one one-shot EVFILT_TIMER to `nextDeadline` and calls
-//! `popExpired` after each wait. `collect` drains every occupied chain,
-//! emits what is due and cascades the rest into the right level, which also
-//! refreshes `slot_min` so `nextDeadline` cannot underestimate into a spin.
+//! `popExpired` after each wait. `collect` walks only chains whose slot_min
+//! can hold a due entry, emits what is due and cascades the rest into the
+//! right level, which also refreshes `slot_min` so `nextDeadline` cannot
+//! underestimate into a spin.
 
 const std = @import("std");
 const Token = @import("token.zig").Token;
@@ -166,9 +167,15 @@ pub const TimerWheel = struct {
     /// within a deadline) and cascade the rest. Only chains whose slot_min
     /// says they can contain a due entry are walked: slot_min underestimates
     /// after a cancelled minimum, never overestimates, so a skipped slot
-    /// holds nothing due. One stale-low chain costs a single O(chain)
-    /// rescan, after which its min is refreshed; work is otherwise charged
-    /// to emitted deadlines, bounded by timers_max per batch.
+    /// holds nothing due.
+    ///
+    /// Cost: one collect walks every occupied chain that could hold a due
+    /// entry, so the worst batch is O(longest chain), O(timers_max) when all
+    /// timers share one chain (a reconnect storm). Amortized cost is ~3
+    /// chain entries per fired timer. A stale-low slot_min from a cancelled
+    /// minimum costs one full O(chain) rescan that fires nothing; the walk
+    /// rebuilds the chain's slot_min, so it is charged once per stale chain,
+    /// not once per pass.
     fn collect(self: *TimerWheel, now_ms: u64) void {
         if (now_ms > self.cur_ms) self.cur_ms = now_ms;
         self.collected_ms = now_ms;
