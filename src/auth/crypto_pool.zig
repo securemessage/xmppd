@@ -1,4 +1,4 @@
-//! # Crypto Pool — offload PBKDF2/Argon2id from the auth event loop (T121)
+//! # Crypto Pool: offload PBKDF2/Argon2id from the auth event loop (T121)
 //!
 //! The auth daemon's event loop is single-threaded; PBKDF2 (and eventually
 //! Argon2id) blocks every other IPC request while deriving. This pool moves
@@ -8,10 +8,14 @@
 //!
 //! Workers do crypto ONLY: no sockets, no store access, no loop-thread
 //! memory. Job passwords are deep-copied with the C allocator (loop and
-//! worker share no allocator state). The workers wait on a condition
-//! variable over the bounded job ring; completions are drained by the event
-//! loop, which is woken with the classic one-byte pipe write (the pipe's
-//! read end is registered in kqueue).
+//! worker share no allocator state). Jobs and completions live in
+//! preallocated bounded rings, so the queue structure itself never
+//! allocates. put() refuses when MAX_JOBS jobs are outstanding (accepted
+//! but their completion not yet popped), which is what keeps both rings
+//! within capacity. The workers wait on a condition variable over the job
+//! ring; completions are drained by the event loop, which is woken with
+//! the classic one-byte pipe write (the pipe's read end is registered in
+//! kqueue).
 
 const std = @import("std");
 const posix = std.posix;
@@ -19,8 +23,11 @@ const sasl = @import("sasl");
 
 const log = std.log.scoped(.crypto_pool);
 
-/// Maximum jobs queued at once. Full = the event loop answers
-/// temporary-auth-failure immediately instead of queueing unboundedly.
+/// Maximum jobs outstanding at once: queued, in flight, or completed but
+/// not yet popped. Full = the event loop answers temporary-auth-failure
+/// immediately instead of queueing unboundedly. The completion ring has
+/// the same capacity, so every accepted job is guaranteed a completion
+/// slot (the reservation is structural).
 pub const MAX_JOBS: usize = 256;
 
 /// One derivation task. `password` is pool-owned (freed on completion).
@@ -41,12 +48,29 @@ pub const Completion = struct {
 /// Fixed-size pool. put() is called from the event loop; completions are
 /// collected with popCompletion() after the wake pipe fires.
 pub const CryptoPool = struct {
+    /// Retained for the construction contract (`.{ .allocator = ... }`).
+    /// The pool's queue storage is fully inline: nothing allocates
+    /// through it.
     allocator: std.mem.Allocator,
 
-    jobs: std.ArrayListUnmanaged(Job) = .{},
-    completions: std.ArrayListUnmanaged(Completion) = .{},
-    /// Accepted jobs whose completion has not been published yet. Protected
-    /// by completion_mutex and used to size the completions list.
+    /// Bounded FIFO of queued jobs. `job_head` is the next slot a worker
+    /// pops, `job_tail` the next a producer fills; the count is
+    /// `job_tail - job_head` and both move only under `job_mutex`.
+    job_slots: [MAX_JOBS]Job = undefined,
+    job_head: usize = 0,
+    job_tail: usize = 0,
+
+    /// Bounded FIFO of published completions, same capacity as the job
+    /// ring: at most `MAX_JOBS` jobs are outstanding, so a worker can
+    /// always publish without allocating. `completion_head` is the next
+    /// pop, `completion_tail` the next publish, under `completion_mutex`.
+    completions: [MAX_JOBS]Completion = undefined,
+    completion_head: usize = 0,
+    completion_tail: usize = 0,
+
+    /// Accepted jobs whose completion has not been popped yet, under
+    /// `completion_mutex`. This counter is both the bound on put() and
+    /// the proof that every accepted job owns a completion slot.
     reserved_completions: usize = 0,
 
     job_mutex: std.Thread.Mutex = .{},
@@ -66,9 +90,9 @@ pub const CryptoPool = struct {
 
     pub const MAX_THREADS = 8;
 
-    /// Pool owns job.password after a successful put. One completion slot is
-    /// reserved before the job is accepted, so a worker can always publish
-    /// its completion without allocating.
+    /// Pool owns job.password after a successful put. Outstanding jobs
+    /// are capped at MAX_JOBS, which is also the completion ring
+    /// capacity, so a worker can always publish its completion.
     pub fn put(self: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
         const copy = std.heap.c_allocator.dupe(u8, password) catch return error.OutOfMemory;
         errdefer std.heap.c_allocator.free(copy);
@@ -76,27 +100,23 @@ pub const CryptoPool = struct {
         {
             self.completion_mutex.lock();
             defer self.completion_mutex.unlock();
-            try self.completions.ensureUnusedCapacity(self.allocator, self.reserved_completions + 1);
+            if (self.reserved_completions >= MAX_JOBS) return error.QueueFull;
             self.reserved_completions += 1;
-        }
-        errdefer {
-            self.completion_mutex.lock();
-            self.reserved_completions -= 1;
-            self.completion_mutex.unlock();
         }
 
         self.job_mutex.lock();
         defer self.job_mutex.unlock();
-        if (self.jobs.items.len >= MAX_JOBS) return error.QueueFull;
+        std.debug.assert(self.job_tail - self.job_head < MAX_JOBS);
         const id = self.next_job_id;
         self.next_job_id +%= 1;
-        try self.jobs.append(self.allocator, .{
+        self.job_slots[self.job_tail % MAX_JOBS] = .{
             .id = id,
             .password = copy,
             .salt = salt,
             .iteration_count = iteration_count,
             .expected_stored_key = expected_stored_key,
-        });
+        };
+        self.job_tail += 1;
         self.job_cond.signal();
         return id;
     }
@@ -111,12 +131,17 @@ pub const CryptoPool = struct {
         }
     }
 
-    /// Pop a completed derivation, or null when the drain is done.
+    /// Pop a completed derivation, or null when the drain is done. Popping
+    /// releases the job's outstanding slot.
     pub fn popCompletion(self: *CryptoPool) ?Completion {
         self.completion_mutex.lock();
         defer self.completion_mutex.unlock();
-        if (self.completions.items.len == 0) return null;
-        return self.completions.orderedRemove(0);
+        if (self.completion_head == self.completion_tail) return null;
+        defer {
+            self.completion_head += 1;
+            self.reserved_completions -= 1;
+        }
+        return self.completions[self.completion_head % MAX_JOBS];
     }
 
     /// Spawn the worker threads and open the wake pipe (read end
@@ -141,7 +166,7 @@ pub const CryptoPool = struct {
     }
 
     /// Stop workers and close the pipe. Queued-but-unstarted jobs are
-    /// dropped and freed — shutdown abandons their pending auths (the core
+    /// dropped and freed; shutdown abandons their pending auths (the core
     /// side times out; nothing here outlives the daemon).
     pub fn stop(self: *CryptoPool) void {
         {
@@ -158,24 +183,30 @@ pub const CryptoPool = struct {
         self.pipe_rd = -1;
         self.pipe_wr = -1;
 
-        // The dropped queued jobs never publish; their reservations die
-        // with the pool.
+        // Free the queued jobs that never ran; their outstanding
+        // reservations die with the pool.
+        self.job_mutex.lock();
+        while (self.job_head < self.job_tail) {
+            std.heap.c_allocator.free(self.job_slots[self.job_head % MAX_JOBS].password);
+            self.job_head += 1;
+        }
+        self.job_mutex.unlock();
+
         self.completion_mutex.lock();
         self.reserved_completions = 0;
         self.completion_mutex.unlock();
-
-        for (self.jobs.items) |j| std.heap.c_allocator.free(j.password);
-        self.jobs.deinit(self.allocator);
-        self.completions.deinit(self.allocator);
     }
 
-    /// Publish one completion and wake the loop. put() reserves capacity for
-    /// every accepted job, so the append cannot allocate or fail here.
+    /// Publish one completion and wake the loop. put() bounds outstanding
+    /// jobs by the ring capacity, so the publish cannot fail.
     fn finish(self: *CryptoPool, id: u64, ok: bool) void {
-        self.completion_mutex.lock();
-        self.completions.appendAssumeCapacity(.{ .id = id, .ok = ok });
-        self.reserved_completions -= 1;
-        self.completion_mutex.unlock();
+        {
+            self.completion_mutex.lock();
+            defer self.completion_mutex.unlock();
+            std.debug.assert(self.completion_tail - self.completion_head < MAX_JOBS);
+            self.completions[self.completion_tail % MAX_JOBS] = .{ .id = id, .ok = ok };
+            self.completion_tail += 1;
+        }
 
         _ = posix.write(self.pipe_wr, "\x00") catch |err| {
             log.err("completion wake write failed for job {d}: {s}", .{ id, @errorName(err) });
@@ -187,11 +218,13 @@ pub const CryptoPool = struct {
             const job = blk: {
                 self.job_mutex.lock();
                 defer self.job_mutex.unlock();
-                while (self.jobs.items.len == 0 and !self.stopping) {
+                while (self.job_tail == self.job_head and !self.stopping) {
                     self.job_cond.wait(&self.job_mutex);
                 }
                 if (self.stopping) break :blk null; // in-flight job finishes; queue dropped by stop()
-                break :blk self.jobs.orderedRemove(0);
+                const j = self.job_slots[self.job_head % MAX_JOBS];
+                self.job_head += 1;
+                break :blk j;
             } orelse return;
 
             defer std.heap.c_allocator.free(job.password);
@@ -216,7 +249,7 @@ pub const CryptoPool = struct {
 fn completionCount(pool: *CryptoPool) usize {
     pool.completion_mutex.lock();
     defer pool.completion_mutex.unlock();
-    return pool.completions.items.len;
+    return pool.completion_tail - pool.completion_head;
 }
 
 fn reservedCount(pool: *CryptoPool) usize {
@@ -271,7 +304,7 @@ test "CryptoPool: the wake follows a visible completion" {
     const id = try putTestJob(&pool, "visible", @splat(4), 1, creds.stored_key);
 
     // Hold the completion lock and poll for a wake. A worker that writes the
-    // wake before publishing leaves the list empty at that moment.
+    // wake before publishing leaves the ring empty at that moment.
     pool.completion_mutex.lock();
     var saw_wake = false;
     var bad = false;
@@ -287,7 +320,7 @@ test "CryptoPool: the wake follows a visible completion" {
         };
         if (n > 0) {
             saw_wake = true;
-            bad = pool.completions.items.len == 0;
+            bad = pool.completion_tail == pool.completion_head;
             break;
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -351,11 +384,7 @@ test "CryptoPool: derive matches inline computation" {
 test "CryptoPool: queue is bounded" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     // No start(): nothing drains, so the cap is hit deterministically.
-    defer {
-        for (pool.jobs.items) |j| std.heap.c_allocator.free(j.password);
-        pool.jobs.deinit(std.testing.allocator);
-        pool.completions.deinit(std.testing.allocator);
-    }
+    defer pool.stop();
 
     const creds = try sasl.StoredCredentials.derive("x", @splat(2), 4096);
     var accepted: usize = 0;
@@ -372,11 +401,7 @@ test "CryptoPool: queue is bounded" {
 test "CryptoPool: a full queue releases the failed reservation" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     // No start(): nothing drains, so the cap is hit deterministically.
-    defer {
-        for (pool.jobs.items) |j| std.heap.c_allocator.free(j.password);
-        pool.jobs.deinit(std.testing.allocator);
-        pool.completions.deinit(std.testing.allocator);
-    }
+    defer pool.stop();
 
     const creds = try sasl.StoredCredentials.derive("x", @splat(2), 4096);
     for (0..MAX_JOBS) |_| {
@@ -384,8 +409,8 @@ test "CryptoPool: a full queue releases the failed reservation" {
     }
     try std.testing.expectEqual(@as(usize, MAX_JOBS), reservedCount(&pool));
 
-    // The rejected put reserved a slot before the queue check and must
-    // release it, or every full-queue rejection leaks one reservation.
+    // The rejected put checked the bound before reserving and must leave
+    // the counter untouched, or every refusal leaks one reservation.
     err: {
         _ = putTestJob(&pool, "x", @splat(2), 4096, creds.stored_key) catch |e| switch (e) {
             error.QueueFull => break :err,
@@ -407,8 +432,9 @@ test "CryptoPool: finished jobs release their reservation" {
         _ = try putTestJob(&pool, "burst", @splat(3), 4096, creds.stored_key);
     }
 
-    // Every accepted job publishes exactly one completion and releases its
-    // reservation; the counter must be back to zero once the burst drains.
+    // Every accepted job publishes exactly one completion; popping it
+    // releases the outstanding slot, so the counter must be back to zero
+    // once the burst drains.
     const deadline = std.time.milliTimestamp() + 5000;
     while (completionCount(&pool) < n and std.time.milliTimestamp() < deadline) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
@@ -429,4 +455,27 @@ test "CryptoPool: stop releases the dropped jobs' reservations" {
 
     pool.stop();
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
+}
+
+test "CryptoPool: the job path never calls the pool allocator" {
+    // The rings are inline: put() and completion publish must succeed with
+    // a pool allocator that fails every request. (This revision still
+    // deep-copies the password through the C allocator directly.)
+    var pool = CryptoPool{ .allocator = std.testing.failing_allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("pw", @splat(5), 1);
+    const id = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
+
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (pool.popCompletion()) |c| {
+            try std.testing.expectEqual(id, c.id);
+            try std.testing.expect(c.ok);
+            return;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.NoCompletion;
 }
