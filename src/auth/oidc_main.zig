@@ -528,19 +528,31 @@ pub const Daemon = struct {
         self.deliver(msg, slot);
     }
 
-    /// Intercept a PLAIN or OAUTHBEARER auth_request: run the non-counting
-    /// pre-gate, bound in-flight work, and queue the exchange. Returns true
-    /// when the message was consumed (queued or answered directly); false
-    /// means the handler should process it as usual.
+    /// Intercept a PLAIN or OAUTHBEARER auth_request: run the handler's own
+    /// admission in its own order so the attempt is charged exactly once
+    /// before the IdP is asked, bound in-flight work, and queue the
+    /// exchange. Returns true when the message was consumed (queued or
+    /// answered directly); false means the handler should process it.
     fn tryQueueIdp(self: *Daemon, req: protocol.AuthRequest, slot: u16) bool {
         var cred: oidc.Credential = undefined;
         var account_identity: []const u8 = "";
         switch (req.mechanism) {
             .plain => {
+                // Parse first, exactly like the handler: a malformed
+                // payload is invalid-encoding before anything is counted,
+                // so it falls through to the handler's own answer.
                 const creds = oidc.plainCredentials(req.payload) orelse return false;
-                // A locked account or IP is answered by the handler's own
-                // path so the attempt counts exactly like a direct request.
-                if (self.handler.policy.check(creds.username, req.client_ip) != null) return false;
+                // The same admission the handler runs before the IdP call:
+                // count the IP attempt, then re-check the locks. A denial
+                // is answered here because the replay no longer re-counts.
+                if (self.handler.policy.admitIp(req.client_ip)) |reason| {
+                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    return true;
+                }
+                if (self.handler.policy.check(creds.username, req.client_ip)) |reason| {
+                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    return true;
+                }
                 cred = .{ .password = .{
                     .username = creds.username,
                     .password = creds.password,
@@ -548,15 +560,24 @@ pub const Daemon = struct {
                 account_identity = creds.username;
             },
             .oauthbearer => {
-                const token = oidc.bearerToken(req.payload) orelse return false;
-                if (self.handler.policy.check("", req.client_ip) != null) return false;
+                // The handler admits the IP before parsing, so a malformed
+                // payload still spends one attempt.
+                if (self.handler.policy.admitIp(req.client_ip)) |reason| {
+                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    return true;
+                }
+                const token = oidc.bearerToken(req.payload) orelse {
+                    self.replyAuthFailure(req.conn_id, slot, "invalid-encoding");
+                    return true;
+                };
                 cred = .{ .token = token };
             },
             else => return false,
         }
 
         // In-flight caps: queued and running exchanges per account key and
-        // per client IP. Over the cap answers directly, not counted.
+        // per client IP. Over the cap answers directly; the attempt stays
+        // admitted but no outcome is recorded.
         var account_key_buf: [lock_store_mod.MAX_KEY_LEN]u8 = undefined;
         const account_key: []const u8 = if (account_identity.len > 0)
             lock_store_mod.canonicalKey(account_identity, &account_key_buf) orelse ""
@@ -616,19 +637,26 @@ pub const Daemon = struct {
         return true;
     }
 
-    /// Answer a request temporary-auth-failure without handler involvement:
-    /// in-flight caps and a full pool are transport backpressure, not a
-    /// failed credential, so nothing is counted or recorded.
-    fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16) void {
+    /// Answer a request with an auth_failure reason without handler
+    /// involvement. Pre-gate denials carry the policy's own reason so the
+    /// client sees what a direct request would have seen.
+    fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, reason: []const u8) void {
         const conn = self.ipc.getClient(slot) orelse return;
         conn.queueSend(.{ .auth_failure = .{
             .conn_id = conn_id,
-            .reason = "temporary-auth-failure",
+            .reason = reason,
         } }) catch {
             self.closeLane(slot);
             return;
         };
         if (conn.hasPendingSend()) self.flush_pending[slot] = true;
+    }
+
+    /// Answer a request temporary-auth-failure without handler involvement:
+    /// in-flight caps and a full pool are transport backpressure, not a
+    /// failed credential, so nothing is counted or recorded.
+    fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16) void {
+        self.replyAuthFailure(conn_id, slot, "temporary-auth-failure");
     }
 
     /// Deliver a message to the handler and queue its reply.
@@ -690,10 +718,21 @@ pub const Daemon = struct {
             off += pend.payload_len;
             const cb_data = pend.owned[off..][0..pend.cb_data_len];
 
+            // An IP lock that engaged since admission denies the parked
+            // verdict, exactly as the handler's own lock check would have
+            // for a direct request.
+            if (self.handler.policy.check("", client_ip)) |reason| {
+                self.replyAuthFailure(pend.conn_id, pend.slot, reason);
+                continue;
+            }
+
             const req = protocol.AuthRequest{
                 .conn_id = pend.conn_id,
                 .mechanism = pend.mechanism,
-                .client_ip = client_ip,
+                // The attempt was already admitted at dispatch; an empty
+                // IP keeps the replay's admitIp free and its lock checks
+                // account-only, so nothing is counted twice.
+                .client_ip = "",
                 .cb_type = pend.cb_type,
                 .cb_data = cb_data,
                 .username = username,
@@ -706,6 +745,18 @@ pub const Daemon = struct {
 
             switch (result) {
                 .reply => |response| {
+                    // Mirror the IP-side outcome the handler could not see
+                    // with an empty client_ip: credential verdicts only,
+                    // matching where a direct request records.
+                    switch (response) {
+                        .auth_success => self.handler.policy.recordOutcome("", client_ip, .success),
+                        .auth_failure => |f| {
+                            if (std.mem.eql(u8, f.reason, "not-authorized")) {
+                                self.handler.policy.recordOutcome("", client_ip, .failure);
+                            }
+                        },
+                        else => {},
+                    }
                     conn.queueSend(response) catch {
                         self.closeLane(slot);
                         continue;
@@ -1454,4 +1505,161 @@ test "a rejected credential replays as not-authorized and records the failure" {
     // The replayed failure is the handler's own accounting: with
     // lockout_threshold 1 alice is now locked.
     try std.testing.expectEqualStrings("account-disabled", fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock);
+}
+
+test "a rate-limited or locked request is denied before the IdP is asked" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 3000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, .{
+        .max_per_ip = 2,
+        .max_per_account = 100,
+        .window_seconds = 120,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 1500,
+        .timeout_ms = 2000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    // Two admitted attempts fill the IP window; the third is denied at
+    // dispatch and never spends an IdP exchange.
+    for (0..2) |i| {
+        const m = plainAuth(@intCast(i + 1), "alice", "pw", "10.0.0.5");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        try fx.daemon.step(10);
+    }
+    const m3 = plainAuth(3, "alice", "pw", "10.0.0.5");
+    defer allocator.free(m3.auth_request.payload);
+    try client.send(m3);
+    const reply_limited = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expectEqual(@as(u32, 3), reply_limited.auth_failure.conn_id);
+    try std.testing.expectEqualStrings("policy-violation", reply_limited.auth_failure.reason);
+
+    // A locked IP is denied at dispatch even for a well-formed request.
+    fx.handler.policy.recordOutcome("", "10.0.0.6", .failure);
+    const m4 = plainAuth(4, "bob", "pw", "10.0.0.6");
+    defer allocator.free(m4.auth_request.payload);
+    try client.send(m4);
+    const reply_locked_ip = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expectEqualStrings("policy-violation", reply_locked_ip.auth_failure.reason);
+
+    // A locked account is denied at dispatch with the handler's own reason.
+    fx.handler.policy.recordOutcome("carol", "", .failure);
+    const m5 = plainAuth(5, "carol", "pw", "10.0.0.7");
+    defer allocator.free(m5.auth_request.payload);
+    try client.send(m5);
+    const reply_locked_acct = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expectEqualStrings("account-disabled", reply_locked_acct.auth_failure.reason);
+
+    // A locked IP also denies a well-formed OAUTHBEARER before parsing.
+    fx.handler.policy.recordOutcome("", "10.0.0.8", .failure);
+    const m6 = rawAuth(6, .oauthbearer, "", "n,,\x01auth=Bearer tok\x01\x01", "10.0.0.8");
+    try client.send(m6);
+    const reply_bearer = (try client.nextReply(&fx.daemon, 500)).?;
+    try std.testing.expectEqualStrings("policy-violation", reply_bearer.auth_failure.reason);
+
+    // Only the two window-filling requests ever reached the pool.
+    try std.testing.expect(fx.daemon.pool.exchanges_run.load(.monotonic) <= 2);
+    try std.testing.expect(fx.daemon.pending.count() <= 2);
+}
+
+test "admission is charged at dispatch; the replay does not charge again" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genIdpTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(allocator, "{s}/cert.pem", .{base}, 0);
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(allocator, "{s}/key.pem", .{base}, 0);
+    defer allocator.free(key_path);
+
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try std.Thread.spawn(.{}, serveOneTlsResponse, .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port });
+    defer stub.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, cert_path, .{
+        .max_per_ip = 4,
+        .max_per_account = 100,
+        .window_seconds = 120,
+        .lockout_threshold = 50,
+        .ip_lockout_threshold = 50,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 5000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m1 = plainAuth(1, "alice", "wrong-pw", "10.0.0.9");
+    defer allocator.free(m1.auth_request.payload);
+    try client.send(m1);
+    try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+
+    // While the exchange is in flight, other attempts fill the IP window.
+    // The admitted request must still land its own verdict; a fourth
+    // attempt beyond the window is denied without touching the IdP.
+    _ = fx.handler.policy.admitIp("10.0.0.9");
+    _ = fx.handler.policy.admitIp("10.0.0.9");
+    _ = fx.handler.policy.admitIp("10.0.0.9");
+
+    const m2 = plainAuth(2, "mallory", "pw", "10.0.0.9");
+    defer allocator.free(m2.auth_request.payload);
+    try client.send(m2);
+
+    var saw_attacker = false;
+    var saw_victim = false;
+    const reply_dl = std.time.milliTimestamp() + 8000;
+    while (std.time.milliTimestamp() < reply_dl and !(saw_attacker and saw_victim)) {
+        const reply = (try client.nextReply(&fx.daemon, 500)) orelse continue;
+        if (reply.auth_failure.conn_id == 2) {
+            saw_attacker = true;
+            try std.testing.expectEqualStrings("policy-violation", reply.auth_failure.reason);
+        } else if (reply.auth_failure.conn_id == 1) {
+            saw_victim = true;
+            // Not the rate-limit denial: the parked verdict is delivered.
+            try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+        }
+    }
+    try std.testing.expect(saw_attacker);
+    try std.testing.expect(saw_victim);
+
+    // Drain completions; the denied request never spent an exchange.
+    const drain_dl = std.time.milliTimestamp() + 2000;
+    while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < drain_dl) {
+        try fx.daemon.step(10);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pool.exchanges_run.load(.monotonic));
+
+    // Exactly one charge: the counted attempt plus the three window fills
+    // is the whole window; the replay added nothing.
+    try std.testing.expect(fx.handler.policy.admitIp("10.0.0.9") != null);
 }
