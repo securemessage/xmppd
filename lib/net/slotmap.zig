@@ -113,10 +113,13 @@ pub fn SlotMap(comptime T: type) type {
         }
 
         /// Whether the slot for `token` currently holds a value (index, gen
-        /// and kind all match).
+        /// and kind all match). Slots at or beyond `pool` were never issued,
+        /// and a `gen_max` token can only be forged: a live slot's generation
+        /// is always below it and retired slots are never re-issued.
         fn matches(self: *const Self, token: Token) bool {
             if (token.kind != self.kind) return false;
-            if (token.index >= self.values.len) return false;
+            if (token.index >= self.pool) return false;
+            if (token.gen == gen_max) return false;
             return self.gens[token.index] == token.gen;
         }
 
@@ -177,6 +180,31 @@ test "SlotMap: wrong kind and out-of-range index never resolve" {
     try std.testing.expect(map.get(.{ .index = t.index, .gen = t.gen, .kind = 2 }) == null);
     try std.testing.expect(map.get(.{ .index = 99, .gen = t.gen, .kind = 1 }) == null);
     try std.testing.expect(map.get(.none) == null);
+}
+
+test "SlotMap: forged tokens for never-issued and retired slots never resolve" {
+    // Indices at or beyond pool hold only the initial generation, so a
+    // forged token could pass the generation check without the pool bound.
+    var map: SlotMap(u32) = undefined;
+    try map.init(std.testing.allocator, 4, 1);
+    defer map.deinit(std.testing.allocator);
+
+    const live = try map.insert(7);
+    const forged: Token = .{ .index = 3, .gen = 1, .kind = 1 };
+    try std.testing.expect(map.get(forged) == null);
+    try std.testing.expect(map.remove(forged) == null);
+    try std.testing.expectEqual(@as(u32, 1), map.count());
+
+    // A forged gen_max token names a retired generation; it must not match
+    // even where a slot was really retired.
+    const forged_max: Token = .{ .index = live.index, .gen = SlotMap(u32).gen_max, .kind = 1 };
+    try std.testing.expect(map.get(forged_max) == null);
+    map.gens[live.index] = SlotMap(u32).gen_max - 1;
+    _ = map.remove(.{ .index = live.index, .gen = map.gens[live.index], .kind = 1 });
+    try std.testing.expectEqual(SlotMap(u32).gen_max, map.gens[live.index]);
+    try std.testing.expect(map.get(forged_max) == null);
+    const next = try map.insert(9); // pool advances past the retired slot
+    try std.testing.expectEqual(@as(u32, 1), next.index);
 }
 
 test "SlotMap: Full at capacity, freed slots refill" {
