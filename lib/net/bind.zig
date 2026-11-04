@@ -184,6 +184,9 @@ pub const PeerCred = struct {
     groups: [16]posix.gid_t,
     group_count: u8,
     pid: posix.pid_t,
+    /// The peer had more supplementary groups than the XU_NGROUPS=16 the
+    /// kernel reports: the set is incomplete and callers must fail closed.
+    truncated: bool,
 };
 
 /// struct xucred (sys/ucred.h): cr_version, cr_uid, cr_ngroups counting
@@ -221,16 +224,25 @@ pub fn peerCred(fd: posix.fd_t, errno_out: ?*u32) error{ NotUnixSocket, Unexpect
             else => error.Unexpected,
         };
     }
-    if (cred.version != xucred_version or cred.ngroups < 0 or cred.ngroups > 16) {
+    // cr_ngroups is the peer's real group count, not the number copied:
+    // a process with more than XU_NGROUPS reports it while cr_groups[16]
+    // holds a truncated set.
+    return credFromXucred(cred) orelse {
         if (errno_out) |out| out.* = @intFromEnum(posix.E.PROTO);
         return error.Unexpected;
-    }
+    };
+}
+
+fn credFromXucred(cred: xucred) ?PeerCred {
+    if (cred.version != xucred_version or cred.ngroups < 0 or cred.ngroups > 1024)
+        return null;
     return .{
         .uid = cred.uid,
         .gid = if (cred.ngroups > 0) cred.groups[0] else 0,
         .groups = cred.groups,
-        .group_count = @intCast(cred.ngroups),
+        .group_count = @intCast(@min(cred.ngroups, 16)),
         .pid = cred.pid_union.pid,
+        .truncated = cred.ngroups > 16,
     };
 }
 
@@ -524,6 +536,24 @@ test "bindTcp: two listeners share the port with REUSEPORT_LB" {
     const port = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&bound))).port;
     const lfd_b = try bindTcp(&.{ .address = "127.0.0.1", .port = std.mem.bigToNative(u16, port) });
     defer posix.close(lfd_b);
+}
+
+test "peerCred: groups beyond XU_NGROUPS are flagged truncated" {
+    var xc: xucred = .{
+        .version = xucred_version,
+        .uid = 1001,
+        .ngroups = 20, // cr_groups holds only the first 16
+        .groups = @splat(55),
+        .pid_union = .{ .pid = 42 },
+    };
+    const pc = credFromXucred(xc).?;
+    try std.testing.expectEqual(@as(u8, 16), pc.group_count);
+    try std.testing.expect(pc.truncated);
+
+    xc.ngroups = 16;
+    const full = credFromXucred(xc).?;
+    try std.testing.expectEqual(@as(u8, 16), full.group_count);
+    try std.testing.expect(!full.truncated);
 }
 
 test "bindTcp: IPv6 literal binds and accepts on ::1" {
