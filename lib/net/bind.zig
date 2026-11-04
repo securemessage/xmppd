@@ -190,16 +190,20 @@ const xucred_version: c_uint = 0;
 /// LOCAL_PEERCRED for an accepted Unix-domain socket. The option lives at
 /// local(4) level 0, not SOL_SOCKET. Returns NotUnixSocket on any other
 /// fd or socket type, and rejects an unexpected xucred layout version.
-pub fn peerCred(fd: posix.fd_t) error{ NotUnixSocket, Unexpected }!PeerCred {
+/// `errno_out`, when given, carries the raw errno on any failure.
+pub fn peerCred(fd: posix.fd_t, errno_out: ?*u32) error{ NotUnixSocket, Unexpected }!PeerCred {
     var cred: xucred = undefined;
     var len: posix.socklen_t = @sizeOf(xucred);
     if (std.c.getsockopt(fd, local_level, so_local_peercred, &cred, &len) != 0) {
-        return switch (posix.errno(-1)) {
+        const e = posix.errno(-1);
+        if (errno_out) |out| out.* = @intFromEnum(e);
+        return switch (e) {
             .INVAL, .OPNOTSUPP, .NOTSOCK => error.NotUnixSocket,
             else => error.Unexpected,
         };
     }
     if (cred.version != xucred_version or cred.ngroups < 0 or cred.ngroups > 16) {
+        if (errno_out) |out| out.* = @intFromEnum(posix.E.PROTO);
         return error.Unexpected;
     }
     return .{
@@ -214,78 +218,130 @@ pub fn peerCred(fd: posix.fd_t) error{ NotUnixSocket, Unexpected }!PeerCred {
 const so_local_peercred: c_int = 0x0001; // LOCAL_PEERCRED on FreeBSD
 const local_level: c_int = 0; // local(4) getsockopt level
 
-/// Owns one listening fd on a Loop. `onReadable` is the consumer's handler
-/// for the listener's `.readable` event.
+/// Owns one listening fd on a Loop. The consumer calls `acceptNext` on each
+/// `.readable` event and drains until a terminal outcome (drained,
+/// batch_limit, paused, peer_rejected or an error).
 pub const Listener = struct {
     loop: *Loop,
     handle: Handle,
-    batch_limit: u16,
+    family: Family,
+    accepted_this_pass: u16,
+    aborted: u64, // ECONNABORTED/EPROTO: peer reset before accept
+    pause_reason: PauseReason,
     fallback_resume_ms: u64,
 
-    pub const Options = struct {
-        batch_limit: u16 = 32,
-        fallback_resume_ms: u64 = 250,
+    pub const Family = enum { tcp, unix };
+    /// Max accepts per readable pass; the listener requeues for the rest.
+    pub const accept_batch_max = 256;
+    pub const fallback_resume_ms_default: u64 = 250;
+
+    pub const PauseReason = enum { emfile, enfile, enobufs, enomem };
+
+    pub const AttachError = loop_mod.AttachError || error{Unexpected};
+    pub const AcceptError = error{ ListenerInvalid, Unexpected };
+
+    pub const AcceptOutcome = union(enum) {
+        accepted: Accepted, // fd is O_NONBLOCK | O_CLOEXEC, owned by the caller
+        drained, // EAGAIN
+        batch_limit, // accept_batch_max reached; listener requeued
+        paused: PauseReason, // EMFILE/ENFILE/ENOBUFS/ENOMEM: read disabled
+        peer_rejected: u32, // unix: LOCAL_PEERCRED failed (errno); fd closed
     };
 
-    /// Attach `fd` (a bindTcp/bindUnix listener; the loop takes ownership) and
-    /// watch read interest with consumer token `ctx`.
-    pub fn init(loop: *Loop, fd: posix.fd_t, ctx: Token, options: *const Options) loop_mod.AttachError!Listener {
+    pub const Peer = union(enum) { ip: std.net.Address, unix: PeerCred };
+    pub const Accepted = struct {
+        fd: posix.fd_t,
+        peer: Peer,
+    };
+
+    /// Takes ownership of a listening fd (from bindTcp/bindUnix or inherited
+    /// from the master); sets O_NONBLOCK and FD_CLOEXEC on it, then registers
+    /// read interest with consumer token `ctx`.
+    pub fn attach(self: *Listener, loop: *Loop, fd: posix.fd_t, ctx: Token, family: Family) AttachError!void {
+        // An adopted fd (master-spawned listener) may arrive blocking and
+        // inheritable; accept must never block the loop.
+        try adoptFlags(fd);
         const handle = try loop.attach(fd, ctx, .{ .read = true });
-        return .{
+        self.* = .{
             .loop = loop,
             .handle = handle,
-            .batch_limit = options.batch_limit,
-            .fallback_resume_ms = options.fallback_resume_ms,
+            .family = family,
+            .accepted_this_pass = 0,
+            .aborted = 0,
+            .pause_reason = .emfile,
+            .fallback_resume_ms = fallback_resume_ms_default,
         };
     }
 
-    /// Drain pending accepts into `onConn` (which takes ownership of each
-    /// accepted fd). Stops at EAGAIN or after batch_limit; over the limit the
-    /// listener requeues itself. On descriptor exhaustion read interest
-    /// pauses until a close() or the fallback deadline resumes it.
-    pub fn onReadable(
-        self: *Listener,
-        ctx: *anyopaque,
-        onConn: *const fn (ctx: *anyopaque, fd: posix.fd_t) void,
-    ) void {
-        if (self.loop.isPaused(self.handle)) return;
-        const lfd = self.loop.fdOf(self.handle) orelse return;
-        var accepted: u16 = 0;
-        while (accepted < self.batch_limit) : (accepted += 1) {
-            const fd = posix.accept(lfd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch |err| switch (err) {
-                error.WouldBlock => return,
-                error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
-                    self.pauseWithFallback();
-                    return;
-                },
-                else => continue, // aborted peer or transient failure; keep draining
-            };
-            onConn(ctx, fd);
+    /// One accept step: an `accepted` outcome per pending connection,
+    /// `drained` at EAGAIN, `batch_limit` after accept_batch_max in one pass
+    /// (the listener requeues itself), `paused` on descriptor exhaustion
+    /// (read interest resumes on a close or the fallback deadline),
+    /// `peer_rejected` when LOCAL_PEERCRED fails on a unix accept. EINTR
+    /// retries, ECONNABORTED/EPROTO are counted and skipped, and every other
+    /// errno is an explicit outcome or error — nothing spins.
+    pub fn acceptNext(self: *Listener) AcceptError!AcceptOutcome {
+        if (self.loop.isPaused(self.handle)) return .{ .paused = self.pause_reason };
+        if (self.accepted_this_pass >= accept_batch_max) {
+            // Come back for the rest after one pass so a busy listener
+            // cannot starve other handles.
+            self.accepted_this_pass = 0;
+            self.loop.requeue(self.handle, .read) catch return error.Unexpected;
+            return .batch_limit;
         }
-        // Hit the batch bound: come back for the rest after one pass so a
-        // busy listener cannot starve other handles.
-        self.loop.requeue(self.handle, .read) catch return;
+        const lfd = self.loop.fdOf(self.handle) orelse return error.ListenerInvalid;
+        while (true) {
+            var sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+            var salen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            const rc = std.c.accept4(lfd, @ptrCast(&sa), &salen, accept_flags);
+            if (rc < 0) {
+                switch (posix.errno(rc)) {
+                    .AGAIN => {
+                        self.accepted_this_pass = 0;
+                        return .drained;
+                    },
+                    .INTR => continue,
+                    .CONNABORTED, .PROTO => {
+                        self.aborted += 1;
+                        continue;
+                    },
+                    .MFILE => return self.pause(.emfile),
+                    .NFILE => return self.pause(.enfile),
+                    .NOBUFS => return self.pause(.enobufs),
+                    .NOMEM => return self.pause(.enomem),
+                    .BADF, .NOTSOCK, .INVAL, .OPNOTSUPP => return error.ListenerInvalid,
+                    else => return error.Unexpected,
+                }
+            }
+            self.accepted_this_pass += 1;
+            const fd: posix.fd_t = @intCast(rc);
+            if (self.family == .unix) {
+                var cred_errno: u32 = 0;
+                const cred = peerCred(fd, &cred_errno) catch {
+                    posix.close(fd);
+                    return .{ .peer_rejected = cred_errno };
+                };
+                return .{ .accepted = .{ .fd = fd, .peer = .{ .unix = cred } } };
+            }
+            return .{ .accepted = .{ .fd = fd, .peer = .{ .ip = peerAddress(&sa) } } };
+        }
     }
 
-    fn pauseWithFallback(self: *Listener) void {
-        self.loop.pauseReadUntilClose(self.handle) catch return;
+    fn pause(self: *Listener, reason: PauseReason) AcceptError!AcceptOutcome {
+        self.pause_reason = reason;
+        self.loop.pauseReadUntilClose(self.handle) catch |err| return switch (err) {
+            error.StaleHandle => error.ListenerInvalid,
+            error.PausedListFull => error.Unexpected,
+        };
+        // Every exhaustion errno still gets the fallback deadline (the F10
+        // change narrows this to ENFILE/ENOBUFS/ENOMEM and tracks the id).
         const resume_ctx: Token = .{
             .index = self.handle.index,
             .gen = self.handle.gen,
             .kind = loop_mod.resume_kind,
         };
-        // TimerTableFull only loses the fallback; close() still resumes.
-        _ = self.loop.scheduleIn(self.fallback_resume_ms, resume_ctx) catch |err| switch (err) {
-            error.TimerTableFull => return,
-        };
-    }
-
-    /// Consumer-side resume; the fallback deadline also reaches here through
-    /// the loop's resume_kind interception.
-    pub fn resumePaused(self: *Listener) void {
-        self.loop.resumePaused(self.handle) catch |err| switch (err) {
-            error.StaleHandle => {},
-        };
+        _ = self.loop.scheduleIn(self.fallback_resume_ms, resume_ctx) catch {};
+        return .{ .paused = reason };
     }
 
     pub fn close(self: *Listener) void {
@@ -294,6 +350,27 @@ pub const Listener = struct {
         };
     }
 };
+
+const accept_flags: c_uint = posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+const fd_cloexec: c_int = 1; // FD_CLOEXEC
+const o_nonblock: c_int = 0x4; // O_NONBLOCK
+
+fn adoptFlags(fd: posix.fd_t) error{Unexpected}!void {
+    if (std.c.fcntl(fd, posix.F.SETFD, fd_cloexec) != 0) return error.Unexpected;
+    const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    if (fl < 0) return error.Unexpected;
+    if (fl & o_nonblock == 0) {
+        if (std.c.fcntl(fd, posix.F.SETFL, fl | o_nonblock) != 0) return error.Unexpected;
+    }
+}
+
+fn peerAddress(sa: *const posix.sockaddr.storage) std.net.Address {
+    const base: *const posix.sockaddr = @ptrCast(@alignCast(sa));
+    return switch (base.family) {
+        posix.AF.INET6 => .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(sa))).* } },
+        else => .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(sa))).* } },
+    };
+}
 
 // ============================================================================
 // Tests
@@ -315,13 +392,24 @@ fn boundAddr(fd: posix.fd_t) !posix.sockaddr.storage {
     return sa;
 }
 
-const AcceptProbe = struct {
-    fds: [8]posix.fd_t = .{-1} ** 8,
+const AcceptDrain = struct {
     n: usize = 0,
-    fn onConn(ctx_: *anyopaque, fd: posix.fd_t) void {
-        const self: *AcceptProbe = @ptrCast(@alignCast(ctx_));
-        self.fds[self.n] = fd;
-        self.n += 1;
+    last: Listener.AcceptOutcome = .drained,
+
+    /// acceptNext() until a terminal outcome; accepted fds land in `fds`.
+    fn drain(self: *AcceptDrain, l: *Listener, fds: []posix.fd_t) Listener.AcceptError!Listener.AcceptOutcome {
+        self.n = 0;
+        while (true) {
+            const out = try l.acceptNext();
+            self.last = out;
+            switch (out) {
+                .accepted => |a| {
+                    fds[self.n] = a.fd;
+                    self.n += 1;
+                },
+                else => return out,
+            }
+        }
     }
 };
 
@@ -332,9 +420,10 @@ test "bindTcp: listener accepts a non-blocking connection" {
     const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
     const bound = try boundAddr(lfd);
 
-    var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
-    var probe: AcceptProbe = .{};
-    defer for (probe.fds) |fd| {
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+    var accepted: [8]posix.fd_t = .{-1} ** 8;
+    defer for (accepted) |fd| {
         if (fd >= 0) posix.close(fd);
     };
 
@@ -346,12 +435,19 @@ test "bindTcp: listener accepts a non-blocking connection" {
     const ev = loop.next().?;
     try std.testing.expect(ev == .readable);
     try std.testing.expect(ev.readable.handle.eql(listener.handle));
-    listener.onReadable(&probe, AcceptProbe.onConn);
-    try std.testing.expectEqual(@as(usize, 1), probe.n);
 
-    // The accepted fd is non-blocking: an empty read gives WouldBlock.
+    var d: AcceptDrain = .{};
+    try std.testing.expect(try d.drain(&listener, &accepted) == .drained);
+    try std.testing.expectEqual(@as(usize, 1), d.n);
+
+    // The accepted fd is non-blocking (empty read: WouldBlock) and inherits
+    // TCP_NODELAY from the listener through the syncache.
     var buf: [4]u8 = undefined;
-    try std.testing.expectError(error.WouldBlock, posix.read(probe.fds[0], &buf));
+    try std.testing.expectError(error.WouldBlock, posix.read(accepted[0], &buf));
+    var nd: c_int = 0;
+    var ndlen: posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(0, std.c.getsockopt(accepted[0], std.c.IPPROTO.TCP, tcp_nodelay, &nd, &ndlen));
+    try std.testing.expect(nd != 0);
 }
 
 test "bindTcp: two listeners share the port with REUSEPORT_LB" {
@@ -369,8 +465,8 @@ test "bindTcp: IPv6 literal binds and accepts on ::1" {
 
     const lfd = try bindTcp(&.{ .address = "::1", .port = 0 });
     const bound = try boundAddr(lfd);
-    var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
-    _ = &listener;
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
 
     const cfd = try posix.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer posix.close(cfd);
@@ -379,8 +475,14 @@ test "bindTcp: IPv6 literal binds and accepts on ::1" {
     try loop.wait();
     const ev = loop.next().?;
     try std.testing.expect(ev == .readable);
-    const afd = try posix.accept(lfd, null, null, posix.SOCK.CLOEXEC);
-    posix.close(afd);
+    var accepted: [4]posix.fd_t = .{-1} ** 4;
+    defer for (accepted) |fd| {
+        if (fd >= 0) posix.close(fd);
+    };
+    var d: AcceptDrain = .{};
+    const out = try d.drain(&listener, &accepted);
+    try std.testing.expectEqual(@as(usize, 1), d.n);
+    try std.testing.expect(out == .drained);
 }
 
 test "bindTcp: a DNS name is rejected, a bad literal is rejected" {
@@ -402,7 +504,8 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
         else => unreachable,
     };
     const lfd = try bindUnix(&.{ .path = path, .mode = 0o600 });
-    var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .unix);
 
     const cfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     defer posix.close(cfd);
@@ -413,21 +516,35 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
     un.len = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
     try posix.connect(cfd, @ptrCast(&un), @sizeOf(posix.sockaddr.un));
 
-    var probe: AcceptProbe = .{};
-    defer for (probe.fds) |fd| {
-        if (fd >= 0) posix.close(fd);
-    };
     try loop.wait();
     _ = loop.next();
-    listener.onReadable(&probe, AcceptProbe.onConn);
-    try std.testing.expectEqual(@as(usize, 1), probe.n);
-
-    const cred = try peerCred(probe.fds[0]);
+    const out = try listener.acceptNext();
+    const a = out.accepted;
+    defer posix.close(a.fd);
+    const cred = switch (a.peer) {
+        .unix => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
     try std.testing.expectEqual(std.c.getuid(), cred.uid);
     try std.testing.expectEqual(getegid(), cred.gid);
     try std.testing.expect(cred.group_count >= 1);
     try std.testing.expectEqual(getegid(), cred.groups[0]);
     try std.testing.expectEqual(std.c.getpid(), cred.pid);
+
+    // A TCP listener driven as family .unix fails LOCAL_PEERCRED on the
+    // accepted socket and reports peer_rejected with the errno.
+    const tlfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    const tbound = try boundAddr(tlfd);
+    var tlistener: Listener = undefined;
+    try tlistener.attach(&loop, tlfd, test_ctx, .unix);
+    const tcfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(tcfd);
+    try posix.connect(tcfd, @ptrCast(&tbound), @sizeOf(posix.sockaddr.in));
+    try loop.wait();
+    _ = loop.next();
+    const rej = try tlistener.acceptNext();
+    try std.testing.expect(rej == .peer_rejected);
+    try std.testing.expect(rej.peer_rejected != 0);
 }
 
 extern "c" fn getegid() posix.gid_t;
@@ -472,6 +589,93 @@ test "bindUnix: long path refused, live listener and regular file refused, mode 
     try std.testing.expectError(error.NotASocket, bindUnix(&.{ .path = reg, .mode = 0o600 }));
 }
 
+test "Listener: bad descriptor and non-listener surface as ListenerInvalid" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    // /dev/null over the listen fd: ENOTSOCK is an error, never a panic.
+    const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    defer posix.close(devnull);
+    try posix.dup2(devnull, lfd);
+    try std.testing.expectError(error.ListenerInvalid, listener.acceptNext());
+
+    // A valid but non-listening fd: accept4 gives EINVAL, same error.
+    var pair: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &pair));
+    defer posix.close(pair[0]);
+    var listener2: Listener = undefined;
+    try listener2.attach(&loop, pair[1], test_ctx, .tcp);
+    try std.testing.expectError(error.ListenerInvalid, listener2.acceptNext());
+}
+
+test "Listener: accept_batch_max requeues for the rest of the backlog" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    const bound = try boundAddr(lfd);
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    const total = Listener.accept_batch_max + 8;
+    var cfds: [total]posix.fd_t = .{-1} ** total;
+    defer for (cfds) |fd| {
+        if (fd >= 0) posix.close(fd);
+    };
+    for (&cfds) |*cfd| {
+        cfd.* = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        try posix.connect(cfd.*, @ptrCast(&bound), @sizeOf(posix.sockaddr.in));
+    }
+
+    var accepted: [total]posix.fd_t = .{-1} ** total;
+    defer for (accepted) |fd| {
+        if (fd >= 0) posix.close(fd);
+    };
+
+    var got: usize = 0;
+    var saw_batch_limit = false;
+    for (0..8) |_| {
+        try loop.wait();
+        while (loop.next()) |ev| {
+            if (ev != .readable) continue;
+            while (true) {
+                const out = try listener.acceptNext();
+                switch (out) {
+                    .accepted => |a| {
+                        accepted[got] = a.fd;
+                        got += 1;
+                    },
+                    .batch_limit => saw_batch_limit = true,
+                    else => break,
+                }
+                if (out != .accepted) break;
+            }
+        }
+        if (got == total) break;
+    }
+    try std.testing.expect(saw_batch_limit);
+    try std.testing.expectEqual(total, got);
+}
+
+test "Listener: an adopted blocking fd gets O_NONBLOCK and FD_CLOEXEC" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    // A bare blocking listener fd, as one inherited from the master.
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var listener: Listener = undefined;
+    try listener.attach(&loop, fd, test_ctx, .tcp);
+
+    const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    try std.testing.expect(fl >= 0 and fl & o_nonblock != 0);
+    const fdf = std.c.fcntl(fd, posix.F.GETFD, @as(c_int, 0));
+    try std.testing.expect(fdf >= 0 and fdf & fd_cloexec != 0);
+}
+
 test "Listener: EMFILE pauses, a close resumes (forked child, lowered RLIMIT)" {
     // A forked child with a lowered RLIMIT_NOFILE proves the pause path:
     // accept fails EMFILE, read interest is disabled, a loop.close() frees a
@@ -493,7 +697,8 @@ fn childEmfile() void {
     var loop = testLoop() catch posix.exit(4);
 
     const lfd = bindTcp(&.{ .address = "127.0.0.1", .port = 0 }) catch posix.exit(6);
-    var listener = Listener.init(&loop, lfd, test_ctx, &.{}) catch posix.exit(7);
+    var listener: Listener = undefined;
+    listener.attach(&loop, lfd, test_ctx, .tcp) catch posix.exit(7);
 
     // Spare handle the child closes to free a descriptor for the resume.
     var pair: [2]posix.fd_t = undefined;
@@ -510,11 +715,28 @@ fn childEmfile() void {
     posix.setrlimit(.NOFILE, lim2) catch posix.exit(13);
 
     loop.wait() catch posix.exit(14);
-    var probe: AcceptProbe = .{};
+    var n: usize = 0;
+    var paused = false;
     while (loop.next()) |ev| {
-        if (ev == .readable) listener.onReadable(&probe, AcceptProbe.onConn);
+        if (ev == .readable) {
+            while (true) {
+                const out = listener.acceptNext() catch posix.exit(24);
+                switch (out) {
+                    .accepted => |a| {
+                        posix.close(a.fd);
+                        n += 1;
+                    },
+                    .paused => {
+                        paused = true;
+                        break;
+                    },
+                    else => break,
+                }
+            }
+        }
     }
-    if (probe.n != 0) posix.exit(15); // accept must have failed
+    if (n != 0) posix.exit(15); // accept must have failed
+    if (!paused) posix.exit(25);
     if (!loop.isPaused(listener.handle)) posix.exit(16);
 
     // Back under the quota (a soft limit may be raised to the hard one), the
@@ -529,10 +751,21 @@ fn childEmfile() void {
     posix.connect(cfd2, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch posix.exit(23);
     loop.wait() catch posix.exit(19);
     while (loop.next()) |ev| {
-        if (ev == .readable) listener.onReadable(&probe, AcceptProbe.onConn);
+        if (ev == .readable) {
+            while (true) {
+                const out = listener.acceptNext() catch posix.exit(26);
+                switch (out) {
+                    .accepted => |a| {
+                        posix.close(a.fd);
+                        n += 1;
+                    },
+                    else => break,
+                }
+            }
+        }
     }
     // The EMFILE'd connection stayed in the backlog: it and the fresh one
     // are both accepted after the resume.
-    if (probe.n != 2) posix.exit(20);
+    if (n != 2) posix.exit(20);
     posix.exit(0);
 }
