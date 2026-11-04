@@ -224,7 +224,7 @@ pub const Listener = struct {
         }
         // Hit the batch bound: come back for the rest after one pass so a
         // busy listener cannot starve other handles.
-        self.loop.requeueHandle(self.handle, .read) catch return;
+        self.loop.requeue(self.handle, .read) catch return;
     }
 
     fn pauseWithFallback(self: *Listener) void {

@@ -143,7 +143,7 @@ pub const Loop = struct {
     kq: posix.fd_t,
     handles: SlotMap(HandleState),
     dirty: std.ArrayList(Token),
-    requeue: std.ArrayList(RequeueEntry),
+    requeue_list: std.ArrayList(RequeueEntry),
     requeue_len: usize, // entries staged before this wait, emitted this pass
     requeue_pos: usize,
     paused: std.ArrayList(Token),
@@ -194,8 +194,8 @@ pub const Loop = struct {
         errdefer gpa.free(event_buf);
         const dirty = try gpa.alloc(Token, options.handles_max);
         errdefer gpa.free(dirty);
-        const requeue = try gpa.alloc(RequeueEntry, 2 * options.handles_max);
-        errdefer gpa.free(requeue);
+        const requeue_list = try gpa.alloc(RequeueEntry, 2 * options.handles_max);
+        errdefer gpa.free(requeue_list);
         const paused = try gpa.alloc(Token, options.paused_max);
         errdefer gpa.free(paused);
 
@@ -207,7 +207,7 @@ pub const Loop = struct {
             .kq = kq,
             .handles = handles,
             .dirty = std.ArrayList(Token).initBuffer(dirty),
-            .requeue = std.ArrayList(RequeueEntry).initBuffer(requeue),
+            .requeue_list = std.ArrayList(RequeueEntry).initBuffer(requeue_list),
             .requeue_len = 0,
             .requeue_pos = 0,
             .paused = std.ArrayList(Token).initBuffer(paused),
@@ -263,7 +263,7 @@ pub const Loop = struct {
         self.handles.deinit(gpa);
         self.wheel.deinit(gpa);
         gpa.free(self.dirty.allocatedSlice());
-        gpa.free(self.requeue.allocatedSlice());
+        gpa.free(self.requeue_list.allocatedSlice());
         gpa.free(self.paused.allocatedSlice());
         gpa.free(self.change_buf);
         gpa.free(self.event_buf);
@@ -315,7 +315,7 @@ pub const Loop = struct {
     /// Emit a synthetic `readable`/`writable` event for `handle` on the next
     /// pass, after a zero-timeout wait. Bounds per-event work (accept and read
     /// drains) without starving other handles; idempotent per filter.
-    pub fn requeueHandle(self: *Loop, handle: Handle, filter: Filter) HandleError!void {
+    pub fn requeue(self: *Loop, handle: Handle, filter: Filter) HandleError!void {
         self.assertOwner();
         const h = self.resolve(handle) orelse return error.StaleHandle;
         switch (filter) {
@@ -328,7 +328,11 @@ pub const Loop = struct {
                 h.req_write = true;
             },
         }
-        self.requeue.appendAssumeCapacity(.{ .token = handle, .filter = filter });
+        // Live entries are bounded by the two req flags per live handle;
+        // reclaim the dead emitted prefix before it can push the list past
+        // its capacity.
+        if (self.requeue_list.items.len == self.requeue_list.capacity) self.collectRequeue();
+        self.requeue_list.appendAssumeCapacity(.{ .token = handle, .filter = filter });
         self.immediate = true;
     }
 
@@ -376,6 +380,7 @@ pub const Loop = struct {
         const fd = h.fd;
         h.fd = -1; // freed slots keep their value; deinit skips -1
         self.purgeDirty(handle);
+        self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         rawClose(fd);
         self.stats_.handles_closed += 1;
@@ -416,6 +421,7 @@ pub const Loop = struct {
         }
         h.fd = -1;
         self.purgeDirty(handle);
+        self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         if (first_err) |err| {
             rawClose(fd);
@@ -567,7 +573,7 @@ pub const Loop = struct {
     // -- Iteration -----------------------------------------------------------
 
     /// The next `wait()` uses a zero timeout. Set automatically by
-    /// `requeueHandle`.
+    /// `requeue`.
     pub fn requestImmediate(self: *Loop) void {
         self.immediate = true;
     }
@@ -638,7 +644,7 @@ pub const Loop = struct {
         }
         std.debug.assert(nchanges <= self.change_buf.len);
 
-        self.requeue_len = self.requeue.items.len;
+        self.requeue_len = self.requeue_list.items.len;
         self.requeue_pos = 0;
 
         var zero_ts: posix.timespec = .{ .sec = 0, .nsec = 0 };
@@ -684,7 +690,7 @@ pub const Loop = struct {
             self.timer_ready = false;
         }
         while (self.requeue_pos < self.requeue_len) {
-            const entry = self.requeue.items[self.requeue_pos];
+            const entry = self.requeue_list.items[self.requeue_pos];
             self.requeue_pos += 1;
             const h = self.handles.get(entry.token) orelse {
                 self.stats_.stale_events += 1;
@@ -711,18 +717,54 @@ pub const Loop = struct {
 
     // -- Internals -----------------------------------------------------------
 
+    /// Drop the emitted prefix of the requeue list: entries below
+    /// `requeue_pos` were already delivered and can never fire again.
+    fn collectRequeue(self: *Loop) void {
+        const pos = self.requeue_pos;
+        if (pos == 0) return;
+        const live = self.requeue_list.items.len - pos;
+        std.mem.copyForwards(
+            RequeueEntry,
+            self.requeue_list.items[0..live],
+            self.requeue_list.items[pos..],
+        );
+        self.requeue_list.shrinkRetainingCapacity(live);
+        self.requeue_len -= pos;
+        self.requeue_pos = 0;
+    }
+
+    /// Order-preserving removal of the handle's undelivered requeue
+    /// entries; the other handles' entries keep their order.
+    fn purgeRequeue(self: *Loop, handle: Handle, h: *HandleState) void {
+        if (!h.req_read and !h.req_write) return;
+        h.req_read = false;
+        h.req_write = false;
+        var out = self.requeue_pos;
+        var kept_pending: usize = 0;
+        var i = self.requeue_pos;
+        while (i < self.requeue_list.items.len) : (i += 1) {
+            const entry = self.requeue_list.items[i];
+            if (entry.token.eql(handle)) continue;
+            self.requeue_list.items[out] = entry;
+            out += 1;
+            if (i < self.requeue_len) kept_pending += 1;
+        }
+        self.requeue_list.shrinkRetainingCapacity(out);
+        self.requeue_len = self.requeue_pos + kept_pending;
+    }
+
     /// Keep requeue entries appended after `requeue_len` (this pass already
     /// delivered its share) for the next pass.
     fn compactRequeue(self: *Loop) void {
-        const tail = self.requeue.items.len - self.requeue_len;
+        const tail = self.requeue_list.items.len - self.requeue_len;
         if (tail > 0) {
             std.mem.copyForwards(
                 RequeueEntry,
-                self.requeue.items[0..tail],
-                self.requeue.items[self.requeue_len..],
+                self.requeue_list.items[0..tail],
+                self.requeue_list.items[self.requeue_len..],
             );
         }
-        self.requeue.shrinkRetainingCapacity(tail);
+        self.requeue_list.shrinkRetainingCapacity(tail);
         self.requeue_len = 0;
         self.requeue_pos = 0;
     }
@@ -1348,7 +1390,7 @@ test "Loop: requeue emits a synthetic event after a zero-timeout wait" {
     defer events.deinit(std.testing.allocator);
     try drain(&loop, &events);
 
-    try loop.requeueHandle(h, .read);
+    try loop.requeue(h, .read);
     try loop.wait(); // zero timeout: no kernel events, one synthetic
     try drain(&loop, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
@@ -1360,11 +1402,67 @@ test "Loop: requeue emits a synthetic event after a zero-timeout wait" {
 
     // Requeueing again produces exactly one more, not duplicates.
     events.clearRetainingCapacity();
-    try loop.requeueHandle(h, .read);
-    try loop.requeueHandle(h, .read);
+    try loop.requeue(h, .read);
+    try loop.requeue(h, .read);
     try loop.wait();
     try drain(&loop, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
+}
+
+test "Loop: close and detach remove requeue entries so the list stays bounded" {
+    // attach + requeue + close churned before one wait must not let the
+    // requeue list grow past its 2-per-handle bound.
+    var options = testOptions(null);
+    options.handles_max = 1;
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, &options);
+    defer loop.deinit(std.testing.allocator);
+
+    for (0..4) |_| {
+        const pair = try socketpairNb();
+        posix.close(pair[0]);
+        const h = try loop.attach(pair[1], tctx(1), .{ .read = true });
+        try loop.requeue(h, .read);
+        try loop.requeue(h, .write);
+        try loop.close(h);
+        try std.testing.expectEqual(@as(usize, 0), loop.requeue_list.items.len);
+    }
+
+    const pair = try socketpairNb();
+    posix.close(pair[0]);
+    const h = try loop.attach(pair[1], tctx(1), .{ .read = true });
+    try loop.requeue(h, .read);
+    _ = try loop.detach(h);
+    try std.testing.expectEqual(@as(usize, 0), loop.requeue_list.items.len);
+}
+
+test "Loop: emitted requeue entries are reclaimed on append" {
+    // After both filters emit, the dead entries still occupy the list;
+    // requeueing the same handle must reclaim them instead of overflowing.
+    var options = testOptions(null);
+    options.handles_max = 1;
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, &options);
+    defer loop.deinit(std.testing.allocator);
+
+    const pair = try socketpairNb();
+    defer posix.close(pair[0]);
+    const h = try loop.attach(pair[1], tctx(1), .{ .read = true });
+    try loop.requeue(h, .read);
+    try loop.requeue(h, .write);
+    try loop.wait();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try drain(&loop, &events);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), loop.requeue_list.items.len);
+
+    events.clearRetainingCapacity();
+    try loop.requeue(h, .read);
+    try loop.wait();
+    try drain(&loop, &events);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0] == .readable);
 }
 
 const FlushProbe = struct {
