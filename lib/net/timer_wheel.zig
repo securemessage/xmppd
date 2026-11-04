@@ -52,6 +52,11 @@ pub const TimerWheel = struct {
     due_pos: usize,
     seq: u64,
     cur_ms: u64,
+    counters: Counters = .{},
+
+    /// Diagnostics for the collect bound: batches run and chain entries
+    /// walked. In steady state scanned stays close to emitted deadlines.
+    pub const Counters = struct { collects: u64 = 0, scanned: u64 = 0 };
 
     /// Owns the entry table (timers_max x 40 B) and the due list; borrows nothing.
     pub fn init(self: *TimerWheel, gpa: std.mem.Allocator, timers_max: u32, now_ms: u64) std.mem.Allocator.Error!void {
@@ -137,23 +142,30 @@ pub const TimerWheel = struct {
         return null;
     }
 
-    /// Drain every occupied chain: emit entries with deadline <= now (sorted
-    /// later by the caller's pop order via due), cascade the rest into the
-    /// level their remaining time belongs to.
+    /// Emit entries with deadline <= now (sorted below by deadline, FIFO
+    /// within a deadline) and cascade the rest. Only chains whose slot_min
+    /// says they can contain a due entry are walked: slot_min underestimates
+    /// after a cancelled minimum, never overestimates, so a skipped slot
+    /// holds nothing due. One stale-low chain costs a single O(chain)
+    /// rescan, after which its min is refreshed; work is otherwise charged
+    /// to emitted deadlines, bounded by timers_max per batch.
     fn collect(self: *TimerWheel, now_ms: u64) void {
         if (now_ms > self.cur_ms) self.cur_ms = now_ms;
         self.due_len = 0;
         self.due_pos = 0;
+        self.counters.collects += 1;
         for (0..LEVELS) |l| {
             var occ = self.occupied[l];
             while (occ != 0) : (occ &= occ - 1) {
                 const s: usize = @intCast(@ctz(occ));
+                if (self.slot_min[l][s] > self.cur_ms) continue;
                 var idx = self.heads[l][s];
                 self.heads[l][s] = NIL;
                 self.tails[l][s] = NIL;
                 self.occupied[l] &= ~(@as(u64, 1) << @intCast(s));
                 self.slot_min[l][s] = std.math.maxInt(u64);
                 while (idx != NIL) {
+                    self.counters.scanned += 1;
                     const e = &self.entries.values[idx];
                     const next = e.next;
                     const idx_tok: TimerId = .{ .index = idx, .gen = self.entries.gens[idx], .kind = timer_entry_kind };
@@ -327,4 +339,28 @@ test "TimerWheel: deadline in the past expires immediately" {
     const t = try wheel.schedule(500, .{ .index = 1, .gen = 1, .kind = 0xEE });
     const d = wheel.popExpired(1000).?;
     try std.testing.expect(d.timer.eql(t));
+}
+
+test "TimerWheel: collect scans only chains that can hold a due entry" {
+    // 63 far timers in one level-3 chain and one near timer: popping the
+    // near one must walk its chain only, not rescan the whole wheel.
+    var wheel: TimerWheel = undefined;
+    try wheel.init(std.testing.allocator, 64, 1000);
+    defer wheel.deinit(std.testing.allocator);
+
+    for (0..63) |i| {
+        _ = try wheel.schedule(10_000_000, .{ .index = @intCast(i + 10), .gen = 1, .kind = 0xEE });
+    }
+    const near = try wheel.schedule(1005, .{ .index = 1, .gen = 1, .kind = 0xEE });
+
+    const d = wheel.popExpired(1005).?;
+    try std.testing.expect(d.timer.eql(near));
+    try std.testing.expectEqual(@as(u64, 1), wheel.counters.scanned);
+    try std.testing.expect(wheel.popExpired(1005) == null);
+
+    // The far timers still fire at their own deadline; scanning them then
+    // walks their single chain.
+    var fired: usize = 0;
+    while (wheel.popExpired(10_000_000)) |_| fired += 1;
+    try std.testing.expectEqual(@as(usize, 63), fired);
 }
