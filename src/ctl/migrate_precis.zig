@@ -148,6 +148,11 @@ const RewriteContext = struct {
     identities: *IdentityTracker,
 };
 
+const Ownership = enum {
+    owner,
+    reference,
+};
+
 fn isHosted(domain: []const u8, hosted_domains: []const []const u8) bool {
     for (hosted_domains) |hosted| {
         if (std.mem.eql(u8, domain, hosted)) return true;
@@ -155,22 +160,22 @@ fn isHosted(domain: []const u8, hosted_domains: []const []const u8) bool {
     return false;
 }
 
-fn rewriteLocalpart(allocator: std.mem.Allocator, name: []const u8, ctx: *const RewriteContext) !?[]u8 {
+fn rewriteLocalpart(allocator: std.mem.Allocator, name: []const u8, ctx: *const RewriteContext, ownership: Ownership) !?[]u8 {
     if (ctx.forced) |rename| {
         if (std.mem.eql(u8, name, rename.old_localpart)) {
-            try ctx.identities.record(name, rename.new_localpart);
+            if (ownership == .owner) try ctx.identities.record(name, rename.new_localpart);
             return try allocator.dupe(u8, rename.new_localpart);
         }
     }
 
     const prepared = migrate_precis_scratch.localpart(name) catch
         return error.InvalidAccountName;
-    try ctx.identities.record(name, prepared);
+    if (ownership == .owner) try ctx.identities.record(name, prepared);
     if (std.mem.eql(u8, prepared, name)) return null;
     return try allocator.dupe(u8, prepared);
 }
 
-fn rewriteJid(allocator: std.mem.Allocator, jid: []const u8, ctx: *const RewriteContext) !?[]u8 {
+fn rewriteJid(allocator: std.mem.Allocator, jid: []const u8, ctx: *const RewriteContext, ownership: Ownership) !?[]u8 {
     // A domain-only JID (with or without a resource) has no account
     // localpart and must stay exactly as stored.
     const at = std.mem.indexOfScalar(u8, jid, '@') orelse return null;
@@ -179,7 +184,7 @@ fn rewriteJid(allocator: std.mem.Allocator, jid: []const u8, ctx: *const Rewrite
     const domain = if (slash) |pos| remainder[0..pos] else remainder;
     if (!isHosted(domain, ctx.hosted_domains)) return null;
 
-    const new_local = try rewriteLocalpart(allocator, jid[0..at], ctx) orelse return null;
+    const new_local = try rewriteLocalpart(allocator, jid[0..at], ctx, ownership) orelse return null;
     defer allocator.free(new_local);
     const suffix = jid[at..];
     const result = try allocator.alloc(u8, new_local.len + suffix.len);
@@ -194,19 +199,21 @@ fn rewriteTwoParts(
     ctx: *const RewriteContext,
     first_is_localpart: bool,
     second_is_localpart: bool,
+    first_ownership: Ownership,
+    second_ownership: Ownership,
 ) !?[]u8 {
     const sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     const first = key[0..sep];
     const second = key[sep + 1 ..];
     const new_first = if (first_is_localpart)
-        try rewriteLocalpart(allocator, first, ctx)
+        try rewriteLocalpart(allocator, first, ctx, first_ownership)
     else
-        try rewriteJid(allocator, first, ctx);
+        try rewriteJid(allocator, first, ctx, first_ownership);
     errdefer if (new_first) |value| allocator.free(value);
     const new_second = if (second_is_localpart)
-        try rewriteLocalpart(allocator, second, ctx)
+        try rewriteLocalpart(allocator, second, ctx, second_ownership)
     else
-        try rewriteJid(allocator, second, ctx);
+        try rewriteJid(allocator, second, ctx, second_ownership);
     errdefer if (new_second) |value| allocator.free(value);
     if (new_first == null and new_second == null) return null;
 
@@ -227,8 +234,8 @@ fn rewriteFirstAndSuffix(
     ctx: *const RewriteContext,
 ) !?[]u8 {
     const sep = std.mem.indexOfScalar(u8, key, 0) orelse
-        return rewriteJid(allocator, key, ctx);
-    const new_first = try rewriteJid(allocator, key[0..sep], ctx) orelse
+        return rewriteJid(allocator, key, ctx, .owner);
+    const new_first = try rewriteJid(allocator, key[0..sep], ctx, .owner) orelse
         return null;
     defer allocator.free(new_first);
     const suffix = key[sep..];
@@ -245,15 +252,16 @@ fn rewriteByContact(
 ) !?[]u8 {
     const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     const second_sep_relative = std.mem.indexOfScalar(u8, key[first_sep + 1 ..], 0) orelse
-        return rewriteTwoParts(allocator, key, ctx, false, false);
+        return rewriteTwoParts(allocator, key, ctx, false, false, .owner, .reference);
     const second_sep = first_sep + 1 + second_sep_relative;
 
-    const new_owner = try rewriteJid(allocator, key[0..first_sep], ctx);
+    const new_owner = try rewriteJid(allocator, key[0..first_sep], ctx, .owner);
     errdefer if (new_owner) |value| allocator.free(value);
     const new_contact = try rewriteJid(
         allocator,
         key[first_sep + 1 .. second_sep],
         ctx,
+        .reference,
     );
     errdefer if (new_contact) |value| allocator.free(value);
     if (new_owner == null and new_contact == null) return null;
@@ -279,7 +287,7 @@ fn rewriteRoomAffiliation(
     const sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     // The room JID is an OpaqueString room name and stays as stored. Only the
     // member JID is an account localpart in scope for this migration.
-    const new_member = try rewriteJid(allocator, key[sep + 1 ..], ctx) orelse
+    const new_member = try rewriteJid(allocator, key[sep + 1 ..], ctx, .reference) orelse
         return null;
     defer allocator.free(new_member);
     const room = key[0 .. sep + 1];
@@ -302,16 +310,16 @@ fn rewriteEntry(
     ctx.identities.db = db;
     ctx.identities.namespace = namespace;
 
-    if (db == .auth and
-        (std.mem.eql(u8, namespace, NS_USERS) or std.mem.eql(u8, namespace, NS_LOCKS)))
-    {
-        rewrite.new_key = try rewriteLocalpart(allocator, key, ctx);
+    if (db == .auth and std.mem.eql(u8, namespace, NS_USERS)) {
+        rewrite.new_key = try rewriteLocalpart(allocator, key, ctx, .owner);
+    } else if (db == .auth and std.mem.eql(u8, namespace, NS_LOCKS)) {
+        rewrite.new_key = try rewriteLocalpart(allocator, key, ctx, .reference);
     } else if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST))
     {
-        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false);
+        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false, .owner, .reference);
     } else if (std.mem.eql(u8, namespace, NS_PENDING_SUB)) {
-        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false);
+        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false, .owner, .reference);
     } else if (std.mem.eql(u8, namespace, NS_BY_CONTACT)) {
         rewrite.new_key = try rewriteByContact(allocator, key, ctx);
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
@@ -324,7 +332,7 @@ fn rewriteEntry(
     {
         rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx);
         if (std.mem.eql(u8, namespace, NS_OFFLINE)) {
-            rewrite.new_value = try rewriteJid(allocator, value, ctx);
+            rewrite.new_value = try rewriteJid(allocator, value, ctx, .reference);
         }
     }
 

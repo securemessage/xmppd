@@ -4,6 +4,7 @@ const migrate = @import("migrate_precis");
 const user_store_mod = @import("user_store");
 const roster_store_mod = @import("roster_store");
 const archive_store_mod = @import("archive_store");
+const lock_store_mod = @import("lock_store");
 const block_store_mod = @import("block_store");
 const vcard_store_mod = @import("vcard_store");
 const pep_store_mod = @import("pep_store");
@@ -147,6 +148,68 @@ test "migrate-precis uses production key models for every namespace" {
     defer second.deinit();
     try std.testing.expectEqual(@as(usize, 0), second.renames.items.len);
     try std.testing.expectEqual(@as(usize, 0), second.issues.items.len);
+}
+
+test "migrate-precis treats users plus their prepared lock as one account" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&auth);
+    try locks.lock("naplestb", .permanent);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{});
+    try std.testing.expect((try users.lookup(allocator, "naplestb")) != null);
+    try std.testing.expect((try locks.isLocked(allocator, "naplestb")) != null);
+
+    var second = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), second.renames.items.len);
+}
+
+test "migrate-precis rewrites references without inventing collisions" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    try users.addUser(allocator, "alice", "pw");
+    var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
+    try roster.setItem("alice@us.example", "naplestb@us.example", "", .both, false);
+    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+    try archive_store.store("alice@us.example", "naplestb@us.example", "id1", 1, "<message/>");
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{});
+    try std.testing.expect((try users.lookup(allocator, "naplestb")) != null);
+    try std.testing.expect((try roster.getItem(allocator, "alice@us.example", "naplestb@us.example")) != null);
+    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id1");
+
+    var second = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), second.renames.items.len);
 }
 
 test "migrate-precis detects identity collisions on data and raw deletion cascades" {
