@@ -72,6 +72,49 @@ test "migrate-precis plans and applies on real LMDB and RocksDB" {
     try std.testing.expectEqualStrings("<message><body>private</body></message>", archive_value.?);
 }
 
+test "the LMDB lock-file probe catches an idle holder process" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fs.path.join(allocator, &.{ base, "lmdb-readers" });
+    defer allocator.free(path);
+    try tmp.dir.makePath("lmdb-readers");
+
+    // The child opens its own environment (so it owns its own shared lock)
+    // and signals readiness before idling without any read transaction.
+    const pipe_fds = try std.posix.pipe();
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        std.posix.close(pipe_fds[0]);
+        var child_env = LmdbBackend.open(path, .{}) catch std.posix.exit(1);
+        defer child_env.close();
+        _ = std.posix.write(pipe_fds[1], "x") catch std.posix.exit(1);
+        std.posix.close(pipe_fds[1]);
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        std.posix.exit(0);
+    }
+    std.posix.close(pipe_fds[1]);
+    var ready: [1]u8 = undefined;
+    _ = try std.posix.read(pipe_fds[0], &ready);
+    std.posix.close(pipe_fds[0]);
+
+    var child_alive = true;
+    defer if (child_alive) {
+        _ = std.c.kill(pid, std.c.SIG.TERM);
+        _ = std.posix.waitpid(pid, 0);
+    };
+
+    var auth = try LmdbBackend.open(path, .{});
+    defer auth.close();
+    try std.testing.expectError(error.DaemonsRunning, auth.assertNoActiveReaders());
+    _ = std.c.kill(pid, std.c.SIG.TERM);
+    _ = std.posix.waitpid(pid, 0);
+    child_alive = false;
+    try auth.assertNoActiveReaders();
+}
+
 test "migrate-precis uses production key models for every namespace" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;

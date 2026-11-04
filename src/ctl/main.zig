@@ -465,8 +465,14 @@ fn runDeleteRaw(
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
-    try assertLmdbOffline(&auth);
-    try assertLmdbOffline(&op);
+    assertLmdbOffline(&auth) catch |err| {
+        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
+        return err;
+    };
+    assertLmdbOffline(&op) catch |err| {
+        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
+        return err;
+    };
 
     migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
         switch (err) {
@@ -513,8 +519,14 @@ fn runMigratePrecis(
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
-    try assertLmdbOffline(&auth);
-    try assertLmdbOffline(&op);
+    assertLmdbOffline(&auth) catch |err| {
+        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
+        return err;
+    };
+    assertLmdbOffline(&op) catch |err| {
+        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
+        return err;
+    };
 
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();

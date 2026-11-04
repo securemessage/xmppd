@@ -24,30 +24,6 @@ const MdbEnvInfoC = extern struct {
     me_numreaders: c_uint,
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
-extern "c" fn mdb_reader_list(env: ?*anyopaque, func: *const fn ([*:0]const u8, ?*anyopaque) callconv(.c) c_int, ctx: ?*anyopaque) c_int;
-
-threadlocal var live_reader_seen = false;
-
-fn readerIsLive(msg: [*:0]const u8, opaque_ctx: ?*anyopaque) callconv(.c) c_int {
-    _ = opaque_ctx;
-    const text = std.mem.span(msg);
-    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    const pid_text = tokens.next() orelse return 0;
-    _ = tokens.next() orelse return 0;
-    const txnid_text = tokens.next() orelse return 0;
-    // Aborted transactions leave retained slots marked "-", not live readers.
-    if (std.mem.eql(u8, txnid_text, "-")) return 0;
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch return 0;
-    std.posix.kill(pid, 0) catch |err| switch (err) {
-        error.ProcessNotFound => return 0,
-        else => {
-            live_reader_seen = true;
-            return 0;
-        },
-    };
-    live_reader_seen = true;
-    return 0;
-}
 
 const log = std.log.scoped(.lmdb_store);
 
@@ -74,6 +50,8 @@ pub const LmdbBackend = struct {
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    db_path_buf: [4096]u8,
+    db_path_len: usize,
 
     comptime {
         backend.assertBackend(LmdbBackend);
@@ -111,6 +89,8 @@ pub const LmdbBackend = struct {
             .dbi_cache = undefined,
             .dbi_count = .init(0),
             .map_size = opts.map_size,
+            .db_path_buf = path_buf,
+            .db_path_len = path.len,
         };
         if (!opts.read_only) try self.openCanonicalNamespaces() else try self.openCanonicalNamespacesReadOnly();
         self.warnIfNearlyFull();
@@ -180,12 +160,33 @@ pub const LmdbBackend = struct {
         self.env.deinit();
     }
 
-    /// Fail if the reader table contains a live process. Pid files alone
-    /// cannot prove an LMDB environment is offline.
+    /// Probe LMDB's byte-0 lock file lock without blocking. Every process
+    /// holding the environment, even an idle one with no read transaction,
+    /// holds a shared fcntl lock there, so an exclusive probe fails closed.
     pub fn assertNoActiveReaders(self: *LmdbBackend) !void {
-        live_reader_seen = false;
-        if (mdb_reader_list(self.env.ptr, readerIsLive, null) != 0) return error.LmdbCheckFailed;
-        if (live_reader_seen) return error.DaemonsRunning;
+        var path_buf: [4096]u8 = undefined;
+        const lock_path = try std.fmt.bufPrint(&path_buf, "{s}/lock.mdb", .{self.db_path_buf[0..self.db_path_len]});
+        var file = std.fs.cwd().openFile(lock_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => return error.LmdbCheckFailed,
+            else => return err,
+        };
+        defer file.close();
+
+        var lock: std.posix.Flock = .{
+            .start = 0,
+            .len = 1,
+            .pid = 0,
+            .type = std.c.F.WRLCK,
+            .whence = 0,
+            .sysid = 0,
+        };
+        const rc = std.c.fcntl(file.handle, std.c.F.SETLK, &lock);
+        if (rc == -1) {
+            return switch (std.posix.errno(rc)) {
+                .ACCES, .AGAIN => error.DaemonsRunning,
+                else => error.LmdbCheckFailed,
+            };
+        }
     }
 
     pub fn get(self: *LmdbBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
