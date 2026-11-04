@@ -11873,6 +11873,96 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
 // An S2S dispatch that reaches one resource locally and another on a second
 // worker must hold one row. The remote worker learns the dispatch identity
 // from the delivery slot; a fresh token there would store the stanza twice.
+// The same dispatch identity must survive the c2s router's hop through the
+// delivery slot: the receiving worker reads the token off the slot instead of
+// minting its own.
+test "c2s: one routed message to two draining workers holds one row" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+    w1.offline = &offline_store;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.offline_pending = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w1.sessions[5] = desk;
+    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+    w0.offline = &offline_store;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.offline_pending = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    w0.sessions[6] = phone;
+    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "c2s-one";
+    const body = "<body>one row</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w1_changes_buf: [64]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    router.dispatchStanza(&w1, &alice, &w1_changes);
+
+    var w0_changes_buf: [32]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    w0.drainDeliveryQueue(&w0_changes);
+
+    // Count the routed message only. A carbon copy of it to bob's other
+    // resource is a separate dispatch, held by the cross-worker carbon path,
+    // which this test does not pin.
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    var message_rows: usize = 0;
+    for (ptrs) |ptr| {
+        const held = try offline_store.getHeldStanza(ptr) orelse continue;
+        defer allocator.free(held);
+        if (std.mem.indexOf(u8, held, "urn:xmpp:carbons:2") != null) continue;
+        if (std.mem.indexOf(u8, held, "from='alice@localhost/mobile' to='bob@localhost'") != null) message_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), message_rows);
+}
+
 test "S2S: one inbound stanza to two draining workers holds one row" {
     const allocator = std.testing.allocator;
 
