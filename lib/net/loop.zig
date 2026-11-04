@@ -1833,6 +1833,96 @@ test "Loop: markDirty on a dirty handle adds no second entry" {
     try std.testing.expectEqual(@as(usize, 1), loop.dirty_count);
 }
 
+/// Walk the intrusive dirty list and assert every invariant: count,
+/// head/tail identity, link consistency in both directions, and that
+/// every linked handle still exists and carries the dirty flag.
+fn expectDirtyListWellFormed(loop: *Loop) !void {
+    var count: usize = 0;
+    var prev: u32 = nil_link;
+    var i = loop.dirty_head;
+    var last: u32 = nil_link;
+    while (i != nil_link) {
+        const h = &loop.handles.values[i];
+        try std.testing.expect(h.dirty);
+        try std.testing.expectEqual(prev, h.dirty_prev);
+        prev = i;
+        last = i;
+        i = h.dirty_next;
+        count += 1;
+    }
+    try std.testing.expectEqual(last, loop.dirty_tail);
+    try std.testing.expectEqual(count, loop.dirty_count);
+    if (count == 0) {
+        try std.testing.expectEqual(nil_link, loop.dirty_head);
+        try std.testing.expectEqual(nil_link, loop.dirty_tail);
+    }
+}
+
+test "Loop: dirty list invariants hold across a random op mix" {
+    // L1-style fuzz: attach, setInterest, close, detach and wait in a
+    // seeded order; the list is walked and checked after every op, so a
+    // stale link, a dead entry or a wrong count fails immediately.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    var rng = std.Random.DefaultPrng.init(0xD1817);
+    const r = rng.random();
+    var live: std.ArrayListUnmanaged(Handle) = .{};
+    defer live.deinit(std.testing.allocator);
+    var peers: std.ArrayListUnmanaged(posix.fd_t) = .{};
+    defer {
+        for (peers.items) |fd| posix.close(fd);
+        peers.deinit(std.testing.allocator);
+    }
+
+    for (0..2000) |step| {
+        const live_n = live.items.len;
+        switch (r.intRangeAtMost(u8, 0, 9)) {
+            0...3 => { // attach
+                if (live_n >= 60) continue;
+                const sp = try socketpairNb();
+                const h = loop.attach(sp[0], tctx(@intCast(step)), .{ .read = true }) catch |err| {
+                    posix.close(sp[0]);
+                    posix.close(sp[1]);
+                    if (err == error.HandleTableFull) continue;
+                    return err;
+                };
+                try live.append(std.testing.allocator, h);
+                try peers.append(std.testing.allocator, sp[1]);
+            },
+            4...5 => { // setInterest on a live handle
+                if (live_n == 0) continue;
+                const h = live.items[r.intRangeLessThan(usize, 0, live_n)];
+                if (loop.resolve(h)) |_| {
+                    loop.setInterest(h, .{ .read = r.boolean(), .write = r.boolean() }) catch {};
+                }
+            },
+            6...7 => { // close a random live handle
+                if (live_n == 0) continue;
+                const idx = r.intRangeLessThan(usize, 0, live_n);
+                const h = live.orderedRemove(idx);
+                _ = peers.orderedRemove(idx);
+                loop.close(h) catch {};
+            },
+            8 => { // detach a random live handle
+                if (live_n == 0) continue;
+                const idx = r.intRangeLessThan(usize, 0, live_n);
+                const h = live.orderedRemove(idx);
+                _ = peers.orderedRemove(idx);
+                const fd = loop.detach(h) catch continue;
+                posix.close(fd);
+            },
+            else => { // wait drains the dirty list through stageChanges
+                loop.requestImmediate();
+                try loop.wait();
+                while (loop.next()) |_| {}
+            },
+        }
+        try expectDirtyListWellFormed(&loop);
+    }
+    try expectDirtyListWellFormed(&loop);
+}
+
 test "Loop: close keeps the dirty order of the survivors" {
     var loop = try testLoop(null);
     defer loop.deinit(std.testing.allocator);
