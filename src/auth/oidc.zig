@@ -1844,6 +1844,91 @@ test "OidcStore: a 200 without id_token or introspection is unavailable, never t
 
 // --- IdpPool tests -----------------------------------------------------
 
+/// A loopback port that refuses connections (bound then closed): an
+/// exchange against it fails fast, so tests can turn jobs around quickly.
+fn refusedPort() !u16 {
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try posix.getsockname(listen_fd, @ptrCast(&addr), &alen);
+    const port = std.mem.bigToNative(u16, addr.port);
+    posix.close(listen_fd);
+    return port;
+}
+
+/// Store whose token and JWKS endpoints point at a refused port: every
+/// exchange completes .unavailable without waiting on a deadline.
+fn refusedStore(allocator: Allocator, port: u16, url_buf: []u8) !OidcStore {
+    const url = try std.fmt.bufPrint(url_buf, "https://127.0.0.1:{d}/", .{port});
+    var store = testStore(allocator, .{ .token_endpoint = url, .jwks_uri = url });
+    try store.start();
+    return store;
+}
+
+/// Test allocator that snapshots every freed buffer before releasing it,
+/// so wipe paths can be proven: any secret left in a freed buffer is found.
+const FreeSnapshot = struct {
+    inner: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    freed: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn allocator(self: *FreeSnapshot) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
+        if (memory.len > 0) {
+            const copy = self.inner.alloc(u8, memory.len) catch @panic("snapshot");
+            @memcpy(copy, memory);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.freed.append(self.inner, copy) catch @panic("snapshot");
+        }
+        self.inner.rawFree(memory, alignment, ra);
+    }
+
+    fn deinit(self: *FreeSnapshot) void {
+        for (self.freed.items) |buf| self.inner.free(buf);
+        self.freed.deinit(self.inner);
+    }
+
+    /// No freed buffer may still carry the marker bytes.
+    fn assertFreedWiped(self: *FreeSnapshot, marker: []const u8) !void {
+        for (self.freed.items) |buf| {
+            try std.testing.expect(std.mem.indexOf(u8, buf, marker) == null);
+        }
+    }
+};
+
 /// Loopback TCP listener that accepts into a hold array and never answers,
 /// so a worker's TLS handshake waits until the cancel pipe or the deadline
 /// fires it.
@@ -1889,6 +1974,85 @@ fn hangingStore(allocator: Allocator, port: u16, url_buf: []u8) !OidcStore {
     var store = testStore(allocator, .{ .token_endpoint = url, .jwks_uri = url });
     try store.start();
     return store;
+}
+
+test "IdpPool: releaseJob wipes the secret before free" {
+    const allocator = std.testing.allocator;
+    const port = try refusedPort();
+    var url_buf: [128]u8 = undefined;
+    var store = try refusedStore(allocator, port, &url_buf);
+    defer store.deinit();
+
+    var snap = FreeSnapshot{ .inner = allocator };
+    defer snap.deinit();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 1,
+        .max_outstanding = 4,
+        .connect_timeout_ms = 1000,
+        .timeout_ms = 3000,
+    });
+    defer pool.stop();
+    pool.secret_alloc = snap.allocator();
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "s3cr3t-m30-marker" } };
+    _ = try pool.put(cred);
+
+    const dl = std.time.milliTimestamp() + 5000;
+    while (std.time.milliTimestamp() < dl) {
+        if (pool.popCompletion()) |job_in| {
+            var job = job_in;
+            IdpPool.releaseJob(&job);
+            break;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    // The freed secret blob must read back wiped, never the credential.
+    try snap.assertFreedWiped("s3cr3t-m30-marker");
+    try snap.assertFreedWiped("alice");
+}
+
+test "IdpPool: popping a completion releases the outstanding slot" {
+    const allocator = std.testing.allocator;
+    const port = try refusedPort();
+    var url_buf: [128]u8 = undefined;
+    var store = try refusedStore(allocator, port, &url_buf);
+    defer store.deinit();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 2,
+        .max_outstanding = 2,
+        .connect_timeout_ms = 1000,
+        .timeout_ms = 5000,
+    });
+    defer pool.stop();
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+    _ = try pool.put(cred);
+    _ = try pool.put(cred);
+    try std.testing.expectError(error.QueueFull, pool.put(cred));
+
+    var popped: usize = 0;
+    const dl = std.time.milliTimestamp() + 5000;
+    while (popped < 2 and std.time.milliTimestamp() < dl) {
+        if (pool.popCompletion()) |job_in| {
+            var job = job_in;
+            IdpPool.releaseJob(&job);
+            popped += 1;
+        } else {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), popped);
+    try std.testing.expectEqual(@as(usize, 0), pool.outstanding());
+
+    // The released slots admit new jobs; a leak would leave the pool
+    // permanently full.
+    _ = try pool.put(cred);
+    _ = try pool.put(cred);
+    try std.testing.expectError(error.QueueFull, pool.put(cred));
 }
 
 test "IdpPool: put rejects at max_outstanding" {
