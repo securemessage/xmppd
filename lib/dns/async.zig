@@ -4844,6 +4844,23 @@ test "dns-async: tcp_seq advances on every connection attempt" {
     try std.testing.expectEqual(s0 +% 2, r.jobs.items[0].tcp_seq);
 }
 
+test "dns-async: a kevent error in step is counted" {
+    // A dead kqueue must not fail silently: step() counts each
+    // kevent error so the caller has a signal in the spin.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    const saved = r.kq;
+    // A non-kqueue fd makes kevent(2) fail every time.
+    r.kq = ufd;
+    r.step(0);
+    try std.testing.expectEqual(@as(usize, 1), r.kevent_errors);
+    r.step(0);
+    try std.testing.expectEqual(@as(usize, 2), r.kevent_errors);
+    r.kq = saved;
+    posix.close(ufd);
+}
+
 test "dns-async: a write on a reset connection reports peer close, not a drop" {
     // A peer that resets makes the next write fail EPIPE; the mapping
     // to PeerClosed is what lets tcpPeerClosed resend on a fresh
