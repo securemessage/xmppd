@@ -394,7 +394,8 @@ pub const UnixOptions = struct { path: []const u8, mode: mode_t, backlog: u31 = 
 pub const BindUnixError = error{ PathTooLong, AddressInUse, NotASocket, AccessDenied,
                                  SystemResources, Unexpected };
 pub fn bindUnix(options: *const UnixOptions) BindUnixError!fd_t;
-pub const PeerCred = struct { uid: uid_t, gid: gid_t, groups: [16]gid_t, group_count: u8, pid: pid_t };
+pub const PeerCred = struct { uid: uid_t, gid: gid_t, groups: [16]gid_t, group_count: u8,
+                              pid: pid_t, truncated: bool };
 ```
 
 Order: path checked against `sun_path` (104 B) and refused, never truncated; bind;
@@ -405,7 +406,9 @@ decides: `ECONNREFUSED` means stale, unlink once and retry; a live listener is
 Peer identity on accept: `LOCAL_PEERCRED` (`xucred`: uid, effective gid first, then the
 supplementary groups, pid). It is a superset of `getpeereid`, which exposes only the
 effective gid; T258 moved the IPC gate to `LOCAL_PEERCRED` for exactly that reason
-(`src/ipc/server.zig:28-43`) [V]. See Q2.
+(`src/ipc/server.zig:28-43`) [V]. See Q2. The kernel caps `cr_ngroups` at
+`XU_NGROUPS`=16 (`cru2x`, `kern_prot.c`), so `truncated` is set when `ngroups >= 16`:
+the set may be incomplete and the caller must fail closed.
 
 ### 9.3 Listener and accept
 

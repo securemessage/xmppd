@@ -14,7 +14,7 @@
 //!
 //! peerCred returns the LOCAL_PEERCRED credentials of an accepted Unix
 //! socket: uid, gid, the group set the kernel reports (XU_NGROUPS=16 cap,
-//! flagged truncated beyond it) and pid.
+//! flagged possibly-truncated at exactly 16) and pid.
 
 const std = @import("std");
 const posix = std.posix;
@@ -185,8 +185,9 @@ pub const PeerCred = struct {
     groups: [16]posix.gid_t,
     group_count: u8,
     pid: posix.pid_t,
-    /// The peer had more supplementary groups than the XU_NGROUPS=16 the
-    /// kernel reports: the set is incomplete and callers must fail closed.
+    /// The peer may have had more supplementary groups than the 16 the
+    /// kernel copies (cru2x caps cr_ngroups at XU_NGROUPS, so exactly 16
+    /// cannot be told apart from more). Callers must fail closed.
     truncated: bool,
 };
 
@@ -225,9 +226,8 @@ pub fn peerCred(fd: posix.fd_t, errno_out: ?*u32) error{ NotUnixSocket, Unexpect
             else => error.Unexpected,
         };
     }
-    // cr_ngroups is the peer's real group count, not the number copied:
-    // a process with more than XU_NGROUPS reports it while cr_groups[16]
-    // holds a truncated set.
+    // cru2x caps cr_ngroups at XU_NGROUPS=16 (kern_prot.c), so the count
+    // never exceeds 16 and a count of exactly 16 may be a truncated set.
     return credFromXucred(cred) orelse {
         if (errno_out) |out| out.* = @intFromEnum(posix.E.PROTO);
         return error.Unexpected;
@@ -243,7 +243,7 @@ fn credFromXucred(cred: xucred) ?PeerCred {
         .groups = cred.groups,
         .group_count = @intCast(@min(cred.ngroups, 16)),
         .pid = cred.pid_union.pid,
-        .truncated = cred.ngroups > 16,
+        .truncated = cred.ngroups >= 16,
     };
 }
 
@@ -543,11 +543,12 @@ test "bindTcp: two listeners share the port with REUSEPORT_LB" {
     defer posix.close(lfd_b);
 }
 
-test "peerCred: groups beyond XU_NGROUPS are flagged truncated" {
+test "peerCred: a full XU_NGROUPS set is flagged possibly truncated" {
+    // The kernel caps cr_ngroups at 16, so exactly-16 may hide more.
     var xc: xucred = .{
         .version = xucred_version,
         .uid = 1001,
-        .ngroups = 20, // cr_groups holds only the first 16
+        .ngroups = 16,
         .groups = @splat(55),
         .pid_union = .{ .pid = 42 },
     };
@@ -555,9 +556,9 @@ test "peerCred: groups beyond XU_NGROUPS are flagged truncated" {
     try std.testing.expectEqual(@as(u8, 16), pc.group_count);
     try std.testing.expect(pc.truncated);
 
-    xc.ngroups = 16;
+    xc.ngroups = 15;
     const full = credFromXucred(xc).?;
-    try std.testing.expectEqual(@as(u8, 16), full.group_count);
+    try std.testing.expectEqual(@as(u8, 15), full.group_count);
     try std.testing.expect(!full.truncated);
 }
 
