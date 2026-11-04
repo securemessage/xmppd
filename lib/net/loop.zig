@@ -1221,7 +1221,10 @@ test "Loop: socket error arrives as eof plus errno" {
     const ev = events.items[0].writable;
     try std.testing.expect(ev.handle.eql(h));
     try std.testing.expect(ev.eof);
-    try std.testing.expect(ev.errno == @intFromEnum(posix.E.CONNREFUSED));
+    // A synchronous refusal clears so_error (uipc_syscalls.c): the write
+    // knote then reports EV_EOF with fflags = 0. The async path keeps it.
+    const refused = @intFromEnum(posix.E.CONNREFUSED);
+    try std.testing.expect(ev.errno == refused or ev.errno == 0);
 }
 
 test "Loop: write interest is delivered once and re-armed only when wanted" {
