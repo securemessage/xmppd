@@ -151,38 +151,9 @@ pub fn main() !void {
         map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
     }
 
-    // IdP worker pool configuration: parsed strictly, an invalid value
-    // refuses to start rather than silently falling back.
-    var pool_options = IdpPool.Options{
-        .threads = 8,
-        .max_outstanding = 256,
-        .connect_timeout_ms = 3000,
-        .timeout_ms = 10000,
+    const pool_options = parsePoolOptions(&cfg) catch {
+        return error.InvalidArgs;
     };
-    if (cfg.get("oidc", "idp_threads")) |v| {
-        pool_options.threads = parseBounded(u8, v, 1, IdpPool.max_threads) orelse {
-            log.err("invalid [oidc] idp_threads '{s}' (want 1..{d})", .{ v, IdpPool.max_threads });
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_max_outstanding")) |v| {
-        pool_options.max_outstanding = parseBounded(u16, v, 1, 4096) orelse {
-            log.err("invalid [oidc] idp_max_outstanding '{s}' (want 1..4096)", .{v});
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_connect_timeout_ms")) |v| {
-        pool_options.connect_timeout_ms = parseBounded(u32, v, 100, 60000) orelse {
-            log.err("invalid [oidc] idp_connect_timeout_ms '{s}' (want 100..60000)", .{v});
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_timeout_ms")) |v| {
-        pool_options.timeout_ms = parseBounded(u32, v, pool_options.connect_timeout_ms, 120000) orelse {
-            log.err("invalid [oidc] idp_timeout_ms '{s}' (want {d}..120000)", .{ v, pool_options.connect_timeout_ms });
-            return error.InvalidArgs;
-        };
-    }
 
     log.info("xmppd-auth-oidc starting", .{});
     log.info("  issuer: {s}", .{issuer});
@@ -265,6 +236,42 @@ fn parseBounded(comptime T: type, value: []const u8, min: T, max: T) ?T {
     const n = std.fmt.parseInt(T, value, 10) catch return null;
     if (n < min or n > max) return null;
     return n;
+}
+
+/// IdP worker pool configuration: parsed strictly, an invalid value
+/// refuses to start rather than silently falling back.
+fn parsePoolOptions(cfg: *const config_mod.Config) error{InvalidArgs}!IdpPool.Options {
+    var options = IdpPool.Options{
+        .threads = 8,
+        .max_outstanding = 256,
+        .connect_timeout_ms = 3000,
+        .timeout_ms = 10000,
+    };
+    if (cfg.get("oidc", "idp_threads")) |v| {
+        options.threads = parseBounded(u8, v, 1, IdpPool.max_threads) orelse {
+            log.warn("invalid [oidc] idp_threads '{s}' (want 1..{d})", .{ v, IdpPool.max_threads });
+            return error.InvalidArgs;
+        };
+    }
+    if (cfg.get("oidc", "idp_max_outstanding")) |v| {
+        options.max_outstanding = parseBounded(u16, v, 1, 4096) orelse {
+            log.warn("invalid [oidc] idp_max_outstanding '{s}' (want 1..4096)", .{v});
+            return error.InvalidArgs;
+        };
+    }
+    if (cfg.get("oidc", "idp_connect_timeout_ms")) |v| {
+        options.connect_timeout_ms = parseBounded(u32, v, 100, 60000) orelse {
+            log.warn("invalid [oidc] idp_connect_timeout_ms '{s}' (want 100..60000)", .{v});
+            return error.InvalidArgs;
+        };
+    }
+    if (cfg.get("oidc", "idp_timeout_ms")) |v| {
+        options.timeout_ms = parseBounded(u32, v, options.connect_timeout_ms, 120000) orelse {
+            log.warn("invalid [oidc] idp_timeout_ms '{s}' (want {d}..120000)", .{ v, options.connect_timeout_ms });
+            return error.InvalidArgs;
+        };
+    }
+    return options;
 }
 
 /// An auth_request parked while its IdP exchange runs on a pool worker.
@@ -923,6 +930,57 @@ test "oidc daemon: the start path migrates legacy lock keys before the read-only
     const alice = (try store.isLocked(allocator, "ALICE")) orelse return error.NotLocked;
     try std.testing.expectEqual(@as(u32, 7), alice.locked_epoch);
     try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
+}
+
+/// Write "[oidc]\n`body`\n" into the tmp dir and return the file path.
+fn writeTmpConfig(allocator: Allocator, tmp: *std.testing.TmpDir, body: []const u8) ![]u8 {
+    const f = try tmp.dir.createFile("t.cfg", .{ .truncate = true });
+    defer f.close();
+    var wbuf: [0]u8 = .{};
+    var w = f.writer(&wbuf);
+    try w.interface.print("[oidc]\n{s}\n", .{body});
+    try w.interface.flush();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    return std.fmt.allocPrint(allocator, "{s}/t.cfg", .{base});
+}
+
+test "pool options reject out-of-range values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bad = [_][]const u8{
+        "idp_threads = 0",
+        "idp_threads = 33",
+        "idp_max_outstanding = 0",
+        "idp_max_outstanding = 4097",
+        "idp_connect_timeout_ms = 99",
+        "idp_connect_timeout_ms = 60001",
+        "idp_timeout_ms = 120001",
+        "idp_threads = eight",
+        // The exchange deadline must cover the connect budget.
+        "idp_connect_timeout_ms = 3000\nidp_timeout_ms = 2000",
+    };
+    for (bad) |kv| {
+        const path = try writeTmpConfig(allocator, &tmp, kv);
+        defer allocator.free(path);
+        var cfg = try config_mod.parse(allocator, path);
+        defer cfg.deinit();
+        try std.testing.expectError(error.InvalidArgs, parsePoolOptions(&cfg));
+    }
+
+    // In-range values parse through; absent keys keep the defaults.
+    const path = try writeTmpConfig(allocator, &tmp,
+        "idp_threads = 16\nidp_max_outstanding = 64\nidp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000");
+    defer allocator.free(path);
+    var cfg = try config_mod.parse(allocator, path);
+    defer cfg.deinit();
+    const opts = try parsePoolOptions(&cfg);
+    try std.testing.expectEqual(@as(u8, 16), opts.threads);
+    try std.testing.expectEqual(@as(u16, 64), opts.max_outstanding);
+    try std.testing.expectEqual(@as(u32, 1500), opts.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 2000), opts.timeout_ms);
 }
 
 // --- Test harness: raw unix-socket IPC client + TCP/TLS IdP stubs ---------
