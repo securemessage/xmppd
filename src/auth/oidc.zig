@@ -355,7 +355,10 @@ pub const OidcStore = struct {
         if (self.config.user_domain) |dom| {
             if (std.mem.indexOfScalar(u8, raw_username, '@')) |at| {
                 if (!std.ascii.eqlIgnoreCase(raw_username[at + 1 ..], dom)) {
-                    log.info("OIDC: claim '{s}' is outside user_domain '{s}'; rejected", .{ raw_username, dom });
+                    log.info(
+                        "OIDC: claim '{s}' is outside user_domain '{s}'; rejected",
+                        .{ raw_username, dom },
+                    );
                     return false;
                 }
             }
@@ -382,7 +385,13 @@ pub const OidcStore = struct {
 
     /// Run one credential against the IdP and classify the outcome. Called
     /// on IdpPool workers only; writes `out` on .verified.
-    pub fn exchange(self: *OidcStore, allocator: Allocator, cred: Credential, options: ExchangeOptions, out: *Identity) Verdict {
+    pub fn exchange(
+        self: *OidcStore,
+        allocator: Allocator,
+        cred: Credential,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) Verdict {
         return switch (cred) {
             .password => |p| self.exchangePassword(allocator, p.username, p.password, options, out),
             .token => |t| self.exchangeToken(allocator, t, options, out),
@@ -391,7 +400,14 @@ pub const OidcStore = struct {
 
     /// ROPC grant: POST the password to the token endpoint and classify the
     /// response.
-    fn exchangePassword(self: *OidcStore, allocator: Allocator, username: []const u8, password: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
+    fn exchangePassword(
+        self: *OidcStore,
+        allocator: Allocator,
+        username: []const u8,
+        password: []const u8,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) Verdict {
         const body = self.buildRopcBody(allocator, username, password) orelse {
             log.warn("ROPC: could not build the token request body", .{});
             return .unavailable;
@@ -401,14 +417,22 @@ pub const OidcStore = struct {
             allocator.free(body.buf);
         }
 
-        var response = self.httpClient().post(allocator, self.config.token_endpoint, body.slice(), requestOptions(options)) catch |err| {
+        var response = self.httpClient().post(
+            allocator,
+            self.config.token_endpoint,
+            body.slice(),
+            requestOptions(options),
+        ) catch |err| {
             log.warn("ROPC: token endpoint request failed: {s}", .{@errorName(err)});
             return httpVerdict(err);
         };
         defer response.deinit();
 
         if (response.status != 200) {
-            log.info("ROPC: token endpoint returned {d} for user '{s}'", .{ response.status, username });
+            log.info(
+                "ROPC: token endpoint returned {d} for user '{s}'",
+                .{ response.status, username },
+            );
             return classifyTokenError(response.status, response.body);
         }
 
@@ -426,7 +450,12 @@ pub const OidcStore = struct {
     /// Form-urlencoded ROPC body on the heap (the password can be large and
     /// percent-encoding triples the worst case). Caller wipes and frees
     /// body.buf.
-    fn buildRopcBody(self: *const OidcStore, allocator: Allocator, username: []const u8, password: []const u8) ?RopcBody {
+    fn buildRopcBody(
+        self: *const OidcStore,
+        allocator: Allocator,
+        username: []const u8,
+        password: []const u8,
+    ) ?RopcBody {
         const domain = self.config.user_domain orelse "";
         const cap = 256 +
             3 * (self.config.client_id.len + self.config.client_secret.len +
@@ -441,7 +470,12 @@ pub const OidcStore = struct {
         return .{ .buf = buf, .len = w.buffered().len };
     }
 
-    fn writeRopcBody(self: *const OidcStore, w: *std.Io.Writer, username: []const u8, password: []const u8) !void {
+    fn writeRopcBody(
+        self: *const OidcStore,
+        w: *std.Io.Writer,
+        username: []const u8,
+        password: []const u8,
+    ) !void {
         try w.writeAll("grant_type=password&client_id=");
         try percentEncode(w, self.config.client_id);
         try w.writeAll("&client_secret=");
@@ -466,7 +500,13 @@ pub const OidcStore = struct {
 
     /// OAUTHBEARER path: JWT validation first, introspection for opaque
     /// tokens.
-    fn exchangeToken(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
+    fn exchangeToken(
+        self: *OidcStore,
+        allocator: Allocator,
+        token: []const u8,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) Verdict {
         return switch (self.checkJwt(token, options, out)) {
             .verified => .verified,
             .malformed => self.introspect(allocator, token, options, out),
@@ -478,7 +518,12 @@ pub const OidcStore = struct {
 
     /// Full JWT validation against the JWKS cache: parse, exp, iss, aud,
     /// signature, then the claim identity and picture claim.
-    fn checkJwt(self: *OidcStore, token: []const u8, options: ExchangeOptions, out: *Identity) JwtCheck {
+    fn checkJwt(
+        self: *OidcStore,
+        token: []const u8,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) JwtCheck {
         const parsed = jwt.parse(token, &jwt_decode_buf) catch return .malformed;
 
         jwt.validateExpiry(&parsed.claims) catch {
@@ -486,11 +531,17 @@ pub const OidcStore = struct {
             return .invalid;
         };
         jwt.validateIssuer(&parsed.claims, self.config.issuer) catch {
-            log.info("JWT: issuer mismatch: got '{s}', expected '{s}'", .{ parsed.claims.iss, self.config.issuer });
+            log.info(
+                "JWT: issuer mismatch: got '{s}', expected '{s}'",
+                .{ parsed.claims.iss, self.config.issuer },
+            );
             return .invalid;
         };
         jwt.validateAudience(&parsed.claims, self.config.client_id) catch {
-            log.info("JWT: audience mismatch: got '{s}', expected '{s}'", .{ parsed.claims.aud, self.config.client_id });
+            log.info(
+                "JWT: audience mismatch: got '{s}', expected '{s}'",
+                .{ parsed.claims.aud, self.config.client_id },
+            );
             return .invalid;
         };
 
@@ -536,17 +587,29 @@ pub const OidcStore = struct {
     /// access_token via introspection when an endpoint is configured. The
     /// IdP accepted the password at this point, so a token that then fails
     /// validation is an IdP fault, not a bad credential: .unavailable.
-    fn identityFromTokenResponse(self: *OidcStore, allocator: Allocator, body: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
+    fn identityFromTokenResponse(
+        self: *OidcStore,
+        allocator: Allocator,
+        body: []const u8,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) Verdict {
         if (extractNamedField(body, "\"id_token\"")) |id_token| {
             if (id_token.len > 0) {
                 return switch (self.checkJwt(id_token, options, out)) {
                     .verified => .verified,
                     .invalid => blk: {
-                        log.warn("OIDC: IdP accepted the password but its id_token failed validation", .{});
+                        log.warn(
+                            "OIDC: IdP accepted the password but its id_token failed validation",
+                            .{},
+                        );
                         break :blk .unavailable;
                     },
                     .malformed => blk: {
-                        log.warn("OIDC: IdP accepted the password but its id_token is not a JWT", .{});
+                        log.warn(
+                            "OIDC: IdP accepted the password but its id_token is not a JWT",
+                            .{},
+                        );
                         break :blk .unavailable;
                     },
                     .unavailable => .unavailable,
@@ -559,18 +622,28 @@ pub const OidcStore = struct {
                 return self.introspect(allocator, access_token, options, out);
             }
         }
-        log.warn("OIDC: IdP accepted the password but returned no usable id_token or access_token", .{});
+        log.warn(
+            "OIDC: IdP accepted the password but returned no usable id_token or access_token",
+            .{},
+        );
         return .unavailable;
     }
 
     /// Validate a token via the introspection endpoint (RFC 7662).
-    fn introspect(self: *OidcStore, allocator: Allocator, token: []const u8, options: ExchangeOptions, out: *Identity) Verdict {
+    fn introspect(
+        self: *OidcStore,
+        allocator: Allocator,
+        token: []const u8,
+        options: ExchangeOptions,
+        out: *Identity,
+    ) Verdict {
         const endpoint = self.config.introspection_endpoint orelse {
             log.info("OIDC: no introspection endpoint configured", .{});
             return .rejected;
         };
 
-        const cap = 64 + 3 * (token.len + self.config.client_id.len + self.config.client_secret.len);
+        const cap = 64 +
+            3 * (token.len + self.config.client_id.len + self.config.client_secret.len);
         const body_buf = allocator.alloc(u8, cap) catch return .unavailable;
         defer {
             std.crypto.secureZero(u8, body_buf);
@@ -584,7 +657,12 @@ pub const OidcStore = struct {
         w.writeAll("&client_secret=") catch return .unavailable;
         percentEncode(&w, self.config.client_secret) catch return .unavailable;
 
-        var response = self.httpClient().post(allocator, endpoint, w.buffered(), requestOptions(options)) catch |err| {
+        var response = self.httpClient().post(
+            allocator,
+            endpoint,
+            w.buffered(),
+            requestOptions(options),
+        ) catch |err| {
             log.warn("introspection: HTTP request failed: {s}", .{@errorName(err)});
             return httpVerdict(err);
         };
@@ -636,7 +714,11 @@ pub const OidcStore = struct {
             };
             for (config_errors) |ce| {
                 if (std.mem.eql(u8, e, ce)) {
-                    log.warn("OIDC: token endpoint reports a client configuration error '{s}' (status {d})", .{ e, status });
+                    log.warn(
+                        "OIDC: token endpoint reports a client configuration error " ++
+                            "'{s}' (status {d})",
+                        .{ e, status },
+                    );
                     return .unavailable;
                 }
             }
@@ -665,10 +747,18 @@ pub const OidcStore = struct {
     /// Handler seam for a replayed PLAIN exchange: no I/O, reads the Answer
     /// the daemon parked in `answer` before calling handleMessage. The
     /// returned slice borrows store-internal buffers.
-    pub fn validatePassword(self: *OidcStore, allocator: Allocator, username: []const u8, password: []const u8) ValidateError!?[]const u8 {
+    pub fn validatePassword(
+        self: *OidcStore,
+        allocator: Allocator,
+        username: []const u8,
+        password: []const u8,
+    ) ValidateError!?[]const u8 {
         _ = allocator;
         const answer = self.answer orelse {
-            log.warn("PLAIN reached validatePassword without a dispatched exchange (programmer error)", .{});
+            log.warn(
+                "PLAIN reached validatePassword without a dispatched exchange (programmer error)",
+                .{},
+            );
             return error.IdpUnavailable;
         };
         const digest = credentialDigest(.{ .password = .{
@@ -683,10 +773,18 @@ pub const OidcStore = struct {
     }
 
     /// Handler seam for a replayed OAUTHBEARER exchange.
-    pub fn validateToken(self: *OidcStore, allocator: Allocator, token: []const u8) ValidateError!?[]const u8 {
+    pub fn validateToken(
+        self: *OidcStore,
+        allocator: Allocator,
+        token: []const u8,
+    ) ValidateError!?[]const u8 {
         _ = allocator;
         const answer = self.answer orelse {
-            log.warn("OAUTHBEARER reached validateToken without a dispatched exchange (programmer error)", .{});
+            log.warn(
+                "OAUTHBEARER reached validateToken without a dispatched " ++
+                    "exchange (programmer error)",
+                .{},
+            );
             return error.IdpUnavailable;
         };
         const digest = credentialDigest(.{ .token = token });
@@ -779,7 +877,10 @@ pub const OidcStore = struct {
             switch (k.kty) {
                 .rsa => {
                     if (k.n.len > copy.n_buf.len or k.e.len > copy.e_buf.len) {
-                        log.warn("JWKS: key '{s}' component exceeds the {d}-byte bound", .{ kid, copy.n_buf.len });
+                        log.warn(
+                            "JWKS: key '{s}' component exceeds the {d}-byte bound",
+                            .{ kid, copy.n_buf.len },
+                        );
                         return .oversize;
                     }
                     @memcpy(copy.n_buf[0..k.n.len], k.n);
@@ -789,7 +890,10 @@ pub const OidcStore = struct {
                 },
                 .okp => {
                     if (k.x.len > copy.x_buf.len) {
-                        log.warn("JWKS: key '{s}' component exceeds the {d}-byte bound", .{ kid, copy.x_buf.len });
+                        log.warn(
+                            "JWKS: key '{s}' component exceeds the {d}-byte bound",
+                            .{ kid, copy.x_buf.len },
+                        );
                         return .oversize;
                     }
                     @memcpy(copy.x_buf[0..k.x.len], k.x);
@@ -807,7 +911,11 @@ pub const OidcStore = struct {
     fn refreshJwksLocked(self: *OidcStore, options: ExchangeOptions) JwksError!void {
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
-        var response = self.httpClient().get(self.allocator, self.config.jwks_uri, requestOptions(options)) catch |err| {
+        var response = self.httpClient().get(
+            self.allocator,
+            self.config.jwks_uri,
+            requestOptions(options),
+        ) catch |err| {
             log.warn("JWKS fetch failed: {s}", .{@errorName(err)});
             return switch (httpVerdict(err)) {
                 .timed_out => JwksError.Timeout,
@@ -822,7 +930,10 @@ pub const OidcStore = struct {
         }
 
         // Copy response body into our own allocation (response.deinit frees its copy)
-        const body_copy = self.allocator.alloc(u8, response.body.len) catch return JwksError.OutOfMemory;
+        const body_copy = self.allocator.alloc(
+            u8,
+            response.body.len,
+        ) catch return JwksError.OutOfMemory;
         @memcpy(body_copy, response.body);
 
         // Replace old JWKS body
@@ -1007,7 +1118,12 @@ pub const IdpPool = struct {
     pub const StartError = posix.PipeError || std.Thread.SpawnError || error{OutOfMemory};
 
     /// Spawn the workers and open the wake and cancel pipes.
-    pub fn start(self: *IdpPool, allocator: Allocator, store: *OidcStore, options: Options) StartError!void {
+    pub fn start(
+        self: *IdpPool,
+        allocator: Allocator,
+        store: *OidcStore,
+        options: Options,
+    ) StartError!void {
         self.allocator = allocator;
         self.store = store;
         self.options = options;
@@ -1096,7 +1212,8 @@ pub const IdpPool = struct {
             .kind = kind,
             .username_len = username_len,
             .secret_alloc = self.secret_alloc,
-            .deadline_ns = http.monotonicNs() + @as(u64, self.options.timeout_ms) * std.time.ns_per_ms,
+            .deadline_ns = http.monotonicNs() +
+                @as(u64, self.options.timeout_ms) * std.time.ns_per_ms,
             .answer = .{
                 .verdict = .unavailable,
                 .input_digest = credentialDigest(cred),
@@ -1207,7 +1324,10 @@ pub const IdpPool = struct {
 
         _ = posix.write(self.wake_wr, "\x00") catch |err| {
             if (err == error.WouldBlock) return; // pending bytes already wake the loop
-            log.err("IdP completion wake write failed for job {d}: {s}", .{ job.id, @errorName(err) });
+            log.err(
+                "IdP completion wake write failed for job {d}: {s}",
+                .{ job.id, @errorName(err) },
+            );
         };
     }
 
@@ -1250,11 +1370,16 @@ pub const IdpPool = struct {
                 owned_job.answer.verdict = .timed_out;
             } else {
                 _ = self.exchanges_run.fetchAdd(1, .monotonic);
-                owned_job.answer.verdict = self.store.exchange(std.heap.c_allocator, jobCredential(&owned_job), .{
-                    .connect_timeout_ms = self.options.connect_timeout_ms,
-                    .deadline_ns = owned_job.deadline_ns,
-                    .cancel_fd = self.cancel_rd,
-                }, &identity);
+                owned_job.answer.verdict = self.store.exchange(
+                    std.heap.c_allocator,
+                    jobCredential(&owned_job),
+                    .{
+                        .connect_timeout_ms = self.options.connect_timeout_ms,
+                        .deadline_ns = owned_job.deadline_ns,
+                        .cancel_fd = self.cancel_rd,
+                    },
+                    &identity,
+                );
             }
             owned_job.answer.identity = identity;
             self.finish(owned_job);
@@ -1294,7 +1419,9 @@ fn extractNamedField(data: []const u8, key: []const u8) ?[]const u8 {
 
     // Skip : and whitespace
     var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+    while (i < after_key.len and
+        (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1)
+    {}
 
     if (i >= after_key.len or after_key[i] != '"') return null;
     i += 1;
@@ -1407,7 +1534,10 @@ test "plainCredentials: the handler's split rules" {
 }
 
 test "bearerToken: RFC 7628 and raw-token fallback" {
-    try std.testing.expectEqualStrings("tok123", bearerToken("n,,\x01auth=Bearer tok123\x01\x01").?);
+    try std.testing.expectEqualStrings(
+        "tok123",
+        bearerToken("n,,\x01auth=Bearer tok123\x01\x01").?,
+    );
     try std.testing.expectEqualStrings("opaque", bearerToken("opaque").?);
     try std.testing.expect(bearerToken("") == null);
     try std.testing.expect(bearerToken("n,,\x01auth=Bearer \x01") == null);
@@ -1539,7 +1669,9 @@ test "OidcStore: a digest mismatch fails closed" {
 
     const answer = Answer{
         .verdict = .rejected,
-        .input_digest = credentialDigest(.{ .password = .{ .username = "alice", .password = "other-pw" } }),
+        .input_digest = credentialDigest(
+            .{ .password = .{ .username = "alice", .password = "other-pw" } },
+        ),
     };
     store.answer = &answer;
     defer store.answer = null;
@@ -1579,7 +1711,8 @@ test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
     // One modulus past the copy bound, one exactly at an 8192-bit RSA
     // modulus (1366 base64url chars) that must still verify.
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"keys":[{{"kty":"RSA","kid":"huge","n":"{s}","e":"AQAB"}},{{"kty":"RSA","kid":"rsa8k","n":"{s}","e":"AQAB"}}]}}
+        \\{{"keys":[{{"kty":"RSA","kid":"huge","n":"{s}","e":"AQAB"}},
+        \\{{"kty":"RSA","kid":"rsa8k","n":"{s}","e":"AQAB"}}]}}
     , .{ "A" ** 3000, "A" ** 1366 });
     store.jwks_body = body; // deinit frees it
     store.jwks_last_refresh = 0; // stale: a failed refresh still serves the cache
@@ -1624,11 +1757,17 @@ test "OidcStore: concurrent kid misses fetch the JWKS once" {
     );
     defer stub.join();
     const dl = std.time.milliTimestamp() + 5000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port.load(.acquire) != 0);
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/certs", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://localhost:{d}/certs",
+        .{port.load(.acquire)},
+    );
     var store = testStore(allocator, .{ .jwks_uri = url, .ca_file = paths.cert });
     defer store.deinit();
     try store.start();
@@ -1684,7 +1823,14 @@ test "OidcStore: replay returns identity, rejection and temporary failure" {
 fn genIdpTestCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
-        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .argv = &.{
+            "openssl",                      "req",           "-x509",
+            "-newkey",                      "rsa:2048",      "-nodes",
+            "-subj",                        "/CN=localhost", "-addext",
+            "subjectAltName=DNS:localhost", "-days",         "1",
+            "-keyout",                      "key.pem",       "-out",
+            "cert.pem",
+        },
         .cwd_dir = dir,
         .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
@@ -1703,7 +1849,13 @@ fn genIdpTestCert(dir: std.fs.Dir) !void {
 /// is published via port_out; a deadline keeps the test from hanging when
 /// the client never connects. kTLS stays off on this end (one userland TLS
 /// end avoids FreeBSD PR 296498 on loopback).
-fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, status_line: []const u8, body: []const u8, port_out: *std.atomic.Value(u16)) void {
+fn serveOneTlsResponse(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    status_line: []const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+) void {
     var ctx = ssl.SslContext.initServer(cert_path, key_path) catch return;
     defer ctx.deinit();
     ctx.disableKtls();
@@ -1755,7 +1907,12 @@ fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, status
             }
         }
         var resp: [8192]u8 = undefined;
-        const out = std.fmt.bufPrint(&resp, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status_line, body.len, body }) catch return;
+        const out = std.fmt.bufPrint(
+            &resp,
+            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ status_line, body.len, body },
+        ) catch return;
         var sent: usize = 0;
         while (sent < out.len and std.time.milliTimestamp() < deadline) {
             const wr = conn.write(out[sent..]) catch break;
@@ -1840,7 +1997,12 @@ fn serveJwksCounted(
         }
         std.Thread.sleep(stall_ms * std.time.ns_per_ms);
         var resp: [8192]u8 = undefined;
-        const out = std.fmt.bufPrint(&resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+        const out = std.fmt.bufPrint(
+            &resp,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ body.len, body },
+        ) catch return;
         var sent: usize = 0;
         while (sent < out.len and std.time.milliTimestamp() < deadline) {
             const wr = conn.write(out[sent..]) catch break;
@@ -1869,20 +2031,36 @@ fn makeIdpTlsPaths(allocator: Allocator, tmp: *std.testing.TmpDir) !IdpTlsPaths 
 }
 
 /// Run one ROPC exchange against a TLS stub answering `status_line` + `body`.
-fn exchangeAgainstTlsStub(allocator: Allocator, tmp: *std.testing.TmpDir, status_line: []const u8, body: []const u8, cred: Credential) !Verdict {
+fn exchangeAgainstTlsStub(
+    allocator: Allocator,
+    tmp: *std.testing.TmpDir,
+    status_line: []const u8,
+    body: []const u8,
+    cred: Credential,
+) !Verdict {
     const paths = try makeIdpTlsPaths(allocator, tmp);
     defer allocator.free(paths.cert);
     defer allocator.free(paths.key);
 
     var port = std.atomic.Value(u16).init(0);
-    const th = try std.Thread.spawn(.{}, serveOneTlsResponse, .{ paths.cert.ptr, paths.key.ptr, status_line, body, &port });
+    const th = try std.Thread.spawn(
+        .{},
+        serveOneTlsResponse,
+        .{ paths.cert.ptr, paths.key.ptr, status_line, body, &port },
+    );
     defer th.join();
     const dl = std.time.milliTimestamp() + 5000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port.load(.acquire) != 0);
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://localhost:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var store = testStore(allocator, .{ .token_endpoint = url, .ca_file = paths.cert });
     defer store.deinit();
@@ -1900,28 +2078,52 @@ test "OidcStore: token endpoint classification" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const v = try exchangeAgainstTlsStub(allocator, &tmp, "400 Bad Request", "{\"error\":\"invalid_grant\"}", cred);
+        const v = try exchangeAgainstTlsStub(
+            allocator,
+            &tmp,
+            "400 Bad Request",
+            "{\"error\":\"invalid_grant\"}",
+            cred,
+        );
         try std.testing.expectEqual(Verdict.rejected, v);
     }
     // A client configuration error is our fault, never the user's credential.
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const v = try exchangeAgainstTlsStub(allocator, &tmp, "401 Unauthorized", "{\"error\":\"invalid_client\"}", cred);
+        const v = try exchangeAgainstTlsStub(
+            allocator,
+            &tmp,
+            "401 Unauthorized",
+            "{\"error\":\"invalid_client\"}",
+            cred,
+        );
         try std.testing.expectEqual(Verdict.unavailable, v);
     }
     // A 5xx is an IdP outage.
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const v = try exchangeAgainstTlsStub(allocator, &tmp, "503 Service Unavailable", "{}", cred);
+        const v = try exchangeAgainstTlsStub(
+            allocator,
+            &tmp,
+            "503 Service Unavailable",
+            "{}",
+            cred,
+        );
         try std.testing.expectEqual(Verdict.unavailable, v);
     }
     // A non-RFC 4xx body is how some IdPs answer unknown users: rejected.
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const v = try exchangeAgainstTlsStub(allocator, &tmp, "404 Not Found", "{\"error\":\"NotFound\",\"message\":\"no rows returned\"}", cred);
+        const v = try exchangeAgainstTlsStub(
+            allocator,
+            &tmp,
+            "404 Not Found",
+            "{\"error\":\"NotFound\",\"message\":\"no rows returned\"}",
+            cred,
+        );
         try std.testing.expectEqual(Verdict.rejected, v);
     }
 }
@@ -1935,7 +2137,8 @@ test "OidcStore: a 200 with a bad id_token is unavailable, never a rejection" {
     // temporary-auth-failure, not counted as a bad credential.
     const bad_iss =
         "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0" ++
-        ".eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9" ++
+        ".eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIs" ++
+        "ImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9" ++
         ".dGVzdA";
     {
         var tmp = std.testing.tmpDir(.{});
@@ -1949,7 +2152,13 @@ test "OidcStore: a 200 with a bad id_token is unavailable, never a rejection" {
     {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const v = try exchangeAgainstTlsStub(allocator, &tmp, "200 OK", "{\"id_token\":\"not-a-jwt\"}", cred);
+        const v = try exchangeAgainstTlsStub(
+            allocator,
+            &tmp,
+            "200 OK",
+            "{\"id_token\":\"not-a-jwt\"}",
+            cred,
+        );
         try std.testing.expectEqual(Verdict.unavailable, v);
     }
 }
@@ -1960,7 +2169,13 @@ test "OidcStore: a 200 without id_token or introspection is unavailable, never t
     defer tmp.cleanup();
 
     const cred = Credential{ .password = .{ .username = "ALICE@us.example", .password = "pw" } };
-    const v = try exchangeAgainstTlsStub(allocator, &tmp, "200 OK", "{\"access_token\":\"opaque-token\",\"token_type\":\"Bearer\"}", cred);
+    const v = try exchangeAgainstTlsStub(
+        allocator,
+        &tmp,
+        "200 OK",
+        "{\"access_token\":\"opaque-token\",\"token_type\":\"Bearer\"}",
+        cred,
+    );
     try std.testing.expectEqual(Verdict.unavailable, v);
 
     // Replay of that verdict through the handler seam errors out; the
@@ -2029,12 +2244,24 @@ const FreeSnapshot = struct {
         return self.inner.rawAlloc(len, alignment, ra);
     }
 
-    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+    fn resizeFn(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) bool {
         const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
         return self.inner.rawResize(memory, alignment, new_len, ra);
     }
 
-    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+    fn remapFn(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) ?[*]u8 {
         const self: *FreeSnapshot = @ptrCast(@alignCast(ctx));
         return self.inner.rawRemap(memory, alignment, new_len, ra);
     }
@@ -2099,7 +2326,9 @@ fn serveHanging(port_out: *std.atomic.Value(u16)) void {
 fn startHangingStub(port_out: *std.atomic.Value(u16)) !std.Thread {
     const th = try std.Thread.spawn(.{}, serveHanging, .{port_out});
     const dl = std.time.milliTimestamp() + 3000;
-    while (port_out.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port_out.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port_out.load(.acquire) != 0);
     return th;
 }
@@ -2131,7 +2360,9 @@ test "IdpPool: releaseJob wipes the secret before free" {
     defer pool.stop();
     pool.secret_alloc = snap.allocator();
 
-    const cred = Credential{ .password = .{ .username = "alice", .password = "s3cr3t-m30-marker" } };
+    const cred = Credential{
+        .password = .{ .username = "alice", .password = "s3cr3t-m30-marker" },
+    };
     _ = try pool.put(cred);
 
     const dl = std.time.milliTimestamp() + 5000;
@@ -2286,7 +2517,9 @@ test "IdpPool: queue time counts against the exchange deadline" {
     const th = try std.Thread.spawn(.{}, serveHangingCounting, .{ &port, &accepted });
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port.load(.acquire) != 0);
 
     var url_buf: [128]u8 = undefined;
@@ -2336,7 +2569,9 @@ test "IdpPool: stop never runs the queued exchanges" {
     const th = try std.Thread.spawn(.{}, serveHangingCounting, .{ &port, &accepted });
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port.load(.acquire) != 0);
 
     var url_buf: [128]u8 = undefined;

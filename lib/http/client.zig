@@ -125,14 +125,33 @@ pub const Client = struct {
 
     /// Perform an HTTPS GET request. Caller owns the returned Response.
     /// Runs entirely on the calling thread; safe to call from any worker.
-    pub fn get(self: *const Client, allocator: Allocator, url: []const u8, options: RequestOptions) HttpError!Response {
+    pub fn get(
+        self: *const Client,
+        allocator: Allocator,
+        url: []const u8,
+        options: RequestOptions,
+    ) HttpError!Response {
         return request(self.ssl_ctx, allocator, "GET", url, null, null, options);
     }
 
     /// Perform an HTTPS POST with form-urlencoded body. Caller owns the
     /// returned Response.
-    pub fn post(self: *const Client, allocator: Allocator, url: []const u8, body: []const u8, options: RequestOptions) HttpError!Response {
-        return request(self.ssl_ctx, allocator, "POST", url, body, "application/x-www-form-urlencoded", options);
+    pub fn post(
+        self: *const Client,
+        allocator: Allocator,
+        url: []const u8,
+        body: []const u8,
+        options: RequestOptions,
+    ) HttpError!Response {
+        return request(
+            self.ssl_ctx,
+            allocator,
+            "POST",
+            url,
+            body,
+            "application/x-www-form-urlencoded",
+            options,
+        );
     }
 };
 
@@ -157,7 +176,13 @@ fn makeKev(ident: usize, filter: i16, flags: u16) posix.Kevent {
 /// or `deadline_ns` passes. The fd filter is staged EV_ADD|EV_ONESHOT in the
 /// same kevent() call that waits; the cancel fd is staged as a persistent
 /// EV_ADD (re-adding an existing knote is an idempotent modify).
-fn waitIo(kq: posix.fd_t, fd: posix.fd_t, filter: i16, deadline_ns: u64, cancel_fd: posix.fd_t) WaitError!void {
+fn waitIo(
+    kq: posix.fd_t,
+    fd: posix.fd_t,
+    filter: i16,
+    deadline_ns: u64,
+    cancel_fd: posix.fd_t,
+) WaitError!void {
     const now = monotonicNs();
     if (now >= deadline_ns) return error.Timeout;
     const remaining = deadline_ns - now;
@@ -176,7 +201,12 @@ fn waitIo(kq: posix.fd_t, fd: posix.fd_t, filter: i16, deadline_ns: u64, cancel_
         .sec = @intCast(remaining / std.time.ns_per_s),
         .nsec = @intCast(remaining % std.time.ns_per_s),
     };
-    const n = posix.kevent(kq, changes[0..n_changes], &events, &timeout) catch return error.WaitFailed;
+    const n = posix.kevent(
+        kq,
+        changes[0..n_changes],
+        &events,
+        &timeout,
+    ) catch return error.WaitFailed;
     if (n == 0) return error.Timeout;
 
     var saw_fd = false;
@@ -258,7 +288,13 @@ fn connectAndHandshake(
     // Non-blocking connect against the connect-phase deadline.
     posix.connect(fd, @ptrCast(&peer.addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
         error.WouldBlock, error.ConnectionPending => {
-            waitIo(kq, fd, std.c.EVFILT.WRITE, connect_deadline, options.cancel_fd) catch |werr| return switch (werr) {
+            waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.WRITE,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.ConnectionFailed,
@@ -303,12 +339,24 @@ fn connectAndHandshake(
         if (ret == 1) return .{ .fd = fd, .ssl_ptr = ssl_ptr };
         const ssl_err = c.SSL_get_error(ssl_ptr, ret);
         switch (ssl_err) {
-            c.SSL_ERROR_WANT_READ => waitIo(kq, fd, std.c.EVFILT.READ, connect_deadline, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.READ,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsHandshakeFailed,
             },
-            c.SSL_ERROR_WANT_WRITE => waitIo(kq, fd, std.c.EVFILT.WRITE, connect_deadline, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.WRITE,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsHandshakeFailed,
@@ -332,7 +380,10 @@ fn sendRequest(
     options: RequestOptions,
 ) HttpError!void {
     const body_len = if (body) |b| b.len else 0;
-    const req_buf = allocator.alloc(u8, MAX_HEAD_SIZE + body_len) catch return HttpError.OutOfMemory;
+    const req_buf = allocator.alloc(
+        u8,
+        MAX_HEAD_SIZE + body_len,
+    ) catch return HttpError.OutOfMemory;
     defer {
         std.crypto.secureZero(u8, req_buf);
         allocator.free(req_buf);
@@ -360,19 +411,35 @@ fn sendRequest(
     var sent: usize = 0;
     while (sent < req_data.len) {
         c.ERR_clear_error();
-        const ret = c.SSL_write(conn.ssl_ptr, @ptrCast(req_data.ptr + sent), @intCast(req_data.len - sent));
+        const ret = c.SSL_write(
+            conn.ssl_ptr,
+            @ptrCast(req_data.ptr + sent),
+            @intCast(req_data.len - sent),
+        );
         if (ret > 0) {
             sent += @intCast(ret);
             continue;
         }
         const ssl_err = c.SSL_get_error(conn.ssl_ptr, ret);
         switch (ssl_err) {
-            c.SSL_ERROR_WANT_READ => waitIo(kq, conn.fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.READ,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsWriteFailed,
             },
-            c.SSL_ERROR_WANT_WRITE => waitIo(kq, conn.fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.WRITE,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsWriteFailed,
@@ -384,7 +451,12 @@ fn sendRequest(
 
 /// Read the response against the total deadline, parse it and copy the
 /// body into a right-sized allocation the caller owns.
-fn readResponse(conn: Conn, kq: posix.fd_t, allocator: Allocator, options: RequestOptions) HttpError!Response {
+fn readResponse(
+    conn: Conn,
+    kq: posix.fd_t,
+    allocator: Allocator,
+    options: RequestOptions,
+) HttpError!Response {
     const resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
     defer {
         std.crypto.secureZero(u8, resp_buf);
@@ -404,7 +476,11 @@ fn readResponse(conn: Conn, kq: posix.fd_t, allocator: Allocator, options: Reque
             .err => |herr| return herr,
         };
         c.ERR_clear_error();
-        const ret = c.SSL_read(conn.ssl_ptr, @ptrCast(resp_buf.ptr + total), @intCast(MAX_RESPONSE_SIZE - total));
+        const ret = c.SSL_read(
+            conn.ssl_ptr,
+            @ptrCast(resp_buf.ptr + total),
+            @intCast(MAX_RESPONSE_SIZE - total),
+        );
         if (ret > 0) {
             total += @intCast(ret);
             continue;
@@ -419,12 +495,24 @@ fn readResponse(conn: Conn, kq: posix.fd_t, allocator: Allocator, options: Reque
                     return HttpError.TlsReadFailed;
                 }
             },
-            c.SSL_ERROR_WANT_READ => waitIo(kq, conn.fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.READ,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsReadFailed,
             },
-            c.SSL_ERROR_WANT_WRITE => waitIo(kq, conn.fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.WRITE,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsReadFailed,
@@ -439,7 +527,11 @@ fn readResponse(conn: Conn, kq: posix.fd_t, allocator: Allocator, options: Reque
     const status = parseStatusLine(resp_data) orelse return HttpError.InvalidResponse;
 
     // Find body (after \r\n\r\n)
-    const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse return HttpError.InvalidResponse;
+    const header_end = std.mem.indexOf(
+        u8,
+        resp_data,
+        "\r\n\r\n",
+    ) orelse return HttpError.InvalidResponse;
     const body_start = header_end + 4;
 
     // A declared Content-Length bounds the body; a short body at EOF is a
@@ -633,7 +725,10 @@ fn resolvePeer(host: []const u8, port: u16) ?ResolvedPeer {
     if (fd < 0) return null;
 
     var addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
-    @memcpy(std.mem.asBytes(&addr)[0..ai.ai_addrlen], @as([*]const u8, @ptrCast(ai.ai_addr))[0..ai.ai_addrlen]);
+    @memcpy(
+        std.mem.asBytes(&addr)[0..ai.ai_addrlen],
+        @as([*]const u8, @ptrCast(ai.ai_addr))[0..ai.ai_addrlen],
+    );
 
     return .{ .fd = fd, .addr = addr };
 }
@@ -778,7 +873,9 @@ test "a server that accepts and never answers hits the connect deadline" {
     const th = try std.Thread.spawn(.{}, serveHanging, .{ @as(u64, 3000), &port });
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 
@@ -832,14 +929,20 @@ test "closing the cancel pipe aborts an in-flight request" {
     const th = try std.Thread.spawn(.{}, serveHanging, .{ @as(u64, 10000), &port });
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 
     const pipe_fds = try posix.pipe();
     defer posix.close(pipe_fds[0]);
 
-    const closer = try std.Thread.spawn(.{}, closeAfter, .{ @as([]const posix.fd_t, pipe_fds[1..2]), @as(u64, 100) });
+    const closer = try std.Thread.spawn(
+        .{},
+        closeAfter,
+        .{ @as([]const posix.fd_t, pipe_fds[1..2]), @as(u64, 100) },
+    );
     defer closer.join();
 
     var client = try Client.init(null);
@@ -871,7 +974,14 @@ test "closing the cancel pipe aborts an in-flight request" {
 fn genTestCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
-        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .argv = &.{
+            "openssl",                      "req",           "-x509",
+            "-newkey",                      "rsa:2048",      "-nodes",
+            "-subj",                        "/CN=localhost", "-addext",
+            "subjectAltName=DNS:localhost", "-days",         "1",
+            "-keyout",                      "key.pem",       "-out",
+            "cert.pem",
+        },
         .cwd_dir = dir,
         .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
@@ -891,7 +1001,11 @@ fn genTestCert(dir: std.fs.Dir) !void {
 /// close. Runs on its own thread; a deadline keeps the test from hanging
 /// when the client never connects (or aborts mid-handshake, the point of
 /// the mismatch case).
-fn serveTlsResponses(cert_path: [*:0]const u8, key_path: [*:0]const u8, n: *std.atomic.Value(usize)) void {
+fn serveTlsResponses(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    n: *std.atomic.Value(usize),
+) void {
     const method = c.TLS_server_method() orelse return;
     const ctx = c.SSL_CTX_new(method) orelse return;
     defer c.SSL_CTX_free(ctx);
@@ -948,16 +1062,32 @@ test "TLS: hostname check pins the certificate identity to the URL host (T357)" 
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     var port = std.atomic.Value(usize).init(0);
-    const th = try std.Thread.spawn(.{}, serveTlsResponses, .{ cert_path.ptr, key_path.ptr, &port });
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 
@@ -984,16 +1114,32 @@ test "TLS: the in-process server keeps serving across a pause between requests" 
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     var port = std.atomic.Value(usize).init(0);
-    const th = try std.Thread.spawn(.{}, serveTlsResponses, .{ cert_path.ptr, key_path.ptr, &port });
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 
@@ -1029,7 +1175,11 @@ test "responseComplete: a huge declared length is rejected, not panicked on" {
     );
     // Above the response cap but parseable.
     var capped_buf: [160]u8 = undefined;
-    const capped = try std.fmt.bufPrint(&capped_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{MAX_RESPONSE_SIZE + 1});
+    const capped = try std.fmt.bufPrint(
+        &capped_buf,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n",
+        .{MAX_RESPONSE_SIZE + 1},
+    );
     try std.testing.expectEqual(
         Complete{ .err = HttpError.ResponseTooLarge },
         responseComplete(capped),
@@ -1040,7 +1190,11 @@ test "responseComplete: Content-Length accepts digits only" {
     const cases = [_][]const u8{ "+5", "1_0", "-1", "abc", "", "0x10" };
     for (cases) |value| {
         var buf: [160]u8 = undefined;
-        const head = try std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\nContent-Length: {s}\r\n\r\n", .{value});
+        const head = try std.fmt.bufPrint(
+            &buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {s}\r\n\r\n",
+            .{value},
+        );
         try std.testing.expectEqual(
             Complete{ .err = HttpError.InvalidResponse },
             responseComplete(head),
@@ -1090,7 +1244,12 @@ test "responseComplete: framing ends the body at Content-Length" {
 /// Serve one raw HTTP response over TLS (whatever bytes the test asks),
 /// then close. Unlike serveTlsResponses this does not build a correct
 /// header: malformed framing is the point.
-fn serveTlsRawResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, response: []const u8, port_out: *std.atomic.Value(u16)) void {
+fn serveTlsRawResponse(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    response: []const u8,
+    port_out: *std.atomic.Value(u16),
+) void {
     const method = c.TLS_server_method() orelse return;
     const ctx = c.SSL_CTX_new(method) orelse return;
     defer c.SSL_CTX_free(ctx);
@@ -1144,10 +1303,16 @@ const RawStub = struct {
 /// Spin up a raw-response TLS stub and return it with its bound port.
 fn startRawStub(cert_path: [*:0]const u8, key_path: [*:0]const u8, response: []const u8) !RawStub {
     var port = std.atomic.Value(u16).init(0);
-    const stub = try std.Thread.spawn(.{}, serveTlsRawResponse, .{ cert_path, key_path, response, &port });
+    const stub = try std.Thread.spawn(
+        .{},
+        serveTlsRawResponse,
+        .{ cert_path, key_path, response, &port },
+    );
     errdefer stub.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port.load(.acquire) != 0);
     return .{ .thread = stub, .port = port.load(.acquire) };
 }
@@ -1158,13 +1323,27 @@ test "TLS: a huge Content-Length errors instead of panicking the worker" {
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     var url_buf: [128]u8 = undefined;
-    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx");
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx",
+    );
     defer stub.thread.join();
     const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
 
@@ -1182,14 +1361,28 @@ test "TLS: a body shorter than Content-Length is InvalidResponse" {
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     // Declares 100 bytes, delivers 4, then closes.
     var url_buf: [128]u8 = undefined;
-    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nok\r\n");
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nok\r\n",
+    );
     defer stub.thread.join();
     const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
 
@@ -1207,13 +1400,27 @@ test "TLS: bytes past Content-Length are not part of the body" {
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     var url_buf: [128]u8 = undefined;
-    const stub = try startRawStub(cert_path, key_path, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL");
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL",
+    );
     defer stub.thread.join();
     const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
 
@@ -1231,16 +1438,32 @@ test "TLS: a Content-Length body comes back exactly" {
     genTestCert(tmp.dir) catch return error.SkipZigTest;
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
     defer std.testing.allocator.free(key_path);
 
     var port = std.atomic.Value(usize).init(0);
-    const th = try std.Thread.spawn(.{}, serveTlsResponses, .{ cert_path.ptr, key_path.ptr, &port });
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
     defer th.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 

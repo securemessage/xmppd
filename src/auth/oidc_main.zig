@@ -189,7 +189,11 @@ pub fn main() !void {
     // Initialize rate limiter
     var rate_policy = RatePolicy{};
     if (cfg.get("oidc", "rate_max_per_account")) |v| {
-        rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch rate_policy.max_per_account;
+        rate_policy.max_per_account = std.fmt.parseInt(
+            u32,
+            v,
+            10,
+        ) catch rate_policy.max_per_account;
     }
     if (cfg.get("oidc", "rate_max_per_ip")) |v| {
         rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch rate_policy.max_per_ip;
@@ -199,11 +203,17 @@ pub fn main() !void {
 
     // Initialize auth handler (generic over OidcStore)
     var handler = AuthHandler.init(allocator, &oidc_store);
-    const rate_limit_disabled = if (cfg.get("oidc", "rate_limit")) |v| std.mem.eql(u8, v, "false") else false;
+    const rate_limit_disabled = if (cfg.get("oidc", "rate_limit")) |v|
+        std.mem.eql(u8, v, "false")
+    else
+        false;
     if (!rate_limit_disabled) {
         handler.setRateLimiter(&rate_limiter);
     } else {
-        log.warn("auth rate limiting DISABLED -- no brute-force protection (benchmark/testing only)", .{});
+        log.warn(
+            "auth rate limiting DISABLED -- no brute-force protection (benchmark/testing only)",
+            .{},
+        );
     }
     defer handler.deinit();
 
@@ -214,9 +224,19 @@ pub fn main() !void {
     // read-write and reopened read-only; every other open fault kills the
     // daemon instead of being provisioned over.
     var auth_path_buf: [1024]u8 = undefined;
-    const auth_path = std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path}) catch return error.InvalidArgs;
+    const auth_path = std.fmt.bufPrint(
+        &auth_path_buf,
+        "{s}/auth",
+        .{db_path},
+    ) catch return error.InvalidArgs;
     var lock_backend: OpBackendType = undefined;
-    var lock_store = openLockStore(OpBackendType, allocator, auth_path, map_size_mb * 1024 * 1024, &lock_backend) catch |err| {
+    var lock_store = openLockStore(
+        OpBackendType,
+        allocator,
+        auth_path,
+        map_size_mb * 1024 * 1024,
+        &lock_backend,
+    ) catch |err| {
         log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
         return err;
     };
@@ -267,7 +287,10 @@ fn parsePoolOptions(cfg: *const config_mod.Config) error{InvalidArgs}!IdpPool.Op
     }
     if (cfg.get("oidc", "idp_timeout_ms")) |v| {
         options.timeout_ms = parseBounded(u32, v, options.connect_timeout_ms, 120000) orelse {
-            log.warn("invalid [oidc] idp_timeout_ms '{s}' (want {d}..120000)", .{ v, options.connect_timeout_ms });
+            log.warn(
+                "invalid [oidc] idp_timeout_ms '{s}' (want {d}..120000)",
+                .{ v, options.connect_timeout_ms },
+            );
             return error.InvalidArgs;
         };
     }
@@ -349,7 +372,14 @@ pub const Daemon = struct {
         SystemResources,
     };
 
-    pub fn init(self: *Daemon, allocator: Allocator, store: *OidcStore, handler: *AuthHandler, socket_path: []const u8, pool_options: IdpPool.Options) InitError!void {
+    pub fn init(
+        self: *Daemon,
+        allocator: Allocator,
+        store: *OidcStore,
+        handler: *AuthHandler,
+        socket_path: []const u8,
+        pool_options: IdpPool.Options,
+    ) InitError!void {
         self.allocator = allocator;
         self.store = store;
         self.handler = handler;
@@ -436,7 +466,10 @@ pub const Daemon = struct {
             };
             if (conn.hasPendingSend()) {
                 self.batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                    log.err("change list full arming write for IPC slot {d}: closing the lane", .{slot});
+                    log.err(
+                        "change list full arming write for IPC slot {d}: closing the lane",
+                        .{slot},
+                    );
                     self.closeLane(slot);
                     continue;
                 };
@@ -604,13 +637,17 @@ pub const Daemon = struct {
             "";
         // The cap table key is bounded like the lock store's; an
         // untrackable key simply never matches a cap bucket.
-        const account_key: []const u8 = if (full_key.len <= lock_store_mod.MAX_KEY_LEN) full_key else "";
+        const account_key: []const u8 = if (full_key.len <= lock_store_mod.MAX_KEY_LEN)
+            full_key
+        else
+            "";
 
         var same_account: usize = 0;
         var same_ip: usize = 0;
         var it = self.pending.valueIterator();
         while (it.next()) |pend| {
-            if (account_key.len > 0 and std.mem.eql(u8, pend.accountKey(), account_key)) same_account += 1;
+            if (account_key.len > 0 and
+                std.mem.eql(u8, pend.accountKey(), account_key)) same_account += 1;
             if (std.mem.eql(u8, pend.clientIp(), req.client_ip)) same_ip += 1;
         }
         if (same_account >= max_inflight_per_account or same_ip >= max_inflight_per_ip) {
@@ -667,7 +704,11 @@ pub const Daemon = struct {
     /// account identity the policy sees is decided in one place. After
     /// PR #30 merges this must check the prepared localpart
     /// (precis.xmppLocalpart), not the raw typed name.
-    fn checkAccountAdmission(self: *Daemon, typed_name: []const u8, client_ip: []const u8) ?[]const u8 {
+    fn checkAccountAdmission(
+        self: *Daemon,
+        typed_name: []const u8,
+        client_ip: []const u8,
+    ) ?[]const u8 {
         return self.handler.policy.check(typed_name, client_ip);
     }
 
@@ -774,7 +815,11 @@ pub const Daemon = struct {
             };
 
             self.store.answer = &job.answer;
-            const result = self.handler.handleMessage(.{ .auth_request = req }, pend.slot, pend.slot_gen);
+            const result = self.handler.handleMessage(
+                .{ .auth_request = req },
+                pend.slot,
+                pend.slot_gen,
+            );
             self.store.answer = null;
 
             switch (result) {
@@ -822,7 +867,10 @@ pub const Daemon = struct {
 
         if (conn.hasPendingSend()) {
             self.batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                log.err("change list full arming write for IPC slot {d}: closing the lane", .{slot});
+                log.err(
+                    "change list full arming write for IPC slot {d}: closing the lane",
+                    .{slot},
+                );
                 self.closeLane(slot);
             };
         }
@@ -990,7 +1038,12 @@ test "pool options reject out-of-range values" {
     }
 
     // In-range values parse through; absent keys keep the defaults.
-    const path = try writeTmpConfig(allocator, &tmp, "idp_threads = 16\nidp_max_outstanding = 64\nidp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000");
+    const path = try writeTmpConfig(
+        allocator,
+        &tmp,
+        "idp_threads = 16\nidp_max_outstanding = 64\n" ++
+            "idp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000",
+    );
     defer allocator.free(path);
     var cfg = try config_mod.parse(allocator, path);
     defer cfg.deinit();
@@ -1066,13 +1119,25 @@ const DaemonFixture = struct {
     handler: AuthHandler = undefined,
     daemon: Daemon = undefined,
 
-    fn init(self: *DaemonFixture, allocator: Allocator, token_endpoint: []const u8, ca_file: ?[]const u8, introspection_endpoint: ?[]const u8, limiter_policy: ?RatePolicy, pool_options: IdpPool.Options) !void {
+    fn init(
+        self: *DaemonFixture,
+        allocator: Allocator,
+        token_endpoint: []const u8,
+        ca_file: ?[]const u8,
+        introspection_endpoint: ?[]const u8,
+        limiter_policy: ?RatePolicy,
+        pool_options: IdpPool.Options,
+    ) !void {
         self.* = .{ .tmp = std.testing.tmpDir(.{}) };
         errdefer self.tmp.cleanup();
 
         // Short unique path: unix socket paths are capped at sun_path.
         const n = fixture_counter.fetchAdd(1, .monotonic);
-        self.sock_path = try std.fmt.allocPrint(allocator, "/tmp/oidc-test-{d}-{d}.sock", .{ std.c.getpid(), n });
+        self.sock_path = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/oidc-test-{d}-{d}.sock",
+            .{ std.c.getpid(), n },
+        );
         errdefer allocator.free(self.sock_path);
 
         self.store = OidcStore.init(allocator, .{
@@ -1124,9 +1189,18 @@ fn connectClient(allocator: Allocator, fx: *DaemonFixture) !IpcTestClient {
     return error.AcceptTimeout;
 }
 
-fn plainAuth(conn_id: u32, username: []const u8, password: []const u8, client_ip: []const u8) protocol.Message {
+fn plainAuth(
+    conn_id: u32,
+    username: []const u8,
+    password: []const u8,
+    client_ip: []const u8,
+) protocol.Message {
     var payload_buf: [512]u8 = undefined;
-    const payload = std.fmt.bufPrint(&payload_buf, "\x00{s}\x00{s}", .{ username, password }) catch unreachable;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "\x00{s}\x00{s}",
+        .{ username, password },
+    ) catch unreachable;
     const owned = std.testing.allocator.dupe(u8, payload) catch unreachable;
     return .{ .auth_request = .{
         .conn_id = conn_id,
@@ -1163,12 +1237,24 @@ const FailOnLen = struct {
         return self.inner.rawAlloc(len, alignment, ra);
     }
 
-    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+    fn resizeFn(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) bool {
         const self: *FailOnLen = @ptrCast(@alignCast(ctx));
         return self.inner.rawResize(memory, alignment, new_len, ra);
     }
 
-    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+    fn remapFn(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) ?[*]u8 {
         const self: *FailOnLen = @ptrCast(@alignCast(ctx));
         return self.inner.rawRemap(memory, alignment, new_len, ra);
     }
@@ -1179,7 +1265,13 @@ const FailOnLen = struct {
     }
 };
 
-fn rawAuth(conn_id: u32, mechanism: protocol.MechanismId, username: []const u8, payload: []const u8, client_ip: []const u8) protocol.Message {
+fn rawAuth(
+    conn_id: u32,
+    mechanism: protocol.MechanismId,
+    username: []const u8,
+    payload: []const u8,
+    client_ip: []const u8,
+) protocol.Message {
     return .{ .auth_request = .{
         .conn_id = conn_id,
         .mechanism = mechanism,
@@ -1226,7 +1318,9 @@ fn serveHangingTcp(hold_ms: u64, port_out: *std.atomic.Value(u16)) void {
 fn startHangingStub(port_out: *std.atomic.Value(u16), hold_ms: u64) !std.Thread {
     const th = try std.Thread.spawn(.{}, serveHangingTcp, .{ hold_ms, port_out });
     const dl = std.time.milliTimestamp() + 3000;
-    while (port_out.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port_out.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     try std.testing.expect(port_out.load(.acquire) != 0);
     return th;
 }
@@ -1254,7 +1348,11 @@ test "a hanging IdP does not stall the loop" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, .{
@@ -1344,7 +1442,11 @@ test "a full pool answers temporary-auth-failure at once" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, null, .{
@@ -1385,7 +1487,11 @@ test "a completion for a closed or reused lane is dropped" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, null, .{
@@ -1432,7 +1538,11 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, null, .{
@@ -1533,7 +1643,11 @@ test "shutdown with exchanges in flight cancels them" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, null, .{
@@ -1568,7 +1682,14 @@ test "shutdown with exchanges in flight cancels them" {
 fn genIdpTestCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
-        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
+        .argv = &.{
+            "openssl",                      "req",           "-x509",
+            "-newkey",                      "rsa:2048",      "-nodes",
+            "-subj",                        "/CN=localhost", "-addext",
+            "subjectAltName=DNS:localhost", "-days",         "1",
+            "-keyout",                      "key.pem",       "-out",
+            "cert.pem",
+        },
         .cwd_dir = dir,
         .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
@@ -1583,7 +1704,13 @@ fn genIdpTestCert(dir: std.fs.Dir) !void {
 }
 
 /// Serve one HTTPS response on a loopback TLS listener, then return.
-fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, status_line: []const u8, body: []const u8, port_out: *std.atomic.Value(u16)) void {
+fn serveOneTlsResponse(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    status_line: []const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+) void {
     const method = c.TLS_server_method() orelse return;
     const ctx = c.SSL_CTX_new(method) orelse return;
     defer c.SSL_CTX_free(ctx);
@@ -1623,7 +1750,12 @@ fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, status
             if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
         }
         var resp_buf: [8192]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status_line, body.len, body }) catch return;
+        const resp = std.fmt.bufPrint(
+            &resp_buf,
+            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ status_line, body.len, body },
+        ) catch return;
         _ = c.SSL_write(ssl_ptr, resp.ptr, @intCast(resp.len));
         return;
     }
@@ -1642,10 +1774,16 @@ test "a rejected credential replays as not-authorized and records the failure" {
     defer allocator.free(key_path);
 
     var port = std.atomic.Value(u16).init(0);
-    const stub = try std.Thread.spawn(.{}, serveOneTlsResponse, .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port });
+    const stub = try std.Thread.spawn(
+        .{},
+        serveOneTlsResponse,
+        .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port },
+    );
     defer stub.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 
@@ -1677,7 +1815,10 @@ test "a rejected credential replays as not-authorized and records the failure" {
 
     // The replayed failure is the handler's own accounting: with
     // lockout_threshold 1 alice is now locked.
-    try std.testing.expectEqualStrings("account-disabled", fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock);
+    try std.testing.expectEqualStrings(
+        "account-disabled",
+        fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock,
+    );
 }
 
 test "a rate-limited or locked request is denied before the IdP is asked" {
@@ -1687,7 +1828,11 @@ test "a rate-limited or locked request is denied before the IdP is asked" {
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port.load(.acquire)});
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
 
     var fx: DaemonFixture = undefined;
     try fx.init(allocator, url, null, null, .{
@@ -1763,10 +1908,16 @@ test "admission is charged at dispatch; the replay does not charge again" {
     defer allocator.free(key_path);
 
     var port = std.atomic.Value(u16).init(0);
-    const stub = try std.Thread.spawn(.{}, serveOneTlsResponse, .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port });
+    const stub = try std.Thread.spawn(
+        .{},
+        serveOneTlsResponse,
+        .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port },
+    );
     defer stub.join();
     const dl = std.time.milliTimestamp() + 3000;
-    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
     const p = port.load(.acquire);
     try std.testing.expect(p != 0);
 

@@ -99,7 +99,10 @@ pub fn parse(token: []const u8, buf: *DecodeBuffer) JwtError!Jwt {
     const header = parseHeader(header_json) orelse return JwtError.InvalidJson;
 
     // Decode payload JSON
-    const payload_len = b64urlDecode(payload_b64, &buf.payload) orelse return JwtError.InvalidBase64;
+    const payload_len = b64urlDecode(
+        payload_b64,
+        &buf.payload,
+    ) orelse return JwtError.InvalidBase64;
     const payload_json = buf.payload[0..payload_len];
 
     const claims = parseClaims(payload_json) orelse return JwtError.InvalidJson;
@@ -164,7 +167,11 @@ pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
     defer c.EVP_MD_CTX_free(md_ctx);
 
     if (c.EVP_DigestVerifyInit(md_ctx, null, c.EVP_sha256(), null, pkey) != 1) return false;
-    if (c.EVP_DigestVerifyUpdate(md_ctx, jwt.signed_portion.ptr, jwt.signed_portion.len) != 1) return false;
+    if (c.EVP_DigestVerifyUpdate(
+        md_ctx,
+        jwt.signed_portion.ptr,
+        jwt.signed_portion.len,
+    ) != 1) return false;
 
     const verify_result = c.EVP_DigestVerifyFinal(md_ctx, signature.ptr, signature.len);
     return verify_result == 1;
@@ -279,7 +286,9 @@ fn extractStringField(json: []const u8, key: []const u8) ?[]const u8 {
 
     // Skip ':'  and optional whitespace
     var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+    while (i < after_key.len and
+        (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1)
+    {}
 
     if (i >= after_key.len or after_key[i] != '"') return null;
     i += 1; // Skip opening quote
@@ -300,7 +309,9 @@ fn extractIntField(json: []const u8, key: []const u8) ?i64 {
 
     // Skip ':' and whitespace
     var i: usize = 0;
-    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+    while (i < after_key.len and
+        (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1)
+    {}
 
     if (i >= after_key.len) return null;
 
@@ -354,12 +365,18 @@ test "b64urlDecode: strict base64url -- padding and standard alphabet rejected" 
 
 test "parse: JWT structure" {
     // A minimal test JWT (header.payload.signature -- signature won't verify without key)
-    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0"; // {"alg":"RS256","kid":"test-key"}
-    const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
+    // {"alg":"RS256","kid":"test-key"}
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIs" ++
+        "ImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
     const sig = "dGVzdA"; // "test" -- won't verify but parses
 
     var token_buf: [1024]u8 = undefined;
-    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+    const token = std.fmt.bufPrint(
+        &token_buf,
+        "{s}.{s}.{s}",
+        .{ header, payload, sig },
+    ) catch unreachable;
 
     var decode: DecodeBuffer = undefined;
     const jwt = try parse(token, &decode);
@@ -383,11 +400,16 @@ noinline fn smashStack() void {
 
 test "parse: claims stay valid after the call returns" {
     const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
-    const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
+    const payload = "eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIs" ++
+        "ImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9";
     const sig = "dGVzdA";
 
     var token_buf: [1024]u8 = undefined;
-    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+    const token = std.fmt.bufPrint(
+        &token_buf,
+        "{s}.{s}.{s}",
+        .{ header, payload, sig },
+    ) catch unreachable;
 
     // The caller owns the decode memory; clobbering the stack afterwards
     // must not touch it.
@@ -408,29 +430,63 @@ test "parse: invalid format" {
 }
 
 test "validateExpiry: not expired" {
-    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 9999999999, .preferred_username = "", .picture = "" };
+    const claims = JwtClaims{
+        .sub = "",
+        .iss = "",
+        .aud = "",
+        .exp = 9999999999,
+        .preferred_username = "",
+        .picture = "",
+    };
     try validateExpiry(&claims);
 }
 
 test "validateExpiry: expired" {
-    const claims = JwtClaims{ .sub = "", .iss = "", .aud = "", .exp = 1000000000, .preferred_username = "", .picture = "" };
+    const claims = JwtClaims{
+        .sub = "",
+        .iss = "",
+        .aud = "",
+        .exp = 1000000000,
+        .preferred_username = "",
+        .picture = "",
+    };
     try std.testing.expectError(JwtError.TokenExpired, validateExpiry(&claims));
 }
 
 test "validateIssuer: match" {
-    const claims = JwtClaims{ .sub = "", .iss = "https://auth.example.com", .aud = "", .exp = 0, .preferred_username = "", .picture = "" };
+    const claims = JwtClaims{
+        .sub = "",
+        .iss = "https://auth.example.com",
+        .aud = "",
+        .exp = 0,
+        .preferred_username = "",
+        .picture = "",
+    };
     try validateIssuer(&claims, "https://auth.example.com");
 }
 
 test "validateIssuer: mismatch" {
-    const claims = JwtClaims{ .sub = "", .iss = "https://wrong.com", .aud = "", .exp = 0, .preferred_username = "", .picture = "" };
-    try std.testing.expectError(JwtError.InvalidIssuer, validateIssuer(&claims, "https://auth.example.com"));
+    const claims = JwtClaims{
+        .sub = "",
+        .iss = "https://wrong.com",
+        .aud = "",
+        .exp = 0,
+        .preferred_username = "",
+        .picture = "",
+    };
+    try std.testing.expectError(
+        JwtError.InvalidIssuer,
+        validateIssuer(&claims, "https://auth.example.com"),
+    );
 }
 
 test "extractStringField: basic" {
     const json = "{\"sub\":\"alice\",\"iss\":\"https://auth.example.com\"}";
     try std.testing.expectEqualStrings("alice", extractStringField(json, "\"sub\"").?);
-    try std.testing.expectEqualStrings("https://auth.example.com", extractStringField(json, "\"iss\"").?);
+    try std.testing.expectEqualStrings(
+        "https://auth.example.com",
+        extractStringField(json, "\"iss\"").?,
+    );
     try std.testing.expect(extractStringField(json, "\"nonexistent\"") == null);
 }
 
