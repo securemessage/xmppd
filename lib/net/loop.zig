@@ -73,7 +73,9 @@ pub const ChangeFailure = struct {
 };
 
 pub const SignalEvent = struct { signo: u32, count: i64 };
-pub const ProcessExit = struct { pid: posix.pid_t };
+/// pid plus waitpid status when the process is a child of this process
+/// (0 when the exit status was already reaped or the pid is not a child).
+pub const ProcessExit = struct { pid: posix.pid_t, status: u32 };
 
 pub const Event = union(enum) {
     readable: Io,
@@ -168,6 +170,8 @@ pub const Loop = struct {
     timer_ready: bool,
     internal_failure: ?InternalFailure,
     watched_signals: std.StaticBitSet(max_signal),
+    saved_dispositions: [max_signal]posix.Sigaction,
+    pending_signals: std.StaticBitSet(max_signal),
 
     const InternalFailure = enum { timer, broadcast };
 
@@ -234,6 +238,8 @@ pub const Loop = struct {
             .timer_ready = false,
             .internal_failure = null,
             .watched_signals = std.StaticBitSet(max_signal).initEmpty(),
+            .saved_dispositions = undefined,
+            .pending_signals = std.StaticBitSet(max_signal).initEmpty(),
         };
 
         // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
@@ -257,7 +263,7 @@ pub const Loop = struct {
         var it = self.watched_signals.iterator(.{});
         while (it.next()) |signo| {
             signal_owners[signo].store(false, .release);
-            restoreDefaultHandler(@intCast(signo));
+            posix.sigaction(@intCast(signo), &self.saved_dispositions[signo], null);
         }
         for (self.handles.values[0..self.handles.pool]) |h| {
             if (h.fd >= 0) rawClose(h.fd);
@@ -504,22 +510,17 @@ pub const Loop = struct {
     };
 
     /// Watch `signo` via EVFILT_SIGNAL: claims process-wide ownership (a
-    /// second loop, or a second watch, gets SignalOwned), sets SIG_IGN so the
-    /// process keeps running, and attaches the knote immediately. SIGCHLD is
-    /// rejected: it stays SIG_DFL so wait(2) keeps working.
+    /// second loop, or a second watch, gets SignalOwned), attaches the knote
+    /// immediately and only then sets SIG_IGN (DESIGN): a signal posted in
+    /// between is still counted by the knote instead of silently ignored.
+    /// A signal already pending at watch time emits once as a synthetic
+    /// `.signal` event. SIGCHLD is rejected: it stays SIG_DFL so wait(2)
+    /// keeps working.
     pub fn watchSignal(self: *Loop, signo: u8) WatchSignalError!void {
         self.assertOwner();
         if (signo == 0 or signo >= max_signal or signo == posix.SIG.CHLD) return error.InvalidSignal;
         if (signal_owners[signo].swap(true, .acq_rel)) return error.SignalOwned;
         errdefer signal_owners[signo].store(false, .release);
-
-        const ign: posix.Sigaction = .{
-            .handler = .{ .handler = posix.SIG.IGN },
-            .flags = 0,
-            .mask = posix.sigemptyset(),
-        };
-        posix.sigaction(signo, &ign, null);
-        errdefer restoreDefaultHandler(signo);
 
         const add = kev.Kevent{
             .ident = signo,
@@ -530,12 +531,30 @@ pub const Loop = struct {
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
         try kev.applyNow(self.kq, &add);
+
+        // Installing SIG_IGN discards pending instances of the signal
+        // (POSIX), so the pending check must read before it lands. Pending
+        // signals emit once as a synthetic `.signal` event.
+        var pend: posix.sigset_t = posix.sigemptyset();
+        const was_pending = sigpending(&pend) == 0 and posix.sigismember(&pend, signo);
+
+        const ign: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .flags = 0,
+            .mask = posix.sigemptyset(),
+        };
+        posix.sigaction(signo, &ign, &self.saved_dispositions[signo]);
         self.watched_signals.set(signo);
+        if (was_pending) {
+            self.pending_signals.set(signo);
+            self.immediate = true;
+        }
     }
 
-    /// Remove the knote, restore SIG_DFL and release ownership. Stale or
-    /// missing knotes are tolerated.
-    pub fn unwatchSignal(self: *Loop, signo: u8) void {
+    /// Remove the knote, restore the pre-watch disposition and release
+    /// ownership. A knote already gone (ENOENT/EBADF) is the wanted state;
+    /// any other delete error is returned.
+    pub fn unwatchSignal(self: *Loop, signo: u8) kev.ApplyError!void {
         self.assertOwner();
         if (signo == 0 or signo >= max_signal) return;
         if (!self.watched_signals.isSet(signo)) return;
@@ -547,19 +566,19 @@ pub const Loop = struct {
             .data = 0,
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
-        // Best-effort delete: the knote is either gone already (fine, that is
-        // the wanted state) or dropped with the kqueue at deinit.
         kev.applyNow(self.kq, &del) catch |err| switch (err) {
             error.NotFound, error.BadDescriptor => {},
-            else => {},
+            else => |e| return e,
         };
         self.watched_signals.unset(signo);
+        self.pending_signals.unset(signo);
         signal_owners[signo].store(false, .release);
-        restoreDefaultHandler(signo);
+        posix.sigaction(signo, &self.saved_dispositions[signo], null);
     }
 
     /// Process exit notification via EVFILT_PROC + NOTE_EXIT; emits
-    /// `.process_exit` with the pid. ESRCH means the pid does not exist.
+    /// `.process_exit` with the pid and, for a child of this process, the
+    /// waitpid status. ESRCH means the pid does not exist.
     pub fn watchProcess(self: *Loop, pid: posix.pid_t) kev.ApplyError!void {
         self.assertOwner();
         const add = kev.Kevent{
@@ -706,6 +725,14 @@ pub const Loop = struct {
                 .read => .{ .readable = io },
                 .write => .{ .writable = io },
             };
+        }
+        // Signals already pending when watchSignal installed emit once here;
+        // the knote catches anything posted after registration.
+        if (self.pending_signals.findFirstSet()) |signo| {
+            self.pending_signals.unset(signo);
+            self.stats_.synthetic_events += 1;
+            self.stats_.delivered_events += 1;
+            return .{ .signal = .{ .signo = @intCast(signo), .count = 1 } };
         }
         return null;
     }
@@ -904,8 +931,13 @@ pub const Loop = struct {
                 return .{ .signal = .{ .signo = token.index, .count = raw.data } };
             },
             proc_kind => {
+                const pid: posix.pid_t = @intCast(raw.ident);
+                // Reap when it is our child so the event carries the exit
+                // status; a non-child or already-reaped pid reports 0.
+                var st: c_int = 0;
+                const status: u32 = if (std.c.waitpid(pid, &st, w_nohang) == pid) @bitCast(st) else 0;
                 self.stats_.delivered_events += 1;
-                return .{ .process_exit = .{ .pid = @intCast(raw.ident) } };
+                return .{ .process_exit = .{ .pid = pid, .status = status } };
             },
             wake_kind => {
                 self.wake_state.consume();
@@ -1007,14 +1039,8 @@ fn rawClose(fd: posix.fd_t) void {
     _ = std.c.close(fd);
 }
 
-fn restoreDefaultHandler(signo: u8) void {
-    const dfl: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.DFL },
-        .flags = 0,
-        .mask = posix.sigemptyset(),
-    };
-    posix.sigaction(signo, &dfl, null);
-}
+const w_nohang: c_int = 1; // WNOHANG
+extern "c" fn sigpending(set: *posix.sigset_t) c_int;
 
 pub fn monotonicMs() u64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch unreachable;
@@ -1681,10 +1707,61 @@ test "Loop: watchSignal delivers count and ownership excludes a second watch" {
     try std.testing.expectEqual(posix.SIG.USR1, ev.signal.signo);
     try std.testing.expect(ev.signal.count >= 1);
 
-    loop.unwatchSignal(posix.SIG.USR1);
+    try loop.unwatchSignal(posix.SIG.USR1);
     try loop2.watchSignal(posix.SIG.USR1); // ownership was released
 
     try std.testing.expectError(error.InvalidSignal, loop.watchSignal(posix.SIG.CHLD));
+}
+
+test "Loop: a signal pending at watch time emits once as a synthetic event" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    // Block USR2, raise it so it sits pending, then watch: the signal posted
+    // before the knote existed, and sigpending hands it to the loop once.
+    var set: posix.sigset_t = posix.sigemptyset();
+    posix.sigaddset(&set, posix.SIG.USR2);
+    posix.sigprocmask(posix.SIG.BLOCK, &set, null);
+    defer posix.sigprocmask(posix.SIG.UNBLOCK, &set, null);
+    try posix.raise(posix.SIG.USR2);
+
+    try loop.watchSignal(posix.SIG.USR2);
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .signal);
+    try std.testing.expectEqual(posix.SIG.USR2, ev.signal.signo);
+    // The real pending delivery may follow behind the synthetic one; both
+    // name the same signal. What must not happen is zero deliveries.
+    while (loop.next()) |more| {
+        if (more == .signal) try std.testing.expectEqual(posix.SIG.USR2, more.signal.signo);
+    }
+}
+
+test "Loop: unwatchSignal restores the pre-watch disposition" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const noop: posix.Sigaction = .{
+        .handler = .{ .handler = testSigHandler },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.HUP, &noop, null);
+    try loop.watchSignal(posix.SIG.HUP);
+    try loop.unwatchSignal(posix.SIG.HUP);
+    var cur: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.HUP, null, &cur);
+    try std.testing.expect(cur.handler.handler == testSigHandler);
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.HUP, &dfl, null);
+}
+
+fn testSigHandler(signo: c_int) callconv(.c) void {
+    _ = signo;
 }
 
 test "Loop: watchProcess reports the child's exit" {
@@ -1693,15 +1770,16 @@ test "Loop: watchProcess reports the child's exit" {
 
     const pid = try posix.fork();
     if (pid == 0) {
-        posix.exit(0);
+        posix.exit(42);
     }
-    defer _ = posix.waitpid(pid, 0);
-    try loop.watchProcess(pid);
+    try loop.watchProcess(pid); // the loop reaps the child for the status
 
     try loop.wait();
     const ev = loop.next().?;
     try std.testing.expect(ev == .process_exit);
     try std.testing.expectEqual(pid, ev.process_exit.pid);
+    try std.testing.expect(posix.W.IFEXITED(ev.process_exit.status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(ev.process_exit.status));
 
     try std.testing.expectError(error.ProcessNotFound, loop.watchProcess(1 << 22));
 }
