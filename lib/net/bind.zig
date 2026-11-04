@@ -155,17 +155,41 @@ fn reclaimStale(path: [:0]const u8, un: *const posix.sockaddr.un, salen: posix.s
     };
 }
 
-pub const PeerCred = struct { uid: posix.uid_t, gid: posix.gid_t };
+/// Peer credentials from LOCAL_PEERCRED: uid, effective gid, the full
+/// group set (effective gid first, then supplementary groups) and pid.
+/// Superset of getpeereid, which exposes no supplementary groups; T258
+/// moved the IPC gate to LOCAL_PEERCRED for exactly that reason.
+pub const PeerCred = struct {
+    uid: posix.uid_t,
+    gid: posix.gid_t,
+    groups: [16]posix.gid_t,
+    group_count: u8,
+    pid: posix.pid_t,
+};
 
+/// struct xucred (sys/ucred.h): cr_version, cr_uid, cr_ngroups counting
+/// cr_gid, cr_groups[16] with the effective gid first, then a union of
+/// an unused pointer and cr_pid.
 const xucred = extern struct {
     version: c_uint,
     uid: posix.uid_t,
     ngroups: c_short,
+    _pad: u16 = 0,
     groups: [16]posix.gid_t,
+    pid_union: extern union { unused: ?*anyopaque, pid: posix.pid_t },
 };
 
+comptime {
+    std.debug.assert(@offsetOf(xucred, "groups") == 12);
+    std.debug.assert(@offsetOf(xucred, "pid_union") == 80);
+    std.debug.assert(@sizeOf(xucred) == 88);
+}
+
+const xucred_version: c_uint = 0;
+
 /// LOCAL_PEERCRED for an accepted Unix-domain socket. The option lives at
-/// local(4) level 0, not SOL_SOCKET.
+/// local(4) level 0, not SOL_SOCKET. Returns NotUnixSocket on any other
+/// fd or socket type, and rejects an unexpected xucred layout version.
 pub fn peerCred(fd: posix.fd_t) error{ NotUnixSocket, Unexpected }!PeerCred {
     var cred: xucred = undefined;
     var len: posix.socklen_t = @sizeOf(xucred);
@@ -175,7 +199,16 @@ pub fn peerCred(fd: posix.fd_t) error{ NotUnixSocket, Unexpected }!PeerCred {
             else => error.Unexpected,
         };
     }
-    return .{ .uid = cred.uid, .gid = if (cred.ngroups > 0) cred.groups[0] else 0 };
+    if (cred.version != xucred_version or cred.ngroups < 0 or cred.ngroups > 16) {
+        return error.Unexpected;
+    }
+    return .{
+        .uid = cred.uid,
+        .gid = if (cred.ngroups > 0) cred.groups[0] else 0,
+        .groups = cred.groups,
+        .group_count = @intCast(cred.ngroups),
+        .pid = cred.pid_union.pid,
+    };
 }
 
 const so_local_peercred: c_int = 0x0001; // LOCAL_PEERCRED on FreeBSD
@@ -391,7 +424,13 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
 
     const cred = try peerCred(probe.fds[0]);
     try std.testing.expectEqual(std.c.getuid(), cred.uid);
+    try std.testing.expectEqual(getegid(), cred.gid);
+    try std.testing.expect(cred.group_count >= 1);
+    try std.testing.expectEqual(getegid(), cred.groups[0]);
+    try std.testing.expectEqual(std.c.getpid(), cred.pid);
 }
+
+extern "c" fn getegid() posix.gid_t;
 
 test "bindUnix: a stale socket path is reclaimed" {
     const path = "/home/admin/tmp/scratch/devin-net/f2-stale.sock";
