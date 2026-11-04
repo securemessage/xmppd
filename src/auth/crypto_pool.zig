@@ -15,8 +15,10 @@
 //! jobs are outstanding (accepted but their completion not yet popped),
 //! which is what keeps both rings within capacity. The workers wait on a
 //! condition variable over the job ring; completions are drained by the
-//! event loop, which is woken with the classic one-byte pipe write (the
-//! pipe's read end is registered in kqueue).
+//! event loop. The worker-to-loop wake is a one-byte pipe write that
+//! fires only on the `wake_pending` false->true transition (the loop
+//! clears the flag in `drainPipe` before popping completions), so a burst
+//! of completions costs one byte per drain cycle and none is ever lost.
 
 const std = @import("std");
 const posix = std.posix;
@@ -86,11 +88,19 @@ pub const CryptoPool = struct {
     job_cond: std.Thread.Condition = .{},
     completion_mutex: std.Thread.Mutex = .{},
 
+    /// Wake coalescing flag (Q2): true while a wake byte may still be
+    /// pending delivery. Workers write the pipe byte only on the
+    /// false->true transition; drainPipe clears it before the caller
+    /// drains completions.
+    wake_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     stopping: bool = false,
     running_threads: usize = 0,
     next_job_id: u64 = 1,
 
-    /// Wake pipe: worker writes one byte per completion; the loop reads.
+    /// Wake pipe: workers write one byte per drain cycle; the loop reads.
+    /// Both ends are non-blocking; a write EAGAIN means the pipe is still
+    /// readable, i.e. a wake is already signaled.
     pipe_rd: posix.fd_t = -1,
     pipe_wr: posix.fd_t = -1,
 
@@ -134,7 +144,10 @@ pub const CryptoPool = struct {
         return id;
     }
 
-    /// Drain the wake pipe (EVFILT_READ then this).
+    /// Drain the wake pipe (EVFILT_READ then this). Clears the wake flag
+    /// after the byte drain and before the caller's completion drain: a
+    /// worker publishing after the clear sees the false->true edge and
+    /// writes a byte for the next wait, so no completion is missed.
     pub fn drainPipe(self: *CryptoPool) void {
         var buf: [64]u8 = undefined;
         while (true) {
@@ -142,6 +155,7 @@ pub const CryptoPool = struct {
             if (n <= 0) break;
             if (n < buf.len) break;
         }
+        self.wake_pending.store(false, .seq_cst);
     }
 
     /// Pop a completed derivation, or null when the drain is done. Popping
@@ -157,13 +171,15 @@ pub const CryptoPool = struct {
         return self.completions[self.completion_head % MAX_JOBS];
     }
 
-    /// Spawn the worker threads and open the wake pipe (read end
-    /// non-blocking for the loop's drain; same pattern as WakePipe).
+    /// Spawn the worker threads and open the wake pipe (both ends
+    /// non-blocking: the loop drains the read end, workers write the
+    /// write end and treat EAGAIN as already-signaled).
     pub fn start(self: *CryptoPool, thread_count: usize) !void {
         const fds = try posix.pipe();
         errdefer posix.close(fds[0]);
         errdefer posix.close(fds[1]);
         _ = std.c.fcntl(fds[0], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = std.c.fcntl(fds[1], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
         self.pipe_rd = fds[0];
         self.pipe_wr = fds[1];
 
@@ -213,7 +229,9 @@ pub const CryptoPool = struct {
     }
 
     /// Publish one completion and wake the loop. put() bounds outstanding
-    /// jobs by the ring capacity, so the publish cannot fail.
+    /// jobs by the ring capacity, so the publish cannot fail. The wake
+    /// byte goes out only on the wake_pending false->true edge; the flag
+    /// is the source of truth and the byte a hint.
     fn finish(self: *CryptoPool, id: u64, ok: bool) void {
         {
             self.completion_mutex.lock();
@@ -223,9 +241,18 @@ pub const CryptoPool = struct {
             self.completion_tail += 1;
         }
 
-        _ = posix.write(self.pipe_wr, "\x00") catch |err| {
-            log.err("completion wake write failed for job {d}: {s}", .{ id, @errorName(err) });
-        };
+        if (!self.wake_pending.swap(true, .seq_cst)) {
+            _ = posix.write(self.pipe_wr, "\x00") catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => {
+                    // Delivery failed: clear the flag so a later
+                    // completion retries the wake instead of every
+                    // publish being coalesced away forever.
+                    self.wake_pending.store(false, .seq_cst);
+                    log.err("completion wake write failed for job {d}: {s}", .{ id, @errorName(err) });
+                },
+            };
+        }
     }
 
     fn workerMain(self: *CryptoPool) void {
@@ -279,6 +306,21 @@ fn reservedCount(pool: *CryptoPool) usize {
 /// cannot distinguish this pool's put from a backend put at the call site.
 fn putTestJob(pool: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
     return pool.put(password, salt, iteration_count, expected_stored_key);
+}
+
+/// Read the pool wake pipe until a byte arrives or the deadline passes;
+/// returns false on timeout. Mirrors waitForPoolWake in handler tests.
+fn waitWakeByte(pool: *CryptoPool, deadline_ms: i64) !bool {
+    var buf: [8]u8 = undefined;
+    while (std.time.milliTimestamp() < deadline_ms) {
+        const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) return true;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return false;
 }
 
 test "CryptoPool: more than eight completions wait without a drain" {
@@ -542,4 +584,83 @@ test "CryptoPool: completed and dropped jobs leave no password bytes" {
     for (&pool2.job_slots) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-b2") == null);
     }
+}
+
+test "CryptoPool: one wake byte per drain cycle" {
+    // The consumer never drains during this test, so wake_pending stays
+    // set after the first completion: a burst of 16 completions must
+    // leave exactly one byte in the pipe.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(4);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("burst", @splat(3), 1);
+    const n: usize = 16;
+    for (0..n) |_| {
+        _ = try putTestJob(&pool, "burst", @splat(3), 1, creds.stored_key);
+    }
+
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (completionCount(&pool) < n and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(n, completionCount(&pool));
+
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    while (std.time.milliTimestamp() < deadline) {
+        const got = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        total += got;
+        if (total > 0) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), total);
+}
+
+test "CryptoPool: no completion is lost under a producer burst" {
+    // Four producer threads race put(); up to MAX_THREADS workers race
+    // the completion side. The consumer only pops after a real wake, so
+    // a lost wakeup shows up as a timeout instead of a hang.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(4);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("s", @splat(9), 1);
+    const jobs_per_producer = 50;
+    const producers = 4;
+
+    const Producer = struct {
+        fn run(p: *CryptoPool, stored: [32]u8) void {
+            for (0..jobs_per_producer) |_| {
+                _ = putTestJob(p, "s", @splat(9), 1, stored) catch |err| {
+                    std.debug.panic("put failed: {s}", .{@errorName(err)});
+                };
+            }
+        }
+    };
+
+    var threads: [producers]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Producer.run, .{ &pool, creds.stored_key });
+    }
+
+    var received: usize = 0;
+    const total = producers * jobs_per_producer;
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (received < total and std.time.milliTimestamp() < deadline) {
+        if (try waitWakeByte(&pool, std.time.milliTimestamp() + 100)) {
+            pool.drainPipe();
+            while (pool.popCompletion()) |c| {
+                try std.testing.expect(c.ok);
+                received += 1;
+            }
+        }
+    }
+    for (threads) |t| t.join();
+
+    try std.testing.expectEqual(total, received);
+    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
