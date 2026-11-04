@@ -2030,15 +2030,15 @@ test "Loop: an interrupted wait does not postpone an armed deadline" {
 
     var stop = std.atomic.Value(bool).init(false);
     var kicker: SignalKicker = .{ .target = std.c.pthread_self(), .stop = &stop };
-    defer {
-        stop.store(true, .release);
-        _ = pthread_kill(std.c.pthread_self(), posix.SIG.USR1);
-    }
 
     const t0 = monotonicMs();
     _ = try loop.scheduleIn(300, tctx(1));
     const thread = try std.Thread.spawn(.{}, SignalKicker.run, .{&kicker});
-    defer thread.join();
+    defer {
+        stop.store(true, .release);
+        _ = pthread_kill(std.c.pthread_self(), posix.SIG.USR1); // unblock wait()
+        thread.join();
+    }
 
     var fired_ms: u64 = 0;
     while (fired_ms == 0) {
@@ -2048,7 +2048,7 @@ test "Loop: an interrupted wait does not postpone an armed deadline" {
         }
         if (monotonicMs() - t0 > 1500) break; // mutation lands the deadline late
     }
-    try std.testing.expect(fired_ms < 600);
+    try std.testing.expect(fired_ms > 0 and fired_ms < 600);
 }
 
 test "Loop: cancelTimer disarms the kernel timer" {
