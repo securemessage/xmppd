@@ -345,68 +345,87 @@ fn planNamespace(
     hosted_domains: []const []const u8,
     forced: ?ForcedRename,
 ) !void {
-    var iterator = try backend.iterator(namespace, "");
-    defer iterator.deinit();
-    while (iterator.next()) |entry| {
-        var rewrite = rewriteEntry(
-            plan.allocator,
-            db,
-            namespace,
-            entry.key,
-            entry.value,
-            hosted_domains,
-            forced,
-        ) catch |err| switch (err) {
-            error.InvalidAccountName => {
-                try addIssue(plan, db, namespace, .invalid_name, entry.key, "");
-                continue;
-            },
-            error.KeyTooLong => {
-                try addIssue(plan, db, namespace, .key_too_long, entry.key, "");
-                continue;
-            },
-            else => return err,
-        };
-        defer rewrite.deinit(plan.allocator);
-        if (rewrite.new_key == null and rewrite.new_value == null) continue;
+    // LMDB allows one transaction per thread. Collect every rewrite first,
+    // close the iterator's read transaction, and only then issue collision
+    // reads against the same backend.
+    var pending: std.ArrayListUnmanaged(Rename) = .{};
+    var transferred: usize = 0;
+    defer {
+        for (pending.items[transferred..]) |rename| {
+            plan.allocator.free(rename.old_key);
+            plan.allocator.free(rename.new_key);
+            if (rename.new_value) |value| plan.allocator.free(value);
+        }
+        pending.deinit(plan.allocator);
+    }
 
-        const same_key = rewrite.new_key == null;
-        const new_key = rewrite.new_key orelse entry.key;
-        if (!same_key) {
-            const id = try targetId(plan.allocator, db, namespace, new_key);
+    {
+        var iterator = try backend.iterator(namespace, "");
+        defer iterator.deinit();
+        while (iterator.next()) |entry| {
+            var rewrite = rewriteEntry(
+                plan.allocator,
+                db,
+                namespace,
+                entry.key,
+                entry.value,
+                hosted_domains,
+                forced,
+            ) catch |err| switch (err) {
+                error.InvalidAccountName => {
+                    try addIssue(plan, db, namespace, .invalid_name, entry.key, "");
+                    continue;
+                },
+                error.KeyTooLong => {
+                    try addIssue(plan, db, namespace, .key_too_long, entry.key, "");
+                    continue;
+                },
+                else => return err,
+            };
+            defer rewrite.deinit(plan.allocator);
+            if (rewrite.new_key == null and rewrite.new_value == null) continue;
+
+            const new_key = rewrite.new_key orelse entry.key;
+            const old_copy = try plan.allocator.dupe(u8, entry.key);
+            errdefer plan.allocator.free(old_copy);
+            const new_copy = try plan.allocator.dupe(u8, new_key);
+            errdefer plan.allocator.free(new_copy);
+            const new_value = if (rewrite.new_value) |value|
+                try plan.allocator.dupe(u8, value)
+            else
+                null;
+            errdefer if (new_value) |value| plan.allocator.free(value);
+            try pending.append(plan.allocator, .{
+                .db = db,
+                .namespace = namespace,
+                .old_key = old_copy,
+                .new_key = new_copy,
+                .new_value = new_value,
+                .same_key = rewrite.new_key == null,
+                .value_len = entry.value.len,
+            });
+        }
+    }
+
+    for (pending.items) |rename| {
+        if (!rename.same_key) {
+            const id = try targetId(plan.allocator, db, namespace, rename.new_key);
             errdefer plan.allocator.free(id);
             if (targets.contains(id)) {
                 plan.allocator.free(id);
-                try addIssue(plan, db, namespace, .collision, entry.key, new_key);
+                try addIssue(plan, db, namespace, .collision, rename.old_key, rename.new_key);
             } else {
-                const existing = try backend.get(plan.allocator, namespace, new_key);
+                const existing = try backend.get(plan.allocator, namespace, rename.new_key);
                 if (existing) |value| {
                     plan.allocator.free(value);
-                    try addIssue(plan, db, namespace, .collision, entry.key, new_key);
+                    try addIssue(plan, db, namespace, .collision, rename.old_key, rename.new_key);
                 }
                 try targets.put(plan.allocator, id, {});
             }
         }
-
-        const old_copy = try plan.allocator.dupe(u8, entry.key);
-        errdefer plan.allocator.free(old_copy);
-        const new_copy = try plan.allocator.dupe(u8, new_key);
-        errdefer plan.allocator.free(new_copy);
-        const new_value = if (rewrite.new_value) |value|
-            try plan.allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (new_value) |value| plan.allocator.free(value);
-        try plan.renames.append(plan.allocator, .{
-            .db = db,
-            .namespace = namespace,
-            .old_key = old_copy,
-            .new_key = new_copy,
-            .new_value = new_value,
-            .same_key = same_key,
-            .value_len = entry.value.len,
-        });
-        plan.rename_bytes += new_key.len + entry.value.len;
+        try plan.renames.append(plan.allocator, rename);
+        transferred += 1;
+        plan.rename_bytes += rename.new_key.len + rename.value_len;
     }
 }
 
@@ -496,21 +515,7 @@ pub fn planMigration(
     return plan;
 }
 
-fn applyRename(
-    backend: anytype,
-    batch: anytype,
-    allocator: std.mem.Allocator,
-    rename: Rename,
-    owned_values: *std.ArrayListUnmanaged([]u8),
-) !void {
-    const stored = if (rename.new_value == null)
-        try backend.get(allocator, rename.namespace, rename.old_key)
-    else
-        null;
-    if (stored) |value| {
-        errdefer allocator.free(value);
-        try owned_values.append(allocator, value);
-    }
+fn applyRename(batch: anytype, rename: Rename, stored: ?[]const u8) !void {
     const value = rename.new_value orelse stored orelse return error.MissingSourceRow;
     try batch.put(rename.namespace, rename.new_key, value);
     if (!rename.same_key) try batch.delete(rename.namespace, rename.old_key);
@@ -526,16 +531,28 @@ fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Pl
     }
     if (!any) return;
 
+    // Fetch source values before opening the write transaction, and retain
+    // them through commit so the batch never references freed memory.
+    var values: std.ArrayListUnmanaged(?[]u8) = .{};
+    defer {
+        for (values.items) |value| {
+            if (value) |bytes| allocator.free(bytes);
+        }
+        values.deinit(allocator);
+    }
+    try values.resize(allocator, plan.renames.items.len);
+    @memset(values.items, null);
+    for (plan.renames.items, 0..) |rename, i| {
+        if (rename.db != db or rename.new_value != null) continue;
+        values.items[i] = try backend.get(allocator, rename.namespace, rename.old_key);
+        if (values.items[i] == null) return error.MissingSourceRow;
+    }
+
     var batch = try backend.writeBatch();
     errdefer batch.abort();
-    var owned_values: std.ArrayListUnmanaged([]u8) = .{};
-    defer {
-        for (owned_values.items) |value| allocator.free(value);
-        owned_values.deinit(allocator);
-    }
-    for (plan.renames.items) |rename| {
+    for (plan.renames.items, 0..) |rename, i| {
         if (rename.db != db) continue;
-        try applyRename(backend, &batch, allocator, rename, &owned_values);
+        try applyRename(&batch, rename, values.items[i]);
     }
     try batch.commit();
 }
@@ -617,15 +634,25 @@ fn applyGroupedDb(
         var end = index + 1;
         while (end < plan.renames.items.len and sameGroup(first, plan.renames.items[end])) : (end += 1) {}
 
+        var values: std.ArrayListUnmanaged(?[]u8) = .{};
+        defer {
+            for (values.items) |value| {
+                if (value) |bytes| allocator.free(bytes);
+            }
+            values.deinit(allocator);
+        }
+        try values.resize(allocator, end - index);
+        @memset(values.items, null);
+        for (plan.renames.items[index..end], 0..) |rename, i| {
+            if (rename.new_value != null) continue;
+            values.items[i] = try backend.get(allocator, rename.namespace, rename.old_key);
+            if (values.items[i] == null) return error.MissingSourceRow;
+        }
+
         var batch = try backend.writeBatch();
         errdefer batch.abort();
-        var owned_values: std.ArrayListUnmanaged([]u8) = .{};
-        defer {
-            for (owned_values.items) |value| allocator.free(value);
-            owned_values.deinit(allocator);
-        }
-        for (plan.renames.items[index..end]) |rename| {
-            try applyRename(backend, &batch, allocator, rename, &owned_values);
+        for (plan.renames.items[index..end], 0..) |rename, i| {
+            try applyRename(&batch, rename, values.items[i]);
         }
         try batch.commit();
 

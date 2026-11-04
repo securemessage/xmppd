@@ -1835,6 +1835,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_migrate_precis_tests = b.addRunArtifact(migrate_precis_tests);
 
+    const migrate_precis_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis_backends_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_precis_backend_test_mod.addImport("backend", backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("migrate_precis", migrate_precis_test_mod);
+    migrate_precis_backend_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("user_store", generic_user_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("roster_store", generic_roster_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("archive_store", archive_store_test_mod);
+    const migrate_precis_backend_tests = b.addTest(.{
+        .name = "migrate-precis-backend-tests",
+        .root_module = migrate_precis_backend_test_mod,
+    });
+    const run_migrate_precis_backend_tests = b.addRunArtifact(migrate_precis_backend_tests);
+
     // T87: archive write queue tests. A separate module on the same root
     // file carries the store/backend imports; archive_queue_mod itself
     // stays dependency-free for the production binaries.
@@ -1928,6 +1947,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
     test_step.dependOn(&run_migrate_precis_tests.step);
+    test_step.dependOn(&run_migrate_precis_backend_tests.step);
     test_step.dependOn(&run_auth_main_tests.step);
 }
 
