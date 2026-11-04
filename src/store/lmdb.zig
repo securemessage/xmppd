@@ -53,21 +53,26 @@ const KinfoVmentry = extern struct {
     kve_vn_rdev: u64,
 };
 const KVME_TYPE_VNODE = 2;
+const KVME_FLAG_NOCOREDUMP = 0x4;
 
 // madvise seam: test builds record the arguments instead of advising the
 // kernel, so a test can check the advised range covers the env map.
+// A nonzero result also sets a deterministic errno so the warn log does
+// not print a stale value.
 const madviseCall = if (builtin.is_test) struct {
     var calls: usize = 0;
     var addr: usize = 0;
     var len: usize = 0;
     var advice: u32 = 0;
     var result: c_int = 0;
+    var result_errno: c_int = @intFromEnum(std.posix.E.INVAL);
 
     fn run(a: usize, l: usize, adv: u32) c_int {
         calls += 1;
         addr = a;
         len = l;
         advice = adv;
+        if (result != 0) std.c._errno().* = result_errno;
         return result;
     }
 } else struct {
@@ -971,4 +976,36 @@ test "LmdbBackend: the env map VMA match requires inode and filesystem" {
     try std.testing.expectEqual(@as(u64, 0x3000), rec.kve_start);
     try std.testing.expect(findVmRecord(buf, 4242, 0xAAAA) != null);
     try std.testing.expect(findVmRecord(buf, 4242, 0xCCCC) == null);
+}
+
+test "LmdbBackend: the real madvise marks the env VMA nocore" {
+    // Goal: the syscall path the seam bypasses works end to end: the
+    // real madvise accepts MADV_NOCORE on the VMA the lookup returns
+    // and the kernel records KVME_FLAG_NOCOREDUMP on it. Method: advise
+    // over the found record's range, then re-read the record and check
+    // the flag. An LMDB value pointer pins the VMA to the env map.
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    const users_ns = comptime backend.registered("users");
+
+    var fd: c_int = 0;
+    try std.testing.expectEqual(@as(c_int, 0), mdb_env_get_fd(db.env.ptr, &fd));
+    const st = try std.posix.fstat(fd);
+    const rec = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    const start: usize = @intCast(rec.kve_start);
+    const len: usize = @intCast(rec.kve_end - rec.kve_start);
+
+    try db.put(users_ns, "probe-key", "probe-value");
+    var iter = try db.iterator(users_ns, "probe-key");
+    defer iter.deinit();
+    const p = @intFromPtr(iter.next().?.value.ptr);
+    try std.testing.expect(p >= start and p < start + len);
+
+    const addr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(start);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.madvise(addr, len, std.c.MADV.NOCORE));
+
+    const after = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    try std.testing.expectEqual(rec.kve_start, after.kve_start);
+    try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
 }
