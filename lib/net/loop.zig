@@ -32,8 +32,9 @@ pub const timer_kind: u8 = 0x03;
 pub const broadcast_kind: u8 = 0x04;
 pub const signal_kind: u8 = 0x05;
 pub const proc_kind: u8 = 0x06;
-/// Internal deadline ctx kind: a paused listener's fallback resume.
-pub const resume_kind: u8 = 0x07;
+// No internal ctx kind is reserved: loop-internal timers (the listener's
+// fallback resume) identify themselves by TimerId, so every kind value
+// stays available to consumers.
 
 /// Process-global signal ownership: a signal may have exactly one watching
 /// loop process-wide. SIGCHLD is excluded and keeps SIG_DFL.
@@ -677,13 +678,6 @@ pub const Loop = struct {
         }
         if (self.timer_ready) {
             while (self.wheel.popExpired(self.now_ms_)) |dl| {
-                // resume_kind deadlines are loop-internal: a paused
-                // listener's fallback timer. Not consumer events.
-                if (dl.ctx.kind == resume_kind) {
-                    const tok: Token = .{ .index = dl.ctx.index, .gen = dl.ctx.gen, .kind = handle_kind };
-                    self.resumePaused(tok) catch continue;
-                    continue;
-                }
                 self.stats_.delivered_events += 1;
                 return .{ .deadline = dl };
             }
@@ -1525,7 +1519,6 @@ test "Loop: scheduleIn fires a deadline event and cancel silences it" {
     try std.testing.expect(ev.? == .deadline);
     try std.testing.expect(ev.?.deadline.timer.eql(t));
     try std.testing.expect(ev.?.deadline.ctx.eql(tctx(3)));
-    try std.testing.expect(loop.next() == null);
 
     // A cancelled timer emits nothing and the knote is disarmed.
     const t2 = try loop.scheduleIn(50, tctx(4));
@@ -1533,6 +1526,23 @@ test "Loop: scheduleIn fires a deadline event and cancel silences it" {
     try std.testing.expect(!loop.cancelTimer(t2));
     loop.requestImmediate();
     try loop.wait();
+    try std.testing.expect(loop.next() == null);
+}
+
+test "Loop: a deadline with any consumer ctx kind is delivered, none reserved" {
+    // ctx kind 0x07 was once reserved for the listener's internal resume
+    // timer: a consumer timer using it was silently swallowed. All kinds
+    // now surface as deadline events.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    var reserved: Token = tctx(7);
+    reserved.kind = 0x07;
+    _ = try loop.scheduleIn(1, reserved);
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .deadline);
+    try std.testing.expect(ev.deadline.ctx.eql(reserved));
     try std.testing.expect(loop.next() == null);
 }
 

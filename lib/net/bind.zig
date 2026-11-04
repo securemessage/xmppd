@@ -344,19 +344,28 @@ pub const Listener = struct {
         };
         // Only ENFILE/ENOBUFS/ENOMEM get the fallback deadline: those may
         // outlast every close in this process. EMFILE is relieved by a
-        // close, which always resumes the pause.
+        // close, which always resumes the pause. The TimerId, not a ctx
+        // sentinel, identifies it in onDeadline.
         switch (reason) {
             .emfile => {},
             else => {
-                const resume_ctx: Token = .{
-                    .index = self.handle.index,
-                    .gen = self.handle.gen,
-                    .kind = loop_mod.resume_kind,
-                };
-                self.fallback_timer = self.loop.scheduleIn(self.fallback_resume_ms, resume_ctx) catch null;
+                self.fallback_timer = self.loop.scheduleIn(self.fallback_resume_ms, .none) catch null;
             },
         }
         return .{ .paused = reason };
+    }
+
+    /// Route a `.deadline` event: returns true when it was this listener's
+    /// fallback resume (the pause is lifted here). The consumer calls this
+    /// on every deadline event; unrelated deadlines return false.
+    pub fn onDeadline(self: *Listener, d: loop_mod.Deadline) bool {
+        const t = self.fallback_timer orelse return false;
+        if (!d.timer.eql(t)) return false;
+        self.fallback_timer = null;
+        self.loop.resumePaused(self.handle) catch |err| switch (err) {
+            error.StaleHandle => {},
+        };
+        return true;
     }
 
     pub fn close(self: *Listener) void {
@@ -689,6 +698,35 @@ test "Listener: an adopted blocking fd gets O_NONBLOCK and FD_CLOEXEC" {
     try std.testing.expect(fl >= 0 and fl & o_nonblock != 0);
     const fdf = std.c.fcntl(fd, posix.F.GETFD, @as(c_int, 0));
     try std.testing.expect(fdf >= 0 and fdf & fd_cloexec != 0);
+}
+
+test "Listener: onDeadline drives the fallback resume" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    // Pause the read interest and arm the fallback the way pause() does.
+    try loop.pauseReadUntilClose(listener.handle);
+    listener.fallback_timer = try loop.scheduleIn(1, .none);
+    try std.testing.expect(loop.isPaused(listener.handle));
+
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .deadline);
+    try std.testing.expect(listener.onDeadline(ev.deadline));
+    try std.testing.expect(!loop.isPaused(listener.handle));
+    try std.testing.expect(listener.fallback_timer == null);
+
+    // An unrelated deadline is not claimed.
+    const other = try loop.scheduleIn(1, .none);
+    try loop.wait();
+    const ev2 = loop.next().?;
+    try std.testing.expect(ev2 == .deadline);
+    try std.testing.expect(ev2.deadline.timer.eql(other));
+    try std.testing.expect(!listener.onDeadline(ev2.deadline));
 }
 
 test "Listener: EMFILE pauses, a close resumes (forked child, lowered RLIMIT)" {
