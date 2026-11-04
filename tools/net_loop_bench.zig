@@ -1,20 +1,23 @@
 //! Microbenchmark: lib/net Loop iteration cost (ADR-8, F2).
 //! Built via `zig build bench-net-loop` (module pinned to ReleaseFast).
+//! Run pinned for the second column: `cpuset -l 4 zig-out/bin/bench-net-loop`.
 //!
-//! Rows:
-//!   idle N      - N attached socketpairs, no events: cost of one commit +
-//!                 kevent(2) pass (change buffer empty, zero-timeout scan).
-//!   active N    - N socketpairs each with 1 byte pending: per-iteration
-//!                 harvest cost and per-event delivery cost.
-//!   wake        - waker().notify() -> wait() -> .wake round trip.
+//! Matrix (DESIGN 13.10):
+//!   idle N       N in {0, 1k, 10k, 50k} attached handles, no events: one
+//!                commit + zero-timeout kevent pass.
+//!   event A      A in {1, 64, 1k} handles with a byte pending that is never
+//!                read(2): harvest + delivery cost per iteration, no I/O.
+//!   active A     same, but one read(2) per event (real handler cost).
+//!   wake 1|8     cross-thread producers spamming notify() while the
+//!                consumer measures wait -> .wake delivery.
 //!
-//! Three runs per row, median reported. CLOCK_MONOTONIC for timestamps.
+//! Five samples per row; min/median/max reported (spread). CLOCK_MONOTONIC.
 
 const std = @import("std");
 const posix = std.posix;
 const net = @import("net");
 
-const runs = 3;
+const runs = 5;
 const iters = 200;
 
 fn nowNs() i128 {
@@ -35,29 +38,49 @@ fn makeLoop(handles_max: u32) !net.Loop {
     return loop;
 }
 
+/// One end of a socketpair; the peer is closed so no event is pending.
 fn pairFd() !posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0, &fds) != 0)
-        return error.SocketPairFailed;
+    const fl = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, fl, 0, &fds) != 0) return error.SocketPairFailed;
     _ = std.c.close(fds[1]);
     return fds[0];
 }
 
-fn median(samples: *[runs]i128) i128 {
-    const s = samples[0..];
-    std.mem.sort(i128, s, {}, std.sort.asc(i128));
-    return s[runs / 2];
+/// Socketpair whose peer stays open and holds one byte, so the read knote
+/// fires on every scan until something reads it.
+fn pendingPair(peer: *posix.fd_t) !posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    const fl = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, fl, 0, &fds) != 0) return error.SocketPairFailed;
+    _ = try posix.write(fds[1], "x");
+    peer.* = fds[1];
+    return fds[0];
 }
 
-fn benchIdle(n: u32) !i128 {
-    var loop = try makeLoop(n);
+fn sortAsc(s: []i128) void {
+    std.mem.sort(i128, s, {}, std.sort.asc(i128));
+}
+
+fn report(name: []const u8, unit: []const u8, samples: *const [runs]i128) void {
+    var s = samples.*;
+    sortAsc(&s);
+    std.debug.print("{s:<14}{d:>9} ns {s:<4} min {d} med {d} max {d}\n", .{
+        name, @divTrunc(s[runs / 2], 1), unit, s[0], s[runs / 2], s[runs - 1],
+    });
+}
+
+fn benchIdle(n: u32) ![runs]i128 {
+    var loop = try makeLoop(@max(n, 1));
     defer loop.deinit(std.heap.page_allocator);
-    var fds = try std.heap.page_allocator.alloc(posix.fd_t, n);
-    defer std.heap.page_allocator.free(fds);
+    const alloc = std.heap.page_allocator;
+    var fds = try alloc.alloc(posix.fd_t, n);
+    defer alloc.free(fds);
     for (0..n) |i| {
         fds[i] = try pairFd();
         _ = try loop.attach(fds[i], ctx_tok, .{ .read = true });
     }
+    loop.requestImmediate();
     try loop.wait();
     while (loop.next() != null) {}
 
@@ -71,78 +94,152 @@ fn benchIdle(n: u32) !i128 {
         }
         s.* = @divTrunc(nowNs() - t0, iters);
     }
-    return median(&samples);
+    return samples;
 }
 
-fn benchActive(n: u32) !i128 {
-    var loop = try makeLoop(n);
+/// `a` handles each get one fresh byte per sample; the events are delivered
+/// but never read(2). The re-pend writes sit outside the timed region, so
+/// the row measures harvest + delivery only. EVFILT_READ|EV_CLEAR refires
+/// only on new data, which is why the write is required.
+fn benchEvent(a: u32) ![runs]i128 {
+    var loop = try makeLoop(a);
     defer loop.deinit(std.heap.page_allocator);
-    var fds = try std.heap.page_allocator.alloc(posix.fd_t, n);
-    defer std.heap.page_allocator.free(fds);
-    var peers = try std.heap.page_allocator.alloc(posix.fd_t, n);
-    defer std.heap.page_allocator.free(peers);
-    for (0..n) |i| {
-        var p: [2]posix.fd_t = undefined;
-        if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0, &p) != 0)
-            return error.SocketPairFailed;
-        peers[i] = p[0];
-        fds[i] = p[1];
-        _ = try loop.attach(fds[i], ctx_tok, .{ .read = true });
+    const alloc = std.heap.page_allocator;
+    var peers = try alloc.alloc(posix.fd_t, a);
+    var mine = try alloc.alloc(posix.fd_t, a);
+    defer alloc.free(peers);
+    defer alloc.free(mine);
+    for (0..a) |i| {
+        mine[i] = try pendingPair(&peers[i]);
+        _ = try loop.attach(mine[i], ctx_tok, .{ .read = true });
     }
-    loop.requestImmediate();
-    try loop.wait();
-    while (loop.next() != null) {}
-
+    var scratch: [1]u8 = undefined;
     var samples: [runs]i128 = undefined;
-    var buf: [64]u8 = undefined;
     for (&samples) |*s| {
-        // Every handle gets one pending byte.
-        for (peers) |pfd| _ = try posix.write(pfd, "x");
         const t0 = nowNs();
-        var delivered: usize = 0;
-        try loop.wait();
-        while (loop.next()) |ev| {
-            if (ev == .readable) {
-                delivered += 1;
-                _ = posix.read(loop.fdOf(ev.readable.handle).?, &buf) catch 0;
+        var events: u64 = 0;
+        while (events < a) {
+            try loop.wait();
+            while (loop.next()) |ev| {
+                if (ev == .readable) events += 1;
             }
         }
-        std.debug.assert(delivered == n);
-        s.* = nowNs() - t0;
+        s.* = @divTrunc(nowNs() - t0, @as(i128, @intCast(events)));
+        // Untimed: drain, then re-pend for the next sample.
+        for (mine) |fd| _ = posix.read(fd, &scratch) catch 0;
+        for (peers) |p| _ = posix.write(p, "x") catch 0;
     }
-    return median(&samples);
+    return samples;
 }
 
-fn benchWake() !i128 {
-    var loop = try makeLoop(8);
+/// `a` handles each read(2) and re-pended per event: the row measures the
+/// full per-event handler cost including one read.
+fn benchActive(a: u32) ![runs]i128 {
+    var loop = try makeLoop(a);
     defer loop.deinit(std.heap.page_allocator);
+    const alloc = std.heap.page_allocator;
+    var peers = try alloc.alloc(posix.fd_t, a);
+    var mine = try alloc.alloc(posix.fd_t, a);
+    defer alloc.free(peers);
+    defer alloc.free(mine);
+    for (0..a) |i| {
+        mine[i] = try pendingPair(&peers[i]);
+        _ = try loop.attach(mine[i], ctx_tok, .{ .read = true });
+    }
+    var scratch: [1]u8 = undefined;
     var samples: [runs]i128 = undefined;
     for (&samples) |*s| {
         const t0 = nowNs();
+        var events: u64 = 0;
         for (0..iters) |_| {
-            try loop.waker().notify();
             try loop.wait();
-            const ev = loop.next();
-            std.debug.assert(ev.? == .wake);
+            while (loop.next()) |ev| {
+                if (ev != .readable) continue;
+                events += 1;
+                const fd = loop.fdOf(ev.readable.handle).?;
+                _ = posix.read(fd, &scratch) catch 0;
+                _ = posix.write(peers[ev.readable.handle.index], "x") catch 0;
+            }
         }
-        s.* = @divTrunc(nowNs() - t0, iters);
+        const dt = nowNs() - t0;
+        s.* = if (events == 0) 0 else @divTrunc(dt, @as(i128, @intCast(events)));
     }
-    return median(&samples);
+    return samples;
+}
+
+const Producer = struct {
+    wake: *net.Wake,
+    done: *const std.atomic.Value(bool),
+    fn run(self: *const Producer) void {
+        while (!self.done.load(.acquire)) {
+            self.wake.notify() catch return;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+fn benchWake(producers: usize) ![runs]i128 {
+    var loop = try makeLoop(1);
+    defer loop.deinit(std.heap.page_allocator);
+    var done = std.atomic.Value(bool).init(false);
+    var threads: [8]std.Thread = undefined;
+    const ctx: Producer = .{ .wake = loop.waker(), .done = &done };
+    for (threads[0..producers]) |*t| t.* = try std.Thread.spawn(.{}, Producer.run, .{&ctx});
+    defer {
+        done.store(true, .release);
+        for (threads[0..producers]) |t| t.join();
+    }
+
+    var samples: [runs]i128 = undefined;
+    for (&samples) |*s| {
+        const t0 = nowNs();
+        var wakes: u64 = 0;
+        while (wakes < iters) {
+            try loop.wait();
+            while (loop.next()) |ev| {
+                if (ev == .wake) wakes += 1;
+            }
+        }
+        s.* = @divTrunc(nowNs() - t0, @as(i128, @intCast(wakes)));
+    }
+    return samples;
+}
+
+fn raiseNofile() void {
+    var rl = posix.getrlimit(.NOFILE) catch return;
+    rl.cur = rl.max;
+    posix.setrlimit(.NOFILE, rl) catch {};
 }
 
 pub fn main() !void {
-    const w = std.debug.lockStderrWriter(&.{});
-    defer std.debug.unlockStderrWriter();
+    raiseNofile();
 
-    try w.print("net-loop bench (ReleaseFast, median of {d} runs)\n", .{runs});
-    for ([_]u32{ 64, 1024, 8192 }) |n| {
-        const ns = try benchIdle(n);
-        try w.print("idle {d: >5} handles: {d: >8} ns/iter\n", .{ n, ns });
+    const idle_ns = [_]u32{ 0, 1000, 10000, 50000 };
+    for (idle_ns) |n| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "idle {d}", .{n});
+        const s = try benchIdle(n);
+        report(name, "/iter", &s);
     }
-    for ([_]u32{ 64, 1024 }) |n| {
-        const ns = try benchActive(n);
-        try w.print("active {d: >4} events:  {d: >8} ns/iter ({d: >6} ns/event)\n", .{ n, ns, @divTrunc(ns, @as(i128, n)) });
+
+    const active_as = [_]u32{ 1, 64, 1000 };
+    for (active_as) |a| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "event {d}", .{a});
+        const s = try benchEvent(a);
+        report(name, "/event", &s);
     }
-    const wake_ns = try benchWake();
-    try w.print("wake round trip:    {d: >8} ns\n", .{wake_ns});
+    for (active_as) |a| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "active {d}", .{a});
+        const s = try benchActive(a);
+        report(name, "/event", &s);
+    }
+
+    for ([_]usize{ 1, 8 }) |p| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "wake {d}", .{p});
+        const s = try benchWake(p);
+        report(name, "/wake", &s);
+    }
 }
