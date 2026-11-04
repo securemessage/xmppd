@@ -325,6 +325,79 @@ test "migrate-precis detects identity collisions on data and raw deletion cascad
     try expectMissing(&archive, NS_MESSAGES, "bob@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id-b1");
 }
 
+const NoDeleteBackend = struct {
+    inner: backend_mod.MemoryBackend,
+
+    pub const Iterator = backend_mod.MemoryBackend.Iterator;
+
+    pub fn open(path: []const u8, opts: backend_mod.OpenOptions) !NoDeleteBackend {
+        return .{ .inner = try backend_mod.MemoryBackend.open(path, opts) };
+    }
+
+    pub fn close(self: *NoDeleteBackend) void {
+        self.inner.close();
+    }
+
+    pub fn get(self: *NoDeleteBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+        return self.inner.get(allocator, ns, key);
+    }
+
+    pub fn put(self: *NoDeleteBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
+        try self.inner.put(ns, key, value);
+    }
+
+    pub fn delete(self: *NoDeleteBackend, ns: []const u8, key: []const u8) !void {
+        _ = self;
+        _ = ns;
+        _ = key;
+    }
+
+    pub fn iterator(self: *NoDeleteBackend, ns: []const u8, prefix: []const u8) !backend_mod.MemoryBackend.Iterator {
+        return self.inner.iterator(ns, prefix);
+    }
+
+    pub const WriteBatch = struct {
+        inner: backend_mod.MemoryBackend.WriteBatch,
+
+        pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            try self.inner.put(ns, key, value);
+        }
+
+        pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
+            _ = self;
+            _ = ns;
+            _ = key;
+        }
+
+        pub fn commit(self: *WriteBatch) !void {
+            try self.inner.commit();
+        }
+
+        pub fn abort(self: *WriteBatch) void {
+            self.inner.abort();
+        }
+    };
+
+    pub fn writeBatch(self: *NoDeleteBackend) !WriteBatch {
+        return .{ .inner = try self.inner.writeBatch() };
+    }
+};
+
+test "deluser --raw reports data that remains after an incomplete cascade" {
+    const allocator = std.testing.allocator;
+    var auth = try NoDeleteBackend.open("", .{});
+    defer auth.close();
+    var op = try NoDeleteBackend.open("", .{});
+    defer op.close();
+    var archive = try NoDeleteBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(NoDeleteBackend).init(&auth);
+    try users.addUser(allocator, "Bob", "pw");
+    const domains = [_][]const u8{"us.example"};
+    try std.testing.expectError(error.DataRemaining, migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "Bob"));
+}
+
 fn expectMissing(backend: anytype, namespace: []const u8, key: []const u8) !void {
     const stored = try backend.get(std.testing.allocator, namespace, key);
     defer if (stored) |bytes| std.testing.allocator.free(bytes);

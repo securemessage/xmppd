@@ -49,6 +49,17 @@ const log = std.log.scoped(.xmppd_auth);
 
 /// Certify the users namespace before any request is served. There is
 /// deliberately no raw-name read fallback.
+fn parseUsersScanLimit(text: []const u8) !usize {
+    return std.fmt.parseInt(usize, text, 10) catch error.InvalidArgs;
+}
+
+/// CLI wins over config, which wins over the built-in default.
+fn resolveUsersScanLimit(default: usize, cli_value: ?[]const u8, config_value: ?[]const u8) !usize {
+    if (cli_value) |v| return parseUsersScanLimit(v);
+    if (config_value) |v| return parseUsersScanLimit(v);
+    return default;
+}
+
 fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
     return user_store_mod.verifyPreparedUsers(Backend, backend, max_keys);
 }
@@ -77,7 +88,8 @@ pub fn main() !void {
     var rate_policy = RatePolicy{};
     var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
-    var users_scan_limit: usize = user_store_mod.max_startup_scan_keys;
+    var users_scan_limit_arg: ?[]const u8 = null;
+    var config_users_scan_limit: ?[]const u8 = null;
     // T121: crypto pool size. 0 disables (inline derive in the event loop).
     var crypto_threads: u32 = 4;
 
@@ -138,7 +150,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
             reg_config.require_invite = false;
         } else if (std.mem.eql(u8, arg, "--users-scan-limit")) {
-            users_scan_limit = parseU32Arg(args.next()) orelse {
+            users_scan_limit_arg = args.next() orelse {
                 log.err("--users-scan-limit requires a numeric value", .{});
                 return error.InvalidArgs;
             };
@@ -219,12 +231,21 @@ pub fn main() !void {
             if (std.mem.eql(u8, v, "false")) reg_config.require_invite = false;
         }
         if (c.get("auth", "users_scan_limit")) |v| {
-            users_scan_limit = std.fmt.parseInt(usize, v, 10) catch users_scan_limit;
+            config_users_scan_limit = v;
         }
 
         log.info("config file: {s}", .{cp});
     }
     defer if (cfg) |*c| c.deinit();
+
+    const users_scan_limit = resolveUsersScanLimit(
+        user_store_mod.max_startup_scan_keys,
+        users_scan_limit_arg,
+        config_users_scan_limit,
+    ) catch |err| {
+        log.err("invalid users_scan_limit value", .{});
+        return err;
+    };
 
     // Build auth-specific sub-path: {db_path}/auth
     var auth_path_buf: [1024]u8 = undefined;
@@ -241,6 +262,8 @@ pub fn main() !void {
     verifyUsersAtStartup(OpBackendType, &backend, users_scan_limit) catch |err| {
         if (err == error.ScanLimitExceeded) {
             log.err("users namespace exceeds the {d}-key startup scan bound; raise --users-scan-limit or review the account DB", .{users_scan_limit});
+        } else if (err == error.ScanFailed) {
+            log.err("users namespace scan failed; check the account database", .{});
         } else {
             log.err("users namespace is not in RFC 7622 prepared form ({}); run 'xmppctl migrate-precis --apply' offline before starting xmppd-auth", .{err});
         }
@@ -604,6 +627,15 @@ fn makeInviteValidator(is: *InviteStore, alloc: std.mem.Allocator) InviteValidat
 fn parseU32Arg(arg: ?[]const u8) ?u32 {
     const s = arg orelse return null;
     return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+test "auth startup: users_scan_limit config is parsed and validated" {
+    try std.testing.expectEqual(@as(usize, 500), try parseUsersScanLimit("500"));
+    try std.testing.expectError(error.InvalidArgs, parseUsersScanLimit("not-a-number"));
+    try std.testing.expectEqual(@as(usize, 100), try resolveUsersScanLimit(100000, "100", "200"));
+    try std.testing.expectEqual(@as(usize, 200), try resolveUsersScanLimit(100000, null, "200"));
+    try std.testing.expectEqual(@as(usize, 100000), try resolveUsersScanLimit(100000, null, null));
+    try std.testing.expectError(error.InvalidArgs, resolveUsersScanLimit(100000, null, "typo"));
 }
 
 test "auth startup: an unprepared users key refuses startup" {

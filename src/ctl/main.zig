@@ -569,8 +569,6 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
     for (plan.issues.items) |issue| {
         const key_hex = try migrate_precis.hexKey(allocator, issue.key);
         defer allocator.free(key_hex);
-        const target_hex = try migrate_precis.hexKey(allocator, issue.target);
-        defer allocator.free(target_hex);
         printErr(@tagName(issue.kind));
         printErr(" ");
         printErr(@tagName(issue.db));
@@ -580,7 +578,7 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
         printErr(key_hex);
         if (issue.target.len != 0) {
             printErr(" -> ");
-            printErr(target_hex);
+            printErr(issue.target);
         }
         printErr("\n");
     }

@@ -28,7 +28,7 @@ const log = std.log.scoped(.session_map);
 const MAX_RESOURCE_LEN: usize = 64;
 /// Full JIDs may contain a maximum-length RFC 7622 localpart plus domain and
 /// resource, so bare/full lookup buffers cannot cap at the old 320/384 bytes.
-const MAX_JID_OCTETS: usize = 2048;
+const MAX_JID_OCTETS: usize = 2112;
 
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {

@@ -14,10 +14,12 @@ const std = @import("std");
 const sasl = @import("sasl");
 const precis = @import("precis_username");
 
-/// Per-thread auth and IdP-identity scratch. The IdP copy is distinct so the
-/// typed authcid remains valid while the returned identity is prepared.
+/// Per-thread auth scratch. IdP PLAIN copies the typed authcid into a small
+/// local buffer before reusing it, so nested lock-store preparation stays
+/// independent without a third 64 KiB thread-local instance. The lock store
+/// owns the only other instance: it is called from inside this prepared
+/// authcid and therefore cannot share the same buffer.
 threadlocal var auth_precis_scratch: precis.Scratch = undefined;
-threadlocal var idp_identity_precis_scratch: precis.Scratch = undefined;
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const policy_mod = @import("policy");
@@ -386,7 +388,10 @@ pub fn AuthHandler(comptime Store: type) type {
                 if (result) |validated_user| {
                     // S3: locks and the bound JID use the prepared localpart
                     // of the identity the IdP handed back, never its domain.
-                    const identity = idp_identity_precis_scratch.localpart(
+                    var typed_account_buf: [precis.max_username_octets]u8 = undefined;
+                    @memcpy(typed_account_buf[0..typed_username.len], typed_username);
+                    const typed_stable = typed_account_buf[0..typed_username.len];
+                    const identity = auth_precis_scratch.localpart(
                         localpartOf(validated_user),
                     ) catch {
                         log.info("PLAIN auth failed (IdP): invalid returned identity", .{});
@@ -403,7 +408,7 @@ pub fn AuthHandler(comptime Store: type) type {
                             log.info("PLAIN auth failed (IdP): '{s}' maps to a locked identity", .{username});
                             // Same bookkeeping as a wrong password: the typed
                             // name and the IP, never the locked identity.
-                            self.policy.recordOutcome(typed_username, req.client_ip, .failure);
+                            self.policy.recordOutcome(typed_stable, req.client_ip, .failure);
                             return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                         }
                         return .{ .reply = authFailure(req.conn_id, reason) };
@@ -411,7 +416,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     if (self.policy.admitAccount(identity)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
                     }
-                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ typed_username, identity });
+                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ typed_stable, identity });
                     self.policy.recordOutcome(identity, req.client_ip, .success);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
@@ -565,7 +570,7 @@ pub fn AuthHandler(comptime Store: type) type {
             if (result) |validated_user| {
                 // Policy and the bound JID use the prepared localpart of the
                 // IdP-verified identity, never the full IdP-qualified string.
-                const identity = idp_identity_precis_scratch.localpart(
+                const identity = auth_precis_scratch.localpart(
                     localpartOf(validated_user),
                 ) catch {
                     log.info("OAUTHBEARER failed: invalid returned identity", .{});
