@@ -1841,6 +1841,60 @@ test "Loop: a deadline scheduled during a pass emits at most once per pass" {
     try std.testing.expectEqual(@as(usize, 2), deadline_passes);
 }
 
+extern "c" fn pthread_kill(t: std.c.pthread_t, sig: c_int) c_int;
+
+const SignalKicker = struct {
+    target: std.c.pthread_t,
+    stop: *const std.atomic.Value(bool),
+    sent: usize = 0,
+    fn run(self: *SignalKicker) void {
+        while (!self.stop.load(.acquire) and self.sent < 15) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            _ = pthread_kill(self.target, posix.SIG.USR1);
+            self.sent += 1;
+        }
+    }
+};
+
+test "Loop: an interrupted wait does not postpone an armed deadline" {
+    // P23: each EINTR resubmit of an EVFILT_TIMER add restarts the timer
+    // from now and discards an undelivered expiration, so signals every
+    // 100 ms must not push a 300 ms deadline past it.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = testSigHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.USR1, &act, &old);
+    defer posix.sigaction(posix.SIG.USR1, &old, null);
+
+    var stop = std.atomic.Value(bool).init(false);
+    var kicker: SignalKicker = .{ .target = std.c.pthread_self(), .stop = &stop };
+    defer {
+        stop.store(true, .release);
+        _ = pthread_kill(std.c.pthread_self(), posix.SIG.USR1);
+    }
+
+    const t0 = monotonicMs();
+    _ = try loop.scheduleIn(300, tctx(1));
+    const thread = try std.Thread.spawn(.{}, SignalKicker.run, .{&kicker});
+    defer thread.join();
+
+    var fired_ms: u64 = 0;
+    while (fired_ms == 0) {
+        try loop.wait();
+        while (loop.next()) |ev| {
+            if (ev == .deadline) fired_ms = monotonicMs() - t0;
+        }
+        if (monotonicMs() - t0 > 1500) break; // mutation lands the deadline late
+    }
+    try std.testing.expect(fired_ms < 600);
+}
+
 test "Loop: cancelTimer disarms the kernel timer" {
     var loop = try testLoop(null);
     defer loop.deinit(std.testing.allocator);
@@ -1991,6 +2045,39 @@ test "Loop: a signal pending at watch time emits once as a synthetic event" {
     while (loop.next()) |more| {
         if (more == .signal) try std.testing.expectEqual(posix.SIG.USR2, more.signal.signo);
     }
+}
+
+test "Loop: unwatchSignal surfaces a failed knote delete" {
+    // NotFound/BadDescriptor are the wanted state and swallowed; any other
+    // delete error propagates (V13e).
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+    try loop.watchSignal(posix.SIG.USR1);
+
+    const nullfd = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    defer posix.close(nullfd);
+    const kq = loop.kq;
+    loop.kq = nullfd; // not a kqueue: kevent answers EINVAL
+    defer loop.kq = kq;
+
+    try std.testing.expectError(error.InvalidArgument, loop.unwatchSignal(posix.SIG.USR1));
+}
+
+test "Loop: an unchanged deadline stages no timer re-arm" {
+    // DESIGN 14: the kernel timer re-arms only when the earliest deadline
+    // changes, not on every wait.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    _ = try loop.scheduleIn(10000, tctx(1));
+    loop.requestImmediate();
+    try loop.wait();
+    while (loop.next()) |_| {}
+    try std.testing.expect(loop.timer_armed);
+
+    loop.requestImmediate();
+    try loop.wait();
+    try std.testing.expectEqual(@as(usize, 0), loop.batch_changes);
 }
 
 test "Loop: unwatchSignal restores the pre-watch disposition" {

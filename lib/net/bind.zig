@@ -94,8 +94,11 @@ pub fn bindTcp(options: *const TcpOptions) BindTcpError!posix.fd_t {
         posix.setsockopt(fd, std.c.IPPROTO.TCP, tcp_nodelay, std.mem.asBytes(&one)) catch
             return error.Unexpected;
     }
-    if (addr.any.family == posix.AF.INET6 and options.v6_only) {
-        posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one)) catch
+    if (addr.any.family == posix.AF.INET6) {
+        // FreeBSD defaults V6ONLY on; the option must clear it for a
+        // dual-stack listener, not just set it.
+        const v6only: c_int = @intFromBool(options.v6_only);
+        posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&v6only)) catch
             return error.Unexpected;
     }
 
@@ -439,6 +442,7 @@ fn boundAddr(fd: posix.fd_t) !posix.sockaddr.storage {
 const AcceptDrain = struct {
     n: usize = 0,
     last: Listener.AcceptOutcome = .drained,
+    last_peer: ?Listener.Peer = null,
 
     /// acceptNext() until a terminal outcome; accepted fds land in `fds`.
     fn drain(
@@ -453,6 +457,7 @@ const AcceptDrain = struct {
             switch (out) {
                 .accepted => |a| {
                     fds[self.n] = a.fd;
+                    self.last_peer = a.peer;
                     self.n += 1;
                 },
                 else => return out,
@@ -490,6 +495,13 @@ test "bindTcp: listener accepts a non-blocking connection" {
     var d: AcceptDrain = .{};
     try std.testing.expect(try d.drain(&listener, &accepted) == .drained);
     try std.testing.expectEqual(@as(usize, 1), d.n);
+    const peer = d.last_peer.?;
+    try std.testing.expect(peer == .ip);
+    var caddr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var clen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try std.testing.expectEqual(0, std.c.getsockname(cfd, @ptrCast(&caddr), &clen));
+    const cs: *posix.sockaddr.in = @ptrCast(@alignCast(&caddr));
+    try std.testing.expect(peer.ip.in.sa.addr == cs.addr); // peer address is the client's
 
     // The accepted fd is non-blocking (empty read: WouldBlock) and inherits
     // TCP_NODELAY from the listener through the syncache.
@@ -519,6 +531,14 @@ test "bindTcp: IPv6 literal binds and accepts on ::1" {
     defer loop.deinit(std.testing.allocator);
 
     const lfd = try bindTcp(&.{ .address = "::1", .port = 0 });
+    // V6ONLY is on by default so the v6 listener never captures v4 traffic.
+    var v6only: c_int = 0;
+    var v6len: posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(
+        0,
+        std.c.getsockopt(lfd, std.c.IPPROTO.IPV6, 27, &v6only, &v6len), // IPV6_V6ONLY
+    );
+    try std.testing.expect(v6only != 0);
     const bound = try boundAddr(lfd);
     var listener: Listener = undefined;
     try listener.attach(&loop, lfd, test_ctx, .tcp);
@@ -538,6 +558,26 @@ test "bindTcp: IPv6 literal binds and accepts on ::1" {
     const out = try d.drain(&listener, &accepted);
     try std.testing.expectEqual(@as(usize, 1), d.n);
     try std.testing.expect(out == .drained);
+}
+
+test "bindTcp: v6_only false leaves the v6 listener dual-stack" {
+    // FreeBSD defaults IPV6_V6ONLY on; the option must clear it explicitly.
+    const lfd = try bindTcp(&.{ .address = "::1", .port = 0, .v6_only = false });
+    defer posix.close(lfd);
+    var v6only: c_int = 1;
+    var v6len: posix.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(
+        0,
+        std.c.getsockopt(lfd, std.c.IPPROTO.IPV6, 27, &v6only, &v6len), // IPV6_V6ONLY
+    );
+    try std.testing.expectEqual(@as(c_int, 0), v6only);
+}
+
+test "bindTcp: a non-local address reports AddressNotAvailable" {
+    try std.testing.expectError(
+        error.AddressNotAvailable,
+        bindTcp(&.{ .address = "192.0.2.1", .port = 0 }), // TEST-NET-1, never local
+    );
 }
 
 test "bindTcp: a DNS name is rejected, a bad literal is rejected" {
@@ -877,6 +917,52 @@ fn childEmfile() void {
     // are both accepted after the resume.
     if (n != 2) posix.exit(20);
     posix.exit(0);
+}
+
+test "Listener: a close-resumed pause cancels the armed fallback" {
+    // Without the cancel a stale deadline fires later and resumes whatever
+    // pause is armed then (V08b).
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+
+    var pair: [2]posix.fd_t = undefined;
+    const sp_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    try std.testing.expectEqual(0, std.c.socketpair(posix.AF.UNIX, sp_flags, 0, &pair));
+    const h = try loop.attach(pair[0], test_ctx, .{ .read = true });
+    posix.close(pair[1]);
+
+    try loop.pauseReadUntilClose(listener.handle);
+    listener.fallback_timer = try loop.scheduleIn(60000, .none);
+    try loop.close(h); // a close on this loop resumes the pause
+
+    _ = listener.acceptNext() catch {}; // preamble cancels the fallback
+    try std.testing.expect(listener.fallback_timer == null);
+    try std.testing.expectEqual(@as(usize, 0), loop.wheel.entries.count());
+}
+
+test "Listener: onDeadline claims only the fallback timer" {
+    // An unrelated deadline while the fallback is armed must not lift the
+    // pause or consume the TimerId (V09).
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    var listener: Listener = undefined;
+    try listener.attach(&loop, lfd, test_ctx, .tcp);
+    try loop.pauseReadUntilClose(listener.handle);
+
+    const fallback = try loop.scheduleIn(60000, .none);
+    listener.fallback_timer = fallback;
+    const other = try loop.scheduleIn(60000, .none);
+
+    try std.testing.expect(!listener.onDeadline(.{ .timer = other, .ctx = .none }));
+    try std.testing.expect(listener.fallback_timer != null);
+    try std.testing.expect(listener.onDeadline(.{ .timer = fallback, .ctx = .none }));
+    try std.testing.expect(listener.fallback_timer == null);
 }
 
 test "Listener: EMFILE relieved outside the loop resumes on the fallback" {

@@ -54,7 +54,10 @@ pub fn submitWait(
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => {
-                // Changes were applied before the scan was interrupted.
+                // Changes were applied before the scan was interrupted, so
+                // do not resubmit them: an EV_ADD on an armed EVFILT_TIMER
+                // restarts it from now and discards an undelivered
+                // expiration (kern_event.c). Resubmitting is not idempotent.
                 pending = &.{};
                 continue;
             },
