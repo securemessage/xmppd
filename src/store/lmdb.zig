@@ -9,6 +9,7 @@
 //! MAP_FULL surfaces as an error, tune via [server] lmdb_map_size_mb).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lmdb = @import("lmdb");
 const backend = @import("backend");
 
@@ -25,7 +26,47 @@ const MdbEnvInfoC = extern struct {
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
 
+// madvise seam: test builds record the arguments instead of advising the
+// kernel, so a test can compare the advised range against mdb_env_info.
+const madviseCall = if (builtin.is_test) struct {
+    var calls: usize = 0;
+    var addr: usize = 0;
+    var len: usize = 0;
+    var advice: u32 = 0;
+    var result: c_int = 0;
+
+    fn run(a: usize, l: usize, adv: u32) c_int {
+        calls += 1;
+        addr = a;
+        len = l;
+        advice = adv;
+        return result;
+    }
+} else struct {
+    fn run(a: usize, l: usize, adv: u32) c_int {
+        const ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(a);
+        return std.c.madvise(ptr, l, adv);
+    }
+};
+
 const log = std.log.scoped(.lmdb_store);
+
+/// Exclude the env map from core dumps: a crash would otherwise write
+/// every touched LMDB page (SCRAM keys, rosters, archive contents) into
+/// the core file. One call covers the whole map lifetime because the map
+/// size is never resized at runtime (S9, T358), so no re-apply path is
+/// needed. Failure is logged once and does not fail the open.
+fn excludeMapFromCoreDump(env: lmdb.Environment) void {
+    var info: MdbEnvInfoC = undefined;
+    if (mdb_env_info(env.ptr, &info) != 0) {
+        log.warn("mdb_env_info failed: LMDB map stays in core dumps", .{});
+        return;
+    }
+    const rc = madviseCall.run(info.me_mapaddr, info.me_mapsize, std.c.MADV.NOCORE);
+    if (rc != 0) {
+        log.warn("madvise MADV_NOCORE on the LMDB map failed (errno {d}): map stays in core dumps", .{@intFromEnum(std.posix.errno(rc))});
+    }
+}
 
 const MAX_DBS = 16;
 
@@ -81,6 +122,7 @@ pub const LmdbBackend = struct {
         // that follows the failure then runs a second env on the same
         // files, where LMDB drops the process's lock-file locks (D5).
         errdefer env.deinit();
+        excludeMapFromCoreDump(env);
 
         var self: LmdbBackend = .{
             .env = env,
@@ -774,4 +816,51 @@ test "LmdbBackend: a failed read-only open closes the env it created (D5)" {
         return error.ShouldHaveFailed;
     } else |_| {}
     try std.testing.expectEqual(before, countOpenFds());
+}
+
+test "LmdbBackend: open advises MADV_NOCORE over the mdb_env_info range" {
+    // Goal: read-write and read-only opens both exclude exactly the env
+    // map range from core dumps. Method: the test seam records madvise
+    // arguments; compare them against a fresh mdb_env_info call.
+    const path = freshTestDir();
+    var info: MdbEnvInfoC = undefined;
+
+    const calls0 = madviseCall.calls;
+    {
+        var db = try LmdbBackend.open(path, .{});
+        defer db.close();
+        try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapaddr, madviseCall.addr);
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+        try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+    }
+
+    const calls1 = madviseCall.calls;
+    {
+        var db = try LmdbBackend.open(path, .{ .create = false, .read_only = true });
+        defer db.close();
+        try std.testing.expectEqual(calls1 + 1, madviseCall.calls);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapaddr, madviseCall.addr);
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+        try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+    }
+}
+
+test "LmdbBackend: a madvise failure does not fail the open" {
+    // Goal: open() succeeds and the store still works when MADV_NOCORE
+    // cannot be applied. Method: the test seam returns an error.
+    const path = freshTestDir();
+    madviseCall.result = -1;
+    defer madviseCall.result = 0;
+
+    const calls0 = madviseCall.calls;
+    var db = try LmdbBackend.open(path, .{});
+    try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
+    defer db.close();
+    try db.put("users", "alice", "creds");
+    const val = try db.get(std.testing.allocator, "users", "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("creds", val.?);
 }
