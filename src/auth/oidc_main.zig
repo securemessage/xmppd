@@ -600,15 +600,11 @@ pub const Daemon = struct {
             return true;
         }
 
-        const job_id = self.pool.put(cred) catch {
-            self.replyTemporary(req.conn_id, slot);
-            return true;
-        };
-
-        // Own the request bytes for the replay: the recv buffer is recycled.
+        // Own the request bytes for the replay: the recv buffer is
+        // recycled. Copied before queueing so an OOM here cannot leave an
+        // orphan job running against the IdP.
         const owned_len = req.client_ip.len + req.username.len + req.payload.len + req.cb_data.len;
         const owned = self.allocator.alloc(u8, owned_len) catch {
-            log.err("IdP pending copy alloc failed; job {d} completes orphaned", .{job_id});
             self.replyTemporary(req.conn_id, slot);
             return true;
         };
@@ -635,6 +631,14 @@ pub const Daemon = struct {
             .account_key_len = @intCast(account_key.len),
         };
         @memcpy(pend.account_key[0..account_key.len], account_key);
+
+        const job_id = self.pool.put(cred) catch {
+            std.crypto.secureZero(u8, owned);
+            self.allocator.free(owned);
+            self.replyTemporary(req.conn_id, slot);
+            return true;
+        };
+
         // Capacity was ensured for the pool bound at init; outstanding jobs
         // can never exceed it.
         self.pending.putAssumeCapacity(job_id, pend);
@@ -1058,6 +1062,46 @@ fn plainAuth(conn_id: u32, username: []const u8, password: []const u8, client_ip
     } };
 }
 
+/// Test allocator that fails every allocation of `bad_len` while armed.
+const FailOnLen = struct {
+    inner: Allocator,
+    armed: bool = false,
+    bad_len: usize = 0,
+
+    fn allocator(self: *FailOnLen) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .remap = remapFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailOnLen = @ptrCast(@alignCast(ctx));
+        if (self.armed and len == self.bad_len) return null;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *FailOnLen = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *FailOnLen = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *FailOnLen = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
 fn rawAuth(conn_id: u32, mechanism: protocol.MechanismId, username: []const u8, payload: []const u8, client_ip: []const u8) protocol.Message {
     return .{ .auth_request = .{
         .conn_id = conn_id,
@@ -1357,6 +1401,51 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
             return error.UnexpectedReply;
         }
     }
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+}
+
+test "an OOM on the pending copy queues no orphan job" {
+    const allocator = std.testing.allocator;
+    const port = try refusedPort();
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/token", .{port});
+
+    var falloc = FailOnLen{ .inner = allocator };
+    const test_alloc = falloc.allocator();
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(test_alloc, url, null, null, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 500,
+        .timeout_ms = 2000,
+    });
+    defer fx.deinit(test_alloc);
+
+    var client = try connectClient(test_alloc, &fx);
+    defer client.close();
+
+    const m = plainAuth(1, "alice", "pw", "10.0.0.1");
+    defer allocator.free(m.auth_request.payload);
+    try client.send(m);
+
+    // Fail exactly the pending-copy allocation while the dispatch runs.
+    falloc.bad_len = m.auth_request.client_ip.len + m.auth_request.username.len +
+        m.auth_request.payload.len + m.auth_request.cb_data.len;
+    falloc.armed = true;
+    try fx.daemon.step(10);
+    falloc.armed = false;
+
+    const reply = (try client.nextReply(&fx.daemon, 1000)).?;
+    try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
+    try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+
+    // Nothing ever reached the pool: a job queued before the failed copy
+    // would run as an orphan and spend an exchange against the IdP.
+    const drain = std.time.milliTimestamp() + 500;
+    while (std.time.milliTimestamp() < drain) try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pool.exchanges_run.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), fx.daemon.pool.outstanding());
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
 }
 
