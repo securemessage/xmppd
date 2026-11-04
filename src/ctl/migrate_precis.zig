@@ -101,6 +101,49 @@ const Rewrite = struct {
     }
 };
 
+/// Tracks every source localpart that folds to an identity, not just users
+/// keys. Two different source spellings of one target are a data collision in
+/// whichever namespace reveals the second spelling.
+const IdentityTracker = struct {
+    plan: *Plan,
+    sources: std.StringHashMapUnmanaged([]const u8) = .{},
+    db: Database,
+    namespace: []const u8,
+
+    fn deinit(self: *IdentityTracker, allocator: std.mem.Allocator) void {
+        var iterator = self.sources.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.sources.deinit(allocator);
+    }
+
+    fn record(self: *IdentityTracker, source: []const u8, target: []const u8) !void {
+        const allocator = self.plan.allocator;
+        const gop = try self.sources.getOrPut(allocator, target);
+        if (!gop.found_existing) {
+            const target_copy = try allocator.dupe(u8, target);
+            errdefer allocator.free(target_copy);
+            const source_copy = try allocator.dupe(u8, source);
+            errdefer allocator.free(source_copy);
+            gop.key_ptr.* = target_copy;
+            gop.value_ptr.* = source_copy;
+            return;
+        }
+        if (std.mem.eql(u8, gop.value_ptr.*, source)) return;
+        const detail = try std.fmt.allocPrint(allocator, "{s} -> {s}", .{ gop.value_ptr.*, target });
+        defer allocator.free(detail);
+        try addIssue(self.plan, self.db, self.namespace, .collision, source, detail);
+    }
+};
+
+const RewriteContext = struct {
+    hosted_domains: []const []const u8,
+    forced: ?ForcedRename,
+    identities: *IdentityTracker,
+};
+
 fn isHosted(domain: []const u8, hosted_domains: []const []const u8) bool {
     for (hosted_domains) |hosted| {
         if (std.mem.eql(u8, domain, hosted)) return true;
@@ -108,13 +151,10 @@ fn isHosted(domain: []const u8, hosted_domains: []const []const u8) bool {
     return false;
 }
 
-fn rewriteLocalpart(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    forced: ?ForcedRename,
-) !?[]u8 {
-    if (forced) |rename| {
+fn rewriteLocalpart(allocator: std.mem.Allocator, name: []const u8, ctx: *const RewriteContext) !?[]u8 {
+    if (ctx.forced) |rename| {
         if (std.mem.eql(u8, name, rename.old_localpart)) {
+            try ctx.identities.record(name, rename.new_localpart);
             return try allocator.dupe(u8, rename.new_localpart);
         }
     }
@@ -124,25 +164,21 @@ fn rewriteLocalpart(
     var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
     const prepared = precis.xmppLocalpart(name, &prep_buf, &scratch_cps, &scratch_cccs) catch
         return error.InvalidAccountName;
+    try ctx.identities.record(name, prepared);
     if (std.mem.eql(u8, prepared, name)) return null;
     return try allocator.dupe(u8, prepared);
 }
 
-fn rewriteJid(
-    allocator: std.mem.Allocator,
-    jid: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
-) !?[]u8 {
+fn rewriteJid(allocator: std.mem.Allocator, jid: []const u8, ctx: *const RewriteContext) !?[]u8 {
     // A domain-only JID (with or without a resource) has no account
     // localpart and must stay exactly as stored.
     const at = std.mem.indexOfScalar(u8, jid, '@') orelse return null;
     const remainder = jid[at + 1 ..];
     const slash = std.mem.indexOfScalar(u8, remainder, '/');
     const domain = if (slash) |pos| remainder[0..pos] else remainder;
-    if (!isHosted(domain, hosted_domains)) return null;
+    if (!isHosted(domain, ctx.hosted_domains)) return null;
 
-    const new_local = try rewriteLocalpart(allocator, jid[0..at], forced) orelse return null;
+    const new_local = try rewriteLocalpart(allocator, jid[0..at], ctx) orelse return null;
     defer allocator.free(new_local);
     const suffix = jid[at..];
     const result = try allocator.alloc(u8, new_local.len + suffix.len);
@@ -154,8 +190,7 @@ fn rewriteJid(
 fn rewriteTwoParts(
     allocator: std.mem.Allocator,
     key: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
     first_is_localpart: bool,
     second_is_localpart: bool,
 ) !?[]u8 {
@@ -163,14 +198,14 @@ fn rewriteTwoParts(
     const first = key[0..sep];
     const second = key[sep + 1 ..];
     const new_first = if (first_is_localpart)
-        try rewriteLocalpart(allocator, first, forced)
+        try rewriteLocalpart(allocator, first, ctx)
     else
-        try rewriteJid(allocator, first, hosted_domains, forced);
+        try rewriteJid(allocator, first, ctx);
     errdefer if (new_first) |value| allocator.free(value);
     const new_second = if (second_is_localpart)
-        try rewriteLocalpart(allocator, second, forced)
+        try rewriteLocalpart(allocator, second, ctx)
     else
-        try rewriteJid(allocator, second, hosted_domains, forced);
+        try rewriteJid(allocator, second, ctx);
     errdefer if (new_second) |value| allocator.free(value);
     if (new_first == null and new_second == null) return null;
 
@@ -188,12 +223,11 @@ fn rewriteTwoParts(
 fn rewriteFirstAndSuffix(
     allocator: std.mem.Allocator,
     key: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !?[]u8 {
     const sep = std.mem.indexOfScalar(u8, key, 0) orelse
-        return rewriteJid(allocator, key, hosted_domains, forced);
-    const new_first = try rewriteJid(allocator, key[0..sep], hosted_domains, forced) orelse
+        return rewriteJid(allocator, key, ctx);
+    const new_first = try rewriteJid(allocator, key[0..sep], ctx) orelse
         return null;
     defer allocator.free(new_first);
     const suffix = key[sep..];
@@ -206,21 +240,19 @@ fn rewriteFirstAndSuffix(
 fn rewriteByContact(
     allocator: std.mem.Allocator,
     key: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !?[]u8 {
     const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     const second_sep_relative = std.mem.indexOfScalar(u8, key[first_sep + 1 ..], 0) orelse
-        return rewriteTwoParts(allocator, key, hosted_domains, forced, false, false);
+        return rewriteTwoParts(allocator, key, ctx, false, false);
     const second_sep = first_sep + 1 + second_sep_relative;
 
-    const new_owner = try rewriteJid(allocator, key[0..first_sep], hosted_domains, forced);
+    const new_owner = try rewriteJid(allocator, key[0..first_sep], ctx);
     errdefer if (new_owner) |value| allocator.free(value);
     const new_contact = try rewriteJid(
         allocator,
         key[first_sep + 1 .. second_sep],
-        hosted_domains,
-        forced,
+        ctx,
     );
     errdefer if (new_contact) |value| allocator.free(value);
     if (new_owner == null and new_contact == null) return null;
@@ -241,13 +273,12 @@ fn rewriteByContact(
 fn rewriteRoomAffiliation(
     allocator: std.mem.Allocator,
     key: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !?[]u8 {
     const sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     // The room JID is an OpaqueString room name and stays as stored. Only the
     // member JID is an account localpart in scope for this migration.
-    const new_member = try rewriteJid(allocator, key[sep + 1 ..], hosted_domains, forced) orelse
+    const new_member = try rewriteJid(allocator, key[sep + 1 ..], ctx) orelse
         return null;
     defer allocator.free(new_member);
     const room = key[0 .. sep + 1];
@@ -263,35 +294,36 @@ fn rewriteEntry(
     namespace: []const u8,
     key: []const u8,
     value: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !Rewrite {
     var rewrite: Rewrite = .{};
     errdefer rewrite.deinit(allocator);
+    ctx.identities.db = db;
+    ctx.identities.namespace = namespace;
 
     if (db == .auth and
         (std.mem.eql(u8, namespace, NS_USERS) or std.mem.eql(u8, namespace, NS_LOCKS)))
     {
-        rewrite.new_key = try rewriteLocalpart(allocator, key, forced);
+        rewrite.new_key = try rewriteLocalpart(allocator, key, ctx);
     } else if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST))
     {
-        rewrite.new_key = try rewriteTwoParts(allocator, key, hosted_domains, forced, false, false);
+        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false);
     } else if (std.mem.eql(u8, namespace, NS_PENDING_SUB)) {
-        rewrite.new_key = try rewriteTwoParts(allocator, key, hosted_domains, forced, false, false);
+        rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false);
     } else if (std.mem.eql(u8, namespace, NS_BY_CONTACT)) {
-        rewrite.new_key = try rewriteByContact(allocator, key, hosted_domains, forced);
+        rewrite.new_key = try rewriteByContact(allocator, key, ctx);
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
-        rewrite.new_key = try rewriteRoomAffiliation(allocator, key, hosted_domains, forced);
+        rewrite.new_key = try rewriteRoomAffiliation(allocator, key, ctx);
     } else if (std.mem.eql(u8, namespace, NS_VCARDS) or
         std.mem.eql(u8, namespace, NS_LASTACT) or
         std.mem.eql(u8, namespace, NS_PEP) or
         std.mem.eql(u8, namespace, NS_OFFLINE) or
         std.mem.eql(u8, namespace, NS_MESSAGES))
     {
-        rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, hosted_domains, forced);
+        rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx);
         if (std.mem.eql(u8, namespace, NS_OFFLINE)) {
-            rewrite.new_value = try rewriteJid(allocator, value, hosted_domains, forced);
+            rewrite.new_value = try rewriteJid(allocator, value, ctx);
         }
     }
 
@@ -343,8 +375,7 @@ fn planNamespace(
     db: Database,
     backend: anytype,
     namespace: []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !void {
     // LMDB allows one transaction per thread. Collect every rewrite first,
     // close the iterator's read transaction, and only then issue collision
@@ -370,8 +401,7 @@ fn planNamespace(
                 namespace,
                 entry.key,
                 entry.value,
-                hosted_domains,
-                forced,
+                ctx,
             ) catch |err| switch (err) {
                 error.InvalidAccountName => {
                     try addIssue(plan, db, namespace, .invalid_name, entry.key, "");
@@ -436,11 +466,10 @@ fn planDb(
     db: Database,
     backend: anytype,
     namespaces: []const []const u8,
-    hosted_domains: []const []const u8,
-    forced: ?ForcedRename,
+    ctx: *const RewriteContext,
 ) !void {
     for (namespaces) |namespace| {
-        try planNamespace(plan, targets, db, backend, namespace, hosted_domains, forced);
+        try planNamespace(plan, targets, db, backend, namespace, ctx);
     }
 }
 
@@ -498,7 +527,15 @@ pub fn planMigration(
         targets.deinit(allocator);
     }
 
-    try planDb(&plan, &targets, .auth, auth, &.{ NS_USERS, NS_LOCKS }, hosted_domains, forced);
+    var identities = IdentityTracker{ .plan = &plan, .db = .auth, .namespace = "" };
+    defer identities.deinit(allocator);
+    const ctx = RewriteContext{
+        .hosted_domains = hosted_domains,
+        .forced = forced,
+        .identities = &identities,
+    };
+
+    try planDb(&plan, &targets, .auth, auth, &.{ NS_USERS, NS_LOCKS }, &ctx);
     try planDb(&plan, &targets, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -508,8 +545,8 @@ pub fn planMigration(
         NS_OFFLINE,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
-    }, hosted_domains, forced);
-    try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, hosted_domains, forced);
+    }, &ctx);
+    try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, &ctx);
 
     std.sort.heap(Rename, plan.renames.items, {}, renameLessThan);
     std.sort.heap(Issue, plan.issues.items, {}, issueLessThan);
@@ -698,6 +735,170 @@ pub fn applyPlan(
         try applyGroupedDb(op, allocator, plan, .op, options.journal_dir);
     }
     try applyGroupedDb(archive, allocator, plan, .archive, options.journal_dir);
+}
+
+const Deletion = struct {
+    db: Database,
+    namespace: []const u8,
+    key: []u8,
+};
+
+fn jidMatchesRaw(jid: []const u8, raw: []const u8, hosted_domains: []const []const u8) bool {
+    const at = std.mem.indexOfScalar(u8, jid, '@') orelse return false;
+    const remainder = jid[at + 1 ..];
+    const slash = std.mem.indexOfScalar(u8, remainder, '/');
+    const domain = if (slash) |pos| remainder[0..pos] else remainder;
+    return isHosted(domain, hosted_domains) and std.mem.eql(u8, jid[0..at], raw);
+}
+
+fn firstJidMatchesRaw(key: []const u8, raw: []const u8, hosted_domains: []const []const u8) bool {
+    const sep = std.mem.indexOfScalar(u8, key, 0) orelse return jidMatchesRaw(key, raw, hosted_domains);
+    return jidMatchesRaw(key[0..sep], raw, hosted_domains);
+}
+
+fn entryMatchesRaw(
+    db: Database,
+    namespace: []const u8,
+    key: []const u8,
+    value: []const u8,
+    raw: []const u8,
+    hosted_domains: []const []const u8,
+) bool {
+    _ = db;
+    if (std.mem.eql(u8, namespace, NS_USERS)) return std.mem.eql(u8, key, raw);
+    if (std.mem.eql(u8, namespace, NS_LOCKS)) {
+        if (std.mem.eql(u8, key, raw)) return true;
+        var prep_buf: [6 * precis.max_input_octets]u8 = undefined;
+        var scratch_cps: [3 * precis.max_input_octets]u21 = undefined;
+        var scratch_cccs: [3 * precis.max_input_octets]u8 = undefined;
+        const prepared = precis.xmppLocalpart(raw, &prep_buf, &scratch_cps, &scratch_cccs) catch return false;
+        return std.mem.eql(u8, key, prepared);
+    }
+    if (std.mem.eql(u8, namespace, NS_ROSTERS) or
+        std.mem.eql(u8, namespace, NS_BLOCKLIST) or
+        std.mem.eql(u8, namespace, NS_PENDING_SUB))
+    {
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+        return jidMatchesRaw(key[0..sep], raw, hosted_domains) or
+            jidMatchesRaw(key[sep + 1 ..], raw, hosted_domains);
+    }
+    if (std.mem.eql(u8, namespace, NS_BY_CONTACT)) {
+        const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+        if (jidMatchesRaw(key[0..first_sep], raw, hosted_domains)) return true;
+        const remainder = key[first_sep + 1 ..];
+        const second_sep = std.mem.indexOfScalar(u8, remainder, 0) orelse remainder.len;
+        return jidMatchesRaw(remainder[0..second_sep], raw, hosted_domains);
+    }
+    if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+        return jidMatchesRaw(key[sep + 1 ..], raw, hosted_domains);
+    }
+    if (std.mem.eql(u8, namespace, NS_VCARDS) or
+        std.mem.eql(u8, namespace, NS_LASTACT) or
+        std.mem.eql(u8, namespace, NS_PEP) or
+        std.mem.eql(u8, namespace, NS_OFFLINE) or
+        std.mem.eql(u8, namespace, NS_MESSAGES))
+    {
+        if (firstJidMatchesRaw(key, raw, hosted_domains)) return true;
+        return std.mem.eql(u8, namespace, NS_OFFLINE) and jidMatchesRaw(value, raw, hosted_domains);
+    }
+    return false;
+}
+
+fn collectRawDeletions(
+    deletions: *std.ArrayListUnmanaged(Deletion),
+    allocator: std.mem.Allocator,
+    db: Database,
+    backend: anytype,
+    namespaces: []const []const u8,
+    raw: []const u8,
+    hosted_domains: []const []const u8,
+) !void {
+    for (namespaces) |namespace| {
+        var iterator = try backend.iterator(namespace, "");
+        defer iterator.deinit();
+        while (iterator.next()) |entry| {
+            if (!entryMatchesRaw(db, namespace, entry.key, entry.value, raw, hosted_domains)) continue;
+            const key = try allocator.dupe(u8, entry.key);
+            errdefer allocator.free(key);
+            try deletions.append(allocator, .{ .db = db, .namespace = namespace, .key = key });
+        }
+    }
+}
+
+fn deleteRawDb(backend: anytype, deletions: []const Deletion, db: Database) !void {
+    var any = false;
+    for (deletions) |deletion| {
+        if (deletion.db == db) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+    var batch = try backend.writeBatch();
+    errdefer batch.abort();
+    for (deletions) |deletion| {
+        if (deletion.db != db) continue;
+        try batch.delete(deletion.namespace, deletion.key);
+    }
+    try batch.commit();
+}
+
+fn freeDeletions(deletions: *std.ArrayListUnmanaged(Deletion), allocator: std.mem.Allocator) void {
+    for (deletions.items) |deletion| allocator.free(deletion.key);
+    deletions.deinit(allocator);
+}
+
+/// Delete every row belonging to one exact source localpart, in every
+/// namespace, or fail without applying a partial migration. Only exact source
+/// spellings match, so the prepared account that survives a collision keeps its
+/// own rows. Folded lock rows and JID index fields are included; stanza payload
+/// bytes are not inspected.
+pub fn deleteRawAccount(
+    allocator: std.mem.Allocator,
+    auth: anytype,
+    op: anytype,
+    archive: anytype,
+    hosted_domains: []const []const u8,
+    raw: []const u8,
+) !void {
+    const existing = try auth.get(allocator, NS_USERS, raw) orelse return error.UserNotFound;
+    allocator.free(existing);
+
+    var deletions: std.ArrayListUnmanaged(Deletion) = .{};
+    defer freeDeletions(&deletions, allocator);
+    try collectRawDeletions(&deletions, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains);
+    try collectRawDeletions(&deletions, allocator, .op, op, &.{
+        NS_ROSTERS,
+        NS_BLOCKLIST,
+        NS_VCARDS,
+        NS_PEP,
+        NS_LASTACT,
+        NS_OFFLINE,
+        NS_ROOM_AFFILIATIONS,
+        NS_PENDING_SUB,
+    }, raw, hosted_domains);
+    try collectRawDeletions(&deletions, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains);
+
+    try deleteRawDb(auth, deletions.items, .auth);
+    try deleteRawDb(op, deletions.items, .op);
+    try deleteRawDb(archive, deletions.items, .archive);
+
+    var remaining: std.ArrayListUnmanaged(Deletion) = .{};
+    defer freeDeletions(&remaining, allocator);
+    try collectRawDeletions(&remaining, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains);
+    try collectRawDeletions(&remaining, allocator, .op, op, &.{
+        NS_ROSTERS,
+        NS_BLOCKLIST,
+        NS_VCARDS,
+        NS_PEP,
+        NS_LASTACT,
+        NS_OFFLINE,
+        NS_ROOM_AFFILIATIONS,
+        NS_PENDING_SUB,
+    }, raw, hosted_domains);
+    try collectRawDeletions(&remaining, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains);
+    if (remaining.items.len != 0) return error.DataRemaining;
 }
 
 /// Refuse to operate while any daemon named by the master's pid files is live.

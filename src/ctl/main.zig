@@ -128,6 +128,18 @@ pub fn main() !void {
         return runMigratePrecis(allocator, db_path, run_dir, apply, hosted_domains.items, forced);
     }
 
+    if (raw and std.mem.eql(u8, command, "deluser")) {
+        if (remaining_args.items.len < 2) {
+            printErr("deluser --raw requires an exact stored key\n");
+            return error.InvalidArgs;
+        }
+        if (hosted_domains.items.len == 0) {
+            printErr("deluser --raw requires at least one --hosted-domain\n");
+            return error.InvalidArgs;
+        }
+        return runDeleteRaw(allocator, db_path, run_dir, hosted_domains.items, remaining_args.items[1]);
+    }
+
     // Try IPC to running auth daemon first for adduser/deluser/passwd.
     // This is required for RocksDB (exclusive lock) and preferred for all backends.
     if (!raw and (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd"))) {
@@ -220,23 +232,16 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
         const jid = remaining_args.items[1];
-        const username = if (raw) jid else extractLocal(jid);
+        const username = extractLocal(jid);
 
-        if (raw) {
-            removeUserRaw(&store, allocator, username) catch |err| {
-                if (err == error.UserNotFound) printErr("user not found\n");
-                return err;
-            };
-        } else {
-            removeUserCanonical(&store, allocator, username) catch |err| {
-                switch (err) {
-                    error.InvalidAccountName => printErr("invalid account name\n"),
-                    error.UserNotFound => printErr("user not found\n"),
-                    else => return err,
-                }
-                return err;
-            };
-        }
+        removeUserCanonical(&store, allocator, username) catch |err| {
+            switch (err) {
+                error.InvalidAccountName => printErr("invalid account name\n"),
+                error.UserNotFound => printErr("user not found\n"),
+                else => return err,
+            }
+            return err;
+        };
         printOut("User ");
         printOut(jid);
         printOut(" removed.\n");
@@ -436,6 +441,44 @@ fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []cons
     try store.removeUser(allocator, canon);
 }
 
+fn runDeleteRaw(
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    run_dir: []const u8,
+    hosted_domains: []const []const u8,
+    stored_key: []const u8,
+) !void {
+    migrate_precis.assertOffline(run_dir) catch |err| {
+        printErr("xmppd is running; stop all daemons before deluser --raw\n");
+        return err;
+    };
+    var auth_path_buf: [1024]u8 = undefined;
+    const auth_path = try std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path});
+    var op_path_buf: [1024]u8 = undefined;
+    const op_path = try std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db_path});
+    var archive_path_buf: [1024]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
+
+    var auth = try OpBackendType.open(auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    defer auth.close();
+    var op = try OpBackendType.open(op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    defer op.close();
+    var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
+    defer archive.close();
+
+    migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
+        switch (err) {
+            error.UserNotFound => printErr("user not found\n"),
+            error.DataRemaining => printErr("account data remains; inspect the DB and rerun\n"),
+            else => printErr("failed to delete account data\n"),
+        }
+        return err;
+    };
+    printOut("User ");
+    printOut(stored_key);
+    printOut(" and all matching account data removed.\n");
+}
+
 fn runMigratePrecis(
     allocator: std.mem.Allocator,
     db_path: []const u8,
@@ -521,12 +564,6 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
         }
         printErr("\n");
     }
-}
-
-/// Delete one exact stored users key without preparation. This is the
-/// collision-resolution escape hatch for migrate-precis, not normal deletion.
-fn removeUserRaw(store: anytype, allocator: std.mem.Allocator, stored_key: []const u8) !void {
-    try store.removeUser(allocator, stored_key);
 }
 
 fn extractLocal(jid: []const u8) []const u8 {
@@ -773,7 +810,8 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  adduser JID     Create a user account
-        \\  deluser JID     Remove a user account (--raw deletes the exact stored key)
+        \\  deluser JID     Remove a user account
+        \\  deluser --raw KEY  Offline: delete KEY's data in every namespace
         \\  passwd  JID     Change a user's password
         \\  listusers       List all users
         \\  lock JID        Permanently lock an account
@@ -791,7 +829,7 @@ fn printUsage() void {
         \\  --password PASS     Provide password on command line (non-interactive)
         \\  --password-file F   Read password from file (first line, trailing newline stripped)
         \\  --apply             Apply migrate-precis renames (default is a dry run)
-        \\  --raw               deluser: delete the exact stored users key
+        \\  --raw               deluser: exact source localpart; requires --hosted-domain
         \\  --run-dir PATH      Daemon pid-file directory (default: /var/run/xmppd)
         \\  --hosted-domain D   Hosted account domain; repeat for each domain
         \\  --rename OLD NEW    migrate-precis: explicitly rename one localpart
@@ -843,19 +881,6 @@ test "password change and deletion resolve the RFC 7622 account name" {
     try std.testing.expectError(error.InvalidAccountName, changePasswordCanonical(&store, allocator, "bad name", "pw"));
     try std.testing.expectError(error.InvalidAccountName, removeUserCanonical(&store, allocator, "bad name"));
     try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
-}
-
-test "removeUserRaw deletes the exact stored key for collision resolution" {
-    const allocator = std.testing.allocator;
-    var db = try backend_mod.MemoryBackend.open("", .{});
-    defer db.close();
-    var store = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&db);
-
-    try store.addUser(allocator, "NaplesTB", "pw-a");
-    try addUserCanonical(&store, allocator, "naplestb", "pw-b");
-    try removeUserRaw(&store, allocator, "NaplesTB");
-    try std.testing.expect((try store.lookup(allocator, "NaplesTB")) == null);
-    try std.testing.expect((try store.lookup(allocator, "naplestb")) != null);
 }
 
 test "addUserCanonical: invalid names refused; conflicts are on the canonical name" {

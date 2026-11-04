@@ -35,10 +35,17 @@
      (repeat `--hosted-domain` for each hosted domain). It prints every
      planned rename and every collision or invalid localpart without
      changing anything.
-  3. Resolve each reported item. Delete an exact stored key with
-     `xmppctl deluser --raw EXACT-KEY`, or preserve it under a new name
-     with `xmppctl migrate-precis --hosted-domain example.org --rename
-     OLD NEW --apply`. Any collision makes `--apply` change nothing.
+  3. Resolve each reported identity. If any two source localparts fold to
+     one target in any namespace (users, rosters, vCards, archive, locks,
+     PEP, offline, or MUC affiliations), `--apply` refuses and lists them.
+     Delete an identity and all of its data with `xmppctl deluser --raw
+     EXACT-KEY --hosted-domain example.org`: this offline command removes
+     the exact source localpart's rows from every namespace and fails if
+     any data remains. Or preserve it under a new name with `xmppctl
+     migrate-precis --hosted-domain example.org --rename OLD NEW --apply`.
+     Never delete only the users row: that would move the deleted person's
+     data into the surviving account. Any collision makes `--apply`
+     change nothing.
   4. Apply with `xmppctl migrate-precis --hosted-domain example.org
      --apply`, then rerun the dry run; it must report 0 renames. Large
      migrations write `migrate-precis.plan` and `migrate-precis.journal`

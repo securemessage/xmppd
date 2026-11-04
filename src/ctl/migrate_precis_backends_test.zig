@@ -149,6 +149,81 @@ test "migrate-precis uses production key models for every namespace" {
     try std.testing.expectEqual(@as(usize, 0), second.issues.items.len);
 }
 
+test "migrate-precis detects identity collisions on data and raw deletion cascades" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "Bob", "pw-a");
+    try users.addUser(allocator, "bob", "pw-b");
+    try auth.put(NS_LOCKS, "bob", "\x01\x00\x00\x00\x00");
+    var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
+    try roster.setItem("Bob@us.example", "friend@us.example", "", .both, false);
+    try roster.setItem("carol@us.example", "Bob@us.example", "", .both, false);
+    var blocks = block_store_mod.BlockStore(MemoryBackend).init(&op);
+    try blocks.block("Bob@us.example", "spam@remote.example");
+    var vcards = vcard_store_mod.VCardStore(MemoryBackend).init(&op);
+    try vcards.set("Bob@us.example", "<vCard><FN>Bob private</FN></vCard>");
+    try vcards.set("bob@us.example", "<vCard><FN>bob public</FN></vCard>");
+    var pep = pep_store_mod.PepStore(MemoryBackend).init(&op);
+    try pep.publish("Bob@us.example", "node", "item", "<item/>");
+    try last_activity_store_mod.record(&op, "Bob@us.example", 42);
+    var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+    _ = try offline.storePointer("carol@us.example", "Bob@us.example/res", "id-x", 1);
+    var rooms = room_store_mod.RoomStore(MemoryBackend).init(&op, allocator);
+    try rooms.setAffiliation("room@conference.us.example", "Bob@us.example", .owner);
+    try op.put(NS_PENDING_SUB, "carol@us.example\x00Bob@us.example", "<presence/>");
+    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+    try archive_store.store("Bob@us.example", "friend@us.example", "id-b1", 1, "<message><body>Bob private history</body></message>");
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    // The collision is not confined to the users row: Bob's roster, vCard,
+    // archive and other account-bearing rows all disagree with bob's identity.
+    try std.testing.expect(plan.issues.items.len >= 4);
+    try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{}));
+
+    try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "Bob");
+    try std.testing.expect((try users.lookup(allocator, "Bob")) == null);
+    try std.testing.expect((try users.lookup(allocator, "bob")) != null);
+    try std.testing.expect((try roster.getItem(allocator, "Bob@us.example", "friend@us.example")) == null);
+    try std.testing.expect((try roster.getItem(allocator, "carol@us.example", "Bob@us.example")) == null);
+    try std.testing.expect(!try blocks.isBlocked(allocator, "Bob@us.example", "spam@remote.example"));
+    try std.testing.expect((try vcards.get(allocator, "Bob@us.example")) == null);
+    const public_vcard = try vcards.get(allocator, "bob@us.example");
+    defer if (public_vcard) |value| allocator.free(value);
+    try std.testing.expect(public_vcard != null);
+    try std.testing.expect((try pep.getItem(allocator, "Bob@us.example", "node", "item")) == null);
+    try std.testing.expectEqual(@as(?u64, null), try last_activity_store_mod.get(allocator, &op, "Bob@us.example"));
+    const carol_pointers = try offline.getPointers("carol@us.example");
+    defer offline.freePointers(carol_pointers);
+    try std.testing.expectEqual(@as(usize, 0), carol_pointers.len);
+    try std.testing.expectEqual(room_store_mod.Affiliation.none, try rooms.getAffiliation("room@conference.us.example", "Bob@us.example"));
+    try expectMissing(&op, NS_PENDING_SUB, "carol@us.example\x00Bob@us.example");
+    try expectMissing(&archive, NS_MESSAGES, "Bob@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id-b1");
+    try expectMissing(&auth, NS_LOCKS, "bob");
+
+    // No Bob data can fold into bob's account after the cascade.
+    var after = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.issues.items.len);
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &after, .{});
+    try expectMissing(&archive, NS_MESSAGES, "bob@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id-b1");
+}
+
+fn expectMissing(backend: anytype, namespace: []const u8, key: []const u8) !void {
+    const stored = try backend.get(std.testing.allocator, namespace, key);
+    defer if (stored) |bytes| std.testing.allocator.free(bytes);
+    try std.testing.expect(stored == null);
+}
+
 fn expectRow(backend: anytype, namespace: []const u8, key: []const u8, value: []const u8) !void {
     const stored = try backend.get(std.testing.allocator, namespace, key);
     defer if (stored) |bytes| std.testing.allocator.free(bytes);
