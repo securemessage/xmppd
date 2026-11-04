@@ -178,8 +178,10 @@ test "applyNow: a valid trigger registers and fires" {
         .udata = 0xAB,
     };
     try applyNow(kq, &add);
-    // A trigger rewrite replaces the knote's udata (EV_KEEPUDATA is inside
-    // EV_SYSFLAGS and stripped), so it must carry the knote's udata again.
+    // A trigger change would rewrite the knote's udata unless EV_KEEPUDATA
+    // is passed; the kernel honors that flag on non-ADD changes
+    // (kern_event.c), but repeating the udata here is simpler and just as
+    // correct.
     const trigger = Kevent{
         .ident = 1,
         .filter = std.c.EVFILT.USER,

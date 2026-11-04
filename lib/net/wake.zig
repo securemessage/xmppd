@@ -5,8 +5,9 @@
 //! only the idle -> busy transition costs a syscall, and a notification can
 //! never be lost (the consumer clears the flag before draining, so a push
 //! racing the drain triggers the next wake). The trigger repeats the knote's
-//! udata: an EVFILT_USER change with flags=0 rewrites kn_kevent.udata, and
-//! EV_KEEPUDATA sits inside EV_SYSFLAGS so the kernel strips it.
+//! udata explicitly: without it an EVFILT_USER change would rewrite
+//! kn_kevent.udata (EV_KEEPUDATA is honored by the kernel on non-ADD
+//! changes, kern_event.c ~:1896, so it is an option, not a requirement).
 //!
 //! Broadcast is one shared pipe per process: every watching loop registers
 //! the read end, and close()ing the write end gives every kqueue a persistent
