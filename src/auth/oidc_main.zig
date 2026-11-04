@@ -769,7 +769,10 @@ pub const Daemon = struct {
                     if (conn.hasPendingSend()) self.flush_pending[slot] = true;
                 },
                 .deferred, .none => {
+                    // Unreachable for a real mechanism, but a replay that
+                    // produced no reply must never leave the client hanging.
                     log.err("IdP replay produced no reply for conn_id {d}", .{pend.conn_id});
+                    self.replyTemporary(pend.conn_id, pend.slot);
                 },
             }
         }
