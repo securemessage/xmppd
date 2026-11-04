@@ -1595,6 +1595,53 @@ test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
     }
 }
 
+fn fetchSigningKey(store: *OidcStore, kid: []const u8, hits: *std.atomic.Value(usize)) void {
+    switch (store.signingKey(kid, testOptions(8000))) {
+        .key => _ = hits.fetchAdd(1, .monotonic),
+        else => {},
+    }
+}
+
+test "OidcStore: concurrent kid misses fetch the JWKS once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try makeIdpTlsPaths(allocator, &tmp);
+    defer allocator.free(paths.cert);
+    defer allocator.free(paths.key);
+
+    const jwks = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}";
+    var fetches = std.atomic.Value(usize).init(0);
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try std.Thread.spawn(
+        .{},
+        serveJwksCounted,
+        .{ paths.cert.ptr, paths.key.ptr, jwks, 800, &fetches, &port },
+    );
+    defer stub.join();
+    const dl = std.time.milliTimestamp() + 5000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/certs", .{port.load(.acquire)});
+    var store = testStore(allocator, .{ .jwks_uri = url, .ca_file = paths.cert });
+    defer store.deinit();
+    try store.start();
+
+    // Two workers race a cold cache for the same kid: jwks_mutex makes
+    // the second wait out the whole refresh and find the key cached, so
+    // the IdP sees exactly one GET and jwks_body is never freed under a
+    // reader.
+    var hits = std.atomic.Value(usize).init(0);
+    const t1 = try std.Thread.spawn(.{}, fetchSigningKey, .{ &store, "k1", &hits });
+    const t2 = try std.Thread.spawn(.{}, fetchSigningKey, .{ &store, "k1", &hits });
+    t1.join();
+    t2.join();
+    try std.testing.expectEqual(@as(usize, 2), hits.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fetches.load(.acquire));
+}
+
 test "OidcStore: replay returns identity, rejection and temporary failure" {
     const allocator = std.testing.allocator;
     var store = testStore(allocator, .{});
@@ -1714,6 +1761,90 @@ fn serveOneTlsResponse(cert_path: [*:0]const u8, key_path: [*:0]const u8, status
             }
         }
         return;
+    }
+}
+
+/// Serve `body` as a JWKS document on every accepted connection, counting
+/// fetches and stalling before each response: the first caller holds
+/// jwks_mutex through the stall, so a racing caller on the same cold
+/// cache reaches the IdP only when the lock is missing. Exits once the
+/// backlog stays quiet after the first fetch.
+fn serveJwksCounted(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    body: []const u8,
+    stall_ms: u64,
+    fetches: *std.atomic.Value(usize),
+    port_out: *std.atomic.Value(u16),
+) void {
+    var ctx = ssl.SslContext.initServer(cert_path, key_path) catch return;
+    defer ctx.deinit();
+    ctx.disableKtls();
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    var quiet_polls: usize = 0;
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 300) catch 0;
+        if (pn <= 0) {
+            if (fetches.load(.acquire) > 0) {
+                quiet_polls += 1;
+                if (quiet_polls > 4) return;
+            }
+            continue;
+        }
+        quiet_polls = 0;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn_fd);
+        _ = fetches.fetchAdd(1, .monotonic);
+        var conn = ssl.SslConn.init(ctx, conn_fd) catch continue;
+        defer {
+            conn.shutdown();
+            conn.deinit();
+        }
+        var hs_done = false;
+        while (!hs_done and std.time.milliTimestamp() < deadline) {
+            const hs = conn.doHandshake() catch break;
+            hs_done = hs == .complete;
+        }
+        if (!hs_done) continue;
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const rr = conn.read(buf[total..]) catch break;
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) break;
+                    total += n;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        std.Thread.sleep(stall_ms * std.time.ns_per_ms);
+        var resp: [8192]u8 = undefined;
+        const out = std.fmt.bufPrint(&resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+        var sent: usize = 0;
+        while (sent < out.len and std.time.milliTimestamp() < deadline) {
+            const wr = conn.write(out[sent..]) catch break;
+            switch (wr) {
+                .ok => |n| sent += n,
+                .want_read, .want_write => {},
+            }
+        }
     }
 }
 
