@@ -640,15 +640,23 @@ pub const Loop = struct {
         }
 
         // Arm the single one-shot kernel timer to the wheel's next deadline;
-        // EVFILT_TIMER data is milliseconds by default.
+        // EVFILT_TIMER data is milliseconds by default. A deadline already
+        // in the past never needs the kernel: emit it in this pass instead
+        // of arming a zero-length timer.
         if (self.wheel.nextDeadline()) |d| {
-            if (!self.timer_armed or self.armed_deadline != d) {
+            const now = monotonicMs();
+            if (d <= now) {
+                // Due already: emit in this pass instead of arming a
+                // zero-length kernel timer, and do not let kevent block.
+                self.timer_ready = true;
+                self.immediate = true;
+            } else if (!self.timer_armed or self.armed_deadline != d) {
                 self.change_buf[nchanges] = .{
                     .ident = timer_ident,
                     .filter = std.c.EVFILT.TIMER,
                     .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                     .fflags = 0,
-                    .data = @intCast(d -| monotonicMs()),
+                    .data = @intCast(d - now),
                     .udata = timer_token.toUdata(),
                 };
                 nchanges += 1;
@@ -1649,6 +1657,22 @@ test "Loop: a deadline with any consumer ctx kind is delivered, none reserved" {
     const ev = loop.next().?;
     try std.testing.expect(ev == .deadline);
     try std.testing.expect(ev.deadline.ctx.eql(reserved));
+    try std.testing.expect(loop.next() == null);
+}
+
+test "Loop: a deadline already in the past emits without arming the kernel timer" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const tid = try loop.scheduleIn(0, tctx(5));
+    try loop.wait();
+    // The deadline was due before wait() returned: it emits from the wheel,
+    // not via a zero-length EVFILT_TIMER arm.
+    try std.testing.expect(!loop.timer_armed);
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .deadline);
+    try std.testing.expect(ev.deadline.timer.eql(tid));
+    try std.testing.expectEqual(@as(u8, 5), ev.deadline.ctx.index);
     try std.testing.expect(loop.next() == null);
 }
 
