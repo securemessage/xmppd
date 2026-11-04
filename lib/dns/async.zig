@@ -4621,6 +4621,117 @@ test "dns-async: a synchronous connect refusal fails the phase, not the job" {
     try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
 }
 
+test "dns-async: a synchronous refusal at the deadline restart fails the phase" {
+    // Goal: onDeadline re-opens a dead TCP leg through tcpRestart; a
+    // connect refused inside connect(2) there must run the same
+    // per-phase failQuery as the asynchronous SO_ERROR arm, so the
+    // TLSA leg ends lookup_failed instead of dropping the job.
+    // Method: the chain is fed to .tlsa over injected answers, the
+    // TLSA query upgrades to TCP on a held-pending connect, and the
+    // retry deadline hits the fail_connects seam for one refusal.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    r.fail_connects = 1;
+    r.onDeadline(job);
+    // The refusal was consumed by the restart's connect; the TLSA
+    // leg failed the phase and the resolve completed.
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a synchronous refusal on the TCP reuse arm fails the phase" {
+    // Goal: sendQuery on a TCP job with an empty write buffer takes
+    // the reuse arm; a synchronous refusal there runs failQuery, not
+    // a job drop.
+    // Method: the fallback chain reaches .fallback_addr, upgrades to
+    // TCP on a held connect, then the socket is closed and the AAAA
+    // leg answered: the A sendQuery re-opens TCP through the reuse
+    // arm into the seam's one refusal, and the collected address
+    // still resolves the job.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    r.tcpClose(job);
+    r.fail_connects = 1;
+    r.handleResponse(job, buf[0..buildAaaaAnswer(&buf, job.request)]);
+    // The refusal was consumed by the reuse arm's connect; the A leg
+    // failed but the AAAA answer still emitted the fallback target.
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+}
+
+test "dns-async: a synchronous refusal on the TCP restart arm fails the phase" {
+    // Goal: sendQuery on a TCP job with a mid-write frame takes the
+    // restart arm (tcpClose + tcpSend); a synchronous refusal there
+    // runs failQuery, not a job drop.
+    // Method: same fallback staging; tcp_out is staged mid-write so
+    // the A sendQuery takes the restart arm into the refusal.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    try job.tcp_out.append(std.testing.allocator, 0);
+    job.tcp_out_pos = 0;
+    r.fail_connects = 1;
+    r.handleResponse(job, buf[0..buildAaaaAnswer(&buf, job.request)]);
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+}
+
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
@@ -5254,6 +5365,37 @@ fn buildNodata(out: []u8, qpkt: []const u8) usize {
     const qlen = qpkt.len - 12;
     @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
     return 12 + qlen;
+}
+
+/// One AAAA answer record for ::1 (owner = the question).
+fn encodeAaaaRr(out: []u8) usize {
+    var off: usize = 0;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    off += 2;
+    std.mem.writeInt(u16, out[off..][0..2], wire.TYPE_AAAA, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 4 ..][0..4], 60, .big);
+    std.mem.writeInt(u16, out[off + 8 ..][0..2], 16, .big);
+    off += 10;
+    @memcpy(out[off .. off + 16], &([1]u8{0} ** 15 ++ [1]u8{1}));
+    return off + 16;
+}
+
+/// An AAAA answer for any question: feeds the fallback chain a real
+/// address where a same-type answer is needed.
+fn buildAaaaAnswer(out: []u8, qpkt: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], 1, .big);
+    @memset(out[8..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    var off = 12 + qlen;
+    off += encodeAaaaRr(out[off..]);
+    return off;
 }
 
 /// One SRV answer record (owner = the question via a 0xC00C pointer).
