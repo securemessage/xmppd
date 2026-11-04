@@ -4779,6 +4779,29 @@ test "dns-async: an A NODATA plus AAAA SERVFAIL is a temporary failure, not nxdo
     try std.testing.expectEqual(Status.failed, ctx.status.?);
 }
 
+test "dns-async: an AAAA send failure after an empty A leg is a temporary failure, not nxdomain" {
+    // Same pin for the sendAddr(AAAA) catch in .addr: a wire send
+    // failure marks target_err, so the dead family plus the empty A
+    // leg is .failed; without the setter the result is .nxdomain.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.fail_sends = true;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.fail_sends = false;
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
 test "dns-async: an AAAA SERVFAIL plus A NODATA fallback is a temporary failure, not nxdomain" {
     // The fallback_err setter on the first fallback leg: a failed
     // AAAA leg plus an empty A leg is a temporary failure.
