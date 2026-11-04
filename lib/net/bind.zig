@@ -23,29 +23,45 @@ const Loop = loop_mod.Loop;
 const Handle = loop_mod.Handle;
 const Interest = loop_mod.Interest;
 
-pub const BindError = error{
+pub const BindTcpError = error{
+    InvalidAddress,
     AddressInUse,
+    AddressNotAvailable,
     AccessDenied,
     SystemResources,
+    Unexpected,
+};
+
+pub const BindUnixError = error{
     PathTooLong,
+    AddressInUse,
+    NotASocket,
+    AccessDenied,
+    SystemResources,
     Unexpected,
 };
 
 pub const TcpOptions = struct {
-    backlog: u16 = 128,
+    address: []const u8, // IPv4 or IPv6 literal; names are rejected (no DNS)
+    port: u16,
+    backlog: u31 = 4096,
+    reuse_port_lb: bool = true, // SO_REUSEPORT_LB: one listener per loop
     v6_only: bool = true,
-    reuseport_lb: bool = true,
+    nodelay: bool = true, // TCP_NODELAY on the listener only
 };
 
 pub const UnixOptions = struct {
-    backlog: u16 = 128,
-    mode: ?posix.mode_t = null,
+    path: [:0]const u8,
+    mode: posix.mode_t,
+    backlog: u31 = 128,
 };
 
 const so_reuseport_lb: c_int = 0x00010000; // SO_REUSEPORT_LB, absent from some std.c.SO blocks
 const tcp_nodelay: c_int = 1; // TCP_NODELAY
+const ipv6_v6only: c_int = 0x1b; // IPV6_V6ONLY
+const sun_path_max = 104; // sizeof(sockaddr_un.sun_path)
 
-fn socketError(err: posix.SocketError) BindError {
+fn socketError(err: posix.SocketError) error{ AccessDenied, SystemResources, Unexpected } {
     return switch (err) {
         error.AccessDenied => error.AccessDenied,
         error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => error.SystemResources,
@@ -53,36 +69,30 @@ fn socketError(err: posix.SocketError) BindError {
     };
 }
 
-/// Non-blocking CLOEXEC TCP listener on `addr` (IPv4 or IPv6 literal,
-/// including bind_address hosts). The caller attaches it to a loop via
-/// `Listener.init`.
-pub fn bindTcp(addr: *const std.net.Address, options: *const TcpOptions) BindError!posix.fd_t {
+/// Non-blocking CLOEXEC TCP listener on an IPv4 or IPv6 literal (including
+/// bind_address hosts); names are rejected instead of resolved. The caller
+/// attaches the fd to a loop via `Listener.attach`.
+pub fn bindTcp(options: *const TcpOptions) BindTcpError!posix.fd_t {
+    const addr = std.net.Address.parseIp(options.address, options.port) catch return error.InvalidAddress;
     const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch |err| return socketError(err);
     errdefer posix.close(fd);
 
-    if (options.reuseport_lb) {
-        const one: c_int = 1;
-        posix.setsockopt(fd, posix.SOL.SOCKET, so_reuseport_lb, std.mem.asBytes(&one)) catch |err| switch (err) {
-            error.OperationNotSupported => {}, // REUSEPORT_LB absent: degrade, still bound
-            else => return socketErrorSet(err),
-        };
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch return error.Unexpected;
+    if (options.reuse_port_lb) {
+        posix.setsockopt(fd, posix.SOL.SOCKET, so_reuseport_lb, std.mem.asBytes(&one)) catch return error.Unexpected;
     }
-    {
-        const one: c_int = 1;
-        posix.setsockopt(fd, std.c.IPPROTO.TCP, tcp_nodelay, std.mem.asBytes(&one)) catch |err| switch (err) {
-            else => return socketErrorSet(err),
-        };
+    if (options.nodelay) {
+        posix.setsockopt(fd, std.c.IPPROTO.TCP, tcp_nodelay, std.mem.asBytes(&one)) catch return error.Unexpected;
     }
     if (addr.any.family == posix.AF.INET6 and options.v6_only) {
-        const one: c_int = 1;
-        posix.setsockopt(fd, posix.IPPROTO.IPV6, 0x1b, std.mem.asBytes(&one)) catch |err| switch (err) {
-            else => return socketErrorSet(err), // IPV6_V6ONLY
-        };
+        posix.setsockopt(fd, posix.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one)) catch return error.Unexpected;
     }
 
     posix.bind(fd, &addr.any, addr.getOsSockLen()) catch |err| return switch (err) {
         error.AddressInUse => error.AddressInUse,
         error.AccessDenied => error.AccessDenied,
+        error.AddressNotAvailable => error.AddressNotAvailable,
         else => error.Unexpected,
     };
     posix.listen(fd, options.backlog) catch |err| return switch (err) {
@@ -92,18 +102,14 @@ pub fn bindTcp(addr: *const std.net.Address, options: *const TcpOptions) BindErr
     return fd;
 }
 
-fn socketErrorSet(err: posix.SetSockOptError) BindError {
-    return switch (err) {
-        error.SystemResources => error.SystemResources,
-        else => error.Unexpected,
-    };
-}
-
-/// Non-blocking CLOEXEC Unix-domain listener. A stale socket at `path` is
-/// detected with a connect probe (ECONNREFUSED) and unlinked once; a live
-/// one reports AddressInUse.
-pub fn bindUnix(path: [:0]const u8, options: *const UnixOptions) BindError!posix.fd_t {
-    if (path.len >= 104) return error.PathTooLong;
+/// Non-blocking CLOEXEC Unix-domain listener. Order: bind, chmod(mode),
+/// listen, so the socket never carries the wrong mode. On EADDRINUSE a
+/// connect probe decides: ECONNREFUSED means stale (unlink once, retry);
+/// ENOTSOCK means a non-socket file owns the path (NotASocket, never
+/// unlinked); anything else means a live listener (AddressInUse).
+pub fn bindUnix(options: *const UnixOptions) BindUnixError!posix.fd_t {
+    const path = options.path;
+    if (path.len >= sun_path_max) return error.PathTooLong;
 
     var un: posix.sockaddr.un = undefined;
     un.family = posix.AF.UNIX;
@@ -116,36 +122,37 @@ pub fn bindUnix(path: [:0]const u8, options: *const UnixOptions) BindError!posix
     errdefer posix.close(fd);
 
     posix.bind(fd, @ptrCast(&un), salen) catch |err| switch (err) {
-        error.AddressInUse => {
-            // Stale socket check: ECONNREFUSED means nothing is listening.
-            const probe = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |e| return socketError(e);
-            defer posix.close(probe);
-            posix.connect(probe, @ptrCast(&un), salen) catch |cerr| switch (cerr) {
-                error.ConnectionRefused => {
-                    posix.unlink(path) catch return error.AddressInUse;
-                    posix.bind(fd, @ptrCast(&un), salen) catch |rerr| switch (rerr) {
-                        error.AddressInUse => return error.AddressInUse,
-                        error.AccessDenied => return error.AccessDenied,
-                        else => return error.Unexpected,
-                    };
-                },
-                error.AccessDenied => return error.AccessDenied,
-                else => return error.AddressInUse, // a live listener owns the path
-            };
-        },
+        error.AddressInUse => try reclaimStale(path, &un, salen, fd),
         error.AccessDenied => return error.AccessDenied,
         else => return error.Unexpected,
     };
 
-    if (options.mode) |mode| {
-        posix.fchmodat(posix.AT.FDCWD, path, mode, 0) catch |err| switch (err) {
-            error.FileNotFound => return error.Unexpected,
-            error.AccessDenied => return error.AccessDenied,
-            else => return error.Unexpected,
-        };
-    }
+    posix.fchmodat(posix.AT.FDCWD, path, options.mode, 0) catch |err| switch (err) {
+        error.AccessDenied => return error.AccessDenied,
+        else => return error.Unexpected,
+    };
     posix.listen(fd, options.backlog) catch return error.Unexpected;
     return fd;
+}
+
+/// EADDRINUSE probe with raw connect(2): std.posix.connect maps ENOTSOCK
+/// (the regular-file case this probe exists for) to unreachable.
+fn reclaimStale(path: [:0]const u8, un: *const posix.sockaddr.un, salen: posix.socklen_t, fd: posix.fd_t) BindUnixError!void {
+    const probe = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| return socketError(err);
+    defer posix.close(probe);
+
+    if (std.c.connect(probe, @ptrCast(un), salen) == 0) return error.AddressInUse;
+    switch (posix.errno(-1)) {
+        .CONNREFUSED => {}, // stale: reclaim below
+        .NOTSOCK => return error.NotASocket,
+        else => return error.AddressInUse,
+    }
+    posix.unlink(path) catch return error.AddressInUse;
+    posix.bind(fd, @ptrCast(un), salen) catch |err| return switch (err) {
+        error.AddressInUse => error.AddressInUse,
+        error.AccessDenied => error.AccessDenied,
+        else => return error.Unexpected,
+    };
 }
 
 pub const PeerCred = struct { uid: posix.uid_t, gid: posix.gid_t };
@@ -289,9 +296,7 @@ test "bindTcp: listener accepts a non-blocking connection" {
     var loop = try testLoop();
     defer loop.deinit(std.testing.allocator);
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    const opts: TcpOptions = .{};
-    const lfd = try bindTcp(&addr, &opts);
+    const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
     const bound = try boundAddr(lfd);
 
     var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
@@ -317,13 +322,37 @@ test "bindTcp: listener accepts a non-blocking connection" {
 }
 
 test "bindTcp: two listeners share the port with REUSEPORT_LB" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    const opts: TcpOptions = .{};
-    const lfd_a = try bindTcp(&addr, &opts);
+    const lfd_a = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
     defer posix.close(lfd_a);
     const bound = try boundAddr(lfd_a);
-    const lfd_b = try bindTcp(@ptrCast(@alignCast(&bound)), &opts);
+    const port = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&bound))).port;
+    const lfd_b = try bindTcp(&.{ .address = "127.0.0.1", .port = std.mem.bigToNative(u16, port) });
     defer posix.close(lfd_b);
+}
+
+test "bindTcp: IPv6 literal binds and accepts on ::1" {
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator);
+
+    const lfd = try bindTcp(&.{ .address = "::1", .port = 0 });
+    const bound = try boundAddr(lfd);
+    var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
+    _ = &listener;
+
+    const cfd = try posix.socket(posix.AF.INET6, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(cfd);
+    try posix.connect(cfd, @ptrCast(&bound), @sizeOf(posix.sockaddr.in6));
+
+    try loop.wait();
+    const ev = loop.next().?;
+    try std.testing.expect(ev == .readable);
+    const afd = try posix.accept(lfd, null, null, posix.SOCK.CLOEXEC);
+    posix.close(afd);
+}
+
+test "bindTcp: a DNS name is rejected, a bad literal is rejected" {
+    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{ .address = "localhost", .port = 80 }));
+    try std.testing.expectError(error.InvalidAddress, bindTcp(&.{ .address = "999.0.0.1", .port = 80 }));
 }
 
 test "bindUnix: accepts and reports LOCAL_PEERCRED" {
@@ -339,8 +368,7 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
         error.FileNotFound => {},
         else => unreachable,
     };
-    const opts: UnixOptions = .{};
-    const lfd = try bindUnix(path, &opts);
+    const lfd = try bindUnix(&.{ .path = path, .mode = 0o600 });
     var listener = try Listener.init(&loop, lfd, test_ctx, &.{});
 
     const cfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
@@ -368,16 +396,41 @@ test "bindUnix: accepts and reports LOCAL_PEERCRED" {
 test "bindUnix: a stale socket path is reclaimed" {
     const path = "/home/admin/tmp/scratch/devin-net/f2-stale.sock";
     // A dead (unlinked-or-closed) socket path: create and close a listener.
-    const opts: UnixOptions = .{};
-    const dead = try bindUnix(path, &opts);
+    const dead = try bindUnix(&.{ .path = path, .mode = 0o600 });
     posix.close(dead);
     // The path now exists but nothing listens: the probe must reclaim it.
     defer posix.unlink(path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => unreachable,
     };
-    const lfd = try bindUnix(path, &opts);
+    const lfd = try bindUnix(&.{ .path = path, .mode = 0o600 });
     defer posix.close(lfd);
+}
+
+test "bindUnix: long path refused, live listener and regular file refused, mode applied" {
+    var long_buf: [128]u8 = undefined;
+    const long_path = try std.fmt.bufPrintZ(&long_buf, "/tmp/{s}", .{"x" ** 110});
+    try std.testing.expectError(error.PathTooLong, bindUnix(&.{ .path = long_path, .mode = 0o600 }));
+
+    const path = "/home/admin/tmp/scratch/devin-net/f2-live.sock";
+    const live = try bindUnix(&.{ .path = path, .mode = 0o640 });
+    defer posix.close(live);
+    defer posix.unlink(path) catch unreachable;
+    // A listener already owns the path: the probe connects, so AddressInUse.
+    try std.testing.expectError(error.AddressInUse, bindUnix(&.{ .path = path, .mode = 0o600 }));
+
+    // The requested mode is on the socket before listen returns it.
+    var st: posix.Stat = undefined;
+    try std.testing.expectEqual(0, std.c.stat(path, &st));
+    try std.testing.expectEqual(@as(u32, 0o640), @as(u32, @intCast(st.mode & 0o777)));
+
+    const reg = "/home/admin/tmp/scratch/devin-net/f2-regular";
+    {
+        const f = try std.fs.cwd().createFile(reg, .{});
+        f.close();
+    }
+    defer std.fs.cwd().deleteFile(reg) catch unreachable;
+    try std.testing.expectError(error.NotASocket, bindUnix(&.{ .path = reg, .mode = 0o600 }));
 }
 
 test "Listener: EMFILE pauses, a close resumes (forked child, lowered RLIMIT)" {
@@ -400,9 +453,7 @@ fn childEmfile() void {
 
     var loop = testLoop() catch posix.exit(4);
 
-    const addr = std.net.Address.parseIp4("127.0.0.1", 0) catch posix.exit(5);
-    const opts: TcpOptions = .{};
-    const lfd = bindTcp(&addr, &opts) catch posix.exit(6);
+    const lfd = bindTcp(&.{ .address = "127.0.0.1", .port = 0 }) catch posix.exit(6);
     var listener = Listener.init(&loop, lfd, test_ctx, &.{}) catch posix.exit(7);
 
     // Spare handle the child closes to free a descriptor for the resume.
