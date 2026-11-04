@@ -83,10 +83,10 @@ const log = std.log.scoped(.lmdb_store);
 /// every touched LMDB page (SCRAM keys, rosters, archive contents) into
 /// the core file. LMDB reports me_mapaddr only for MDB_FIXEDMAP envs,
 /// so the map range comes from the process VM map instead: the vnode
-/// entry whose inode is the env's data file (mdb_env_get_fd). One call
-/// covers the map's lifetime because the map is never resized at
-/// runtime (S9, T358); failure is logged once and does not fail the
-/// open.
+/// entry whose inode and filesystem id match the env's data file
+/// (mdb_env_get_fd). One call covers the map's lifetime because the map
+/// is never resized at runtime (S9, T358); failure is logged once and
+/// does not fail the open.
 fn excludeMapFromCoreDump(env: lmdb.Environment) void {
     var fd: c_int = 0;
     if (mdb_env_get_fd(env.ptr, &fd) != 0) {
@@ -97,21 +97,21 @@ fn excludeMapFromCoreDump(env: lmdb.Environment) void {
         log.warn("fstat on the LMDB data fd failed: map stays in core dumps", .{});
         return;
     };
-    const map = findVmEntryByInode(st.ino) orelse {
+    const rec = findVmEntry(st.ino, st.dev) orelse {
         log.warn("LMDB map not found in kern.proc.vmmap: map stays in core dumps", .{});
         return;
     };
-    const rc = madviseCall.run(map.start, map.end - map.start, std.c.MADV.NOCORE);
+    const start: usize = @intCast(rec.kve_start);
+    const len: usize = @intCast(rec.kve_end - rec.kve_start);
+    const rc = madviseCall.run(start, len, std.c.MADV.NOCORE);
     if (rc != 0) {
         log.warn("madvise MADV_NOCORE on the LMDB map failed (errno {d}): map stays in core dumps", .{@intFromEnum(std.posix.errno(rc))});
     }
 }
 
-const VmRange = struct { start: usize, end: usize };
-
-/// Address range of the VMA backed by the vnode with inode `ino`, or
+/// Fixed prefix of the VMA record backed by the vnode (ino, fsid), or
 /// null when kern.proc.vmmap yields no match.
-fn findVmEntryByInode(ino: u64) ?VmRange {
+fn findVmEntry(ino: u64, fsid: u64) ?KinfoVmentry {
     var mib = [_]c_int{ 1, 14, 32, std.c.getpid() }; // CTL_KERN, KERN_PROC, KERN_PROC_VMMAP
     var len: usize = 0;
     if (std.c.sysctl(&mib, mib.len, null, &len, null, 0) != 0) return null;
@@ -119,14 +119,21 @@ fn findVmEntryByInode(ino: u64) ?VmRange {
     defer std.heap.page_allocator.free(buf);
     var out_len = buf.len;
     if (std.c.sysctl(&mib, mib.len, buf.ptr, &out_len, null, 0) != 0) return null;
+    return findVmRecord(buf[0..out_len], ino, fsid);
+}
 
+/// First vnode record in a kern.proc.vmmap buffer whose inode and
+/// filesystem id both match. Inode numbers are per filesystem (ZFS
+/// object numbers repeat across datasets), so an inode-only match can
+/// pick an unrelated mapping and leave the env map in core dumps.
+fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
     var off: usize = 0;
-    while (off + @sizeOf(KinfoVmentry) <= out_len) {
+    while (off + @sizeOf(KinfoVmentry) <= buf.len) {
         const rec: *align(1) const KinfoVmentry = @ptrCast(buf.ptr + off);
         const size: usize = @intCast(rec.kve_structsize);
         if (size < @sizeOf(KinfoVmentry)) break;
-        if (rec.kve_type == KVME_TYPE_VNODE and rec.kve_vn_fileid == ino)
-            return .{ .start = @intCast(rec.kve_start), .end = @intCast(rec.kve_end) };
+        if (rec.kve_type == KVME_TYPE_VNODE and rec.kve_vn_fileid == ino and rec.kve_vn_fsid == fsid)
+            return rec.*;
         off += size;
     }
     return null;
@@ -939,4 +946,29 @@ test "LmdbBackend: a madvise failure does not fail the open" {
     const val = try db.get(std.testing.allocator, users_ns, "alice");
     defer if (val) |v| std.testing.allocator.free(v);
     try std.testing.expectEqualStrings("creds", val.?);
+}
+
+test "LmdbBackend: the env map VMA match requires inode and filesystem" {
+    // Goal: a same-inode record on another filesystem is skipped, so the
+    // advice can never land on an unrelated mapping (ZFS inode numbers
+    // repeat across datasets). Method: a synthetic kern.proc.vmmap
+    // buffer holding two vnode records that share an inode but differ
+    // in kve_vn_fsid.
+    var recs = [_]KinfoVmentry{ std.mem.zeroes(KinfoVmentry), std.mem.zeroes(KinfoVmentry) };
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_start = 0x1000;
+    recs[0].kve_end = 0x2000;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    recs[1] = recs[0];
+    recs[1].kve_start = 0x3000;
+    recs[1].kve_end = 0x9000;
+    recs[1].kve_vn_fsid = 0xBBBB;
+    const buf = std.mem.sliceAsBytes(&recs);
+
+    const rec = findVmRecord(buf, 4242, 0xBBBB) orelse return error.VmRecordNotFound;
+    try std.testing.expectEqual(@as(u64, 0x3000), rec.kve_start);
+    try std.testing.expect(findVmRecord(buf, 4242, 0xAAAA) != null);
+    try std.testing.expect(findVmRecord(buf, 4242, 0xCCCC) == null);
 }
