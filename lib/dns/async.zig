@@ -603,7 +603,7 @@ pub const Resolver = struct {
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
         const n = rawKevent(self.kq, &.{}, &events, &ts) catch |err| {
             self.kevent_errors += 1;
-            if (self.kevent_errors == 1) log.err("dns: kevent failed in step: {}", .{err});
+            if (self.kevent_errors == 1) log.warn("dns: kevent failed in step: {}", .{err});
             return;
         };
         self.dispatchEvents(events[0..n]);
@@ -4732,6 +4732,180 @@ test "dns-async: a synchronous refusal on the TCP restart arm fails the phase" {
     try std.testing.expectEqual(@as(usize, 1), res.targets.len);
 }
 
+test "dns-async: an A SERVFAIL plus AAAA NODATA is a temporary failure, not nxdomain" {
+    // Goal: a per-target leg that fails marks target_err, so one dead
+    // family plus one empty family is a temporary failure, never an
+    // nxdomain that would end the chain as 'no service'.
+    // Method: an SRV answer, a SERVFAIL on the A leg, NODATA on the
+    // AAAA leg; the resolve must report .failed.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Phase.addr6, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an A NODATA plus AAAA SERVFAIL is a temporary failure, not nxdomain" {
+    // Same pin for the .addr6 setter: the failure marker set by the
+    // second address leg must also produce .failed.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr6, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an AAAA SERVFAIL plus A NODATA fallback is a temporary failure, not nxdomain" {
+    // The fallback_err setter on the first fallback leg: a failed
+    // AAAA leg plus an empty A leg is a temporary failure.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Phase.fallback_addr4, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an AAAA NODATA plus A SERVFAIL fallback is a temporary failure, not nxdomain" {
+    // The fallback_err setter on the second fallback leg: an empty
+    // AAAA leg plus a failed A leg is a temporary failure.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr4, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: tcp_seq advances on every connection attempt" {
+    // TCP knote udata names a connection by (seq, gen, slot); a seq
+    // that did not advance would let an old connection's events reach
+    // the new one. Every tcpSend must bump it.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    const s0 = r.jobs.items[0].tcp_seq;
+    r.onDeadline(job);
+    try std.testing.expectEqual(s0 +% 1, r.jobs.items[0].tcp_seq);
+    r.onDeadline(r.jobs.items[0]);
+    try std.testing.expectEqual(s0 +% 2, r.jobs.items[0].tcp_seq);
+}
+
+test "dns-async: a write on a reset connection reports peer close, not a drop" {
+    // A peer that resets makes the next write fail EPIPE; the mapping
+    // to PeerClosed is what lets tcpPeerClosed resend on a fresh
+    // connection instead of dropping the job.
+    // Method: a real loopback connection whose accepted end closes
+    // with unread data (an RST); tcpWrite on the client fd must
+    // report error.PeerClosed.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const la = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &la.any, la.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    const sa = try net.Address.parseIp("127.0.0.1", port);
+    try posix.connect(cfd, &sa.any, sa.getOsSockLen());
+    const afd = try posix.accept(lfd, null, null, 0);
+    // Unread data at the accept end makes its close an RST.
+    _ = try posix.send(cfd, "x", posix.MSG.NOSIGNAL);
+    posix.close(afd);
+    var rbuf: [8]u8 = undefined;
+    var spins: usize = 0;
+    while (spins < 100_000) : (spins += 1) {
+        _ = posix.recv(cfd, &rbuf, posix.MSG.DONTWAIT) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => break,
+        };
+        break;
+    }
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(sa);
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    job.tcp_fd = cfd;
+    job.tcp_connected = true;
+    try job.tcp_out.appendSlice(std.testing.allocator, &.{ 0, 4, 't', 'e', 's', 't' });
+    // A write after the peer's close may still succeed once on a
+    // half-close; the dead connection fails the next one with EPIPE,
+    // which must surface as PeerClosed so the resend path runs.
+    var saw_peer_closed = false;
+    var tries: usize = 0;
+    while (tries < 16 and !saw_peer_closed) : (tries += 1) {
+        job.tcp_out_pos = 0;
+        r.tcpWrite(job) catch |err| {
+            try std.testing.expectEqual(error.PeerClosed, err);
+            saw_peer_closed = true;
+        };
+        _ = posix.recv(cfd, &rbuf, posix.MSG.DONTWAIT) catch {};
+    }
+    try std.testing.expect(saw_peer_closed);
+    job.tcp_fd = -1;
+    posix.close(cfd);
+}
+
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
@@ -5360,6 +5534,19 @@ fn buildNodata(out: []u8, qpkt: []const u8) usize {
     const id = std.mem.readInt(u16, qpkt[0..2], .big);
     std.mem.writeInt(u16, out[0..2], id, .big);
     std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    return 12 + qlen;
+}
+
+/// An error echo of `qpkt` carrying `rcode` (SERVFAIL is 2): runs the
+/// per-phase failure path for the outstanding query.
+fn buildRcode(out: []u8, qpkt: []const u8, rcode: u16) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180 | rcode, .big);
     std.mem.writeInt(u16, out[4..6], 1, .big);
     @memset(out[6..12], 0);
     const qlen = qpkt.len - 12;
