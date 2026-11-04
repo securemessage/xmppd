@@ -176,7 +176,22 @@ test "Broadcast: close reaches every watching loop exactly once" {
     try std.testing.expectEqual(.broadcast_closed, loop_b.next().?);
 
     // The knote is disarmed after delivery: the persistent EOF cannot spin.
+    // broadcast_seen alone would still suppress emission, so assert on
+    // raw_events: a live knote keeps landing in the batch.
+    const seen = loop_a.stats().raw_events;
     loop_a.requestImmediate();
     try loop_a.wait();
     try std.testing.expect(loop_a.next() == null);
+    try std.testing.expectEqual(seen, loop_a.stats().raw_events);
+}
+
+test "Wake: a coalesced notify does not pay for a trigger syscall" {
+    // Once pending is set, notify returns without touching the kqueue: with
+    // the kqueue gone out-of-band a second notify still succeeds.
+    var loop = try testLoop();
+    defer loop.deinit(std.testing.allocator); // rawClose tolerates the dead kq
+    try loop.waker().notify();
+    posix.close(loop.kq);
+    loop.kq = -1;
+    try loop.waker().notify();
 }

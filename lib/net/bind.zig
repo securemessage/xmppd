@@ -471,6 +471,9 @@ test "bindTcp: listener accepts a non-blocking connection" {
     defer loop.deinit(std.testing.allocator);
 
     const lfd = try bindTcp(&.{ .address = "127.0.0.1", .port = 0 });
+    // Created with SOCK_CLOEXEC: no exec may ever inherit the listener.
+    const fd_flags = try posix.fcntl(lfd, posix.F.GETFD, 0);
+    try std.testing.expect(fd_flags & posix.FD_CLOEXEC != 0);
     const bound = try boundAddr(lfd);
 
     var listener: Listener = undefined;
@@ -499,9 +502,10 @@ test "bindTcp: listener accepts a non-blocking connection" {
     try std.testing.expectError(error.WouldBlock, posix.read(accepted[0], &buf));
     var nd: c_int = 0;
     var ndlen: posix.socklen_t = @sizeOf(c_int);
+    const real_nodelay: c_int = 1; // TCP_NODELAY; do not share the setup const
     try std.testing.expectEqual(
         0,
-        std.c.getsockopt(accepted[0], std.c.IPPROTO.TCP, tcp_nodelay, &nd, &ndlen),
+        std.c.getsockopt(accepted[0], std.c.IPPROTO.TCP, real_nodelay, &nd, &ndlen),
     );
     try std.testing.expect(nd != 0);
 }

@@ -286,6 +286,23 @@ test "TimerWheel: expiry order across levels and ties" {
     try std.testing.expect(wheel.popExpired(80000) == null);
 }
 
+test "TimerWheel: entries on one slot chain emit in deadline order" {
+    // A level-1 slot covers 64 deadlines: schedule the later one first so
+    // chain order disagrees with deadline order and only the sort fixes it.
+    var wheel: TimerWheel = undefined;
+    try wheel.init(std.testing.allocator, 4, 0);
+    defer wheel.deinit(std.testing.allocator);
+
+    const late = try wheel.schedule(100, .{ .index = 1, .gen = 1, .kind = 0xEE });
+    const early = try wheel.schedule(70, .{ .index = 2, .gen = 1, .kind = 0xEE });
+
+    const d1 = wheel.popExpired(110).?;
+    const d2 = wheel.popExpired(110).?;
+    try std.testing.expect(d1.timer.eql(early));
+    try std.testing.expect(d2.timer.eql(late));
+    try std.testing.expect(wheel.popExpired(110) == null);
+}
+
 test "TimerWheel: cancel is O(1) and stale ids cannot cancel a reused entry" {
     var wheel: TimerWheel = undefined;
     try wheel.init(std.testing.allocator, 2, 0);

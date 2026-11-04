@@ -1741,6 +1741,180 @@ test "Loop: cancelling a collected-but-unemitted deadline loses no other deadlin
     try std.testing.expectEqual(@as(usize, 64), fired);
 }
 
+test "Loop: a stale token in a delivered event does not resolve the reused slot" {
+    // ev1 drains, A is closed, B reuses the slot; ev2 arrives with A's stale
+    // udata and must not resolve (generation check at delivery).
+    var options = testOptions(null);
+    options.handles_max = 1;
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, &options);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp_a = try socketpairNb();
+    const a = try loop.attach(sp_a[0], tctx(1), .{ .read = true, .write = true });
+    _ = try posix.write(sp_a[1], "x");
+    posix.close(sp_a[1]);
+
+    try loop.wait();
+    const first = loop.next().?;
+    try std.testing.expect(first == .readable or first == .writable);
+    try loop.close(a);
+
+    const sp_b = try socketpairNb();
+    const b = try loop.attach(sp_b[0], tctx(2), .{ .read = true });
+    _ = try posix.write(sp_b[1], "y");
+    defer posix.close(sp_b[1]);
+    try std.testing.expect(b.index == a.index and !b.eql(a)); // slot reused
+
+    while (loop.next()) |ev| {
+        switch (ev) {
+            .readable, .writable => |io| {
+                try std.testing.expect(!io.handle.eql(a));
+            },
+            else => {},
+        }
+    }
+}
+
+test "Loop: markDirty on a dirty handle adds no second entry" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp = try socketpairNb();
+    defer posix.close(sp[1]);
+    const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
+    const hs = loop.resolve(h).?;
+    loop.markDirty(h, hs);
+    loop.markDirty(h, hs);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+}
+
+test "Loop: close keeps the dirty order of the survivors" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    var handles: [4]Handle = undefined;
+    var spares: [4]posix.fd_t = undefined;
+    for (&handles, &spares) |*h, *s| {
+        const sp = try socketpairNb();
+        h.* = try loop.attach(sp[0], tctx(0), .{ .read = true });
+        s.* = sp[1];
+        loop.markDirty(h.*, loop.resolve(h.*).?);
+    }
+    defer for (spares) |fd| posix.close(fd);
+
+    try loop.close(handles[1]);
+    try std.testing.expectEqual(@as(usize, 3), loop.dirty.items.len);
+    try std.testing.expect(loop.dirty.items[0].eql(handles[0]));
+    try std.testing.expect(loop.dirty.items[1].eql(handles[2]));
+    try std.testing.expect(loop.dirty.items[2].eql(handles[3]));
+}
+
+test "Loop: cancelTimer disarms the kernel timer" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    // Arm through an immediate pass, then cancel: the disarm must reach the
+    // kernel. A stale armed knote fires ~50 ms later and lands in raw_events.
+    const id = try loop.scheduleIn(50, tctx(1));
+    loop.requestImmediate();
+    try loop.wait();
+    while (loop.next()) |_| {}
+    try std.testing.expect(loop.timer_armed);
+
+    _ = loop.cancelTimer(id);
+    loop.requestImmediate();
+    try loop.wait();
+    try std.testing.expect(!loop.timer_armed);
+    while (loop.next()) |_| {}
+
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+    loop.requestImmediate();
+    const before = loop.stats().raw_events;
+    try loop.wait();
+    try std.testing.expectEqual(before, loop.stats().raw_events);
+}
+
+test "Loop: detach purges the dirty entry immediately" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp = try socketpairNb();
+    defer posix.close(sp[1]);
+    const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
+    loop.markDirty(h, loop.resolve(h).?);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    const fd = try loop.detach(h);
+    posix.close(fd);
+    try std.testing.expectEqual(@as(usize, 0), loop.dirty.items.len);
+}
+
+test "Loop: a dead handle emits change_failed once, not every commit" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp = try socketpairNb();
+    const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
+    posix.close(sp[0]); // out-of-band: the staged change will be rejected
+    posix.close(sp[1]);
+    try loop.setInterest(h, .{ .read = true, .write = true });
+    try loop.wait();
+    var failures: u64 = 0;
+    while (loop.next()) |ev| {
+        if (ev == .change_failed) failures += 1;
+    }
+    try std.testing.expectEqual(@as(u64, 2), failures); // read and write both rejected
+    try std.testing.expectEqual(failures, loop.stats().change_failures);
+
+    // The handle is now marked broken: further interest changes stage no
+    // knotes, so a second commit produces no second EV_ERROR.
+    try loop.setInterest(h, .{ .read = true });
+    loop.requestImmediate();
+    try loop.wait();
+    try std.testing.expect(loop.next() == null);
+    try std.testing.expectEqual(failures, loop.stats().change_failures);
+}
+
+test "Loop: the change buffer holds 2H changes plus the internal ones" {
+    var options = testOptions(null);
+    options.handles_max = 4;
+    var loop: Loop = undefined;
+    try loop.init(std.testing.allocator, &options);
+    defer loop.deinit(std.testing.allocator);
+
+    var spares: [4][2]posix.fd_t = undefined;
+    for (&spares) |*sp| {
+        sp.* = try socketpairNb();
+        const h = try loop.attach(sp[0], tctx(0), .{ .read = true });
+        try loop.setInterest(h, .{ .read = true, .write = true });
+    }
+    _ = try loop.scheduleIn(60000, tctx(9)); // arms the kernel timer: +1 change
+
+    // 4 handles x 2 changes = 8 == 2H; the kernel timer arm is one of the
+    // two internal extras the buffer must still hold.
+    try loop.wait();
+    try std.testing.expectEqual(@as(usize, 9), loop.batch_changes);
+    while (loop.next()) |_| {}
+}
+
+test "Loop: close with a staged change emits no change_failed" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const sp = try socketpairNb();
+    defer posix.close(sp[1]);
+    const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
+    try loop.setInterest(h, .{ .read = true, .write = true });
+    try loop.close(h); // purge drops the staged write add
+
+    loop.requestImmediate(); // commit pass only; nothing is pending
+    try loop.wait();
+    while (loop.next()) |ev| {
+        try std.testing.expect(ev != .change_failed);
+    }
+    try std.testing.expectEqual(@as(u64, 0), loop.stats().change_failures);
+}
+
 test "Loop: watchSignal delivers count and ownership excludes a second watch" {
     var loop = try testLoop(null);
     defer loop.deinit(std.testing.allocator);
