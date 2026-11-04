@@ -247,7 +247,9 @@ fn writeCp(cp: u21, out: []u8) PrecisError!usize {
 fn bidiOk(cps: []const u21) bool {
     var has_rtl = false;
     for (cps) |cp| {
-        if (tables.bidiGroupOf(cp) == .r_al) {
+        // RFC 5893 Section 1.4: an RTL label contains R, AL or AN.
+        const group = tables.bidiGroupOf(cp);
+        if (group == .r_al or group == .an) {
             has_rtl = true;
             break;
         }
@@ -543,10 +545,13 @@ test "usernameCaseMapped: CONTEXTO Hebrew punctuation and katakana middle dot" {
 }
 
 test "usernameCaseMapped: CONTEXTO digits must not mix" {
-    try expectUsername("\u{0660}\u{0661}", "\u{0660}\u{0661}");
+    // AN makes every one of these an RTL candidate; an AN-first or EN-first
+    // label has no valid L/R/AL initial character, so Bidi rejects before the
+    // contextual digit rule is reached.
+    try expectUsernameError(error.BidiViolation, "\u{0660}\u{0661}");
     try expectUsername("\u{06F0}\u{06F1}", "\u{06F0}\u{06F1}");
-    try expectUsernameError(error.DisallowedCharacter, "\u{0660}\u{06F1}");
-    try expectUsernameError(error.DisallowedCharacter, "\u{06F1}\u{0660}");
+    try expectUsernameError(error.BidiViolation, "\u{0660}\u{06F1}");
+    try expectUsernameError(error.BidiViolation, "\u{06F1}\u{0660}");
 }
 
 test "usernameCaseMapped: Bidi Rule failures" {
@@ -561,6 +566,15 @@ test "usernameCaseMapped: Bidi Rule failures" {
     try expectUsername("\u{0627}1", "\u{0627}1");
     // Trailing nonspacing marks are fine after an RTL letter.
     try expectUsername("\u{05D0}\u{05B7}", "\u{05D0}\u{05B7}");
+}
+
+test "usernameCaseMapped: Arabic-Indic digits trigger the Bidi Rule" {
+    // RFC 5893 Section 1.4 includes AN in the RTL-label trigger.
+    try expectUsernameError(error.BidiViolation, "\u{0660}");
+    try expectUsernameError(error.BidiViolation, "a\u{0660}");
+    try expectUsernameError(error.BidiViolation, "\u{0660}c");
+    // A right-to-left label ending in AN alone is valid (condition 3).
+    try expectUsername("\u{0627}\u{0661}", "\u{0627}\u{0661}");
 }
 
 test "usernameCaseMapped: spaces and symbols are rejected" {
