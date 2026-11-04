@@ -228,6 +228,7 @@ pub const Listener = struct {
     accepted_this_pass: u16,
     aborted: u64, // ECONNABORTED/EPROTO: peer reset before accept
     pause_reason: PauseReason,
+    fallback_timer: ?loop_mod.TimerId, // armed for ENFILE/ENOBUFS/ENOMEM
     fallback_resume_ms: u64,
 
     pub const Family = enum { tcp, unix };
@@ -269,6 +270,7 @@ pub const Listener = struct {
             .accepted_this_pass = 0,
             .aborted = 0,
             .pause_reason = .emfile,
+            .fallback_timer = null,
             .fallback_resume_ms = fallback_resume_ms_default,
         };
     }
@@ -282,6 +284,13 @@ pub const Listener = struct {
     /// errno is an explicit outcome or error — nothing spins.
     pub fn acceptNext(self: *Listener) AcceptError!AcceptOutcome {
         if (self.loop.isPaused(self.handle)) return .{ .paused = self.pause_reason };
+        // The pause ended through a close or a resume: the fallback deadline
+        // is no longer needed; cancel it so it cannot resume a later pause
+        // early (cancel returns false once it already fired).
+        if (self.fallback_timer) |t| {
+            _ = self.loop.cancelTimer(t);
+            self.fallback_timer = null;
+        }
         if (self.accepted_this_pass >= accept_batch_max) {
             // Come back for the rest after one pass so a busy listener
             // cannot starve other handles.
@@ -333,14 +342,20 @@ pub const Listener = struct {
             error.StaleHandle => error.ListenerInvalid,
             error.PausedListFull => error.Unexpected,
         };
-        // Every exhaustion errno still gets the fallback deadline (the F10
-        // change narrows this to ENFILE/ENOBUFS/ENOMEM and tracks the id).
-        const resume_ctx: Token = .{
-            .index = self.handle.index,
-            .gen = self.handle.gen,
-            .kind = loop_mod.resume_kind,
-        };
-        _ = self.loop.scheduleIn(self.fallback_resume_ms, resume_ctx) catch {};
+        // Only ENFILE/ENOBUFS/ENOMEM get the fallback deadline: those may
+        // outlast every close in this process. EMFILE is relieved by a
+        // close, which always resumes the pause.
+        switch (reason) {
+            .emfile => {},
+            else => {
+                const resume_ctx: Token = .{
+                    .index = self.handle.index,
+                    .gen = self.handle.gen,
+                    .kind = loop_mod.resume_kind,
+                };
+                self.fallback_timer = self.loop.scheduleIn(self.fallback_resume_ms, resume_ctx) catch null;
+            },
+        }
         return .{ .paused = reason };
     }
 
@@ -738,6 +753,8 @@ fn childEmfile() void {
     if (n != 0) posix.exit(15); // accept must have failed
     if (!paused) posix.exit(25);
     if (!loop.isPaused(listener.handle)) posix.exit(16);
+    // EMFILE is relieved by a close: no fallback deadline gets armed.
+    if (listener.fallback_timer != null) posix.exit(27);
 
     // Back under the quota (a soft limit may be raised to the hard one), the
     // close frees a descriptor and resumes the listener.
