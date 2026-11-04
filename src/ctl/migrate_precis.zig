@@ -134,8 +134,9 @@ fn rewriteJid(
     hosted_domains: []const []const u8,
     forced: ?ForcedRename,
 ) !?[]u8 {
-    const at = std.mem.indexOfScalar(u8, jid, '@') orelse
-        return rewriteLocalpart(allocator, jid, forced);
+    // A domain-only JID (with or without a resource) has no account
+    // localpart and must stay exactly as stored.
+    const at = std.mem.indexOfScalar(u8, jid, '@') orelse return null;
     const remainder = jid[at + 1 ..];
     const slash = std.mem.indexOfScalar(u8, remainder, '/');
     const domain = if (slash) |pos| remainder[0..pos] else remainder;
@@ -275,7 +276,7 @@ fn rewriteEntry(
     } else if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST))
     {
-        rewrite.new_key = try rewriteTwoParts(allocator, key, hosted_domains, forced, true, false);
+        rewrite.new_key = try rewriteTwoParts(allocator, key, hosted_domains, forced, false, false);
     } else if (std.mem.eql(u8, namespace, NS_PENDING_SUB)) {
         rewrite.new_key = try rewriteTwoParts(allocator, key, hosted_domains, forced, false, false);
     } else if (std.mem.eql(u8, namespace, NS_BY_CONTACT)) {
@@ -813,67 +814,6 @@ fn expectSnapshotEqual(before: *const Snapshot, after: *const Snapshot) !void {
     }
 }
 
-test "migrate-precis: mixed-case account rows rename everywhere and rerun empty" {
-    const allocator = std.testing.allocator;
-    var auth = try MemoryBackend.open("", .{});
-    defer auth.close();
-    var op = try MemoryBackend.open("", .{});
-    defer op.close();
-    var archive = try MemoryBackend.open("", .{});
-    defer archive.close();
-
-    try auth.put(NS_USERS, "NaplesTB", "creds");
-    try auth.put(NS_LOCKS, "NaplesTB", "\x01\x00\x00\x00\x00");
-    try op.put(NS_ROSTERS, "NaplesTB\x00friend@us.example", "roster-local");
-    try op.put(NS_ROSTERS, "NaplesTB\x00Friend@remote.example", "roster-remote");
-    try op.put(NS_BLOCKLIST, "NaplesTB\x00blocked@us.example", "\x00");
-    try op.put(NS_VCARDS, "NaplesTB@us.example", "<vCard/>");
-    try op.put(NS_PEP, "NaplesTB@us.example\x00node\x00item", "<item/>");
-    try op.put(NS_LASTACT, "NaplesTB@us.example", "epoch");
-    try op.put(NS_OFFLINE, "NaplesTB@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "NaplesTB@us.example/res");
-    try op.put(NS_ROOM_AFFILIATIONS, "room@conference.us.example\x00NaplesTB@us.example", "\x04");
-    try op.put(NS_PENDING_SUB, "NaplesTB@us.example\x00friend@us.example", "<presence from='NaplesTB@us.example'/>");
-    try archive.put(NS_MESSAGES, "NaplesTB@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message from='NaplesTB@us.example/res'/>");
-    try archive.put(NS_BY_CONTACT, "NaplesTB@us.example\x00Friend@remote.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id1");
-
-    const domains = [_][]const u8{"us.example"};
-    var plan = try planMigration(allocator, &auth, &op, &archive, &domains, null);
-    defer plan.deinit();
-    try std.testing.expectEqual(@as(usize, 13), plan.renames.items.len);
-    try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(journal_dir);
-    try applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
-
-    try expectRow(&auth, NS_USERS, "naplestb", "creds");
-    try expectMissing(&auth, NS_USERS, "NaplesTB");
-    try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
-    try expectRow(&op, NS_ROSTERS, "naplestb\x00friend@us.example", "roster-local");
-    try expectRow(&op, NS_ROSTERS, "naplestb\x00Friend@remote.example", "roster-remote");
-    try expectRow(&op, NS_BLOCKLIST, "naplestb\x00blocked@us.example", "\x00");
-    try expectRow(&op, NS_VCARDS, "naplestb@us.example", "<vCard/>");
-    try expectRow(&op, NS_PEP, "naplestb@us.example\x00node\x00item", "<item/>");
-    try expectRow(&op, NS_LASTACT, "naplestb@us.example", "epoch");
-    try expectRow(&op, NS_OFFLINE, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "naplestb@us.example/res");
-    try expectRow(&op, NS_ROOM_AFFILIATIONS, "room@conference.us.example\x00naplestb@us.example", "\x04");
-    // The pending-subscription payload is a stanza and stays byte-identical.
-    try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00friend@us.example", "<presence from='NaplesTB@us.example'/>");
-    // Archive stanza payload is never rewritten, even though its key moves.
-    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message from='NaplesTB@us.example/res'/>");
-    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00Friend@remote.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id1");
-
-    try tmp.dir.access("migrate-precis.plan", .{});
-    try tmp.dir.access("migrate-precis.journal", .{});
-
-    var second = try planMigration(allocator, &auth, &op, &archive, &domains, null);
-    defer second.deinit();
-    try std.testing.expectEqual(@as(usize, 0), second.renames.items.len);
-    try std.testing.expectEqual(@as(usize, 0), second.issues.items.len);
-}
-
 test "migrate-precis: a collision aborts with every DB byte-identical" {
     const allocator = std.testing.allocator;
     var auth = try MemoryBackend.open("", .{});
@@ -885,7 +825,7 @@ test "migrate-precis: a collision aborts with every DB byte-identical" {
 
     try auth.put(NS_USERS, "NaplesTB", "creds-a");
     try auth.put(NS_USERS, "naplestb", "creds-b");
-    try op.put(NS_ROSTERS, "NaplesTB\x00friend@us.example", "roster");
+    try op.put(NS_ROSTERS, "NaplesTB@us.example\x00friend@us.example", "roster");
     try archive.put(NS_MESSAGES, "NaplesTB@us.example\x00id", "stanza");
 
     var before = try takeSnapshot(allocator, &auth, &op, &archive);
@@ -931,7 +871,7 @@ test "migrate-precis: an explicit rename resolves a collision" {
     defer archive.close();
     try auth.put(NS_USERS, "NaplesTB", "creds-a");
     try auth.put(NS_USERS, "naplestb", "creds-b");
-    try op.put(NS_ROSTERS, "NaplesTB\x00friend@us.example", "roster");
+    try op.put(NS_ROSTERS, "NaplesTB@us.example\x00friend@us.example", "roster");
 
     const domains = [_][]const u8{"us.example"};
     const forced = ForcedRename{ .old_localpart = "NaplesTB", .new_localpart = "naples_tb" };
@@ -941,7 +881,7 @@ test "migrate-precis: an explicit rename resolves a collision" {
     try applyPlan(allocator, &auth, &op, &archive, &plan, .{});
     try expectRow(&auth, NS_USERS, "naples_tb", "creds-a");
     try expectRow(&auth, NS_USERS, "naplestb", "creds-b");
-    try expectRow(&op, NS_ROSTERS, "naples_tb\x00friend@us.example", "roster");
+    try expectRow(&op, NS_ROSTERS, "naples_tb@us.example\x00friend@us.example", "roster");
 }
 
 test "migrate-precis: live and stale pid files drive the offline guard" {

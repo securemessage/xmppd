@@ -1848,6 +1848,12 @@ pub fn build(b: *std.Build) void {
     migrate_precis_backend_test_mod.addImport("user_store", generic_user_store_test_mod);
     migrate_precis_backend_test_mod.addImport("roster_store", generic_roster_store_test_mod);
     migrate_precis_backend_test_mod.addImport("archive_store", archive_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("block_store", block_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("vcard_store", vcard_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("pep_store", pep_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("last_activity_store", last_activity_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("offline_store", generic_offline_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("room_store", room_store_test_mod);
     const migrate_precis_backend_tests = b.addTest(.{
         .name = "migrate-precis-backend-tests",
         .root_module = migrate_precis_backend_test_mod,
