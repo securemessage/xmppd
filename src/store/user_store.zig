@@ -35,7 +35,10 @@ pub const StartupScanError = error{
 /// already in RFC 7622 prepared form. No rows are changed and no read fallback
 /// is provided: an unprepared key makes startup refuse loudly so the operator
 /// runs `xmppctl migrate-precis` instead of users being silently locked out.
-threadlocal var startup_precis_scratch: precis.Scratch = undefined;
+/// Startup-only scratch: verifyPreparedUsers runs once before the auth event
+/// loop, so this is deliberately not thread-local (avoids 64 KiB of TLS in
+/// every auth and crypto-pool thread).
+var startup_precis_scratch: precis.Scratch = undefined;
 
 pub fn verifyPreparedUsers(comptime Backend: type, backend: *Backend, max_keys: usize) StartupScanError!void {
     comptime backend_mod.assertBackend(Backend);
