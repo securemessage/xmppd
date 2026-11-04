@@ -3246,7 +3246,10 @@ pub const Server = struct {
                         }
                         fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
                     } else if (self.delivery_system) |ds| {
-                        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml) catch {
+                        // Carry this dispatch's token: the receiving worker holds
+                        // under the same identity, so the store writes one row
+                        // whichever worker reaches it first.
+                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -11865,6 +11868,78 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     try std.testing.expect(captured.len > 0);
 
     try std.testing.expectEqualStrings(wire[0..wire_len], captured.buf[0..captured.len]);
+}
+
+// An S2S dispatch that reaches one resource locally and another on a second
+// worker must hold one row. The remote worker learns the dispatch identity
+// from the delivery slot; a fresh token there would store the stanza twice.
+test "S2S: one inbound stanza to two draining workers holds one row" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    // Worker 1 receives the stanza and owns the first resource of the bare JID.
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+    w1.offline = &offline_store;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.offline_pending = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w1.sessions[5] = desk;
+    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    // Worker 0 owns the second resource, so the second target is remote.
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+    w0.offline = &offline_store;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.offline_pending = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    w0.sessions[6] = phone;
+    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='h1' type='chat'><body>cross</body></message>";
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.dispatchS2sResponse(.{ .s2s_inbound = .{
+        .from_jid = "carol@example.com/res",
+        .to_jid = "bob@localhost",
+        .stanza_xml = stanza,
+    } }, &w1_changes);
+
+    var w0_changes_buf: [32]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    w0.drainDeliveryQueue(&w0_changes);
+
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 }
 
 test "N1: two workers draining one bare JID hold a message once" {
