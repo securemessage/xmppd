@@ -45,6 +45,7 @@ const ChangeList = event_loop_mod.ChangeList;
 const config_mod = @import("config");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
+const policy_mod = @import("policy");
 const OpBackendType = @import("op_backend").Backend;
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
@@ -578,11 +579,14 @@ pub const Daemon = struct {
         // In-flight caps: queued and running exchanges per account key and
         // per client IP. Over the cap answers directly; the attempt stays
         // admitted but no outcome is recorded.
-        var account_key_buf: [lock_store_mod.MAX_KEY_LEN]u8 = undefined;
-        const account_key: []const u8 = if (account_identity.len > 0)
-            lock_store_mod.canonicalKey(account_identity, &account_key_buf) orelse ""
+        var account_key_buf: [policy_mod.account_key_max]u8 = undefined;
+        const full_key: []const u8 = if (account_identity.len > 0)
+            policy_mod.accountKey(account_identity, &account_key_buf)
         else
             "";
+        // The cap table key is bounded like the lock store's; an
+        // untrackable key simply never matches a cap bucket.
+        const account_key: []const u8 = if (full_key.len <= lock_store_mod.MAX_KEY_LEN) full_key else "";
 
         var same_account: usize = 0;
         var same_ip: usize = 0;

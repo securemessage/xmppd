@@ -1600,6 +1600,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("ipc_server", oidc_ipc_server_mod);
     oidc_main_mod.addImport("handler", oidc_handler_mod);
     oidc_main_mod.addImport("oidc", oidc_store_mod);
+    oidc_main_mod.addImport("policy", oidc_policy_mod);
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
