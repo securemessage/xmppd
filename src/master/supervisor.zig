@@ -266,26 +266,39 @@ pub const Supervisor = struct {
         return pid;
     }
 
+    /// What the caller does after a wait report. Kept distinct so an
+    /// ignored stop/continue report cannot be misread as a shutdown.
+    pub const ExitAction = enum {
+        /// Child terminated; restart per backoff policy.
+        restart,
+        /// Child terminated while shutting down; stop the master loop.
+        shutdown,
+        /// A stop or continue report: no state change, no restart.
+        ignore,
+    };
+
     /// Handle child exit notification.
     ///
     /// Call this when kqueue `EVFILT_PROC` fires or after `waitpid()`.
-    /// Updates state and backoff. Returns true if the supervisor should
-    /// restart the child (i.e., not shutting down).
-    pub fn handleChildExit(self: *Supervisor, status: u32) bool {
+    /// Updates state and backoff for terminations; a stop or continue
+    /// report is ignored.
+    pub fn handleChildExit(self: *Supervisor, status: u32) ExitAction {
         // WIFEXITED gates the exit-status read and WIFSIGNALED the signal
         // read: a stop or continue report is neither, and treating its
-        // 0x7f marker as a signal would restart over a live child.
+        // 0x7f marker as a signal would restart over a live child. Zig
+        // 0.15.2 W.IFSIGNALED is also true for FreeBSD continued reports
+        // (0x13), so stopped and continued are excluded first.
         if (posix.W.IFEXITED(status)) {
             log.info("child pid={?d} exited with code {d}", .{ self.child_pid, posix.W.EXITSTATUS(status) });
-        } else if (posix.W.IFSIGNALED(status)) {
+        } else if (posix.W.IFSIGNALED(status) and !posix.W.IFSTOPPED(status) and !wifContinued(status)) {
             log.warn("child pid={?d} killed by signal {d}", .{ self.child_pid, posix.W.TERMSIG(status) });
         } else {
             log.warn("child pid={?d} wait status 0x{x} is not a termination", .{ self.child_pid, status });
-            return false;
+            return .ignore;
         }
 
         if (self.state == .shutting_down) {
-            return false;
+            return .shutdown;
         }
 
         self.state = .exited;
@@ -304,7 +317,7 @@ pub const Supervisor = struct {
             self.restart_count += 1;
         }
 
-        return true;
+        return .restart;
     }
 
     /// Get the current backoff delay in milliseconds (for timer registration).
@@ -346,6 +359,12 @@ pub const Supervisor = struct {
     }
 };
 
+/// FreeBSD _WCONTINUED report; Zig 0.15.2 std.c.W has no IFCONTINUED for
+/// this target and W.IFSIGNALED reads true for 0x13.
+fn wifContinued(status: u32) bool {
+    return (status & 0xffff) == 0x13;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -376,7 +395,7 @@ test "Supervisor: handleChildExit with quick exit increases backoff" {
     sup.last_start = std.time.nanoTimestamp(); // Just started
 
     const should_restart = sup.handleChildExit(0); // Exit code 0
-    try std.testing.expect(should_restart);
+    try std.testing.expect(should_restart == .restart);
     try std.testing.expect(sup.state == .exited);
     try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), sup.backoff_ns);
     try std.testing.expectEqual(@as(u32, 1), sup.restart_count);
@@ -388,7 +407,7 @@ test "Supervisor: handleChildExit during shutdown returns false" {
     sup.child_pid = 12345;
 
     const should_restart = sup.handleChildExit(0);
-    try std.testing.expect(!should_restart);
+    try std.testing.expect(should_restart == .shutdown);
 }
 
 test "Supervisor: backoff caps at MAX_BACKOFF" {
@@ -449,16 +468,23 @@ test "Supervisor: a signal kill is a termination, a stop report is not" {
     const status = try sup.waitChild();
     try std.testing.expect(posix.W.IFSIGNALED(status));
     try std.testing.expectEqual(@as(u32, posix.SIG.KILL), posix.W.TERMSIG(status));
-    try std.testing.expect(sup.handleChildExit(status));
+    try std.testing.expect(sup.handleChildExit(status) == .restart);
     try std.testing.expect(sup.state == .exited);
 
+    // Stopped and continued reports are not terminations: ignore them.
+    // Zig 0.15.2 W.IFSIGNALED reads true for the continued encoding, so
+    // this half pins the stop/continue gate, not just the decode.
     var sup2 = try Supervisor.init("/nonexistent", &.{}, 1);
     sup2.state = .running;
     sup2.child_pid = 12345;
     const stopped_status: u32 = (@as(u32, posix.SIG.STOP) << 8) | 0x7f;
+    const continued_status: u32 = 0x13;
     try std.testing.expect(!posix.W.IFEXITED(stopped_status));
     try std.testing.expect(!posix.W.IFSIGNALED(stopped_status));
-    try std.testing.expect(!sup2.handleChildExit(stopped_status));
+    try std.testing.expect(!posix.W.IFEXITED(continued_status));
+    try std.testing.expect(posix.W.IFSIGNALED(continued_status));
+    try std.testing.expect(sup2.handleChildExit(stopped_status) == .ignore);
+    try std.testing.expect(sup2.handleChildExit(continued_status) == .ignore);
     try std.testing.expect(sup2.state == .running);
 }
 
