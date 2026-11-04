@@ -4885,15 +4885,11 @@ test "dns-async: a write on a reset connection reports peer close, not a drop" {
     // Unread data at the accept end makes its close an RST.
     _ = try posix.send(cfd, "x", posix.MSG.NOSIGNAL);
     posix.close(afd);
+    // Wait for the close to land before writing: loopback delivers
+    // it at once, but a tight write loop can outrun the processing.
+    var pfds = [1]posix.pollfd{.{ .fd = cfd, .events = std.c.POLL.IN, .revents = 0 }};
+    _ = posix.poll(&pfds, 5000) catch 0;
     var rbuf: [8]u8 = undefined;
-    var spins: usize = 0;
-    while (spins < 100_000) : (spins += 1) {
-        _ = posix.recv(cfd, &rbuf, posix.MSG.DONTWAIT) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => break,
-        };
-        break;
-    }
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
