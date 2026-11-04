@@ -1034,6 +1034,26 @@ test "migrate-precis: a collision aborts with every DB byte-identical" {
     try expectSnapshotEqual(&before, &after);
 }
 
+test "migrate-precis: two unprepared keys folding to one new key collide" {
+    const allocator = std.testing.allocator;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    try auth.put(NS_USERS, "NaplesTB", "creds-a");
+    try auth.put(NS_USERS, "NAPLESTB", "creds-b");
+    const domains = [_][]const u8{"us.example"};
+    var plan = try planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(plan.issues.items.len > 0);
+    try std.testing.expectError(error.MigrationBlocked, applyPlan(allocator, &auth, &op, &archive, &plan, .{}));
+    try expectRow(&auth, NS_USERS, "NaplesTB", "creds-a");
+    try expectRow(&auth, NS_USERS, "NAPLESTB", "creds-b");
+}
+
 test "migrate-precis: an unpreparable account name blocks the apply" {
     const allocator = std.testing.allocator;
     var auth = try MemoryBackend.open("", .{});

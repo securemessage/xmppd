@@ -73,8 +73,8 @@ pub const account_key_max = rate_limiter.max_key_len;
 /// Canonical account key: the identity localpart prepared by the one RFC 7622
 /// function shared with the permanent lock store. A name that fails
 /// preparation has no account key and can never match an account. An
-/// untrackable (overlong) prepared key is returned unfolded so admission keeps
-/// PR #21's fail-closed behavior.
+/// untrackable (overlong) prepared key is returned unfolded so admission
+/// fails closed on it.
 pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
     return lock_store_mod.prepareAccountKey(identity, buf[0..]) catch |err| switch (err) {
         error.InvalidAccountName => "",

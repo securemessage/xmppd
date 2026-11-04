@@ -24,6 +24,30 @@ const MdbEnvInfoC = extern struct {
     me_numreaders: c_uint,
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
+extern "c" fn mdb_reader_list(env: ?*anyopaque, func: *const fn ([*:0]const u8, ?*anyopaque) callconv(.c) c_int, ctx: ?*anyopaque) c_int;
+
+threadlocal var live_reader_seen = false;
+
+fn readerIsLive(msg: [*:0]const u8, opaque_ctx: ?*anyopaque) callconv(.c) c_int {
+    _ = opaque_ctx;
+    const text = std.mem.span(msg);
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const pid_text = tokens.next() orelse return 0;
+    _ = tokens.next() orelse return 0;
+    const txnid_text = tokens.next() orelse return 0;
+    // Aborted transactions leave retained slots marked "-", not live readers.
+    if (std.mem.eql(u8, txnid_text, "-")) return 0;
+    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch return 0;
+    std.posix.kill(pid, 0) catch |err| switch (err) {
+        error.ProcessNotFound => return 0,
+        else => {
+            live_reader_seen = true;
+            return 0;
+        },
+    };
+    live_reader_seen = true;
+    return 0;
+}
 
 const log = std.log.scoped(.lmdb_store);
 
@@ -154,6 +178,14 @@ pub const LmdbBackend = struct {
 
     pub fn close(self: *LmdbBackend) void {
         self.env.deinit();
+    }
+
+    /// Fail if the reader table contains a live process. Pid files alone
+    /// cannot prove an LMDB environment is offline.
+    pub fn assertNoActiveReaders(self: *LmdbBackend) !void {
+        live_reader_seen = false;
+        if (mdb_reader_list(self.env.ptr, readerIsLive, null) != 0) return error.LmdbCheckFailed;
+        if (live_reader_seen) return error.DaemonsRunning;
     }
 
     pub fn get(self: *LmdbBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {

@@ -3191,8 +3191,7 @@ test "AuthHandler: registration conflict is on the canonical name" {
         try std.testing.expectEqualStrings("conflict", dup.register_result.reason);
     }
 
-    // The Kelvin sign folds to 'k' (PR #21 account-key semantics): U+212A
-    // and "k" are one account name.
+    // The Kelvin sign folds to 'k': U+212A and "k" are one account name.
     const kelvin = handleSync(&handler, .{ .register_request = .{
         .conn_id = 312,
         .username = "\u{212A}",

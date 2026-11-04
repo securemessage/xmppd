@@ -19,29 +19,19 @@
 //!      to strings that contain right-to-left code points."
 //!
 //! Plus RFC 8265 Section 3.3.3: "the entity MUST ensure that the username
-//! is not zero bytes in length", RFC 7622 Section 3.1's 1023-octet limit
-//! on the prepared name, and RFC 8264 Section 7: "an implementation
-//! SHOULD apply the rules repeatedly until the output string is stable; if
-//! the output string does not stabilize after reapplying the rules three
-//! (3) additional times after the first application, the implementation
-//! SHOULD terminate application of the rules and reject the input string
-//! as invalid."
+//! is not zero bytes in length" and RFC 8264 Section 7's stability rule.
+//! `xmppLocalpart` adds the RFC 7622 Section 3.3.1 exclusions and the
+//! 1023-octet localpart limit; `usernameCaseMapped` itself stays pure RFC 8265.
 //!
-//! Case mapping decision (zed, 2026-11-02): full Unicode lowercase =
-//! UnicodeData simple lowercase + UNCONDITIONAL SpecialCasing entries
-//! only; every conditional entry is skipped (no Final_Sigma, no tr/az/lt
-//! rules). U+03A3 always maps to U+03C3 and U+03C2 maps to itself. This
-//! equals golang.org/x/text/secure/precis
-//! cases.Lower(language.Und, cases.HandleFinalSigma(false)). Consequence:
-//! the two sigmas are confusables; "οδος" (U+03C2) and "οδοσ" (U+03C3) are
-//! different account names after preparation. Detecting that is out of
-//! scope here.
+//! Case mapping uses UnicodeData simple lowercase plus UNCONDITIONAL
+//! SpecialCasing entries only; every conditional entry is skipped (no
+//! Final_Sigma and no tr/az/lt rules). U+03A3 always maps to U+03C3 and
+//! U+03C2 maps to itself. Consequence: "οδος" (U+03C2) and "οδοσ" (U+03C3)
+//! are different account names after preparation.
 //!
-//! The IdentifierClass check runs after case mapping, not at RFC 8265
-//! Section 3.3.2 preparation time, so the mapped code points are what is
-//! validated: U+212A KELVIN SIGN (IdentifierClass DISALLOWED) prepares to
-//! U+006B and is accepted, matching the account-key folding of PR #21
-//! (src/auth/policy.zig, src/store/lock_store.zig).
+//! The IdentifierClass check runs after case mapping, so the mapped code
+//! points are what is validated: U+212A KELVIN SIGN (IdentifierClass
+//! DISALLOWED) prepares to U+006B and is accepted.
 //!
 //! Tables come from lib/precis/precis_tables.zig, generated from the
 //! pinned Unicode 15.0.0 UCD by tools/gen_precis_tables.py. NFC comes
@@ -134,6 +124,7 @@ pub fn xmppLocalpart(
     scratch_cps: []u21,
     scratch_cccs: []u8,
 ) PrecisError![]const u8 {
+    if (input.len > max_input_octets) return error.TooLong;
     const prepared = try usernameCaseMapped(input, buf, scratch_cps, scratch_cccs);
     for (prepared) |byte| {
         switch (byte) {
@@ -172,7 +163,6 @@ fn enforce(
     scratch_cccs: []u8,
 ) PrecisError![]const u8 {
     if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
-    if (input.len > max_input_octets) return error.TooLong;
     const slot_len = 3 * input.len;
     if (buf.len < 2 * slot_len) return error.NoSpaceLeft;
     if (scratch_cps.len < slot_len or scratch_cccs.len < slot_len) return error.NoSpaceLeft;
@@ -241,9 +231,6 @@ fn applyRules(
     // not zero bytes in length".
     if (normed.len == 0) return error.Empty;
 
-    // RFC 7622 Section 3.1: 1023 octets on the prepared name.
-    if (normed.len > max_username_octets) return error.TooLong;
-
     return normed;
 }
 
@@ -258,9 +245,8 @@ fn writeCp(cp: u21, out: []u8) PrecisError!usize {
 /// strings that contain right-to-left code points (RFC 8265 Section 3.3.1
 /// rule 5: "for strings that do not contain right-to-left code points,
 /// there is no special processing for directionality"). The generated
-/// BidiGroup pools ES, CS, ET and BN (allowed in both label types) with
-/// the remaining classes; every pooled code point is IdentifierClass
-/// DISALLOWED and is rejected by the class check.
+/// BidiGroup pools ES, CS, ET and BN with the remaining classes; the
+/// IdentifierClass check still decides which of those code points is valid.
 fn bidiOk(cps: []const u21) bool {
     var has_rtl = false;
     for (cps) |cp| {
@@ -493,7 +479,7 @@ test "usernameCaseMapped: sigma, no final-sigma rule" {
 
 test "usernameCaseMapped: KELVIN SIGN folds to k" {
     // U+212A is IdentifierClass DISALLOWED; case mapping runs first, so
-    // the prepared name is the letter k (PR #21 account-key semantics).
+    // the prepared name is the letter k.
     try expectUsername("k", "\u{212A}");
     try expectUsername("kk", "\u{212A}\u{212A}");
 }
@@ -501,6 +487,10 @@ test "usernameCaseMapped: KELVIN SIGN folds to k" {
 test "usernameCaseMapped: fullwidth and halfwidth map to decompositions" {
     try expectUsername("abc", "\u{FF21}\u{FF22}\u{FF23}");
     try expectUsername("12", "\u{FF11}\u{FF12}");
+    // Width mapping precedes the XMPP-only exclusions: UCM itself produces
+    // the ASCII quote and at-sign even though xmppLocalpart rejects them.
+    try expectUsername("\"", "\u{FF02}");
+    try expectUsername("@", "\u{FF20}");
     // Halfwidth katakana letter a -> U+30A2 (its decomposition mapping).
     try expectUsername("\u{30A2}", "\u{FF71}");
 }
@@ -607,22 +597,18 @@ test "usernameCaseMapped: spaces and symbols are rejected" {
     try expectUsername("a,b.c-d_1", "a,b.c-d_1");
 }
 
-test "usernameCaseMapped: empty and RFC 7622 length limit" {
+test "usernameCaseMapped: empty and no XMPP localpart length limit" {
     try expectUsernameError(error.Empty, "");
-    var buf: [8192]u8 = undefined;
-    var cps: [4096]u21 = undefined;
-    var cccs: [4096]u8 = undefined;
-    var in1023: [max_username_octets]u8 = undefined;
-    @memset(&in1023, 'a');
-    const ok = try usernameCaseMapped(&in1023, &buf, &cps, &cccs);
-    try testing.expectEqual(@as(usize, max_username_octets), ok.len);
-    var in1024: [max_username_octets + 1]u8 = undefined;
-    @memset(&in1024, 'a');
-    try testing.expectError(error.TooLong, usernameCaseMapped(&in1024, &buf, &cps, &cccs));
-    // Beyond max_input_octets the input cannot shrink below the limit.
+    // RFC 8265 alone has no 1023-octet localpart limit: that limit belongs
+    // only to xmppLocalpart (RFC 7622 Section 3.3).
+    var buf: [6 * (max_input_octets + 1)]u8 = undefined;
+    var cps: [3 * (max_input_octets + 1)]u21 = undefined;
+    var cccs: [3 * (max_input_octets + 1)]u8 = undefined;
     var big: [max_input_octets + 1]u8 = undefined;
     @memset(&big, 'a');
-    try testing.expectError(error.TooLong, usernameCaseMapped(&big, &buf, &cps, &cccs));
+    const got = try usernameCaseMapped(&big, &buf, &cps, &cccs);
+    try testing.expectEqual(big.len, got.len);
+    try testing.expectError(error.TooLong, xmppLocalpart(&big, &buf, &cps, &cccs));
 }
 
 test "usernameCaseMapped: buffer contracts" {
@@ -704,6 +690,39 @@ const NonStabilizingMapper = struct {
         return .{ cp, 0 };
     }
 };
+
+/// Changes output for `settle_on - 1` applications, then becomes the identity.
+/// Input is one code point, so map calls count rule applications exactly.
+fn CountingMapper(comptime settle_on: usize) type {
+    return struct {
+        var calls: usize = 0;
+
+        fn map(cp: u21) [2]u21 {
+            calls += 1;
+            if (calls < settle_on) return .{ cp + 1, 0 };
+            return .{ cp, 0 };
+        }
+    };
+}
+
+test "usernameCaseMapped: stability on the fourth application is accepted" {
+    const M = CountingMapper(4);
+    M.calls = 0;
+    var buf: [64]u8 = undefined;
+    var cps: [32]u21 = undefined;
+    var cccs: [32]u8 = undefined;
+    const got = try enforce(M, "a", &buf, &cps, &cccs);
+    try testing.expectEqualStrings("d", got);
+}
+
+test "usernameCaseMapped: stability on the fifth application is rejected" {
+    const M = CountingMapper(5);
+    M.calls = 0;
+    var buf: [64]u8 = undefined;
+    var cps: [32]u21 = undefined;
+    var cccs: [32]u8 = undefined;
+    try testing.expectError(error.NotStable, enforce(M, "a", &buf, &cps, &cccs));
+}
 
 test "usernameCaseMapped: RFC 8264 stability loop limit rejects" {
     var buf: [64]u8 = undefined;

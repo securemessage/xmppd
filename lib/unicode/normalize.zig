@@ -268,6 +268,15 @@ test "nfc: hangul syllable consumes decomposition scratch" {
     try testing.expectError(error.NoSpaceLeft, nfc("\u{AC00}", &buf, &cps, &cccs));
 }
 
+test "nfc: hangul LV accepts T but LVT does not compose another T" {
+    try testing.expectEqual(@as(?u21, 0xAC01), hangulCompFor(0xAC00, 0x11A8));
+    try testing.expectEqual(@as(?u21, null), hangulCompFor(0xAC01, 0x11A8));
+    // Dropping the LV-base guard would incorrectly compose the second trailing
+    // jamo into the already-complete LVT syllable.
+    const out = try nfcOf("\u{AC01}\u{11A8}");
+    try testing.expectEqualStrings("\u{AC01}\u{11A8}", out);
+}
+
 test "nfc: intervening mark blocks hangul starter composition" {
     // U+1100 U+0301 U+1161: the mark blocks L+V
     const out = try nfcOf("\u{1100}\u{0301}\u{1161}");

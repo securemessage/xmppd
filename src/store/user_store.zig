@@ -28,6 +28,7 @@ pub const max_startup_scan_keys = 100_000;
 pub const StartupScanError = error{
     UnpreparedAccountName,
     ScanLimitExceeded,
+    ScanFailed,
 };
 
 /// Verify once, on the auth daemon's startup path, that every users key is
@@ -36,9 +37,9 @@ pub const StartupScanError = error{
 /// runs `xmppctl migrate-precis` instead of users being silently locked out.
 threadlocal var startup_precis_scratch: precis.Scratch = undefined;
 
-pub fn verifyPreparedUsers(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
+pub fn verifyPreparedUsers(comptime Backend: type, backend: *Backend, max_keys: usize) StartupScanError!void {
     comptime backend_mod.assertBackend(Backend);
-    var iterator = try backend.iterator(NAMESPACE, "");
+    var iterator = backend.iterator(NAMESPACE, "") catch return error.ScanFailed;
     defer iterator.deinit();
 
     var count: usize = 0;

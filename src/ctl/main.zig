@@ -434,6 +434,13 @@ fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []cons
     try store.removeUser(allocator, canon);
 }
 
+fn assertLmdbOffline(backend: anytype) !void {
+    const Backend = @TypeOf(backend.*);
+    if (comptime @hasDecl(Backend, "assertNoActiveReaders")) {
+        try backend.assertNoActiveReaders();
+    }
+}
+
 fn runDeleteRaw(
     allocator: std.mem.Allocator,
     db_path: []const u8,
@@ -458,6 +465,8 @@ fn runDeleteRaw(
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
+    try assertLmdbOffline(&auth);
+    try assertLmdbOffline(&op);
 
     migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
         switch (err) {
@@ -504,6 +513,8 @@ fn runMigratePrecis(
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
+    try assertLmdbOffline(&auth);
+    try assertLmdbOffline(&op);
 
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();
@@ -529,7 +540,11 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
         defer allocator.free(old_hex);
         const new_hex = try migrate_precis.hexKey(allocator, rename.new_key);
         defer allocator.free(new_hex);
-        printOut("rename ");
+        if (rename.same_key) {
+            printOut("rewrite-value ");
+        } else {
+            printOut("rename ");
+        }
         printOut(@tagName(rename.db));
         printOut(" ");
         printOut(rename.namespace);

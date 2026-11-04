@@ -49,8 +49,8 @@ const log = std.log.scoped(.xmppd_auth);
 
 /// Certify the users namespace before any request is served. There is
 /// deliberately no raw-name read fallback.
-fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend) !void {
-    return user_store_mod.verifyPreparedUsers(Backend, backend, user_store_mod.max_startup_scan_keys);
+fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
+    return user_store_mod.verifyPreparedUsers(Backend, backend, max_keys);
 }
 
 /// Sentinel value for the listener fd in kqueue udata.
@@ -77,6 +77,7 @@ pub fn main() !void {
     var rate_policy = RatePolicy{};
     var rate_limit_enabled = true;
     var reg_config = RegistrationConfig{};
+    var users_scan_limit: usize = user_store_mod.max_startup_scan_keys;
     // T121: crypto pool size. 0 disables (inline derive in the event loop).
     var crypto_threads: u32 = 4;
 
@@ -136,6 +137,11 @@ pub fn main() !void {
             reg_config.enabled = true;
         } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
             reg_config.require_invite = false;
+        } else if (std.mem.eql(u8, arg, "--users-scan-limit")) {
+            users_scan_limit = parseU32Arg(args.next()) orelse {
+                log.err("--users-scan-limit requires a numeric value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -212,6 +218,9 @@ pub fn main() !void {
         if (c.get("auth", "require_invite")) |v| {
             if (std.mem.eql(u8, v, "false")) reg_config.require_invite = false;
         }
+        if (c.get("auth", "users_scan_limit")) |v| {
+            users_scan_limit = std.fmt.parseInt(usize, v, 10) catch users_scan_limit;
+        }
 
         log.info("config file: {s}", .{cp});
     }
@@ -229,8 +238,12 @@ pub fn main() !void {
     var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
     defer backend.close();
     var store = UserStore.init(&backend);
-    verifyUsersAtStartup(OpBackendType, &backend) catch |err| {
-        log.err("users namespace is not in RFC 7622 prepared form ({}); run 'xmppctl migrate-precis --apply' offline before starting xmppd-auth", .{err});
+    verifyUsersAtStartup(OpBackendType, &backend, users_scan_limit) catch |err| {
+        if (err == error.ScanLimitExceeded) {
+            log.err("users namespace exceeds the {d}-key startup scan bound; raise --users-scan-limit or review the account DB", .{users_scan_limit});
+        } else {
+            log.err("users namespace is not in RFC 7622 prepared form ({}); run 'xmppctl migrate-precis --apply' offline before starting xmppd-auth", .{err});
+        }
         return err;
     };
     var lock_store = LockStore.init(&backend);
@@ -597,11 +610,13 @@ test "auth startup: an unprepared users key refuses startup" {
     var db = try backend_mod.MemoryBackend.open("", .{});
     defer db.close();
     try db.put(user_store_mod.NAMESPACE, "NaplesTB", "x");
-    try std.testing.expectError(error.UnpreparedAccountName, verifyUsersAtStartup(backend_mod.MemoryBackend, &db));
+    try std.testing.expectError(error.UnpreparedAccountName, verifyUsersAtStartup(backend_mod.MemoryBackend, &db, user_store_mod.max_startup_scan_keys));
 
     try db.delete(user_store_mod.NAMESPACE, "NaplesTB");
     try db.put(user_store_mod.NAMESPACE, "naplestb", "x");
-    try verifyUsersAtStartup(backend_mod.MemoryBackend, &db);
+    try verifyUsersAtStartup(backend_mod.MemoryBackend, &db, user_store_mod.max_startup_scan_keys);
+    try std.testing.expectError(error.ScanLimitExceeded, verifyUsersAtStartup(backend_mod.MemoryBackend, &db, 0));
+    try verifyUsersAtStartup(backend_mod.MemoryBackend, &db, 1);
 }
 
 fn printUsage() void {
@@ -620,6 +635,7 @@ fn printUsage() void {
         \\  --no-rate-limit            Disable auth rate limiting entirely (testing/benchmarks only)
         \\  --enable-registration      Enable in-band registration (XEP-0077)
         \\  --no-require-invite        Allow registration without invitation code
+        \\  --users-scan-limit N       Max users keys certified at startup (default: 100000)
         \\  --help, -h                 Show this help
         \\
     ;
