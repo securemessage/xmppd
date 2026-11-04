@@ -338,7 +338,18 @@ pub const Daemon = struct {
 
     running: bool = true,
 
-    pub fn init(self: *Daemon, allocator: Allocator, store: *OidcStore, handler: *AuthHandler, socket_path: []const u8, pool_options: IdpPool.Options) !void {
+    /// Everything init() can fail with: the IPC listener socket, the
+    /// kqueue, the pool start and the pending-table capacity.
+    pub const InitError = IdpPool.StartError || posix.SocketError || posix.BindError ||
+        posix.ListenError || posix.KQueueError || error{
+        OutOfMemory,
+        PathTooLong,
+        EventNotFound,
+        ProcessNotFound,
+        SystemResources,
+    };
+
+    pub fn init(self: *Daemon, allocator: Allocator, store: *OidcStore, handler: *AuthHandler, socket_path: []const u8, pool_options: IdpPool.Options) InitError!void {
         self.allocator = allocator;
         self.store = store;
         self.handler = handler;

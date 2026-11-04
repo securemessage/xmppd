@@ -191,6 +191,12 @@ fn waitIo(kq: posix.fd_t, fd: posix.fd_t, filter: i16, deadline_ns: u64, cancel_
     return error.WaitFailed;
 }
 
+/// One established connection: the socket plus its SSL.
+const Conn = struct {
+    fd: posix.fd_t,
+    ssl_ptr: *c.SSL,
+};
+
 /// Core HTTP request implementation. Owns one socket, one SSL and one
 /// kqueue for the exchange's duration.
 fn request(
@@ -221,10 +227,33 @@ fn request(
     const kq = posix.kqueue() catch return HttpError.ConnectionFailed;
     defer posix.close(kq);
 
+    const conn = try connectAndHandshake(ssl_ctx, kq, host_z, parsed, connect_deadline, options);
+    defer posix.close(conn.fd);
+    defer {
+        // One non-blocking shutdown, never waited on (freebsd-ktls D6).
+        _ = c.SSL_shutdown(conn.ssl_ptr);
+        c.SSL_free(conn.ssl_ptr);
+    }
+
+    try sendRequest(conn, kq, allocator, method, parsed, body, content_type, options);
+    return readResponse(conn, kq, allocator, options);
+}
+
+/// DNS, TCP connect and TLS handshake under the connect-phase deadline
+/// (freebsd-ktls D5: the handshake is part of connect). Caller owns the
+/// returned fd and SSL.
+fn connectAndHandshake(
+    ssl_ctx: *c.SSL_CTX,
+    kq: posix.fd_t,
+    host_z: [*:0]const u8,
+    parsed: ParsedUrl,
+    connect_deadline: u64,
+    options: RequestOptions,
+) HttpError!Conn {
     // DNS resolution (blocking, IPv4, no deadline -- see module header).
     const peer = resolvePeer(parsed.host, parsed.port) orelse return HttpError.DnsResolutionFailed;
     const fd = peer.fd;
-    defer posix.close(fd);
+    errdefer posix.close(fd);
 
     // Non-blocking connect against the connect-phase deadline.
     posix.connect(fd, @ptrCast(&peer.addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
@@ -254,7 +283,7 @@ fn request(
     };
 
     const ssl_ptr = c.SSL_new(ssl_ctx) orelse return HttpError.TlsInitFailed;
-    defer c.SSL_free(ssl_ptr);
+    errdefer c.SSL_free(ssl_ptr);
 
     _ = c.SSL_set_fd(ssl_ptr, @intCast(fd));
     _ = c.SSL_set_tlsext_host_name(ssl_ptr, host_z);
@@ -267,16 +296,11 @@ fn request(
     if (c.X509_VERIFY_PARAM_set1_host(verify_param, host_z, 0) != 1)
         return HttpError.TlsInitFailed;
 
-    // TLS handshake on the non-blocking socket, bounded by the
-    // connect-phase deadline (freebsd-ktls D5).
-    var handshake_done = false;
-    while (!handshake_done) {
+    // TLS handshake on the non-blocking socket.
+    while (true) {
         c.ERR_clear_error();
         const ret = c.SSL_connect(ssl_ptr);
-        if (ret == 1) {
-            handshake_done = true;
-            break;
-        }
+        if (ret == 1) return .{ .fd = fd, .ssl_ptr = ssl_ptr };
         const ssl_err = c.SSL_get_error(ssl_ptr, ret);
         switch (ssl_err) {
             c.SSL_ERROR_WANT_READ => waitIo(kq, fd, std.c.EVFILT.READ, connect_deadline, options.cancel_fd) catch |werr| return switch (werr) {
@@ -292,13 +316,21 @@ fn request(
             else => return HttpError.TlsHandshakeFailed,
         }
     }
-    defer if (handshake_done) {
-        // One non-blocking shutdown, never waited on (freebsd-ktls D6).
-        _ = c.SSL_shutdown(ssl_ptr);
-    };
+}
 
-    // Build the request head plus body into a heap buffer (secrets in the
-    // body are wiped before free).
+/// Build the request head plus body into one heap buffer (secrets in the
+/// body are wiped before free) and write it out. On WANT_* the retry
+/// passes the identical pointer and length (freebsd-ktls D3).
+fn sendRequest(
+    conn: Conn,
+    kq: posix.fd_t,
+    allocator: Allocator,
+    method: []const u8,
+    parsed: ParsedUrl,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+    options: RequestOptions,
+) HttpError!void {
     const body_len = if (body) |b| b.len else 0;
     const req_buf = allocator.alloc(u8, MAX_HEAD_SIZE + body_len) catch return HttpError.OutOfMemory;
     defer {
@@ -325,24 +357,22 @@ fn request(
     if (body) |b| @memcpy(req_buf[head_len..][0..b.len], b);
     const req_data = req_buf[0 .. head_len + body_len];
 
-    // Send the request. On WANT_* the retry passes the identical pointer
-    // and length (freebsd-ktls D3).
     var sent: usize = 0;
     while (sent < req_data.len) {
         c.ERR_clear_error();
-        const ret = c.SSL_write(ssl_ptr, @ptrCast(req_data.ptr + sent), @intCast(req_data.len - sent));
+        const ret = c.SSL_write(conn.ssl_ptr, @ptrCast(req_data.ptr + sent), @intCast(req_data.len - sent));
         if (ret > 0) {
             sent += @intCast(ret);
             continue;
         }
-        const ssl_err = c.SSL_get_error(ssl_ptr, ret);
+        const ssl_err = c.SSL_get_error(conn.ssl_ptr, ret);
         switch (ssl_err) {
-            c.SSL_ERROR_WANT_READ => waitIo(kq, fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_READ => waitIo(kq, conn.fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsWriteFailed,
             },
-            c.SSL_ERROR_WANT_WRITE => waitIo(kq, fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_WRITE => waitIo(kq, conn.fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsWriteFailed,
@@ -350,8 +380,11 @@ fn request(
             else => return HttpError.TlsWriteFailed,
         }
     }
+}
 
-    // Read the response against the total deadline.
+/// Read the response against the total deadline, parse it and copy the
+/// body into a right-sized allocation the caller owns.
+fn readResponse(conn: Conn, kq: posix.fd_t, allocator: Allocator, options: RequestOptions) HttpError!Response {
     const resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
     defer {
         std.crypto.secureZero(u8, resp_buf);
@@ -371,12 +404,12 @@ fn request(
             .err => |herr| return herr,
         };
         c.ERR_clear_error();
-        const ret = c.SSL_read(ssl_ptr, @ptrCast(resp_buf.ptr + total), @intCast(MAX_RESPONSE_SIZE - total));
+        const ret = c.SSL_read(conn.ssl_ptr, @ptrCast(resp_buf.ptr + total), @intCast(MAX_RESPONSE_SIZE - total));
         if (ret > 0) {
             total += @intCast(ret);
             continue;
         }
-        const ssl_err = c.SSL_get_error(ssl_ptr, ret);
+        const ssl_err = c.SSL_get_error(conn.ssl_ptr, ret);
         switch (ssl_err) {
             c.SSL_ERROR_ZERO_RETURN => saw_eof = true,
             c.SSL_ERROR_SYSCALL => {
@@ -386,12 +419,12 @@ fn request(
                     return HttpError.TlsReadFailed;
                 }
             },
-            c.SSL_ERROR_WANT_READ => waitIo(kq, fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_READ => waitIo(kq, conn.fd, std.c.EVFILT.READ, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsReadFailed,
             },
-            c.SSL_ERROR_WANT_WRITE => waitIo(kq, fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
+            c.SSL_ERROR_WANT_WRITE => waitIo(kq, conn.fd, std.c.EVFILT.WRITE, options.deadline_ns, options.cancel_fd) catch |werr| return switch (werr) {
                 error.Timeout => HttpError.Timeout,
                 error.Cancelled => HttpError.Cancelled,
                 error.WaitFailed => HttpError.TlsReadFailed,

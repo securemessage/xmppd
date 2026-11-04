@@ -1002,8 +1002,12 @@ pub const IdpPool = struct {
         timeout_ms: u32,
     };
 
+    /// Everything start() can fail with: the two pipes, the ring
+    /// allocations and the worker spawns.
+    pub const StartError = posix.PipeError || std.Thread.SpawnError || error{OutOfMemory};
+
     /// Spawn the workers and open the wake and cancel pipes.
-    pub fn start(self: *IdpPool, allocator: Allocator, store: *OidcStore, options: Options) !void {
+    pub fn start(self: *IdpPool, allocator: Allocator, store: *OidcStore, options: Options) StartError!void {
         self.allocator = allocator;
         self.store = store;
         self.options = options;
