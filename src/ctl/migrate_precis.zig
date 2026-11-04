@@ -769,9 +769,9 @@ fn entryMatchesRaw(
     _ = db;
     if (std.mem.eql(u8, namespace, NS_USERS)) return std.mem.eql(u8, key, raw);
     if (std.mem.eql(u8, namespace, NS_LOCKS)) {
-        if (std.mem.eql(u8, key, raw)) return true;
-        const prepared = migrate_precis_scratch.localpart(raw) catch return false;
-        return std.mem.eql(u8, key, prepared);
+        // A prepared lock key belongs to the canonical identity, not to the
+        // deleted spelling. Only an exact raw legacy key may be deleted.
+        return std.mem.eql(u8, key, raw);
     }
     if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST) or

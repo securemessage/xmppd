@@ -271,7 +271,8 @@ test "migrate-precis detects identity collisions on data and raw deletion cascad
     try std.testing.expectEqual(room_store_mod.Affiliation.none, try rooms.getAffiliation("room@conference.us.example", "Bob@us.example"));
     try expectMissing(&op, NS_PENDING_SUB, "carol@us.example\x00Bob@us.example");
     try expectMissing(&archive, NS_MESSAGES, "Bob@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id-b1");
-    try expectMissing(&auth, NS_LOCKS, "bob");
+    // The prepared lock belongs to the surviving account, not to Bob.
+    try expectRow(&auth, NS_LOCKS, "bob", "\x01\x00\x00\x00\x00");
 
     // No Bob data can fold into bob's account after the cascade.
     var after = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
