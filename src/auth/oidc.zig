@@ -1546,6 +1546,26 @@ test "OidcStore: a digest mismatch fails closed" {
     );
 }
 
+test "OidcStore: a token digest mismatch fails closed" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+
+    // The parked answer was computed for a different token than the one
+    // the replaying request carries; validateToken must not consult it.
+    const answer = Answer{
+        .verdict = .rejected,
+        .input_digest = credentialDigest(.{ .token = "other-token" }),
+    };
+    store.answer = &answer;
+    defer store.answer = null;
+
+    try std.testing.expectError(
+        OidcStore.ValidateError.IdpUnavailable,
+        store.validateToken(allocator, "the-token"),
+    );
+}
+
 test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
     const allocator = std.testing.allocator;
     var store = testStore(allocator, .{});
@@ -1768,6 +1788,34 @@ test "OidcStore: token endpoint classification" {
         defer tmp.cleanup();
         const v = try exchangeAgainstTlsStub(allocator, &tmp, "404 Not Found", "{\"error\":\"NotFound\",\"message\":\"no rows returned\"}", cred);
         try std.testing.expectEqual(Verdict.rejected, v);
+    }
+}
+
+test "OidcStore: a 200 with a bad id_token is unavailable, never a rejection" {
+    const allocator = std.testing.allocator;
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+
+    // The IdP accepted the password, so an id_token that then fails
+    // validation is an IdP fault: the attempt must be answered
+    // temporary-auth-failure, not counted as a bad credential.
+    const bad_iss =
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0" ++
+        ".eyJzdWIiOiJhbGljZSIsImlzcyI6Imh0dHBzOi8vYXV0aC5leGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OSwiYXVkIjoieG1wcGQiLCJwcmVmZXJyZWRfdXNlcm5hbWUiOiJhbGljZSJ9" ++
+        ".dGVzdA";
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const body = try std.fmt.allocPrint(allocator, "{{\"id_token\":\"{s}\"}}", .{bad_iss});
+        defer allocator.free(body);
+        const v = try exchangeAgainstTlsStub(allocator, &tmp, "200 OK", body, cred);
+        try std.testing.expectEqual(Verdict.unavailable, v);
+    }
+    // The same when the id_token is not a JWT at all.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const v = try exchangeAgainstTlsStub(allocator, &tmp, "200 OK", "{\"id_token\":\"not-a-jwt\"}", cred);
+        try std.testing.expectEqual(Verdict.unavailable, v);
     }
 }
 
