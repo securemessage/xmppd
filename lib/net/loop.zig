@@ -116,7 +116,13 @@ const HandleState = struct {
     broken: bool, // a change was rejected; the consumer must close
     req_read: bool, // a readable synthetic event is queued
     req_write: bool, // a writable synthetic event is queued
+    // Intrusive dirty list links (slot indices): unlinking a handle on
+    // close/detach is O(1) instead of an O(dirty) list scan.
+    dirty_next: u32 = nil_link,
+    dirty_prev: u32 = nil_link,
 };
+
+const nil_link = std.math.maxInt(u32);
 
 const RequeueEntry = struct { token: Token, filter: Filter };
 
@@ -145,7 +151,9 @@ const extras_max = 2; // loop-internal changes beyond the two per handle
 pub const Loop = struct {
     kq: posix.fd_t,
     handles: SlotMap(HandleState),
-    dirty: std.ArrayList(Token),
+    dirty_head: u32,
+    dirty_tail: u32,
+    dirty_count: usize,
     requeue_list: std.ArrayList(RequeueEntry),
     requeue_len: usize, // entries staged before this wait, emitted this pass
     requeue_pos: usize,
@@ -199,8 +207,6 @@ pub const Loop = struct {
         errdefer gpa.free(change_buf);
         const event_buf = try gpa.alloc(kev.Kevent, change_cap + options.events_max);
         errdefer gpa.free(event_buf);
-        const dirty = try gpa.alloc(Token, options.handles_max);
-        errdefer gpa.free(dirty);
         const requeue_list = try gpa.alloc(RequeueEntry, 2 * options.handles_max);
         errdefer gpa.free(requeue_list);
         const paused = try gpa.alloc(Token, options.paused_max);
@@ -213,7 +219,9 @@ pub const Loop = struct {
         self.* = .{
             .kq = kq,
             .handles = handles,
-            .dirty = std.ArrayList(Token).initBuffer(dirty),
+            .dirty_head = nil_link,
+            .dirty_tail = nil_link,
+            .dirty_count = 0,
             .requeue_list = std.ArrayList(RequeueEntry).initBuffer(requeue_list),
             .requeue_len = 0,
             .requeue_pos = 0,
@@ -271,7 +279,6 @@ pub const Loop = struct {
         rawClose(self.kq);
         self.handles.deinit(gpa);
         self.wheel.deinit(gpa);
-        gpa.free(self.dirty.allocatedSlice());
         gpa.free(self.requeue_list.allocatedSlice());
         gpa.free(self.paused.allocatedSlice());
         gpa.free(self.change_buf);
@@ -300,13 +307,13 @@ pub const Loop = struct {
             .want = interest,
             .reg_read = .none,
             .reg_write = .none,
-            .dirty = true,
+            .dirty = false,
             .paused = false,
             .broken = false,
             .req_read = false,
             .req_write = false,
         }) catch return error.HandleTableFull;
-        self.dirty.appendAssumeCapacity(token);
+        self.markDirty(token, self.handles.get(token).?);
         self.stats_.handles_attached += 1;
         return token;
     }
@@ -388,7 +395,7 @@ pub const Loop = struct {
         const h = self.resolve(handle) orelse return error.StaleHandle;
         const fd = h.fd;
         h.fd = -1; // freed slots keep their value; deinit skips -1
-        self.purgeDirty(handle, h);
+        self.purgeDirty(h);
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         rawClose(fd);
@@ -429,7 +436,7 @@ pub const Loop = struct {
             };
         }
         h.fd = -1;
-        self.purgeDirty(handle, h);
+        self.purgeDirty(h);
         self.purgeRequeue(handle, h);
         _ = self.handles.remove(handle);
         if (first_err) |err| {
@@ -708,13 +715,26 @@ pub const Loop = struct {
     /// in the past emits directly (timer_ready) instead of a zero-length arm.
     fn stageChanges(self: *Loop) usize {
         var nchanges: usize = 0;
-        for (self.dirty.items) |tok| {
-            const h = self.handles.get(tok) orelse continue; // closed: tombstone
+        var i = self.dirty_head;
+        while (i != nil_link) {
+            const h = &self.handles.values[i];
+            const link_next = h.dirty_next;
             h.dirty = false;
-            if (h.broken) continue;
-            nchanges = self.commitHandle(tok, h, nchanges);
+            h.dirty_next = nil_link;
+            h.dirty_prev = nil_link;
+            if (!h.broken) {
+                const tok: Token = .{
+                    .index = i,
+                    .gen = self.handles.gens[i],
+                    .kind = handle_kind,
+                };
+                nchanges = self.commitHandle(tok, h, nchanges);
+            }
+            i = link_next;
         }
-        self.dirty.clearRetainingCapacity();
+        self.dirty_head = nil_link;
+        self.dirty_tail = nil_link;
+        self.dirty_count = 0;
         if (self.broadcast_disarm and self.broadcast_fd >= 0) {
             self.change_buf[nchanges] = .{
                 .ident = @intCast(self.broadcast_fd),
@@ -825,28 +845,35 @@ pub const Loop = struct {
     fn markDirty(self: *Loop, token: Token, h: *HandleState) void {
         if (h.dirty) return;
         h.dirty = true;
-        self.dirty.appendAssumeCapacity(token);
+        h.dirty_prev = self.dirty_tail;
+        if (self.dirty_tail == nil_link) {
+            self.dirty_head = token.index;
+        } else {
+            self.handles.values[self.dirty_tail].dirty_next = token.index;
+        }
+        self.dirty_tail = token.index;
+        self.dirty_count += 1;
     }
 
-    /// Order-preserving removal of `handle`'s staged dirty entry (S20): the
-    /// other handles' entries keep their relative order. Skipped outright
-    /// when the handle is not dirty, keeping close() O(1) in the common
-    /// case instead of O(dirty list).
-    fn purgeDirty(self: *Loop, handle: Handle, h: *HandleState) void {
+    /// O(1) removal of `handle`'s staged dirty entry (S20): the other
+    /// handles' entries keep their relative order. Skipped outright when
+    /// the handle is not dirty.
+    fn purgeDirty(self: *Loop, h: *HandleState) void {
         if (!h.dirty) return;
         h.dirty = false;
-        for (self.dirty.items, 0..) |tok, i| {
-            if (tok.eql(handle)) {
-                const tail = self.dirty.items.len - i - 1;
-                std.mem.copyForwards(
-                    Token,
-                    self.dirty.items[i .. i + tail],
-                    self.dirty.items[i + 1 ..],
-                );
-                self.dirty.shrinkRetainingCapacity(self.dirty.items.len - 1);
-                return;
-            }
+        if (h.dirty_prev == nil_link) {
+            self.dirty_head = h.dirty_next;
+        } else {
+            self.handles.values[h.dirty_prev].dirty_next = h.dirty_next;
         }
+        if (h.dirty_next == nil_link) {
+            self.dirty_tail = h.dirty_prev;
+        } else {
+            self.handles.values[h.dirty_next].dirty_prev = h.dirty_prev;
+        }
+        h.dirty_next = nil_link;
+        h.dirty_prev = nil_link;
+        self.dirty_count -= 1;
     }
 
     /// Immediate EV_DELETE for one filter; ENOENT counts as success.
@@ -1380,14 +1407,14 @@ test "Loop: close leaves other dirty entries and the flag consistent" {
 
     // hb is clean: its close must leave ha's dirty entry alone.
     try loop.setInterest(ha, .{ .read = true, .write = true });
-    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty_count);
     try loop.close(hb);
-    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
-    try std.testing.expect(loop.dirty.items[0].eql(ha));
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty_count);
+    try std.testing.expectEqual(ha.index, loop.dirty_head);
 
     // ha is dirty: its close removes exactly its entry.
     try loop.close(ha);
-    try std.testing.expectEqual(@as(usize, 0), loop.dirty.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.dirty_count);
 }
 
 test "Loop: a stale token after slot reuse never resolves" {
@@ -1792,7 +1819,7 @@ test "Loop: markDirty on a dirty handle adds no second entry" {
     const hs = loop.resolve(h).?;
     loop.markDirty(h, hs);
     loop.markDirty(h, hs);
-    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty_count);
 }
 
 test "Loop: close keeps the dirty order of the survivors" {
@@ -1810,10 +1837,15 @@ test "Loop: close keeps the dirty order of the survivors" {
     defer for (spares) |fd| posix.close(fd);
 
     try loop.close(handles[1]);
-    try std.testing.expectEqual(@as(usize, 3), loop.dirty.items.len);
-    try std.testing.expect(loop.dirty.items[0].eql(handles[0]));
-    try std.testing.expect(loop.dirty.items[1].eql(handles[2]));
-    try std.testing.expect(loop.dirty.items[2].eql(handles[3]));
+    try std.testing.expectEqual(@as(usize, 3), loop.dirty_count);
+    var di = loop.dirty_head;
+    try std.testing.expectEqual(handles[0].index, di);
+    di = loop.handles.values[di].dirty_next;
+    try std.testing.expectEqual(handles[2].index, di);
+    di = loop.handles.values[di].dirty_next;
+    try std.testing.expectEqual(handles[3].index, di);
+    di = loop.handles.values[di].dirty_next;
+    try std.testing.expectEqual(nil_link, di);
 }
 
 test "Loop: a deadline scheduled during a pass emits at most once per pass" {
@@ -1928,10 +1960,10 @@ test "Loop: detach purges the dirty entry immediately" {
     defer posix.close(sp[1]);
     const h = try loop.attach(sp[0], tctx(1), .{ .read = true });
     loop.markDirty(h, loop.resolve(h).?);
-    try std.testing.expectEqual(@as(usize, 1), loop.dirty.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.dirty_count);
     const fd = try loop.detach(h);
     posix.close(fd);
-    try std.testing.expectEqual(@as(usize, 0), loop.dirty.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.dirty_count);
 }
 
 test "Loop: a dead handle emits change_failed once, not every commit" {
