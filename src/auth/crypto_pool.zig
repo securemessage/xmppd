@@ -875,10 +875,12 @@ test "CryptoPool: no completion is lost under a kqueue-driven drain" {
     }
 
     var lost: usize = 0;
+    var late: usize = 0;
     var received: usize = 0;
     var expected_total: usize = 0;
     var evs: [4]std.posix.Kevent = undefined;
     const ts = std.posix.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+    const ts_grace = std.posix.timespec{ .sec = 10, .nsec = 0 };
     for (1..rounds + 1) |r| {
         var expect: usize = 0;
         for (sh.sizes[0..producers]) |*s| {
@@ -891,7 +893,16 @@ test "CryptoPool: no completion is lost under a kqueue-driven drain" {
         while (got < expect) {
             const n = try std.posix.kevent(kq, &.{}, &evs, &ts);
             if (n == 0 and completionCount(&pool) == 0) continue;
-            if (n == 0) lost += 1;
+            if (n == 0) {
+                // A worker preempted between its wake_pending swap and
+                // the write delivers the byte late; only a wake still
+                // missing after a long grace counts as lost.
+                if (try std.posix.kevent(kq, &.{}, &evs, &ts_grace) == 0) {
+                    lost += 1;
+                } else {
+                    late += 1;
+                }
+            }
             pool.drainPipe();
             while (pool.popCompletion()) |c| {
                 try std.testing.expect(c.ok);
@@ -903,6 +914,7 @@ test "CryptoPool: no completion is lost under a kqueue-driven drain" {
     sh.quit.store(true, .release);
     for (threads) |t| t.join();
 
+    std.debug.print("kqueue drain: {d} late wakes\n", .{late});
     try std.testing.expectEqual(@as(usize, 0), lost);
     try std.testing.expectEqual(expected_total, received);
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
