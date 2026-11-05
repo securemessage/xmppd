@@ -592,6 +592,11 @@ fn parseResponseHead(head: []const u8) HeadParse {
         if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
             if (colon == 0) return .invalid;
             if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
+        } else if (line.len > 0) {
+            // RFC 9112 5: a field line is field-name ":". A non-empty
+            // line without a colon is not a field; an empty one is a
+            // tolerated bare-LF artifact of the line split.
+            return .invalid;
         }
         const te_prefix = "transfer-encoding:";
         // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
@@ -1344,6 +1349,21 @@ test "responseComplete: a one-character field name is accepted" {
     // is invalid.
     const resp = "HTTP/1.1 200 OK\r\nX: 1\r\nContent-Length: 5\r\n\r\nhello";
     try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: a field line without a colon is rejected" {
+    // RFC 9112 5: a field line is field-name ":". A colonless TE must
+    // not slip past the TE reject as an unknown line either.
+    const garbage = "HTTP/1.1 200 OK\r\ngarbage\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(garbage),
+    );
+    const te = "HTTP/1.1 200 OK\r\nTransfer-Encoding chunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(te),
+    );
 }
 
 test "responseComplete: framing ends the body at Content-Length" {
