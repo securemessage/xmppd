@@ -701,6 +701,14 @@ pub const Conn = struct {
                     list.link(c);
                     return .{ .closed = .{ .err = error.KtlsRequired } };
                 }
+                // OpenSSL consumed the Finished record and may have left
+                // a coalesced app-data record in the socket; EV_CLEAR
+                // already fired for it, so re-drive one read through the
+                // walk. Write interest stays on when the outbox is not
+                // empty (finishHandshake dropped it).
+                c.requeue_read = true;
+                list.link(c);
+                if (!c.outbox.empty()) c.interest(true, true);
                 return .handshake_done;
             },
             .want_read => {
@@ -1906,4 +1914,65 @@ test "Transport tls: one conn's failure does not poison another conn's read" {
     try std.testing.expect(A.read(&buf) == .err);
     try std.testing.expect(ta.conn.fatal);
     try std.testing.expectEqual(IoResult.want_read, B.read(&buf));
+}
+
+test "Conn: app data coalesced with the client Finished is delivered" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    var client_done = false;
+    var sent = false;
+    var hs_done = false;
+    var timer_fired: usize = 0;
+    for (0..40) |_| {
+        if (!client_done) {
+            client_done = (try client.doHandshake()) == .complete;
+        }
+        if (client_done and !sent) {
+            // XMPP clients send <stream:stream> right behind the Finished;
+            // OpenSSL may read it with the Finished and leave it socketed.
+            _ = try client.write("<stream:stream>");
+            sent = true;
+        }
+        const tid = try loop.scheduleIn(50, mkConnCtx(9));
+        try loop.wait();
+        var fired = false;
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => fired = true,
+                .readable, .writable => switch (c.onEvent(ev, &list)) {
+                    .handshake_done => hs_done = true,
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        if (fired) timer_fired += 1 else _ = loop.cancelTimer(tid);
+        try walkDirty(&list, &loop);
+        if (c.inbox.unread().len > 0) break;
+        if (hs_done and timer_fired >= 3) break;
+    }
+    try std.testing.expect(hs_done);
+    try std.testing.expectEqualStrings("<stream:stream>", c.inbox.unread());
+    c.state = .closing;
+    c.teardown();
 }
