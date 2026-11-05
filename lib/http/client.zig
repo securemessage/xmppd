@@ -602,7 +602,9 @@ fn parseResponseHead(head: []const u8) HeadParse {
             return .invalid;
         }
         const cl_prefix = "content-length:";
-        if (line.len <= cl_prefix.len) continue;
+        // A bare "Content-Length:" reaches the value parse and dies on
+        // the empty value (RFC 9112 6.3 rule 5), like every other bad CL.
+        if (line.len < cl_prefix.len) continue;
         if (!std.ascii.eqlIgnoreCase(line[0..cl_prefix.len], cl_prefix)) continue;
         const value = std.mem.trim(u8, line[cl_prefix.len..], " \t");
         const cl = parseContentLengthValue(value) catch |err| switch (err) {
@@ -1227,6 +1229,22 @@ test "responseComplete: duplicate Content-Length headers must agree" {
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(disagree),
+    );
+}
+
+test "responseComplete: an empty Content-Length value is rejected" {
+    // RFC 9112 6.3 rule 5: an invalid Content-Length in a response is an
+    // unrecoverable error, never EOF framing.
+    const bare = "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bare),
+    );
+    // The invalid first value is not dropped as a duplicate either.
+    const then_valid = "HTTP/1.1 200 OK\r\nContent-Length:\r\nContent-Length: 3\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(then_valid),
     );
 }
 
