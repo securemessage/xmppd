@@ -350,21 +350,6 @@ fn putTestJob(pool: *CryptoPool, password: []const u8, salt: [32]u8, iteration_c
     return pool.put(password, salt, iteration_count, expected_stored_key);
 }
 
-/// Read the pool wake pipe until a byte arrives or the deadline passes;
-/// returns false on timeout. Mirrors waitForPoolWake in handler tests.
-fn waitWakeByte(pool: *CryptoPool, deadline_ms: i64) !bool {
-    var buf: [8]u8 = undefined;
-    while (std.time.milliTimestamp() < deadline_ms) {
-        const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => return err,
-        };
-        if (n > 0) return true;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
-    return false;
-}
-
 test "CryptoPool: more than eight completions wait without a drain" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     try pool.start(4);
@@ -768,47 +753,93 @@ test "CryptoPool: one wake byte per drain cycle" {
     try std.testing.expectEqual(@as(usize, 1), total);
 }
 
-test "CryptoPool: no completion is lost under a producer burst" {
-    // Four producer threads race put(); up to MAX_THREADS workers race
-    // the completion side. The consumer only pops after a real wake, so
-    // a lost wakeup shows up as a timeout instead of a hang.
+test "CryptoPool: no completion is lost under a kqueue-driven drain" {
+    // Producers fire random bursts per round and idle between rounds,
+    // like real login traffic; the consumer waits on the wake pipe in
+    // kqueue, drains the byte, then pops to empty. A completion that
+    // misses its wake edge is left stranded in the ring past the kevent
+    // timeout, so lost wakeups show up as a count, not a hang.
+    const rounds = 400;
+    const producers = 4;
+    const per_max = 16;
     var pool = CryptoPool{ .allocator = std.testing.allocator };
-    try pool.start(4);
+    try pool.start(CryptoPool.MAX_THREADS);
     defer pool.stop();
 
-    const creds = try sasl.StoredCredentials.derive("s", @splat(9), 1);
-    const jobs_per_producer = 50;
-    const producers = 4;
+    const kq = try std.posix.kqueue();
+    defer std.posix.close(kq);
+    var ch = [1]std.posix.Kevent{.{
+        .ident = @intCast(pool.pipe_rd),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    _ = try std.posix.kevent(kq, &ch, &.{}, null);
 
-    const Producer = struct {
-        fn run(p: *CryptoPool, stored: [32]u8) void {
-            for (0..jobs_per_producer) |_| {
-                _ = putTestJob(p, "s", @splat(9), 1, stored) catch |err| {
-                    std.debug.panic("put failed: {s}", .{@errorName(err)});
-                };
+    const creds = try sasl.StoredCredentials.derive("s", @splat(9), 1);
+
+    const Shared = struct {
+        round: std.atomic.Value(usize) = .init(0),
+        quit: std.atomic.Value(bool) = .init(false),
+        sizes: [producers]usize = undefined,
+    };
+    var sh = Shared{};
+    const Prod = struct {
+        fn run(p: *CryptoPool, s: *Shared, idx: usize, stored: [32]u8) void {
+            var seen: usize = 0;
+            while (true) {
+                var r = s.round.load(.acquire);
+                while (r == seen) {
+                    if (s.quit.load(.acquire)) return;
+                    std.Thread.yield() catch {};
+                    r = s.round.load(.acquire);
+                }
+                seen = r;
+                for (0..s.sizes[idx]) |_| {
+                    _ = p.put("s", @splat(9), 1, stored) catch |err|
+                        std.debug.panic("put: {s}", .{@errorName(err)});
+                }
             }
         }
     };
 
     var threads: [producers]std.Thread = undefined;
-    for (&threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, Producer.run, .{ &pool, creds.stored_key });
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Prod.run, .{ &pool, &sh, i, creds.stored_key });
     }
 
+    var lost: usize = 0;
     var received: usize = 0;
-    const total = producers * jobs_per_producer;
-    const deadline = std.time.milliTimestamp() + 10000;
-    while (received < total and std.time.milliTimestamp() < deadline) {
-        if (try waitWakeByte(&pool, std.time.milliTimestamp() + 100)) {
+    var expected_total: usize = 0;
+    var evs: [4]std.posix.Kevent = undefined;
+    const ts = std.posix.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+    for (1..rounds + 1) |r| {
+        var expect: usize = 0;
+        for (sh.sizes[0..producers]) |*s| {
+            s.* = 1 + std.crypto.random.uintLessThan(usize, per_max);
+            expect += s.*;
+        }
+        expected_total += expect;
+        sh.round.store(r, .release);
+        var got: usize = 0;
+        while (got < expect) {
+            const n = try std.posix.kevent(kq, &.{}, &evs, &ts);
+            if (n == 0 and completionCount(&pool) == 0) continue;
+            if (n == 0) lost += 1;
             pool.drainPipe();
             while (pool.popCompletion()) |c| {
                 try std.testing.expect(c.ok);
-                received += 1;
+                got += 1;
             }
         }
+        received += got;
     }
+    sh.quit.store(true, .release);
     for (threads) |t| t.join();
 
-    try std.testing.expectEqual(total, received);
+    try std.testing.expectEqual(@as(usize, 0), lost);
+    try std.testing.expectEqual(expected_total, received);
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
