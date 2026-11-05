@@ -62,6 +62,10 @@ const STALE_RECHECK_MS: i64 = 30_000;
 /// The stale-serve log line is emitted at most once per window and
 /// owner name.
 const STALE_LOG_MS: i64 = 60_000;
+/// How many LRU nodes evictOne may walk looking for a stale owner
+/// before it settles for the window's tail-most unpinned fresh one;
+/// the bound lifts while every node seen is pinned.
+const EVICT_SCAN_MAX: usize = 32;
 
 pub const Service = enum(u8) { client = 0, server = 1 };
 
@@ -2069,20 +2073,30 @@ pub const Resolver = struct {
 
     /// Evict one owner, stale rows before fresh ones (ADR-13 /
     /// RFC 8767 section 6): the LRU tail is walked for the first
-    /// owner holding no fresh row; an all-fresh cache sheds its tail
-    /// instead. Pinned owners are skipped. Returns false when nothing
-    /// can be evicted. O(owners) but only on an insert over budget.
+    /// owner holding no fresh row; an all-fresh window sheds its
+    /// tail-most unpinned owner instead. The walk is bounded to
+    /// EVICT_SCAN_MAX nodes so an insert over budget never costs an
+    /// O(owners) scan; a stale owner deeper than the window keeps
+    /// its slot. The bound lifts only while every node seen is
+    /// pinned, so an all-pinned window still reaches an evictable
+    /// owner further up. Returns false when nothing can be evicted.
     fn evictOne(self: *Resolver, now: i64) bool {
         var tail_fresh: ?*OwnerEnt = null;
+        var saw_unpinned = false;
+        var scanned: usize = 0;
         var node = self.lru.last;
         while (node) |n| : (node = n.prev) {
             const owner: *OwnerEnt = @fieldParentPtr("node", n);
-            if (ownerPinned(owner)) continue;
-            if (!ownerHasFresh(owner, now)) {
-                self.removeOwner(owner);
-                return true;
+            scanned += 1;
+            if (!ownerPinned(owner)) {
+                saw_unpinned = true;
+                if (!ownerHasFresh(owner, now)) {
+                    self.removeOwner(owner);
+                    return true;
+                }
+                if (tail_fresh == null) tail_fresh = owner;
             }
-            if (tail_fresh == null) tail_fresh = owner;
+            if (scanned >= EVICT_SCAN_MAX and saw_unpinned) break;
         }
         if (tail_fresh) |owner| {
             self.removeOwner(owner);
@@ -4578,6 +4592,55 @@ test "dns-async: stale owners evict before fresh ones under pressure" {
     try std.testing.expect(r.evictOne(r.now_ms()));
     try std.testing.expectEqual(@as(usize, 0), r.owners.count());
     try std.testing.expect(!r.evictOne(r.now_ms()));
+}
+
+test "dns-async: eviction past the scan window sheds the fresh tail" {
+    // Goal: the stale-first walk is bounded to EVICT_SCAN_MAX nodes;
+    // a stale owner parked deeper than the window survives while the
+    // fresh tail sheds. Method: 94 KiB answers so 43 owners sit just
+    // under the byte budget and the 44th overflows, one eviction per
+    // insert; the stale row sits EVICT_SCAN_MAX + 1 nodes above the
+    // tail.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 11_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.alloc(u8, 94 * 1024);
+    defer std.testing.allocator.free(owned_rdata);
+    @memset(owned_rdata, 0xAB);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+
+    // LRU tail->head: e0..e32 fresh, stale.test parked past the scan
+    // window behind h0..h8.
+    var name_buf: [40]u8 = undefined;
+    for (0..EVICT_SCAN_MAX + 1) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "e{d}.test", .{i}) catch unreachable;
+        r.cachePut(n, KIND_A, &rrs);
+    }
+    rrs[0].ttl = 30;
+    r.cachePut("stale.test", KIND_A, &rrs);
+    rrs[0].ttl = 60;
+    for (0..9) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "h{d}.test", .{i}) catch unreachable;
+        r.cachePut(n, KIND_A, &rrs);
+    }
+    // Only the 30 s row is stale; every other owner is still fresh.
+    fake_now += 31_000;
+    try std.testing.expectEqual(@as(usize, EVICT_SCAN_MAX + 11), r.owners.count());
+
+    // One insert over budget evicts one owner: the window holds only
+    // fresh owners, so the tail-most fresh one sheds while the stale
+    // owner deeper than the window survives. An unbounded stale-first
+    // walk would have evicted stale.test instead.
+    r.cachePut("over.test", KIND_A, &rrs);
+    try std.testing.expect(r.cache_bytes <= CACHE_BYTES_MAX);
+    try std.testing.expect(r.owners.get("e0.test") == null);
+    try std.testing.expect(r.owners.get("e32.test") != null);
+    try std.testing.expect(r.owners.get("stale.test") != null);
+    try std.testing.expect(r.owners.get("over.test") != null);
 }
 
 test "dns-async: a CNAME answer evicts sibling types at the owner" {
