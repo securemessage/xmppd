@@ -19,9 +19,14 @@
 //! 4. User reconnects -> scan pointers -> fetch held payload or archive row -> deliver -> delete pointers
 
 const std = @import("std");
+const builtin = @import("builtin");
 const backend = @import("backend");
 /// LMDB key size limit (MDB_MAXKEYSIZE); mirrors store/keys.zig.
 const MAX_KEY_LEN = 511;
+
+/// A test-only u32 that does not exist in a production build.
+const SeamCounter = if (builtin.is_test) u32 else void;
+const seam_zero: SeamCounter = if (builtin.is_test) 0 else {};
 
 /// Full-prefix test for an iterator result. The LMDB and RocksDB iterators
 /// clip the scan prefix to 256 bytes, while v2 keys accept recipients up to
@@ -108,18 +113,34 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         const Self = @This();
         db: *Backend,
         allocator: std.mem.Allocator,
-        /// Test seam: fail this many `deletePointer` calls before letting one
-        /// through. A drain that hands a stanza to the connection and then
-        /// fails its delete is reachable in production (a full map) but no
-        /// test can arrange it. Never set in production.
-        test_fail_deletes: u32 = 0,
-        /// Counts `storeHeldPointerOnce` calls, so a test can tell a caller
-        /// that short-circuits from one that leans on the token dedupe.
-        test_hold_calls: u32 = 0,
-        /// Test seam: fail this many `countMessages` calls. A count runs
-        /// before the drain is armed, so a failure there is easy to leave
-        /// unrecoverable. Never set in production.
-        test_fail_counts: u32 = 0,
+        /// Test seams. They exist as non-void fields only in a test build, so
+        /// the production hot path neither writes shared state nor branches
+        /// on them. Every worker shares one store instance, so a plain u32
+        /// would be an unsynchronized cross-thread write.
+        ///
+        /// fail_deletes: fail this many `deletePointer` calls. A drain that
+        /// hands a stanza to the connection and then fails its delete is
+        /// reachable in production (a full map) but no test can arrange it.
+        /// hold_calls: counts `storeHeldPointerOnce` calls, so a test can tell
+        /// a caller that short-circuits from one that leans on the token
+        /// dedupe. fail_counts: fail this many `countMessages` calls, which
+        /// run before the drain is armed.
+        test_fail_deletes: SeamCounter = seam_zero,
+        test_hold_calls: SeamCounter = seam_zero,
+        test_fail_counts: SeamCounter = seam_zero,
+
+        comptime {
+            // A production build carries no storage for these, and no worker
+            // writes shared counters from the hold path.
+            if (!builtin.is_test) {
+                const T = @This();
+                for ([_][]const u8{ "test_fail_deletes", "test_hold_calls", "test_fail_counts" }) |name| {
+                    if (@TypeOf(@field(@as(T, undefined), name)) != void) {
+                        @compileError("offline store test seam " ++ name ++ " must be void outside a test build");
+                    }
+                }
+            }
+        }
 
         pub fn init(db: *Backend, allocator: std.mem.Allocator) Self {
             return .{ .db = db, .allocator = allocator };
@@ -185,7 +206,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
             // An unminted token cannot distinguish dispatches, so accepting it
             // would reintroduce the content-based collapse it replaces.
             if (token == HOLD_TOKEN_NONE) return error.HoldTokenNotMinted;
-            self.test_hold_calls += 1;
+            if (builtin.is_test) self.test_hold_calls += 1;
             self.db.compound_mutex.lock();
             defer self.db.compound_mutex.unlock();
 
@@ -211,7 +232,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
 
         /// Count pending offline messages for a recipient.
         pub fn countMessages(self: *Self, recipient: []const u8) !usize {
-            if (self.test_fail_counts > 0) {
+            if (builtin.is_test and self.test_fail_counts > 0) {
                 self.test_fail_counts -= 1;
                 return error.MapFull;
             }
@@ -242,7 +263,7 @@ pub fn GenericOfflineStore(comptime Backend: type) type {
         /// Delete a specific offline pointer after successful delivery.
         /// Also drops any held payload stored with it.
         pub fn deletePointer(self: *Self, ptr: OfflinePointer) !void {
-            if (self.test_fail_deletes > 0) {
+            if (builtin.is_test and self.test_fail_deletes > 0) {
                 self.test_fail_deletes -= 1;
                 return error.MapFull;
             }
