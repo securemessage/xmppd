@@ -162,6 +162,99 @@ pub const Transport = union(enum) {
     }
 };
 
+/// Per-pass inbound fairness budget (Options.read_budget_*): bytes or
+/// read calls, whichever is spent first, so one fast sender cannot hold
+/// a pass that serves thousands of connections.
+pub const ReadBudget = struct {
+    bytes: usize = 64 << 10,
+    reads: u32 = 16,
+};
+
+/// What a drain pass ended on.
+pub const DrainResult = union(enum) {
+    /// EAGAIN: the socket is dry and EV_CLEAR will report new data.
+    drained,
+    /// Budget spent, inbox full, or TLS wanted a write: re-drive the
+    /// conn before the loop sleeps (ConnList + Loop.requeue).
+    budget_left,
+    /// The TLS read needed a write event first.
+    want_write,
+    /// Orderly peer shutdown; `eof` latches on the inbox.
+    eof,
+    /// Socket or TLS failure; the conn is finished.
+    err: IoError,
+};
+
+/// Reads plaintext or decrypted bytes into a caller-owned slice.
+///
+/// `consumed` is the deferred-compaction cursor: bytes below it were
+/// parsed already; `drain` folds them away once per call, never per
+/// message, so parsed spans stay valid until the next drain.
+pub const Inbox = struct {
+    /// Owned slice, allocated once at Conn.init (Options.inbox_bytes).
+    buf: []u8,
+    len: usize = 0,
+    consumed: usize = 0,
+    eof: bool = false,
+
+    pub fn init(buf: []u8) Inbox {
+        return .{ .buf = buf };
+    }
+
+    /// Bytes available to parse. Borrows `buf` and stays valid until the
+    /// next `drain`/`compact`.
+    pub fn unread(in: *const Inbox) []const u8 {
+        return in.buf[in.consumed..in.len];
+    }
+
+    /// Mark `n` parsed bytes consumed; compaction is deferred to drain.
+    pub fn consume(in: *Inbox, n: usize) void {
+        std.debug.assert(in.consumed + n <= in.len);
+        in.consumed += n;
+    }
+
+    /// Move unconsumed bytes to the front and clear the cursor.
+    pub fn compact(in: *Inbox) void {
+        if (in.consumed == 0) return;
+        const remaining = in.len - in.consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, in.buf[0..remaining], in.buf[in.consumed..in.len]);
+        }
+        in.len = remaining;
+        in.consumed = 0;
+    }
+
+    /// Read until EAGAIN, the budget is spent, the inbox fills, or EOF.
+    /// A `budget_left` result means more data may be pending, or the
+    /// inbox holds bytes the consumer has not consumed yet, and the conn
+    /// must be re-driven before the loop sleeps: EV_CLEAR is
+    /// transition-armed, so leftover data raises no new event.
+    pub fn drain(in: *Inbox, t: *Transport, budget: *ReadBudget) DrainResult {
+        if (in.eof) return .eof;
+        in.compact();
+        while (true) {
+            if (budget.reads == 0 or budget.bytes == 0) return .budget_left;
+            const space = in.buf.len - in.len;
+            if (space == 0) return .budget_left;
+            budget.reads -= 1;
+            const want = @min(space, budget.bytes);
+            switch (t.read(in.buf[in.len .. in.len + want])) {
+                .n => |n| {
+                    in.len += n;
+                    budget.bytes -= n;
+                },
+                .want_read => return .drained,
+                .want_write => return .want_write,
+                .eof => {
+                    in.eof = true;
+                    return .eof;
+                },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
+};
+
 const o_nonblock: c_int = 0x4; // O_NONBLOCK
 const so_nosigpipe: c_int = 0x0800; // SO_NOSIGPIPE (FreeBSD)
 
@@ -393,4 +486,104 @@ test "Transport tls: handshake, echo, pending, eof" {
 
     client.shutdown();
     try std.testing.expectEqual(IoResult.eof, t.read(&buf));
+}
+
+test "Inbox: drain to EAGAIN, unread stability, consume, compact" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var t: Transport = .{ .plain = pair[0] };
+    var buf: [64]u8 = undefined;
+    var in = Inbox.init(&buf);
+    var budget: ReadBudget = .{};
+
+    _ = try posix.write(pair[1], "first");
+    try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
+    try std.testing.expectEqualStrings("first", in.unread());
+
+    // Parsed spans stay valid until the next drain: consume defers.
+    in.consume(3);
+    try std.testing.expectEqualStrings("st", in.unread());
+
+    _ = try posix.write(pair[1], "second");
+    try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
+    // Compaction ran once per drain: "st" moved to the front.
+    try std.testing.expectEqualStrings("stsecond", in.unread());
+
+    // A chunk larger than the pre-compaction free space only fits
+    // because drain folded the consumed prefix away first.
+    in.consume(8);
+    const tail = [_]u8{0x30} ** 56;
+    _ = try posix.write(pair[1], &tail);
+    try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
+    try std.testing.expectEqualStrings(&tail, in.unread());
+}
+
+test "Inbox: a spent read budget stops the drain" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var t: Transport = .{ .plain = pair[0] };
+    var buf: [32]u8 = undefined;
+    var in = Inbox.init(&buf);
+
+    // One read allowed: even with more data pending the drain stops.
+    var budget: ReadBudget = .{ .bytes = 64 << 10, .reads = 1 };
+    _ = try posix.write(pair[1], "0123456789abcdef");
+    try std.testing.expectEqual(DrainResult.budget_left, in.drain(&t, &budget));
+    try std.testing.expectEqual(@as(u32, 0), budget.reads);
+
+    in.consume(in.len);
+    budget.reads = 8;
+    try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
+}
+
+test "Inbox: a full inbox stops the drain until consume" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var t: Transport = .{ .plain = pair[0] };
+    var buf: [16]u8 = undefined;
+    var in = Inbox.init(&buf);
+    var budget: ReadBudget = .{};
+
+    // Consumer left the inbox full: the drain cannot make progress.
+    in.len = in.buf.len;
+    try std.testing.expectEqual(DrainResult.budget_left, in.drain(&t, &budget));
+    in.consume(in.len);
+    try std.testing.expectEqualStrings("", in.unread());
+    try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
+}
+
+test "Inbox: byte budget is spent by bytes moved, not calls" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var t: Transport = .{ .plain = pair[0] };
+    var buf: [64]u8 = undefined;
+    var in = Inbox.init(&buf);
+    var budget: ReadBudget = .{ .bytes = 5, .reads = 16 };
+
+    _ = try posix.write(pair[1], "0123456789");
+    try std.testing.expectEqual(DrainResult.budget_left, in.drain(&t, &budget));
+    try std.testing.expectEqual(@as(usize, 5), in.len);
+}
+
+test "Inbox: eof is distinct and latches" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var t: Transport = .{ .plain = pair[0] };
+    var buf: [16]u8 = undefined;
+    var in = Inbox.init(&buf);
+    var budget: ReadBudget = .{};
+
+    posix.shutdown(pair[1], .both) catch {};
+    try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
+    try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
 }
