@@ -434,10 +434,22 @@ fn removeUserCanonical(store: anytype, allocator: std.mem.Allocator, raw: []cons
     try store.removeUser(allocator, canon);
 }
 
-fn assertLmdbOffline(backend: anytype) !void {
-    const Backend = @TypeOf(backend.*);
-    if (comptime @hasDecl(Backend, "assertNoActiveReaders")) {
-        try backend.assertNoActiveReaders();
+/// Open an op/auth backend with the LMDB offline lock already held. LMDB
+/// backends take the exclusive lock before env open and keep it until close;
+/// a second descriptor opened after env open must never be closed (D5).
+fn openOpBackendOffline(comptime Backend: type, path: []const u8, opts: backend_mod.OpenOptions) !Backend {
+    if (comptime @hasDecl(Backend, "openOffline")) return Backend.openOffline(path, opts);
+    var opened = try Backend.open(path, opts);
+    errdefer opened.close();
+    if (comptime @hasDecl(Backend, "assertNoActiveReaders")) try opened.assertNoActiveReaders();
+    return opened;
+}
+
+fn reportOfflineOpenError(err: anyerror) void {
+    switch (err) {
+        error.DaemonsRunning => printErr("an LMDB process holds the DB; stop every daemon and close all clients\n"),
+        error.LmdbCheckFailed => printErr("cannot verify the LMDB lock file; check DB path and permissions\n"),
+        else => printErr("failed to open the database\n"),
     }
 }
 
@@ -459,20 +471,18 @@ fn runDeleteRaw(
     var archive_path_buf: [1024]u8 = undefined;
     const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
 
-    var auth = try OpBackendType.open(auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    var auth = openOpBackendOffline(OpBackendType, auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 }) catch |err| {
+        reportOfflineOpenError(err);
+        return err;
+    };
     defer auth.close();
-    var op = try OpBackendType.open(op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    var op = openOpBackendOffline(OpBackendType, op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 }) catch |err| {
+        reportOfflineOpenError(err);
+        return err;
+    };
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
-    assertLmdbOffline(&auth) catch |err| {
-        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
-        return err;
-    };
-    assertLmdbOffline(&op) catch |err| {
-        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
-        return err;
-    };
 
     migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
         switch (err) {
@@ -513,20 +523,18 @@ fn runMigratePrecis(
     var archive_path_buf: [1024]u8 = undefined;
     const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
 
-    var auth = try OpBackendType.open(auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    var auth = openOpBackendOffline(OpBackendType, auth_path, .{ .create = false, .map_size = 256 * 1024 * 1024 }) catch |err| {
+        reportOfflineOpenError(err);
+        return err;
+    };
     defer auth.close();
-    var op = try OpBackendType.open(op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 });
+    var op = openOpBackendOffline(OpBackendType, op_path, .{ .create = false, .map_size = 256 * 1024 * 1024 }) catch |err| {
+        reportOfflineOpenError(err);
+        return err;
+    };
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
-    assertLmdbOffline(&auth) catch |err| {
-        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
-        return err;
-    };
-    assertLmdbOffline(&op) catch |err| {
-        printErr("an LMDB reader holds the DB; stop every daemon and close all clients\n");
-        return err;
-    };
 
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();
