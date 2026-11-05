@@ -1864,3 +1864,46 @@ test "Conn: an established TLS conn frees the SSL at teardown" {
     c.deinit();
     try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
 }
+
+test "Transport tls: one conn's failure does not poison another conn's read" {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pa = try socketpair();
+    defer posix.close(pa[0]);
+    defer posix.close(pa[1]);
+    const pb = try socketpair();
+    defer posix.close(pb[0]);
+    defer posix.close(pb[1]);
+
+    var ta: Tls = .{ .conn = try ssl.SslConn.init(pki.ctx, pa[0]) };
+    defer ta.conn.deinit();
+    var tb: Tls = .{ .conn = try ssl.SslConn.init(pki.ctx, pb[0]) };
+    defer tb.conn.deinit();
+    var ca = try ssl.SslConn.initClient(client_ctx, pa[1], null);
+    defer ca.deinit();
+    var cb = try ssl.SslConn.initClient(client_ctx, pb[1], null);
+    defer cb.deinit();
+    try driveHandshake(&ta.conn, &ca);
+    try driveHandshake(&tb.conn, &cb);
+    tc.ERR_clear_error();
+
+    var A: Transport = .{ .tls = &ta };
+    var B: Transport = .{ .tls = &tb };
+    var buf: [64]u8 = undefined;
+    _ = A.read(&buf);
+    _ = B.read(&buf);
+
+    // A takes a bogus application record: the OpenSSL error queue is
+    // per-thread, so a stale entry would mis-classify B's next read as
+    // an error instead of want_read.
+    const bogus = [_]u8{ 0x17, 0x03, 0x03, 0x00, 0x20 } ++ [_]u8{0x41} ** 32;
+    _ = try posix.write(pa[1], &bogus);
+    try std.testing.expect(A.read(&buf) == .err);
+    try std.testing.expect(ta.conn.fatal);
+    try std.testing.expectEqual(IoResult.want_read, B.read(&buf));
+}

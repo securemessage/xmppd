@@ -236,6 +236,13 @@ pub const SslConn = struct {
     /// Client role (initClient): channel binding picks the PEER certificate
     /// for tls-server-end-point, not our own (T263).
     is_client: bool = false,
+    /// A non-want SSL_get_error result ended the conn. SSL_shutdown is
+    /// skipped on a fatal conn: it would only push more entries onto the
+    /// thread's shared error queue.
+    fatal: bool = false,
+    /// errno captured when a call fails with SSL_ERROR_SYSCALL, kept for
+    /// the caller's close diagnostics (the queue entry does not carry it).
+    syscall_errno: c_int = 0,
 
     pub fn sockFd(self: *const SslConn) std.posix.fd_t {
         return self.sock_fd;
@@ -303,6 +310,9 @@ pub const SslConn = struct {
     ///
     /// Returns `.complete` when the handshake finishes successfully.
     pub fn doHandshake(self: *SslConn) SslError!HandshakeResult {
+        // The error queue is per-thread and shared by every conn: a stale
+        // entry left by another conn would mis-classify this call.
+        c.ERR_clear_error();
         const ret = c.SSL_do_handshake(self.ssl);
         if (ret == 1) return .complete;
 
@@ -311,6 +321,8 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
                 // Log the OpenSSL error queue for diagnostics. warn, not
                 // err: handshake failures are client-caused routine noise
                 // (bad certs, port scans, aborted probes), not daemon
@@ -335,6 +347,7 @@ pub const SslConn = struct {
     ///
     /// A return of `ConnectionClosed` means the peer sent a TLS close_notify.
     pub fn read(self: *SslConn, buf: []u8) SslError!IoResult {
+        c.ERR_clear_error();
         const ret = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
         if (ret > 0) return .{ .ok = @intCast(ret) };
 
@@ -343,7 +356,11 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             c.SSL_ERROR_ZERO_RETURN => SslError.ConnectionClosed,
-            else => SslError.ReadFailed,
+            else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
+                return SslError.ReadFailed;
+            },
         };
     }
 
@@ -352,6 +369,7 @@ pub const SslConn = struct {
     /// Returns the number of bytes written, or `want_read`/`want_write` if
     /// the underlying socket isn't ready.
     pub fn write(self: *SslConn, data: []const u8) SslError!IoResult {
+        c.ERR_clear_error();
         const ret = c.SSL_write(self.ssl, data.ptr, @intCast(data.len));
         if (ret > 0) return .{ .ok = @intCast(ret) };
 
@@ -359,7 +377,11 @@ pub const SslConn = struct {
         return switch (err) {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
-            else => SslError.WriteFailed,
+            else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
+                return SslError.WriteFailed;
+            },
         };
     }
 
@@ -547,8 +569,11 @@ pub const SslConn = struct {
     }
 
     /// Initiate a clean TLS shutdown (sends close_notify alert).
-    /// Non-blocking — may need to be called again after kqueue signals readiness.
+    /// Non-blocking — may need to be called again after kqueue signals
+    /// readiness. Skipped on a fatal conn: the conn is already broken and
+    /// the call would only add entries to the shared error queue.
     pub fn shutdown(self: *SslConn) void {
+        if (self.fatal) return;
         _ = c.SSL_shutdown(self.ssl);
     }
 
