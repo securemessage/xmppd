@@ -543,6 +543,28 @@ test "CryptoPool: a full queue releases the failed reservation" {
     try std.testing.expectEqual(@as(usize, MAX_JOBS), reservedCount(&pool));
 }
 
+test "CryptoPool: completed but unpopped jobs still count against the bound" {
+    // The bound is on outstanding jobs, not queued ones: a full ring of
+    // completions waiting for popCompletion() must still reject put(),
+    // or the completion publish would overrun the ring.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 1);
+    for (0..MAX_JOBS) |_| {
+        _ = try putTestJob(&pool, "x", @splat(2), 1, creds.stored_key);
+    }
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (completionCount(&pool) < MAX_JOBS and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(MAX_JOBS, completionCount(&pool));
+    try std.testing.expectError(error.QueueFull, putTestJob(&pool, "x", @splat(2), 1, creds.stored_key));
+    _ = pool.popCompletion() orelse return error.NoCompletion;
+    _ = try putTestJob(&pool, "x", @splat(2), 1, creds.stored_key);
+}
+
 test "CryptoPool: finished jobs release their reservation" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     try pool.start(4);
