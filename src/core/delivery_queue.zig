@@ -69,9 +69,6 @@ pub const DeliverySlot = struct {
     target_generation: u32 = 0,
     /// Length of the stanza payload in bytes.
     payload_len: u16 = 0,
-    /// Bytes 8..15 of the slot. The compiler pads the two-byte length up to
-    /// the eight-byte token, so the explicit filler only names that gap.
-    _pad: [6]u8 = undefined,
     /// Dispatch identity minted by the producer (see offline_store.HoldToken).
     /// Carried in the slot so a consumer on another worker holds the message
     /// under the same identity, and two identical messages stay distinct.
@@ -83,6 +80,16 @@ pub const DeliverySlot = struct {
     /// Serialized XMPP stanza bytes.
     payload: [MAX_PAYLOAD_SIZE]u8 = undefined,
 };
+
+comptime {
+    // Zig reorders struct fields to minimize padding, so declaration order
+    // does not decide the layout: the id bytes, the two-byte length, the flag
+    // and the token pack into a 24-byte header with no filler either way. A
+    // manual filler field is what costs space: six bytes of _pad pushed the
+    // slot to 4112, an eight-byte slab per queue across every worker. Pin the
+    // header so any future field that does not fit the gaps fails here.
+    std.debug.assert(@sizeOf(DeliverySlot) == MAX_PAYLOAD_SIZE + 24); // 4104
+}
 
 /// Per-worker MPSC delivery queue (bounded ring buffer).
 pub const MpscQueue = struct {
