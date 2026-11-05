@@ -764,7 +764,7 @@ pub const Conn = struct {
     /// detaches it (immediate EV_DELETE per filter) so a pool thread can
     /// register it on its own kqueue. The conn keeps `ctx`; the driver
     /// posts `Done` back through `loop.wake` and the consumer re-adopts.
-    pub fn releaseFd(c: *Conn) error{StaleHandle}!posix.fd_t {
+    pub fn releaseFd(c: *Conn) loop_mod.DetachError!posix.fd_t {
         const fd = try c.loop.detach(c.handle);
         if (c.hs) |*hs| hs.fd = fd;
         return fd;
@@ -1547,4 +1547,140 @@ test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
         try std.testing.expectEqual(list.count, fwd);
     }
     _ = alloc;
+}
+
+test "Conn: startTls refuses a non-empty outbox and read-ahead" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // Outbox not empty: refuse before even looking at the inbox.
+    const parts = [_][]const u8{"queued"};
+    var list: ConnList = .{};
+    _ = c.send(&list, &parts);
+    try std.testing.expectError(StartError.OutboxNotEmpty, c.startTls(pki.ctx, .accept, null, mkConnCtx(2)));
+    _ = c.outbox.flush(&c.transport, 1 << 20);
+
+    // Buffered read-ahead past the upgrade point: refuse.
+    _ = try posix.write(pair[1], "GET / HTTP/1.0");
+    var budget: ReadBudget = .{};
+    _ = c.inbox.drain(&c.transport, &budget);
+    try std.testing.expectError(StartError.ReadAhead, c.startTls(pki.ctx, .accept, null, mkConnCtx(2)));
+    c.inbox.consume(c.inbox.len);
+
+    // Clean state: accepted, moves to handshake owning the fd.
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    try std.testing.expectEqual(State.handshake, c.state);
+    try std.testing.expectEqual(pair[0], c.hs.?.fd);
+}
+
+const SeamPayload = struct {
+    hs: *Handshake,
+    client: *ssl.SslConn,
+    wake: *wake_mod.Wake,
+    err: ?anyerror = null,
+    err_side: enum { none, server, client } = .none,
+    woke: bool = false,
+};
+
+const wake_mod = @import("wake.zig");
+
+fn seamDriver(p: *SeamPayload) void {
+    // The pool-side driver: owns the fd while the handshake runs. In F7
+    // this registers on its own kqueue; stepping both ends here is the
+    // same state machine on a deterministic interleave. A failed SSL
+    // must never be stepped again (OpenSSL crashes on a dead state).
+    var steps: usize = 0;
+    drive: while (steps < 10_000) : (steps += 1) {
+        switch (p.hs.step()) {
+            .ok => break,
+            .err => |e| {
+                p.err = e;
+                p.err_side = .server;
+                break :drive;
+            },
+            else => {},
+        }
+        _ = p.client.doHandshake() catch |e| {
+            p.err = e;
+            p.err_side = .client;
+            break :drive;
+        };
+    }
+    if (p.hs.done != .ok and p.err == null) p.err = error.HandshakeStuck;
+    p.wake.notify() catch |e| {
+        if (p.err == null) p.err = e;
+    };
+}
+
+test "Conn: handshake seam hands the fd to a second thread and back" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    // The loop deregisters the fd; the Handshake owns it while it runs.
+    const fd = try c.releaseFd();
+    try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+
+    var payload: SeamPayload = .{
+        .hs = &c.hs.?,
+        .client = &client,
+        .wake = loop.waker(),
+    };
+    const thread = try std.Thread.spawn(.{}, seamDriver, .{&payload});
+
+    // Owning loop waits for the Done post through Wake.
+    // Blocking wait: the only knote that can fire while the fd is
+    // released is the driver's Done post.
+    var woke = false;
+    try loop.wait();
+    while (loop.next()) |ev| {
+        if (ev == .wake) woke = true;
+    }
+    thread.join();
+    if (payload.err != null) std.debug.print("seam driver err={s} side={s}\n", .{ @errorName(payload.err.?), @tagName(payload.err_side) });
+    try std.testing.expect(woke);
+    try std.testing.expect(payload.err == null);
+    try std.testing.expectEqual(Done.ok, c.hs.?.done);
+
+    // The loop re-adopts the fd; the conn finishes the upgrade.
+    try c.adoptFd(fd);
+    c.finishHandshake();
+    try std.testing.expectEqual(State.established, c.state);
+    try std.testing.expectEqual(KtlsToken.sw, c.tls_storage.ktlsToken());
+    try std.testing.expectEqual(@as(u64, 1), counters.sw);
+
+    // Established TLS transport echoes through the userland client end.
+    _ = try client.write("seam ok");
+    var budget: ReadBudget = .{};
+    _ = c.inbox.drain(&c.transport, &budget);
+    try std.testing.expectEqualStrings("seam ok", c.inbox.unread());
 }
