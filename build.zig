@@ -185,6 +185,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const net_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/net.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -253,6 +259,11 @@ pub fn build(b: *std.Build) void {
         .root_module = conf_mod,
     });
 
+    const net_tests = b.addTest(.{
+        .name = "net-tests",
+        .root_module = net_mod,
+    });
+
     const xml_writer_tests = b.addTest(.{
         .name = "xml-writer-tests",
         .root_module = xml_writer_mod,
@@ -315,6 +326,7 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_conf_tests = b.addRunArtifact(conf_tests);
+    const run_net_tests = b.addRunArtifact(net_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
 
     // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
@@ -361,6 +373,25 @@ pub fn build(b: *std.Build) void {
     });
     const bench_crypto_pool_step = b.step("bench-crypto-pool", "Run the A9 crypto pool benchmark");
     bench_crypto_pool_step.dependOn(&b.addRunArtifact(pool_bench).step);
+
+    // F2 lib/net loop microbenchmark; pinned ReleaseFast per the work item.
+    const net_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/net_loop_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    net_bench_mod.addImport("net", b.createModule(.{
+        .root_source_file = b.path("lib/net/net.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const net_bench = b.addExecutable(.{
+        .name = "net-loop-bench",
+        .root_module = net_bench_mod,
+    });
+    const bench_net_loop_step = b.step("bench-net-loop", "Run the F2 lib/net loop benchmark");
+    bench_net_loop_step.dependOn(&b.addRunArtifact(net_bench).step);
+
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
@@ -1627,6 +1658,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("ipc_server", oidc_ipc_server_mod);
     oidc_main_mod.addImport("handler", oidc_handler_mod);
     oidc_main_mod.addImport("oidc", oidc_store_mod);
+    oidc_main_mod.addImport("policy", oidc_policy_mod);
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
@@ -1786,6 +1818,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all library tests");
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
+    test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
