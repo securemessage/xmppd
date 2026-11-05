@@ -1761,6 +1761,68 @@ fn serveOneTlsResponse(
     }
 }
 
+/// Serve `count` HTTPS responses on one loopback TLS listener, counting
+/// answered connections so a test can prove how many exchanges reached
+/// the IdP, then return.
+fn serveTlsResponsesCounted(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    status_line: []const u8,
+    body: []const u8,
+    count: usize,
+    port_out: *std.atomic.Value(u16),
+    served: *std.atomic.Value(usize),
+) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    while (served.load(.monotonic) < count and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn_fd);
+        const ssl_ptr = c.SSL_new(ctx) orelse continue;
+        defer c.SSL_free(ssl_ptr);
+        _ = c.SSL_set_fd(ssl_ptr, conn_fd);
+        if (c.SSL_accept(ssl_ptr) != 1) continue;
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+            if (r <= 0) break;
+            total += @intCast(r);
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+        }
+        var resp_buf: [8192]u8 = undefined;
+        const resp = std.fmt.bufPrint(
+            &resp_buf,
+            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ status_line, body.len, body },
+        ) catch return;
+        _ = c.SSL_write(ssl_ptr, resp.ptr, @intCast(resp.len));
+        _ = served.fetchAdd(1, .monotonic);
+    }
+}
+
 test "a rejected credential replays as not-authorized and records the failure" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2360,4 +2422,223 @@ test "a correct password answers auth_success end to end" {
     try std.testing.expect(std.meta.activeTag(reply) == .auth_success);
     try std.testing.expectEqual(@as(u32, 1), reply.auth_success.conn_id);
     try std.testing.expectEqualStrings("alice", reply.auth_success.username);
+}
+
+test "replayed credential failures engage the IP lockout" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genIdpTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(allocator, "{s}/cert.pem", .{base}, 0);
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(allocator, "{s}/key.pem", .{base}, 0);
+    defer allocator.free(key_path);
+
+    var port = std.atomic.Value(u16).init(0);
+    var served = std.atomic.Value(usize).init(0);
+    const stub = try std.Thread.spawn(.{}, serveTlsResponsesCounted, .{
+        cert_path.ptr,
+        key_path.ptr,
+        "400 Bad Request",
+        "{\"error\":\"invalid_grant\"}",
+        3,
+        &port,
+        &served,
+    });
+    defer stub.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, cert_path, null, .{
+        .lockout_threshold = 50,
+        .ip_lockout_threshold = 3,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 5000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    // Each replayed not-authorized mirrors one IP failure; the lock the
+    // handler's empty-IP replay cannot see engages on the third.
+    const reasons = [_][]const u8{
+        "not-authorized",
+        "not-authorized",
+        "not-authorized",
+        "policy-violation",
+    };
+    for (reasons, 0..) |want, i| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "u{d}", .{i}) catch unreachable;
+        const m = plainAuth(@intCast(i + 1), name, "wrong-pw", "10.0.3.1");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        const reply = (try client.nextReply(&fx.daemon, 8000)).?;
+        try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), reply.auth_failure.conn_id);
+        try std.testing.expectEqualStrings(want, reply.auth_failure.reason);
+    }
+    // Without the mirror the fourth request would have reached the IdP.
+    try std.testing.expectEqual(@as(usize, 3), served.load(.monotonic));
+}
+
+test "an IP lock engaged mid-flight denies the parked verdict" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 3000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, .{
+        .lockout_threshold = 50,
+        .ip_lockout_threshold = 1,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 150,
+        .timeout_ms = 300,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m = plainAuth(1, "alice", "pw", "10.0.4.1");
+    defer allocator.free(m.auth_request.payload);
+    try client.send(m);
+    try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+
+    // The lock engages while the exchange is parked; the replay re-check
+    // must answer with the denial, not the parked timeout verdict.
+    fx.handler.policy.recordOutcome("", "10.0.4.1", .failure);
+    const reply = (try client.nextReply(&fx.daemon, 3000)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
+    try std.testing.expectEqualStrings("policy-violation", reply.auth_failure.reason);
+}
+
+test "an account lock engaged mid-flight replays account-disabled only" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 3000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, .{
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+        .max_per_account = 100,
+        .max_per_ip = 100,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 150,
+        .timeout_ms = 300,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m = plainAuth(1, "alice", "pw", "10.0.5.1");
+    defer allocator.free(m.auth_request.payload);
+    try client.send(m);
+    try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+
+    // alice locks while her exchange is parked. The replay answers with
+    // the account denial and the mirror must not charge her IP for it:
+    // with ip_lockout_threshold 1 a mirrored failure would lock the IP.
+    fx.handler.policy.recordOutcome("alice", "", .failure);
+    const reply = (try client.nextReply(&fx.daemon, 3000)).?;
+    try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+    try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
+    try std.testing.expectEqualStrings("account-disabled", reply.auth_failure.reason);
+    try std.testing.expect(fx.handler.policy.check("", "10.0.5.1") == null);
+}
+
+test "a full-pool denial does not count the IP attempt again" {
+    const allocator = std.testing.allocator;
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try startHangingStub(&port, 5000);
+    defer stub.join();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://127.0.0.1:{d}/token",
+        .{port.load(.acquire)},
+    );
+
+    var fx: DaemonFixture = undefined;
+    try fx.init(allocator, url, null, null, .{
+        .lockout_threshold = 50,
+        .ip_lockout_threshold = 50,
+        .max_per_account = 100,
+        .max_per_ip = 3,
+    }, .{
+        .threads = 1,
+        .max_outstanding = 1,
+        .connect_timeout_ms = 2000,
+        .timeout_ms = 4000,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const m1 = plainAuth(1, "alice", "pw", "10.0.6.1");
+    defer allocator.free(m1.auth_request.payload);
+    try client.send(m1);
+    try fx.daemon.step(10);
+    try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
+
+    // The pool is full: requests two and three are backpressured, and
+    // backpressure must not spend window attempts beyond the one counted
+    // at dispatch. A denial handed to the handler would count twice and
+    // the third request would come back policy-violation instead.
+    for (2..4) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "u{d}", .{i}) catch unreachable;
+        const m = plainAuth(@intCast(i), name, "pw", "10.0.6.1");
+        defer allocator.free(m.auth_request.payload);
+        try client.send(m);
+        const reply = (try client.nextReply(&fx.daemon, 500)).?;
+        try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), reply.auth_failure.conn_id);
+        try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
+    }
 }

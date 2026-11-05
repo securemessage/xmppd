@@ -2560,6 +2560,8 @@ test "IdpPool: queue time counts against the exchange deadline" {
     try std.testing.expectEqual(@as(usize, 3), done);
     try std.testing.expect(elapsed_ms < 700);
     try std.testing.expectEqual(@as(usize, 1), accepted.load(.monotonic));
+    // The expired queued jobs completed without ever calling exchange.
+    try std.testing.expectEqual(@as(usize, 1), pool.exchanges_run.load(.monotonic));
 }
 
 test "IdpPool: stop never runs the queued exchanges" {
