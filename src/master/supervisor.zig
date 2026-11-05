@@ -287,10 +287,12 @@ pub const Supervisor = struct {
         // read: a stop or continue report is neither, and treating its
         // 0x7f marker as a signal would restart over a live child. Zig
         // 0.15.2 W.IFSIGNALED is also true for FreeBSD continued reports
-        // (0x13), so stopped and continued are excluded first.
+        // (0x13), and W.IFSTOPPED reads the FreeBSD core-dump bit (0x80)
+        // as stopped, so stopped and continued are excluded first with
+        // local checks.
         if (posix.W.IFEXITED(status)) {
             log.info("child pid={?d} exited with code {d}", .{ self.child_pid, posix.W.EXITSTATUS(status) });
-        } else if (posix.W.IFSIGNALED(status) and !posix.W.IFSTOPPED(status) and !wifContinued(status)) {
+        } else if (posix.W.IFSIGNALED(status) and !wifStopped(status) and !wifContinued(status)) {
             log.warn("child pid={?d} killed by signal {d}", .{ self.child_pid, posix.W.TERMSIG(status) });
         } else {
             log.warn("child pid={?d} wait status 0x{x} is not a termination", .{ self.child_pid, status });
@@ -363,6 +365,14 @@ pub const Supervisor = struct {
 /// this target and W.IFSIGNALED reads true for 0x13.
 fn wifContinued(status: u32) bool {
     return (status & 0xffff) == 0x13;
+}
+
+/// FreeBSD stopped marker (0x7f in the low seven bits). Done locally:
+/// Zig 0.15.2 W.IFSTOPPED uses a formula that also matches the
+/// core-dump bit, so a crash reported as signal|0x80 (SIGABRT 0x86,
+/// SIGSEGV 0x8b) would be misread as stopped and never restarted.
+fn wifStopped(status: u32) bool {
+    return (status & 0x7f) == 0x7f;
 }
 
 // ============================================================================
@@ -486,6 +496,18 @@ test "Supervisor: a signal kill is a termination, a stop report is not" {
     try std.testing.expect(sup2.handleChildExit(stopped_status) == .ignore);
     try std.testing.expect(sup2.handleChildExit(continued_status) == .ignore);
     try std.testing.expect(sup2.state == .running);
+
+    // A core-dumping crash reports signal|0x80. Zig 0.15.2 W.IFSTOPPED
+    // reads the core bit as a stop marker, so pin the restarts here: a
+    // crash that decodes to .ignore would leave the child unrestarted.
+    var sup3 = try Supervisor.init("/nonexistent", &.{}, 1);
+    sup3.child_pid = 23456;
+    for ([_]u32{ 0x80 | posix.SIG.ABRT, 0x80 | posix.SIG.SEGV }) |crash_status| {
+        try std.testing.expect(posix.W.IFSIGNALED(crash_status));
+        try std.testing.expect(!wifStopped(crash_status));
+        sup3.state = .running;
+        try std.testing.expect(sup3.handleChildExit(crash_status) == .restart);
+    }
 }
 
 test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356)" {
