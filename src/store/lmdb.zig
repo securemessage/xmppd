@@ -9,6 +9,7 @@
 //! MAP_FULL surfaces as an error, tune via [server] lmdb_map_size_mb).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const lmdb = @import("lmdb");
 const backend = @import("backend");
 
@@ -24,8 +25,197 @@ const MdbEnvInfoC = extern struct {
     me_numreaders: c_uint,
 };
 extern "c" fn mdb_env_info(env: ?*anyopaque, info: *MdbEnvInfoC) c_int;
+extern "c" fn mdb_env_get_fd(env: ?*anyopaque, fd: *c_int) c_int;
+
+// sysctl kern.proc.vmmap record prefix (sys/user.h kinfo_vmentry).
+// Records are walked by kve_structsize: kve_path is truncated on
+// copyout, so sizeof here is only the fixed prefix actually read.
+const KinfoVmentry = extern struct {
+    kve_structsize: c_int,
+    kve_type: c_int,
+    kve_start: u64,
+    kve_end: u64,
+    kve_offset: u64,
+    kve_vn_fileid: u64,
+    kve_vn_fsid_freebsd11: u32,
+    kve_flags: c_int,
+    kve_resident: c_int,
+    kve_private_resident: c_int,
+    kve_protection: c_int,
+    kve_ref_count: c_int,
+    kve_shadow_count: c_int,
+    kve_vn_type: c_int,
+    kve_vn_size: u64,
+    kve_vn_rdev_freebsd11: u32,
+    kve_vn_mode: u16,
+    kve_status: u16,
+    kve_vn_fsid: u64,
+    kve_vn_rdev: u64,
+};
+const KVME_TYPE_VNODE = 2;
+const KVME_FLAG_NOCOREDUMP = 0x4;
+const VMMAP_ATTEMPTS_MAX = 3;
+const VMMAP_BUF_SLACK = 4096;
+
+// kern.proc.vmmap seam: tests can substitute synthetic records and ENOMEM
+// failures so the bounded retry can be checked without racing mappings.
+const vmmapCall = if (builtin.is_test) struct {
+    var stub = false;
+    var size_calls: usize = 0;
+    var read_calls: usize = 0;
+    var read_fails: usize = 0;
+    var read_error: std.posix.SysCtlError = error.SystemResources;
+    var records: []const u8 = &.{};
+
+    fn reset() void {
+        stub = false;
+        size_calls = 0;
+        read_calls = 0;
+        read_fails = 0;
+        read_error = error.SystemResources;
+        records = &.{};
+    }
+
+    fn size(mib: []const c_int, len: *usize) std.posix.SysCtlError!void {
+        if (!stub) return std.posix.sysctl(mib, null, len, null, 0);
+        size_calls += 1;
+        len.* = records.len;
+    }
+
+    fn read(mib: []const c_int, buf: []u8, len: *usize) std.posix.SysCtlError!void {
+        if (!stub) {
+            len.* = buf.len;
+            return std.posix.sysctl(mib, buf.ptr, len, null, 0);
+        }
+        read_calls += 1;
+        if (read_fails != 0) {
+            read_fails -= 1;
+            return read_error;
+        }
+        if (records.len > buf.len) return error.SystemResources;
+        @memcpy(buf[0..records.len], records);
+        len.* = records.len;
+    }
+} else struct {
+    fn size(mib: []const c_int, len: *usize) std.posix.SysCtlError!void {
+        return std.posix.sysctl(mib, null, len, null, 0);
+    }
+
+    fn read(mib: []const c_int, buf: []u8, len: *usize) std.posix.SysCtlError!void {
+        len.* = buf.len;
+        return std.posix.sysctl(mib, buf.ptr, len, null, 0);
+    }
+};
+
+// madvise seam: test builds record the arguments instead of advising the
+// kernel, so a test can check the advised range covers the env map.
+// A nonzero result also sets a deterministic errno so the warn log does
+// not print a stale value.
+const madviseCall = if (builtin.is_test) struct {
+    var calls: usize = 0;
+    var addr: usize = 0;
+    var len: usize = 0;
+    var advice: u32 = 0;
+    var result: c_int = 0;
+    var result_errno: c_int = @intFromEnum(std.posix.E.INVAL);
+
+    fn run(a: usize, l: usize, adv: u32) c_int {
+        calls += 1;
+        addr = a;
+        len = l;
+        advice = adv;
+        if (result != 0) std.c._errno().* = result_errno;
+        return result;
+    }
+} else struct {
+    fn run(a: usize, l: usize, adv: u32) c_int {
+        const ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(a);
+        return std.c.madvise(ptr, l, adv);
+    }
+};
 
 const log = std.log.scoped(.lmdb_store);
+
+/// Exclude the env map from core dumps: a crash would otherwise write
+/// every touched LMDB page (SCRAM keys, rosters, archive contents) into
+/// the core file. LMDB reports me_mapaddr only for MDB_FIXEDMAP envs,
+/// so the map range comes from the process VM map instead: the vnode
+/// entry whose inode and filesystem id match the env's data file
+/// (mdb_env_get_fd). One call covers the map's lifetime because the map
+/// is never resized at runtime (S9, T358); failure is logged once and
+/// does not fail the open.
+fn excludeMapFromCoreDump(env: lmdb.Environment) void {
+    var fd: c_int = 0;
+    if (mdb_env_get_fd(env.ptr, &fd) != 0) {
+        log.warn("mdb_env_get_fd failed: LMDB map stays in core dumps", .{});
+        return;
+    }
+    const st = std.posix.fstat(fd) catch {
+        log.warn("fstat on the LMDB data fd failed: map stays in core dumps", .{});
+        return;
+    };
+    const rec = findVmEntry(st.ino, st.dev) orelse {
+        log.warn("LMDB map not found in kern.proc.vmmap: map stays in core dumps", .{});
+        return;
+    };
+    const start: usize = @intCast(rec.kve_start);
+    const len: usize = @intCast(rec.kve_end - rec.kve_start);
+    const rc = madviseCall.run(start, len, std.c.MADV.NOCORE);
+    if (rc != 0) {
+        log.warn("madvise MADV_NOCORE on the LMDB map failed (errno {d}): map stays in core dumps", .{@intFromEnum(std.posix.errno(rc))});
+    }
+}
+
+/// Fixed prefix of the VMA record backed by the vnode (ino, fsid), or
+/// null when kern.proc.vmmap yields no match. Other threads can add
+/// mappings between the size query and the read, so ENOMEM retries are
+/// bounded by VMMAP_ATTEMPTS_MAX.
+fn findVmEntry(ino: u64, fsid: u64) ?KinfoVmentry {
+    var mib = [_]c_int{ 1, 14, 32, std.c.getpid() }; // CTL_KERN, KERN_PROC, KERN_PROC_VMMAP
+    var attempt: usize = 0;
+    while (attempt < VMMAP_ATTEMPTS_MAX) : (attempt += 1) {
+        var len: usize = 0;
+        vmmapCall.size(&mib, &len) catch |err| {
+            switch (err) {
+                error.SystemResources => continue,
+                else => return null,
+            }
+        };
+
+        const buf_len = std.math.add(usize, len, VMMAP_BUF_SLACK) catch return null;
+        const buf = std.heap.page_allocator.alloc(u8, buf_len) catch return null;
+        var out_len = buf.len;
+        vmmapCall.read(&mib, buf, &out_len) catch |err| {
+            std.heap.page_allocator.free(buf);
+            switch (err) {
+                error.SystemResources => continue,
+                else => return null,
+            }
+        };
+
+        const rec = findVmRecord(buf[0..out_len], ino, fsid);
+        std.heap.page_allocator.free(buf);
+        return rec;
+    }
+    return null;
+}
+
+/// First vnode record in a kern.proc.vmmap buffer whose inode and
+/// filesystem id both match. Inode numbers are per filesystem (ZFS
+/// object numbers repeat across datasets), so an inode-only match can
+/// pick an unrelated mapping and leave the env map in core dumps.
+fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
+    var off: usize = 0;
+    while (off + @sizeOf(KinfoVmentry) <= buf.len) {
+        const rec: *align(1) const KinfoVmentry = @ptrCast(buf.ptr + off);
+        const size: usize = @intCast(rec.kve_structsize);
+        if (size < @sizeOf(KinfoVmentry)) break;
+        if (rec.kve_type == KVME_TYPE_VNODE and rec.kve_vn_fileid == ino and rec.kve_vn_fsid == fsid)
+            return rec.*;
+        off += size;
+    }
+    return null;
+}
 
 const MAX_DBS = 24;
 
@@ -86,6 +276,7 @@ pub const LmdbBackend = struct {
         // that follows the failure then runs a second env on the same
         // files, where LMDB drops the process's lock-file locks (D5).
         errdefer env.deinit();
+        excludeMapFromCoreDump(env);
 
         var self: LmdbBackend = .{
             .env = env,
@@ -779,4 +970,164 @@ test "LmdbBackend: a failed read-only open closes the env it created (D5)" {
         return error.ShouldHaveFailed;
     } else |_| {}
     try std.testing.expectEqual(before, countOpenFds());
+}
+
+test "LmdbBackend: open advises MADV_NOCORE over the env map" {
+    // Goal: read-write and read-only opens both exclude exactly the env
+    // map VMA from core dumps. Method: the test seam records the madvise
+    // arguments; the advised range must have the me_mapsize length and
+    // contain a value pointer LMDB returned from inside the map.
+    const path = freshTestDir();
+    var info: MdbEnvInfoC = undefined;
+    const users_ns = comptime backend.registered("users");
+
+    const calls0 = madviseCall.calls;
+    {
+        var db = try LmdbBackend.open(path, .{});
+        defer db.close();
+        try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
+        try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+
+        try db.put(users_ns, "probe-key", "probe-value");
+        var iter = try db.iterator(users_ns, "probe-key");
+        defer iter.deinit();
+        const p = @intFromPtr(iter.next().?.value.ptr);
+        try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
+    }
+
+    const calls1 = madviseCall.calls;
+    {
+        var db = try LmdbBackend.open(path, .{ .create = false, .read_only = true });
+        defer db.close();
+        try std.testing.expectEqual(calls1 + 1, madviseCall.calls);
+        try std.testing.expectEqual(std.c.MADV.NOCORE, madviseCall.advice);
+        try std.testing.expectEqual(@as(c_int, 0), mdb_env_info(db.env.ptr, &info));
+        try std.testing.expectEqual(info.me_mapsize, madviseCall.len);
+
+        var iter = try db.iterator(users_ns, "probe-key");
+        defer iter.deinit();
+        const p = @intFromPtr(iter.next().?.value.ptr);
+        try std.testing.expect(p >= madviseCall.addr and p < madviseCall.addr + madviseCall.len);
+    }
+}
+
+test "LmdbBackend: a madvise failure does not fail the open" {
+    // Goal: open() succeeds and the store still works when MADV_NOCORE
+    // cannot be applied. Method: the test seam returns an error.
+    const path = freshTestDir();
+    madviseCall.result = -1;
+    defer madviseCall.result = 0;
+
+    const calls0 = madviseCall.calls;
+    var db = try LmdbBackend.open(path, .{});
+    try std.testing.expectEqual(calls0 + 1, madviseCall.calls);
+    defer db.close();
+    const users_ns = comptime backend.registered("users");
+    try db.put(users_ns, "alice", "creds");
+    const val = try db.get(std.testing.allocator, users_ns, "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("creds", val.?);
+}
+
+test "LmdbBackend: the env map VMA match requires inode and filesystem" {
+    // Goal: a same-inode record on another filesystem is skipped, so the
+    // advice can never land on an unrelated mapping (ZFS inode numbers
+    // repeat across datasets). Method: a synthetic kern.proc.vmmap
+    // buffer holding two vnode records that share an inode but differ
+    // in kve_vn_fsid.
+    var recs = [_]KinfoVmentry{ std.mem.zeroes(KinfoVmentry), std.mem.zeroes(KinfoVmentry) };
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_start = 0x1000;
+    recs[0].kve_end = 0x2000;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    recs[1] = recs[0];
+    recs[1].kve_start = 0x3000;
+    recs[1].kve_end = 0x9000;
+    recs[1].kve_vn_fsid = 0xBBBB;
+    const buf = std.mem.sliceAsBytes(&recs);
+
+    const rec = findVmRecord(buf, 4242, 0xBBBB) orelse return error.VmRecordNotFound;
+    try std.testing.expectEqual(@as(u64, 0x3000), rec.kve_start);
+    try std.testing.expect(findVmRecord(buf, 4242, 0xAAAA) != null);
+    try std.testing.expect(findVmRecord(buf, 4242, 0xCCCC) == null);
+}
+
+test "LmdbBackend: the vmmap lookup retries ENOMEM and re-queries the size" {
+    // Goal: mappings added between the size query and the read do not lose
+    // the VMA. Method: the seam fails one read with ENOMEM, then returns
+    // one matching record.
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = 1;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_start = 0x7000;
+    recs[0].kve_end = 0x9000;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const rec = findVmEntry(4242, 0xAAAA) orelse return error.VmEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 0x7000), rec.kve_start);
+    try std.testing.expectEqual(@as(usize, 2), vmmapCall.size_calls);
+    try std.testing.expectEqual(@as(usize, 2), vmmapCall.read_calls);
+}
+
+test "LmdbBackend: the vmmap ENOMEM retry is bounded" {
+    // Goal: repeated ENOMEM does not loop forever. Method: the seam fails
+    // every read and the lookup must stop at VMMAP_ATTEMPTS_MAX.
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = VMMAP_ATTEMPTS_MAX;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    try std.testing.expect(findVmEntry(4242, 0xAAAA) == null);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.size_calls);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
+}
+
+test "LmdbBackend: the real madvise marks the env VMA nocore" {
+    // Goal: the syscall path the seam bypasses works end to end: the
+    // real madvise accepts MADV_NOCORE on the VMA the lookup returns
+    // and the kernel records KVME_FLAG_NOCOREDUMP on it. Method: advise
+    // over the found record's range, then re-read the record and check
+    // the flag. An LMDB value pointer pins the VMA to the env map.
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    const users_ns = comptime backend.registered("users");
+
+    var fd: c_int = 0;
+    try std.testing.expectEqual(@as(c_int, 0), mdb_env_get_fd(db.env.ptr, &fd));
+    const st = try std.posix.fstat(fd);
+    const rec = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    const start: usize = @intCast(rec.kve_start);
+    const len: usize = @intCast(rec.kve_end - rec.kve_start);
+
+    try db.put(users_ns, "probe-key", "probe-value");
+    var iter = try db.iterator(users_ns, "probe-key");
+    defer iter.deinit();
+    const p = @intFromPtr(iter.next().?.value.ptr);
+    try std.testing.expect(p >= start and p < start + len);
+
+    const addr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(start);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.madvise(addr, len, std.c.MADV.NOCORE));
+
+    const after = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    try std.testing.expectEqual(rec.kve_start, after.kve_start);
+    try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
 }

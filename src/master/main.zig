@@ -576,30 +576,33 @@ pub fn main() !void {
                 .process_exit => |p| {
                     if (auth_sup.child_pid != null and p.pid == auth_sup.child_pid.?) {
                         _ = auth_sup.waitChild() catch {};
-                        const should_restart = auth_sup.handleChildExit(p.status);
-                        if (should_restart) {
-                            log.info("restarting auth daemon in {d}ms", .{auth_sup.backoffMs()});
-                            loop.addTimer(AUTH_UDATA, auth_sup.backoffMs(), true) catch {};
-                        } else {
-                            running = false;
+                        switch (auth_sup.handleChildExit(p.status)) {
+                            .restart => {
+                                log.info("restarting auth daemon in {d}ms", .{auth_sup.backoffMs()});
+                                loop.addTimer(AUTH_UDATA, auth_sup.backoffMs(), true) catch {};
+                            },
+                            .shutdown => running = false,
+                            .ignore => {},
                         }
                     } else if (core_sup.child_pid != null and p.pid == core_sup.child_pid.?) {
                         _ = core_sup.waitChild() catch {};
-                        const should_restart = core_sup.handleChildExit(p.status);
-                        if (should_restart) {
-                            log.info("restarting core in {d}ms", .{core_sup.backoffMs()});
-                            loop.addTimer(CORE_UDATA, core_sup.backoffMs(), true) catch {};
-                        } else {
-                            running = false;
+                        switch (core_sup.handleChildExit(p.status)) {
+                            .restart => {
+                                log.info("restarting core in {d}ms", .{core_sup.backoffMs()});
+                                loop.addTimer(CORE_UDATA, core_sup.backoffMs(), true) catch {};
+                            },
+                            .shutdown => running = false,
+                            .ignore => {},
                         }
                     } else if (s2s_enabled and s2s_sup.child_pid != null and p.pid == s2s_sup.child_pid.?) {
                         _ = s2s_sup.waitChild() catch {};
-                        const should_restart = s2s_sup.handleChildExit(p.status);
-                        if (should_restart) {
-                            log.info("restarting s2s in {d}ms", .{s2s_sup.backoffMs()});
-                            loop.addTimer(S2S_UDATA, s2s_sup.backoffMs(), true) catch {};
-                        } else {
-                            running = false;
+                        switch (s2s_sup.handleChildExit(p.status)) {
+                            .restart => {
+                                log.info("restarting s2s in {d}ms", .{s2s_sup.backoffMs()});
+                                loop.addTimer(S2S_UDATA, s2s_sup.backoffMs(), true) catch {};
+                            },
+                            .shutdown => running = false,
+                            .ignore => {},
                         }
                     }
                 },
