@@ -515,12 +515,14 @@ test "deluser --raw accepts a data-only spelling and keeps the account" {
 
     var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
     try users.addUser(allocator, "NaplesTB", "pw");
+    try auth.put(NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
     var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
     _ = try offline.storePointer("naplestb@us.example", "alice@us.example/res", "id1", 1);
 
     const domains = [_][]const u8{"us.example"};
     try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "naplestb");
     try std.testing.expect((try users.lookup(allocator, "NaplesTB")) != null);
+    try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
     const pointers = try offline.getPointers("naplestb@us.example");
     defer offline.freePointers(pointers);
     try std.testing.expectEqual(@as(usize, 0), pointers.len);

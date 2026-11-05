@@ -1015,13 +1015,15 @@ fn entryMatchesRaw(
     value: []const u8,
     raw: []const u8,
     hosted_domains: []const []const u8,
+    delete_locks: bool,
 ) bool {
     _ = db;
     if (std.mem.eql(u8, namespace, NS_USERS)) return std.mem.eql(u8, key, raw);
     if (std.mem.eql(u8, namespace, NS_LOCKS)) {
-        // A prepared lock key belongs to the canonical identity, not to the
-        // deleted spelling. Only an exact raw legacy key may be deleted.
-        return std.mem.eql(u8, key, raw);
+        // A data-only spelling can equal a prepared lock key owned by the
+        // surviving account. Only a real users-row deletion may remove the
+        // exact raw lock.
+        return delete_locks and std.mem.eql(u8, key, raw);
     }
     if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST) or
@@ -1062,12 +1064,13 @@ fn collectRawDeletions(
     namespaces: []const []const u8,
     raw: []const u8,
     hosted_domains: []const []const u8,
+    delete_locks: bool,
 ) !void {
     for (namespaces) |namespace| {
         var iterator = try backend.iterator(namespace, "");
         defer iterator.deinit();
         while (iterator.next()) |entry| {
-            if (!entryMatchesRaw(db, namespace, entry.key, entry.value, raw, hosted_domains)) continue;
+            if (!entryMatchesRaw(db, namespace, entry.key, entry.value, raw, hosted_domains, delete_locks)) continue;
             const key = try allocator.dupe(u8, entry.key);
             errdefer allocator.free(key);
             try deletions.append(allocator, .{ .db = db, .namespace = namespace, .key = key });
@@ -1112,6 +1115,7 @@ pub fn deleteRawAccount(
     raw: []const u8,
 ) !void {
     const existing = try auth.get(allocator, NS_USERS, raw);
+    const raw_has_users = existing != null;
     if (existing) |value| {
         allocator.free(value);
     } else {
@@ -1136,7 +1140,7 @@ pub fn deleteRawAccount(
 
     var deletions: std.ArrayListUnmanaged(Deletion) = .{};
     defer freeDeletions(&deletions, allocator);
-    try collectRawDeletions(&deletions, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains);
+    try collectRawDeletions(&deletions, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains, raw_has_users);
     try collectRawDeletions(&deletions, allocator, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -1146,8 +1150,8 @@ pub fn deleteRawAccount(
         NS_OFFLINE,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
-    }, raw, hosted_domains);
-    try collectRawDeletions(&deletions, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains);
+    }, raw, hosted_domains, raw_has_users);
+    try collectRawDeletions(&deletions, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains, raw_has_users);
 
     try deleteRawDb(auth, deletions.items, .auth);
     try deleteRawDb(op, deletions.items, .op);
@@ -1155,7 +1159,7 @@ pub fn deleteRawAccount(
 
     var remaining: std.ArrayListUnmanaged(Deletion) = .{};
     defer freeDeletions(&remaining, allocator);
-    try collectRawDeletions(&remaining, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains);
+    try collectRawDeletions(&remaining, allocator, .auth, auth, &.{ NS_USERS, NS_LOCKS }, raw, hosted_domains, raw_has_users);
     try collectRawDeletions(&remaining, allocator, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -1165,8 +1169,8 @@ pub fn deleteRawAccount(
         NS_OFFLINE,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
-    }, raw, hosted_domains);
-    try collectRawDeletions(&remaining, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains);
+    }, raw, hosted_domains, raw_has_users);
+    try collectRawDeletions(&remaining, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains, raw_has_users);
     if (remaining.items.len != 0) return error.DataRemaining;
 }
 
