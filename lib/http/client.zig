@@ -1331,6 +1331,14 @@ test "responseComplete: an empty field name is rejected" {
     );
 }
 
+test "responseComplete: an empty line inside the head does not panic" {
+    // A bare-LF blank line sits before the CRLFCRLF terminator. The
+    // line.len > 0 guard on the obs-fold check is what keeps line[0]
+    // in bounds.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\n\nX: 1\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
 test "responseComplete: framing ends the body at Content-Length" {
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL";
     try std.testing.expectEqual(
