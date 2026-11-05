@@ -1905,6 +1905,10 @@ pub const Resolver = struct {
                 .rrs = dup,
                 .expires_ms = expires_ms,
                 .stale_ms = expires_ms + STALE_MAX_MS,
+                // A replace must keep the refresh pin: another job may
+                // still borrow this row, and dropping the flag lets
+                // a CNAME answer or eviction free it under it.
+                .refreshing = ent.refreshing,
             };
             const new_bytes = typeEntBytes(ent);
             owner.bytes = owner.bytes - old_bytes + new_bytes;
@@ -6224,6 +6228,45 @@ test "dns-async: a NODATA refresh answer clears the row's refresh pin" {
     r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
     try r.query("stale.test", .a, 8);
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+}
+
+test "dns-async: an in-place replace keeps the borrowed row's refresh pin" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    // Job A misses on the name and is still on the wire when another
+    // answer lands: a short-TTL row that goes stale, then job B's
+    // lookup starts a refresh and borrows the row.
+    try r.query("dup.test", .a, 1);
+    const ja = r.jobs.items[0];
+    var rrs = [1]wire.Rr{.{ .name = "dup.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 1, .rdata = &.{ 10, 1, 1, 1 } }};
+    r.cacheInsert("dup.test", KIND_A, &rrs, .none, 1);
+    fake_now += 2_000;
+    try r.query("dup.test", .a, 2);
+    const jb = r.jobs.items[1];
+    try std.testing.expect(jb.stale != null);
+    // A's late answer replaces the row in place; the pin must
+    // survive, or a CNAME answer or eviction frees the row while
+    // B still borrows it.
+    var buf: [512]u8 = undefined;
+    r.handleResponse(ja, buf[0..answerTcpQuery(&buf, ja.request)]);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(jb.stale.?.ent.refreshing);
+    const cn = [1]wire.Rr{.{ .name = "dup.test", .rtype = wire.TYPE_CNAME, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 'w', 'w', 'w', 0 } }};
+    r.cacheInsert("dup.test", KIND_SRV, &cn, .none, 60);
+    const o = r.owners.get("dup.test").?;
+    try std.testing.expect(Resolver.findTypeRow(o, KIND_A) != null);
+    // B's refresh fails: the borrowed row still serves it.
+    r.handleResponse(jb, buf[0..buildRcode(&buf, jb.request, 2)]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res2 = ctx.raw.?;
+    defer res2.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, res2.rrs[0].rdata);
 }
 
 test "dns-async: SRV targets come back in RFC 2782 priority order" {
