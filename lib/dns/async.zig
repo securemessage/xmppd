@@ -464,6 +464,12 @@ pub const Resolver = struct {
         };
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) {
+            // ADR-13: a refresh never starves a client lookup the
+            // cache could answer, so a waiterless refresh-only job
+            // yields its slot first.
+            _ = self.reclaimRefreshOnly();
+        }
+        if (self.jobs.items.len >= MAX_JOBS) {
             try self.enqueueWait(session_key, fqdn, .{ .kind = .query, .rtype = qt });
             return;
         }
@@ -628,6 +634,11 @@ pub const Resolver = struct {
             job.waiters[job.waiter_count] = session_key;
             job.waiter_count += 1;
             return;
+        }
+        if (self.jobs.items.len >= MAX_JOBS) {
+            // Same rule as query(): refresh-only jobs yield to client
+            // lookups, so a fully cached resolve() can always answer.
+            _ = self.reclaimRefreshOnly();
         }
         if (self.jobs.items.len >= MAX_JOBS) {
             try self.enqueueWait(session_key, fqdn, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
@@ -1632,6 +1643,23 @@ pub const Resolver = struct {
             out.append(alloc, rr) catch return error.OutOfMemory;
         }
         return out.items;
+    }
+
+    /// Free one slot held by a waiterless refresh-only job so a
+    /// client lookup can take it (ADR-13: a refresh never starves a
+    /// lookup the cache could answer). The aborted refresh counts as
+    /// a failed one: freeJob stamps last_fail_ms, suppressing an
+    /// immediate respawn for the recheck window. promoteWait inside
+    /// abortJob hands the slot to a queued request first, so FIFO
+    /// order survives. Returns true when a job was reclaimed.
+    fn reclaimRefreshOnly(self: *Resolver) bool {
+        for (self.jobs.items) |job| {
+            if (job.refresh_only) {
+                self.abortJob(job);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Remove a job without answering its waiters: for callers that
@@ -6423,6 +6451,54 @@ test "dns-async: uncacheable TLSA refresh answers drop the stale row (D3, D4, D5
     got = try runStaleTlsaLegs(&r, .none, .nodata);
     try std.testing.expectEqual(TlsaStatus.absent, got[0]);
     try std.testing.expectEqual(TlsaStatus.lookup_failed, got[1]);
+}
+
+test "dns-async: refresh-only jobs yield a slot to a client lookup" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var name_buf: [32]u8 = undefined;
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    for (0..MAX_JOBS + 1) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "s{d}.test", .{i}) catch unreachable;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 60);
+    }
+    fake_now += 61_000;
+    seedSvcChain(&r, false);
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    // Every lookup on a stale row starts a refresh; each per-query
+    // deadline leaves a waiterless refresh-only job until all slots
+    // are refreshes.
+    for (0..MAX_JOBS) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "s{d}.test", .{i}) catch unreachable;
+        try r.query(n, .a, 100 + i);
+    }
+    for (r.jobs.items) |j| {
+        r.onDeadline(j);
+        var res = ctx.raw.?;
+        res.deinitOn(std.testing.allocator);
+        ctx.raw = null;
+        ctx.status = null;
+    }
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
+    // A fully cached resolve answers synchronously: a refresh job
+    // yields its slot, the cache answers, and the slot frees again.
+    var rctx = TestCtx{};
+    r.setCallback(.{ .ctx = &rctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 900, false);
+    try std.testing.expect(rctx.status != null);
+    var res = rctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+    // A lookup on a stale, not-yet-refreshed row takes a reclaimed
+    // slot on the wire instead of queueing behind refreshes.
+    const n65 = std.fmt.bufPrint(&name_buf, "s{d}.test", .{MAX_JOBS}) catch unreachable;
+    try r.query(n65, .a, 901);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
 }
 
 test "dns-async: SRV targets come back in RFC 2782 priority order" {
