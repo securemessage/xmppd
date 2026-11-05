@@ -1339,6 +1339,13 @@ test "responseComplete: an empty line inside the head does not panic" {
     try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
 }
 
+test "responseComplete: a one-character field name is accepted" {
+    // tchar allows a single-character name; only the truly empty name
+    // is invalid.
+    const resp = "HTTP/1.1 200 OK\r\nX: 1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
 test "responseComplete: framing ends the body at Content-Length" {
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL";
     try std.testing.expectEqual(
