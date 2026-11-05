@@ -56,10 +56,9 @@ const SessionMap = session_map_mod.SessionMap;
 const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
-const generic_offline = @import("generic_offline_store");
 const offline_store_mod = @import("generic_offline_store");
-const GenericOfflineStore = generic_offline.GenericOfflineStore;
-const OfflinePointer = generic_offline.OfflinePointer;
+const GenericOfflineStore = offline_store_mod.GenericOfflineStore;
+const OfflinePointer = offline_store_mod.OfflinePointer;
 const archive_store_mod = @import("archive_store");
 const ArchiveBackendMod = @import("archive_backend");
 const ArchiveBackendType = ArchiveBackendMod.Backend;
@@ -6609,9 +6608,9 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
     try std.testing.expectEqual(@as(u32, 1), queue.pending());
 }
 
-// The live delivery path enqueues with queueSendWithFlush, which the ratchet
-// now sees. Counting it is not enough: the stanza still has to be tracked for
-// XEP-0198, or the ack window shifts under the client.
+// The live delivery path enqueues with queueSendWithFlush. Counting the call
+// is not enough: the stanza still has to be tracked for XEP-0198, or the ack
+// window shifts under the client.
 test "S15: live router delivery tracks the stanza for XEP-0198" {
     const allocator = std.testing.allocator;
 
@@ -9367,8 +9366,8 @@ test "Server: G2 two workers cannot exceed the shared offline quota" {
     defer allocator.free(op_path);
     var op_db = try OpBackendMod.Backend.open(op_path, .{});
     defer op_db.close();
-    try op_db.put(generic_offline.NS_OFFLINE, "warmup", "");
-    try op_db.delete(generic_offline.NS_OFFLINE, "warmup");
+    try op_db.put(offline_store_mod.NS_OFFLINE, "warmup", "");
+    try op_db.delete(offline_store_mod.NS_OFFLINE, "warmup");
 
     const Store = GenericOfflineStore(OpBackendType);
     const Context = struct {
@@ -11714,12 +11713,12 @@ test "every store namespace constant is registered and every registry entry is o
         last_activity_store.NAMESPACE,
         invite_store.NAMESPACE,
         block_store_mod.NAMESPACE,
-        generic_offline.NS_OFFLINE,
-        generic_offline.NS_OFFLINE_HOLD,
-        generic_offline.NS_OFFLINE_V2,
-        generic_offline.NS_OFFLINE_HOLD_V2,
-        generic_offline.NS_OFFLINE_SEQ,
-        generic_offline.NS_OFFLINE_HOLD_TOKEN,
+        offline_store_mod.NS_OFFLINE,
+        offline_store_mod.NS_OFFLINE_HOLD,
+        offline_store_mod.NS_OFFLINE_V2,
+        offline_store_mod.NS_OFFLINE_HOLD_V2,
+        offline_store_mod.NS_OFFLINE_SEQ,
+        offline_store_mod.NS_OFFLINE_HOLD_TOKEN,
         room_store_mod.NS_ROOMS,
         room_store_mod.NS_AFFILIATIONS,
         archive_store_mod.NS_MESSAGES,

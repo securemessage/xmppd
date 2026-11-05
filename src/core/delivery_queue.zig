@@ -69,8 +69,9 @@ pub const DeliverySlot = struct {
     target_generation: u32 = 0,
     /// Length of the stanza payload in bytes.
     payload_len: u16 = 0,
-    /// Padding for alignment.
-    _pad: [3]u8 = undefined,
+    /// Bytes 8..15 of the slot. The compiler pads the two-byte length up to
+    /// the eight-byte token, so the explicit filler only names that gap.
+    _pad: [6]u8 = undefined,
     /// Dispatch identity minted by the producer (see offline_store.HoldToken).
     /// Carried in the slot so a consumer on another worker holds the message
     /// under the same identity, and two identical messages stay distinct.

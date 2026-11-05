@@ -628,10 +628,6 @@ fn buildStoredStanza(
     return fbs.getWritten();
 }
 
-/// Serialize a stanza for delivery to a local target into `buf`, returning the
-/// bytes written or null when they do not fit. `emit_type` is decided by the
-/// caller because type='normal' is omitted on messages (RFC 6121 section
-/// 8.5.2.1.1) but carried on other stanza kinds.
 /// RFC 6121 section 8.5.2.1.1 omits type='normal' on messages. Both the local
 /// and the cross-worker form must agree on this, or one dispatch becomes two.
 fn emitTypeFor(kind: StanzaKind, type_str: []const u8) bool {
@@ -639,6 +635,9 @@ fn emitTypeFor(kind: StanzaKind, type_str: []const u8) bool {
         !(kind == .message and std.mem.eql(u8, type_str, "normal"));
 }
 
+/// Serialize one delivery form into `buf`, returning the bytes written or null
+/// when they do not fit. Every target of a dispatch, local or on another
+/// worker, gets these bytes, so the store sees one dispatch as one message.
 fn buildDeliveryStanza(
     buf: []u8,
     tag_name: []const u8,
