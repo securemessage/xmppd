@@ -586,8 +586,11 @@ fn parseResponseHead(head: []const u8) HeadParse {
         if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return .invalid;
         // RFC 9112 5.1: no whitespace is allowed between the field name
         // and the colon. "Content-Length : 5" must not fall through to a
-        // looser parse of some other header shape.
+        // looser parse of some other header shape. RFC 9110 5.1 makes
+        // the name one or more tchar, so a colon at index 0 is not a
+        // field line at all.
         if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            if (colon == 0) return .invalid;
             if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
         }
         const te_prefix = "transfer-encoding:";
@@ -1299,6 +1302,15 @@ test "responseComplete: a reason phrase may contain ' : '" {
     // reason phrase with whitespace before a colon stays accepted.
     const resp = "HTTP/1.1 200 OK : yes\r\nContent-Length: 5\r\n\r\nhello";
     try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: an empty field name is rejected" {
+    // RFC 9110 5.1: field-name is one or more tchar; ": v" has none.
+    const resp = "HTTP/1.1 200 OK\r\n: v\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(resp),
+    );
 }
 
 test "responseComplete: framing ends the body at Content-Length" {
