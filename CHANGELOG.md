@@ -60,12 +60,14 @@
 
 - **Known gap until PR #9 lands:** local-domain JIDs are not yet prepared
   at stanza or payload ingress. Mail and presence addressed to the old
-  spelling (for example `NaplesTB@domain`) do not reach the migrated
-  account `naplestb`, including offline delivery. Address accounts by
-  their prepared localpart. Roster items, blocklist items, MUC
-  affiliations and MAM `with` filters can also store the old spelling;
-  PR #9 will prepare those payload JIDs and make the domain comparison
-  case-insensitive.
+  spelling (for example `NaplesTB@domain`) are stored under that old
+  spelling and stay unreachable, including offline delivery, until PR #9
+  prepares them. Address accounts by their prepared localpart. Roster
+  items, blocklist items, MUC affiliations and MAM `with` filters can also
+  store the old spelling, and JIDs whose domain differs in case from the
+  configured hosted domain are not treated as local. After PR #9 lands,
+  rerun `migrate-precis` to absorb every row written under an old spelling
+  in the meantime.
 
 ## v0.9.0 - 2026-10-04
 
