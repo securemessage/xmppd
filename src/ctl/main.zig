@@ -539,7 +539,7 @@ fn runMigratePrecis(
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();
     try printMigrationPlan(allocator, &plan);
-    if (plan.issues.items.len != 0) {
+    if (plan.hasBlockingIssues()) {
         printErr("migration blocked; resolve every collision or invalid name and rerun\n");
         return error.MigrationBlocked;
     }
@@ -560,7 +560,9 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
         defer allocator.free(old_hex);
         const new_hex = try migrate_precis.hexKey(allocator, rename.new_key);
         defer allocator.free(new_hex);
-        if (rename.same_key) {
+        if (rename.delete_only) {
+            printOut("dedupe-drop ");
+        } else if (rename.same_key) {
             printOut("rewrite-value ");
         } else {
             printOut("rename ");
