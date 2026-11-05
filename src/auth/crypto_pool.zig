@@ -198,6 +198,17 @@ pub const CryptoPool = struct {
         self.completions = completions;
     }
 
+    /// Wipe and drop every queued-but-unstarted job: the slots hold
+    /// plaintext until zeroed. Called by stop() after the workers join.
+    fn dropQueued(self: *CryptoPool) void {
+        self.job_mutex.lock();
+        defer self.job_mutex.unlock();
+        while (self.job_head < self.job_tail) {
+            std.crypto.secureZero(u8, &self.job_slots[self.job_head % MAX_JOBS].password);
+            self.job_head += 1;
+        }
+    }
+
     /// Spawn the worker threads and open the wake pipe (both ends
     /// non-blocking: the loop drains the read end, workers write the
     /// write end and treat EAGAIN as already-signaled).
@@ -250,12 +261,7 @@ pub const CryptoPool = struct {
         // Wipe the queued jobs that never ran: their slots hold
         // plaintext until zeroed, and their outstanding reservations
         // die with the pool.
-        self.job_mutex.lock();
-        while (self.job_head < self.job_tail) {
-            std.crypto.secureZero(u8, &self.job_slots[self.job_head % MAX_JOBS].password);
-            self.job_head += 1;
-        }
-        self.job_mutex.unlock();
+        self.dropQueued();
 
         // In-flight completions published before the join are dropped
         // with the pool: drain the ring so a pop after stop() returns
@@ -683,9 +689,8 @@ test "CryptoPool: an over-bound password is not truncated to a match" {
 }
 
 test "CryptoPool: completed and dropped jobs leave no password bytes" {
-    // A worker wipes the slot's inline password when it pops the job, and
-    // stop() wipes every queued slot it drops. Scan the ring for the
-    // submitted marker after each exit path.
+    // A worker wipes the slot's inline password when it pops the job.
+    // Scan the ring for the submitted marker after the job completes.
     var pool = CryptoPool{ .allocator = std.testing.allocator };
     try pool.start(1);
     defer pool.stop();
@@ -703,18 +708,18 @@ test "CryptoPool: completed and dropped jobs leave no password bytes" {
     for (pool.job_slots) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-a1") == null);
     }
+}
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var pool2 = CryptoPool{ .allocator = arena.allocator() };
-    // No start(): the job stays queued and stop() must wipe its slot.
-    // The arena never releases the ring's pages, so the wiped slot is
-    // still readable after stop() frees it.
-    _ = try putTestJob(&pool2, "wipe-marker-b2", @splat(7), 1, @splat(8));
-    const slots2 = pool2.job_slots;
-    pool2.stop();
-    for (slots2) |*slot| {
-        try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-b2") == null);
+test "CryptoPool: stop wipes queued slots before freeing them" {
+    // Scan job_slots while they are still mapped: Allocator.free poisons
+    // the ring in safe modes, so a scan after stop() cannot tell the
+    // wipe from the poison. dropQueued() is what stop() calls.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    defer pool.stop();
+    _ = try putTestJob(&pool, "wipe-marker-q3", @splat(7), 1, @splat(8));
+    pool.dropQueued();
+    for (pool.job_slots) |*slot| {
+        try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-q3") == null);
     }
 }
 
