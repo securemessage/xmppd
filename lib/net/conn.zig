@@ -564,6 +564,10 @@ pub const Conn = struct {
     /// Deferred end-of-iteration work the consumer's walk performs.
     requeue_read: bool = false,
     requeue_write: bool = false,
+    /// `tls_storage.conn` owns a live SSL*; deinit frees it. Keyed on a
+    /// flag, not state: teardown requires `.closing`, so no conn closed
+    /// through the contract is ever `.established` at deinit.
+    tls_live: bool = false,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
@@ -598,7 +602,7 @@ pub const Conn = struct {
     /// Free inbox/ring/spill memory. Only valid after `teardown` (the
     /// fd is already closed) or when init's attach never ran.
     pub fn deinit(c: *Conn) void {
-        if (c.state == .established) c.tls_storage.conn.deinit();
+        if (c.tls_live) c.tls_storage.conn.deinit();
         if (c.hs) |*hs| hs.conn.deinit();
         const alloc = c.outbox.alloc;
         c.outbox.deinit();
@@ -691,7 +695,12 @@ pub const Conn = struct {
         switch (hs.step()) {
             .ok => {
                 c.finishHandshake();
-                if (c.state == .closing) return .{ .closed = .{ .err = error.KtlsRequired } };
+                if (c.state == .closing) {
+                    // require failed inside finishHandshake: link so the
+                    // walk tears the conn down (fd and SSL would leak).
+                    list.link(c);
+                    return .{ .closed = .{ .err = error.KtlsRequired } };
+                }
                 return .handshake_done;
             },
             .want_read => {
@@ -724,6 +733,7 @@ pub const Conn = struct {
         };
         hs.conn = undefined;
         c.hs = null;
+        c.tls_live = true;
         const token = c.tls_storage.ktlsToken();
         c.opts.counters.countKtls(token);
         std.log.scoped(.net_conn).debug("tls established fd={d} ktls={s} {s}/{s}", .{
@@ -894,6 +904,8 @@ const tc = @cImport({
     @cInclude("openssl/pem.h");
     @cInclude("openssl/bio.h");
     @cInclude("openssl/objects.h");
+    @cInclude("openssl/ssl.h");
+    @cInclude("openssl/err.h");
 });
 
 fn bioDrain(bio: *tc.BIO, buf: []u8) ![]u8 {
@@ -1405,6 +1417,70 @@ fn mkConnCtx(index: u32) Token {
     return .{ .index = index, .gen = 1, .kind = 0x7c };
 }
 
+// Test helpers: an SSL ex_data slot whose free callback counts frees,
+// so a leaked SSL object is observable in-process.
+var ssl_mark_frees: usize = 0;
+var ssl_mark_byte: u8 = 0;
+var ssl_mark_idx: c_int = -1;
+
+fn sslMarkFree(parent: ?*anyopaque, ptr: ?*anyopaque, ad: [*c]tc.CRYPTO_EX_DATA, idx: c_int, argl: c_long, argp: ?*anyopaque) callconv(.c) void {
+    _ = parent;
+    _ = ad;
+    _ = idx;
+    _ = argl;
+    _ = argp;
+    if (ptr == @as(?*anyopaque, @ptrCast(&ssl_mark_byte))) ssl_mark_frees += 1;
+}
+
+fn sslMark(sc: *ssl.SslConn) void {
+    if (ssl_mark_idx < 0) {
+        ssl_mark_idx = tc.CRYPTO_get_ex_new_index(tc.CRYPTO_EX_INDEX_SSL, 0, null, null, null, sslMarkFree);
+    }
+    _ = tc.SSL_set_ex_data(@ptrCast(sc.ssl), ssl_mark_idx, @ptrCast(&ssl_mark_byte));
+}
+
+/// Synthetic loop event for a conn, so a test can drive onEvent without
+/// a kevent round trip.
+fn synthIo(c: *Conn, kind: enum { r, w }) Event {
+    const io: loop_mod.Io = .{ .handle = c.handle, .ctx = c.ctx, .data = 0, .eof = false, .errno = 0 };
+    return switch (kind) {
+        .r => .{ .readable = io },
+        .w => .{ .writable = io },
+    };
+}
+
+/// Test-side end-of-iteration walk: tear down closing conns and re-drive
+/// requeued reads/writes through the loop.
+fn walkDirty(list: *ConnList, loop: *Loop) !void {
+    var guard: usize = 0;
+    while (list.pop()) |c| : (guard += 1) {
+        if (guard > 1000) return error.WalkRunaway;
+        if (c.state == .closing) {
+            c.teardown();
+            continue;
+        }
+        if (c.requeue_read) {
+            c.requeue_read = false;
+            try loop.requeue(c.handle, .read);
+        }
+        if (c.requeue_write) {
+            c.requeue_write = false;
+            try loop.requeue(c.handle, .write);
+        }
+    }
+}
+
+/// Drive a server-side handshake through synthetic readable events until
+/// onEvent reports something, pumping the client end between steps.
+fn hsToEnd(c: *Conn, client: *ssl.SslConn, list: *ConnList) !Outcome {
+    for (0..100) |_| {
+        _ = client.doHandshake() catch {};
+        const out = c.onEvent(synthIo(c, .r), list);
+        if (out != .none) return out;
+    }
+    return error.HandshakeStuck;
+}
+
 test "Conn: readable event delivers .readable and inbox bytes" {
     const alloc = std.testing.allocator;
     var loop = try mkLoop(alloc);
@@ -1718,4 +1794,73 @@ test "Conn: handshake seam hands the fd to a second thread and back" {
     var budget: ReadBudget = .{};
     _ = c.inbox.drain(&c.transport, &budget);
     try std.testing.expectEqualStrings("seam ok", c.inbox.unread());
+}
+
+test "Conn: a require-policy failure closes through ConnList and frees the SSL" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters, .ktls = .require });
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    sslMark(&c.hs.?.conn);
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    const before = ssl_mark_frees;
+    const out = try hsToEnd(&c, &client, &list);
+    // A unix socket cannot offload: require closes the conn through the
+    // dirty list so the end-of-iteration walk tears it down.
+    try std.testing.expect(out == .closed);
+    try std.testing.expectEqual(error.KtlsRequired, out.closed.err);
+    try std.testing.expectEqual(State.closing, c.state);
+    try std.testing.expect(c.on_dirty);
+    try walkDirty(&list, &loop);
+    try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
+    c.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
+}
+
+test "Conn: an established TLS conn frees the SSL at teardown" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    sslMark(&c.hs.?.conn);
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    const before = ssl_mark_frees;
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    c.close(&list);
+    try walkDirty(&list, &loop);
+    try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
+    c.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
 }
