@@ -862,7 +862,7 @@ test "CryptoPool: no completion is lost under a kqueue-driven drain" {
                 }
                 seen = r;
                 for (0..s.sizes[idx]) |_| {
-                    _ = p.put("s", @splat(9), 1, stored) catch |err|
+                    _ = putTestJob(p, "s", @splat(9), 1, stored) catch |err|
                         std.debug.panic("put: {s}", .{@errorName(err)});
                 }
             }
