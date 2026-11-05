@@ -1957,20 +1957,41 @@ pub const Resolver = struct {
 
     /// Store a second deep copy of the answer under (qname, qtype) with a
     /// TTL-derived expiry, capped at CACHE_TTL_CEIL_S; TTL 0 is not
-    /// cached.
+    /// cached but still replaces the row it refreshed (ADR-13).
     fn cachePut(self: *Resolver, qname: []const u8, qtype: u16, rrs: []const wire.Rr) void {
         const ttl = @min(minTtl(rrs), CACHE_TTL_CEIL_S);
-        if (ttl == 0) return;
+        if (ttl == 0) {
+            // completeRaw also calls here with the empty slice right
+            // after cachePutNeg handled the negative answer, so only
+            // a non-empty answer drops the row.
+            if (rrs.len > 0) self.cacheDrop(qname, qtype);
+            return;
+        }
         self.cacheInsert(qname, qtype, rrs, .none, ttl);
     }
 
     /// Negative caching per RFC 2308: NXDOMAIN and NODATA answers live
     /// as long as the zone's SOA minimum (the last u32 of the SOA
-    /// rdata), capped at the same ceiling. No SOA, no cache.
+    /// rdata), capped at the same ceiling. An answer with no SOA or a
+    /// zero minimum is not cached but still replaces the row.
     fn cachePutNeg(self: *Resolver, qname: []const u8, qtype: u16, neg: NegKind, msg: wire.Message) void {
-        const ttl = @min(soaMinimum(msg) orelse return, CACHE_TTL_CEIL_S);
-        if (ttl == 0) return;
+        const ttl = @min(soaMinimum(msg) orelse return self.cacheDrop(qname, qtype), CACHE_TTL_CEIL_S);
+        if (ttl == 0) return self.cacheDrop(qname, qtype);
         self.cacheInsert(qname, qtype, &.{}, neg, ttl);
+    }
+
+    /// A NOERROR or NXDOMAIN answer that cannot be cached still
+    /// replaces the row it answered (ADR-13: NOERROR and NXDOMAIN
+    /// always replace): drop it unless a refresh pins it, so a later
+    /// SERVFAIL fails the lookup instead of serving the stale row.
+    fn cacheDrop(self: *Resolver, qname: []const u8, qtype: u16) void {
+        var name_buf: [280]u8 = undefined;
+        const folded = foldName(&name_buf, qname) orelse return;
+        const owner = self.owners.get(folded) orelse return;
+        const idx = findTypeRow(owner, qtype) orelse return;
+        if (owner.types.items[idx].refreshing) return;
+        self.removeTypeRow(owner, idx);
+        if (owner.types.items.len == 0) self.removeOwner(owner);
     }
 
     /// The SOA "minimum" field is the last u32 of the record's rdata;
@@ -6059,8 +6080,8 @@ test "dns-async: a NXDOMAIN refresh answer answers nxdomain and unpins the row" 
     var buf: [512]u8 = undefined;
     r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 3)]);
     try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
-    // The answer carried no SOA, so the stale row was not replaced;
-    // its refresh still ended, so the next lookup refreshes again.
+    // The answer carried no SOA, so the stale row was dropped instead
+    // of replaced; either way the next lookup goes back to the wire.
     var ctx2 = TestCtx{};
     r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
     try r.query("stale.test", .a, 8);
@@ -6269,6 +6290,141 @@ test "dns-async: an in-place replace keeps the borrowed row's refresh pin" {
     try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, res2.rrs[0].rdata);
 }
 
+/// Seed the svc.test chain's per-target TLSA row inside the
+/// serve-stale window: .none seeds the record set, the negative
+/// flavors seed NODATA/NXDOMAIN rows.
+fn seedStaleTlsa(r: *Resolver, neg: NegKind) void {
+    var t_rrs = [1]wire.Rr{.{ .name = "_15222._tcp.srv.test", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 0, 1, 0xDE, 0xAD } }};
+    if (neg == .none) {
+        r.cacheInsert("_15222._tcp.srv.test", KIND_TLSA, &t_rrs, .none, 60);
+    } else {
+        r.cacheInsert("_15222._tcp.srv.test", KIND_TLSA, &.{}, neg, 60);
+    }
+    fake_now += 61_000;
+}
+
+test "dns-async: a TTL-0 answer drops the stale row it refreshed" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 7);
+    var job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    // The live answer carries TTL 0: served to the waiter but never
+    // cached, and it still replaces the stale row (ADR-13).
+    r.handleResponse(job, buf[0..buildTypedAnswer(&buf, job.request, KIND_A, 0, &.{ 127, 0, 0, 2 })]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 2 }, res.rrs[0].rdata);
+    try std.testing.expect(r.cacheGetClass("stale.test", KIND_A) == null);
+    // A later SERVFAIL now fails the lookup; the dropped row is not
+    // there to be served stale.
+    fake_now += 1_000;
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 8);
+    job = r.jobs.items[0];
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx2.status.?);
+}
+
+test "dns-async: a NODATA refresh without SOA drops the stale row" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 7);
+    var job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(r.cacheGetClass("stale.test", KIND_A) == null);
+    fake_now += 1_000;
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 8);
+    job = r.jobs.items[0];
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx2.status.?);
+}
+
+const StaleLegAnswer = enum { tlsa_ttl0, nodata };
+
+/// Drive the seeded svc.test chain through one stale-TLSA refresh:
+/// feed `first` to the first resolve's TLSA leg and SERVFAIL to the
+/// second resolve's. Returns the two targets' tlsa_status values.
+fn runStaleTlsaLegs(r: *Resolver, neg: NegKind, first: StaleLegAnswer) ![2]TlsaStatus {
+    seedStaleTlsa(r, neg);
+    seedSvcChain(r, false);
+    var out: [2]TlsaStatus = undefined;
+    var buf: [512]u8 = undefined;
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    var job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA) return error.TestUnexpectedResult;
+    const n = switch (first) {
+        .tlsa_ttl0 => buildTypedAnswer(&buf, job.request, KIND_TLSA, 0, &.{ 3, 1, 1, 0xBE, 0xEF }),
+        .nodata => buildNodata(&buf, job.request),
+    };
+    r.handleResponse(job, buf[0..n]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    {
+        var res = ctx.res.?;
+        defer res.deinitOn(std.testing.allocator);
+        out[0] = res.targets[0].tlsa_status;
+    }
+    fake_now += 1_000;
+    var ctx2 = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx2, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 4, true);
+    job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA) return error.TestUnexpectedResult;
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.resolved, ctx2.status.?);
+    var res2 = ctx2.res.?;
+    defer res2.deinitOn(std.testing.allocator);
+    out[1] = res2.targets[0].tlsa_status;
+    return out;
+}
+
+test "dns-async: uncacheable TLSA refresh answers drop the stale row (D3, D4, D5)" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+
+    // D3: stale NODATA, live TLSA with TTL 0 -> present, then SERVFAIL
+    // -> lookup_failed (the dropped row cannot serve "absent").
+    var got = try runStaleTlsaLegs(&r, .nodata, .tlsa_ttl0);
+    try std.testing.expectEqual(TlsaStatus.present, got[0]);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, got[1]);
+
+    // D5: stale NXDOMAIN behind the same TTL-0 live answer.
+    got = try runStaleTlsaLegs(&r, .nxdomain, .tlsa_ttl0);
+    try std.testing.expectEqual(TlsaStatus.present, got[0]);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, got[1]);
+
+    // D4: stale records, a NODATA answer with no SOA -> absent, then
+    // SERVFAIL -> lookup_failed instead of the stale records.
+    got = try runStaleTlsaLegs(&r, .none, .nodata);
+    try std.testing.expectEqual(TlsaStatus.absent, got[0]);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, got[1]);
+}
+
 test "dns-async: SRV targets come back in RFC 2782 priority order" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
@@ -6407,6 +6563,31 @@ fn buildRcode(out: []u8, qpkt: []const u8, rcode: u16) usize {
     const qlen = qpkt.len - 12;
     @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
     return 12 + qlen;
+}
+
+/// A NOERROR echo of `qpkt` with one answer record of `rtype`, `ttl`
+/// and `rdata` (owner = the question via a 0xC00C pointer): feeds a
+/// refresh answer with arbitrary cache semantics.
+fn buildTypedAnswer(out: []u8, qpkt: []const u8, rtype: u16, ttl: u32, rdata: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], 1, .big);
+    @memset(out[8..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    var off = 12 + qlen;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    off += 2;
+    std.mem.writeInt(u16, out[off..][0..2], rtype, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 4 ..][0..4], ttl, .big);
+    std.mem.writeInt(u16, out[off + 8 ..][0..2], @intCast(rdata.len), .big);
+    off += 10;
+    @memcpy(out[off .. off + rdata.len], rdata);
+    return off + rdata.len;
 }
 
 /// One AAAA answer record for ::1 (owner = the question).
