@@ -260,7 +260,10 @@ const TypeEnt = struct {
     rrs: []wire.Rr = &.{}, // names and rdata owned per record
     expires_ms: i64 = 0,
     stale_ms: i64 = 0,
-    last_fail_ms: i64 = 0,
+    /// minInt so a never-attempted row reads as "failed long ago"
+    /// under the saturating recheck compare: uptime below
+    /// STALE_RECHECK_MS would otherwise read as a recent failure.
+    last_fail_ms: i64 = std.math.minInt(i64),
     refreshing: bool = false,
 };
 
@@ -272,8 +275,9 @@ const OwnerEnt = struct {
     node: std.DoublyLinkedList.Node = .{},
     types: std.ArrayListUnmanaged(*TypeEnt) = .{},
     bytes: usize = 0,
-    /// Rate limiter for the stale-serve log line, per owner name.
-    stale_log_ms: i64 = 0,
+    /// Rate limiter for the stale-serve log line, per owner name;
+    /// minInt so the first serve always logs, even at low uptime.
+    stale_log_ms: i64 = std.math.minInt(i64),
 };
 
 /// A located cache row plus its owner, so stale serving can account
@@ -459,7 +463,7 @@ pub const Resolver = struct {
                 // recheck window serves the stale row at once; no
                 // job slot is needed to answer from the cache.
                 const now = self.now_ms();
-                if (hit.ent.refreshing or now - hit.ent.last_fail_ms < STALE_RECHECK_MS) {
+                if (hit.ent.refreshing or now -| hit.ent.last_fail_ms < STALE_RECHECK_MS) {
                     try self.answerStaleNow(hit, session_key);
                     return;
                 }
@@ -593,6 +597,14 @@ pub const Resolver = struct {
             // A refresh-only job has no waiters by definition; it
             // dies with its wire query or the chain deadline.
             if (job.waiter_count == 0 and !job.refresh_only) {
+                // A cancelled refresh is not a failed one: unpin the
+                // borrowed row without stamping last_fail_ms, so the
+                // next lookup refreshes at once instead of serving
+                // stale inside the recheck window.
+                if (job.stale) |hit| {
+                    hit.ent.refreshing = false;
+                    job.stale = null;
+                }
                 _ = self.jobs.orderedRemove(i);
                 self.freeJob(job);
                 self.promoteWait();
@@ -964,7 +976,7 @@ pub const Resolver = struct {
                 .fresh => |hit| return self.feedEnt(job, hit.ent, true),
                 .stale => |hit| {
                     const now = self.now_ms();
-                    if (hit.ent.refreshing or now - hit.ent.last_fail_ms < STALE_RECHECK_MS) {
+                    if (hit.ent.refreshing or now -| hit.ent.last_fail_ms < STALE_RECHECK_MS) {
                         return self.serveStale(job, hit);
                     }
                     // A wire refresh starts here: pin the row on the
@@ -1048,7 +1060,7 @@ pub const Resolver = struct {
     fn noteStaleServe(self: *Resolver, owner: *OwnerEnt) void {
         self.stale_serves += 1;
         const now = self.now_ms();
-        if (now - owner.stale_log_ms >= STALE_LOG_MS) {
+        if (now -| owner.stale_log_ms >= STALE_LOG_MS) {
             owner.stale_log_ms = now;
             log.warn("dns: serving stale {s}", .{owner.name});
         }
@@ -1070,10 +1082,10 @@ pub const Resolver = struct {
 
     /// The per-query deadline fired on a job refreshing a stale row
     /// (RFC 8767): waiters get the stale answer now. A chain job
-    /// feeds it to the phase machine and moves on; the dead refresh
-    /// stamps last_fail_ms. A raw job answers its waiters and keeps
-    /// the wire query as a refresh-only job bounded by the chain
-    /// deadline, so the row still gets its renewal.
+    /// feeds it to the phase machine and moves on while a detached
+    /// refresh-only job carries the renewal. A raw job answers its
+    /// waiters and keeps the wire query as a refresh-only job bounded
+    /// by the chain deadline, so the row still gets its renewal.
     fn serveStaleDeadline(self: *Resolver, job: *Job) void {
         const hit = job.stale.?;
         if (job.is_raw) {
@@ -1091,10 +1103,44 @@ pub const Resolver = struct {
             return;
         }
         const ent = hit.ent;
+        // The chain moves on with the stale answer while a detached
+        // refresh-only job renews the row on the wire: the dead query
+        // is not a failed refresh (no last_fail_ms stamp) and the
+        // row keeps refreshing instead of expiring behind it.
+        var name_buf: [280]u8 = undefined;
+        const qname = name_buf[0..job.pending_qname.len];
+        @memcpy(qname, job.pending_qname);
+        const qtype = job.pending_qtype;
         job.stale = null;
-        ent.last_fail_ms = self.now_ms();
-        self.serveStale(job, hit);
         ent.refreshing = false;
+        // The feed may complete and free this job; only the copied
+        // query name and type are safe to use afterwards.
+        self.serveStale(job, hit);
+        self.spawnRefresh(qname, qtype);
+    }
+
+    /// Detached renewal for a stale row a chain already answered
+    /// from (RFC 8767): a waiterless raw job re-asks the wire query
+    /// so the row still gets its refresh after the borrowing chain
+    /// moved on. Bounded by its own chain deadline; skipped while
+    /// the job table is full (the next stale hit starts one instead).
+    fn spawnRefresh(self: *Resolver, qname: []const u8, qtype: u16) void {
+        if (self.jobs.items.len >= MAX_JOBS) return;
+        const job = self.allocJob(0, qname) catch return;
+        job.phase = .raw;
+        job.is_raw = true;
+        job.refresh_only = true;
+        job.waiter_count = 0;
+        self.jobs.append(self.alloc, job) catch {
+            self.freeJob(job);
+            return;
+        };
+        self.armChainDeadline(job) catch return self.abortJob(job);
+        // The stale consult inside sendQuery re-pins the row on the
+        // job; last_fail_ms was never stamped for the leg that died
+        // (the renewal is still in flight), so the recheck window
+        // lets the query go out instead of serving stale again.
+        self.sendQuery(job, qname, qtype) catch self.abortJob(job);
     }
 
     /// Answer a raw job's waiters from a stale row: the same
@@ -1566,7 +1612,12 @@ pub const Resolver = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
 
-        const msg = wire.parse(arena_state.allocator(), pkt) catch return self.dropJob(job, .failed);
+        const msg = wire.parse(arena_state.allocator(), pkt) catch {
+            // A malformed refresh answer is a failed refresh: the
+            // stale row it tried to renew still serves the waiters.
+            if (job.stale != null) return self.failQuery(job);
+            return self.dropJob(job, .failed);
+        };
         if (msg.truncated) {
             // A TC message is never an answer. On a job already on
             // TCP it is a late duplicate of the reply that caused
@@ -6562,6 +6613,300 @@ test "dns-async: refresh-only jobs yield a slot to a client lookup" {
     try r.query(n65, .a, 901);
     try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
     try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
+}
+
+test "dns-async: a chain deadline serves the stale row it refreshed" {
+    // Goal: a per-query deadline on a chain leg refreshing a stale
+    // row feeds the row's answer to the phase machine (RFC 8767);
+    // the chain resolves from it. Method: stale TLSA behind the
+    // svc.test chain; fire onDeadline on the TLSA leg.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    const job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA or job.stale == null) return error.TestUnexpectedResult;
+    r.onDeadline(job);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(@as(usize, 1), r.stale_serves);
+}
+
+test "dns-async: a chain deadline serve keeps the refresh running off the chain" {
+    // Goal: the deadline stale serve detaches the renewal into a
+    // waiterless refresh-only job instead of abandoning it (finding
+    // 8, ADR-13). Method: as above, then answer the spawned job's
+    // wire query and check the row went fresh.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    const job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA or job.stale == null) return error.TestUnexpectedResult;
+    r.onDeadline(job);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    // The chain completed; the detached refresh job re-asks the same
+    // question on the wire.
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    const refresh = r.jobs.items[0];
+    try std.testing.expect(refresh.is_raw);
+    try std.testing.expect(refresh.refresh_only);
+    try std.testing.expectEqual(@as(usize, 0), refresh.waiter_count);
+    try std.testing.expectEqualStrings("_15222._tcp.srv.test", refresh.pending_qname);
+    var buf: [512]u8 = undefined;
+    r.handleResponse(refresh, buf[0..buildTypedAnswer(&buf, refresh.request, KIND_TLSA, 60, &.{ 3, 1, 1, 0xBE, 0xEF })]);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    try std.testing.expect(r.cacheGet("_15222._tcp.srv.test", KIND_TLSA) != null);
+}
+
+test "dns-async: a chain failure serves the stale row it refreshed" {
+    // Goal: failQuery on a chain leg refreshing a stale row feeds
+    // the row's answer to the phase machine instead of the per-phase
+    // failure. Method: SERVFAIL the TLSA leg; the target's TLSA
+    // records come back from the stale row.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    const job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA or job.stale == null) return error.TestUnexpectedResult;
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(@as(usize, 1), r.stale_serves);
+}
+
+test "dns-async: a suppressed chain refresh serves the stale row" {
+    // Goal: the sendQuery stale consult serves the row at once when
+    // a refresh already ran or was attempted inside the recheck
+    // window, chain leg or not; no wire query goes out. Method:
+    // stamp last_fail_ms on the stale TLSA row, resolve, expect a
+    // synchronous answer.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    const owner = r.owners.get("_15222._tcp.srv.test").?;
+    owner.types.items[0].last_fail_ms = fake_now;
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    // The consult served stale inside resolve(): no job survives.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.present, res.targets[0].tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r.stale_serves);
+}
+
+test "dns-async: a stale row refreshes and logs inside the boot window" {
+    // Goal: uptime below STALE_RECHECK_MS/STALE_LOG_MS must not read
+    // as "recently failed / recently logged": the stamps start at
+    // minInt and the compares saturate. Method: pin the clock at
+    // 2 s of uptime, hit a stale row, expect a refresh job and a
+    // stamped owner log.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000;
+    var rrs = [1]wire.Rr{.{ .name = "stale.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 1, .rdata = &.{ 10, 1, 1, 1 } }};
+    r.cacheInsert("stale.test", KIND_A, &rrs, .none, 1);
+    fake_now = 2_000;
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 7);
+    // A zero last_fail_ms would read as a failure 2 s ago and
+    // suppress the refresh: the row must go to the wire.
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    // The in-flight refresh suppresses the second lookup: it serves
+    // stale and still stamps the owner log below STALE_LOG_MS.
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 8);
+    try std.testing.expectEqual(Status.resolved, ctx2.status.?);
+    var res = ctx2.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    const owner = r.owners.get("stale.test").?;
+    try std.testing.expectEqual(fake_now, owner.stale_log_ms);
+}
+
+test "dns-async: a cancelled refresh does not suppress the next one" {
+    // Goal: cancel is not a wire failure; it must not stamp
+    // last_fail_ms, or the next lookup serves stale inside the
+    // recheck window instead of refreshing. Method: cancel the
+    // refresh, query again, expect a new job on the wire.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 7);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    r.cancel(7);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    var ctx2 = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx2, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 8);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expect(ctx2.status == null);
+}
+
+test "dns-async: a malformed refresh answer serves the stale row" {
+    // Goal: an unparsable wire answer on a refresh fails the
+    // refresh, so the stale row it tried to renew answers the
+    // waiters (RFC 8767). Method: feed a short garbage packet to the
+    // refresh job.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("stale.test", .a, 7);
+    const job = r.jobs.items[0];
+    var junk = [4]u8{ 0xde, 0xad, 0xbe, 0xef };
+    r.handleResponse(job, &junk);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 1, 1, 1 }, res.rrs[0].rdata);
+    try std.testing.expectEqual(@as(usize, 1), r.stale_serves);
+}
+
+test "dns-async: eviction skips a pinned owner at the tail" {
+    // Goal: a refreshing row pins its owner against eviction; the
+    // walk passes it and sheds the next unpinned owner. Method: pin
+    // the LRU tail, evictOne by hand.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 5_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    var rrs = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+
+    // LRU head->tail: a.test, b.test, pin.test.
+    r.cachePut("pin.test", KIND_A, &rrs);
+    r.cachePut("b.test", KIND_A, &rrs);
+    r.cachePut("a.test", KIND_A, &rrs);
+    const owner = r.owners.get("pin.test").?;
+    owner.types.items[0].refreshing = true;
+
+    // The pinned tail is skipped: b.test sheds first, then a.test,
+    // and a cache holding only pinned owners has nothing to evict.
+    try std.testing.expect(r.evictOne(r.now_ms()));
+    try std.testing.expect(r.owners.get("pin.test") != null);
+    try std.testing.expect(r.owners.get("b.test") == null);
+    try std.testing.expect(r.owners.get("a.test") != null);
+    try std.testing.expect(r.evictOne(r.now_ms()));
+    try std.testing.expect(r.owners.get("pin.test") != null);
+    try std.testing.expect(r.owners.get("a.test") == null);
+    try std.testing.expect(!r.evictOne(r.now_ms()));
+}
+
+test "dns-async: a dead row past the stale window stays while a refresh pins it" {
+    // Goal: the on-hit prune past stale_ms skips a pinned row; the
+    // job refreshing it still borrows the records. Method: seed a
+    // stale row, age it past the serve-stale window, pin it, consult.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    fake_now += STALE_MAX_MS;
+    const owner = r.owners.get("stale.test").?;
+    owner.types.items[0].refreshing = true;
+    // Past even the serve-stale window the consult misses, but the
+    // pinned row and its owner are left for the refreshing job.
+    try std.testing.expect(r.cacheGetClass("stale.test", KIND_A) == null);
+    try std.testing.expect(r.owners.get("stale.test") != null);
+}
+
+test "dns-async: an aborted refresh drops the row's pin" {
+    // Goal: a job that dies mid-refresh clears ent.refreshing so the
+    // row is not pinned forever. Method: fail the send of a refresh
+    // query on a stale row; the abort path frees the job.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    r.fail_sends = true;
+    try std.testing.expectError(error.SendFailed, r.query("stale.test", .a, 7));
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+    const owner = r.owners.get("stale.test").?;
+    try std.testing.expect(!owner.types.items[0].refreshing);
+}
+
+test "dns-async: a CNAME answer keeps the pinned sibling row" {
+    // Goal: the CNAME sibling eviction skips a pinned row; a refresh
+    // may still borrow it. Method: pin x.test's SRV row, then cache
+    // an answer carrying a CNAME record under a third type.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 9_000_000;
+
+    const owned_name = try std.testing.allocator.dupe(u8, "x.test");
+    defer std.testing.allocator.free(owned_name);
+    const owned_rdata = try std.testing.allocator.dupe(u8, &.{ 10, 1, 1, 1 });
+    defer std.testing.allocator.free(owned_rdata);
+    const a_rr = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    const srv_rr = [1]wire.Rr{.{ .name = owned_name, .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = owned_rdata }};
+    r.cachePut("x.test", KIND_A, &a_rr);
+    r.cachePut("x.test", KIND_SRV, &srv_rr);
+    const owner = r.owners.get("x.test").?;
+    owner.types.items[Resolver.findTypeRow(owner, KIND_SRV).?].refreshing = true;
+
+    const cn = [1]wire.Rr{.{ .name = "x.test", .rtype = wire.TYPE_CNAME, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 'w', 'w', 'w', 0 } }};
+    r.cacheInsert("x.test", KIND_TLSA, &cn, .none, 60);
+    // The unpinned A row is evicted as a sibling of the CNAME; the
+    // pinned SRV row survives.
+    try std.testing.expect(Resolver.findTypeRow(owner, KIND_A) == null);
+    try std.testing.expect(Resolver.findTypeRow(owner, KIND_SRV) != null);
+    try std.testing.expect(Resolver.findTypeRow(owner, KIND_TLSA) != null);
 }
 
 test "dns-async: SRV targets come back in RFC 2782 priority order" {
