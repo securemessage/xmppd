@@ -464,6 +464,7 @@ pub const OidcStore = struct {
 
         var w: std.Io.Writer = .fixed(buf);
         self.writeRopcBody(&w, username, password) catch {
+            std.crypto.secureZero(u8, buf);
             allocator.free(buf);
             return null;
         };

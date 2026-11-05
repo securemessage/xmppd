@@ -576,8 +576,15 @@ const HeadParse = union(enum) {
 fn parseResponseHead(head: []const u8) HeadParse {
     var content_length: ?usize = null;
     var it = std.mem.splitScalar(u8, head, '\n');
+    _ = it.next(); // status line
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
+        // RFC 9112 5.1: no whitespace is allowed between the field name
+        // and the colon. "Content-Length : 5" must not fall through to a
+        // looser parse of some other header shape.
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
+        }
         const te_prefix = "transfer-encoding:";
         if (line.len > te_prefix.len and
             std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
@@ -1224,6 +1231,34 @@ test "responseComplete: Transfer-Encoding is rejected outright" {
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(both),
+    );
+}
+
+test "responseComplete: whitespace before the colon is rejected" {
+    // RFC 9112 5.1: a field name followed by whitespace before the colon
+    // is a malformed header, not a renamed one. The spaced TE must not
+    // smuggle chunk text in as the body and the spaced CL must not
+    // silently degrade to EOF framing.
+    const te = "HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(te),
+    );
+    const cl = "HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(cl),
+    );
+    const tab = "HTTP/1.1 200 OK\r\nContent-Length\t: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(tab),
+    );
+    // An unrelated header with a spaced name is malformed the same way.
+    const other = "HTTP/1.1 200 OK\r\nX-Trace : 1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(other),
     );
 }
 
