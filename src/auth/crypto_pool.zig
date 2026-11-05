@@ -44,7 +44,7 @@ pub const MAX_JOBS: usize = 256;
 pub const PASSWORD_LEN_MAX: usize = 1024;
 
 comptime {
-    std.debug.assert(PASSWORD_LEN_MAX == 1024);
+    std.debug.assert(PASSWORD_LEN_MAX == sasl.password_len_max);
 }
 
 /// One derivation task. `password` is a fixed inline buffer holding
