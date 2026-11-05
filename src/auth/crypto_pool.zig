@@ -72,14 +72,16 @@ pub const Completion = struct {
 /// Fixed-size pool. put() is called from the event loop; completions are
 /// collected with popCompletion() after the wake pipe fires.
 pub const CryptoPool = struct {
-    /// Retained for the construction contract (`.{ .allocator = ... }`).
-    /// The pool's storage is fully inline: nothing allocates through it.
+    /// Allocates the job and completion rings once, on first use. The
+    /// job path itself never allocates; the rings are what let the pool
+    /// stay small enough to live in a frame local.
     allocator: std.mem.Allocator,
 
-    /// Bounded FIFO of queued jobs. `job_head` is the next slot a worker
-    /// pops, `job_tail` the next a producer fills; the count is
-    /// `job_tail - job_head` and both move only under `job_mutex`.
-    job_slots: [MAX_JOBS]Job = undefined,
+    /// Bounded FIFO of queued jobs, allocated once by ensureRingsLocked.
+    /// `job_head` is the next slot a worker pops, `job_tail` the next a
+    /// producer fills; the count is `job_tail - job_head` and both move
+    /// only under `job_mutex`.
+    job_slots: []Job = &.{},
     job_head: usize = 0,
     job_tail: usize = 0,
 
@@ -87,7 +89,7 @@ pub const CryptoPool = struct {
     /// ring: at most `MAX_JOBS` jobs are outstanding, so a worker can
     /// always publish without allocating. `completion_head` is the next
     /// pop, `completion_tail` the next publish, under `completion_mutex`.
-    completions: [MAX_JOBS]Completion = undefined,
+    completions: []Completion = &.{},
     completion_head: usize = 0,
     completion_tail: usize = 0,
 
@@ -128,6 +130,9 @@ pub const CryptoPool = struct {
     /// with password_len = 0 and nothing copied; the worker finishes it
     /// ok = false without deriving.
     pub fn put(self: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
+        self.job_mutex.lock();
+        defer self.job_mutex.unlock();
+        try self.ensureRingsLocked();
         {
             self.completion_mutex.lock();
             defer self.completion_mutex.unlock();
@@ -135,8 +140,6 @@ pub const CryptoPool = struct {
             self.reserved_completions += 1;
         }
 
-        self.job_mutex.lock();
-        defer self.job_mutex.unlock();
         std.debug.assert(self.job_tail - self.job_head < MAX_JOBS);
         const id = self.next_job_id;
         self.next_job_id +%= 1;
@@ -184,6 +187,17 @@ pub const CryptoPool = struct {
         return self.completions[self.completion_head % MAX_JOBS];
     }
 
+    /// Allocate the job and completion rings once. put() and start()
+    /// call this under job_mutex, which serializes the first use.
+    fn ensureRingsLocked(self: *CryptoPool) !void {
+        if (self.job_slots.len != 0) return;
+        const jobs = try self.allocator.alloc(Job, MAX_JOBS);
+        errdefer self.allocator.free(jobs);
+        const completions = try self.allocator.alloc(Completion, MAX_JOBS);
+        self.job_slots = jobs;
+        self.completions = completions;
+    }
+
     /// Spawn the worker threads and open the wake pipe (both ends
     /// non-blocking: the loop drains the read end, workers write the
     /// write end and treat EAGAIN as already-signaled).
@@ -191,10 +205,17 @@ pub const CryptoPool = struct {
         const fds = try posix.pipe();
         errdefer posix.close(fds[0]);
         errdefer posix.close(fds[1]);
-        _ = std.c.fcntl(fds[0], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
-        _ = std.c.fcntl(fds[1], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        const nonblock: usize = @intCast(@as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = try posix.fcntl(fds[0], std.c.F.SETFL, nonblock);
+        _ = try posix.fcntl(fds[1], std.c.F.SETFL, nonblock);
         self.pipe_rd = fds[0];
         self.pipe_wr = fds[1];
+
+        {
+            self.job_mutex.lock();
+            defer self.job_mutex.unlock();
+            try self.ensureRingsLocked();
+        }
 
         const n = @min(thread_count, MAX_THREADS);
         for (0..n) |i| {
@@ -236,9 +257,18 @@ pub const CryptoPool = struct {
         }
         self.job_mutex.unlock();
 
+        // In-flight completions published before the join are dropped
+        // with the pool: drain the ring so a pop after stop() returns
+        // null instead of underflowing the reservation counter.
         self.completion_mutex.lock();
+        self.completion_head = self.completion_tail;
         self.reserved_completions = 0;
         self.completion_mutex.unlock();
+
+        if (self.job_slots.len != 0) self.allocator.free(self.job_slots);
+        if (self.completions.len != 0) self.allocator.free(self.completions);
+        self.job_slots = &.{};
+        self.completions = &.{};
     }
 
     /// Publish one completion and wake the loop. put() bounds outstanding
@@ -543,26 +573,55 @@ test "CryptoPool: stop releases the dropped jobs' reservations" {
     try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
 
-test "CryptoPool: the job path needs no heap allocation" {
-    // The rings are inline: put() and completion publish must succeed with
-    // an allocator that fails every request.
-    var pool = CryptoPool{ .allocator = std.testing.failing_allocator };
+test "CryptoPool: the pool struct stays off the hot path's stack" {
+    // main.zig keeps the pool in a frame local; the rings are the only
+    // bulk and they are allocated on the heap once, on first use.
+    try std.testing.expect(@sizeOf(CryptoPool) < 4096);
+}
+
+test "CryptoPool: the job path allocates once, then never per job" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var pool = CryptoPool{ .allocator = failing.allocator() };
     try pool.start(1);
     defer pool.stop();
 
     const creds = try sasl.StoredCredentials.derive("pw", @splat(5), 1);
-    const id = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
+    _ = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
+    _ = try awaitCompletion(&pool);
 
-    const deadline = std.time.milliTimestamp() + 3000;
-    while (std.time.milliTimestamp() < deadline) {
-        if (pool.popCompletion()) |c| {
-            try std.testing.expectEqual(id, c.id);
-            try std.testing.expect(c.ok);
-            return;
-        }
+    // Rings exist after the first job; fail the allocator on any
+    // further request so a per-job allocation breaks the test.
+    failing.fail_index = failing.alloc_index;
+
+    const n: usize = 8;
+    for (0..n) |_| {
+        _ = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
+    }
+    for (0..n) |_| {
+        _ = try awaitCompletion(&pool);
+    }
+}
+
+test "CryptoPool: a completion left over stop() cannot be popped" {
+    // stop() drains the completion ring along with the reservation
+    // count, so a straggler pop returns null instead of underflowing
+    // reserved_completions.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    const creds = try sasl.StoredCredentials.derive("x", @splat(2), 1);
+    _ = try putTestJob(&pool, "x", @splat(2), 1, creds.stored_key);
+
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (completionCount(&pool) == 0 and std.time.milliTimestamp() < deadline) {
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    return error.NoCompletion;
+    try std.testing.expectEqual(@as(usize, 1), completionCount(&pool));
+
+    pool.stop();
+    try std.testing.expect(pool.popCompletion() == null);
+    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 }
 
 /// Poll popCompletion until a result arrives or the deadline passes.
@@ -641,15 +700,20 @@ test "CryptoPool: completed and dropped jobs leave no password bytes" {
     } else {
         return error.NoCompletion;
     }
-    for (&pool.job_slots) |*slot| {
+    for (pool.job_slots) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-a1") == null);
     }
 
-    var pool2 = CryptoPool{ .allocator = std.testing.allocator };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pool2 = CryptoPool{ .allocator = arena.allocator() };
     // No start(): the job stays queued and stop() must wipe its slot.
+    // The arena never releases the ring's pages, so the wiped slot is
+    // still readable after stop() frees it.
     _ = try putTestJob(&pool2, "wipe-marker-b2", @splat(7), 1, @splat(8));
+    const slots2 = pool2.job_slots;
     pool2.stop();
-    for (&pool2.job_slots) |*slot| {
+    for (slots2) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-b2") == null);
     }
 }
