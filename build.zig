@@ -1594,15 +1594,9 @@ pub fn build(b: *std.Build) void {
         .root_module = auth_mod,
     });
     const run_auth_main_tests = b.addRunArtifact(auth_main_tests);
-
-    const precis_frame_check = b.addSystemCommand(&.{ "sh", "tools/check_precis_frames.sh" });
-    precis_frame_check.addArtifactArg(auth_exe);
-    precis_frame_check.addArtifactArg(core_exe);
-    const precis_frame_self_test = b.addSystemCommand(&.{
-        "sh",
-        "tools/check_precis_frames.sh",
-        "--self-test",
-    });
+    // This test spawns the installed xmppd-auth binary; wait for install so
+    // it never exercises a stale executable from the previous build.
+    run_auth_main_tests.step.dependOn(b.getInstallStep());
 
     // xmppd-auth-oidc: the OIDC authentication daemon
     const oidc_ipc_protocol_mod = b.createModule(.{
@@ -1689,6 +1683,16 @@ pub fn build(b: *std.Build) void {
         .root_module = oidc_main_mod,
     });
     b.installArtifact(oidc_exe);
+
+    const precis_frame_check = b.addSystemCommand(&.{ "sh", "tools/check_precis_frames.sh" });
+    precis_frame_check.addArtifactArg(auth_exe);
+    precis_frame_check.addArtifactArg(oidc_exe);
+    precis_frame_check.addArtifactArg(core_exe);
+    const precis_frame_self_test = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_precis_frames.sh",
+        "--self-test",
+    });
 
     // The OIDC daemon's start path is only under test when the daemon source
     // is compiled by the test step.

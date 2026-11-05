@@ -5,20 +5,24 @@ set -eu
 self_test=0
 if [ "${1:-}" = "--self-test" ]; then
     self_test=1
-    set -- /bin/true /bin/true
+    set -- /bin/true /bin/true /bin/true
 fi
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 AUTH_BINARY CORE_BINARY" >&2
+if [ "$#" -ne 3 ]; then
+    echo "usage: $0 AUTH_BINARY AUTH_OIDC_BINARY CORE_BINARY" >&2
     exit 2
 fi
 
-check_symbol() {
+check_symbol_impl() {
     binary=$1
     symbol=$2
+    required=$3
     prologue=$(objdump -d --demangle "$binary" | sed -n "/<${symbol}>:/,+12p")
     if [ -z "$prologue" ]; then
-        echo "missing required symbol: $symbol in $binary" >&2
-        exit 1
+        if [ "$required" -eq 1 ]; then
+            echo "missing required symbol: $symbol in $binary" >&2
+            exit 1
+        fi
+        return 0
     fi
     frame_hex=$(printf '%s\n' "$prologue" | sed -n 's/.*subq.*\$0x\([0-9a-f][0-9a-f]*\), %rsp.*/\1/p' | head -n 1)
     if [ -z "$frame_hex" ]; then
@@ -37,6 +41,26 @@ check_symbol() {
     echo "$symbol: $frame bytes"
 }
 
+check_symbol() {
+    check_symbol_impl "$1" "$2" 1
+}
+
+check_optional_symbol() {
+    check_symbol_impl "$1" "$2" 0
+}
+
+check_auth_binary() {
+    binary=$1
+    prefix=$2
+    # ReleaseSafe inlines the mechanism handlers, so their symbols may be
+    # absent; Debug keeps them out of line and they must pass on their own.
+    # handleMessage is the inlining parent and is always required.
+    check_symbol "$binary" "${prefix}.handleMessage"
+    check_optional_symbol "$binary" "${prefix}.handlePlainAuth"
+    check_optional_symbol "$binary" "${prefix}.handleScramInit"
+    check_optional_symbol "$binary" "${prefix}.handleRegisterRequest"
+}
+
 if [ "$self_test" -eq 1 ]; then
     if ( check_symbol /bin/true '__definitely_missing_precis_symbol__' >/dev/null 2>&1 ); then
         echo "self-test failed: a missing symbol was accepted" >&2
@@ -46,8 +70,6 @@ if [ "$self_test" -eq 1 ]; then
     exit 0
 fi
 
-# Production symbols only: ReleaseSafe legitimately inlines the specific
-# mechanism handlers. The inlining parent carries their scratch and must stay
-# within budget; a renamed/missing symbol is a hard failure.
-check_symbol "$1" 'handler.AuthHandler(user_store.UserStore(lmdb.LmdbBackend)).handleMessage'
-check_symbol "$2" 'iq_handler.handleRegisterSubmit'
+check_auth_binary "$1" 'handler.AuthHandler(user_store.UserStore(lmdb.LmdbBackend))'
+check_auth_binary "$2" 'handler.AuthHandler(oidc.OidcStore)'
+check_symbol "$3" 'iq_handler.handleRegisterSubmit'

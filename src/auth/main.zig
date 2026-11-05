@@ -638,6 +638,42 @@ test "auth startup: users_scan_limit config is parsed and validated" {
     try std.testing.expectError(error.InvalidArgs, resolveUsersScanLimit(100000, null, "typo"));
 }
 
+test "auth startup: main applies --users-scan-limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
+    defer allocator.free(auth_path);
+
+    var db = try OpBackendType.open(auth_path, .{});
+    try db.put(user_store_mod.NAMESPACE, "alice", "x");
+    try db.put(user_store_mod.NAMESPACE, "bob", "x");
+    db.close();
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-precis-test/auth.sock",
+            "--users-scan-limit",
+            "1",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "startup scan bound") != null);
+}
+
 test "auth startup: an unprepared users key refuses startup" {
     var db = try backend_mod.MemoryBackend.open("", .{});
     defer db.close();

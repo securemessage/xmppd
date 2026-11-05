@@ -587,11 +587,27 @@ fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.
         printErr(" ");
         printErr(key_hex);
         if (issue.target.len != 0) {
+            const target = try escapeBytesAlloc(allocator, issue.target);
+            defer allocator.free(target);
             printErr(" -> ");
-            printErr(issue.target);
+            printErr(target);
         }
         printErr("\n");
     }
+}
+
+fn escapeBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const hex = "0123456789abcdef";
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    for (bytes) |byte| {
+        if (byte >= 0x20 and byte <= 0x7e and byte != '\\') {
+            try out.append(allocator, byte);
+        } else {
+            try out.appendSlice(allocator, &[_]u8{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] });
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn extractLocal(jid: []const u8) []const u8 {
@@ -868,6 +884,13 @@ fn printUsage() void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "xmppctl escapes control bytes in collision targets" {
+    const allocator = std.testing.allocator;
+    const escaped = try escapeBytesAlloc(allocator, "alice@us.example\x00naplestb@us.example");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("alice@us.example\\x00naplestb@us.example", escaped);
+}
 
 test "extractLocal: JID with domain" {
     try std.testing.expectEqualStrings("alice", extractLocal("alice@example.com"));
