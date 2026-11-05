@@ -7391,6 +7391,60 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='big'") != null);
 }
 
+// A delivery form between the write buffer and the scratch bank fits the
+// serializer but never the socket buffer. That is not a slow reader: the form
+// could never be queued for anyone, so it bounces and the recipient stays
+// healthy.
+test "Re-review 7.6: a form over the write buffer but inside the bank does not mark overflow" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const bob_fds = try makeSocketPair();
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.stream.state = .active;
+    bob.stream.authenticated = true;
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[5] = bob;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    sm.setPresenceAvailable("bob", "localhost", "desk", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.state = .active;
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "band";
+    // A full stanza: its delivery form clears the write buffer by the head and
+    // tail alone, and still fits the 20 KiB scratch bank.
+    @memset(alice.stanza_buf[0..16384], 'x');
+    alice.stanza_buf_len = 16384;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    router.dispatchStanza(&server, &alice, &changes);
+
+    try std.testing.expect(!bob.sm_overflow);
+    try std.testing.expectEqual(@as(usize, 0), bob.conn.pendingWriteBytes());
+
+    _ = alice.conn.flushSend() catch {};
+    var wire: [4096]u8 = undefined;
+    const n = posix.read(alice_fds[1], &wire) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='band'") != null);
+}
+
 test "Re-review 5.4: a stuck delete retry deletes without resending" {
     const allocator = std.testing.allocator;
 
