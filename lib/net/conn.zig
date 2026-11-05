@@ -255,6 +255,198 @@ pub const Inbox = struct {
     }
 };
 
+/// What an append did with the bytes.
+pub const AppendResult = enum {
+    /// All parts fit in the ring.
+    queued,
+    /// Ring was full; parts went to the bounded spill.
+    spilled,
+    /// Past max_outbound_bytes: fail closed, nothing dropped silently.
+    failed_closed,
+};
+
+/// What a flush pass ended on.
+pub const FlushResult = union(enum) {
+    /// Ring and spill are both empty.
+    drained,
+    /// TLS write needs a read event (post-handshake traffic); arm read.
+    want_read,
+    /// Kernel send buffer full or TLS wants a write; arm write.
+    want_write,
+    /// The per-pass flush budget was spent; re-drive via ConnList.
+    budget_left,
+    /// Socket or TLS failure; the conn is finished.
+    err: IoError,
+};
+
+/// The retained (ptr, len) of an in-flight write that returned want_*.
+/// Formed only from `ring`, never from `spill`: the ring is one heap
+/// slice allocated at Conn.init and its addresses cannot move, so a
+/// spill realloc can never invalidate the pin (kTLS D3).
+const Pin = struct { ptr: [*]const u8, len: usize };
+
+/// Queues outbound bytes: a fixed ring first, a bounded spill behind
+/// it. The pin holds the head run across a want_* retry so the TLS
+/// retry presents an identical (ptr, len); new bytes sit behind it
+/// and are never part of the retry (S23's rule).
+pub const Outbox = struct {
+    /// Owned slice, allocated once at Conn.init (Options.outbox_ring_bytes).
+    ring: []u8,
+    /// Index of the first unsent byte.
+    head: usize = 0,
+    /// Unsent bytes in the ring.
+    used: usize = 0,
+    /// Backlog behind the ring: [spill_head, items.len) unsent.
+    /// `.empty` until first use, so idle conns pay nothing.
+    spill: std.ArrayList(u8) = .empty,
+    spill_head: usize = 0,
+    /// Options.max_outbound_bytes: the spill bound (fail closed past it).
+    spill_limit: usize,
+    /// Spill capacity kept once the outbox drains empty (default 64 KiB).
+    spill_high_water: usize = 64 << 10,
+    pin: ?Pin = null,
+    counters: *Counters,
+    alloc: std.mem.Allocator,
+
+    pub fn init(ring: []u8, alloc: std.mem.Allocator, spill_limit: usize, counters: *Counters) Outbox {
+        return .{ .ring = ring, .spill_limit = spill_limit, .counters = counters, .alloc = alloc };
+    }
+
+    pub fn deinit(o: *Outbox) void {
+        o.spill.deinit(o.alloc);
+    }
+
+    /// Total unsent bytes (ring plus pending spill).
+    pub fn bytes(o: *const Outbox) usize {
+        return o.used + o.spill.items.len - o.spill_head;
+    }
+
+    pub fn empty(o: *const Outbox) bool {
+        return o.bytes() == 0;
+    }
+
+    fn ringFree(o: *const Outbox) usize {
+        return o.ring.len - o.used;
+    }
+
+    fn ringTail(o: *const Outbox) usize {
+        return (o.head + o.used) % o.ring.len;
+    }
+
+    /// Gather append: parts are copied once, whole-append into the ring
+    /// when it all fits (keeps frames contiguous), otherwise all of it
+    /// into the bounded spill. Over `spill_limit` the result is
+    /// `failed_closed` and the counter moves; nothing is dropped
+    /// silently.
+    pub fn append(o: *Outbox, parts: []const []const u8) AppendResult {
+        var total: usize = 0;
+        for (parts) |p| total += p.len;
+        if (total == 0) return .queued;
+
+        if (total <= o.ringFree()) {
+            for (parts) |p| o.ringWrite(p);
+            return .queued;
+        }
+
+        const pending = o.spill.items.len - o.spill_head;
+        if (pending + total > o.spill_limit) {
+            o.counters.outbox_failed_closed += 1;
+            return .failed_closed;
+        }
+        for (parts) |p| {
+            o.spill.appendSlice(o.alloc, p) catch {
+                o.counters.outbox_failed_closed += 1;
+                return .failed_closed;
+            };
+        }
+        return .spilled;
+    }
+
+    /// Copy `data` into the ring's free space (wrapping); caller checked
+    /// it fits.
+    fn ringWrite(o: *Outbox, data: []const u8) void {
+        const cap = o.ring.len;
+        var pos = o.ringTail();
+        var rest = data;
+        while (rest.len > 0) {
+            const run = @min(rest.len, cap - pos);
+            @memcpy(o.ring[pos .. pos + run], rest[0..run]);
+            pos = (pos + run) % cap;
+            rest = rest[run..];
+        }
+        o.used += data.len;
+    }
+
+    /// Move spill into the empty ring (bounded copy); the pin is only
+    /// ever formed from ring memory, so spill bytes must pass through
+    /// the ring before they can be written.
+    fn reloadRing(o: *Outbox) void {
+        std.debug.assert(o.used == 0);
+        const pending = o.spill.items.len - o.spill_head;
+        if (pending == 0) return;
+        const n = @min(pending, o.ring.len);
+        @memcpy(o.ring[0..n], o.spill.items[o.spill_head .. o.spill_head + n]);
+        o.head = 0;
+        o.used = n;
+        o.spill_head += n;
+        if (o.spill_head == o.spill.items.len) {
+            o.spill.clearRetainingCapacity();
+            o.spill_head = 0;
+        }
+    }
+
+    /// Once the outbox drains empty, release spill capacity above the
+    /// high-water mark: one burst must not pin memory for the session.
+    fn releaseSpill(o: *Outbox) void {
+        if (o.spill.capacity <= o.spill_high_water) return;
+        if (o.alloc.resize(o.spill.allocatedSlice(), o.spill_high_water)) {
+            o.spill.capacity = o.spill_high_water;
+            return;
+        }
+        o.spill.shrinkAndFree(o.alloc, 0);
+        // Best-effort retention of the high-water arena; an alloc
+        // failure is not fatal, the spill just re-grows next burst.
+        o.spill.ensureTotalCapacityPrecise(o.alloc, o.spill_high_water) catch {};
+    }
+
+    /// Write out until empty, want_*, or the per-call byte budget is
+    /// spent. A pending pin is retried verbatim before any new slice is
+    /// formed; the retry never grows (S23).
+    pub fn flush(o: *Outbox, t: *Transport, budget: usize) FlushResult {
+        var left = budget;
+        while (true) {
+            if (o.pin == null) {
+                if (o.used == 0) {
+                    o.reloadRing();
+                    if (o.used == 0) {
+                        o.releaseSpill();
+                        return .drained;
+                    }
+                }
+                const run = @min(o.used, o.ring.len - o.head);
+                const want = @min(run, left);
+                if (want == 0) return .budget_left;
+                o.pin = .{ .ptr = @ptrCast(o.ring.ptr + o.head), .len = want };
+            }
+            if (left == 0) return .budget_left;
+            const p = o.pin.?;
+            switch (t.write(p.ptr[0..p.len])) {
+                .n => |n| {
+                    if (n == 0) return .want_write;
+                    o.head = (o.head + n) % o.ring.len;
+                    o.used -= n;
+                    o.pin = null;
+                    left -= n;
+                },
+                .want_write => return .want_write,
+                .want_read => return .want_read,
+                .eof => return .{ .err = error.WriteFailed },
+                .err => |e| return .{ .err = e },
+            }
+        }
+    }
+};
+
 const o_nonblock: c_int = 0x4; // O_NONBLOCK
 const so_nosigpipe: c_int = 0x0800; // SO_NOSIGPIPE (FreeBSD)
 
@@ -586,4 +778,185 @@ test "Inbox: eof is distinct and latches" {
     posix.shutdown(pair[1], .both) catch {};
     try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
     try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
+}
+
+/// Read until `buf` is full, the peer stops sending, or a bounded spin
+/// runs out (a hung producer must fail the suite, not stall it).
+fn readAll(fd: posix.fd_t, buf: []u8) !usize {
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got < buf.len and spins < 100_000) {
+        const n = posix.read(fd, buf[got..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                spins += 1;
+                continue;
+            },
+            else => return err,
+        };
+        if (n == 0) break;
+        got += n;
+    }
+    return got;
+}
+
+test "Outbox: gather order, bytes accounting, drain" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [64]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+
+    const parts = [_][]const u8{ "he", "llo", " ", "world" };
+    try std.testing.expectEqual(AppendResult.queued, o.append(&parts));
+    try std.testing.expectEqual(@as(usize, 11), o.bytes());
+    try std.testing.expect(!o.empty());
+
+    var t: Transport = .{ .plain = pair[0] };
+    try std.testing.expectEqual(FlushResult.drained, o.flush(&t, 1 << 20));
+    try std.testing.expect(o.empty());
+
+    var buf: [64]u8 = undefined;
+    const n = try readAll(pair[1], buf[0..11]);
+    try std.testing.expectEqualStrings("hello world", buf[0..n]);
+}
+
+test "Outbox: ring wrap keeps order" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [16]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+    var t: Transport = .{ .plain = pair[0] };
+
+    const first = [_][]const u8{"0123456789"};
+    try std.testing.expectEqual(AppendResult.queued, o.append(&first));
+    _ = o.flush(&t, 1 << 20);
+    _ = try readAll(pair[1], &ring); // peer drains (reuse ring as scratch)
+
+    // Head now sits mid-ring; a 10-byte append wraps around the end.
+    const second = [_][]const u8{"abcdefghij"};
+    try std.testing.expectEqual(AppendResult.queued, o.append(&second));
+    _ = o.flush(&t, 1 << 20);
+    var buf: [16]u8 = undefined;
+    const n = try readAll(pair[1], buf[0..10]);
+    try std.testing.expectEqualStrings("abcdefghij", buf[0..n]);
+}
+
+test "Outbox: spill bound fails closed and counts" {
+    var counters: Counters = .{};
+    var ring: [8]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 64, &counters);
+    defer o.deinit();
+
+    const big_data = [_]u8{0x41} ** 100;
+    const big = [_][]const u8{&big_data};
+    try std.testing.expectEqual(AppendResult.failed_closed, o.append(&big));
+    try std.testing.expectEqual(@as(u64, 1), counters.outbox_failed_closed);
+    try std.testing.expectEqual(@as(usize, 0), o.bytes());
+}
+
+test "Outbox: spill reloads through the ring, high-water frees capacity" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [16]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+    o.spill_high_water = 32;
+    var t: Transport = .{ .plain = pair[0] };
+
+    // 48 bytes with a 16-byte ring: all of it spills (whole-append
+    // rule), then reloads through the ring in order.
+    var data: [48]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i);
+    const parts = [_][]const u8{&data};
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&parts));
+    try std.testing.expectEqual(@as(usize, 48), o.bytes());
+    const cap_after_spill = o.spill.capacity;
+    try std.testing.expect(cap_after_spill > o.spill_high_water);
+
+    try std.testing.expectEqual(FlushResult.drained, o.flush(&t, 1 << 20));
+    // Drained: the reload passed spill bytes through the ring in order,
+    // and capacity above the high-water mark was released.
+    try std.testing.expectEqual(@as(usize, 0), o.bytes());
+    try std.testing.expect(o.spill.capacity <= o.spill_high_water);
+    var buf: [48]u8 = undefined;
+    const n = try readAll(pair[1], &buf);
+    try std.testing.expectEqual(@as(usize, 48), n);
+    try std.testing.expectEqualSlices(u8, &data, buf[0..n]);
+}
+
+test "Outbox: pin retries the identical slice across want_write" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+    const one_k: c_int = 1024;
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&one_k));
+
+    var counters: Counters = .{};
+    var ring: [128]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+    var t: Transport = .{ .plain = pair[0] };
+
+    // Fill the kernel buffer directly so flushes stall: FreeBSD clamps
+    // SO_SNDBUF, so keep writing until the fd itself says EAGAIN.
+    const big = [_]u8{0x77} ** (1 << 20);
+    var sent: usize = 0;
+    while (sent < big.len) {
+        sent += posix.write(pair[0], big[sent..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    // An append that stalls mid-way leaves a pin; a second stalled
+    // flush must present the identical (ptr, len).
+    const a = [_][]const u8{"0123456789abcdef"};
+    _ = o.append(&a);
+    try std.testing.expectEqual(FlushResult.want_write, o.flush(&t, 1 << 20));
+    const pin_ptr = o.pin.?.ptr;
+    const pin_len = o.pin.?.len;
+    try std.testing.expectEqual(FlushResult.want_write, o.flush(&t, 1 << 20));
+    try std.testing.expectEqual(pin_ptr, o.pin.?.ptr);
+    try std.testing.expectEqual(pin_len, o.pin.?.len);
+
+    // Bytes appended behind a pending pin are never part of its retry.
+    const b = [_][]const u8{"APPENDED-BEHIND"};
+    _ = o.append(&b);
+
+    // Interleave flush and peer-read until the outbox drains; the peer
+    // must receive byte-identical data, ordered, pin bytes first.
+    var scratch: [4096]u8 = undefined;
+    var tail: [31]u8 = undefined;
+    var idle: usize = 0;
+    while (idle < 1000) {
+        _ = o.flush(&t, 1 << 20);
+        const n = posix.read(pair[1], &scratch) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n == 0) {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        if (n >= tail.len) {
+            @memcpy(&tail, scratch[n - tail.len .. n]);
+        } else {
+            const keep = tail.len - n;
+            std.mem.copyForwards(u8, tail[0..keep], tail[n..]);
+            @memcpy(tail[keep..], scratch[0..n]);
+        }
+    }
+    // The last bytes out are the two appends (16 + 15 = 31).
+    try std.testing.expectEqualStrings("0123456789abcdefAPPENDED-BEHIND", &tail);
 }
