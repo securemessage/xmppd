@@ -336,20 +336,22 @@ pub const Outbox = struct {
 
     /// Gather append: parts are copied once, whole-append into the ring
     /// when it all fits (keeps frames contiguous), otherwise all of it
-    /// into the bounded spill. Over `spill_limit` the result is
-    /// `failed_closed` and the counter moves; nothing is dropped
-    /// silently.
+    /// into the bounded spill. Once spill holds bytes every append goes
+    /// to spill: flush sends the ring first, so a ring append would
+    /// overtake the earlier spill bytes on the wire. Over `spill_limit`
+    /// the result is `failed_closed` and the counter moves; nothing is
+    /// dropped silently.
     pub fn append(o: *Outbox, parts: []const []const u8) AppendResult {
         var total: usize = 0;
         for (parts) |p| total += p.len;
         if (total == 0) return .queued;
 
-        if (total <= o.ringFree()) {
+        const pending = o.spill.items.len - o.spill_head;
+        if (pending == 0 and total <= o.ringFree()) {
             for (parts) |p| o.ringWrite(p);
             return .queued;
         }
 
-        const pending = o.spill.items.len - o.spill_head;
         if (pending + total > o.spill_limit) {
             o.counters.outbox_failed_closed += 1;
             return .failed_closed;
@@ -1298,6 +1300,32 @@ test "Outbox: spill reloads through the ring, high-water frees capacity" {
     const n = try readAll(pair[1], &buf);
     try std.testing.expectEqual(@as(usize, 48), n);
     try std.testing.expectEqualSlices(u8, &data, buf[0..n]);
+}
+
+test "Outbox: an append behind a pending spill keeps wire order" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [16]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+    var t: Transport = .{ .plain = pair[0] };
+
+    // 10 bytes queue in the ring, the next 10 spill, and a 4-byte
+    // append that would still fit the ring must go to spill instead:
+    // the ring flushes first, so queuing it there would reorder.
+    const a = [_][]const u8{"AAAAAAAAAA"};
+    const b = [_][]const u8{"BBBBBBBBBB"};
+    const cc = [_][]const u8{"CCCC"};
+    try std.testing.expectEqual(AppendResult.queued, o.append(&a));
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&b));
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&cc));
+    try std.testing.expectEqual(FlushResult.drained, o.flush(&t, 1 << 20));
+    var buf: [24]u8 = undefined;
+    const n = try readAll(pair[1], &buf);
+    try std.testing.expectEqualStrings("AAAAAAAAAABBBBBBBBBBCCCC", buf[0..n]);
 }
 
 test "Outbox: pin retries the identical slice across want_write" {
