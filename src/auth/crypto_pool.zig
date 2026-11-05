@@ -635,14 +635,11 @@ test "CryptoPool: the job path allocates once, then never per job" {
     try pool.start(1);
     defer pool.stop();
 
-    const creds = try sasl.StoredCredentials.derive("pw", @splat(5), 1);
-    _ = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
-    _ = try awaitCompletion(&pool);
-
-    // Rings exist after the first job; fail the allocator on any
-    // further request so a per-job allocation breaks the test.
+    // Rings exist after start(); fail the allocator on any further
+    // request so a put-time allocation breaks the test.
     failing.fail_index = failing.alloc_index;
 
+    const creds = try sasl.StoredCredentials.derive("pw", @splat(5), 1);
     const n: usize = 8;
     for (0..n) |_| {
         _ = try putTestJob(&pool, "pw", @splat(5), 1, creds.stored_key);
