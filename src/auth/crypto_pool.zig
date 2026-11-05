@@ -33,11 +33,18 @@ const log = std.log.scoped(.crypto_pool);
 /// slot (the reservation is structural).
 pub const MAX_JOBS: usize = 256;
 
-/// Maximum password bytes a job slot can hold. SASL passwords beyond this
-/// are a DoS surface, not a credential: put() rejects them with
-/// error.PasswordTooLong, which the handler maps to
-/// temporary-auth-failure like any other pool refusal.
+/// Maximum password bytes a job slot can hold. Over-bound passwords are
+/// still accepted: the job completes with ok = false and no derive, so the
+/// caller answers and charges the attempt exactly like a wrong password.
+/// Refusing them instead would let a client probe account existence (the
+/// handler only reaches put() for known users). Must equal the derive prep
+/// bound in lib/sasl/scram.zig (prep_buf.len / 2): a password that fits a
+/// slot is always derivable.
 pub const PASSWORD_LEN_MAX: usize = 1024;
+
+comptime {
+    std.debug.assert(PASSWORD_LEN_MAX == 1024);
+}
 
 /// One derivation task. `password` is a fixed inline buffer holding
 /// `password_len` bytes; it is `secureZero`'d when the job leaves the
@@ -45,6 +52,10 @@ pub const PASSWORD_LEN_MAX: usize = 1024;
 pub const Job = struct {
     id: u64,
     password_len: u16,
+    /// True when the submitted password exceeded PASSWORD_LEN_MAX: nothing
+    /// was copied into `password` and the worker completes ok = false
+    /// without deriving.
+    over_bound: bool,
     salt: [32]u8,
     iteration_count: u32,
     expected_stored_key: [32]u8,
@@ -112,11 +123,10 @@ pub const CryptoPool = struct {
     /// Copy the password into a job slot and queue it. Outstanding jobs
     /// are capped at MAX_JOBS, which is also the completion ring
     /// capacity, so a worker can always publish its result. A full ring
-    /// is an explicit error.QueueFull; an over-long password is
-    /// error.PasswordTooLong and nothing of it is copied.
+    /// is an explicit error.QueueFull. An over-bound password is queued
+    /// with password_len = 0 and nothing copied; the worker finishes it
+    /// ok = false without deriving.
     pub fn put(self: *CryptoPool, password: []const u8, salt: [32]u8, iteration_count: u32, expected_stored_key: [32]u8) !u64 {
-        if (password.len > PASSWORD_LEN_MAX) return error.PasswordTooLong;
-
         {
             self.completion_mutex.lock();
             defer self.completion_mutex.unlock();
@@ -130,15 +140,17 @@ pub const CryptoPool = struct {
         const id = self.next_job_id;
         self.next_job_id +%= 1;
         const slot = &self.job_slots[self.job_tail % MAX_JOBS];
+        const over = password.len > PASSWORD_LEN_MAX;
         slot.* = .{
             .id = id,
-            .password_len = @intCast(password.len),
+            .password_len = if (over) 0 else @intCast(password.len),
+            .over_bound = over,
             .salt = salt,
             .iteration_count = iteration_count,
             .expected_stored_key = expected_stored_key,
             .password = undefined,
         };
-        @memcpy(slot.password[0..password.len], password);
+        if (!over) @memcpy(slot.password[0..password.len], password);
         self.job_tail += 1;
         self.job_cond.signal();
         return id;
@@ -272,6 +284,12 @@ pub const CryptoPool = struct {
             } orelse return;
 
             defer std.crypto.secureZero(u8, &job.password);
+            // An over-bound job holds no password bytes; it fails like a
+            // wrong password without paying for a derive.
+            if (job.over_bound) {
+                self.finish(job.id, false);
+                continue;
+            }
             // Prep failure means the presented password can never match a
             // prepped stored credential: report as a mismatch.
             const test_creds = sasl.StoredCredentials.derive(job.password[0..job.password_len], job.salt, job.iteration_count) catch {
@@ -538,21 +556,62 @@ test "CryptoPool: the job path needs no heap allocation" {
     return error.NoCompletion;
 }
 
-test "CryptoPool: a password over the inline bound is rejected" {
+/// Poll popCompletion until a result arrives or the deadline passes.
+fn awaitCompletion(pool: *CryptoPool) !Completion {
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (pool.popCompletion()) |c| return c;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.NoCompletion;
+}
+
+test "CryptoPool: an over-bound password completes as a failed auth" {
     var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
     defer pool.stop();
 
-    var too_long: [PASSWORD_LEN_MAX + 1]u8 = @splat('x');
+    var too_long: [PASSWORD_LEN_MAX + 64]u8 = @splat('x');
+    std.crypto.random.bytes(too_long[PASSWORD_LEN_MAX..]);
     const creds = try sasl.StoredCredentials.derive("x", @splat(2), 1);
-    try std.testing.expectError(
-        error.PasswordTooLong,
-        pool.put(&too_long, @splat(2), 1, creds.stored_key),
-    );
-    // The refusal reserved nothing and copied nothing.
-    try std.testing.expectEqual(@as(usize, 0), reservedCount(&pool));
 
-    // A password exactly at the bound is accepted.
-    _ = try putTestJob(&pool, too_long[0..PASSWORD_LEN_MAX], @splat(2), 1, creds.stored_key);
+    // Accepted like any other job: it counts as outstanding, and its
+    // completion is the same ok=false a wrong password gets.
+    const id = try pool.put(&too_long, @splat(2), 1, creds.stored_key);
+    try std.testing.expectEqual(@as(usize, 1), reservedCount(&pool));
+
+    const c = try awaitCompletion(&pool);
+    try std.testing.expectEqual(id, c.id);
+    try std.testing.expect(!c.ok);
+}
+
+test "CryptoPool: an over-bound password is not truncated to a match" {
+    // The first PASSWORD_LEN_MAX bytes are a real credential. If the pool
+    // truncated instead of flagging the job over-bound, the derive would
+    // return ok=true.
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    var pw: [PASSWORD_LEN_MAX + 1]u8 = @splat('k');
+    const creds = try sasl.StoredCredentials.derive(pw[0..PASSWORD_LEN_MAX], @splat(7), 1);
+    const over_id = try pool.put(&pw, @splat(7), 1, creds.stored_key);
+    const ok_id = try pool.put(pw[0..PASSWORD_LEN_MAX], @splat(7), 1, creds.stored_key);
+
+    var saw_over = false;
+    var saw_ok = false;
+    while (!saw_over or !saw_ok) {
+        const c = try awaitCompletion(&pool);
+        if (c.id == over_id) {
+            try std.testing.expect(!c.ok);
+            saw_over = true;
+        } else if (c.id == ok_id) {
+            try std.testing.expect(c.ok);
+            saw_ok = true;
+        } else {
+            return error.UnexpectedJobId;
+        }
+    }
 }
 
 test "CryptoPool: completed and dropped jobs leave no password bytes" {
