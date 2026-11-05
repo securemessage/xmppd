@@ -11976,9 +11976,6 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     try std.testing.expectEqualStrings(wire[0..wire_len], captured.buf[0..captured.len]);
 }
 
-// An S2S dispatch that reaches one resource locally and another on a second
-// worker must hold one row. The remote worker learns the dispatch identity
-// from the delivery slot; a fresh token there would store the stanza twice.
 // A worker that restarts within the same wall second starts its stanza id
 // counter from zero again, so without per-process entropy both incarnations
 // mint the token the other already stored and the store answers a new message
@@ -12091,6 +12088,9 @@ test "c2s: one routed message to two draining workers holds one row" {
     try std.testing.expectEqual(@as(usize, 1), message_rows);
 }
 
+// An S2S dispatch that reaches one resource locally and another on a second
+// worker must hold one row. The remote worker learns the dispatch identity
+// from the delivery slot; a fresh token there would store the stanza twice.
 test "S2S: one inbound stanza to two draining workers holds one row" {
     const allocator = std.testing.allocator;
 
