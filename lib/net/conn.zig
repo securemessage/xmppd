@@ -1494,6 +1494,13 @@ test "Conn: send arms write interest and the writable pass drains" {
 test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
     const alloc = std.testing.allocator;
     var conns: [8]Conn = undefined;
+    // ConnList only touches the link fields; initialize those alone so
+    // an undefined on_dirty in non-Debug builds cannot fake "linked".
+    for (&conns) |*c| {
+        c.on_dirty = false;
+        c.dirty_next = null;
+        c.dirty_prev = null;
+    }
     var list: ConnList = .{};
 
     // FIFO pop order.
