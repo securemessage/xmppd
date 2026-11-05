@@ -558,8 +558,15 @@ pub const Server = struct {
     server_host: []const u8,
     running: bool = true,
 
-    /// Process start time (epoch seconds) — XEP-0012 domain uptime answer.
+    /// Process start time (epoch seconds). XEP-0012 domain uptime answer.
     start_time: i64 = 0,
+
+    /// Per-process entropy for `mintHoldToken`, drawn once at init. The stanza
+    /// id alone is (wall second, worker, counter), so an incarnation that
+    /// restarted within the same second as its predecessor would re-mint the
+    /// tokens that predecessor already stored, and the store would answer a
+    /// new message as already held.
+    hold_token_seed: u64 = 0,
 
     /// Session table — indexed by session ID. Heap-allocated, size configurable.
     sessions: []?*Session = &.{},
@@ -807,6 +814,7 @@ pub const Server = struct {
             .allocator = allocator,
             .server_host = host,
             .start_time = std.time.timestamp(),
+            .hold_token_seed = std.crypto.random.int(u64),
         };
         server.bindIpcAllocators();
         return server;
@@ -865,6 +873,7 @@ pub const Server = struct {
             .allocator = allocator,
             .server_host = host,
             .start_time = std.time.timestamp(),
+            .hold_token_seed = std.crypto.random.int(u64),
         };
         server.bindIpcAllocators();
         return server;
@@ -3519,19 +3528,24 @@ pub const Server = struct {
         router.dispatchStanza(self, session, changes);
     }
 
-    /// Generate a unique XEP-0359 stanza ID. Zero-padded timestamp, worker,
-    /// and counter fields keep the representation fixed-width.
     /// Mint the identity of one dispatch, for `holdBehindOfflineTail`. The
-    /// stanza id generator gives a value unique per worker and call, so the
-    /// hash is unique across workers and never collides with a later dispatch.
+    /// stanza id generator gives a value unique per worker and call; the
+    /// per-process seed keeps it unique across incarnations too, so a restart
+    /// in the same second cannot reproduce a token an older row still holds.
     pub fn mintHoldToken(self: *Server) offline_store_mod.HoldToken {
         var buf: [32]u8 = undefined;
         const id = self.generateStanzaId(&buf);
+        var hasher = std.hash.Wyhash.init(0x686f6c64746f6b);
+        var seed_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seed_bytes, self.hold_token_seed, .little);
+        hasher.update(&seed_bytes);
+        hasher.update(id);
         // Fold out the zero sentinel; a minted token must never look unminted.
-        const token = std.hash.Wyhash.hash(0x686f6c64746f6b, id) | 1;
-        return token;
+        return hasher.final() | 1;
     }
 
+    /// Generate a unique XEP-0359 stanza ID. Zero-padded timestamp, worker,
+    /// and counter fields keep the representation fixed-width.
     pub fn generateStanzaId(self: *Server, buf: *[32]u8) []const u8 {
         const timestamp: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())));
         const counter = self.stanza_id_counter;
@@ -11873,6 +11887,28 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
 // An S2S dispatch that reaches one resource locally and another on a second
 // worker must hold one row. The remote worker learns the dispatch identity
 // from the delivery slot; a fresh token there would store the stanza twice.
+// A worker that restarts within the same wall second starts its stanza id
+// counter from zero again, so without per-process entropy both incarnations
+// mint the token the other already stored and the store answers a new message
+// as already held.
+test "hold token: a second incarnation in the same second mints a new token" {
+    const allocator = std.testing.allocator;
+
+    var first = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    defer first.deinit();
+    var second = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    defer second.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), first.stanza_id_counter);
+    try std.testing.expectEqual(@as(u32, 0), second.stanza_id_counter);
+
+    const a = first.mintHoldToken();
+    const b = second.mintHoldToken();
+    try std.testing.expect(a != b);
+    try std.testing.expect(a != 0);
+    try std.testing.expect(b != 0);
+}
+
 // The same dispatch identity must survive the c2s router's hop through the
 // delivery slot: the receiving worker reads the token off the slot instead of
 // minting its own.
