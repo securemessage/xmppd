@@ -579,6 +579,11 @@ fn parseResponseHead(head: []const u8) HeadParse {
     _ = it.next(); // status line
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
+        // RFC 9112 5.2: a line starting with SP or HTAB is an obs-fold
+        // continuation of the previous field. This client does not
+        // unfold; rejecting keeps a folded Transfer-Encoding or
+        // Content-Length from degrading the head to EOF framing.
+        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return .invalid;
         // RFC 9112 5.1: no whitespace is allowed between the field name
         // and the colon. "Content-Length : 5" must not fall through to a
         // looser parse of some other header shape.
@@ -586,7 +591,9 @@ fn parseResponseHead(head: []const u8) HeadParse {
             if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
         }
         const te_prefix = "transfer-encoding:";
-        if (line.len > te_prefix.len and
+        // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
+        // declared TE; it rejects like any other TE.
+        if (line.len >= te_prefix.len and
             std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
         {
             return .invalid;
@@ -1259,6 +1266,31 @@ test "responseComplete: whitespace before the colon is rejected" {
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(other),
+    );
+    // RFC 9112 5.2 obs-fold: a folded field must not fall back to EOF
+    // framing. The folded line carries no colon, so only the leading-SP
+    // rule catches it.
+    const folded_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_te),
+    );
+    const folded_cl = "HTTP/1.1 200 OK\r\nContent-Length:\r\n 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_cl),
+    );
+    // A fold after an unrelated header is rejected the same way.
+    const folded_bare = "HTTP/1.1 200 OK\r\nX-A: 1\r\n\tchunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_bare),
+    );
+    // An empty Transfer-Encoding value still declares the field.
+    const empty_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(empty_te),
     );
 }
 
