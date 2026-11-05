@@ -1294,6 +1294,13 @@ test "responseComplete: whitespace before the colon is rejected" {
     );
 }
 
+test "responseComplete: a reason phrase may contain ' : '" {
+    // The status line is skipped before the field rules run, so a
+    // reason phrase with whitespace before a colon stays accepted.
+    const resp = "HTTP/1.1 200 OK : yes\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
 test "responseComplete: framing ends the body at Content-Length" {
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL";
     try std.testing.expectEqual(
