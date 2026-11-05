@@ -9,6 +9,7 @@
 //! See F3-DESIGN.md for the full contract.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const ssl = @import("ssl");
 const loop_mod = @import("loop.zig");
@@ -444,6 +445,411 @@ pub const Outbox = struct {
                 .err => |e| return .{ .err = e },
             }
         }
+    }
+};
+
+/// Per-consumer sizes and budgets (F3-DESIGN section 1): defaults equal
+/// today's per-connection memory; any increase needs an M-series
+/// measurement.
+pub const Options = struct {
+    inbox_bytes: usize = 8 << 10,
+    outbox_ring_bytes: usize = 16 << 10,
+    max_outbound_bytes: usize = 1 << 20,
+    read_budget_bytes: usize = 64 << 10,
+    read_budget_reads: u32 = 16,
+    flush_budget_bytes: usize = 64 << 10,
+    ktls: KtlsPolicy = .prefer,
+    counters: *Counters,
+};
+
+pub const State = enum { cleartext, handshake, established, closing };
+
+pub const CloseReason = union(enum) {
+    /// Orderly peer shutdown.
+    eof,
+    /// Socket or TLS failure; the error is captured for the consumer.
+    err: anyerror,
+    /// Outbox append exceeded max_outbound_bytes (fail closed).
+    outbox_full,
+    /// `Conn.close` called by the consumer.
+    consumer,
+};
+
+/// What `onEvent` wants the consumer's dispatch to do. There are no
+/// per-conn callbacks and no event queue: a callback that closes or
+/// frees the conn inside `onEvent` is the UAF class T215 fixed, so every
+/// terminal effect goes through this return value and the
+/// end-of-iteration ConnList walk.
+pub const Outcome = union(enum) {
+    /// Event absorbed: interest change only, or a stale event on a
+    /// closing conn.
+    none,
+    /// New bytes sit in `inbox.unread()`; consumer parses + consume()s.
+    readable,
+    /// Handshake completed: `.handshake` -> `.established`; the kTLS
+    /// token was recorded.
+    handshake_done,
+    /// The conn is on the closing list; the consumer frees it in the
+    /// end-of-iteration walk.
+    closed: CloseReason,
+};
+
+/// The handoff object for the TLS handshake (F3-DESIGN section 7).
+/// Owns the fd and the SslConn while the upgrade runs; whoever holds
+/// the fd enforces the deadline through `deadline_ctx`. `done` is the
+/// only cross-thread channel: the driving thread posts it, never a
+/// side effect on the conn.
+pub const Handshake = struct {
+    conn: ssl.SslConn,
+    fd: posix.fd_t,
+    deadline_ctx: Token,
+    done: Done = .want_read,
+
+    /// One `SSL_do_handshake` call. On a socket BIO this does socket
+    /// I/O, so it runs where the fd is registered: the consumer's loop
+    /// in F3, a pool thread's own kqueue in F7.
+    pub fn step(hs: *Handshake) Done {
+        const r = hs.conn.doHandshake() catch |e| {
+            hs.done = .{ .err = e };
+            return hs.done;
+        };
+        hs.done = switch (r) {
+            .complete => .ok,
+            .want_read => .want_read,
+            .want_write => .want_write,
+        };
+        return hs.done;
+    }
+};
+
+pub const Done = union(enum) {
+    ok,
+    want_read,
+    want_write,
+    err: SslError,
+};
+
+pub const StartError = error{
+    /// STARTTLS requires an empty outbox (the ADR-2 upgrade-point rule).
+    OutboxNotEmpty,
+    /// Bytes buffered past the upgrade point are a protocol error.
+    ReadAhead,
+    /// SslConn init failed on the fd.
+    SslInitFailed,
+    /// The fd was released to a handshake driver already.
+    Detached,
+};
+
+/// One connection's I/O state on its owning loop. Must not move after
+/// init: `Transport.tls` points into the struct and ConnList links live
+/// inside it.
+pub const Conn = struct {
+    loop: *Loop,
+    handle: loop_mod.Handle,
+    transport: Transport,
+    tls_storage: Tls,
+    hs: ?Handshake,
+    inbox: Inbox,
+    outbox: Outbox,
+    state: State,
+    /// Consumer's ctx token, attached as the handle's ctx and echoed.
+    ctx: Token,
+    opts: Options,
+    /// ConnList dirty links (intrusive; consumer owns the list).
+    dirty_next: ?*Conn = null,
+    dirty_prev: ?*Conn = null,
+    on_dirty: bool = false,
+    /// Deferred end-of-iteration work the consumer's walk performs.
+    requeue_read: bool = false,
+    requeue_write: bool = false,
+
+    /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
+    /// outbound s2s fds are covered the same as accepted ones, and
+    /// attaches read interest on the loop. The fd must already be
+    /// non-blocking; `alloc` backs inbox, ring and spill for the conn's
+    /// lifetime.
+    pub fn init(c: *Conn, loop: *Loop, fd: posix.fd_t, ctx: Token, alloc: std.mem.Allocator, opts: Options) !void {
+        try setNoSigpipe(fd);
+        if (builtin.mode == .Debug) {
+            const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+            std.debug.assert(fl >= 0 and fl & o_nonblock != 0);
+        }
+        const inbox_buf = try alloc.alloc(u8, opts.inbox_bytes);
+        errdefer alloc.free(inbox_buf);
+        const ring_buf = try alloc.alloc(u8, opts.outbox_ring_bytes);
+        errdefer alloc.free(ring_buf);
+        const handle = try loop.attach(fd, ctx, .{ .read = true });
+        c.* = .{
+            .loop = loop,
+            .handle = handle,
+            .transport = .{ .plain = fd },
+            .tls_storage = .{ .conn = undefined, .policy = opts.ktls },
+            .hs = null,
+            .inbox = Inbox.init(inbox_buf),
+            .outbox = Outbox.init(ring_buf, alloc, opts.max_outbound_bytes, opts.counters),
+            .state = .cleartext,
+            .ctx = ctx,
+            .opts = opts,
+        };
+    }
+
+    /// Free inbox/ring/spill memory. Only valid after `teardown` (the
+    /// fd is already closed) or when init's attach never ran.
+    pub fn deinit(c: *Conn) void {
+        if (c.state == .established) c.tls_storage.conn.deinit();
+        if (c.hs) |*hs| hs.conn.deinit();
+        const alloc = c.outbox.alloc;
+        c.outbox.deinit();
+        alloc.free(c.inbox.buf);
+        alloc.free(c.outbox.ring);
+    }
+
+    fn interest(c: *Conn, read: bool, write: bool) void {
+        c.loop.setInterest(c.handle, .{ .read = read, .write = write }) catch {};
+    }
+
+    fn markClosing(c: *Conn, list: *ConnList) void {
+        c.state = .closing;
+        list.link(c);
+    }
+
+    /// State machine driver: translates loop events into drain/flush
+    /// calls and interest updates, returning the Outcome the consumer
+    /// switches on. A second batched event for a conn closed by the
+    /// first hits the `.closing` short-circuit and is skipped.
+    pub fn onEvent(c: *Conn, ev: Event, list: *ConnList) Outcome {
+        if (c.state == .closing) return .none;
+        return switch (ev) {
+            .readable => c.onReadable(list),
+            .writable => c.onWritable(list),
+            else => .none,
+        };
+    }
+
+    fn onReadable(c: *Conn, list: *ConnList) Outcome {
+        if (c.state == .handshake) return c.driveHandshake(list);
+        var budget: ReadBudget = .{ .bytes = c.opts.read_budget_bytes, .reads = c.opts.read_budget_reads };
+        return switch (c.inbox.drain(&c.transport, &budget)) {
+            .drained => .readable,
+            .budget_left => {
+                // EV_CLEAR raises no new event for data left pending:
+                // the end-of-iteration walk re-drives this conn.
+                c.requeue_read = true;
+                list.link(c);
+                return .readable;
+            },
+            .want_write => {
+                // TLS read needs a write event (post-handshake reply):
+                // arm write interest; the writable pass re-drives.
+                c.requeue_read = true;
+                c.interest(true, true);
+                return .readable;
+            },
+            .eof => {
+                c.markClosing(list);
+                return .{ .closed = .eof };
+            },
+            .err => |e| {
+                c.markClosing(list);
+                return .{ .closed = .{ .err = e } };
+            },
+        };
+    }
+
+    fn onWritable(c: *Conn, list: *ConnList) Outcome {
+        if (c.state == .handshake) return c.driveHandshake(list);
+        const r = c.outbox.flush(&c.transport, c.opts.flush_budget_bytes);
+        switch (r) {
+            .drained => {
+                if (c.requeue_read) {
+                    // The write the TLS read was waiting for happened:
+                    // re-drive the stalled read this pass.
+                    c.requeue_read = false;
+                    list.link(c);
+                }
+                c.interest(true, false);
+                return .none;
+            },
+            .want_write => return .none, // write interest stays armed
+            .want_read => return .none,  // read interest already armed
+            .budget_left => {
+                c.requeue_write = true;
+                list.link(c);
+                return .none;
+            },
+            .err => |e| {
+                c.markClosing(list);
+                return .{ .closed = .{ .err = e } };
+            },
+        }
+    }
+
+    fn driveHandshake(c: *Conn, list: *ConnList) Outcome {
+        const hs = &c.hs.?;
+        switch (hs.step()) {
+            .ok => {
+                c.finishHandshake();
+                if (c.state == .closing) return .{ .closed = .{ .err = error.KtlsRequired } };
+                return .handshake_done;
+            },
+            .want_read => {
+                c.interest(true, false);
+                return .none;
+            },
+            .want_write => {
+                c.interest(true, true);
+                return .none;
+            },
+            .err => |e| {
+                c.markClosing(list);
+                return .{ .closed = .{ .err = e } };
+            },
+        }
+    }
+
+    /// Install the Tls transport after Handshake reports .ok: read the
+    /// kTLS flags once, record the one-shot token in the consumer's
+    /// counter registry plus a debug line, and apply the policy.
+    /// `prefer` never refuses; `require` closes the conn on `sw` or a
+    /// partial offload.
+    pub fn finishHandshake(c: *Conn) void {
+        const hs = &c.hs.?;
+        c.tls_storage = .{
+            .conn = hs.conn,
+            .ktls_tx = hs.conn.ktlsSend(),
+            .ktls_rx = hs.conn.ktlsRecv(),
+            .policy = c.opts.ktls,
+        };
+        hs.conn = undefined;
+        c.hs = null;
+        const token = c.tls_storage.ktlsToken();
+        c.opts.counters.countKtls(token);
+        std.log.scoped(.net_conn).debug("tls established fd={d} ktls={s} {s}/{s}", .{
+            c.sockFd(), @tagName(token), c.tls_storage.conn.versionName(), c.tls_storage.conn.cipherName(),
+        });
+        if (c.opts.ktls == .require and token != .ktls) {
+            c.state = .closing;
+            return;
+        }
+        c.transport = .{ .tls = &c.tls_storage };
+        c.state = .established;
+        c.interest(true, false);
+    }
+
+    /// STARTTLS upgrade point (the single rule): refuse when anything
+    /// is queued behind the upgrade or buffered past it. On acceptance
+    /// the conn moves to `.handshake`; `Handshake` owns the fd and the
+    /// SslConn for the upgrade.
+    pub fn startTls(c: *Conn, sctx: ssl.SslContext, mode: enum { accept, connect }, hostname: ?[*:0]const u8, deadline_ctx: Token) StartError!void {
+        if (!c.outbox.empty()) return StartError.OutboxNotEmpty;
+        if (c.inbox.unread().len != 0) return StartError.ReadAhead;
+        const fd = switch (c.transport) {
+            .plain => |fd| fd,
+            .tls => return StartError.ReadAhead, // already upgraded
+        };
+        const sc = switch (mode) {
+            .accept => ssl.SslConn.init(sctx, fd),
+            .connect => ssl.SslConn.initClient(sctx, fd, hostname),
+        } catch return StartError.SslInitFailed;
+        c.hs = .{ .conn = sc, .fd = fd, .deadline_ctx = deadline_ctx };
+        c.state = .handshake;
+    }
+
+    /// The conn's socket, or -1 while released to a handshake driver.
+    pub fn sockFd(c: *const Conn) posix.fd_t {
+        return c.loop.fdOf(c.handle) orelse (if (c.hs) |*hs| hs.fd else -1);
+    }
+
+    /// Hand the fd to a handshake driver (ADR-11 step 1): the loop
+    /// detaches it (immediate EV_DELETE per filter) so a pool thread can
+    /// register it on its own kqueue. The conn keeps `ctx`; the driver
+    /// posts `Done` back through `loop.wake` and the consumer re-adopts.
+    pub fn releaseFd(c: *Conn) error{StaleHandle}!posix.fd_t {
+        const fd = try c.loop.detach(c.handle);
+        if (c.hs) |*hs| hs.fd = fd;
+        return fd;
+    }
+
+    /// Re-attach the fd on the owning loop after a handshake driver
+    /// posts `Done` back.
+    pub fn adoptFd(c: *Conn, fd: posix.fd_t) loop_mod.AttachError!void {
+        c.handle = try c.loop.attach(fd, c.ctx, .{ .read = true });
+    }
+
+    /// Consumer-initiated close: marks `.closing` and links the conn on
+    /// the ConnList; the fd close and the consumer's free happen in the
+    /// end-of-iteration walk, after every batched event ran.
+    pub fn close(c: *Conn, list: *ConnList) void {
+        c.markClosing(list);
+    }
+
+    /// End-of-iteration teardown for a closing conn: `SSL_shutdown`
+    /// once (plain: no-op), then close the loop handle and fd. The
+    /// consumer frees the Conn after this.
+    pub fn teardown(c: *Conn) void {
+        std.debug.assert(c.state == .closing);
+        c.transport.shutdown();
+        c.loop.close(c.handle) catch {};
+    }
+
+    /// Queue outbound bytes through the outbox and arm write interest.
+    /// `failed_closed` moves to `.closing` and reports `outbox_full`.
+    pub fn send(c: *Conn, list: *ConnList, parts: []const []const u8) Outcome {
+        if (c.state == .closing) return .none;
+        return switch (c.outbox.append(parts)) {
+            .queued, .spilled => {
+                c.interest(true, true);
+                return .none;
+            },
+            .failed_closed => {
+                c.markClosing(list);
+                return .{ .closed = .outbox_full };
+            },
+        };
+    }
+};
+
+/// The intrusive per-loop dirty list (FIFO, O(1) link/unlink,
+/// order-preserving). The consumer walks it at end-of-iteration for
+/// outbox flushes, inbox-budget re-drives and deferred closes; the
+/// walk is what makes the ADR-2 end-of-iteration flush rule
+/// mechanical.
+pub const ConnList = struct {
+    head: ?*Conn = null,
+    tail: ?*Conn = null,
+    count: usize = 0,
+
+    /// Append `c` if it is not linked already (idempotent).
+    pub fn link(l: *ConnList, c: *Conn) void {
+        if (c.on_dirty) return;
+        c.on_dirty = true;
+        c.dirty_prev = l.tail;
+        c.dirty_next = null;
+        if (l.tail) |t| t.dirty_next = c else l.head = c;
+        l.tail = c;
+        l.count += 1;
+    }
+
+    /// Detach `c` without disturbing the order of the rest.
+    pub fn unlink(l: *ConnList, c: *Conn) void {
+        if (!c.on_dirty) return;
+        if (c.dirty_prev) |p| p.dirty_next = c.dirty_next else l.head = c.dirty_next;
+        if (c.dirty_next) |n| n.dirty_prev = c.dirty_prev else l.tail = c.dirty_prev;
+        c.dirty_next = null;
+        c.dirty_prev = null;
+        c.on_dirty = false;
+        l.count -= 1;
+    }
+
+    /// Remove and return the head, or null.
+    pub fn pop(l: *ConnList) ?*Conn {
+        const c = l.head orelse return null;
+        l.unlink(c);
+        return c;
+    }
+
+    pub fn empty(l: *const ConnList) bool {
+        return l.head == null;
     }
 };
 
@@ -959,4 +1365,186 @@ test "Outbox: pin retries the identical slice across want_write" {
     }
     // The last bytes out are the two appends (16 + 15 = 31).
     try std.testing.expectEqualStrings("0123456789abcdefAPPENDED-BEHIND", &tail);
+}
+
+fn mkLoop(alloc: std.mem.Allocator) !Loop {
+    var l: Loop = undefined;
+    try l.init(alloc, &.{ .handles_max = 8, .timers_max = 4 });
+    return l;
+}
+
+fn mkConnCtx(index: u32) Token {
+    return .{ .index = index, .gen = 1, .kind = 0x7c };
+}
+
+test "Conn: readable event delivers .readable and inbox bytes" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    _ = try posix.write(pair[1], "hi");
+    var list: ConnList = .{};
+    try loop.wait();
+    var got_readable = false;
+    while (loop.next()) |ev| {
+        switch (c.onEvent(ev, &list)) {
+            .readable => {
+                got_readable = true;
+                try std.testing.expectEqualStrings("hi", c.inbox.unread());
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(got_readable);
+    posix.close(pair[0]);
+}
+
+test "Conn: a second batched event on a closing conn is skipped" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // Arm write interest, then have the peer write AND close: the batch
+    // can carry a readable-with-EOF and a writable for the same conn.
+    const parts = [_][]const u8{"x"};
+    var list: ConnList = .{};
+    _ = c.send(&list, &parts);
+    _ = try posix.write(pair[1], "last");
+    posix.shutdown(pair[1], .both) catch {};
+
+    var outcomes: [8]Outcome = undefined;
+    var n: usize = 0;
+    try loop.wait();
+    while (loop.next()) |ev| {
+        outcomes[n] = c.onEvent(ev, &list);
+        n += 1;
+    }
+    // The first event that reached the conn closed it; every later
+    // event in the batch must be absorbed, never driven to I/O.
+    var saw_closed = false;
+    for (outcomes[0..n], 0..) |o, i| switch (o) {
+        .closed => |reason| {
+            try std.testing.expect(!saw_closed);
+            saw_closed = true;
+            try std.testing.expect(reason == .eof);
+            for (outcomes[i + 1 .. n]) |o2| try std.testing.expect(o2 == .none);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_closed);
+    try std.testing.expectEqual(State.closing, c.state);
+    // Deferred close: teardown shuts down and closes the fd here, in
+    // the end-of-iteration walk position, not inside onEvent.
+    c.teardown();
+    // The fd is already gone; no further close.
+    try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
+}
+
+test "Conn: send arms write interest and the writable pass drains" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+    defer posix.close(pair[0]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    const parts = [_][]const u8{ "he", "llo" };
+    var list: ConnList = .{};
+    try std.testing.expectEqual(Outcome.none, c.send(&list, &parts));
+    try std.testing.expectEqual(@as(usize, 5), c.outbox.bytes());
+
+    try loop.wait();
+    var flushed = false;
+    while (loop.next()) |ev| {
+        if (ev == .writable) {
+            _ = c.onEvent(ev, &list);
+            flushed = true;
+        }
+    }
+    try std.testing.expect(flushed);
+    try std.testing.expect(c.outbox.empty());
+
+    var buf: [8]u8 = undefined;
+    const n = try readAll(pair[1], buf[0..5]);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
+    const alloc = std.testing.allocator;
+    var conns: [8]Conn = undefined;
+    var list: ConnList = .{};
+
+    // FIFO pop order.
+    for (conns[0..4]) |*c| list.link(c);
+    try std.testing.expectEqual(@as(usize, 4), list.count);
+    for (0..4) |i| try std.testing.expectEqual(&conns[i], list.pop().?);
+    try std.testing.expect(list.empty());
+
+    // unlink preserves the order of survivors.
+    for (&conns) |*c| list.link(c);
+    list.unlink(&conns[2]);
+    list.unlink(&conns[5]);
+    const order = [_]usize{ 0, 1, 3, 4, 6, 7 };
+    for (order) |i| try std.testing.expectEqual(&conns[i], list.pop().?);
+    try std.testing.expectEqual(@as(usize, 0), list.count);
+
+    // Seeded fuzz: link/unlink/pop mix, invariant walk after every op.
+    var rng = std.Random.DefaultPrng.init(0xF3);
+    const r = rng.random();
+    var live: [8]bool = [_]bool{false} ** 8;
+    for (0..2000) |_| {
+        const i = r.intRangeLessThan(usize, 0, 8);
+        switch (r.intRangeLessThan(u8, 0, 3)) {
+            0 => {
+                list.link(&conns[i]);
+                live[i] = true;
+            },
+            1 => {
+                list.unlink(&conns[i]);
+                live[i] = false;
+            },
+            else => {
+                if (list.pop()) |c| {
+                    const idx = (@intFromPtr(c) - @intFromPtr(&conns)) / @sizeOf(Conn);
+                    live[idx] = false;
+                }
+            },
+        }
+        // Invariant walk: count links, check forward/backward agree.
+        var fwd: usize = 0;
+        var prev: ?*Conn = null;
+        var it = list.head;
+        while (it) |c| {
+            try std.testing.expect(c.on_dirty);
+            try std.testing.expect(c.dirty_prev == prev);
+            prev = c;
+            it = c.dirty_next;
+            fwd += 1;
+        }
+        try std.testing.expect(prev == list.tail);
+        try std.testing.expectEqual(list.count, fwd);
+    }
+    _ = alloc;
 }
