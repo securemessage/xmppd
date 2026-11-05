@@ -698,8 +698,8 @@ pub const Conn = struct {
             .drained => {
                 if (c.requeue_read) {
                     // The write the TLS read was waiting for happened:
-                    // re-drive the stalled read this pass.
-                    c.requeue_read = false;
+                    // the walk re-drives the stalled read. The flag
+                    // stays set so the walk can see it.
                     list.link(c);
                 }
                 c.interest(true, false);
@@ -914,6 +914,41 @@ pub const ConnList = struct {
 
     pub fn empty(l: *const ConnList) bool {
         return l.head == null;
+    }
+
+    /// The end-of-iteration walk (ADR-2): tear down closing conns and
+    /// turn deferred work flags into `Loop.requeue` calls so each conn
+    /// is re-driven once on the next pass. Bounded by membership: a
+    /// conn links at most once and `pop` unlinks it. A StaleHandle
+    /// requeue means the fd was released to a handshake driver and
+    /// cannot be driven anyway.
+    pub fn service(l: *ConnList) void {
+        while (l.pop()) |c| {
+            if (c.state == .closing) {
+                c.teardown();
+                continue;
+            }
+            if (c.requeue_read) {
+                c.requeue_read = false;
+                c.loop.requeue(c.handle, .read) catch {};
+            }
+            if (c.requeue_write) {
+                c.requeue_write = false;
+                c.loop.requeue(c.handle, .write) catch {};
+            }
+        }
+    }
+
+    fn serviceHook(ctx: *anyopaque) void {
+        const l: *ConnList = @ptrCast(@alignCast(ctx));
+        l.service();
+    }
+
+    /// Install as `Loop.Options.on_flush`: the dirty list is serviced at
+    /// every end-of-iteration, which makes the ADR-2 flush/requeue rule
+    /// mechanical rather than the consumer remembered.
+    pub fn flushHook(l: *ConnList) loop_mod.FlushHook {
+        return .{ .ctx = l, .func = serviceHook };
     }
 };
 
@@ -1502,27 +1537,6 @@ fn synthIo(c: *Conn, kind: enum { r, w }) Event {
     };
 }
 
-/// Test-side end-of-iteration walk: tear down closing conns and re-drive
-/// requeued reads/writes through the loop.
-fn walkDirty(list: *ConnList, loop: *Loop) !void {
-    var guard: usize = 0;
-    while (list.pop()) |c| : (guard += 1) {
-        if (guard > 1000) return error.WalkRunaway;
-        if (c.state == .closing) {
-            c.teardown();
-            continue;
-        }
-        if (c.requeue_read) {
-            c.requeue_read = false;
-            try loop.requeue(c.handle, .read);
-        }
-        if (c.requeue_write) {
-            c.requeue_write = false;
-            try loop.requeue(c.handle, .write);
-        }
-    }
-}
-
 /// Drive a server-side handshake through synthetic readable events until
 /// onEvent reports something, pumping the client end between steps.
 fn hsToEnd(c: *Conn, client: *ssl.SslConn, list: *ConnList) !Outcome {
@@ -1880,7 +1894,7 @@ test "Conn: a require-policy failure closes through ConnList and frees the SSL" 
     try std.testing.expectEqual(error.KtlsRequired, out.closed.err);
     try std.testing.expectEqual(State.closing, c.state);
     try std.testing.expect(c.on_dirty);
-    try walkDirty(&list, &loop);
+    list.service();
     try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
     c.deinit();
     try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
@@ -1912,7 +1926,7 @@ test "Conn: an established TLS conn frees the SSL at teardown" {
     const before = ssl_mark_frees;
     try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
     c.close(&list);
-    try walkDirty(&list, &loop);
+    list.service();
     try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
     c.deinit();
     try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
@@ -2012,7 +2026,7 @@ test "Conn: app data coalesced with the client Finished is delivered" {
             }
         }
         if (fired) timer_fired += 1 else _ = loop.cancelTimer(tid);
-        try walkDirty(&list, &loop);
+        list.service();
         if (c.inbox.unread().len > 0) break;
         if (hs_done and timer_fired >= 3) break;
     }
@@ -2054,7 +2068,7 @@ test "Conn: a full inbox the consumer cannot consume does not spin the loop" {
                 else => {},
             }
         }
-        try walkDirty(&list, &loop);
+        list.service();
     }
     try std.testing.expect(passes < 50);
     try std.testing.expect(c.inbox_stalled);
@@ -2067,7 +2081,7 @@ test "Conn: a full inbox the consumer cannot consume does not spin the loop" {
     try std.testing.expect(!c.inbox_stalled);
     try std.testing.expect(c.requeue_read);
     try std.testing.expect(c.on_dirty);
-    try walkDirty(&list, &loop);
+    list.service();
     try loop.wait();
     while (loop.next()) |ev| {
         switch (ev) {
@@ -2076,6 +2090,94 @@ test "Conn: a full inbox the consumer cannot consume does not spin the loop" {
         }
     }
     try std.testing.expectEqual(@as(usize, 64), c.inbox.unread().len);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "ConnList: service re-drives a budget-stopped read once per pass" {
+    const alloc = std.testing.allocator;
+    var list: ConnList = .{};
+    var loop: Loop = undefined;
+    // on_flush makes the walk mechanical: service runs inside wait().
+    try loop.init(alloc, &.{ .handles_max = 8, .timers_max = 4, .on_flush = list.flushHook() });
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{
+        .counters = &counters,
+        .read_budget_bytes = 8,
+        .read_budget_reads = 16,
+    });
+    defer c.deinit();
+
+    const big = [_]u8{0x3c} ** 200;
+    _ = try posix.write(pair[1], &big);
+
+    const syn0 = loop.stats().synthetic_events;
+    var got: usize = 0;
+    var passes: usize = 0;
+    while ((got < big.len or !list.empty()) and passes < 40) : (passes += 1) {
+        const tid = try loop.scheduleIn(50, mkConnCtx(9));
+        try loop.wait();
+        var fired = false;
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => fired = true,
+                .readable => {
+                    _ = c.onEvent(ev, &list);
+                    got += c.inbox.unread().len;
+                    c.consume(&list, c.inbox.unread().len);
+                },
+                else => {},
+            }
+        }
+        if (!fired) _ = loop.cancelTimer(tid);
+    }
+    // Every pass after the first kernel event was driven by exactly one
+    // requeued synthetic read; the walk did the re-driving.
+    try std.testing.expectEqual(big.len, got);
+    try std.testing.expect(list.empty());
+    try std.testing.expectEqual(passes - 1, loop.stats().synthetic_events - syn0);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "ConnList: a drained flush re-drives the stalled read through service" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // A TLS read that wanted a write leaves requeue_read set; the next
+    // writable pass drains the outbox and the walk must re-drive it.
+    const parts = [_][]const u8{"x"};
+    var list: ConnList = .{};
+    _ = c.send(&list, &parts);
+    c.requeue_read = true;
+    _ = c.onEvent(synthIo(&c, .w), &list);
+    try std.testing.expect(c.requeue_read);
+    try std.testing.expect(c.on_dirty);
+    list.service();
+    try std.testing.expect(!c.requeue_read);
+
+    _ = try loop.scheduleIn(50, mkConnCtx(9));
+    try loop.wait();
+    var saw_readable = false;
+    while (loop.next()) |ev| {
+        if (ev == .readable and ev.readable.handle.eql(c.handle)) saw_readable = true;
+    }
+    try std.testing.expect(saw_readable);
     c.state = .closing;
     c.teardown();
 }
