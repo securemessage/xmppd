@@ -21,6 +21,7 @@
 //! of completions costs one byte per drain cycle and none is ever lost.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const sasl = @import("sasl");
 
@@ -269,20 +270,37 @@ pub const CryptoPool = struct {
 
     fn workerMain(self: *CryptoPool) void {
         while (true) {
-            var job = blk: {
+            // Field-wise copy into a single local: a whole-struct copy
+            // would leave a second plaintext image in the frame that the
+            // job.password wipe below cannot reach.
+            var job: Job = undefined;
+            {
                 self.job_mutex.lock();
                 defer self.job_mutex.unlock();
                 while (self.job_tail == self.job_head and !self.stopping) {
                     self.job_cond.wait(&self.job_mutex);
                 }
-                if (self.stopping) break :blk null; // in-flight job finishes; queue dropped by stop()
+                if (self.stopping) return; // in-flight job finishes; queue dropped by stop()
                 const slot = &self.job_slots[self.job_head % MAX_JOBS];
-                const j = slot.*;
+                job.id = slot.id;
+                job.password_len = slot.password_len;
+                job.over_bound = slot.over_bound;
+                job.salt = slot.salt;
+                job.iteration_count = slot.iteration_count;
+                job.expected_stored_key = slot.expected_stored_key;
+                @memcpy(job.password[0..slot.password_len], slot.password[0..slot.password_len]);
                 std.crypto.secureZero(u8, &slot.password);
                 self.job_head += 1;
-                break :blk j;
-            } orelse return;
+            }
+            if (builtin.is_test) test_worker_job_addr.store(@intFromPtr(&job), .release);
 
+            // The residue check is registered before the wipe so it runs
+            // second (defers run LIFO): it samples job.password after the
+            // secureZero, on every exit path, before the next iteration
+            // reuses the frame.
+            defer if (builtin.is_test) {
+                test_worker_pw_zeroed.store(std.mem.allEqual(u8, job.password[0..], 0), .release);
+            };
             defer std.crypto.secureZero(u8, &job.password);
             // An over-bound job holds no password bytes; it fails like a
             // wrong password without paying for a derive.
@@ -303,6 +321,12 @@ pub const CryptoPool = struct {
         }
     }
 };
+
+/// Test-only residue anchors, written by workerMain under builtin.is_test:
+/// the job copy's address, and whether the password buffer read back all
+/// zeros after the wipe defer ran. Never written in non-test builds.
+var test_worker_job_addr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var test_worker_pw_zeroed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 // ============================================================================
 // Tests
@@ -643,6 +667,71 @@ test "CryptoPool: completed and dropped jobs leave no password bytes" {
     for (&pool2.job_slots) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-b2") == null);
     }
+}
+
+/// Count occurrences of `needle` inside the mapped region containing
+/// `anchor`. procstat -v reports the grown extents, so the scan never
+/// reads outside a live mapping (the worker's stack extent is only a
+/// few KiB above its frames; a fixed window could run off the top).
+fn scanRegionContaining(anchor: usize, needle: []const u8) !usize {
+    var pidbuf: [16]u8 = undefined;
+    const pids = try std.fmt.bufPrint(&pidbuf, "{d}", .{std.c.getpid()});
+    const res = try std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{ "procstat", "-v", pids },
+        .max_output_bytes = 1 << 22,
+    });
+    defer std.testing.allocator.free(res.stdout);
+    defer std.testing.allocator.free(res.stderr);
+    var lines = std.mem.splitScalar(u8, res.stdout, '\n');
+    _ = lines.next();
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        var cols: [3][]const u8 = undefined;
+        var n: usize = 0;
+        while (it.next()) |c| : (n += 1) {
+            if (n < cols.len) cols[n] = c;
+        }
+        if (n < 3) continue;
+        const start = std.fmt.parseInt(usize, cols[1], 0) catch continue;
+        const end = std.fmt.parseInt(usize, cols[2], 0) catch continue;
+        if (anchor < start or anchor >= end) continue;
+        const region = @as([*]const u8, @ptrFromInt(start))[0 .. end - start];
+        var hits: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, region, pos, needle)) |i| : (pos = i + 1) {
+            hits += 1;
+        }
+        return hits;
+    }
+    return error.AnchorNotMapped;
+}
+
+test "CryptoPool: no plaintext left on the worker stack" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(1);
+    defer pool.stop();
+
+    // Random marker: the submitted buffer itself lives on this thread's
+    // stack, outside the scanned region.
+    var marker: [96]u8 = undefined;
+    std.crypto.random.bytes(&marker);
+    const creds = try sasl.StoredCredentials.derive("wipe", @splat(6), 1);
+    _ = try putTestJob(&pool, &marker, @splat(6), 1, creds.stored_key);
+    _ = try awaitCompletion(&pool);
+
+    const job_addr = test_worker_job_addr.load(.acquire);
+    try std.testing.expect(job_addr != 0);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+
+    // The worker samples its own copy at scope exit, before the next
+    // iteration re-poisons the frame: a missed wipe leaves the marker
+    // readable then.
+    try std.testing.expect(test_worker_pw_zeroed.load(.acquire));
+
+    // Any second plaintext image the pickup left elsewhere in the frame
+    // outlives the job copy: scan the whole mapped stack region for it.
+    try std.testing.expectEqual(@as(usize, 0), try scanRegionContaining(job_addr, &marker));
 }
 
 test "CryptoPool: one wake byte per drain cycle" {
