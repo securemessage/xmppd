@@ -65,6 +65,12 @@ zig build -Dop-storage=lmdb -Darchive-storage=sqlite       # mix
 - SQL makes range queries and retention cleanup natural.
 - Good "I just want one DB file" option for small deployments.
 
+**Core dumps:** LMDB env maps are excluded from core dumps
+(`madvise(MADV_NOCORE)` in `LmdbBackend.open`), so touched LMDB pages -
+SCRAM keys, rosters, archive contents - never land in a core file. The
+RocksDB archive is not excluded: its block cache and memtables are heap
+memory and still appear in cores.
+
 ## 5. Architecture
 
 ```
