@@ -471,13 +471,13 @@ pub const Resolver = struct {
             },
         };
         try self.ensureOpen();
-        if (self.jobs.items.len >= MAX_JOBS) {
+        if (self.slotsFull()) {
             // ADR-13: a refresh never starves a client lookup the
             // cache could answer, so a waiterless refresh-only job
             // yields its slot first.
             _ = self.reclaimRefreshOnly();
         }
-        if (self.jobs.items.len >= MAX_JOBS) {
+        if (self.slotsFull()) {
             try self.enqueueWait(session_key, fqdn, .{ .kind = .query, .rtype = qt });
             return;
         }
@@ -509,11 +509,26 @@ pub const Resolver = struct {
         try self.wait_queue.append(self.alloc, e);
     }
 
+    /// In-flight capacity is the slot table, not `jobs`: a job
+    /// firing its completion callbacks already left `jobs` but
+    /// still holds its slot until freeJob runs after the last
+    /// callback, so a lookup issued from inside a callback must
+    /// see the table as full.
+    fn slotsFull(self: *const Resolver) bool {
+        for (self.slots) |s| {
+            if (s == null) return false;
+        }
+        return true;
+    }
+
     /// Launch the head of the wait queue now that a job slot opened.
     /// A launch that fails answers the waiter's callback with .failed;
-    /// there is no error return this deep in the pump.
+    /// there is no error return this deep in the pump. A queued
+    /// lookup still outranks a waiterless refresh-only job, so a
+    /// full table sheds one before the head is launched.
     fn promoteWait(self: *Resolver) void {
-        while (self.jobs.items.len < MAX_JOBS and self.wait_queue.items.len > 0) {
+        while (self.wait_queue.items.len > 0) {
+            if (self.slotsFull() and !self.dropRefreshOnly()) break;
             const e = self.wait_queue.orderedRemove(0);
             defer self.alloc.free(e.name);
             switch (e.kind) {
@@ -651,12 +666,12 @@ pub const Resolver = struct {
             job.waiter_count += 1;
             return;
         }
-        if (self.jobs.items.len >= MAX_JOBS) {
+        if (self.slotsFull()) {
             // Same rule as query(): refresh-only jobs yield to client
             // lookups, so a fully cached resolve() can always answer.
             _ = self.reclaimRefreshOnly();
         }
-        if (self.jobs.items.len >= MAX_JOBS) {
+        if (self.slotsFull()) {
             try self.enqueueWait(session_key, fqdn, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
             return;
         }
@@ -1100,6 +1115,8 @@ pub const Resolver = struct {
                 self.dropJob(job, .failed);
                 return;
             };
+            // Queued client lookups outrank this renewal; may free job.
+            self.promoteWait();
             return;
         }
         const ent = hit.ent;
@@ -1125,7 +1142,7 @@ pub const Resolver = struct {
     /// moved on. Bounded by its own chain deadline; skipped while
     /// the job table is full (the next stale hit starts one instead).
     fn spawnRefresh(self: *Resolver, qname: []const u8, qtype: u16) void {
-        if (self.jobs.items.len >= MAX_JOBS) return;
+        if (self.slotsFull()) return;
         const job = self.allocJob(0, qname) catch return;
         job.phase = .raw;
         job.is_raw = true;
@@ -1702,15 +1719,24 @@ pub const Resolver = struct {
 
     /// Free one slot held by a waiterless refresh-only job so a
     /// client lookup can take it (ADR-13: a refresh never starves a
-    /// lookup the cache could answer). The aborted refresh counts as
+    /// lookup the cache could answer). The dropped refresh counts as
     /// a failed one: freeJob stamps last_fail_ms, suppressing an
-    /// immediate respawn for the recheck window. promoteWait inside
-    /// abortJob hands the slot to a queued request first, so FIFO
-    /// order survives. Returns true when a job was reclaimed.
+    /// immediate respawn for the recheck window. The promoted wait
+    /// queue keeps FIFO order. Returns true when a job was reclaimed.
     fn reclaimRefreshOnly(self: *Resolver) bool {
-        for (self.jobs.items) |job| {
+        if (!self.dropRefreshOnly()) return false;
+        self.promoteWait();
+        return true;
+    }
+
+    /// Drop one refresh-only job; no promote so callers inside a
+    /// callback cannot reenter the queue pump. Returns true when a
+    /// job was freed.
+    fn dropRefreshOnly(self: *Resolver) bool {
+        for (self.jobs.items, 0..) |job, i| {
             if (job.refresh_only) {
-                self.abortJob(job);
+                _ = self.jobs.orderedRemove(i);
+                self.freeJob(job);
                 return true;
             }
         }
@@ -6611,6 +6637,131 @@ test "dns-async: refresh-only jobs yield a slot to a client lookup" {
     // slot on the wire instead of queueing behind refreshes.
     const n65 = std.fmt.bufPrint(&name_buf, "s{d}.test", .{MAX_JOBS}) catch unreachable;
     try r.query(n65, .a, 901);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
+}
+
+test "dns-async: a queued lookup is answered as refresh jobs convert" {
+    // Goal: a lookup queued behind a full table does not wait for the
+    // refresh-only jobs ahead of it to die: the deadline conversion
+    // hands a slot to the queue. Method: fill the table with raw
+    // stale refreshes, queue a fully cached resolve, fire every
+    // per-query deadline.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    var nb: [32]u8 = undefined;
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    for (0..MAX_JOBS) |i| {
+        const n = std.fmt.bufPrint(&nb, "s{d}.test", .{i}) catch unreachable;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 60);
+    }
+    fake_now += 61_000;
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    var qctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &qctx, .fun = TestCtx.onQuery });
+    for (0..MAX_JOBS) |i| {
+        const n = std.fmt.bufPrint(&nb, "s{d}.test", .{i}) catch unreachable;
+        try r.query(n, .a, 100 + i);
+    }
+    try r.resolve("svc.test", .client, 5222, 900, false);
+    try std.testing.expectEqual(@as(usize, 1), r.wait_queue.items.len);
+    while (true) {
+        var target: ?*Job = null;
+        for (r.jobs.items) |j| {
+            if (!j.refresh_only) {
+                target = j;
+                break;
+            }
+        }
+        const t = target orelse break;
+        r.onDeadline(t);
+        if (qctx.raw) |res| {
+            var x = res;
+            x.deinitOn(std.testing.allocator);
+            qctx.raw = null;
+        }
+    }
+    // The first converted job gave the queued resolve its slot; the
+    // chain completed on the cache synchronously.
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+}
+
+const CbLookupCtx = struct {
+    r: *Resolver,
+    armed: bool = false,
+    err1: ?anyerror = null,
+    err2: ?anyerror = null,
+    status: ?Status = null,
+    res: ?Resolution = null,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, _: usize, status: Status, res: ?Resolution) void {
+        const self: *CbLookupCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.status = status;
+        self.res = res;
+        if (self.armed) {
+            self.r.query("cbx1.test", .a, 7001) catch |e| {
+                self.err1 = e;
+            };
+            self.r.query("cbx2.test", .a, 7002) catch |e| {
+                self.err2 = e;
+            };
+        }
+    }
+};
+
+test "dns-async: a lookup inside a completion callback reclaims a refresh-only slot" {
+    // Goal: a completing job still holds its slot while its
+    // callbacks run, so capacity is measured on the slot table, not
+    // `jobs`; a refresh-only job then yields as usual. Method: one
+    // spawned refresh job plus cache misses fill the slots; the
+    // completing resolve's callback issues two raw queries.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = CbLookupCtx{ .r = &r };
+    r.setCallback(.{ .ctx = &ctx, .fun = CbLookupCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    r.onDeadline(r.jobs.items[0]); // chain serves stale; spawns a refresh-only job
+    {
+        var res0 = ctx.res.?;
+        res0.deinitOn(std.testing.allocator);
+        ctx.res = null;
+        ctx.status = null;
+    }
+    var spawned: usize = 0;
+    for (r.jobs.items) |j| {
+        if (j.refresh_only) spawned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), spawned);
+    var nb: [32]u8 = undefined;
+    for (0..MAX_JOBS - 2) |i| {
+        const n = std.fmt.bufPrint(&nb, "miss{d}.test", .{i}) catch unreachable;
+        try r.query(n, .a, 5000 + i);
+    }
+    // The completing resolve takes the last slot; inside its
+    // callback the table reads 63 jobs but all 64 slots are held.
+    ctx.armed = true;
+    try r.resolve("svc.test", .client, 5222, 4, true);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    // Neither query failed: the first reclaimed the refresh-only
+    // slot, the second queued and launched once the resolve's slot
+    // freed.
+    try std.testing.expect(ctx.err1 == null);
+    try std.testing.expect(ctx.err2 == null);
     try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
     try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
 }
