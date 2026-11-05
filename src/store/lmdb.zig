@@ -1095,6 +1095,24 @@ test "LmdbBackend: the vmmap ENOMEM retry is bounded" {
     try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
 }
 
+test "LmdbBackend: vmmap lookup exhaustion does not fail the open" {
+    // Goal: a lookup that exhausts its ENOMEM retries warns and leaves
+    // the map in core dumps; it is never a verdict against the open
+    // itself. Method: the seam fails every read; the open must still
+    // succeed and no madvise can be attempted without a record.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = VMMAP_ATTEMPTS_MAX;
+
+    const calls0 = madviseCall.calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
+}
+
 test "LmdbBackend: the real madvise marks the env VMA nocore" {
     // Goal: the syscall path the seam bypasses works end to end: the
     // real madvise accepts MADV_NOCORE on the VMA the lookup returns
