@@ -221,22 +221,44 @@ pub const CryptoPool = struct {
         _ = try posix.fcntl(fds[1], std.c.F.SETFL, nonblock);
         self.pipe_rd = fds[0];
         self.pipe_wr = fds[1];
+        errdefer {
+            self.pipe_rd = -1;
+            self.pipe_wr = -1;
+        }
 
         {
             self.job_mutex.lock();
             defer self.job_mutex.unlock();
             try self.ensureRingsLocked();
         }
+        errdefer self.freeRings();
 
         const n = @min(thread_count, MAX_THREADS);
         for (0..n) |i| {
-            self.threads_buf[i] = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
+            self.threads_buf[i] = self.spawnWorker() catch |err| {
                 // Pool with zero threads is useless; errdefer closes the pipe.
                 if (i == 0) return err;
                 break;
             };
             self.thread_count += 1;
         }
+    }
+
+    /// Spawn one worker. The is_test branch lets a test fail the first
+    /// spawn to pin the errdefer cleanup in start().
+    fn spawnWorker(self: *CryptoPool) std.Thread.SpawnError!std.Thread {
+        if (builtin.is_test and test_spawn_fail) return error.SystemResources;
+        return std.Thread.spawn(.{}, workerMain, .{self});
+    }
+
+    /// Free the job and completion rings. Safe when they were never
+    /// allocated (a never-started pool, or a start that failed before
+    /// its errdefer ran).
+    fn freeRings(self: *CryptoPool) void {
+        if (self.job_slots.len != 0) self.allocator.free(self.job_slots);
+        if (self.completions.len != 0) self.allocator.free(self.completions);
+        self.job_slots = &.{};
+        self.completions = &.{};
     }
 
     /// Stop workers and close the pipe. Queued-but-unstarted jobs are
@@ -271,10 +293,7 @@ pub const CryptoPool = struct {
         self.reserved_completions = 0;
         self.completion_mutex.unlock();
 
-        if (self.job_slots.len != 0) self.allocator.free(self.job_slots);
-        if (self.completions.len != 0) self.allocator.free(self.completions);
-        self.job_slots = &.{};
-        self.completions = &.{};
+        self.freeRings();
     }
 
     /// Publish one completion and wake the loop. put() bounds outstanding
@@ -363,6 +382,9 @@ pub const CryptoPool = struct {
 /// zeros after the wipe defer ran. Never written in non-test builds.
 var test_worker_job_addr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var test_worker_pw_zeroed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Test-only: fail the first spawn in start() to pin its error cleanup.
+var test_spawn_fail: bool = false;
 
 // ============================================================================
 // Tests
@@ -628,6 +650,20 @@ test "CryptoPool: the job path allocates once, then never per job" {
     for (0..n) |_| {
         _ = try awaitCompletion(&pool);
     }
+}
+
+test "CryptoPool: a failed first spawn frees the rings" {
+    // main.zig never calls stop() when start() fails, so the error path
+    // must release the rings itself. The DebugAllocator reports any
+    // surviving ring as a leak at deinit.
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    test_spawn_fail = true;
+    defer test_spawn_fail = false;
+
+    var pool = CryptoPool{ .allocator = gpa.allocator() };
+    defer pool.stop(); // safe after a failed start: no threads, fds reset
+    try std.testing.expectError(error.SystemResources, pool.start(1));
+    try std.testing.expect(gpa.deinit() == .ok);
 }
 
 test "CryptoPool: a completion left over stop() cannot be popped" {
