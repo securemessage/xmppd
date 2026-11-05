@@ -189,7 +189,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/net/net.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    net_mod.addImport("ssl", ssl_mod);
 
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
