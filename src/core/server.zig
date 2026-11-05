@@ -10408,6 +10408,45 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
     try std.testing.expectEqual(@as(usize, 3), bundle.stanzas.items.len);
 }
 
+// The owning worker's snapshot decides what the resumed session believes it
+// has already drained. A bundle built without the drain sequence makes the
+// requesting worker resend a tail the resumed client already has.
+test "Re-review 7.4: the resume request carries the drain sequence into the bundle" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    server.worker_id = 1;
+    var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    sm_handoff.resetForTesting();
+
+    const previd = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    const detached = try makeDetachedForResume(&server, 2, previd, 6, 5, 3, det_fds[0]);
+    detached.offline_pending = true;
+    detached.offline_last_sent_sequence = 41;
+
+    var status = CapturedResumeStatus{};
+    server.handleSmResumeRequest(.{
+        .previd = previd,
+        .h = 5,
+        .req_worker = 1,
+        .req_session = 1,
+        .req_epoch = 0,
+        .auth_local = "alice",
+        .auth_domain = "localhost",
+        .hops = 0,
+    });
+    captureSmResumeStatus(&delivery_sys, 1, &status);
+    try std.testing.expectEqualStrings("ok", status.slice());
+
+    const bundle = sm_handoff.take(previd) orelse return error.Missing;
+    defer sm_handoff.release(bundle);
+    try std.testing.expect(bundle.offline_pending);
+    try std.testing.expectEqual(@as(u64, 41), bundle.offline_last_sent_sequence);
+}
+
 test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
