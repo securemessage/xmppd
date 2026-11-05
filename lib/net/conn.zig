@@ -175,9 +175,13 @@ pub const ReadBudget = struct {
 pub const DrainResult = union(enum) {
     /// EAGAIN: the socket is dry and EV_CLEAR will report new data.
     drained,
-    /// Budget spent, inbox full, or TLS wanted a write: re-drive the
-    /// conn before the loop sleeps (ConnList + Loop.requeue).
+    /// Budget spent: more data may be pending; re-drive the conn
+    /// before the loop sleeps (ConnList + Loop.requeue).
     budget_left,
+    /// Inbox cannot take more until the consumer consumes. The conn
+    /// parks its read interest and re-drives only from `Conn.consume`;
+    /// re-queuing every pass would busy-loop the worker.
+    full,
     /// The TLS read needed a write event first.
     want_write,
     /// Orderly peer shutdown; `eof` latches on the inbox.
@@ -214,6 +218,13 @@ pub const Inbox = struct {
         in.consumed += n;
     }
 
+    /// True when the buffer holds `buf.len` bytes: a drain can move
+    /// nothing until bytes are consumed. A consumer that finds nothing
+    /// parseable in a full inbox should close with a stream error.
+    pub fn full(in: *const Inbox) bool {
+        return in.len == in.buf.len;
+    }
+
     /// Move unconsumed bytes to the front and clear the cursor.
     pub fn compact(in: *Inbox) void {
         if (in.consumed == 0) return;
@@ -226,17 +237,17 @@ pub const Inbox = struct {
     }
 
     /// Read until EAGAIN, the budget is spent, the inbox fills, or EOF.
-    /// A `budget_left` result means more data may be pending, or the
-    /// inbox holds bytes the consumer has not consumed yet, and the conn
+    /// A `budget_left` result means more data may be pending and the conn
     /// must be re-driven before the loop sleeps: EV_CLEAR is
-    /// transition-armed, so leftover data raises no new event.
+    /// transition-armed, so leftover data raises no new event. A `full`
+    /// result means nothing can move until the consumer consumes.
     pub fn drain(in: *Inbox, t: *Transport, budget: *ReadBudget) DrainResult {
         if (in.eof) return .eof;
         in.compact();
         while (true) {
             if (budget.reads == 0 or budget.bytes == 0) return .budget_left;
             const space = in.buf.len - in.len;
-            if (space == 0) return .budget_left;
+            if (space == 0) return .full;
             budget.reads -= 1;
             const want = @min(space, budget.bytes);
             switch (t.read(in.buf[in.len .. in.len + want])) {
@@ -568,6 +579,12 @@ pub const Conn = struct {
     /// flag, not state: teardown requires `.closing`, so no conn closed
     /// through the contract is ever `.established` at deinit.
     tls_live: bool = false,
+    /// Last write interest passed to `interest`, kept so a read
+    /// suppression can re-arm without clobbering it.
+    want_write: bool = false,
+    /// Read is parked: the last drain found the inbox full. Lifted only
+    /// by `Conn.consume`; a parked read must not wake the loop.
+    inbox_stalled: bool = false,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
@@ -610,8 +627,12 @@ pub const Conn = struct {
         alloc.free(c.outbox.ring);
     }
 
+    /// Record the wanted interest and reconcile it with the loop. Read
+    /// is armed only while the inbox is not parked: a full inbox cannot
+    /// move, and re-driving it every pass spins the worker.
     fn interest(c: *Conn, read: bool, write: bool) void {
-        c.loop.setInterest(c.handle, .{ .read = read, .write = write }) catch {};
+        c.want_write = write;
+        c.loop.setInterest(c.handle, .{ .read = read and !c.inbox_stalled, .write = write }) catch {};
     }
 
     fn markClosing(c: *Conn, list: *ConnList) void {
@@ -637,6 +658,14 @@ pub const Conn = struct {
         var budget: ReadBudget = .{ .bytes = c.opts.read_budget_bytes, .reads = c.opts.read_budget_reads };
         return switch (c.inbox.drain(&c.transport, &budget)) {
             .drained => .readable,
+            .full => {
+                // Nothing can move until the consumer consumes: park the
+                // read (interest() applies the suppression) and report
+                // the buffered bytes; re-queuing here would busy-loop.
+                c.inbox_stalled = true;
+                c.interest(true, c.want_write);
+                return .readable;
+            },
             .budget_left => {
                 // EV_CLEAR raises no new event for data left pending:
                 // the end-of-iteration walk re-drives this conn.
@@ -794,6 +823,7 @@ pub const Conn = struct {
     /// posts `Done` back.
     pub fn adoptFd(c: *Conn, fd: posix.fd_t) loop_mod.AttachError!void {
         c.handle = try c.loop.attach(fd, c.ctx, .{ .read = true });
+        c.want_write = false;
     }
 
     /// Consumer-initiated close: marks `.closing` and links the conn on
@@ -801,6 +831,20 @@ pub const Conn = struct {
     /// end-of-iteration walk, after every batched event ran.
     pub fn close(c: *Conn, list: *ConnList) void {
         c.markClosing(list);
+    }
+
+    /// Mark `n` inbox bytes parsed (the only supported consume path).
+    /// Lifts a full-inbox park: read interest is re-armed and the conn
+    /// is re-driven once, since EV_CLEAR's edge is already gone.
+    pub fn consume(c: *Conn, list: *ConnList, n: usize) void {
+        const stalled = c.inbox_stalled;
+        c.inbox.consume(n);
+        if (stalled) {
+            c.inbox_stalled = false;
+            c.interest(true, c.want_write);
+            c.requeue_read = true;
+            list.link(c);
+        }
     }
 
     /// End-of-iteration teardown for a closing conn: `SSL_shutdown`
@@ -1172,7 +1216,8 @@ test "Inbox: a full inbox stops the drain until consume" {
 
     // Consumer left the inbox full: the drain cannot make progress.
     in.len = in.buf.len;
-    try std.testing.expectEqual(DrainResult.budget_left, in.drain(&t, &budget));
+    try std.testing.expectEqual(DrainResult.full, in.drain(&t, &budget));
+    try std.testing.expect(in.full());
     in.consume(in.len);
     try std.testing.expectEqualStrings("", in.unread());
     try std.testing.expectEqual(DrainResult.drained, in.drain(&t, &budget));
@@ -1973,6 +2018,64 @@ test "Conn: app data coalesced with the client Finished is delivered" {
     }
     try std.testing.expect(hs_done);
     try std.testing.expectEqualStrings("<stream:stream>", c.inbox.unread());
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Conn: a full inbox the consumer cannot consume does not spin the loop" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters, .inbox_bytes = 64 });
+    defer c.deinit();
+
+    // 1000 pending bytes against a 64-byte inbox; the consumer parses
+    // nothing yet. A requeue-on-full conn would burn a pass per
+    // synthetic event until the deadline.
+    var big: [1000]u8 = undefined;
+    @memset(&big, 0x3c);
+    _ = try posix.write(pair[1], &big);
+    var list: ConnList = .{};
+    _ = try loop.scheduleIn(100, mkConnCtx(9));
+    var passes: usize = 0;
+    var done = false;
+    while (!done and passes < 100_000) : (passes += 1) {
+        try loop.wait();
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => done = true,
+                .readable, .writable => _ = c.onEvent(ev, &list),
+                else => {},
+            }
+        }
+        try walkDirty(&list, &loop);
+    }
+    try std.testing.expect(passes < 50);
+    try std.testing.expect(c.inbox_stalled);
+    try std.testing.expect(c.inbox.full());
+    try std.testing.expect(c.inbox.unread().len == 64);
+
+    // Consume through Conn: the park lifts and the drain resumes into
+    // the freed space (it parks again on the next full inbox).
+    c.consume(&list, 32);
+    try std.testing.expect(!c.inbox_stalled);
+    try std.testing.expect(c.requeue_read);
+    try std.testing.expect(c.on_dirty);
+    try walkDirty(&list, &loop);
+    try loop.wait();
+    while (loop.next()) |ev| {
+        switch (ev) {
+            .readable, .writable => _ = c.onEvent(ev, &list),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 64), c.inbox.unread().len);
     c.state = .closing;
     c.teardown();
 }
