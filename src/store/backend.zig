@@ -522,18 +522,20 @@ test "MemoryBackend: iterator honors a prefix past 256 bytes and rejects over-ca
     try db.put(ns, key_b, "b");
 
     const prefix = owner_a ++ "\x00";
-    var iter = try db.iterator(ns, prefix);
-    defer iter.deinit();
 
     // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
     var keys: [4][MAX_PREFIX_LEN]u8 = undefined;
     var key_lens: [4]usize = undefined;
     var scanned: usize = 0;
-    while (iter.next()) |entry| {
-        if (scanned == keys.len) return error.TooManyEntries;
-        @memcpy(keys[scanned][0..entry.key.len], entry.key);
-        key_lens[scanned] = entry.key.len;
-        scanned += 1;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
     }
     try std.testing.expectEqual(@as(usize, 1), scanned);
     try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
