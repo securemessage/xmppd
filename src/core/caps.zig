@@ -250,7 +250,6 @@ pub const SERVER_FEATURES = [_][]const u8{
     "http://jabber.org/protocol/pubsub#persistent-items",
     "http://jabber.org/protocol/pubsub#publish",
     "http://jabber.org/protocol/pubsub#retrieve-items",
-    "http://jabber.org/protocol/pubsub#subscribe",
     "jabber:iq:last",
     "jabber:iq:register",
     "jabber:iq:roster",
@@ -453,6 +452,52 @@ test "SERVER_FEATURES: sorted alphabetically" {
     while (i < SERVER_FEATURES.len) : (i += 1) {
         const order = std.mem.order(u8, SERVER_FEATURES[i - 1], SERVER_FEATURES[i]);
         try std.testing.expect(order == .lt);
+    }
+}
+
+/// Every advertised pubsub#* feature and the iq_handler.zig dispatch branch
+/// that backs it. `verb` is the pubsub element the dispatch routes; `call` is
+/// the code that carries out the feature's contract. pubsub#subscribe is
+/// deliberately absent: no subscribe handler exists, so it is not advertised.
+const PubsubDispatch = struct {
+    feature: []const u8,
+    verb: []const u8,
+    call: []const u8,
+};
+
+const PUBSUB_DISPATCH = [_]PubsubDispatch{
+    // <publish> is the only PEP write verb: the store upsert covers
+    // auto-create and persistent-items, and the notification fan-out it
+    // triggers is the XEP-0163 roster-derived auto-subscribe model.
+    .{ .feature = "http://jabber.org/protocol/pubsub#publish", .verb = "publish", .call = "handlePepPublish" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#auto-create", .verb = "publish", .call = "ps.publish(" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#persistent-items", .verb = "publish", .call = "ps.publish(" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#auto-subscribe", .verb = "publish", .call = "sendPepNotification(" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#retrieve-items", .verb = "items", .call = "handlePepItems" },
+};
+
+test "SERVER_FEATURES: every advertised pubsub feature has a dispatch branch" {
+    // Goal: an advertised pubsub#* feature must name the iq_handler branch
+    // that implements it, so a claim like pubsub#subscribe (no handler)
+    // cannot be advertised. Method: match each advertised feature against
+    // PUBSUB_DISPATCH, then verify the verb dispatch and implementing call
+    // are present in the iq_handler source.
+    const src = @embedFile("iq_handler.zig");
+
+    for (SERVER_FEATURES) |feature| {
+        if (!std.mem.startsWith(u8, feature, "http://jabber.org/protocol/pubsub#")) continue;
+
+        const entry = for (PUBSUB_DISPATCH) |d| {
+            if (std.mem.eql(u8, d.feature, feature)) break d;
+        } else {
+            std.debug.print("pubsub feature advertised with no dispatch branch: {s}\n", .{feature});
+            return error.PubsubFeatureUndispatched;
+        };
+
+        var needle_buf: [64]u8 = undefined;
+        const verb_needle = std.fmt.bufPrint(&needle_buf, "local_name, \"{s}\"", .{entry.verb}) catch unreachable;
+        try std.testing.expect(std.mem.indexOf(u8, src, verb_needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, entry.call) != null);
     }
 }
 
