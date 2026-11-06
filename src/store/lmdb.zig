@@ -428,6 +428,7 @@ pub const LmdbBackend = struct {
     }
 
     pub fn iterator(self: *LmdbBackend, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > backend.MAX_PREFIX_LEN) return error.PrefixTooLong;
         const dbi = try self.getOrCreateDbi(ns);
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
         errdefer txn.abort();
@@ -439,10 +440,10 @@ pub const LmdbBackend = struct {
             .cursor = cur,
             .txn = txn,
             .prefix = undefined,
-            .prefix_len = @min(prefix.len, 256),
+            .prefix_len = prefix.len,
             .started = false,
         };
-        @memcpy(iter.prefix[0..iter.prefix_len], prefix[0..iter.prefix_len]);
+        @memcpy(iter.prefix[0..iter.prefix_len], prefix);
         return iter;
     }
 
@@ -459,7 +460,7 @@ pub const LmdbBackend = struct {
     pub const Iterator = struct {
         cursor: lmdb.Cursor,
         txn: lmdb.Transaction,
-        prefix: [256]u8,
+        prefix: [backend.MAX_PREFIX_LEN]u8,
         prefix_len: usize,
         started: bool,
 
@@ -718,6 +719,54 @@ test "LmdbBackend: iterator prefix-bounded" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "LmdbBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime backend.registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    // The scan is scoped: the iterator's read txn must close before the
+    // deletes open a write txn on this thread.
+    var keys: [4][backend.MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (backend.MAX_PREFIX_LEN + 1)));
 }
 
 test "LmdbBackend: iterator returns key and value" {
