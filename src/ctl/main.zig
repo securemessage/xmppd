@@ -547,7 +547,11 @@ fn runMigratePrecis(
 
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();
-    try printMigrationPlan(allocator, &plan);
+    var out_buf: [0]u8 = .{};
+    var stdout = std.fs.File.stdout().writer(&out_buf);
+    var err_buf: [0]u8 = .{};
+    var stderr = std.fs.File.stderr().writer(&err_buf);
+    try printMigrationPlan(allocator, &plan, &stdout.interface, &stderr.interface);
     if (plan.hasBlockingIssues()) {
         printErr("migration blocked; resolve every collision or invalid name and rerun\n");
         return error.MigrationBlocked;
@@ -563,45 +567,50 @@ fn runMigratePrecis(
     printOut(line);
 }
 
-fn printMigrationPlan(allocator: std.mem.Allocator, plan: *const migrate_precis.Plan) !void {
+fn printMigrationPlan(
+    allocator: std.mem.Allocator,
+    plan: *const migrate_precis.Plan,
+    out: *std.Io.Writer,
+    errw: *std.Io.Writer,
+) !void {
     for (plan.renames.items) |rename| {
         const old_hex = try migrate_precis.hexKey(allocator, rename.old_key);
         defer allocator.free(old_hex);
         const new_hex = try migrate_precis.hexKey(allocator, rename.new_key);
         defer allocator.free(new_hex);
         if (rename.delete_only) {
-            printOut("dedupe-drop ");
+            try out.writeAll("dedupe-drop ");
         } else if (rename.same_key) {
-            printOut("rewrite-value ");
+            try out.writeAll("rewrite-value ");
         } else {
-            printOut("rename ");
+            try out.writeAll("rename ");
         }
-        printOut(@tagName(rename.db));
-        printOut(" ");
-        printOut(rename.namespace);
-        printOut(" ");
-        printOut(old_hex);
-        printOut(" -> ");
-        printOut(new_hex);
-        printOut("\n");
+        try out.writeAll(@tagName(rename.db));
+        try out.writeAll(" ");
+        try out.writeAll(rename.namespace);
+        try out.writeAll(" ");
+        try out.writeAll(old_hex);
+        try out.writeAll(" -> ");
+        try out.writeAll(new_hex);
+        try out.writeAll("\n");
     }
     for (plan.issues.items) |issue| {
         const key_hex = try migrate_precis.hexKey(allocator, issue.key);
         defer allocator.free(key_hex);
-        printErr(@tagName(issue.kind));
-        printErr(" ");
-        printErr(@tagName(issue.db));
-        printErr(" ");
-        printErr(issue.namespace);
-        printErr(" ");
-        printErr(key_hex);
+        try errw.writeAll(@tagName(issue.kind));
+        try errw.writeAll(" ");
+        try errw.writeAll(@tagName(issue.db));
+        try errw.writeAll(" ");
+        try errw.writeAll(issue.namespace);
+        try errw.writeAll(" ");
+        try errw.writeAll(key_hex);
         if (issue.target.len != 0) {
             const target = try escapeBytesAlloc(allocator, issue.target);
             defer allocator.free(target);
-            printErr(" -> ");
-            printErr(target);
+            try errw.writeAll(" -> ");
+            try errw.writeAll(target);
         }
-        printErr("\n");
+        try errw.writeAll("\n");
     }
 }
 
@@ -899,6 +908,26 @@ test "xmppctl escapes control bytes in collision targets" {
     const escaped = try escapeBytesAlloc(allocator, "alice@us.example\x00naplestb@us.example");
     defer allocator.free(escaped);
     try std.testing.expectEqualStrings("alice@us.example\\x00naplestb@us.example", escaped);
+}
+
+test "xmppctl printMigrationPlan escapes NUL in dedupe targets" {
+    const allocator = std.testing.allocator;
+    var plan = migrate_precis.Plan.init(allocator);
+    defer plan.deinit();
+    try plan.issues.append(allocator, .{
+        .db = .op,
+        .namespace = "by_contact",
+        .kind = .deduplicated,
+        .key = try allocator.dupe(u8, "dedupe-key"),
+        .target = try allocator.dupe(u8, "alice@us.example\x00naplestb@us.example"),
+    });
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err_buf: [512]u8 = undefined;
+    var errw: std.Io.Writer = .fixed(&err_buf);
+    try printMigrationPlan(allocator, &plan, &out, &errw);
+    try std.testing.expect(std.mem.indexOf(u8, errw.buffered(), "alice@us.example\\x00naplestb@us.example") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, errw.buffered(), 0) == null);
 }
 
 test "extractLocal: JID with domain" {
