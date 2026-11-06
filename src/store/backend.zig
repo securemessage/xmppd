@@ -22,10 +22,17 @@
 //!
 //! Iterators are prefix-bounded. `next()` returns null when the cursor key
 //! no longer starts with the prefix passed to `iterator()`. Each backend
-//! enforces this internally — callers never leak data from adjacent
-//! namespaces.
+//! enforces this internally: callers never leak data from adjacent
+//! namespaces. The full caller prefix is honored up to `MAX_PREFIX_LEN`;
+//! a longer prefix can match no stored key, so `iterator()` rejects it
+//! with `error.PrefixTooLong` instead of truncating.
 
 const std = @import("std");
+
+/// Longest iterator prefix honored exactly. Keys are capped at
+/// keys.MAX_KEY_LEN (the LMDB limit), so a longer prefix matches nothing
+/// and is rejected rather than clipped.
+pub const MAX_PREFIX_LEN: usize = @import("keys.zig").MAX_KEY_LEN;
 
 /// Options for opening a storage backend.
 pub const OpenOptions = struct {
@@ -103,7 +110,8 @@ pub const Entry = struct {
 ///   fn put(self: *B, ns: []const u8, key: []const u8, value: []const u8) !void
 ///   fn delete(self: *B, ns: []const u8, key: []const u8) !void
 ///
-///   // Prefix-bounded iteration
+///   // Prefix-bounded iteration; error.PrefixTooLong when
+///   // prefix.len > MAX_PREFIX_LEN
 ///   fn iterator(self: *B, ns: []const u8, prefix: []const u8) !B.Iterator
 ///
 ///   // Atomic batch writes
@@ -243,6 +251,7 @@ pub const MemoryBackend = struct {
     };
 
     pub fn iterator(self: *Self, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > MAX_PREFIX_LEN) return error.PrefixTooLong;
         const map = self.namespaces.get(ns) orelse return .{ .entries = &.{}, .pos = 0 };
         const alloc = self.arena.allocator();
 
@@ -492,6 +501,49 @@ test "MemoryBackend: iterator prefix-bounded" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "MemoryBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    var keys: [4][MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    while (iter.next()) |entry| {
+        if (scanned == keys.len) return error.TooManyEntries;
+        @memcpy(keys[scanned][0..entry.key.len], entry.key);
+        key_lens[scanned] = entry.key.len;
+        scanned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (MAX_PREFIX_LEN + 1)));
 }
 
 test "MemoryBackend: iterator on missing namespace" {
