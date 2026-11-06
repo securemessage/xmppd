@@ -131,44 +131,15 @@ test "the LMDB offline lock survives env open and blocks a second writer" {
     var open = true;
     defer if (open) auth.close();
     // Closing a second descriptor after env open would release the lock;
-    // a child must still be refused while the offline env is open.
-    try std.testing.expectEqual(@as(u8, 'B'), try childExclusiveLockProbe(path));
+    // a child must still be refused while the offline env is open. The read
+    // probe pins the post-open exclusive re-take: a downgraded shared lock
+    // would let a second reader in.
+    try std.testing.expectEqual(@as(u8, 'B'), try childLockProbe(path, std.c.F.WRLCK));
+    try std.testing.expectEqual(@as(u8, 'B'), try childLockProbe(path, std.c.F.RDLCK));
     auth.close();
     open = false;
-    try std.testing.expectEqual(@as(u8, 'A'), try childExclusiveLockProbe(path));
-}
-
-/// Child probe: 'A' when it acquired the byte-0 lock, 'B' when refused.
-fn childExclusiveLockProbe(path: []const u8) !u8 {
-    var lock_path_buf: [4096]u8 = undefined;
-    const lock_path = try std.fmt.bufPrint(&lock_path_buf, "{s}/lock.mdb", .{path});
-    const pipe_fds = try std.posix.pipe();
-    const pid = try std.posix.fork();
-    if (pid == 0) {
-        std.posix.close(pipe_fds[0]);
-        var file = std.fs.cwd().openFile(lock_path, .{ .mode = .read_write }) catch std.posix.exit(2);
-        defer file.close();
-        var lock: std.posix.Flock = .{
-            .start = 0,
-            .len = 1,
-            .pid = 0,
-            .type = std.c.F.WRLCK,
-            .whence = 0,
-            .sysid = 0,
-        };
-        const rc = std.c.fcntl(file.handle, std.c.F.SETLK, &lock);
-        const byte: u8 = if (rc == 0) 'A' else 'B';
-        _ = std.posix.write(pipe_fds[1], &.{byte}) catch {};
-        std.posix.close(pipe_fds[1]);
-        std.posix.exit(0);
-    }
-    std.posix.close(pipe_fds[1]);
-    var result: [1]u8 = undefined;
-    const count = try std.posix.read(pipe_fds[0], &result);
-    std.posix.close(pipe_fds[0]);
-    _ = std.posix.waitpid(pid, 0);
-    if (count != 1) return error.ProbeFailed;
-    return result[0];
+    try std.testing.expectEqual(@as(u8, 'A'), try childLockProbe(path, std.c.F.WRLCK));
+    try std.testing.expectEqual(@as(u8, 'A'), try childLockProbe(path, std.c.F.RDLCK));
 }
 
 test "a daemon starting during an offline hold must be restarted" {
