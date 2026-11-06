@@ -228,6 +228,9 @@ const Job = struct {
     /// at the per-query deadline, so the job takes no new waiters and
     /// its wire query only updates the cache row.
     refresh_only: bool = false,
+    /// Set while answerStaleRaw runs this job's callbacks: the job
+    /// stays on `jobs`, so the refresh-only reclaim must not free it.
+    answering: bool = false,
 
     targets: std.ArrayListUnmanaged(Target) = .{},
 };
@@ -1105,7 +1108,9 @@ pub const Resolver = struct {
         const hit = job.stale.?;
         if (job.is_raw) {
             job.refresh_only = true;
+            job.answering = true;
             self.answerStaleRaw(job, hit);
+            job.answering = false;
             job.waiter_count = 0;
             self.armChainDeadline(job) catch {
                 self.dropJob(job, .failed);
@@ -1734,7 +1739,7 @@ pub const Resolver = struct {
     /// job was freed.
     fn dropRefreshOnly(self: *Resolver) bool {
         for (self.jobs.items, 0..) |job, i| {
-            if (job.refresh_only) {
+            if (job.refresh_only and !job.answering) {
                 _ = self.jobs.orderedRemove(i);
                 self.freeJob(job);
                 return true;
@@ -6764,6 +6769,55 @@ test "dns-async: a lookup inside a completion callback reclaims a refresh-only s
     try std.testing.expect(ctx.err2 == null);
     try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
     try std.testing.expectEqual(@as(usize, MAX_JOBS), r.jobs.items.len);
+}
+
+const StaleCbQueryCtx = struct {
+    r: *Resolver,
+    fired: bool = false,
+    queued_in_cb: usize = 0,
+    status: ?Status = null,
+
+    fn onQuery(ctx_ptr: ?*anyopaque, _: usize, status: Status, res: ?RecordResult) void {
+        const self: *StaleCbQueryCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.status = status;
+        if (res) |x| {
+            var y = x;
+            y.deinitOn(std.testing.allocator);
+        }
+        if (self.fired) return;
+        self.fired = true;
+        self.r.query("cbx1.test", .a, 7001) catch {};
+        self.queued_in_cb = self.r.wait_queue.items.len;
+    }
+};
+
+test "dns-async: a stale callback's lookup never reclaims the answering job" {
+    // Goal: a raw stale refresh still answering its waiters keeps
+    // its slot: a lookup issued inside the waiter callback queues
+    // instead of freeing the answering job out from under the feed.
+    // Method: fill the table with one stale refresh plus misses,
+    // fire the first job's per-query deadline, record the queue
+    // inside the callback and after the deadline returns.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleA(&r, "stale.test", &.{ 10, 1, 1, 1 });
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = StaleCbQueryCtx{ .r = &r };
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = StaleCbQueryCtx.onQuery });
+    try r.query("stale.test", .a, 1);
+    var nb: [32]u8 = undefined;
+    for (0..MAX_JOBS - 1) |i| {
+        const n = std.fmt.bufPrint(&nb, "miss{d}.test", .{i}) catch unreachable;
+        try r.query(n, .a, 5000 + i);
+    }
+    r.onDeadline(r.jobs.items[0]);
+    // The callback's query queued behind the full table; once the
+    // answering job finished converting, promoteWait handed the
+    // freed slot to the queue.
+    try std.testing.expectEqual(@as(usize, 1), ctx.queued_in_cb);
+    try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
 }
 
 test "dns-async: a chain deadline serves the stale row it refreshed" {
