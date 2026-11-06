@@ -7,6 +7,7 @@ pub const ScramServer = scram.ScramServer;
 pub const ScramClient = scram.ScramClient;
 pub const ScramClientSha1 = scram.ScramClientSha1;
 pub const StoredCredentials = scram.StoredCredentials;
+pub const password_len_max = scram.password_len_max;
 pub const PlainCredentials = plain.PlainCredentials;
 
 /// Supported SASL mechanisms.
