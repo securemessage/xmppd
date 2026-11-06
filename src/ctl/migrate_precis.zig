@@ -62,8 +62,14 @@ pub const Rename = struct {
     /// The changed component is a reference; an occupied prepared key is a
     /// dedupe, not a collision.
     reference_duplicate: bool = false,
+    /// The changed component is a data-only owner; an occupied target row is
+    /// the same nonexistent identity and is deduplicated.
+    data_duplicate: bool = false,
     /// Remove old_key without writing new_key (deduplicated reference row).
     delete_only: bool = false,
+    /// The source spelling names a users row; used to pick the winner when
+    /// several references move into one freed prepared key.
+    has_users: bool = false,
 };
 
 pub const Plan = struct {
@@ -119,6 +125,9 @@ const Rewrite = struct {
     /// occupies the prepared key, this row is deduplicated rather than a
     /// collision: the prepared-key row wins.
     reference_duplicate: bool = false,
+    /// The changed component is a data-only owner; an occupied target row is
+    /// deduplicated because it is the same nonexistent identity.
+    data_duplicate: bool = false,
 
     fn deinit(self: *Rewrite, allocator: std.mem.Allocator) void {
         if (self.new_key) |key| allocator.free(key);
@@ -219,6 +228,7 @@ const RewriteContext = struct {
     hosted_domains: []const []const u8,
     forced: ?ForcedRename,
     identities: *IdentityTracker,
+    users_sources: *const std.StringHashMapUnmanaged(void),
 };
 
 const Ownership = enum {
@@ -440,6 +450,34 @@ fn rewriteEntry(
     return rewrite;
 }
 
+fn localpartHasUsers(set: *const std.StringHashMapUnmanaged(void), jid_or_name: []const u8) bool {
+    const local = if (std.mem.indexOfScalar(u8, jid_or_name, '@')) |at| jid_or_name[0..at] else jid_or_name;
+    return set.contains(local);
+}
+
+fn renameHasUsers(ns: []const u8, key: []const u8, set: *const std.StringHashMapUnmanaged(void)) bool {
+    if (std.mem.eql(u8, ns, NS_LOCKS) or std.mem.eql(u8, ns, NS_USERS)) {
+        return localpartHasUsers(set, key);
+    }
+    if (std.mem.eql(u8, ns, NS_VCARDS) or
+        std.mem.eql(u8, ns, NS_LASTACT) or
+        std.mem.eql(u8, ns, NS_PEP) or
+        std.mem.eql(u8, ns, NS_OFFLINE) or
+        std.mem.eql(u8, ns, NS_MESSAGES))
+    {
+        const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+        return localpartHasUsers(set, key[0..sep]);
+    }
+    const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return localpartHasUsers(set, key);
+    if (std.mem.eql(u8, ns, NS_ROOM_AFFILIATIONS)) {
+        return localpartHasUsers(set, key[first_sep + 1 ..]);
+    }
+    if (localpartHasUsers(set, key[0..first_sep])) return true;
+    const rest = key[first_sep + 1 ..];
+    const second_sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    return localpartHasUsers(set, rest[0..second_sep]);
+}
+
 fn addIssue(
     plan: *Plan,
     db: Database,
@@ -538,6 +576,8 @@ fn planNamespace(
                 .same_key = rewrite.new_key == null,
                 .value_len = entry.value.len,
                 .reference_duplicate = rewrite.reference_duplicate,
+                .data_duplicate = rewrite.data_duplicate,
+                .has_users = renameHasUsers(namespace, entry.key, ctx.users_sources),
             });
         }
     }
@@ -549,6 +589,7 @@ fn planNamespace(
     for (pending.items) |rename| {
         if (!rename.same_key) try old_keys.put(plan.allocator, rename.old_key, {});
     }
+    std.sort.heap(Rename, pending.items, {}, pendingLessThan);
 
     for (pending.items) |rename| {
         if (!rename.same_key) {
@@ -556,19 +597,17 @@ fn planNamespace(
             var id_owned = true;
             defer if (id_owned) plan.allocator.free(id);
             var occupied = targets.contains(id);
-            var existing_row = false;
             if (!occupied) {
                 const existing = try backend.get(plan.allocator, namespace, rename.new_key);
                 if (existing) |value| {
                     plan.allocator.free(value);
-                    existing_row = true;
                     // The occupant is itself renamed away by this plan, so the
                     // key will be free by the time this row is written.
                     occupied = !old_keys.contains(rename.new_key);
                 }
             }
-            if (occupied or existing_row) {
-                if (rename.reference_duplicate) {
+            if (occupied) {
+                if (rename.reference_duplicate or rename.data_duplicate) {
                     // The prepared-key row wins; the duplicate old row is
                     // deleted so it cannot survive the migration.
                     try addIssue(plan, db, namespace, .deduplicated, rename.old_key, rename.new_key);
@@ -607,6 +646,11 @@ fn planDb(
     for (namespaces) |namespace| {
         try planNamespace(plan, targets, db, backend, namespace, ctx);
     }
+}
+
+fn pendingLessThan(_: void, a: Rename, b: Rename) bool {
+    if (a.has_users != b.has_users) return a.has_users;
+    return std.mem.lessThan(u8, a.old_key, b.old_key);
 }
 
 fn renameLessThan(_: void, a: Rename, b: Rename) bool {
@@ -658,13 +702,39 @@ pub fn planMigration(
 
     var identities = IdentityTracker{ .plan = &plan, .db = .auth, .namespace = "" };
     defer identities.deinit(allocator);
+    const empty_users: std.StringHashMapUnmanaged(void) = .{};
+    const auth_ctx = RewriteContext{
+        .hosted_domains = hosted_domains,
+        .forced = forced,
+        .identities = &identities,
+        .users_sources = &empty_users,
+    };
+    try planDb(&plan, &targets, .auth, auth, &.{ NS_USERS, NS_LOCKS }, &auth_ctx);
+
+    // Reference writers into one freed prepared key prefer the spelling that
+    // is a real users row (bobref3: Bob over stale BOB).
+    var users_sources: std.StringHashMapUnmanaged(void) = .{};
+    defer {
+        var keys = users_sources.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        users_sources.deinit(allocator);
+    }
+    {
+        var iterator = try auth.iterator(NS_USERS, "");
+        defer iterator.deinit();
+        while (iterator.next()) |entry| {
+            const key = try allocator.dupe(u8, entry.key);
+            errdefer allocator.free(key);
+            try users_sources.put(allocator, key, {});
+        }
+    }
     const ctx = RewriteContext{
         .hosted_domains = hosted_domains,
         .forced = forced,
         .identities = &identities,
+        .users_sources = &users_sources,
     };
 
-    try planDb(&plan, &targets, .auth, auth, &.{ NS_USERS, NS_LOCKS }, &ctx);
     try planDb(&plan, &targets, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -719,8 +789,10 @@ fn appendOrderedNamespace(
     defer allocator.free(dependent);
     @memset(dependent, null);
     for (items, 0..) |rename, i| {
+        if (rename.delete_only) continue;
         if (old_index.get(rename.new_key)) |j| {
             if (j != i) {
+                if (dependent[j] != null) return error.DuplicateRenameTarget;
                 indegree[i] = 1;
                 dependent[j] = i;
             }
@@ -762,7 +834,7 @@ fn orderForDb(allocator: std.mem.Allocator, plan: *const Plan, db: Database) ![]
     return ordered.toOwnedSlice(allocator);
 }
 
-fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Plan, db: Database) !void {
+fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Plan, db: Database, order: []const usize) !void {
     var any = false;
     for (plan.renames.items) |rename| {
         if (rename.db == db) {
@@ -789,8 +861,6 @@ fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Pl
         if (values.items[i] == null) return error.MissingSourceRow;
     }
 
-    const order = try orderForDb(allocator, plan, db);
-    defer allocator.free(order);
     var batch = try backend.writeBatch();
     errdefer batch.abort();
     for (order) |i| {
@@ -798,6 +868,15 @@ fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Pl
         try applyRename(&batch, rename, values.items[i]);
     }
     try batch.commit();
+}
+
+fn preflightDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Plan, db: Database) !void {
+    for (plan.renames.items) |rename| {
+        if (rename.db != db or rename.new_value != null) continue;
+        const value = try backend.get(allocator, rename.namespace, rename.old_key);
+        if (value == null) return error.MissingSourceRow;
+        allocator.free(value.?);
+    }
 }
 
 fn keyPrefix(key: []const u8) []const u8 {
@@ -865,11 +944,10 @@ fn applyGroupedDb(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     db: Database,
+    order: []const usize,
     journal_dir: ?[]const u8,
 ) !void {
-    const order = try orderForDb(allocator, plan, db);
-    defer allocator.free(order);
-
+    _ = db;
     var position: usize = 0;
     while (position < order.len) {
         const first = plan.renames.items[order[position]];
@@ -928,18 +1006,33 @@ pub fn applyPlan(
     }
     const journaled = archive_work or plan.rename_bytes > options.single_txn_budget;
     if (journaled and options.journal_dir == null) return error.JournalRequired;
+
+    // Validate every DB before the first mutation: dependency cycles, missing
+    // source rows and key/order problems must never surface after another env
+    // has committed. Op commits before auth so an op failure leaves auth
+    // untouched; archive is last and its own WriteBatch is atomic.
+    const auth_order = try orderForDb(allocator, plan, .auth);
+    defer allocator.free(auth_order);
+    const op_order = try orderForDb(allocator, plan, .op);
+    defer allocator.free(op_order);
+    const archive_order = try orderForDb(allocator, plan, .archive);
+    defer allocator.free(archive_order);
+    try preflightDb(auth, allocator, plan, .auth);
+    try preflightDb(op, allocator, plan, .op);
+    try preflightDb(archive, allocator, plan, .archive);
+
     if (options.journal_dir) |dir| {
         if (journaled) try writePlanFile(allocator, dir, plan);
     }
 
     if (plan.rename_bytes <= options.single_txn_budget) {
-        try applySingleDb(auth, allocator, plan, .auth);
-        try applySingleDb(op, allocator, plan, .op);
+        try applySingleDb(op, allocator, plan, .op, op_order);
+        try applySingleDb(auth, allocator, plan, .auth, auth_order);
     } else {
-        try applyGroupedDb(auth, allocator, plan, .auth, options.journal_dir);
-        try applyGroupedDb(op, allocator, plan, .op, options.journal_dir);
+        try applyGroupedDb(op, allocator, plan, .op, op_order, options.journal_dir);
+        try applyGroupedDb(auth, allocator, plan, .auth, auth_order, options.journal_dir);
     }
-    try applyGroupedDb(archive, allocator, plan, .archive, options.journal_dir);
+    try applyGroupedDb(archive, allocator, plan, .archive, archive_order, options.journal_dir);
 }
 
 const Deletion = struct {
@@ -947,6 +1040,8 @@ const Deletion = struct {
     namespace: []const u8,
     key: []u8,
 };
+
+pub const RawDeleteKind = enum { account, data_only };
 
 fn jidMatchesRaw(jid: []const u8, raw: []const u8, hosted_domains: []const []const u8) bool {
     const at = std.mem.indexOfScalar(u8, jid, '@') orelse return false;
@@ -1019,11 +1114,16 @@ fn entryMatchesRaw(
 ) bool {
     _ = db;
     if (std.mem.eql(u8, namespace, NS_USERS)) return std.mem.eql(u8, key, raw);
+    if (!delete_locks) {
+        // No users row: delete only rows this exact raw spelling owns.
+        // References (another roster's contact, a room member, an archive
+        // index or offline sender) belong to the account the spelling folds
+        // into, not to this data-only spelling.
+        return entryOwnsRaw(namespace, key, raw, hosted_domains);
+    }
     if (std.mem.eql(u8, namespace, NS_LOCKS)) {
-        // A data-only spelling can equal a prepared lock key owned by the
-        // surviving account. Only a real users-row deletion may remove the
-        // exact raw lock.
-        return delete_locks and std.mem.eql(u8, key, raw);
+        // A real users-row deletion may remove its exact raw lock.
+        return std.mem.eql(u8, key, raw);
     }
     if (std.mem.eql(u8, namespace, NS_ROSTERS) or
         std.mem.eql(u8, namespace, NS_BLOCKLIST) or

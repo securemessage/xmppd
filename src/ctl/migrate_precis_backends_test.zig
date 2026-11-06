@@ -449,6 +449,59 @@ test "migrate-precis forced rename frees its target for another account" {
     try std.testing.expect((try users.lookup(allocator, "bob2")) != null);
 }
 
+test "migrate-precis forced rename moves references into the freed key" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "Bob", "pw-a");
+    try users.addUser(allocator, "bob", "pw-b");
+    var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
+    try roster.setItem("carol@us.example", "Bob@us.example", "Bob (real)", .both, false);
+    try roster.setItem("carol@us.example", "bob@us.example", "bob (other)", .both, false);
+    try roster.setItem("carol@us.example", "BOB@us.example", "stale", .both, false);
+    var rooms = room_store_mod.RoomStore(MemoryBackend).init(&op, allocator);
+    try rooms.setAffiliation("room@conference.us.example", "Bob@us.example", .owner);
+    try rooms.setAffiliation("room@conference.us.example", "bob@us.example", .member);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, .{
+        .old_localpart = "bob",
+        .new_localpart = "bob2",
+    });
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    var deduplicated: usize = 0;
+    for (plan.issues.items) |issue| {
+        if (issue.kind == .deduplicated) deduplicated += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), deduplicated);
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{});
+
+    const real = try roster.getItem(allocator, "carol@us.example", "bob@us.example");
+    defer if (real) |entry| if (entry.name.len > 0) allocator.free(entry.name);
+    try std.testing.expect(real != null);
+    try std.testing.expectEqualStrings("Bob (real)", real.?.name);
+    const other = try roster.getItem(allocator, "carol@us.example", "bob2@us.example");
+    defer if (other) |entry| if (entry.name.len > 0) allocator.free(entry.name);
+    try std.testing.expect(other != null);
+    try std.testing.expectEqualStrings("bob (other)", other.?.name);
+    try std.testing.expect((try roster.getItem(allocator, "carol@us.example", "BOB@us.example")) == null);
+    try std.testing.expectEqual(room_store_mod.Affiliation.owner, try rooms.getAffiliation("room@conference.us.example", "bob@us.example"));
+    try std.testing.expectEqual(room_store_mod.Affiliation.member, try rooms.getAffiliation("room@conference.us.example", "bob2@us.example"));
+
+    var clean = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer clean.deinit();
+    try std.testing.expectEqual(@as(usize, 0), clean.renames.items.len);
+    try std.testing.expect(!clean.hasBlockingIssues());
+}
+
 test "migrate-precis keeps account-owned data without a users row as a collision" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
@@ -669,6 +722,98 @@ test "deluser --raw reports data that remains after an incomplete cascade" {
     try users.addUser(allocator, "Bob", "pw");
     const domains = [_][]const u8{"us.example"};
     try std.testing.expectError(error.DataRemaining, migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "Bob"));
+}
+
+const FailingCommitBackend = struct {
+    inner: backend_mod.MemoryBackend,
+
+    pub const Iterator = backend_mod.MemoryBackend.Iterator;
+
+    pub fn open(path: []const u8, opts: backend_mod.OpenOptions) !FailingCommitBackend {
+        return .{ .inner = try backend_mod.MemoryBackend.open(path, opts) };
+    }
+
+    pub fn close(self: *FailingCommitBackend) void {
+        self.inner.close();
+    }
+
+    pub fn get(self: *FailingCommitBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+        return self.inner.get(allocator, ns, key);
+    }
+
+    pub fn put(self: *FailingCommitBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
+        try self.inner.put(ns, key, value);
+    }
+
+    pub fn delete(self: *FailingCommitBackend, ns: []const u8, key: []const u8) !void {
+        try self.inner.delete(ns, key);
+    }
+
+    pub fn iterator(self: *FailingCommitBackend, ns: []const u8, prefix: []const u8) !backend_mod.MemoryBackend.Iterator {
+        return self.inner.iterator(ns, prefix);
+    }
+
+    pub const WriteBatch = struct {
+        inner: backend_mod.MemoryBackend.WriteBatch,
+
+        pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            try self.inner.put(ns, key, value);
+        }
+
+        pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
+            try self.inner.delete(ns, key);
+        }
+
+        pub fn commit(self: *WriteBatch) !void {
+            _ = self;
+            return error.InjectedCommitFailure;
+        }
+
+        pub fn abort(self: *WriteBatch) void {
+            self.inner.abort();
+        }
+    };
+
+    pub fn writeBatch(self: *FailingCommitBackend) !WriteBatch {
+        return .{ .inner = try self.inner.writeBatch() };
+    }
+};
+
+test "migrate-precis op commit failure leaves auth unchanged" {
+    const allocator = std.testing.allocator;
+    var auth = try backend_mod.MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try FailingCommitBackend.open("", .{});
+    defer op.close();
+    var archive = try backend_mod.MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(backend_mod.MemoryBackend).init(&auth);
+    try users.addUser(allocator, "Bob", "pw-a");
+    try users.addUser(allocator, "bob", "pw-b");
+    var roster = roster_store_mod.RosterStore(FailingCommitBackend).init(&op);
+    try roster.setItem("carol@us.example", "Bob@us.example", "Bob (real)", .both, false);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, .{
+        .old_localpart = "bob",
+        .new_localpart = "bob2",
+    });
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try std.testing.expectError(error.InjectedCommitFailure, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{}));
+    const bob_row = try auth.get(allocator, NS_USERS, "Bob");
+    defer if (bob_row) |value| allocator.free(value);
+    try std.testing.expect(bob_row != null);
+    const bob2_row = try auth.get(allocator, NS_USERS, "bob2");
+    defer if (bob2_row) |value| allocator.free(value);
+    try std.testing.expect(bob2_row == null);
+    const old_roster = try op.get(allocator, NS_ROSTERS, "carol@us.example\x00Bob@us.example");
+    defer if (old_roster) |value| allocator.free(value);
+    try std.testing.expect(old_roster != null);
+    const new_roster = try op.get(allocator, NS_ROSTERS, "carol@us.example\x00bob@us.example");
+    defer if (new_roster) |value| allocator.free(value);
+    try std.testing.expect(new_roster == null);
 }
 
 fn expectMissing(backend: anytype, namespace: []const u8, key: []const u8) !void {
