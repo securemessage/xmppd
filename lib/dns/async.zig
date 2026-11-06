@@ -268,6 +268,13 @@ const TypeEnt = struct {
     /// STALE_RECHECK_MS would otherwise read as a recent failure.
     last_fail_ms: i64 = std.math.minInt(i64),
     refreshing: bool = false,
+    /// Stale feeds in progress (serveStale); a borrowed row is never
+    /// freed, and the count never stands in for the refresh pin.
+    borrows: u16 = 0,
+
+    fn pinned(ent: *const TypeEnt) bool {
+        return ent.refreshing or ent.borrows > 0;
+    }
 };
 
 /// Cache owner: every type row for one folded qname, its LRU node and
@@ -1085,17 +1092,17 @@ pub const Resolver = struct {
     }
 
     /// Serve a stale row's answer to the job (RFC 8767): the row is
-    /// pinned while the feed runs so a callback reaching the cache
+    /// borrowed while the feed runs so a callback reaching the cache
     /// cannot free the borrowed records, and the feed never
-    /// recaches. The caller owns refresh bookkeeping; the pinned
-    /// flag is restored on exit.
+    /// recaches. The caller owns refresh bookkeeping; the borrow
+    /// never touches the refresh pin, so a pin holder dying inside
+    /// the feed leaves no orphan.
     fn serveStale(self: *Resolver, job: *Job, hit: CacheHit) void {
         const ent = hit.ent;
-        const pinned = ent.refreshing;
-        ent.refreshing = true;
+        ent.borrows += 1;
+        defer ent.borrows -= 1;
         self.noteStaleServe(hit.owner);
         self.feedEnt(job, ent, false);
-        ent.refreshing = pinned;
     }
 
     /// The per-query deadline fired on a job refreshing a stale row
@@ -1134,10 +1141,12 @@ pub const Resolver = struct {
         @memcpy(qname, job.pending_qname);
         const qtype = job.pending_qtype;
         job.stale = null;
-        ent.refreshing = false;
         // The feed may complete and free this job; only the copied
-        // query name and type are safe to use afterwards.
+        // query name and type are safe to use afterwards. The pin
+        // survives the feed so a callback cannot start a second
+        // refresh on the row.
         self.serveStale(job, hit);
+        ent.refreshing = false;
         self.spawnRefresh(qname, qtype);
     }
 
@@ -1956,7 +1965,7 @@ pub const Resolver = struct {
         // Past even the serve-stale window: prune the dead row now
         // rather than waiting for memory pressure to collect it; a
         // row pinned by an in-flight refresh dies with its job.
-        if (!ent.refreshing) {
+        if (!ent.pinned()) {
             self.removeTypeRow(owner, idx);
             if (owner.types.items.len == 0) self.removeOwner(owner);
         }
@@ -2023,6 +2032,7 @@ pub const Resolver = struct {
                 // still borrow this row, and dropping the flag lets
                 // a CNAME answer or eviction free it under it.
                 .refreshing = ent.refreshing,
+                .borrows = ent.borrows,
             };
             const new_bytes = typeEntBytes(ent);
             owner.bytes = owner.bytes - old_bytes + new_bytes;
@@ -2058,7 +2068,7 @@ pub const Resolver = struct {
             var i: usize = 0;
             while (i < owner.types.items.len) {
                 const ent = owner.types.items[i];
-                if (ent.rtype != rtype and !ent.refreshing) {
+                if (ent.rtype != rtype and !ent.pinned()) {
                     self.removeTypeRow(owner, i);
                     continue;
                 }
@@ -2103,7 +2113,7 @@ pub const Resolver = struct {
         const folded = foldName(&name_buf, qname) orelse return;
         const owner = self.owners.get(folded) orelse return;
         const idx = findTypeRow(owner, qtype) orelse return;
-        if (owner.types.items[idx].refreshing) return;
+        if (owner.types.items[idx].pinned()) return;
         self.removeTypeRow(owner, idx);
         if (owner.types.items.len == 0) self.removeOwner(owner);
     }
@@ -2140,7 +2150,7 @@ pub const Resolver = struct {
     /// borrowed by the job refreshing it.
     fn ownerPinned(owner: *const OwnerEnt) bool {
         for (owner.types.items) |ent| {
-            if (ent.refreshing) return true;
+            if (ent.pinned()) return true;
         }
         return false;
     }
@@ -6818,6 +6828,58 @@ test "dns-async: a stale callback's lookup never reclaims the answering job" {
     // freed slot to the queue.
     try std.testing.expectEqual(@as(usize, 1), ctx.queued_in_cb);
     try std.testing.expectEqual(@as(usize, 0), r.wait_queue.items.len);
+}
+
+const CancelOnResolveCtx = struct {
+    r: *Resolver,
+    armed: bool = false,
+    cancel_key: usize = 0,
+    status: ?Status = null,
+    res: ?Resolution = null,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, _: usize, status: Status, res: ?Resolution) void {
+        const self: *CancelOnResolveCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.status = status;
+        self.res = res;
+        if (self.armed) self.r.cancel(self.cancel_key);
+    }
+};
+
+test "dns-async: a stale feed cannot resurrect a dead job's refresh pin" {
+    // Goal: a stale serve borrows the row instead of re-pinning it,
+    // so a pin holder dying inside the feed leaves no orphan pin
+    // that would serve the row stale forever. Method: K's raw query
+    // pins the stale srv.test A row; J's chain is served that row
+    // while its resolve callback cancels K.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedSvcChain(&r, false);
+    var a_rrs = [1]wire.Rr{.{ .name = "srv.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 1, .rdata = &.{ 10, 1, 1, 1 } }};
+    r.cacheInsert("srv.test", KIND_A, &a_rrs, .none, 1);
+    fake_now += 2_000; // the A row alone is stale; the SRV rows stay fresh
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = CancelOnResolveCtx{ .r = &r };
+    r.setCallback(.{ .ctx = &ctx, .fun = CancelOnResolveCtx.onResolve });
+    var qctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &qctx, .fun = TestCtx.onQuery });
+    try r.query("srv.test", .a, 50); // K: raw refresh pins the row
+    const owner = r.owners.get("srv.test").?;
+    const ent = owner.types.items[Resolver.findTypeRow(owner, KIND_A).?];
+    try std.testing.expect(ent.refreshing);
+    ctx.armed = true;
+    ctx.cancel_key = 50;
+    try r.resolve("svc.test", .client, 5222, 60, false); // J serves the pinned row; its callback kills K
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    // The borrow ended with the feed and the pin died with K.
+    try std.testing.expect(!ent.refreshing);
+    try std.testing.expectEqual(@as(u16, 0), ent.borrows);
+    fake_now += 31_000; // past the recheck window
+    try r.query("srv.test", .a, 51);
+    // An orphan pin would answer from stale and start no wire job.
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
 }
 
 test "dns-async: a chain deadline serves the stale row it refreshed" {
