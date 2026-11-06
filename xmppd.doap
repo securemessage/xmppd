@@ -140,7 +140,7 @@
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0160.html"/>
         <xmpp:status>complete</xmpp:status>
-        <xmpp:note xml:lang="en">Store-and-forward while offline, delivered on next login. Offline-delivered messages are not yet stamped with an XEP-0203 delay, which XEP-0160 section 2 recommends; tracked in https://pacyworld.dev/securemessage/xmppd/issues/25.</xmpp:note>
+        <xmpp:note xml:lang="en">Store-and-forward while offline, delivered on next login with an XEP-0203 delay stamp (queue time, server domain as from) per XEP-0160 section 3.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -181,8 +181,8 @@
     <implements>
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0203.html"/>
-        <xmpp:status>partial</xmpp:status>
-        <xmpp:note xml:lang="en">urn:xmpp:delay stamps on MAM replay and MUC history; offline-delivered messages are not yet stamped.</xmpp:note>
+        <xmpp:status>complete</xmpp:status>
+        <xmpp:note xml:lang="en">urn:xmpp:delay stamps on MAM replay, MUC history, and offline-delivered messages.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

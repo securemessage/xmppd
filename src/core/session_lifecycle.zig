@@ -506,6 +506,12 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     defer store.freePointers(pointers);
     if (server.test_after_offline_pointers) |hook| hook(server, bare_jid);
 
+    // Scratch for the stamped wire copies, leased once for the whole drain:
+    // queueSendStanza copies, so the bank is reusable as soon as the send is
+    // queued.
+    var delay_lease = server.leaseByteScratch();
+    defer if (delay_lease) |*lease| lease.release();
+
     var delivered: usize = 0;
     var completed = true;
     for (pointers) |ptr| {
@@ -551,7 +557,23 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 delivered += 1;
                 continue;
             }
-            session.queueSendStanza(xml_data) catch {
+            // XEP-0203 (XEP-0160 section 3): stamp the queue time so the
+            // client renders when the message was stored, not when it
+            // arrived. Only the wire copy is stamped; the held bytes are
+            // never modified. SM replay resends these exact bytes and a
+            // stanza that already carries our delay goes out as stored,
+            // so the stamp is never duplicated.
+            var wire: []const u8 = xml_data;
+            var delay_buf: [64]u8 = undefined;
+            if (muc_handler.formatDelayStamp(&delay_buf, ptr.timestamp)) |stamp| {
+                if (delay_lease) |*lease| {
+                    wire = stampOfflineDelay(xml_data, domain, stamp, lease.buf) catch |err| blk: {
+                        log.warn("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
+                        break :blk xml_data;
+                    };
+                }
+            }
+            session.queueSendStanza(wire) catch {
                 // Send buffer full: stop here and let the writable handler
                 // drain the tail at the low-water mark. This message and the
                 // rest stay in the store, so nothing is lost.
@@ -619,6 +641,87 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
+}
+
+/// XEP-0203: insert a <delay/> as a direct child of a stored stanza's root
+/// element, written in the same pass as the stanza (no second parse, no
+/// allocation). `stamp` is the pointer's queue time in XEP-0082 form.
+/// Returns the wire bytes: a slice of `buf` when stamped, or `stanza`
+/// unchanged when it already carries a delay with our `from` (a re-stored
+/// or redelivered copy is never stamped twice) or when it has no writable
+/// root element. error.BufferTooSmall when the stamped copy exceeds `buf`.
+fn stampOfflineDelay(stanza: []const u8, domain: []const u8, stamp: []const u8, buf: []u8) error{BufferTooSmall}![]const u8 {
+    if (hasDelayFrom(stanza, domain)) return stanza;
+
+    // End of the root element's open tag, quote-aware: an attribute value
+    // may contain '>'. Malformed input goes back unstamped, never dropped.
+    if (stanza.len < 3 or stanza[0] != '<' or !std.ascii.isAlphabetic(stanza[1])) return stanza;
+    var gt: ?usize = null;
+    var in_quote: u8 = 0;
+    var i: usize = 1;
+    while (i < stanza.len) : (i += 1) {
+        const c = stanza[i];
+        if (in_quote != 0) {
+            if (c == in_quote) in_quote = 0;
+        } else if (c == '\'' or c == '"') {
+            in_quote = c;
+        } else if (c == '>') {
+            gt = i;
+            break;
+        }
+    }
+    const gt_idx = gt orelse return stanza;
+    const self_closing = stanza[gt_idx - 1] == '/';
+    var name_end: usize = 1;
+    while (name_end < stanza.len and isStanzaNameChar(stanza[name_end])) : (name_end += 1) {}
+
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeAll(stanza[0 .. gt_idx - @intFromBool(self_closing)]) catch return error.BufferTooSmall;
+    w.writeByte('>') catch return error.BufferTooSmall;
+    w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch return error.BufferTooSmall;
+    xml.escapeWrite(w, domain) catch return error.BufferTooSmall;
+    w.writeAll("' stamp='") catch return error.BufferTooSmall;
+    w.writeAll(stamp) catch return error.BufferTooSmall;
+    w.writeAll("'/>") catch return error.BufferTooSmall;
+    if (self_closing) {
+        w.writeAll("</") catch return error.BufferTooSmall;
+        w.writeAll(stanza[1..name_end]) catch return error.BufferTooSmall;
+        w.writeByte('>') catch return error.BufferTooSmall;
+    }
+    w.writeAll(stanza[gt_idx + 1 ..]) catch return error.BufferTooSmall;
+    return fbs.getWritten();
+}
+
+/// Whether the stanza already carries a <delay xmlns='urn:xmpp:delay'>
+/// element whose from is `domain`. Both attribute quote forms match.
+fn hasDelayFrom(stanza: []const u8, domain: []const u8) bool {
+    var sq_buf: [280]u8 = undefined;
+    const sq_from = std.fmt.bufPrint(&sq_buf, "from='{s}'", .{domain}) catch return false;
+    var dq_buf: [280]u8 = undefined;
+    const dq_from = std.fmt.bufPrint(&dq_buf, "from=\"{s}\"", .{domain}) catch return false;
+
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, stanza, pos, "<delay")) |idx| {
+        const boundary = if (idx + "<delay".len < stanza.len) stanza[idx + "<delay".len] else ' ';
+        if (boundary == ' ' or boundary == '\t' or boundary == '/' or boundary == '>') {
+            const gt = std.mem.indexOfScalarPos(u8, stanza, idx, '>') orelse return false;
+            const tag = stanza[idx..gt];
+            if (std.mem.indexOf(u8, tag, xml.ns.delay) != null and
+                (std.mem.indexOf(u8, tag, sq_from) != null or std.mem.indexOf(u8, tag, dq_from) != null))
+            {
+                return true;
+            }
+            pos = gt + 1;
+        } else {
+            pos = idx + 1;
+        }
+    }
+    return false;
+}
+
+fn isStanzaNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == ':' or c == '-' or c == '_' or c == '.';
 }
 
 /// Bounded prompt retries for an offline drain stalled on a store error.
@@ -1736,4 +1839,325 @@ test "S13: full changelist preserves the offline retry fallback" {
     try std.testing.expectEqual(OFFLINE_STALL_RETRY_MAX + 1, session.offline_store_stalls);
     try std.testing.expect(!session.offline_retry_timer_armed);
     try std.testing.expect(server.offline_retry_sweep_needed);
+}
+
+// ---- S35: XEP-0203 delay stamps on offline delivery ----
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |idx| {
+        n += 1;
+        pos = idx + 1;
+    }
+    return n;
+}
+
+/// Read what the drain queued onto the session's connection.
+fn readSent(fds: [2]posix.fd_t, session: *Session, buf: []u8) []const u8 {
+    _ = session.conn.flushSend() catch {};
+    const n = posix.read(fds[1], buf) catch 0;
+    return buf[0..n];
+}
+
+test "S35: offline delivery stamps the queue time once (XEP-0203)" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<delay xmlns='urn:xmpp:delay' from='localhost' stamp='1970-01-01T00:16:40Z'/>") != null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<body>held</body>") != null);
+}
+
+test "S35: a foreign delay stamp is kept and ours is added once" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body><delay xmlns='urn:xmpp:delay' from='other.example' stamp='2020-06-06T00:00:00Z'/></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    // Ours is added as a direct child; the foreign stamp is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, wire, "from='localhost' stamp='1970-01-01T00:16:40Z'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "from='other.example' stamp='2020-06-06T00:00:00Z'") != null);
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(wire, "urn:xmpp:delay"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "from='localhost'"));
+}
+
+test "S35: a stanza already stamped by us is not stamped twice" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // A re-stored copy (e.g. a resent message) already carries our stamp.
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><delay xmlns='urn:xmpp:delay' from='localhost' stamp='1999-12-31T23:59:59Z'/><body>held</body></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
+    try std.testing.expect(std.mem.indexOf(u8, wire, "1999-12-31T23:59:59Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "1970-01-01T00:16:40Z") == null);
+}
+
+test "S35: SM replay resends the stamped stanza unchanged" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    session.sm_enabled = true;
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
+
+    // The bytes the SM-resume replay would send are the tracked queue copy:
+    // they carry the stamp written at drain time, still exactly once.
+    var iter = session.sm_unacked.?.getUnacked();
+    var replayed: usize = 0;
+    while (iter.next()) |replayed_stanza| {
+        replayed += 1;
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(replayed_stanza, "urn:xmpp:delay"));
+        try std.testing.expect(std.mem.indexOf(u8, replayed_stanza, "stamp='1970-01-01T00:16:40Z'") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replayed);
+}
+
+test "S35: a message held behind the tail (cross-worker path) is stamped on drain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // The cross-worker dispatch holds a live message behind the draining
+    // tail as a held pointer; it reaches the wire through the same drain.
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "res" };
+    session.offline_pending = true;
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n2'><body>queued</body></message>";
+    const held = try offline_store.storeHeldPointerOnce("bob@localhost", "alice@localhost", "n2", 2000, stanza, 42);
+    try std.testing.expect(held == .stored);
+
+    drainOfflinePending(&server, session, &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<delay xmlns='urn:xmpp:delay' from='localhost' stamp='1970-01-01T00:33:20Z'/>") != null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<body>queued</body>") != null);
+}
+
+test "S35: live delivery carries no delay stamp" {
+    const allocator = std.testing.allocator;
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    session.queueSendStanza("<message from='alice@localhost' to='bob@localhost' id='l1'><body>live</body></message>") catch return error.TestUnexpectedResult;
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<body>live</body>") != null);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(wire, "urn:xmpp:delay"));
+}
+
+test "S35: stampOfflineDelay covers self-closing roots and quoted '>'" {
+    var buf: [1024]u8 = undefined;
+    const stamp = "2026-01-01T00:00:00Z";
+
+    const expanded = try stampOfflineDelay("<message from='a@x' to='b@x'/>", "x.test", stamp, &buf);
+    try std.testing.expectEqualStrings(
+        "<message from='a@x' to='b@x'><delay xmlns='urn:xmpp:delay' from='x.test' stamp='2026-01-01T00:00:00Z'/></message>",
+        expanded,
+    );
+
+    // A '>' inside a quoted attribute must not end the root open tag.
+    const tricky = "<message to='a>b@x' from='s@x'><body>hi</body></message>";
+    const stamped = try stampOfflineDelay(tricky, "x.test", stamp, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "to='a>b@x' from='s@x'><delay ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, stamped, "<body>hi</body></message>"));
+
+    // Already ours: returned unchanged.
+    var buf2: [1024]u8 = undefined;
+    const again = try stampOfflineDelay(stamped, "x.test", stamp, &buf2);
+    try std.testing.expectEqualStrings(stamped, again);
+
+    // A buffer too small reports the error instead of truncating.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, stampOfflineDelay("<message><body/></message>", "x.test", stamp, &tiny));
 }
