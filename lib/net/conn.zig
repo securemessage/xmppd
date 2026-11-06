@@ -867,7 +867,17 @@ pub const Conn = struct {
     pub fn teardown(c: *Conn) void {
         std.debug.assert(c.state == .closing);
         c.transport.shutdown();
-        c.loop.close(c.handle) catch {};
+        c.loop.close(c.handle) catch |err| switch (err) {
+            // A released fd freed its handle slot at detach, so the loop
+            // cannot close it. The Handshake still owns it: close it
+            // here or a conn torn down mid-upgrade leaks the fd.
+            error.StaleHandle => if (c.hs) |*hs| {
+                if (hs.fd >= 0) {
+                    posix.close(hs.fd);
+                    hs.fd = -1;
+                }
+            },
+        };
     }
 
     /// Queue outbound bytes through the outbox and link the conn so the
@@ -1962,39 +1972,70 @@ test "Conn: startTls refuses a non-empty outbox and read-ahead" {
 
 const SeamPayload = struct {
     hs: *Handshake,
-    client: *ssl.SslConn,
+    fd: posix.fd_t,
     wake: *wake_mod.Wake,
     err: ?anyerror = null,
-    err_side: enum { none, server, client } = .none,
-    woke: bool = false,
 };
 
 const wake_mod = @import("wake.zig");
 
 fn seamDriver(p: *SeamPayload) void {
-    // The pool-side driver: owns the fd while the handshake runs. In F7
-    // this registers on its own kqueue; stepping both ends here is the
-    // same state machine on a deterministic interleave. A failed SSL
-    // must never be stepped again (OpenSSL crashes on a dead state).
-    var steps: usize = 0;
-    drive: while (steps < 10_000) : (steps += 1) {
-        switch (p.hs.step()) {
-            .ok => break,
-            .err => |e| {
-                p.err = e;
-                p.err_side = .server;
-                break :drive;
-            },
-            else => {},
-        }
-        _ = p.client.doHandshake() catch |e| {
-            p.err = e;
-            p.err_side = .client;
-            break :drive;
-        };
-    }
-    if (p.hs.done != .ok and p.err == null) p.err = error.HandshakeStuck;
+    seamDrive(p);
     p.wake.notify() catch |e| {
+        if (p.err == null) p.err = e;
+    };
+}
+
+/// The F7 pool-side driver (decision 4): the released fd registers on
+/// the thread's own Loop — `assertOwner` is per-thread, so the driver
+/// cannot touch the consumer's Loop — and `hs.step()` runs on the fd's
+/// real readiness events under a 10 s deadline. The fd is detached back
+/// before the Done post so `adoptFd` never races a live knote.
+fn seamDrive(p: *SeamPayload) void {
+    var dloop: Loop = undefined;
+    dloop.init(std.testing.allocator, &.{ .handles_max = 4, .timers_max = 2 }) catch |e| {
+        p.err = e;
+        return;
+    };
+    defer dloop.deinit(std.testing.allocator);
+    const dh = dloop.attach(p.fd, mkConnCtx(7), .{ .read = true, .write = true }) catch |e| {
+        p.err = e;
+        return;
+    };
+    _ = dloop.scheduleIn(10_000, mkConnCtx(9)) catch |e| {
+        p.err = e;
+        return;
+    };
+    drive: while (true) {
+        dloop.wait() catch |e| {
+            p.err = e;
+            break;
+        };
+        while (dloop.next()) |ev| {
+            switch (ev) {
+                .readable, .writable => switch (p.hs.step()) {
+                    .ok => break :drive,
+                    .want_read => dloop.setInterest(dh, .{ .read = true }) catch |e| {
+                        p.err = e;
+                        break :drive;
+                    },
+                    .want_write => dloop.setInterest(dh, .{ .read = true, .write = true }) catch |e| {
+                        p.err = e;
+                        break :drive;
+                    },
+                    .err => |e| {
+                        p.err = e;
+                        break :drive;
+                    },
+                },
+                .deadline => break :drive,
+                else => {},
+            }
+        }
+        if (p.hs.done == .ok) break;
+    }
+    if (p.err == null and p.hs.done != .ok) p.err = error.HandshakeStuck;
+    _ = dloop.detach(dh) catch |e| {
         if (p.err == null) p.err = e;
     };
 }
@@ -2027,21 +2068,51 @@ test "Conn: handshake seam hands the fd to a second thread and back" {
 
     var payload: SeamPayload = .{
         .hs = &c.hs.?,
-        .client = &client,
+        .fd = fd,
         .wake = loop.waker(),
     };
     const thread = try std.Thread.spawn(.{}, seamDriver, .{&payload});
 
-    // Owning loop waits for the Done post through Wake.
-    // Blocking wait: the only knote that can fire while the fd is
-    // released is the driver's Done post.
+    // The client end is driven by this (the consumer's) loop, not by a
+    // thread polling `hs.done`: its doHandshake steps on the fd's real
+    // readiness events, and a 10 s deadline bounds a stalled driver.
+    const ch = try loop.attach(pair[1], mkConnCtx(8), .{ .read = true, .write = true });
+    _ = try loop.scheduleIn(10_000, mkConnCtx(9));
+    var client_done = false;
+    var client_err: ?SslError = null;
     var woke = false;
-    try loop.wait();
-    while (loop.next()) |ev| {
-        if (ev == .wake) woke = true;
+    var timed_out = false;
+    while (!woke and !timed_out and client_err == null) {
+        try loop.wait();
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .readable, .writable => |io| {
+                    if (!io.handle.eql(ch)) continue;
+                    const r = client.doHandshake() catch |e| {
+                        client_err = e;
+                        break;
+                    };
+                    switch (r) {
+                        .complete => {
+                            client_done = true;
+                            try loop.setInterest(ch, .{ .read = true });
+                        },
+                        .want_read => try loop.setInterest(ch, .{ .read = true }),
+                        .want_write => try loop.setInterest(ch, .{ .read = true, .write = true }),
+                    }
+                },
+                .wake => woke = true,
+                .deadline => timed_out = true,
+                else => {},
+            }
+        }
     }
     thread.join();
-    if (payload.err != null) std.debug.print("seam driver err={s} side={s}\n", .{ @errorName(payload.err.?), @tagName(payload.err_side) });
+    if (payload.err) |e| std.debug.print("seam driver err={s}\n", .{@errorName(e)});
+    if (client_err) |e| std.debug.print("seam client err={s}\n", .{@errorName(e)});
+    try std.testing.expect(!timed_out);
+    try std.testing.expect(client_err == null);
+    try std.testing.expect(client_done);
     try std.testing.expect(woke);
     try std.testing.expect(payload.err == null);
     try std.testing.expectEqual(Done.ok, c.hs.?.done);
@@ -2058,6 +2129,40 @@ test "Conn: handshake seam hands the fd to a second thread and back" {
     var budget: ReadBudget = .{};
     _ = c.inbox.drain(&c.transport, &budget);
     try std.testing.expectEqualStrings("seam ok", c.inbox.unread());
+
+    // Hand the client fd back to the test before teardown.
+    const back = try loop.detach(ch);
+    try std.testing.expectEqual(pair[1], back);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Conn: teardown closes the fd while it is released to a driver" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    const fd = try c.releaseFd();
+
+    // Torn down while the fd is released (the peer is replaced
+    // mid-upgrade): the handle slot is gone, so teardown must close the
+    // Handshake-owned fd itself instead of leaking it.
+    var list: ConnList = .{};
+    c.close(&list);
+    list.service();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), c.hs.?.fd);
+    try std.testing.expect(std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0)) == -1);
 }
 
 test "Conn: a require-policy failure closes through ConnList and frees the SSL" {
