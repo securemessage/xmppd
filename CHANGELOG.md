@@ -38,20 +38,27 @@
      (repeat `--hosted-domain` for each hosted domain). It prints every
      planned rename and every collision or invalid localpart without
      changing anything.
-  3. Resolve each reported identity. A collision exists only between
-     distinct accounts: two owner spellings that fold to one target in any
-     namespace. Locks, roster contacts, subscribers, MUC members and MAM
-     `with` references follow the account and do not collide on their own.
-     `--apply` refuses and lists every owner collision. **Prefer
-     `--rename`** with `xmppctl migrate-precis --hosted-domain example.org
-     --rename OLD NEW --apply`: it moves the account and every reference
-     while preserving locks. If deletion is required, use `xmppctl deluser
-     --raw EXACT-KEY --hosted-domain example.org` offline. It deletes only
-     rows the deleted spelling owns plus reference rows naming that exact
-     raw spelling; it never removes another account's prepared lock and
-     fails if data remains. Never delete only the users row: that would
-     move the deleted person's data into the surviving account. Any
-     collision makes `--apply` change nothing.
+  3. Resolve each reported identity. A collision exists between distinct
+     accounts: two users rows that fold together, or account-owned data
+     (roster, blocklist, vCard, PEP, lastact) that folds onto another
+     account. Data-only spellings (offline, archive and pending-sub rows
+     written by third parties) merge into the account they fold to, and two
+     data-only spellings with no users row merge with each other. Duplicate
+     reference rows are deduplicated: the prepared-key row wins and the
+     duplicate is printed as `deduplicated`. `--apply` refuses and lists
+     every remaining collision. **Prefer `--rename`** with `xmppctl
+     migrate-precis --hosted-domain example.org --rename OLD NEW --apply`:
+     it moves the account and every reference while preserving locks. If
+     deletion is required, use `xmppctl deluser --raw EXACT-KEY
+     --hosted-domain example.org` offline. If EXACT-KEY is a users row, it
+     deletes rows that spelling owns plus reference rows naming exactly that
+     raw spelling; it never removes another account's prepared lock. If
+     EXACT-KEY is a data-only spelling with no users row, it deletes only
+     rows keyed by that exact spelling and leaves every reference, lock and
+     account intact. It fails if data remains and prints what was removed.
+     Never delete only the users row: that would move the deleted person's
+     data into the surviving account. Any collision makes `--apply` change
+     nothing.
   4. Apply with `xmppctl migrate-precis --hosted-domain example.org
      --apply`, then rerun the dry run; it must report 0 renames. Large
      migrations write `migrate-precis.plan` and `migrate-precis.journal`

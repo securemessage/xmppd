@@ -27,51 +27,6 @@ const NS_PENDING_SUB = backend_mod.registered("pending_sub");
 const NS_MESSAGES = backend_mod.registered("messages");
 const NS_BY_CONTACT = backend_mod.registered("by_contact");
 
-test "migrate-precis plans and applies on real LMDB and RocksDB" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(base);
-    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
-    defer allocator.free(auth_path);
-    const op_path = try std.fs.path.join(allocator, &.{ base, "op" });
-    defer allocator.free(op_path);
-    const archive_path = try std.fs.path.join(allocator, &.{ base, "archive" });
-    defer allocator.free(archive_path);
-
-    var auth = try LmdbBackend.open(auth_path, .{});
-    defer auth.close();
-    var op = try LmdbBackend.open(op_path, .{});
-    defer op.close();
-    var archive = try RocksDbBackend.open(archive_path, .{});
-    defer archive.close();
-
-    // Seed through the same stores that construct production keys.
-    var users = user_store_mod.UserStore(LmdbBackend).init(&auth);
-    try users.addUser(allocator, "NaplesTB", "pw");
-    var roster = roster_store_mod.RosterStore(LmdbBackend).init(&op);
-    try roster.setItem("NaplesTB@us.example", "friend@us.example", "", .both, false);
-    var archive_store = archive_store_mod.ArchiveStore(RocksDbBackend).init(&archive, allocator);
-    try archive_store.store("NaplesTB@us.example", "friend@remote.example", "id1", 1, "<message><body>private</body></message>");
-
-    const domains = [_][]const u8{"us.example"};
-    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
-    defer plan.deinit();
-    try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
-    try applyGuarded(&auth, &op, &archive, &plan, base, allocator);
-
-    const users_value = try auth.get(allocator, NS_USERS, "naplestb");
-    defer if (users_value) |value| allocator.free(value);
-    try std.testing.expect(users_value != null);
-    const roster_value = try op.get(allocator, NS_ROSTERS, "naplestb@us.example\x00friend@us.example");
-    defer if (roster_value) |value| allocator.free(value);
-    try std.testing.expect(roster_value != null);
-    const archive_value = try archive.get(allocator, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
-    defer if (archive_value) |value| allocator.free(value);
-    try std.testing.expectEqualStrings("<message><body>private</body></message>", archive_value.?);
-}
-
 test "the LMDB offline lock catches an idle holder before env open" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -546,6 +501,41 @@ test "migrate-precis forced rename moves references into the freed key" {
     try std.testing.expect(!clean.hasBlockingIssues());
 }
 
+test "migrate-precis merges same-second archive and duplicate subscription rows" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+    try archive_store.store("NaplesTB@us.example", "alice@us.example", "id1", 1, "<message><body>one</body></message>");
+    try archive_store.store("naplestb@us.example", "alice@us.example", "id2", 1, "<message><body>two</body></message>");
+    try op.put(NS_PENDING_SUB, "NaplesTB@us.example\x00remote@remote.example", "<presence>one</presence>");
+    try op.put(NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(journal_dir);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+    try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
+    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
+    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message><body>one</body></message>");
+    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "<message><body>two</body></message>");
+}
+
 test "deluser --raw on a data-only spelling touches only owned rows" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
@@ -586,41 +576,6 @@ test "deluser --raw on a data-only spelling touches only owned rows" {
     try expectMissing(&op, NS_OFFLINE, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
     try expectMissing(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
     try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
-}
-
-test "migrate-precis merges same-second archive and duplicate subscription rows" {
-    const allocator = std.testing.allocator;
-    const MemoryBackend = backend_mod.MemoryBackend;
-    var auth = try MemoryBackend.open("", .{});
-    defer auth.close();
-    var op = try MemoryBackend.open("", .{});
-    defer op.close();
-    var archive = try MemoryBackend.open("", .{});
-    defer archive.close();
-
-    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
-    try users.addUser(allocator, "NaplesTB", "pw");
-    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
-    try archive_store.store("NaplesTB@us.example", "alice@us.example", "id1", 1, "<message><body>one</body></message>");
-    try archive_store.store("naplestb@us.example", "alice@us.example", "id2", 1, "<message><body>two</body></message>");
-    try op.put(NS_PENDING_SUB, "NaplesTB@us.example\x00remote@remote.example", "<presence>one</presence>");
-    try op.put(NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(journal_dir);
-
-    const domains = [_][]const u8{"us.example"};
-    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
-    defer plan.deinit();
-    try std.testing.expect(!plan.hasBlockingIssues());
-    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
-
-    try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
-    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
-    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message><body>one</body></message>");
-    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "<message><body>two</body></message>");
 }
 
 test "migrate-precis keeps account-owned data without a users row as a collision" {
@@ -952,4 +907,49 @@ fn expectRow(backend: anytype, namespace: []const u8, key: []const u8, value: []
 
 fn applyGuarded(auth: anytype, op: anytype, archive: anytype, plan: *const migrate.Plan, journal_dir: []const u8, allocator: std.mem.Allocator) !void {
     try migrate.applyPlan(allocator, auth, op, archive, plan, .{ .journal_dir = journal_dir });
+}
+
+test "migrate-precis plans and applies on real LMDB and RocksDB" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
+    defer allocator.free(auth_path);
+    const op_path = try std.fs.path.join(allocator, &.{ base, "op" });
+    defer allocator.free(op_path);
+    const archive_path = try std.fs.path.join(allocator, &.{ base, "archive" });
+    defer allocator.free(archive_path);
+
+    var auth = try LmdbBackend.open(auth_path, .{});
+    defer auth.close();
+    var op = try LmdbBackend.open(op_path, .{});
+    defer op.close();
+    var archive = try RocksDbBackend.open(archive_path, .{});
+    defer archive.close();
+
+    // Seed through the same stores that construct production keys.
+    var users = user_store_mod.UserStore(LmdbBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    var roster = roster_store_mod.RosterStore(LmdbBackend).init(&op);
+    try roster.setItem("NaplesTB@us.example", "friend@us.example", "", .both, false);
+    var archive_store = archive_store_mod.ArchiveStore(RocksDbBackend).init(&archive, allocator);
+    try archive_store.store("NaplesTB@us.example", "friend@remote.example", "id1", 1, "<message><body>private</body></message>");
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
+    try applyGuarded(&auth, &op, &archive, &plan, base, allocator);
+
+    const users_value = try auth.get(allocator, NS_USERS, "naplestb");
+    defer if (users_value) |value| allocator.free(value);
+    try std.testing.expect(users_value != null);
+    const roster_value = try op.get(allocator, NS_ROSTERS, "naplestb@us.example\x00friend@us.example");
+    defer if (roster_value) |value| allocator.free(value);
+    try std.testing.expect(roster_value != null);
+    const archive_value = try archive.get(allocator, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
+    defer if (archive_value) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("<message><body>private</body></message>", archive_value.?);
 }
