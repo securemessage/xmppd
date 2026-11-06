@@ -742,11 +742,10 @@ pub const Conn = struct {
                 // OpenSSL consumed the Finished record and may have left
                 // a coalesced app-data record in the socket; EV_CLEAR
                 // already fired for it, so re-drive one read through the
-                // walk. Write interest stays on when the outbox is not
-                // empty (finishHandshake dropped it).
+                // walk. The same link makes the walk flush any outbox
+                // bytes queued during the upgrade.
                 c.requeue_read = true;
                 list.link(c);
-                if (!c.outbox.empty()) c.interest(true, true);
                 return .handshake_done;
             },
             .want_read => {
@@ -865,13 +864,15 @@ pub const Conn = struct {
         c.loop.close(c.handle) catch {};
     }
 
-    /// Queue outbound bytes through the outbox and arm write interest.
+    /// Queue outbound bytes through the outbox and link the conn so the
+    /// end-of-iteration walk flushes (ADR-2): write interest is armed
+    /// only when the flush stalls on `want_write`, not per send.
     /// `failed_closed` moves to `.closing` and reports `outbox_full`.
     pub fn send(c: *Conn, list: *ConnList, parts: []const []const u8) Outcome {
         if (c.state == .closing) return .none;
         return switch (c.outbox.append(parts)) {
             .queued, .spilled => {
-                c.interest(true, true);
+                list.link(c);
                 return .none;
             },
             .failed_closed => {
@@ -925,17 +926,33 @@ pub const ConnList = struct {
         return l.head == null;
     }
 
-    /// The end-of-iteration walk (ADR-2): tear down closing conns and
-    /// turn deferred work flags into `Loop.requeue` calls so each conn
-    /// is re-driven once on the next pass. Bounded by membership: a
-    /// conn links at most once and `pop` unlinks it. A StaleHandle
-    /// requeue means the fd was released to a handshake driver and
-    /// cannot be driven anyway.
+    /// The end-of-iteration walk (ADR-2): tear down closing conns,
+    /// flush dirty outboxes (the flush `send` defers to), and turn
+    /// deferred work flags into `Loop.requeue` calls so each conn is
+    /// re-driven once on the next pass. Bounded by membership: a conn
+    /// links at most once and `pop` unlinks it. A StaleHandle requeue
+    /// means the fd was released to a handshake driver and cannot be
+    /// driven anyway.
     pub fn service(l: *ConnList) void {
         while (l.pop()) |c| {
             if (c.state == .closing) {
                 c.teardown();
                 continue;
+            }
+            // Mid-upgrade the transport is still plain: queued bytes
+            // wait for `.established` rather than leave as cleartext.
+            if (c.state != .handshake and !c.outbox.empty()) {
+                switch (c.outbox.flush(&c.transport, c.opts.flush_budget_bytes)) {
+                    .drained => c.interest(true, false),
+                    .want_write => c.interest(true, true),
+                    .want_read => c.interest(true, c.want_write),
+                    .budget_left => c.requeue_write = true,
+                    .err => {
+                        c.state = .closing;
+                        c.teardown();
+                        continue;
+                    },
+                }
             }
             if (c.requeue_read) {
                 c.requeue_read = false;
@@ -1295,6 +1312,19 @@ test "Inbox: eof is distinct and latches" {
     posix.shutdown(pair[1], .both) catch {};
     try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
     try std.testing.expectEqual(DrainResult.eof, in.drain(&t, &budget));
+}
+
+/// Fold `bytes` into a rolling last-`tail.len` window of the stream.
+fn feedTail(tail: *[4]u8, tail_len: *usize, bytes: []const u8) void {
+    if (bytes.len >= tail.len) {
+        @memcpy(tail, bytes[bytes.len - tail.len ..]);
+        tail_len.* = tail.len;
+        return;
+    }
+    const keep = @min(tail_len.*, tail.len - bytes.len);
+    std.mem.copyForwards(u8, tail[0..keep], tail[tail_len.* - keep .. tail_len.*]);
+    @memcpy(tail[keep .. keep + bytes.len], bytes);
+    tail_len.* = keep + bytes.len;
 }
 
 /// Read until `buf` is full, the peer stops sending, or a bounded spin
@@ -1671,39 +1701,119 @@ test "Conn: a second batched event on a closing conn is skipped" {
     try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
 }
 
-test "Conn: send arms write interest and the writable pass drains" {
+test "Conn: send reaches the wire in the end-of-iteration walk (ADR-2)" {
     const alloc = std.testing.allocator;
     var loop = try mkLoop(alloc);
     defer loop.deinit(alloc);
 
     const pair = try socketpair();
     defer posix.close(pair[1]);
-    defer posix.close(pair[0]);
 
     var counters: Counters = .{};
     var c: Conn = undefined;
     try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
     defer c.deinit();
 
-    const parts = [_][]const u8{ "he", "llo" };
+    // Settle the attach registration so the send below stages nothing.
+    loop.requestImmediate();
+    try loop.wait();
+    while (loop.next()) |_| {}
+    const committed0 = loop.stats().changes_committed;
+
+    // One iteration: the consumer sends during dispatch and the walk
+    // flushes it before the next wait, without an EVFILT_WRITE staged
+    // by send (ADR-2).
+    const parts = [_][]const u8{"stanza"};
     var list: ConnList = .{};
     try std.testing.expectEqual(Outcome.none, c.send(&list, &parts));
-    try std.testing.expectEqual(@as(usize, 5), c.outbox.bytes());
+    list.service();
 
+    var buf: [16]u8 = undefined;
+    const n = posix.read(pair[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqualStrings("stanza", buf[0..n]);
+    // A pass to commit anything send or the walk staged: nothing may.
+    loop.requestImmediate();
     try loop.wait();
-    var flushed = false;
-    while (loop.next()) |ev| {
-        if (ev == .writable) {
-            _ = c.onEvent(ev, &list);
-            flushed = true;
-        }
-    }
-    try std.testing.expect(flushed);
-    try std.testing.expect(c.outbox.empty());
+    while (loop.next()) |_| {}
+    try std.testing.expectEqual(committed0, loop.stats().changes_committed);
+    c.state = .closing;
+    c.teardown();
+}
 
-    var buf: [8]u8 = undefined;
-    const n = try readAll(pair[1], buf[0..5]);
-    try std.testing.expectEqualStrings("hello", buf[0..n]);
+test "Conn: a stalled flush arms write; the writable pass drains" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+    const one_k: c_int = 1024;
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&one_k));
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // Fill the kernel send buffer so the walk's flush stalls.
+    const filler = [_]u8{0x55} ** (1 << 20);
+    while (true) {
+        _ = posix.write(pair[0], &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    const parts = [_][]const u8{"tail"};
+    var list: ConnList = .{};
+    _ = c.send(&list, &parts);
+    list.service();
+    try std.testing.expect(c.want_write);
+    try std.testing.expect(!c.outbox.empty());
+
+    // The peer drains; each freed window raises a writable event that
+    // resumes the flush until the outbox empties in order.
+    var sink: [8192]u8 = undefined;
+    var tail: [4]u8 = undefined;
+    var tail_len: usize = 0;
+    var writables: usize = 0;
+    var passes: usize = 0;
+    while (passes < 400 and !c.outbox.empty()) : (passes += 1) {
+        const n = posix.read(pair[1], &sink) catch 0;
+        feedTail(&tail, &tail_len, sink[0..n]);
+        const tid = try loop.scheduleIn(20, mkConnCtx(9));
+        try loop.wait();
+        var fired = false;
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => fired = true,
+                .writable => {
+                    writables += 1;
+                    _ = c.onEvent(ev, &list);
+                },
+                else => {},
+            }
+        }
+        if (!fired) _ = loop.cancelTimer(tid);
+        list.service();
+    }
+    // The last bytes may still be in the kernel when the outbox empties.
+    var spins: usize = 0;
+    while (spins < 100_000) : (spins += 1) {
+        const n = posix.read(pair[1], &sink) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        feedTail(&tail, &tail_len, sink[0..n]);
+    }
+    try std.testing.expect(writables > 0);
+    try std.testing.expect(c.outbox.empty());
+    try std.testing.expect(!c.want_write);
+    try std.testing.expectEqualStrings("tail", &tail);
+    c.state = .closing;
+    c.teardown();
 }
 
 test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
