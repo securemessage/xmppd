@@ -1225,7 +1225,7 @@ pub const Resolver = struct {
     }
 
     fn onDeadline(self: *Resolver, job: *Job) void {
-        if (job.stale != null and !job.refresh_only) {
+        if (job.stale != null and !job.refresh_only and self.now_ms() < job.stale.?.ent.stale_ms) {
             // A refresh still running at the per-query deadline
             // serves the stale row now and keeps resolving (RFC 8767).
             return self.serveStaleDeadline(job);
@@ -1269,13 +1269,19 @@ pub const Resolver = struct {
     /// skipped; inside the fallback the other family still gets its
     /// try; every other phase fails the job.
     fn failQuery(self: *Resolver, job: *Job) void {
-        if (job.stale) |hit| {
+        if (job.stale) |hit| stale: {
             // A failed refresh serves the stale row it tried to
             // renew; last_fail_ms suppresses another attempt inside
             // the recheck window. The pin survives the feed so the
             // borrowed records stay live through the callbacks.
             const ent = hit.ent;
             job.stale = null;
+            if (self.now_ms() >= ent.stale_ms) {
+                // Superseded by an uncacheable answer or past the
+                // stale cap: a plain failure, not a stale serve.
+                ent.refreshing = false;
+                break :stale;
+            }
             ent.last_fail_ms = self.now_ms();
             self.serveStale(job, hit);
             ent.refreshing = false;
@@ -1985,8 +1991,8 @@ pub const Resolver = struct {
     /// `rrs`. An answer carrying a CNAME record proves the owner is
     /// an alias: RFC 8767 section 7 then invalidates the owner's
     /// other cached types, so they are evicted here (a row pinned by
-    /// an in-flight refresh survives - it is replaced or failed out
-    /// when its refresh concludes). Bounds are enforced after the
+    /// an in-flight refresh stops being servable instead and dies
+    /// with its borrower). Bounds are enforced after the
     /// insert, stale rows evicting before fresh ones.
     fn cacheInsert(self: *Resolver, qname: []const u8, rtype: u16, rrs: []const wire.Rr, neg: NegKind, ttl_s: u32) void {
         var name_buf: [280]u8 = undefined;
@@ -2068,11 +2074,19 @@ pub const Resolver = struct {
             var i: usize = 0;
             while (i < owner.types.items.len) {
                 const ent = owner.types.items[i];
-                if (ent.rtype != rtype and !ent.pinned()) {
-                    self.removeTypeRow(owner, i);
+                if (ent.rtype == rtype) {
+                    i += 1;
                     continue;
                 }
-                i += 1;
+                if (ent.pinned()) {
+                    // A borrowed row cannot be freed; it stops being
+                    // servable instead and dies with its borrower.
+                    ent.expires_ms = @min(ent.expires_ms, now);
+                    ent.stale_ms = now;
+                    i += 1;
+                    continue;
+                }
+                self.removeTypeRow(owner, i);
             }
             break;
         }
@@ -2113,7 +2127,15 @@ pub const Resolver = struct {
         const folded = foldName(&name_buf, qname) orelse return;
         const owner = self.owners.get(folded) orelse return;
         const idx = findTypeRow(owner, qtype) orelse return;
-        if (owner.types.items[idx].pinned()) return;
+        const ent = owner.types.items[idx];
+        if (ent.pinned()) {
+            // A borrowed row cannot be freed; it stops being
+            // servable instead and dies with its borrower.
+            const now = self.now_ms();
+            ent.expires_ms = @min(ent.expires_ms, now);
+            ent.stale_ms = now;
+            return;
+        }
         self.removeTypeRow(owner, idx);
         if (owner.types.items.len == 0) self.removeOwner(owner);
     }
@@ -6464,13 +6486,18 @@ test "dns-async: an in-place replace keeps the borrowed row's refresh pin" {
     const cn = [1]wire.Rr{.{ .name = "dup.test", .rtype = wire.TYPE_CNAME, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 'w', 'w', 'w', 0 } }};
     r.cacheInsert("dup.test", KIND_SRV, &cn, .none, 60);
     const o = r.owners.get("dup.test").?;
-    try std.testing.expect(Resolver.findTypeRow(o, KIND_A) != null);
-    // B's refresh fails: the borrowed row still serves it.
+    // The CNAME invalidates the sibling row: borrowed, so it stops
+    // being servable instead of being freed.
+    const aidx = Resolver.findTypeRow(o, KIND_A).?;
+    try std.testing.expect(o.types.items[aidx].stale_ms <= r.now_ms());
+    // B's refresh fails: the superseded row no longer serves, so
+    // the waiter gets a plain failure.
     r.handleResponse(jb, buf[0..buildRcode(&buf, jb.request, 2)]);
-    try std.testing.expectEqual(Status.resolved, ctx.status.?);
-    var res2 = ctx.raw.?;
-    defer res2.deinitOn(std.testing.allocator);
-    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, res2.rrs[0].rdata);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    // Unpinned and past the stale window, the row is pruned on the
+    // next consult.
+    try std.testing.expect(r.cacheGetClass("dup.test", KIND_A) == null);
+    try std.testing.expect(Resolver.findTypeRow(o, KIND_A) == null);
 }
 
 /// Seed the svc.test chain's per-target TLSA row inside the
@@ -6882,6 +6909,45 @@ test "dns-async: a stale feed cannot resurrect a dead job's refresh pin" {
     try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
 }
 
+test "dns-async: an uncacheable answer retires a pinned stale row" {
+    // Goal: a NOERROR answer that cannot be cached replaces the row
+    // it answered even while a refresh borrows it (ADR-13): the row
+    // stops being servable and dies with its borrower, whose failure
+    // is then a plain lookup_failed instead of a stale serve (for a
+    // TLSA row, serving the superseded NODATA downgrades DANE to
+    // PKIX). Method: C misses on the TLSA name; a NODATA row lands
+    // and goes stale; A's chain pins it; C's TTL-0 answer supersedes
+    // the row; A's SERVFAIL must not serve it.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    var qctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &qctx, .fun = TestCtx.onQuery });
+    try r.query("_15222._tcp.srv.test", .tlsa, 70); // C: a miss on the wire
+    const jc = r.jobs.items[0];
+    r.cacheInsert("_15222._tcp.srv.test", KIND_TLSA, &.{}, .nodata, 1);
+    fake_now += 2_000; // the NODATA row is stale
+    try r.resolve("svc.test", .client, 5222, 71, true); // A's TLSA leg pins it
+    const ja = r.jobs.items[1];
+    var buf: [512]u8 = undefined;
+    // The zone now publishes TLSA with TTL 0: C's waiter sees the
+    // live answer, and the borrowed NODATA row is superseded.
+    r.handleResponse(jc, buf[0..buildTypedAnswer(&buf, jc.request, KIND_TLSA, 0, &.{ 3, 1, 1, 0xBE, 0xEF })]);
+    try std.testing.expectEqual(Status.resolved, qctx.status.?);
+    var cres = qctx.raw.?;
+    defer cres.deinitOn(std.testing.allocator);
+    r.handleResponse(ja, buf[0..buildRcode(&buf, ja.request, 2)]);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
 test "dns-async: a chain deadline serves the stale row it refreshed" {
     // Goal: a per-query deadline on a chain leg refreshing a stale
     // row feeds the row's answer to the phase machine (RFC 8767);
@@ -7170,9 +7236,12 @@ test "dns-async: a CNAME answer keeps the pinned sibling row" {
     const cn = [1]wire.Rr{.{ .name = "x.test", .rtype = wire.TYPE_CNAME, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 'w', 'w', 'w', 0 } }};
     r.cacheInsert("x.test", KIND_TLSA, &cn, .none, 60);
     // The unpinned A row is evicted as a sibling of the CNAME; the
-    // pinned SRV row survives.
+    // pinned SRV row survives as a borrow but is no longer servable.
     try std.testing.expect(Resolver.findTypeRow(owner, KIND_A) == null);
-    try std.testing.expect(Resolver.findTypeRow(owner, KIND_SRV) != null);
+    const sidx = Resolver.findTypeRow(owner, KIND_SRV).?;
+    const srv_ent = owner.types.items[sidx];
+    try std.testing.expect(srv_ent.expires_ms <= r.now_ms());
+    try std.testing.expect(srv_ent.stale_ms <= r.now_ms());
     try std.testing.expect(Resolver.findTypeRow(owner, KIND_TLSA) != null);
 }
 
