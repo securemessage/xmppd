@@ -1213,7 +1213,7 @@ pub fn deleteRawAccount(
     archive: anytype,
     hosted_domains: []const []const u8,
     raw: []const u8,
-) !void {
+) !RawDeleteKind {
     const existing = try auth.get(allocator, NS_USERS, raw);
     const raw_has_users = existing != null;
     if (existing) |value| {
@@ -1272,6 +1272,7 @@ pub fn deleteRawAccount(
     }, raw, hosted_domains, raw_has_users);
     try collectRawDeletions(&remaining, allocator, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, raw, hosted_domains, raw_has_users);
     if (remaining.items.len != 0) return error.DataRemaining;
+    return if (raw_has_users) .account else .data_only;
 }
 
 /// Refuse to operate while any daemon named by the master's pid files is live.

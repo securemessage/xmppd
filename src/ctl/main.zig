@@ -484,7 +484,7 @@ fn runDeleteRaw(
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
 
-    migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
+    const kind = migrate_precis.deleteRawAccount(allocator, &auth, &op, &archive, hosted_domains, stored_key) catch |err| {
         switch (err) {
             error.UserNotFound => printErr("user not found\n"),
             error.DataRemaining => printErr("account data remains; inspect the DB and rerun\n"),
@@ -492,9 +492,18 @@ fn runDeleteRaw(
         }
         return err;
     };
-    printOut("User ");
-    printOut(stored_key);
-    printOut(" and all matching account data removed.\n");
+    switch (kind) {
+        .account => {
+            printOut("User ");
+            printOut(stored_key);
+            printOut(" and all matching account data removed.\n");
+        },
+        .data_only => {
+            printOut("data stored under spelling ");
+            printOut(stored_key);
+            printOut(" removed\n");
+        },
+    }
 }
 
 fn runMigratePrecis(

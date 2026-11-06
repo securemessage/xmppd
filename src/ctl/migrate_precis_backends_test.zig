@@ -502,6 +502,48 @@ test "migrate-precis forced rename moves references into the freed key" {
     try std.testing.expect(!clean.hasBlockingIssues());
 }
 
+test "deluser --raw on a data-only spelling touches only owned rows" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    try users.addUser(allocator, "alice", "pw");
+    try auth.put(NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
+    var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
+    try roster.setItem("alice@us.example", "naplestb@us.example", "Naples", .both, false);
+    var rooms = room_store_mod.RoomStore(MemoryBackend).init(&op, allocator);
+    try rooms.setAffiliation("room@conference.us.example", "naplestb@us.example", .admin);
+    var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+    _ = try offline.storePointer("naplestb@us.example", "alice@us.example/res", "id1", 1);
+    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+    try archive_store.store("naplestb@us.example", "alice@us.example", "id1", 1, "<message><body>owned</body></message>");
+    try archive_store.store("alice@us.example", "naplestb@us.example", "id2", 1, "<message><body>reference</body></message>");
+
+    const domains = [_][]const u8{"us.example"};
+    const kind = try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "naplestb");
+    try std.testing.expectEqual(migrate.RawDeleteKind.data_only, kind);
+
+    const contact = try roster.getItem(allocator, "alice@us.example", "naplestb@us.example");
+    defer if (contact) |entry| {
+        if (entry.name.len > 0) allocator.free(entry.name);
+        if (entry.groups.len > 0) allocator.free(entry.groups);
+    };
+    try std.testing.expect(contact != null);
+    try std.testing.expectEqual(room_store_mod.Affiliation.admin, try rooms.getAffiliation("room@conference.us.example", "naplestb@us.example"));
+    try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
+    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
+    try expectMissing(&op, NS_OFFLINE, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
+    try expectMissing(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
+    try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
+}
+
 test "migrate-precis keeps account-owned data without a users row as a collision" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
@@ -573,7 +615,7 @@ test "deluser --raw accepts a data-only spelling and keeps the account" {
     _ = try offline.storePointer("naplestb@us.example", "alice@us.example/res", "id1", 1);
 
     const domains = [_][]const u8{"us.example"};
-    try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "naplestb");
+    _ = try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "naplestb");
     try std.testing.expect((try users.lookup(allocator, "NaplesTB")) != null);
     try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
     const pointers = try offline.getPointers("naplestb@us.example");
@@ -622,7 +664,7 @@ test "migrate-precis detects identity collisions on data and raw deletion cascad
     try std.testing.expect(plan.issues.items.len >= 4);
     try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{}));
 
-    try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "Bob");
+    _ = try migrate.deleteRawAccount(allocator, &auth, &op, &archive, &domains, "Bob");
     try std.testing.expect((try users.lookup(allocator, "Bob")) == null);
     try std.testing.expect((try users.lookup(allocator, "bob")) != null);
     try std.testing.expect((try roster.getItem(allocator, "Bob@us.example", "friend@us.example")) == null);
