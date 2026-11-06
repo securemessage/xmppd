@@ -658,6 +658,12 @@ pub const Conn = struct {
         return switch (ev) {
             .readable => c.onReadable(list),
             .writable => c.onWritable(list),
+            // The loop marked the handle broken: its kevent changes can
+            // no longer reach the kernel, so the conn cannot be driven.
+            .change_failed => {
+                c.markClosing(list);
+                return .{ .closed = .{ .err = error.ChangeFailed } };
+            },
             else => .none,
         };
     }
@@ -1814,6 +1820,43 @@ test "Conn: a stalled flush arms write; the writable pass drains" {
     try std.testing.expectEqualStrings("tail", &tail);
     c.state = .closing;
     c.teardown();
+}
+
+test "Conn: a rejected registration closes through the ConnList" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // The fd vanishes before the staged EV_ADD reaches the kernel:
+    // wait() delivers the rejection as change_failed, which the loop
+    // marks broken. Ignoring it leaves a cleartext conn that can never
+    // be driven; it must close through the list.
+    posix.close(pair[0]);
+    _ = try loop.scheduleIn(20, mkConnCtx(9));
+    try loop.wait();
+    var saw_fail = false;
+    var outcome: Outcome = .none;
+    while (loop.next()) |ev| switch (ev) {
+        .change_failed => {
+            saw_fail = true;
+            outcome = c.onEvent(ev, &list);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_fail);
+    try std.testing.expect(outcome == .closed);
+    try std.testing.expectEqual(State.closing, c.state);
+    try std.testing.expect(c.on_dirty);
+    list.service();
 }
 
 test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
