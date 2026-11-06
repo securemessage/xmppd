@@ -406,6 +406,15 @@ pub const Outbox = struct {
         if (o.spill_head == o.spill.items.len) {
             o.spill.clearRetainingCapacity();
             o.spill_head = 0;
+        } else if (o.spill_head >= o.spill.items.len - o.spill_head) {
+            // Half or more of the allocation is sent bytes: fold the
+            // pending tail to the front. Without this a steady backlog
+            // (peer drains about as fast as we produce) lets items.len
+            // grow with total traffic forever.
+            const rest = o.spill.items.len - o.spill_head;
+            std.mem.copyForwards(u8, o.spill.items[0..rest], o.spill.items[o.spill_head..]);
+            o.spill.items.len = rest;
+            o.spill_head = 0;
         }
     }
 
@@ -1426,6 +1435,41 @@ test "Outbox: an append behind a pending spill keeps wire order" {
     var buf: [24]u8 = undefined;
     const n = try readAll(pair[1], &buf);
     try std.testing.expectEqualStrings("AAAAAAAAAABBBBBBBBBBCCCC", buf[0..n]);
+}
+
+test "Outbox: a steady backlog compacts the spill instead of growing it" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [1024]u8 = undefined;
+    const limit: usize = 64 << 10;
+    var o = Outbox.init(&ring, std.testing.allocator, limit, &counters);
+    defer o.deinit();
+    var t: Transport = .{ .plain = pair[0] };
+    const small: c_int = 1024;
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small));
+
+    // Producer appends 2 KiB per pass while the peer drains 1 KiB:
+    // pending stays under the limit, but a spill that never folds its
+    // sent prefix grows linearly with total traffic (the H1 OOM path).
+    var chunk: [2048]u8 = undefined;
+    @memset(&chunk, 0x61);
+    const parts = [_][]const u8{&chunk};
+    for (0..16) |_| _ = o.append(&parts);
+    var max_cap: usize = 0;
+    var max_pending: usize = 0;
+    var sink: [1024]u8 = undefined;
+    for (0..4000) |_| {
+        _ = o.append(&parts);
+        _ = o.flush(&t, 1 << 20);
+        _ = posix.read(pair[1], &sink) catch 0;
+        max_cap = @max(max_cap, o.spill.capacity);
+        max_pending = @max(max_pending, o.spill.items.len - o.spill_head);
+    }
+    try std.testing.expect(max_pending <= limit);
+    try std.testing.expect(max_cap <= 4 * limit);
 }
 
 test "Outbox: pin retries the identical slice across want_write" {
