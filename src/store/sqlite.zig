@@ -11,7 +11,7 @@ const c = @cImport(@cInclude("sqlite3.h"));
 
 const log = std.log.scoped(.sqlite_store);
 
-const MAX_TABLES = 16;
+const MAX_TABLES = 24;
 
 const TableCacheEntry = struct {
     name_buf: [64]u8,
@@ -24,6 +24,7 @@ pub const SqliteBackend = struct {
     db: *c.sqlite3,
     table_cache: [MAX_TABLES]TableCacheEntry,
     table_count: u32,
+    compound_mutex: std.Thread.Mutex = .{},
     /// Guards table_cache lookups/appends (S9): canonical tables are
     /// created at open(); the lock covers only test/unknown names.
     table_lock: std.Thread.Mutex = .{},

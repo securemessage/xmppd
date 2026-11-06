@@ -30,7 +30,7 @@ const std = @import("std");
 /// Options for opening a storage backend.
 pub const OpenOptions = struct {
     /// Maximum number of namespaces (LMDB: max_dbs, others: ignored).
-    max_namespaces: u32 = 16,
+    max_namespaces: u32 = 24,
 
     /// LMDB map size in bytes (ignored by other backends). Never resized at
     /// runtime (S9: LMDB forbids env resize with concurrent readers); a
@@ -60,6 +60,11 @@ pub const canonical_namespaces = [_][]const u8{
     "invites",
     "blocklist",
     "offline",
+    "offline_hold",
+    "offline_v2",
+    "offline_hold_v2",
+    "offline_seq",
+    "offline_hold_token",
     "rooms",
     "messages",
     "by_contact",
@@ -104,6 +109,9 @@ pub const Entry = struct {
 ///   // Atomic batch writes
 ///   fn writeBatch(self: *B) !B.WriteBatch
 ///
+///   // Shared lock for compound domain-store operations
+///   compound_mutex: std.Thread.Mutex
+///
 /// Required on B.Iterator:
 ///   fn next(self: *Iterator) ?Entry
 ///   fn deinit(self: *Iterator) void
@@ -132,6 +140,8 @@ pub fn assertBackend(comptime B: type) void {
             @compileError("StorageBackend missing: put(*B, []const u8, []const u8, []const u8) !void");
         if (!@hasDecl(B, "delete"))
             @compileError("StorageBackend missing: delete(*B, []const u8, []const u8) !void");
+        if (!@hasField(B, "compound_mutex"))
+            @compileError("StorageBackend missing: compound_mutex: std.Thread.Mutex");
 
         if (!@hasDecl(B, "Iterator"))
             @compileError("StorageBackend missing: const Iterator type");
@@ -169,6 +179,7 @@ pub const MemoryBackend = struct {
     namespaces: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
     arena: std.heap.ArenaAllocator,
     backing: std.mem.Allocator,
+    compound_mutex: std.Thread.Mutex = .{},
 
     pub fn open(path: []const u8, opts: OpenOptions) !Self {
         _ = path;
@@ -333,6 +344,7 @@ pub const FailBatchBackend = struct {
     fail_ops: bool = true,
     fail_commit: bool = false,
     iter_entries: []const Entry = &.{},
+    compound_mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 
@@ -587,7 +599,7 @@ test "MemoryBackend: separate namespaces" {
 
 test "OpenOptions defaults" {
     const opts = OpenOptions{};
-    try std.testing.expectEqual(@as(u32, 16), opts.max_namespaces);
+    try std.testing.expectEqual(@as(u32, 24), opts.max_namespaces);
     // 8 GiB default (S9): headroom for existing production DBs that
     // already exceed 64 MiB; sparse maps cost address space only.
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
@@ -600,15 +612,15 @@ test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted
     // name would collide in the DBI cache lookups, and a name over 64
     // bytes fails mdb_dbi_open (name_buf is [64]u8 plus NUL). The count
     // ratchets the set: additions must be deliberate, removals break the
-    // stores that own them (pending_sub = presence_handler,
-    // room_affiliations = room_store).
+    // stores that own them (offline_* = offline_store,
+    // pending_sub = presence_handler, room_affiliations = room_store).
     for (canonical_namespaces, 0..) |ns, i| {
         try std.testing.expect(ns.len > 0 and ns.len <= 64);
         for (canonical_namespaces[i + 1 ..]) |other| {
             try std.testing.expect(!std.mem.eql(u8, ns, other));
         }
     }
-    try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
+    try std.testing.expectEqual(@as(usize, 19), canonical_namespaces.len);
 }
 
 const TokenKind = enum { str, chr, comment };

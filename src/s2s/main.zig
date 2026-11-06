@@ -264,6 +264,7 @@ pub const S2sDaemon = struct {
             return null;
         };
         reader.* = XmlReader.init(self.allocator);
+        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         self.readers[slot] = reader;
 
         log.info("accepted inbound S2S connection id={d} fd={d}", .{ slot, client_fd });
@@ -964,13 +965,16 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     var pos: usize = 0;
 
     while (true) {
+        // The item cap follows the stream's authentication state, checked
+        // before each item so a stanza that arrives in the same read as the
+        // auth that permits it is still accepted (H6).
+        reader.setMaxItemBytes(if (session.stream.isEstablished())
+            xml.max_item_bytes_authenticated
+        else
+            xml.max_item_bytes_pre_auth);
         const event = reader.next(data, &pos) catch |err| {
             log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            sendStreamError(session, .not_well_formed);
-            if (session.hasPendingWrite()) {
-                batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
-            }
-            // Close after flushing error
+            closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
             return;
         };
         if (event == null) break;
@@ -1089,16 +1093,21 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             if (!session.stream_open_seen) {
                 session.stream_open_seen = true;
                 session.setRemoteDomain(from);
-            } else if (!session.restartFromAllowed(from)) {
-                log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
-                sendStreamError(session, .invalid_from);
-                _ = session.flushWrite() catch {};
-                daemon.closeInbound(batch, session.id);
-                return;
-            } else if (session.auth_domain_count > 0) {
-                // Authenticated domain may differ from the first open (dialback
-                // multiplexing); the tracked identity follows it.
-                session.setRemoteDomain(from);
+            } else {
+                // A restart begins a new stream, so our header from the previous
+                // one does not cover it: an error must open this one first.
+                session.stream_header_sent = false;
+                if (!session.restartFromAllowed(from)) {
+                    log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
+                    sendStreamError(session, .invalid_from);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                } else if (session.auth_domain_count > 0) {
+                    // Authenticated domain may differ from the first open
+                    // (dialback multiplexing); the tracked identity follows it.
+                    session.setRemoteDomain(from);
+                }
             }
             // The header to= selects which served host this stream addresses;
             // replies echo it as their from= (S2). An unserved host
@@ -1135,6 +1144,9 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // If accumulating a stanza, serialize child elements into inner buffer
             if (session.stanza_active) {
                 session.accumulateElement(elem, reader);
+                // The stanza can no longer be forwarded whole. Keep parsing is
+                // pure cost: close now rather than at the end of the item.
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
 
@@ -1226,6 +1238,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             if (session.stanza_active) {
                 if (reader.depth > 1) {
                     session.accumulateClose(name);
+                    if (session.stanzaBroken()) closeBrokenStanza(daemon, batch, session);
                 } else {
                     dispatchInboundStanza(daemon, session, batch);
                 }
@@ -1244,6 +1257,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // Stanza content accumulation
             if (session.stanza_active) {
                 session.accumulateText(text_content);
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
             // Capture db:result key text (dialback key submission)
@@ -1301,7 +1315,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
     }
 }
 
-/// Domainpart of a JID (RFC 7622 §3.1): cut at the resource separator
+/// Domainpart of a JID (RFC 7622 section 3.1): cut at the resource separator
 /// FIRST, then split off the localpart. Cutting at '@' first would let
 /// "victim.example/x@them.example" resolve to "them.example" (S2).
 fn jidDomain(jid: []const u8) []const u8 {
@@ -1310,7 +1324,7 @@ fn jidDomain(jid: []const u8) []const u8 {
     return bare;
 }
 
-/// RFC 6120 §4.9.3.9 / §4.9.3.6: an inbound stanza's from= domain must be
+/// RFC 6120 sections 4.9.3.9 and 4.9.3.6: an inbound stanza's from= domain must be
 /// authenticated for the session (dialback or EXTERNAL+DANE; auth_ok is the
 /// caller's set lookup), and to= must be a host we serve (bare domain or the
 /// MUC host).
@@ -1335,17 +1349,18 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     const from = session.getStanzaFrom();
     const to = session.getStanzaTo();
 
-    // A stanza whose children overflowed the accumulator must not forward:
-    // truncated XML is malformed input for the receiver (S1). The lane
-    // stays open; the stanza is counted and gone.
+    // Never forward truncated XML. Reset before closing because closeInbound
+    // frees the session.
     if (session.stanzaBroken()) {
-        log.warn("inbound S2S id={d} stanza dropped: inner accumulation overflowed (from={s} to={s})", .{ session.id, from, to });
+        const slot = session.id;
+        log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
         session.resetStanza();
+        closeInboundWithStreamError(daemon, batch, slot, .policy_violation);
         return;
     }
 
     if (from.len == 0 or to.len == 0) {
-        // RFC 6120 §4.9.3.10: missing from/to on an established stream.
+        // RFC 6120 section 4.9.3.10: missing from/to on an established stream.
         log.warn("inbound stanza missing from/to (improper-addressing)", .{});
         sendStreamError(session, .improper_addressing);
         _ = session.flushWrite() catch {};
@@ -1664,6 +1679,7 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
                 return;
             };
             session.queueWrite(response) catch {};
+            session.stream_header_sent = true;
         },
         .send_features => {
             const features = session.buildFeatures(&buf) catch {
@@ -1749,9 +1765,37 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
 
 /// Send a stream error and close.
 fn sendStreamError(session: *S2sSession, err: StreamError) void {
+    // A peer whose header we never answered gets one first, as c2s does
+    // (RFC 6120 4.9.1). Queued separately and before the error so a host or
+    // domain at the buffer limit cannot stop the error from being sent:
+    // leaving the peer to wait is worse than an unopened error.
+    if (!session.stream_header_sent) {
+        var header_buf: [1024]u8 = undefined;
+        if (session.buildStreamOpenResponse(&header_buf)) |header| {
+            session.queueWrite(header) catch {};
+            session.stream_header_sent = true;
+        } else |_| {}
+    }
     var buf: [512]u8 = undefined;
     const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
     session.queueWrite(error_xml) catch {};
+}
+
+fn closeInboundWithStreamError(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, err: StreamError) void {
+    const session = daemon.getInbound(slot) orelse return;
+    sendStreamError(session, err);
+    _ = session.flushWrite() catch {};
+    daemon.closeInbound(batch, slot);
+}
+
+/// Drop a stanza that overflowed the accumulator and fail the stream.
+/// A peer whose stanza we cannot relay is not a peer we can serve, and
+/// staying open would let it keep sending bytes we must parse and discard.
+fn closeBrokenStanza(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+    const slot = session.id;
+    log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
+    session.resetStanza();
+    closeInboundWithStreamError(daemon, batch, slot, .policy_violation);
 }
 
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
@@ -1905,6 +1949,12 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     var pos: usize = 0;
 
     while (true) {
+        // Pre-auth cap until the stream is established, then the federation
+        // cap; derived per item so an auth completed mid-read applies at once.
+        reader.setMaxItemBytes(if (conn.isEstablished())
+            xml.max_item_bytes_authenticated
+        else
+            xml.max_item_bytes_pre_auth);
         const event = reader.next(data, &pos) catch {
             conn.fail("xml-parse-error");
             daemon.closeOutbound(batch, slot);
@@ -2542,6 +2592,295 @@ fn printUsage() void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn connectInboundForTest(daemon: *S2sDaemon) !posix.fd_t {
+    try daemon.listen("127.0.0.1", 0);
+    if (std.c.fcntl(daemon.listener_fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(daemon.listener_fd, @ptrCast(&addr), &addr_len) != 0) {
+        return error.GetSockNameFailed;
+    }
+
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(client_fd);
+    var connect_addr = std.c.sockaddr.in{
+        .port = addr.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in));
+    const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
+    try std.testing.expectEqual(@as(usize, 0), slot);
+    const session = daemon.getInbound(slot) orelse return error.NoSession;
+    if (std.c.fcntl(session.fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    return client_fd;
+}
+
+fn attachInboundSocketpairForTest(daemon: *S2sDaemon, slot: usize) !posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    var daemon_owns_fd = false;
+    errdefer if (!daemon_owns_fd) posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+
+    const session = try daemon.allocator.create(S2sSession);
+    session.* = S2sSession.init(fds[0], slot, daemon.local_domain);
+    daemon.inbound[slot] = session;
+    daemon_owns_fd = true;
+    const reader = try daemon.allocator.create(XmlReader);
+    reader.* = XmlReader.init(daemon.allocator);
+    reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
+    daemon.readers[slot] = reader;
+    return fds[1];
+}
+
+fn feedInboundForTest(daemon: *S2sDaemon, batch: *ChangeList, peer_fd: posix.fd_t, payload: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const end = @min(offset + 2048, payload.len);
+        try std.testing.expectEqual(end - offset, try posix.write(peer_fd, payload[offset..end]));
+        batch.reset();
+        handleInboundReadable(daemon, batch, 0);
+        offset = end;
+        if (daemon.getInbound(0) == null) break;
+    }
+}
+
+test "S2sDaemon: G5 an XML error is flushed once and closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<foo/>");
+    handleInboundReadable(&daemon, &batch, 0);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") != null);
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(client_fd, &response));
+}
+
+test "S2sDaemon: E6 an over-long token maps to policy-violation at the call site" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+
+    const payload = try alloc.alloc(u8, xml.scanner.max_token_bytes + 2);
+    defer alloc.free(payload);
+    payload[0] = '<';
+    @memset(payload[1..], 'a');
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") == null);
+}
+
+test "S2sDaemon: G5 a small pre-auth item cap closes an unterminated stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    _ = try posix.write(client_fd, stream_open);
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    _ = try posix.write(client_fd, "<iq>");
+    handleInboundReadable(&daemon, &batch, 0);
+    // The synchronous test invokes the readable handler directly, so loopback
+    // readiness races must not block it.
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    for (0..20_000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, "<a/>");
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [16384]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G5 the pre-auth cap covers an unterminated stream header" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<stream:stream xmlns='jabber:server' from='");
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    const chunk = [_]u8{'a'} ** 64;
+    for (0..2000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, &chunk);
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: an overflowed stanza closes the stream before the item ends" {
+    // Closing at the end of an item is not enough on its own: the peer would
+    // still get to send, and the server to parse, everything up to the reader's
+    // item cap. This item is never terminated and stays under that cap, so only
+    // a close driven by the accumulator overflow closes the stream.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='b.example' to='alice@a.example'>");
+
+    // Complete child elements, so each one is accumulated as it is parsed and
+    // the total crosses the 16 KiB accumulator while the item source stays
+    // under the reader's cap. The message is never closed.
+    var unit: [907]u8 = undefined;
+    const unit_open = "<b>";
+    const unit_close = "</b>";
+    @memcpy(unit[0..unit_open.len], unit_open);
+    @memset(unit[unit_open.len..][0 .. unit.len - unit_open.len - unit_close.len], 'x');
+    @memcpy(unit[unit.len - unit_close.len ..], unit_close);
+    var fed: usize = 0;
+    while (fed < xml.max_item_bytes_authenticated and daemon.getInbound(0) != null) : (fed += unit.len) {
+        try feedInboundForTest(&daemon, &batch, peer_fd, &unit);
+    }
+    // Closed before the reader's cap was reached, i.e. on the overflow and not
+    // on the end of an item that never came.
+    try std.testing.expect(fed < xml.max_item_bytes_authenticated);
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 an oversized accumulated stanza is rejected whole" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, prefix.len + 20_000 + suffix.len);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0..20_000], 'x');
+    @memcpy(payload[prefix.len + 20_000 ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, 16_384);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0 .. payload.len - prefix.len - suffix.len], 'x');
+    @memcpy(payload[payload.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    const expected = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        "<message xmlns='jabber:server' from='b.example' to='alice@a.example'><body xmlns='jabber:server'>",
+        payload[prefix.len .. payload.len - suffix.len],
+        suffix,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, msg.s2s_inbound.stanza_xml);
+}
 
 test "extractDomain: user@domain" {
     try std.testing.expectEqualStrings("b.example", extractDomain("alice@b.example"));
@@ -4851,6 +5190,11 @@ test "S2sDaemon: MUC host is served on stream open; replies echo the requested h
     try std.testing.expect(daemon.getInbound(2) == null);
     var rbuf2: [2048]u8 = undefined;
     const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    // RFC 6120 4.9.1: the error is preceded by the stream header we never sent,
+    // so the peer can parse it. Both must arrive.
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:error>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream").? < std.mem.indexOf(u8, resp2, "<stream:error>").?);
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
 }
 

@@ -18,7 +18,6 @@ const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const StanzaKind = server_mod.StanzaKind;
-const IPC_S2S_UDATA = server_mod.IPC_S2S_UDATA;
 const ChangeList = @import("event_loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
@@ -26,9 +25,53 @@ const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
+const connection_mod = @import("connection.zig");
+const offline_store = @import("generic_offline_store");
 const ipc_protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.router);
+
+/// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so
+/// this buffer holds every valid key in full (S4).
+pub const BARE_JID_MAX = 512;
+/// Worst-case full JID from bind: two 256-byte parts, the separators, and the
+/// server host. A shorter buffer silently dropped the stanza on overflow.
+pub const FULL_JID_MAX = 1024;
+
+/// Build a bare JID "local@domain" into out. A JID that does not fit returns
+/// NoSpaceLeft rather than a truncated prefix (S4).
+pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(out);
+    const w = fbs.writer();
+    try w.writeAll(local);
+    try w.writeByte('@');
+    try w.writeAll(domain);
+    return fbs.getWritten();
+}
+
+test "router: bare JID buffers hold a full store-key JID without truncation" {
+    var out: [BARE_JID_MAX]u8 = undefined;
+    // A bare JID just under the store-key limit builds in full.
+    var local: [300]u8 = undefined;
+    @memset(&local, 'l');
+    var domain: [200]u8 = undefined;
+    @memset(&domain, 'd');
+    const jid = try buildBareJid(&local, &domain, &out);
+    try std.testing.expectEqual(@as(usize, 300 + 1 + 200), jid.len);
+    // A full store-key-length bare JID (511) also fits.
+    var local2: [280]u8 = undefined;
+    @memset(&local2, 'l');
+    var domain2: [230]u8 = undefined;
+    @memset(&domain2, 'd');
+    const jid2 = try buildBareJid(&local2, &domain2, &out);
+    try std.testing.expectEqual(@as(usize, 511), jid2.len);
+
+    var local3: [300]u8 = undefined;
+    @memset(&local3, 'l');
+    var domain3: [300]u8 = undefined;
+    @memset(&domain3, 'd');
+    try std.testing.expectError(error.NoSpaceLeft, buildBareJid(&local3, &domain3, &out));
+}
 
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
@@ -72,11 +115,16 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         return;
     };
 
-    // Build the from string (full JID: local@domain/resource)
-    var from_buf: [256]u8 = undefined;
+    // Build the from string (full JID: local@domain/resource). Bind caps the
+    // localpart and resource at 256 bytes each, so the full JID can exceed
+    // 256 and a smaller buffer would drop the stanza with no answer.
+    var from_buf: [FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const from_w = from_fbs.writer();
-    from_w.writeAll(from_jid.local) catch return;
+    from_w.writeAll(from_jid.local) catch {
+        log.warn("connection {d} sender JID exceeds {d} bytes, stanza dropped", .{ session.conn.id, FULL_JID_MAX });
+        return;
+    };
     from_w.writeByte('@') catch return;
     from_w.writeAll(from_jid.domain) catch return;
     if (from_jid.resource.len > 0) {
@@ -124,8 +172,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Route: find target session(s) via unified session map.
     const sm = server.session_map orelse return;
-    var entries_buf: [16]SessionEntry = undefined;
-    var local_ids: [16]usize = undefined;
+    var lease_a = server.leaseScratch(.a);
+    defer lease_a.release();
+    const entries_buf = lease_a.entries;
+    const local_ids = server.scratchIdsA();
     var target_count: usize = 0;
 
     var remote_delivered: bool = false;
@@ -139,7 +189,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // Resource not found (§8.5.3.2). For type='chat', fall back to best
         // available resource (§8.5.3.2.1). For others, store offline or bounce.
         if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "chat")) {
-            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
             if (avail_count > 0) {
                 var best_idx: usize = 0;
                 var best_prio: i8 = -128;
@@ -158,7 +208,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         break :blk @as(usize, 0);
     } else blk: {
         // RFC 6121 §8.5.2: Stanza addressed to bare JID — deliver to available resources.
-        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &entries_buf);
+        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
         if (avail_count == 0) break :blk @as(usize, 0);
 
         if (session.stanza_kind == .iq) {
@@ -217,19 +267,26 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const archive_stanza_id: []const u8 = if (is_archivable) server.generateStanzaId(&sid_buf) else "";
 
     // Build augmented inner_xml with stanza-id appended (for delivery to recipients)
-    var aug_buf: [16512]u8 = undefined;
-    var aug_fbs = std.io.fixedBufferStream(&aug_buf);
+    var aug_lease = server.leaseByteScratch() orelse return;
+    defer aug_lease.release();
+    var aug_fbs = std.io.fixedBufferStream(aug_lease.buf);
     const delivery_inner_xml: []const u8 = if (archive_stanza_id.len > 0) blk: {
         const aw = aug_fbs.writer();
         aw.writeAll(inner_xml) catch break :blk inner_xml;
         aw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch break :blk inner_xml;
-        aw.writeAll(archive_stanza_id) catch break :blk inner_xml;
+        xml.escapeWrite(aw, archive_stanza_id) catch break :blk inner_xml;
         aw.writeAll("' by='") catch break :blk inner_xml;
-        aw.writeAll(server.server_host) catch break :blk inner_xml;
+        xml.escapeWrite(aw, server.server_host) catch break :blk inner_xml;
         aw.writeAll("'/>") catch break :blk inner_xml;
         break :blk aug_fbs.getWritten();
     } else inner_xml;
 
+    // One identity for this dispatch. Every resource and every worker that
+    // holds the message quotes it, so the store collapses the copies of this
+    // dispatch and never two dispatches with identical bytes.
+    const hold_token = server.mintHoldToken();
+
+    var delivery_failed = false;
     for (entries_buf[0..route_count]) |entry| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
         if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
@@ -240,7 +297,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 target_count += 1;
             }
         } else {
-            enqueueCrossThreadStanza(
+            if (enqueueCrossThreadStanza(
                 server,
                 entry,
                 from_str,
@@ -249,63 +306,58 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 id_str,
                 delivery_inner_xml,
                 session.stanza_kind,
-            );
-            remote_delivered = true;
+                hold_token,
+            )) {
+                remote_delivered = true;
+            } else {
+                // Other local and remote resources still get their copies;
+                // the sender gets an error if no resource accepts the stanza.
+                delivery_failed = true;
+            }
         }
     }
 
-    // Build sender bare JID for archive
-    var sender_bare_buf: [256]u8 = undefined;
-    var sender_bare_fbs = std.io.fixedBufferStream(&sender_bare_buf);
-    sender_bare_fbs.writer().writeAll(from_jid.local) catch {};
-    sender_bare_fbs.writer().writeByte('@') catch {};
-    sender_bare_fbs.writer().writeAll(from_jid.domain) catch {};
-    const sender_bare = sender_bare_fbs.getWritten();
+    // Build sender bare JID for archive. A bare JID over the store-key limit
+    // cannot be a key anywhere, but it must not cost the stanza its delivery:
+    // null here only disables the archive and offline branches.
+    var sender_bare_buf: [BARE_JID_MAX]u8 = undefined;
+    const sender_bare: ?[]const u8 = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf) catch blk: {
+        log.warn("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
+        break :blk null;
+    };
 
     // Single timestamp for all archive operations in this dispatch (T123)
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
 
-    // Archive under both sender and recipient bare JIDs (T81 + T82)
-    if (is_archivable) {
+    // One serialization buffer for this dispatch. The archive form is built
+    // and consumed (copied by the writer queue, or stored) before the
+    // delivery form is built below, and the offline-store branch returns
+    // before the delivery loop runs, so the lifetimes never overlap.
+    var out_lease = server.leaseByteScratch() orelse return;
+    defer out_lease.release();
+    const out_buf = out_lease.buf;
+
+    // Build the archived form of the stanza (includes the stanza-id element).
+    // A form that does not fit the scratch bank is not archived at all: the
+    // truncated bytes would otherwise be written to the archive and replayed
+    // to the recipient on the next drain (E2d).
+    var archive_stanza: []const u8 = "";
+    if (is_archivable and sender_bare != null) {
         if (server.archive != null) {
-            var recip_buf: [256]u8 = undefined;
-            var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-            recip_fbs.writer().writeAll(to_jid.local) catch {};
-            recip_fbs.writer().writeByte('@') catch {};
-            recip_fbs.writer().writeAll(to_jid.domain) catch {};
-            const recipient_bare = recip_fbs.getWritten();
+            archive_stanza = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, archive_stanza_id, server.server_host) orelse blk: {
+                log.warn("connection {d} archive form for {s} exceeds the serialization buffer, not archived", .{ session.conn.id, to_str });
+                break :blk "";
+            };
 
-            // Build full stanza XML for archive (includes stanza-id element)
-            var stanza_buf: [20480]u8 = undefined;
-            var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
-            const sw = stanza_fbs.writer();
-            sw.writeAll("<message from='") catch {};
-            sw.writeAll(from_str) catch {};
-            sw.writeAll("' to='") catch {};
-            sw.writeAll(to_str) catch {};
-            sw.writeByte('\'') catch {};
-            if (type_str.len > 0) {
-                sw.writeAll(" type='") catch {};
-                sw.writeAll(type_str) catch {};
-                sw.writeByte('\'') catch {};
+            if (archive_stanza.len > 0) {
+                var recip_buf: [BARE_JID_MAX]u8 = undefined;
+                if (buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch null) |recipient_bare| {
+                    server.archiveStore(recipient_bare, sender_bare.?, archive_stanza_id, archive_timestamp, archive_stanza);
+                    server.archiveStore(sender_bare.?, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
+                } else {
+                    log.warn("connection {d} recipient bare JID exceeds {d} bytes, not archived", .{ session.conn.id, BARE_JID_MAX });
+                }
             }
-            if (id_str.len > 0) {
-                sw.writeAll(" id='") catch {};
-                sw.writeAll(id_str) catch {};
-                sw.writeByte('\'') catch {};
-            }
-            sw.writeByte('>') catch {};
-            sw.writeAll(inner_xml) catch {};
-            sw.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch {};
-            sw.writeAll(archive_stanza_id) catch {};
-            sw.writeAll("' by='") catch {};
-            sw.writeAll(server.server_host) catch {};
-            sw.writeAll("'/>") catch {};
-            sw.writeAll("</message>") catch {};
-            const full_stanza = stanza_fbs.getWritten();
-
-            server.archiveStore(recipient_bare, sender_bare, archive_stanza_id, archive_timestamp, full_stanza);
-            server.archiveStore(sender_bare, recipient_bare, archive_stanza_id, archive_timestamp, full_stanza);
         }
     }
 
@@ -327,59 +379,63 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             }
         }
 
-        // Offline storage for messages
+        // Offline storage for messages. Both keys must fit the store-key limit;
+        // when either does not, fall through to the bounce below instead of
+        // dropping the stanza with no answer to the sender.
         if (session.stanza_kind == .message) {
             if (server.offline) |store| {
-                if (is_archivable and archive_stanza_id.len > 0) {
-                    var recip_buf2: [256]u8 = undefined;
-                    var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                    recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                    recip_fbs2.writer().writeByte('@') catch {};
-                    recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                    const recipient_bare2 = recip_fbs2.getWritten();
-                    if (store.storePointer(recipient_bare2, sender_bare, archive_stanza_id, archive_timestamp) catch false) {
-                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                        return;
-                    }
-                } else if (server.archive) |archive| {
-                    var recip_buf2: [256]u8 = undefined;
-                    var recip_fbs2 = std.io.fixedBufferStream(&recip_buf2);
-                    recip_fbs2.writer().writeAll(to_jid.local) catch {};
-                    recip_fbs2.writer().writeByte('@') catch {};
-                    recip_fbs2.writer().writeAll(to_jid.domain) catch {};
-                    const recipient_bare2 = recip_fbs2.getWritten();
+                var recip_buf2: [BARE_JID_MAX]u8 = undefined;
+                const recipient_bare2 = buildBareJid(to_jid.local, to_jid.domain, &recip_buf2) catch null;
 
-                    var stanza_buf2: [20480]u8 = undefined;
-                    var stanza_fbs2 = std.io.fixedBufferStream(&stanza_buf2);
-                    const sw2 = stanza_fbs2.writer();
-                    sw2.writeAll("<message from='") catch {};
-                    sw2.writeAll(from_str) catch {};
-                    sw2.writeAll("' to='") catch {};
-                    sw2.writeAll(to_str) catch {};
-                    sw2.writeByte('\'') catch {};
-                    if (type_str.len > 0) {
-                        sw2.writeAll(" type='") catch {};
-                        sw2.writeAll(type_str) catch {};
-                        sw2.writeByte('\'') catch {};
-                    }
-                    if (id_str.len > 0) {
-                        sw2.writeAll(" id='") catch {};
-                        sw2.writeAll(id_str) catch {};
-                        sw2.writeByte('\'') catch {};
-                    }
-                    if (inner_xml.len == 0) {
-                        sw2.writeAll("/>") catch {};
+                // A bare JID over the store-key limit cannot key a row, so the
+                // stanza is not stored. It still reaches the bounce below: an
+                // unanswered drop loses the message silently.
+                if (sender_bare == null or recipient_bare2 == null) {
+                    _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
+                    log.warn("connection {d} message to {s} has a JID over the store-key limit, not stored offline", .{ session.conn.id, to_str });
+                } else {
+                    const sender_key = sender_bare.?;
+                    const recipient_key = recipient_bare2.?;
+
+                    // The payload goes down with the pointer: the archive row
+                    // this stanza was also handed to may still be sitting in
+                    // the async writer queue, and a drain that read the archive
+                    // alone would see a dangling pointer and delete a message
+                    // that is merely in flight (S13).
+                    var stored_form: []const u8 = "";
+                    var stored_id: []const u8 = "";
+                    if (is_archivable and archive_stanza_id.len > 0) {
+                        // Empty here means the archived form did not fit the
+                        // scratch bank, and a payloadless pointer would replay
+                        // nothing (E2d).
+                        stored_form = archive_stanza;
+                        stored_id = archive_stanza_id;
                     } else {
-                        sw2.writeByte('>') catch {};
-                        sw2.writeAll(inner_xml) catch {};
-                        sw2.writeAll("</message>") catch {};
+                        // Not archivable, so no stanza-id was minted and the
+                        // stored form carries none. This does not depend on an
+                        // archive being configured: the held copy carries the
+                        // payload, and requiring the archive would drop the
+                        // message for a deployment without one.
+                        stored_form = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, "", server.server_host) orelse "";
+                        stored_id = if (id_str.len > 0) id_str else "offline";
+                        if (stored_form.len > 0) {
+                            if (server.archive != null) {
+                                // archiveStore counts failures and rate-limits
+                                // its log; a per-stanza line here would be
+                                // unbounded.
+                                server.archiveStore(recipient_key, sender_key, stored_id, archive_timestamp, stored_form);
+                            }
+                        }
                     }
-                    const full_stanza2 = stanza_fbs2.getWritten();
-                    const offline_id = if (id_str.len > 0) id_str else "offline";
-                    archive.store(recipient_bare2, sender_bare, offline_id, archive_timestamp, full_stanza2) catch {};
-                    if (store.storePointer(recipient_bare2, sender_bare, offline_id, archive_timestamp) catch false) {
-                        log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
-                        return;
+
+                    if (stored_form.len > 0) {
+                        if (store.storeHeldPointer(recipient_key, sender_key, stored_id, archive_timestamp, stored_form) catch false) {
+                            log.info("connection {d} message to {s} stored offline", .{ session.conn.id, to_str });
+                            return;
+                        }
+                    } else {
+                        _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
+                        log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
                     }
                 }
             }
@@ -404,10 +460,62 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const is_typing_only = session.stanza_kind == .message and !is_archivable and
         std.mem.indexOf(u8, inner_xml, "<body") == null;
 
+    // Serialize the delivery copy once: every branch below sends or stores the
+    // same bytes. RFC 6121 section 8.5.2.1.1 omits type='normal' on messages.
+    const emit_type = emitTypeFor(session.stanza_kind, type_str);
+    const built = buildDeliveryStanza(out_buf, tag_name, from_str, to_str, type_str, emit_type, id_str, delivery_inner_xml);
+    if (built == null) {
+        log.warn("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
+    }
+
+    var hold_bounced = false;
+    var hold_stored = false;
+    var local_delivery_succeeded = false;
     // Forward to each local target session
     for (local_ids[0..target_count]) |tid| {
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
+        const sent_data = built orelse {
+            delivery_failed = true;
+            continue;
+        };
+        // A session whose offline tail is still draining must not be overtaken.
+        if (target_session.offline_pending and session.stanza_kind == .message and
+            !std.mem.eql(u8, type_str, "error"))
+        {
+            // The tail is per bare JID, so one message is held once however
+            // many local resources are draining it. A second hold here would
+            // add a second row, and the drain would then deliver both.
+            if (hold_stored) {
+                local_delivery_succeeded = true;
+                continue;
+            }
+            const hold_id = if (is_archivable)
+                archive_stanza_id
+            else if (id_str.len > 0)
+                id_str
+            else
+                "offline";
+            if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data, hold_token)) {
+                hold_stored = true;
+                local_delivery_succeeded = true;
+                log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
+                continue;
+            }
+            // No offline store, or the recipient's queue is at quota. The
+            // stanza can neither be held nor sent without overtaking the
+            // tail, so tell the sender instead of dropping it silently.
+            if (!hold_bounced) {
+                hold_bounced = true;
+                _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
+                log.info("connection {d} message to {s} not held, offline queue unavailable or full", .{ session.conn.id, to_str });
+                sendServiceUnavailable(session, id_str, to_str, from_str);
+                if (session.conn.hasPendingWrite()) {
+                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
+                }
+            }
+            continue;
+        }
         // T153: a detached (SM resume pending) session has no live connection —
         // its conn.fd was already closed by detachSession(). Attempting
         // conn.queueSend()/changes.addWrite() here would register a kqueue
@@ -416,77 +524,42 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // session slot. Track the stanza for resume replay instead of
         // attempting live delivery.
         if (target_session.sm_detached) {
-            var msg_buf: [20480]u8 = undefined;
-            var msg_fbs = std.io.fixedBufferStream(&msg_buf);
-            const mw = msg_fbs.writer();
-            mw.writeByte('<') catch continue;
-            mw.writeAll(tag_name) catch continue;
-            mw.writeAll(" from='") catch continue;
-            mw.writeAll(from_str) catch continue;
-            mw.writeAll("' to='") catch continue;
-            mw.writeAll(to_str) catch continue;
-            mw.writeByte('\'') catch continue;
-            if (type_str.len > 0 and !(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-                mw.writeAll(" type='") catch continue;
-                mw.writeAll(type_str) catch continue;
-                mw.writeByte('\'') catch continue;
-            }
-            if (id_str.len > 0) {
-                mw.writeAll(" id='") catch continue;
-                mw.writeAll(id_str) catch continue;
-                mw.writeByte('\'') catch continue;
-            }
-            if (delivery_inner_xml.len == 0) {
-                mw.writeAll("/>") catch continue;
-            } else {
-                mw.writeByte('>') catch continue;
-                mw.writeAll(delivery_inner_xml) catch continue;
-                mw.writeAll("</") catch continue;
-                mw.writeAll(tag_name) catch continue;
-                mw.writeByte('>') catch continue;
-            }
-            target_session.smTrackOutbound(msg_fbs.getWritten());
+            target_session.smTrackOutbound(sent_data);
+            local_delivery_succeeded = true;
             continue;
         }
-        var msg_buf: [20480]u8 = undefined;
-        var msg_fbs = std.io.fixedBufferStream(&msg_buf);
-        const mw = msg_fbs.writer();
-
-        mw.writeByte('<') catch continue;
-        mw.writeAll(tag_name) catch continue;
-        mw.writeAll(" from='") catch continue;
-        mw.writeAll(from_str) catch continue;
-        mw.writeAll("' to='") catch continue;
-        mw.writeAll(to_str) catch continue;
-        mw.writeByte('\'') catch continue;
-        if (type_str.len > 0) {
-            if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-                mw.writeAll(" type='") catch continue;
-                mw.writeAll(type_str) catch continue;
-                mw.writeByte('\'') catch continue;
+        // Apply the MUC fan-out policy here too. A stanza that fits an empty
+        // buffer but not the current one means the peer is not reading, so
+        // mark it for the slow-reader teardown, as the MUC path does. A stanza
+        // larger than the whole buffer can never be delivered to anyone.
+        target_session.conn.queueSendWithFlush(sent_data) catch |err| {
+            delivery_failed = true;
+            if (err == error.WriteBufferFull) {
+                if (sent_data.len <= connection_mod.WRITE_BUF_SIZE) {
+                    target_session.sm_overflow = true;
+                    log.warn("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
+                } else {
+                    log.warn("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
+                }
+            } else {
+                log.warn("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
             }
-        }
-        if (id_str.len > 0) {
-            mw.writeAll(" id='") catch continue;
-            mw.writeAll(id_str) catch continue;
-            mw.writeByte('\'') catch continue;
-        }
-
-        if (delivery_inner_xml.len == 0) {
-            mw.writeAll("/>") catch continue;
-        } else {
-            mw.writeByte('>') catch continue;
-            mw.writeAll(delivery_inner_xml) catch continue;
-            mw.writeAll("</") catch continue;
-            mw.writeAll(tag_name) catch continue;
-            mw.writeByte('>') catch continue;
-        }
-
-        const sent_data = msg_fbs.getWritten();
-        target_session.conn.queueSend(sent_data) catch continue;
+            continue;
+        };
         target_session.smTrackOutbound(sent_data);
+        local_delivery_succeeded = true;
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, tid) catch {};
+        }
+    }
+
+    const bounceable = (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) or
+        (session.stanza_kind == .iq and (std.mem.eql(u8, type_str, "get") or std.mem.eql(u8, type_str, "set")));
+    if (delivery_failed and !local_delivery_succeeded and !remote_delivered and !hold_bounced and bounceable) {
+        log.info("connection {d} stanza to {s} could not be delivered to any resource", .{ session.conn.id, to_str });
+        sendServiceUnavailable(session, id_str, to_str, from_str);
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     }
 
@@ -495,9 +568,116 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (session.stanza_kind == .message and !has_no_copy and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
     {
+        // The serialized stanza is dead now that the delivery loop above has
+        // consumed it; give the bank back so sendCarbons, which still reads
+        // delivery_inner_xml out of the augmented bank, can take it.
+        out_lease.release();
+
         sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
         sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
     }
+}
+
+/// Build the form that is written to the archive and held for offline replay:
+/// the message with its attributes, its body, and (when one was minted) the
+/// XEP-0359 stanza-id element. Returns null when the result does not fit
+/// `buf`, so a caller can skip the store rather than persist and later replay
+/// a truncated stanza (E2d). Pass an empty stanza_id to omit the element.
+fn buildStoredStanza(
+    buf: []u8,
+    from_str: []const u8,
+    to_str: []const u8,
+    type_str: []const u8,
+    id_str: []const u8,
+    inner_xml: []const u8,
+    stanza_id: []const u8,
+    server_host: []const u8,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+
+    w.writeAll("<message from='") catch return null;
+    xml.escapeWrite(w, from_str) catch return null;
+    w.writeAll("' to='") catch return null;
+    xml.escapeWrite(w, to_str) catch return null;
+    w.writeByte('\'') catch return null;
+    if (type_str.len > 0) {
+        w.writeAll(" type='") catch return null;
+        xml.escapeWrite(w, type_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (inner_xml.len == 0) {
+        w.writeAll("/>") catch return null;
+        return fbs.getWritten();
+    }
+    w.writeByte('>') catch return null;
+    w.writeAll(inner_xml) catch return null;
+    if (stanza_id.len > 0) {
+        w.writeAll("<stanza-id xmlns='urn:xmpp:sid:0' id='") catch return null;
+        xml.escapeWrite(w, stanza_id) catch return null;
+        w.writeAll("' by='") catch return null;
+        xml.escapeWrite(w, server_host) catch return null;
+        w.writeAll("'/>") catch return null;
+    }
+    w.writeAll("</message>") catch return null;
+    return fbs.getWritten();
+}
+
+/// RFC 6121 section 8.5.2.1.1 omits type='normal' on messages. Both the local
+/// and the cross-worker form must agree on this, or one dispatch becomes two.
+fn emitTypeFor(kind: StanzaKind, type_str: []const u8) bool {
+    return type_str.len > 0 and
+        !(kind == .message and std.mem.eql(u8, type_str, "normal"));
+}
+
+/// Serialize one delivery form into `buf`, returning the bytes written or null
+/// when they do not fit. Every target of a dispatch, local or on another
+/// worker, gets these bytes, so the store sees one dispatch as one message.
+fn buildDeliveryStanza(
+    buf: []u8,
+    tag_name: []const u8,
+    from_str: []const u8,
+    to_str: []const u8,
+    type_str: []const u8,
+    emit_type: bool,
+    id_str: []const u8,
+    inner_xml: []const u8,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+
+    w.writeByte('<') catch return null;
+    w.writeAll(tag_name) catch return null;
+    w.writeAll(" from='") catch return null;
+    xml.escapeWrite(w, from_str) catch return null;
+    w.writeAll("' to='") catch return null;
+    xml.escapeWrite(w, to_str) catch return null;
+    w.writeByte('\'') catch return null;
+    if (emit_type) {
+        w.writeAll(" type='") catch return null;
+        xml.escapeWrite(w, type_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (inner_xml.len == 0) {
+        w.writeAll("/>") catch return null;
+    } else {
+        w.writeByte('>') catch return null;
+        w.writeAll(inner_xml) catch return null;
+        w.writeAll("</") catch return null;
+        w.writeAll(tag_name) catch return null;
+        w.writeByte('>') catch return null;
+    }
+    return fbs.getWritten();
 }
 
 /// Forward a stanza to a remote domain via the S2S daemon IPC.
@@ -518,27 +698,28 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
         .none => return,
     };
 
-    var stanza_buf: [20480]u8 = undefined;
-    var stanza_fbs = std.io.fixedBufferStream(&stanza_buf);
+    var stanza_lease = server.leaseByteScratch() orelse return;
+    defer stanza_lease.release();
+    var stanza_fbs = std.io.fixedBufferStream(stanza_lease.buf);
     const sw = stanza_fbs.writer();
 
     sw.writeByte('<') catch return;
     sw.writeAll(tag_name) catch return;
     sw.writeAll(" from='") catch return;
-    sw.writeAll(from_str) catch return;
+    xml.escapeWrite(sw, from_str) catch return;
     sw.writeAll("' to='") catch return;
-    sw.writeAll(to_str) catch return;
+    xml.escapeWrite(sw, to_str) catch return;
     sw.writeByte('\'') catch return;
     if (type_str.len > 0) {
         if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
             sw.writeAll(" type='") catch return;
-            sw.writeAll(type_str) catch return;
+            xml.escapeWrite(sw, type_str) catch return;
             sw.writeByte('\'') catch return;
         }
     }
     if (id_str.len > 0) {
         sw.writeAll(" id='") catch return;
-        sw.writeAll(id_str) catch return;
+        xml.escapeWrite(sw, id_str) catch return;
         sw.writeByte('\'') catch return;
     }
     if (inner_xml.len == 0) {
@@ -566,14 +747,15 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
         return;
     };
 
-    if (server.s2s_ipc.hasPendingSend()) {
-        changes.addWrite(server.s2s_ipc.fd, IPC_S2S_UDATA) catch {};
-    }
-
+    // Write interest is armed by reconcileIpcWriteInterest, once per loop
+    // iteration (S10). Arming here would leave a persistent filter with
+    // s2s_write_armed still false, so nothing would ever remove it.
     log.info("connection {d} stanza to remote {s} forwarded via S2S", .{ session.conn.id, to_str });
 }
 
 /// Serialize a stanza and enqueue for cross-thread delivery via MPSC.
+/// Returns false when the stanza did not fit a delivery slot or the queue
+/// failed; the caller must treat that recipient as undelivered (S14).
 fn enqueueCrossThreadStanza(
     server: *Server,
     route: SessionEntry,
@@ -583,52 +765,46 @@ fn enqueueCrossThreadStanza(
     id_str: []const u8,
     inner_xml: []const u8,
     kind: StanzaKind,
-) void {
-    const ds = server.delivery_system orelse return;
+    hold_token: offline_store.HoldToken,
+) bool {
+    const ds = server.delivery_system orelse return false;
 
     const tag_name: []const u8 = switch (kind) {
         .message => "message",
         .presence => "presence",
         .iq => "iq",
-        .none => return,
+        .none => return false,
     };
 
+    // The same serializer as the local path: the receiving worker holds this
+    // message under the token below, and a byte that differs between the two
+    // forms would split one dispatch into two rows.
     var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    const payload = buildDeliveryStanza(
+        &buf,
+        tag_name,
+        from_str,
+        to_str,
+        type_str,
+        emitTypeFor(kind, type_str),
+        id_str,
+        inner_xml,
+    ) orelse return dropOversize(inner_xml.len, route);
 
-    w.writeByte('<') catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeAll(" from='") catch return;
-    w.writeAll(from_str) catch return;
-    w.writeAll("' to='") catch return;
-    w.writeAll(to_str) catch return;
-    w.writeByte('\'') catch return;
-    if (type_str.len > 0) {
-        if (!(kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-            w.writeAll(" type='") catch return;
-            w.writeAll(type_str) catch return;
-            w.writeByte('\'') catch return;
-        }
-    }
-    if (id_str.len > 0) {
-        w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
-        w.writeByte('\'') catch return;
-    }
-    if (inner_xml.len == 0) {
-        w.writeAll("/>") catch return;
-    } else {
-        w.writeByte('>') catch return;
-        w.writeAll(inner_xml) catch return;
-        w.writeAll("</") catch return;
-        w.writeAll(tag_name) catch return;
-        w.writeByte('>') catch return;
-    }
-
-    ds.deliver(route.worker_id, route.local_session_id, route.generation, fbs.getWritten()) catch |err| {
+    // Carry the dispatch identity so the receiving worker holds this message
+    // under the same token every other holder uses.
+    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
+        _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+        return false;
     };
+    return true;
+}
+
+fn dropOversize(inner_len: usize, route: SessionEntry) bool {
+    _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
+    return false;
 }
 
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
@@ -646,9 +822,18 @@ fn sendCarbons(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
+
+    // Reuse one serialization buffer across resources: each carbon is fully
+    // consumed by queueSend or the MPSC delivery before the next iteration.
+    // The pool lease keeps per-recipient serialization storage off the stack.
+    var carbon_lease = server.leaseByteScratch() orelse return;
+    defer carbon_lease.release();
+    const cbuf = carbon_lease.buf;
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
@@ -656,20 +841,19 @@ fn sendCarbons(
             if (&target.conn == &sender_session.conn) continue;
             if (!target.carbons_enabled) continue;
 
-            var cbuf: [20480]u8 = undefined;
-            var cfbs = std.io.fixedBufferStream(&cbuf);
+            var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeByte('/') catch continue;
-            cw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(cw, entry.resource()) catch continue;
             cw.writeAll("' type='chat'>") catch continue;
 
             cw.writeByte('<') catch continue;
@@ -677,18 +861,18 @@ fn sendCarbons(
             cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(from_str) catch continue;
+            xml.escapeWrite(cw, from_str) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(to_str) catch continue;
+            xml.escapeWrite(cw, to_str) catch continue;
             cw.writeByte('\'') catch continue;
             if (type_str.len > 0) {
                 cw.writeAll(" type='") catch continue;
-                cw.writeAll(type_str) catch continue;
+                xml.escapeWrite(cw, type_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (id_str.len > 0) {
                 cw.writeAll(" id='") catch continue;
-                cw.writeAll(id_str) catch continue;
+                xml.escapeWrite(cw, id_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (delivery_inner_xml.len == 0) {
@@ -709,20 +893,19 @@ fn sendCarbons(
             // T89: Cross-thread carbon delivery via MPSC
             const ds = server.delivery_system orelse continue;
 
-            var cbuf: [20480]u8 = undefined;
-            var cfbs = std.io.fixedBufferStream(&cbuf);
+            var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(user_local) catch continue;
+            xml.escapeWrite(cw, user_local) catch continue;
             cw.writeByte('@') catch continue;
-            cw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(cw, user_domain) catch continue;
             cw.writeByte('/') catch continue;
-            cw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(cw, entry.resource()) catch continue;
             cw.writeAll("' type='chat'>") catch continue;
 
             cw.writeByte('<') catch continue;
@@ -730,18 +913,18 @@ fn sendCarbons(
             cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
 
             cw.writeAll("<message from='") catch continue;
-            cw.writeAll(from_str) catch continue;
+            xml.escapeWrite(cw, from_str) catch continue;
             cw.writeAll("' to='") catch continue;
-            cw.writeAll(to_str) catch continue;
+            xml.escapeWrite(cw, to_str) catch continue;
             cw.writeByte('\'') catch continue;
             if (type_str.len > 0) {
                 cw.writeAll(" type='") catch continue;
-                cw.writeAll(type_str) catch continue;
+                xml.escapeWrite(cw, type_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (id_str.len > 0) {
                 cw.writeAll(" id='") catch continue;
-                cw.writeAll(id_str) catch continue;
+                xml.escapeWrite(cw, id_str) catch continue;
                 cw.writeByte('\'') catch continue;
             }
             if (delivery_inner_xml.len == 0) {
@@ -758,6 +941,7 @@ fn sendCarbons(
 
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
+                _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             };
         }
     }
@@ -780,18 +964,18 @@ pub fn sendNotAuthorized(session: *Session, id_str: []const u8, to_str: []const 
     w.writeAll(" type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     if (to_str.len > 0) {
         w.writeAll(" from='") catch return;
-        w.writeAll(to_str) catch return;
+        xml.escapeWrite(w, to_str) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
     w.writeAll(tag_name) catch return;
     w.writeByte('>') catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Send a service-unavailable error for a stanza that can't be delivered.
@@ -803,22 +987,46 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
         else => "message",
     };
 
-    var fbs = std.io.fixedBufferStream(&session.write_scratch);
-    const w = fbs.writer();
-    w.writeByte('<') catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeAll(" type='error'") catch return;
-    if (id_str.len > 0) {
-        w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
-        w.writeByte('\'') catch return;
+    if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, true)) |bounce| {
+        session.queueSendStanza(bounce) catch return;
+        return;
     }
-    w.writeAll(" from='") catch return;
-    w.writeAll(to_str) catch return;
-    w.writeAll("' to='") catch return;
-    w.writeAll(from_str) catch return;
-    w.writeAll("'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeByte('>') catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    // Both JIDs escape wider than the scratch buffer. Echoing them is optional
+    // and being told is not, so answer without them: the reply goes to the
+    // sender's own connection, which already knows who it is and who it wrote
+    // to. Omitted, not truncated, so the result is still a valid stanza.
+    if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, false)) |bounce| {
+        session.queueSendStanza(bounce) catch return;
+    }
+}
+
+fn writeServiceUnavailable(
+    buf: []u8,
+    tag_name: []const u8,
+    id_str: []const u8,
+    to_str: []const u8,
+    from_str: []const u8,
+    echo_jids: bool,
+) ?[]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeByte('<') catch return null;
+    w.writeAll(tag_name) catch return null;
+    w.writeAll(" type='error'") catch return null;
+    if (id_str.len > 0) {
+        w.writeAll(" id='") catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    if (echo_jids) {
+        w.writeAll(" from='") catch return null;
+        xml.escapeWrite(w, to_str) catch return null;
+        w.writeAll("' to='") catch return null;
+        xml.escapeWrite(w, from_str) catch return null;
+        w.writeByte('\'') catch return null;
+    }
+    w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return null;
+    w.writeAll(tag_name) catch return null;
+    w.writeByte('>') catch return null;
+    return fbs.getWritten();
 }

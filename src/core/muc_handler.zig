@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const xml = @import("xml");
+const xmpp = @import("xmpp");
 const room_registry = @import("room_registry");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
@@ -25,6 +26,7 @@ const RoomConfig = room_store.RoomConfig;
 const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
 
+const connection_mod = @import("connection.zig");
 const server_mod = @import("server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
@@ -155,7 +157,8 @@ pub fn handleMucGroupchat(
         return;
     }
 
-    // Build the from JID: room@conference.host/sender_nick
+    // Build the from JID: room@conference.host/sender_nick. Kept raw here;
+    // buildPrefix escapes the whole from_str once on emit (S1).
     var from_buf: [384]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
@@ -164,16 +167,32 @@ pub fn handleMucGroupchat(
     fw.writeAll(sender.getNick()) catch return;
     const from_str = from_fbs.getWritten();
 
-    // Build pre-built stanza: prefix (before recipient JID) + suffix (after)
-    var prefix_buf: [512]u8 = undefined;
+    // Build pre-built stanza: prefix (before recipient JID) + suffix (after).
+    // The suffix is bounded to what the fan-out queue can park, so a stanza is
+    // never too long to queue after being delivered live.
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_buf: [16500]u8 = undefined;
-    const suffix_len = fanout.buildSuffix(&suffix_buf, id_str, inner_xml) orelse return;
+    var suffix_lease = server.leaseByteScratch() orelse return;
+    defer suffix_lease.release();
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], id_str, inner_xml) orelse return;
+    if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
+        // No occupant could receive it, and queueing it would trip the
+        // slow-reader teardown on every session in the room (H5).
+        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ room_jid, prefix_len, suffix_len });
+        sendMessageError(server, session, to_local, muc_host, id_str, "resource-constraint", changes);
+        return;
+    }
     const prefix = prefix_buf[0..prefix_len];
-    const suffix = suffix_buf[0..suffix_len];
+    const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast: one MPSC enqueue per remote worker (not per occupant)
     server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // One delivery buffer reused for every local occupant. Leased from the
+    // per-worker pool instead of taken per delivery so the fan-out loop does
+    // not add a 20 KiB frame per recipient (S18).
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
 
     // Local fan-out: deliver to occupants on this worker (bounded continuation)
     const batch_size = server.fanout_queue.batch_size;
@@ -188,7 +207,7 @@ pub fn handleMucGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -213,13 +232,13 @@ pub fn handleMucGroupchat(
             @memcpy(pf.room_jid_buf[0..room_jid.len], room_jid);
             pf.room_jid_len = @intCast(room_jid.len);
             @memcpy(pf.prefix_buf[0..prefix_len], prefix);
-            pf.prefix_len = prefix_len;
+            pf.prefix_len = @intCast(prefix_len);
             @memcpy(pf.suffix_buf[0..suffix_len], suffix);
-            pf.suffix_len = suffix_len;
+            pf.suffix_len = @intCast(suffix_len);
             pf.next_slot = resume_slot;
             log.debug("queued fan-out continuation for {s} from slot {d}", .{ room_jid, resume_slot });
         } else {
-            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+            deliverRemainingSync(server, room, resume_slot, deliver_lease.buf, prefix, suffix, changes);
         }
     }
 
@@ -228,15 +247,19 @@ pub fn handleMucGroupchat(
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (id_str.len > 0) id_str else "muc";
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
-        var arch_buf: [17200]u8 = undefined;
-        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        // The fan-out above has finished, so its buffer is given back first
+        // rather than held across the archive build.
+        deliver_lease.release();
+        var arch_lease = server.leaseByteScratch() orelse return;
+        defer arch_lease.release();
+        var arch_fbs = std.io.fixedBufferStream(arch_lease.buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
-        aw.writeAll(from_str) catch return;
+        xml.escapeWrite(aw, from_str) catch return;
         aw.writeAll("' type='groupchat'") catch return;
         if (id_str.len > 0) {
             aw.writeAll(" id='") catch return;
-            aw.writeAll(id_str) catch return;
+            xml.escapeWrite(aw, id_str) catch return;
             aw.writeByte('\'') catch return;
         }
         aw.writeByte('>') catch return;
@@ -270,6 +293,13 @@ pub fn drainPendingFanout(
     const suffix = pf.getSuffix();
     var delivered: u8 = 0;
 
+    // One delivery buffer reused across the batch (S18).
+    var deliver_lease = server.leaseByteScratch() orelse {
+        pf.complete();
+        return true;
+    };
+    defer deliver_lease.release();
+
     // Continuation only handles local occupants — multicast was sent in initial call
     var i: usize = pf.next_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
@@ -279,7 +309,7 @@ pub fn drainPendingFanout(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -306,6 +336,7 @@ fn deliverRemainingSync(
     server: *Server,
     room: *const Room,
     start_slot: u8,
+    buf: []u8,
     prefix: []const u8,
     suffix: []const u8,
     changes: *ChangeList,
@@ -319,7 +350,7 @@ fn deliverRemainingSync(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
     }
 }
 
@@ -336,17 +367,17 @@ pub fn handleMucDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
     w.writeAll("<identity category='conference' type='text' name='Chat Rooms'/>") catch return;
     w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -367,11 +398,11 @@ pub fn handleMucDiscoItems(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#items'>") catch return;
 
     // List local public rooms (owned by this worker)
@@ -379,17 +410,17 @@ pub fn handleMucDiscoItems(
     const count = reg.listPublicRooms(&room_ptrs);
     for (room_ptrs[0..count]) |room| {
         w.writeAll("<item jid='") catch break;
-        w.writeAll(room.getJid()) catch break;
+        xml.escapeWrite(w, room.getJid()) catch break;
         w.writeAll("' name='") catch break;
         const name = room.config.getName();
         if (name.len > 0) {
-            w.writeAll(name) catch break;
+            xml.escapeWrite(w, name) catch break;
         } else {
             const jid = room.getJid();
             if (std.mem.indexOfScalar(u8, jid, '@')) |at| {
-                w.writeAll(jid[0..at]) catch break;
+                xml.escapeWrite(w, jid[0..at]) catch break;
             } else {
-                w.writeAll(jid) catch break;
+                xml.escapeWrite(w, jid) catch break;
             }
         }
         w.writeAll("'/>") catch break;
@@ -402,17 +433,17 @@ pub fn handleMucDiscoItems(
         // Skip rooms that are also in our local shard (avoid duplicates)
         if (reg.findByJid(entry.getJid()) != null) continue;
         w.writeAll("<item jid='") catch break;
-        w.writeAll(entry.getJid()) catch break;
+        xml.escapeWrite(w, entry.getJid()) catch break;
         w.writeAll("' name='") catch break;
         const dname = entry.getName();
         if (dname.len > 0) {
-            w.writeAll(dname) catch break;
+            xml.escapeWrite(w, dname) catch break;
         } else {
             const djid = entry.getJid();
             if (std.mem.indexOfScalar(u8, djid, '@')) |at| {
-                w.writeAll(djid[0..at]) catch break;
+                xml.escapeWrite(w, djid[0..at]) catch break;
             } else {
-                w.writeAll(djid) catch break;
+                xml.escapeWrite(w, djid) catch break;
             }
         }
         w.writeAll("'/>") catch break;
@@ -420,7 +451,7 @@ pub fn handleMucDiscoItems(
 
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -464,11 +495,11 @@ pub fn handleRoomDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
 
     if (reg.findByJid(room_jid)) |room| {
@@ -476,7 +507,7 @@ pub fn handleRoomDiscoInfo(
         w.writeAll("<identity category='conference' type='text'") catch return;
         if (name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(name) catch return;
+            xml.escapeWrite(w, name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll("/>") catch return;
@@ -516,7 +547,7 @@ pub fn handleRoomDiscoInfo(
 
     w.writeAll("</query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -607,6 +638,10 @@ pub fn handleMucAdminIq(
     // Parse the requested action
     if (std.mem.eql(u8, new_role_str, "none")) {
         // Kick — remove occupant and broadcast with status 307
+        if (target_idx == requester_idx) {
+            sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
+            return;
+        }
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         // T114: Send shadow_part to the kicked occupant's worker
@@ -621,11 +656,8 @@ pub fn handleMucAdminIq(
             } });
         }
 
-        // Auto-destroy transient empty rooms
-        if (room.occupant_count == 0 and !room.config.persistent) {
-            broadcastDirectoryUpdate(server, room_jid, room.config.getName(), false);
-            _ = reg.destroyRoom(room_jid);
-        }
+        // Empty transient rooms are destroyed by cleanupEmptyRooms, never
+        // mid-processing (S6).
     } else if (std.mem.eql(u8, new_role_str, "visitor")) {
         // Revoke voice — set role to visitor
         if (room.occupants[target_idx]) |*occ| {
@@ -643,14 +675,14 @@ pub fn handleMucAdminIq(
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
-    rw.writeAll(room_jid) catch return;
+    xml.escapeWrite(rw, room_jid) catch return;
     rw.writeAll("' to='") catch return;
     writeSessionJid(rw, session) catch return;
     rw.writeAll("' id='") catch return;
-    rw.writeAll(iq_id) catch return;
+    xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
-    session.conn.queueSend(result_fbs.getWritten()) catch return;
+    session.queueSendStanza(result_fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -664,22 +696,36 @@ fn sendIqErrorFromRoom(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    sendIqErrorFromRoomTyped(server, session, room_jid, iq_id, condition, "cancel", changes);
+}
+
+fn sendIqErrorFromRoomTyped(
+    server: *Server,
+    session: *Session,
+    room_jid: []const u8,
+    iq_id: []const u8,
+    condition: []const u8,
+    err_type: []const u8,
+    changes: *ChangeList,
+) void {
     _ = server;
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
     w.writeAll("<iq type='error' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
-    w.writeAll("'><error type='cancel'><") catch return;
+    xml.escapeWrite(w, iq_id) catch return;
+    w.writeAll("'><error type='") catch return;
+    w.writeAll(err_type) catch return;
+    w.writeAll("'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -723,11 +769,11 @@ pub fn handleMucOwnerGet(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/muc#owner'>") catch return;
     w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
     w.writeAll("<title>Room Configuration</title>") catch return;
@@ -737,12 +783,12 @@ pub fn handleMucOwnerGet(
 
     // Room name
     w.writeAll("<field var='muc#roomconfig_roomname' type='text-single' label='Room Name'><value>") catch return;
-    w.writeAll(room.config.getName()) catch return;
+    xml.escapeWrite(w, room.config.getName()) catch return;
     w.writeAll("</value></field>") catch return;
 
     // Room description
     w.writeAll("<field var='muc#roomconfig_roomdesc' type='text-single' label='Description'><value>") catch return;
-    w.writeAll(room.config.getSubject()) catch return;
+    xml.escapeWrite(w, room.config.getSubject()) catch return;
     w.writeAll("</value></field>") catch return;
 
     // Boolean fields
@@ -755,12 +801,12 @@ pub fn handleMucOwnerGet(
 
     // Password
     w.writeAll("<field var='muc#roomconfig_roomsecret' type='text-private' label='Password'><value>") catch return;
-    w.writeAll(room.config.getPassword()) catch return;
+    xml.escapeWrite(w, room.config.getPassword()) catch return;
     w.writeAll("</value></field>") catch return;
 
     w.writeAll("</x></query></iq>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -797,24 +843,18 @@ pub fn handleMucOwnerSet(
         return;
     }
 
-    // Parse form fields from accumulated stanza buffer.
-    // The form XML is in session.stanza_buf — parse key/value pairs from <field var='...'><value>...</value></field>
+    // Parse form fields from accumulated stanza buffer. The form XML is in
+    // session.stanza_buf. Any overflowing or malformed value, or a secret
+    // wider than the field, rejects the whole form with type='modify'
+    // (XEP-0045): never apply a partially parsed config (G1).
     const form_xml = session.stanza_buf[0..session.stanza_buf_len];
     var config = room.config;
     const was_persistent = config.persistent;
 
-    // Parse each field we recognize
-    config.persistent = parseFormBool(form_xml, "muc#roomconfig_persistentroom") orelse config.persistent;
-    config.public_room = parseFormBool(form_xml, "muc#roomconfig_publicroom") orelse config.public_room;
-    config.members_only = parseFormBool(form_xml, "muc#roomconfig_membersonly") orelse config.members_only;
-    config.moderated = parseFormBool(form_xml, "muc#roomconfig_moderatedroom") orelse config.moderated;
-    config.password_protected = parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom") orelse config.password_protected;
-    config.allow_invites = parseFormBool(form_xml, "muc#roomconfig_allowinvites") orelse config.allow_invites;
-
-    // Text fields
-    if (parseFormValue(form_xml, "muc#roomconfig_roomname")) |name| config.setName(name);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomdesc")) |desc| config.setSubject(desc);
-    if (parseFormValue(form_xml, "muc#roomconfig_roomsecret")) |pw| config.setPassword(pw);
+    applyConfigForm(&config, form_xml) catch {
+        sendIqErrorFromRoomTyped(server, session, room_jid, iq_id, "not-acceptable", "modify", changes);
+        return;
+    };
 
     // Apply config to the in-memory room
     room.config = config;
@@ -836,14 +876,14 @@ pub fn handleMucOwnerSet(
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
-    rw.writeAll(room_jid) catch return;
+    xml.escapeWrite(rw, room_jid) catch return;
     rw.writeAll("' to='") catch return;
     writeSessionJid(rw, session) catch return;
     rw.writeAll("' id='") catch return;
-    rw.writeAll(iq_id) catch return;
+    xml.escapeWrite(rw, iq_id) catch return;
     rw.writeAll("'/>") catch return;
 
-    session.conn.queueSend(result_fbs.getWritten()) catch return;
+    session.queueSendStanza(result_fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -855,24 +895,50 @@ pub fn handleMucOwnerSet(
 /// Write a boolean form field element.
 fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, value: bool) void {
     w.writeAll("<field var='") catch return;
-    w.writeAll(var_name) catch return;
+    xml.escapeWrite(w, var_name) catch return;
     w.writeAll("' type='boolean' label='") catch return;
-    w.writeAll(label) catch return;
+    xml.escapeWrite(w, label) catch return;
     w.writeAll("'><value>") catch return;
     w.writeAll(if (value) "1" else "0") catch return;
     w.writeAll("</value></field>") catch return;
 }
 
-/// Parse a boolean value from a form field in XML.
-fn parseFormBool(xml_data: []const u8, field_var: []const u8) ?bool {
-    const value = parseFormValue(xml_data, field_var) orelse return null;
+/// Parse a boolean value from a form field in XML. Absent is null; anything
+/// present that is not a boolean literal is an error, so a typo cannot be
+/// mistaken for "leave this setting alone".
+fn parseFormBool(xml_data: []const u8, field_var: []const u8) !?bool {
+    var buf: [16]u8 = undefined;
+    const value = (try parseFormValue(xml_data, field_var, &buf)) orelse return null;
     if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false")) return false;
-    return null;
+    return error.FormValueInvalid;
 }
 
-/// Parse the <value>...</value> content for a given field var from form XML.
-fn parseFormValue(xml_data: []const u8, field_var: []const u8) ?[]const u8 {
+/// Apply a submitted room config form to `config`. Any overflowing or
+/// malformed field value, and any room secret wider than the field, is an
+/// error for the whole form: the caller must reject it rather than apply a
+/// partially parsed config (G1). Values are stored decoded; output escapes.
+fn applyConfigForm(config: *RoomConfig, form_xml: []const u8) !void {
+    config.persistent = (try parseFormBool(form_xml, "muc#roomconfig_persistentroom")) orelse config.persistent;
+    config.public_room = (try parseFormBool(form_xml, "muc#roomconfig_publicroom")) orelse config.public_room;
+    config.members_only = (try parseFormBool(form_xml, "muc#roomconfig_membersonly")) orelse config.members_only;
+    config.moderated = (try parseFormBool(form_xml, "muc#roomconfig_moderatedroom")) orelse config.moderated;
+    config.password_protected = (try parseFormBool(form_xml, "muc#roomconfig_passwordprotectedroom")) orelse config.password_protected;
+    config.allow_invites = (try parseFormBool(form_xml, "muc#roomconfig_allowinvites")) orelse config.allow_invites;
+
+    var text_buf: [512]u8 = undefined;
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomname", &text_buf)) |name| config.setName(name);
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomdesc", &text_buf)) |desc| config.setSubject(desc);
+    if (try parseFormValue(form_xml, "muc#roomconfig_roomsecret", &text_buf)) |pw| try config.setPassword(pw);
+}
+
+/// Parse the <value>...</value> content for a given field var from form XML,
+/// decoded into `buf` (the form buffer holds escaped XML; storing it raw
+/// would double-escape on every output round trip). Returns null when the
+/// field is absent. Returns error.FormValueInvalid when the value does not
+/// fit or the entities are malformed, so the caller rejects the whole form
+/// rather than silently skipping the field (G1).
+fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) !?[]const u8 {
     // Find field_var in the XML
     const var_pos = std.mem.indexOf(u8, xml_data, field_var) orelse return null;
     // Find the next <value> after this field
@@ -881,7 +947,9 @@ fn parseFormValue(xml_data: []const u8, field_var: []const u8) ?[]const u8 {
     const content_start = value_start_tag + 7; // len("<value>")
     const remaining = after_var[content_start..];
     const value_end = std.mem.indexOf(u8, remaining, "</value>") orelse return null;
-    return remaining[0..value_end];
+    var fbs = std.io.fixedBufferStream(buf);
+    xml.decodeWrite(fbs.writer(), remaining[0..value_end]) catch return error.FormValueInvalid;
+    return fbs.getWritten();
 }
 
 /// Broadcast status code 104 (config changed) to all room occupants.
@@ -895,7 +963,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<message from='") catch continue;
-        w.writeAll(room.getJid()) catch continue;
+        xml.escapeWrite(w, room.getJid()) catch continue;
         w.writeAll("' to='") catch continue;
         writeSessionJid(w, target) catch continue;
         w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch continue;
@@ -1006,7 +1074,18 @@ fn handleJoin(
         return;
     }
 
-    // Password-protected room check (T67) — require matching <password> in join presence
+    // A protected room with no stored secret must not be joinable (G1):
+    // fail closed rather than letting anyone in without a password.
+    if (r.config.password_protected and r.config.password_len == 0) {
+        sendPresenceError(server, session, room_local, muc_host, "not-authorized", changes);
+        return;
+    }
+
+    // Password-protected room check (T67): require a matching <password> in the
+    // join presence. stanza_buf holds escaped text, so the submitted password is
+    // decoded before the comparison: the stored secret is decoded (parseFormValue),
+    // and comparing the escaped form locks out any password containing &, <, >, '
+    // or ".
     if (r.config.password_protected and r.config.password_len > 0) {
         const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
         const expected = r.config.getPassword();
@@ -1016,7 +1095,15 @@ fn handleJoin(
             const gt = std.mem.indexOfScalarPos(u8, inner_xml, pw_start, '>') orelse break :blk false;
             const after = inner_xml[gt + 1 ..];
             const pw_end = std.mem.indexOf(u8, after, "</password>") orelse break :blk false;
-            break :blk std.mem.eql(u8, after[0..pw_end], expected);
+            var submitted_buf: [RoomConfig.password_max_len]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&submitted_buf);
+            xml.decodeWrite(fbs.writer(), after[0..pw_end]) catch break :blk false;
+            const submitted = fbs.getWritten();
+            if (submitted.len != expected.len) break :blk false;
+            // Constant time so the answer does not reveal a prefix match.
+            var diff: u8 = 0;
+            for (submitted, expected) |a, b| diff |= a ^ b;
+            break :blk diff == 0;
         };
         if (!has_correct_password) {
             sendPresenceError(server, session, room_local, muc_host, "not-authorized", changes);
@@ -1181,9 +1268,9 @@ fn sendOccupantPresence(
 
     // from = room@host/nick
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(occ.getNick()) catch return;
+    xml.escapeWrite(w, occ.getNick()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, target) catch return;
     w.writeAll("'>") catch return;
@@ -1218,9 +1305,9 @@ fn sendSelfPresence(
     const w = fbs.writer();
 
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(occ.getNick()) catch return;
+    xml.escapeWrite(w, occ.getNick()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
@@ -1229,7 +1316,7 @@ fn sendSelfPresence(
     w.writeAll(occ.role.toName()) catch return;
     w.writeAll("'/><status code='110'/></x></presence>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1258,9 +1345,9 @@ fn broadcastOccupantJoin(
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(pw, room.getJid()) catch return;
     pw.writeByte('/') catch return;
-    pw.writeAll(nick) catch return;
+    xml.escapeWrite(pw, nick) catch return;
     pw.writeAll("' to='") catch return;
     const prefix = prefix_fbs.getWritten();
 
@@ -1292,6 +1379,10 @@ fn broadcastOccupantJoin(
     s110w.writeAll("'/><status code='110'/></x></presence>") catch return;
     const suffix_110 = suffix_110_fbs.getWritten();
 
+    // One delivery buffer reused for every occupant (S18).
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
+
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
@@ -1299,7 +1390,7 @@ fn broadcastOccupantJoin(
         const target = server.sessions[occ.session_id] orelse continue;
 
         const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
     }
 }
 
@@ -1318,9 +1409,9 @@ fn broadcastOccupantLeave(
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(pw, room.getJid()) catch return;
     pw.writeByte('/') catch return;
-    pw.writeAll(removed.getNick()) catch return;
+    xml.escapeWrite(pw, removed.getNick()) catch return;
     pw.writeAll("' to='") catch return;
     const prefix = prefix_fbs.getWritten();
 
@@ -1341,6 +1432,13 @@ fn broadcastOccupantLeave(
     // Multicast to remote workers
     server.deliverMulticastToWorkers(room, prefix, suffix);
 
+    // One delivery buffer reused for the whole function: each delivery copies,
+    // so the stanza built for one occupant is dead before the next is built
+    // (S18). The self-delivery below uses it too, and the suffixes it reads
+    // live in small stack buffers.
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
+
     // Local fan-out to remaining occupants on this worker
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
@@ -1348,7 +1446,7 @@ fn broadcastOccupantLeave(
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuiltToSession(target, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
@@ -1370,7 +1468,7 @@ fn broadcastOccupantLeave(
         }
         s110w.writeAll("</x></presence>") catch return;
 
-        fanout.deliverPrebuiltToSession(self_target, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
     }
 }
 
@@ -1410,20 +1508,24 @@ fn collapseOccupant(
     return true;
 }
 
+const REPLACED_NOTICE_BUF_LEN = 6 * (256 + 64 + 256) + 256;
+
 /// Tells a resource replaced by a takeover that it is no longer in the room.
 /// A local target is checked against its bound JID so a reused session slot
 /// never receives it; a target on another worker goes through the
 /// generation-checked unicast.
 fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
-    var buf: [1024]u8 = undefined;
+    // Every variable byte may become a six-byte XML entity; the remaining
+    // 256 bytes cover the literal markup and affiliation name.
+    var buf: [REPLACED_NOTICE_BUF_LEN]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
-    w.writeAll(r.getJid()) catch return;
+    xml.escapeWrite(w, r.getJid()) catch return;
     w.writeByte('/') catch return;
-    w.writeAll(before.getNick()) catch return;
+    xml.escapeWrite(w, before.getNick()) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(before.getRealJid()) catch return;
+    xml.escapeWrite(w, before.getRealJid()) catch return;
     w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
     w.writeAll(before.affiliation.toName()) catch return;
     w.writeAll("' role='none'/><status code='110'/></x></presence>") catch return;
@@ -1431,7 +1533,10 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 
     if (before.worker_id != server.worker_id) {
         const ds = server.delivery_system orelse return;
-        ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch {};
+        ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch |err| {
+            log.warn("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.session_id, @errorName(err) });
+            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        };
         return;
     }
     const target = server.sessions[before.session_id] orelse return;
@@ -1448,13 +1553,16 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(ev.real_jid) catch return;
+    xml.escapeWrite(w, ev.real_jid) catch return;
     w.writeAll("' type='error'><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
-    ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch {};
+    ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, fbs.getWritten()) catch |err| {
+        log.warn("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+    };
 }
 
 /// Replay recent room history to a joining occupant (XEP-0045 §7.2.14).
@@ -1489,6 +1597,11 @@ fn sendRoomHistory(
 
     if (result.messages.len == 0) return;
 
+    // One buffer reused per history message: queueSendStanza copies, so a
+    // message is dead before the next is built (S18).
+    var hist_lease = server.leaseByteScratch() orelse return;
+    defer hist_lease.release();
+
     // Deliver in chronological order (reverse of backward query)
     var i: usize = result.messages.len;
     while (i > 0) {
@@ -1508,8 +1621,7 @@ fn sendRoomHistory(
         const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
         const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
 
-        var buf: [20480]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var fbs = std.io.fixedBufferStream(hist_lease.buf);
         const w = fbs.writer();
 
         // Write up to first '>', injecting to='jid'
@@ -1521,13 +1633,13 @@ fn sendRoomHistory(
         w.writeAll(stanza[first_gt..close_pos]) catch continue;
         // Append delay stamp
         w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-        w.writeAll(room_jid) catch continue;
+        xml.escapeWrite(w, room_jid) catch continue;
         w.writeAll("' stamp='") catch continue;
         w.writeAll(delay_str) catch continue;
         w.writeAll("'/>") catch continue;
         w.writeAll(close_tag) catch continue;
 
-        session.conn.queueSend(fbs.getWritten()) catch continue;
+        session.queueSendStanza(fbs.getWritten()) catch continue;
     }
 
     if (session.conn.hasPendingWrite()) {
@@ -1573,14 +1685,14 @@ fn sendRoomSubject(
     const w = fbs.writer();
 
     w.writeAll("<message from='") catch return;
-    w.writeAll(room.getJid()) catch return;
+    xml.escapeWrite(w, room.getJid()) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='groupchat'><subject>") catch return;
-    w.writeAll(subject) catch return;
+    xml.escapeWrite(w, subject) catch return;
     w.writeAll("</subject></message>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1604,16 +1716,16 @@ fn sendPresenceError(
     const w = fbs.writer();
 
     w.writeAll("<presence from='") catch return;
-    w.writeAll(room_local) catch return;
+    xml.escapeWrite(w, room_local) catch return;
     w.writeByte('@') catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='error'><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1634,22 +1746,22 @@ fn sendMessageError(
     const w = fbs.writer();
 
     w.writeAll("<message from='") catch return;
-    w.writeAll(room_local) catch return;
+    xml.escapeWrite(w, room_local) catch return;
     w.writeByte('@') catch return;
-    w.writeAll(muc_host) catch return;
+    xml.escapeWrite(w, muc_host) catch return;
     w.writeAll("' to='") catch return;
     writeSessionJid(w, session) catch return;
     w.writeAll("' type='error'") catch return;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(id_str) catch return;
+        xml.escapeWrite(w, id_str) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><error type='cancel'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1702,11 +1814,11 @@ pub fn processRemoteJoin(
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<presence from='") catch return;
-        w.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(w, ev.room_jid) catch return;
         w.writeByte('/') catch return;
-        w.writeAll(occ.getNick()) catch return;
+        xml.escapeWrite(w, occ.getNick()) catch return;
         w.writeAll("' to='") catch return;
-        w.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(w, ev.real_jid) catch return;
         w.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
         w.writeAll(occ.affiliation.toName()) catch return;
         w.writeAll("' role='") catch return;
@@ -1734,9 +1846,9 @@ pub fn processRemoteJoin(
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
-            ew.writeAll(ev.room_jid) catch return;
+            xml.escapeWrite(ew, ev.room_jid) catch return;
             ew.writeAll("' to='") catch return;
-            ew.writeAll(ev.real_jid) catch return;
+            xml.escapeWrite(ew, ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><conflict xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
             ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
@@ -1760,9 +1872,9 @@ pub fn processRemoteJoin(
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
-            ew.writeAll(ev.room_jid) catch return;
+            xml.escapeWrite(ew, ev.room_jid) catch return;
             ew.writeAll("' to='") catch return;
-            ew.writeAll(ev.real_jid) catch return;
+            xml.escapeWrite(ew, ev.real_jid) catch return;
             ew.writeAll("' type='error'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
             ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
             return;
@@ -1779,9 +1891,9 @@ pub fn processRemoteJoin(
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
-        ew.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(ew, ev.room_jid) catch return;
         ew.writeAll("' to='") catch return;
-        ew.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(ew, ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><registration-required xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
@@ -1793,9 +1905,9 @@ pub fn processRemoteJoin(
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
-        ew.writeAll(ev.room_jid) catch return;
+        xml.escapeWrite(ew, ev.room_jid) catch return;
         ew.writeAll("' to='") catch return;
-        ew.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(ew, ev.real_jid) catch return;
         ew.writeAll("' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, err_fbs.getWritten()) catch {};
         return;
@@ -1840,11 +1952,11 @@ fn finishRemoteJoin(
         var occ_fbs = std.io.fixedBufferStream(&occ_buf);
         const ow = occ_fbs.writer();
         ow.writeAll("<presence from='") catch continue;
-        ow.writeAll(r.getJid()) catch continue;
+        xml.escapeWrite(ow, r.getJid()) catch continue;
         ow.writeByte('/') catch continue;
-        ow.writeAll(occ.getNick()) catch continue;
+        xml.escapeWrite(ow, occ.getNick()) catch continue;
         ow.writeAll("' to='") catch continue;
-        ow.writeAll(ev.real_jid) catch continue;
+        xml.escapeWrite(ow, ev.real_jid) catch continue;
         ow.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch continue;
         ow.writeAll(occ.affiliation.toName()) catch continue;
         ow.writeAll("' role='") catch continue;
@@ -1864,11 +1976,11 @@ fn finishRemoteJoin(
         var self_fbs = std.io.fixedBufferStream(&self_buf);
         const sw = self_fbs.writer();
         sw.writeAll("<presence from='") catch return;
-        sw.writeAll(r.getJid()) catch return;
+        xml.escapeWrite(sw, r.getJid()) catch return;
         sw.writeByte('/') catch return;
-        sw.writeAll(ev.nick) catch return;
+        xml.escapeWrite(sw, ev.nick) catch return;
         sw.writeAll("' to='") catch return;
-        sw.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(sw, ev.real_jid) catch return;
         sw.writeAll("'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
         sw.writeAll(affiliation.toName()) catch return;
         sw.writeAll("' role='") catch return;
@@ -1885,11 +1997,11 @@ fn finishRemoteJoin(
         var subj_fbs = std.io.fixedBufferStream(&subj_buf);
         const sjw = subj_fbs.writer();
         sjw.writeAll("<message from='") catch return;
-        sjw.writeAll(r.getJid()) catch return;
+        xml.escapeWrite(sjw, r.getJid()) catch return;
         sjw.writeAll("' to='") catch return;
-        sjw.writeAll(ev.real_jid) catch return;
+        xml.escapeWrite(sjw, ev.real_jid) catch return;
         sjw.writeAll("' type='groupchat'><subject>") catch return;
-        sjw.writeAll(subject) catch return;
+        xml.escapeWrite(sjw, subject) catch return;
         sjw.writeAll("</subject></message>") catch return;
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, subj_fbs.getWritten()) catch {};
     }
@@ -1954,15 +2066,26 @@ pub fn processRemoteGroupchat(
     fw.writeAll(sender.getNick()) catch return;
     const from_str = from_fbs.getWritten();
 
-    var prefix_buf: [512]u8 = undefined;
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_buf: [16500]u8 = undefined;
-    const suffix_len = fanout.buildSuffix(&suffix_buf, ev.stanza_id, ev.inner_xml) orelse return;
+    var suffix_lease = server.leaseByteScratch() orelse return;
+    defer suffix_lease.release();
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse return;
+    if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
+        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ ev.room_jid, prefix_len, suffix_len });
+        bounceRoomMailboxFull(server, .{ .room_message = ev }, ev.room_jid, changes);
+        return;
+    }
     const prefix = prefix_buf[0..prefix_len];
-    const suffix = suffix_buf[0..suffix_len];
+    const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast
     server.deliverMulticastToWorkers(room, prefix, suffix);
+
+    // One delivery buffer reused for every local occupant (S18), as in
+    // handleMucGroupchat.
+    var deliver_lease = server.leaseByteScratch() orelse return;
+    defer deliver_lease.release();
 
     // Local fan-out (same bounded continuation as handleMucGroupchat)
     const batch_size = server.fanout_queue.batch_size;
@@ -1977,7 +2100,7 @@ pub fn processRemoteGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -2001,12 +2124,12 @@ pub fn processRemoteGroupchat(
             @memcpy(pf.room_jid_buf[0..ev.room_jid.len], ev.room_jid);
             pf.room_jid_len = @intCast(ev.room_jid.len);
             @memcpy(pf.prefix_buf[0..prefix_len], prefix);
-            pf.prefix_len = prefix_len;
+            pf.prefix_len = @intCast(prefix_len);
             @memcpy(pf.suffix_buf[0..suffix_len], suffix);
-            pf.suffix_len = suffix_len;
+            pf.suffix_len = @intCast(suffix_len);
             pf.next_slot = resume_slot;
         } else {
-            deliverRemainingSync(server, room, resume_slot, prefix, suffix, changes);
+            deliverRemainingSync(server, room, resume_slot, deliver_lease.buf, prefix, suffix, changes);
         }
     }
 
@@ -2014,15 +2137,20 @@ pub fn processRemoteGroupchat(
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
         const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
-        var arch_buf: [17200]u8 = undefined;
-        var arch_fbs = std.io.fixedBufferStream(&arch_buf);
+        // The fan-out above has finished and the stanza is rebuilt from
+        // ev.inner_xml, so both of its buffers are given back first.
+        deliver_lease.release();
+        suffix_lease.release();
+        var arch_lease = server.leaseByteScratch() orelse return;
+        defer arch_lease.release();
+        var arch_fbs = std.io.fixedBufferStream(arch_lease.buf);
         const aw = arch_fbs.writer();
         aw.writeAll("<message from='") catch return;
-        aw.writeAll(from_str) catch return;
+        xml.escapeWrite(aw, from_str) catch return;
         aw.writeAll("' type='groupchat'") catch return;
         if (ev.stanza_id.len > 0) {
             aw.writeAll(" id='") catch return;
-            aw.writeAll(ev.stanza_id) catch return;
+            xml.escapeWrite(aw, ev.stanza_id) catch return;
             aw.writeByte('\'') catch return;
         }
         aw.writeByte('>') catch return;
@@ -2048,11 +2176,11 @@ pub fn processRemoteDiscoInfo(
     const w = fbs.writer();
 
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' to='") catch return;
-    w.writeAll(ev.reply_to_jid) catch return;
+    xml.escapeWrite(w, ev.reply_to_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(ev.iq_id) catch return;
+    xml.escapeWrite(w, ev.iq_id) catch return;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
 
     if (reg.findByJid(ev.room_jid)) |room| {
@@ -2060,7 +2188,7 @@ pub fn processRemoteDiscoInfo(
         w.writeAll("<identity category='conference' type='text'") catch return;
         if (name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(name) catch return;
+            xml.escapeWrite(w, name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll("/>") catch return;
@@ -2294,11 +2422,11 @@ fn sendRoomHistoryRemote(
 
         w.writeAll(stanza[0..first_gt]) catch continue;
         w.writeAll(" to='") catch continue;
-        w.writeAll(real_jid) catch continue;
+        xml.escapeWrite(w, real_jid) catch continue;
         w.writeByte('\'') catch continue;
         w.writeAll(stanza[first_gt..close_pos]) catch continue;
         w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-        w.writeAll(room_jid) catch continue;
+        xml.escapeWrite(w, room_jid) catch continue;
         w.writeAll("' stamp='") catch continue;
         w.writeAll(delay_str) catch continue;
         w.writeAll("'/>") catch continue;
@@ -2347,17 +2475,17 @@ fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u
 
 fn writeSessionJid(w: anytype, session: *const Session) !void {
     const bound = session.stream.bound_jid orelse return;
-    try w.writeAll(bound.local);
+    try xml.escapeWrite(w, bound.local);
     try w.writeByte('@');
-    try w.writeAll(bound.domain);
+    try xml.escapeWrite(w, bound.domain);
     if (bound.resource.len > 0) {
         try w.writeByte('/');
-        try w.writeAll(bound.resource);
+        try xml.escapeWrite(w, bound.resource);
     }
 }
 
 fn writeOccupantRealJid(w: anytype, occ: *const Occupant) !void {
-    try w.writeAll(occ.getRealJid());
+    try xml.escapeWrite(w, occ.getRealJid());
 }
 
 /// Look up a user's XEP-0084 avatar hash from PEP metadata node.
@@ -2387,8 +2515,15 @@ fn getAvatarHash(server: *Server, bare_jid: []const u8) ?[]const u8 {
 }
 
 /// Write XEP-0153 vcard-temp:x:update element with avatar photo hash.
+/// The hash comes from client-published metadata; anything that is not a
+/// hex digest is refused so it cannot carry markup into presence (S1).
 fn writeVcardUpdate(w: anytype, avatar_hash: ?[]const u8) void {
     const hash = avatar_hash orelse return;
+    if (hash.len == 0 or hash.len > 64) return;
+    for (hash) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) return;
+    }
     w.writeAll("<x xmlns='vcard-temp:x:update'><photo>") catch return;
     w.writeAll(hash) catch return;
     w.writeAll("</photo></x>") catch return;
@@ -2408,6 +2543,100 @@ pub fn handleRoomDirectoryUpdate(server: *Server, ev: actor_message.RoomDirector
     } else {
         // Room destroyed on another worker — remove from local directory
         reg.updateDirectory(ev.room_jid, ev.room_name, false);
+    }
+}
+
+/// S16: a room-mailbox overflow drop must not be silent. Sends an explicit
+/// resource-constraint error to the originator of the dropped actor message,
+/// cross-worker when the sender lives on another worker. Best-effort: if the
+/// sender's session no longer exists the drop is already logged and counted
+/// by the caller.
+pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_jid: []const u8, changes: *ChangeList) void {
+    switch (msg) {
+        .room_message => |ev| {
+            // ev.from_jid is the sender's real full JID. Bounce straight to
+            // it: resolving through the occupant list could match a nick
+            // equal to the sender's resource and would both bounce the
+            // wrong user and leak the real JID (S16).
+            const jid = xmpp.Jid.parse(ev.from_jid) catch return;
+            const sm = server.session_map orelse return;
+            const entry = sm.findByFullJid(jid.local, jid.domain, jid.resource) orelse return;
+            var buf: [768]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
+            w.writeAll("<message from='") catch return;
+            xml.escapeWrite(w, room_jid) catch return;
+            w.writeAll("' to='") catch return;
+            xml.escapeWrite(w, ev.from_jid) catch return;
+            w.writeAll("' type='error'") catch return;
+            if (ev.stanza_id.len > 0) {
+                w.writeAll(" id='") catch return;
+                xml.escapeWrite(w, ev.stanza_id) catch return;
+                w.writeByte('\'') catch return;
+            }
+            w.writeAll("><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch return;
+            deliverToTriple(server, fbs.getWritten(), entry.worker_id, entry.local_session_id, entry.generation, changes);
+        },
+        .room_join, .room_part => |ev| {
+            var buf: [640]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
+            w.writeAll("<presence from='") catch return;
+            xml.escapeWrite(w, room_jid) catch return;
+            w.writeAll("' to='") catch return;
+            xml.escapeWrite(w, ev.real_jid) catch return;
+            w.writeAll("' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+            deliverToTriple(server, fbs.getWritten(), ev.worker_id, ev.session_id, ev.generation, changes);
+        },
+        .room_disco_info, .room_disco_items => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        .room_admin => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        .room_mam_query => |ev| {
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, changes);
+        },
+        else => {},
+    }
+}
+
+fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, worker: u16, session_id: u32, generation: u32, changes: *ChangeList) void {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<iq type='error' from='") catch return;
+    xml.escapeWrite(w, room_jid) catch return;
+    w.writeAll("' id='") catch return;
+    xml.escapeWrite(w, iq_id) catch return;
+    w.writeAll("'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
+    deliverToTriple(server, fbs.getWritten(), worker, session_id, generation, changes);
+}
+
+/// Deliver a small stanza to a (worker, session, generation) triple, locally
+/// when the session lives on this worker or via the MPSC otherwise.
+fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id: usize, generation: u32, changes: *ChangeList) void {
+    if (worker == server.worker_id) {
+        // The triple may be stale: a reused session slot must never get a
+        // stanza meant for its previous holder.
+        const sm = server.session_map orelse return;
+        if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
+        const session = server.sessions[session_id] orelse return;
+        session.queueSendStanza(stanza) catch |err| {
+            if (err == error.WriteBufferFull) {
+                session.sm_overflow = true;
+                log.warn("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+            }
+            return;
+        };
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    } else {
+        const ds = server.delivery_system orelse return;
+        ds.deliver(worker, @intCast(session_id), generation, stanza) catch {
+            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        };
     }
 }
 
@@ -2446,6 +2675,10 @@ pub fn processRemoteAdminAction(
 
     if (std.mem.eql(u8, ev.new_role, "none")) {
         // Kick
+        if (target_idx == requester_idx) {
+            sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_session, ev.reply_to_generation, "not-allowed");
+            return;
+        }
         const removed = room.removeOccupant(target_idx) orelse return;
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         // T114: Send shadow_part to the kicked occupant's worker so it removes the
@@ -2460,10 +2693,9 @@ pub fn processRemoteAdminAction(
                 .generation = 0,
             } });
         }
-        if (room.occupant_count == 0 and !room.config.persistent) {
-            broadcastDirectoryUpdate(server, ev.room_jid, room.config.getName(), false);
-            _ = reg.destroyRoom(ev.room_jid);
-        }
+        // Do NOT destroy the room here: ev.room_jid/ev.iq_id borrow this
+        // room's mailbox payload and are read again below (S6). Destruction
+        // is deferred to cleanupEmptyRooms.
     } else if (std.mem.eql(u8, ev.new_role, "visitor")) {
         if (room.occupants[target_idx]) |*occ| {
             occ.role = .visitor;
@@ -2479,9 +2711,9 @@ pub fn processRemoteAdminAction(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='result' from='") catch return;
-    w.writeAll(ev.room_jid) catch return;
+    xml.escapeWrite(w, ev.room_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(ev.iq_id) catch return;
+    xml.escapeWrite(w, ev.iq_id) catch return;
     w.writeAll("'/>") catch return;
 
     const ds = server.delivery_system orelse return;
@@ -2582,11 +2814,952 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='error' from='") catch return;
-    w.writeAll(room_jid) catch return;
+    xml.escapeWrite(w, room_jid) catch return;
     w.writeAll("' id='") catch return;
-    w.writeAll(iq_id) catch return;
+    xml.escapeWrite(w, iq_id) catch return;
     w.writeAll("'><error type='cancel'><") catch return;
     w.writeAll(error_type) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
     ds.deliver(target_worker, @intCast(target_session), target_generation, fbs.getWritten()) catch {};
+}
+
+test "S6: self-kick is rejected and the room survives actor processing" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+    _ = try room.addOccupant("solo", "solo@localhost/x", "solo@localhost", 0, 0, 1, .moderator, .owner);
+
+    var scratch: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // The only occupant kicks themselves: rejected, nothing removed.
+    processRemoteAdminAction(&server, .{
+        .room_jid = "room@conference.localhost",
+        .actor_jid = "solo@localhost/x",
+        .target_nick = "solo",
+        .new_role = "none",
+        .iq_id = "kick1",
+        .reply_to_worker = 0,
+        .reply_to_session = 0,
+        .reply_to_generation = 1,
+    }, &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
+
+    // A kick of another occupant must not destroy the room mid-processing
+    // either: cleanupEmptyRooms is the only destroy site.
+    _ = try room.addOccupant("vic", "vic@localhost/y", "vic@localhost", 1, 0, 1, .participant, .none);
+    processRemoteAdminAction(&server, .{
+        .room_jid = "room@conference.localhost",
+        .actor_jid = "solo@localhost/x",
+        .target_nick = "vic",
+        .new_role = "none",
+        .iq_id = "kick2",
+        .reply_to_worker = 0,
+        .reply_to_session = 0,
+        .reply_to_generation = 1,
+    }, &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
+
+    // Once the last occupant is gone, the deferred cleanup pass destroys it.
+    _ = room.removeByRealJid("solo@localhost/x");
+    cleanupEmptyRooms(&server);
+    try std.testing.expect(reg.findByJid("room@conference.localhost") == null);
+}
+
+test "S1: room secret with XML specials is accepted on join" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    // The secret is stored decoded, the way parseFormValue stores a submitted
+    // room config form.
+    var config = RoomConfig{ .persistent = false };
+    try config.setPassword("A&B");
+    const room = try reg.createRoom("secret@conference.localhost", config);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = alice; // owned by server.deinit from here on
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // stanza_buf holds the escaped form of what the client sent, which is what
+    // the join check reads.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'>" ++
+        "<password>A&amp;B</password></x>";
+    @memcpy(alice.stanza_buf[0..join.len], join);
+    alice.stanza_buf_len = join.len;
+
+    handleMucPresence(&server, alice, "secret", "alice", "", &changes);
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    try std.testing.expect(room.findByRealJid("alice@localhost/desk") != null);
+}
+
+test "S1: a wrong room secret of the same decoded length is still refused" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    var config = RoomConfig{ .persistent = false };
+    try config.setPassword("A&B");
+    const room = try reg.createRoom("secret@conference.localhost", config);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[1] = bob;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // "X&Y" decodes to the same 3 bytes as the secret but is not it, so the
+    // comparison has to look at content and not just length.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'>" ++
+        "<password>X&amp;Y</password></x>";
+    @memcpy(bob.stanza_buf[0..join.len], join);
+    bob.stanza_buf_len = join.len;
+
+    handleMucPresence(&server, bob, "secret", "bob", "", &changes);
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
+}
+
+test "S1: vcard update photo requires a hex hash" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    writeVcardUpdate(fbs.writer(), "0123456789abcdef0123456789abcdef01234567");
+    try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "<photo>0123456789abcdef") != null);
+
+    fbs.reset();
+    writeVcardUpdate(fbs.writer(), "x'</photo><message from='admin@localhost'/>");
+    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+}
+
+test "S1: room config form values are stored decoded, escaped once on output" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    var store = room_store.RoomStore(server_mod.OpBackendType).init(&db, allocator);
+    server.room_store = &store;
+    try store.setAffiliation("room@conference.localhost", "owner@localhost", .owner);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = session; // owned by server.deinit from here on
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+
+    // stanza_buf holds the re-serialized (escaped) form submission.
+    const form = "<query xmlns='http://jabber.org/protocol/muc#owner'>" ++
+        "<x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='muc#roomconfig_roomname'><value>A&amp;B &lt;C&gt;</value></field>" ++
+        "</x></query>";
+    @memcpy(session.stanza_buf[0..form.len], form);
+    session.stanza_buf_len = form.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
+
+    // Stored decoded; with the raw-slice parse this is the escaped form.
+    try std.testing.expectEqualStrings("A&B <C>", room.config.getName());
+
+    // The config form response escapes exactly once: no &amp;amp; growth.
+    handleMucOwnerGet(&server, session, "room", "cfg2", &changes);
+    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
+}
+
+test "G1: applyConfigForm rejects an overflowing or over-wide secret" {
+    var config = RoomConfig{};
+    const overflow_form = "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 600) ++ "</value></field>";
+    try std.testing.expectError(error.FormValueInvalid, applyConfigForm(&config, overflow_form));
+    const wide_form = "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 65) ++ "</value></field>";
+    try std.testing.expectError(error.PasswordTooLong, applyConfigForm(&config, wide_form));
+    // A valid secret is applied and stored decoded.
+    const ok_form = "<field var='muc#roomconfig_roomsecret'><value>s&amp;cr</value></field>";
+    try applyConfigForm(&config, ok_form);
+    try std.testing.expectEqualStrings("s&cr", config.getPassword());
+}
+
+test "G1: an invalid boolean literal rejects the whole config form" {
+    var config = RoomConfig{};
+    config.persistent = false;
+    // A typo must not read as "field absent", which would silently keep the
+    // previous value and report the form as accepted.
+    const bad = "<field var='muc#roomconfig_persistentroom'><value>yes</value></field>";
+    try std.testing.expectError(error.FormValueInvalid, applyConfigForm(&config, bad));
+    try std.testing.expect(!config.persistent);
+
+    // Absent still means "leave alone".
+    try applyConfigForm(&config, "<field var='muc#roomconfig_roomname'><value>r</value></field>");
+    try std.testing.expect(!config.persistent);
+
+    const good = "<field var='muc#roomconfig_persistentroom'><value>1</value></field>";
+    try applyConfigForm(&config, good);
+    try std.testing.expect(config.persistent);
+}
+
+test "G1: an overflowing room secret rejects the whole config form" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = session;
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+
+    // passwordprotectedroom=1 with a secret too wide for the form buffer:
+    // the whole form must be rejected, not applied with an empty secret.
+    const form = "<query xmlns='http://jabber.org/protocol/muc#owner'><x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='muc#roomconfig_passwordprotectedroom'><value>1</value></field>" ++
+        "<field var='muc#roomconfig_roomsecret'><value>" ++ ("x" ** 600) ++ "</value></field>" ++
+        "</x></query>";
+    @memcpy(session.stanza_buf[0..form.len], form);
+    session.stanza_buf_len = form.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
+
+    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-acceptable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "type='modify'") != null);
+    // The rejected form is not applied: no protected room with an empty secret.
+    try std.testing.expect(!room.config.password_protected);
+    try std.testing.expectEqual(@as(u8, 0), room.config.password_len);
+}
+
+test "G1: a protected room with no stored secret refuses the join" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+
+    // Protected but with no stored secret: this state must not be joinable.
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false, .password_protected = true });
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = bob;
+
+    // A MUC join with no password element.
+    const join = "<x xmlns='http://jabber.org/protocol/muc'/>";
+    @memcpy(bob.stanza_buf[0..join.len], join);
+    bob.stanza_buf_len = join.len;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucPresence(&server, bob, "room", "bob", "", &changes);
+
+    try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
+    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
+}
+
+test "S16: mailbox-full bounce targets the sender and fails closed on overflow" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const sm_mod = @import("session_map");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = sm_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    server.worker_id = 0;
+
+    // bob sent the message from his real full JID; carol is another
+    // occupant whose room nick equals bob's resource.
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = bob;
+    _ = try sm.bind(0, 0, "bob", "localhost", "phone");
+
+    var carol_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &carol_fds));
+    defer posix.close(carol_fds[1]);
+    const carol = try allocator.create(Session);
+    carol.* = Session.init(carol_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = carol;
+    _ = try sm.bind(0, 1, "carol", "localhost", "tablet");
+
+    const msg = actor_message.Message{ .room_message = .{
+        .room_jid = "room@conference.localhost",
+        .from_jid = "bob@localhost/phone",
+        .inner_xml = "<body>hi</body>",
+        .stanza_id = "m42",
+    } };
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
+
+    // bob gets the error bounce, addressed from the room to his real JID.
+    _ = try bob.conn.flushSend();
+    var buf: [1024]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &buf) catch 0;
+    const bounce = buf[0..bn];
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "from='room@conference.localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "to='bob@localhost/phone'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "id='m42'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bounce, "resource-constraint") != null);
+
+    // carol gets nothing and learns nothing about bob's real JID.
+    _ = carol.conn.flushSend() catch {};
+    var cbuf: [1024]u8 = undefined;
+    const cn = posix.read(carol_fds[1], &cbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), cn);
+
+    bob.conn.write_end = bob.conn.write_buf.len;
+    bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
+    try std.testing.expect(bob.sm_overflow);
+}
+
+test "T256: remote-join twin collapses onto the existing occupant" {
+    const allocator = std.testing.allocator;
+    const reg_mod = @import("room_registry");
+    const dq_mod = @import("delivery_queue");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = reg_mod.RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // alice's first resource joins from worker 1.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "alice@localhost/phone",
+        .nick = "ally",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    const room = registry.findByJid("room@conference.localhost").?;
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+
+    // Her second resource joins with the same nick: takeover, no twin.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "alice@localhost/laptop",
+        .nick = "ally",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+
+    try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
+    const idx = room.findByNick("ally").?;
+    const occ = room.occupants[idx].?;
+    try std.testing.expectEqualStrings("alice@localhost/laptop", occ.getRealJid());
+    try std.testing.expectEqual(@as(usize, 9), occ.session_id);
+    try std.testing.expectEqual(idx, room.findByRealJid("alice@localhost/laptop").?);
+    // The old resource is gone from the index.
+    try std.testing.expect(room.findByRealJid("alice@localhost/phone") == null);
+
+    // Removing the collapsed occupant leaves no stale nick mapping.
+    _ = room.removeOccupant(idx);
+    try std.testing.expect(room.findByNick("ally") == null);
+}
+
+/// Collects cross-worker deliveries so a test can inspect stanza bytes.
+/// Payloads point into reusable queue slots, so they are copied.
+const StanzaCollector = struct {
+    allocator: std.mem.Allocator,
+    stanzas: std.ArrayList([]const u8) = .{},
+
+    fn deinit(self: *StanzaCollector) void {
+        for (self.stanzas.items) |s| self.allocator.free(s);
+        self.stanzas.deinit(self.allocator);
+    }
+
+    fn onDelivery(ctx: *StanzaCollector, session_id: u32, generation: u32, payload: []const u8) void {
+        _ = session_id;
+        _ = generation;
+        const copy = ctx.allocator.dupe(u8, payload) catch @panic("oom");
+        ctx.stanzas.append(ctx.allocator, copy) catch @panic("oom");
+    }
+};
+
+test "S1: takeover notice escapes the replaced resource's nick and JID" {
+    const allocator = std.testing.allocator;
+    const reg_mod = @import("room_registry");
+    const dq_mod = @import("delivery_queue");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = reg_mod.RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // The nick carries a quote, so an unescaped write would close the from
+    // attribute and let the attacker inject attributes or elements.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "e'><evil a='",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    var collector = StanzaCollector{ .allocator = allocator };
+    defer collector.deinit();
+
+    // Second resource on the same bare JID takes the nick over; the replaced
+    // resource on worker 1 is told it left.
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/laptop",
+        .nick = "e'><evil a='",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+
+    _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
+
+    var notice: ?[]const u8 = null;
+    for (collector.stanzas.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "type='unavailable'") != null) notice = payload;
+    }
+    const stanza = notice orelse return error.TestUnexpectedResult;
+
+    // The quote is escaped, so the from attribute stays a single attribute.
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "&apos;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "'><evil") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "<evil") == null);
+}
+
+test "S1: remote presence error escapes the room and target JIDs" {
+    const allocator = std.testing.allocator;
+    const dq_mod = @import("delivery_queue");
+
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    sendRemotePresenceError(&delivery_sys, .{
+        .room_jid = "r'@conference.localhost",
+        .real_jid = "eve@localhost/x'y",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 5,
+        .generation = 1,
+    }, "resource-constraint");
+
+    var collector = StanzaCollector{ .allocator = allocator };
+    defer collector.deinit();
+    _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
+
+    try std.testing.expectEqual(@as(usize, 1), collector.stanzas.items.len);
+    const stanza = collector.stanzas.items[0];
+
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "&apos;") != null);
+    // Neither raw quote reaches the wire, so both attributes stay closed.
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "from='r'@") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "to='eve@localhost/x'y'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stanza, "resource-constraint") != null);
+}
+
+test "T413: replaced-resource delivery drops are counted" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+
+    var initial = StanzaCollector{ .allocator = allocator };
+    defer initial.deinit();
+    const queue = delivery_sys.getQueue(1);
+    _ = queue.drain(&initial, StanzaCollector.onDelivery);
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+
+    const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/laptop",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 9,
+        .generation = 2,
+    }, &changes);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+}
+
+test "T413: remote presence error delivery drops are counted" {
+    const allocator = std.testing.allocator;
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    const queue = delivery_sys.getQueue(1);
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+
+    const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
+    sendRemotePresenceError(&delivery_sys, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "eve@localhost/phone",
+        .nick = "eve",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, "resource-constraint");
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+}
+
+test "S16: local replaced-resource notice overflow fails the session" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try registry.createRoom("room@conference.localhost", .{});
+    _ = try room.addOccupant("eve", "eve@localhost/phone", "eve@localhost", 0, 0, 1, .moderator, .owner);
+    const before = room.occupants[0].?;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
+    server.sessions[0] = target;
+
+    target.conn.write_end = target.conn.write_buf.len;
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    notifyReplacedResource(&server, room, &before, &changes);
+
+    try std.testing.expect(target.sm_overflow);
+}
+
+test "S16: local delivery refuses a stale session generation" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const sm_mod = @import("session_map");
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = sm_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    server.worker_id = 0;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = session;
+    const generation = try sm.bind(0, 0, "bob", "localhost", "phone");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const stanza = "<message from='room@conference.localhost' to='bob@localhost/phone' type='error'/>";
+    deliverToTriple(&server, stanza, 0, 0, generation + 1, &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [1024]u8 = undefined;
+    var n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(!session.sm_overflow);
+
+    deliverToTriple(&server, stanza, 0, 0, generation, &changes);
+    _ = try session.conn.flushSend();
+    n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expectEqualStrings(stanza, buf[0..n]);
+}
+
+// H5 keeps the slow-reader teardown for a buffer that is genuinely full, so
+// the loss still happens for an occupant whose queue is full. Review 131 and
+// 160 asked for the first fan-out after a loss: the loss must not wedge the
+// fan-out, and every other occupant must still receive the next message.
+test "H5: the first fan-out after a genuine buffer-full loss still reaches the room" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("arena@conference.localhost", .{ .persistent = false });
+
+    const names = [_][]const u8{ "alice", "bob", "carol" };
+    var peer_fds: [3]posix.fd_t = undefined;
+    for (names, 0..) |name, idx| {
+        var pair: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &pair));
+        peer_fds[idx] = pair[1];
+        const session = try allocator.create(Session);
+        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.stream.state = .active;
+        session.stream.authenticated = true;
+        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = "desk" };
+        server.sessions[idx] = session;
+        var jid_buf: [128]u8 = undefined;
+        const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/desk", .{name});
+        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+    }
+    defer for (peer_fds) |fd| posix.close(fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // bob's connection is nearly full, so a small stanza no longer fits. This
+    // is the genuinely-full case the teardown is for, not the H5 size case.
+    server.sessions[1].?.conn.write_end = connection_mod.WRITE_BUF_SIZE - 64;
+
+    const body = "<body>one</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "arena", body, "m1", &changes);
+
+    // bob is marked for teardown; alice and carol are not.
+    try std.testing.expect(server.sessions[1].?.sm_overflow);
+    try std.testing.expect(!server.sessions[0].?.sm_overflow);
+    try std.testing.expect(!server.sessions[2].?.sm_overflow);
+
+    // The next fan-out still reaches everyone whose buffer has room.
+    for (0..3) |idx| {
+        _ = server.sessions[idx].?.conn.flushSend() catch {};
+    }
+    var sink: [8192]u8 = undefined;
+    while ((posix.read(peer_fds[1], &sink) catch 0) > 0) {}
+    server.sessions[1].?.conn.write_end = 0;
+    const body2 = "<body>two</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "arena", body2, "m2", &changes);
+    for (0..3) |idx| {
+        _ = server.sessions[idx].?.conn.flushSend() catch {};
+    }
+    var buf: [4096]u8 = undefined;
+    for ([_]usize{ 0, 2 }) |idx| {
+        const n = posix.read(peer_fds[idx], &buf) catch 0;
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>two</body>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "id='m2'") != null);
+    }
+}
+
+// Review 131 asked for the first fan-out after a loss. A rejected oversized
+// groupchat is a loss the sender is told about; it must not leave the room's
+// fan-out queue or any occupant session in a state where the next groupchat
+// fails to reach everyone.
+test "H5: the first fan-out after a rejected oversized groupchat reaches every occupant" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("hall@conference.localhost", .{ .persistent = false });
+
+    const names = [_][]const u8{ "alice", "bob", "carol" };
+    const resources = [_][]const u8{ "desk", "phone", "tablet" };
+    var pair_fds: [3][2]posix.fd_t = undefined;
+    for (&pair_fds) |*pair| {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, pair));
+    }
+    defer for (pair_fds) |pair| posix.close(pair[1]);
+    for (names, resources, pair_fds, 0..) |name, res, pair, idx| {
+        const session = try allocator.create(Session);
+        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.stream.state = .active;
+        session.stream.authenticated = true;
+        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = res };
+        server.sessions[idx] = session;
+        var jid_buf: [256]u8 = undefined;
+        const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/{s}", .{ name, res });
+        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+    }
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    const oversized = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    handleMucGroupchat(&server, server.sessions[0].?, "hall", oversized, "big1", &changes);
+    try std.testing.expect(!server.fanout_queue.hasPending());
+
+    // The next groupchat is delivered to all three occupants.
+    const body = "<body>after</body>";
+    handleMucGroupchat(&server, server.sessions[0].?, "hall", body, "ok1", &changes);
+    try std.testing.expect(!server.fanout_queue.hasPending());
+
+    for (pair_fds, 0..) |pair, idx| {
+        const session = server.sessions[idx].?;
+        _ = session.conn.flushSend() catch {};
+        var buf: [2048]u8 = undefined;
+        const n = posix.read(pair[1], &buf) catch 0;
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>after</body>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "id='ok1'") != null);
+        try std.testing.expect(!session.sm_overflow);
+    }
+}
+
+// H5: a groupchat body larger than a connection's write buffer used to reach
+// every occupant as a WriteBufferFull, which marks each session for the
+// slow-reader teardown: one oversized message disconnected the whole room.
+// It is now rejected at ingress with an error to the sender instead.
+test "H5: an oversized groupchat body is rejected with a bounce, not a room teardown" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("lobby@conference.localhost", .{ .persistent = false });
+
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    server.sessions[0] = alice;
+
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 1, server.server_host, false, allocator);
+    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    bob.stream.state = .active;
+    bob.stream.authenticated = true;
+    server.sessions[1] = bob;
+
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+    _ = try room.addOccupant("bob", "bob@localhost/phone", "bob@localhost", 1, 0, 1, .participant, .member);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // A body one byte past what any recipient's write buffer can hold, which
+    // is the size the review probe used (16,320 bytes).
+    const inner_len = connection_mod.WRITE_BUF_SIZE + 1;
+    const inner = try allocator.alloc(u8, inner_len);
+    defer allocator.free(inner);
+    @memset(inner, 'x');
+    @memcpy(inner[0..6], "<body>");
+    @memcpy(inner[inner_len - 7 ..], "</body>");
+
+    handleMucGroupchat(&server, alice, "lobby", inner, "big1", &changes);
+
+    // The sender is told, and neither session is marked for teardown.
+    try std.testing.expect(!alice.sm_overflow);
+    try std.testing.expect(!bob.sm_overflow);
+    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='big1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
+
+    // Nothing was fanned out to bob.
+    _ = bob.conn.flushSend() catch {};
+    var buf: [256]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+// H5 sizing must use the escaped recipient JID, not its raw length. A real
+// JID with characters that expand when escaped makes the emitted stanza wider
+// than its stored form, so sizing on the raw length accepts a stanza that then
+// fails `queueSend` for that occupant and tears down the whole room. The
+// existing H5 tests use plain JIDs, where both lengths agree, so they cannot
+// tell the two apart.
+test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    const room = try reg.createRoom("quotaroom@conference.localhost", .{ .persistent = false });
+
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    server.sessions[0] = alice;
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+
+    // Two characters that each grow from 1 to 4 bytes under escaping, so the
+    // emitted recipient JID is 6 bytes wider than the one the room stores.
+    var wide_buf: [256]u8 = undefined;
+    var wide_fbs = std.io.fixedBufferStream(&wide_buf);
+    const wide_w = wide_fbs.writer();
+    wide_w.writeByte('<') catch unreachable;
+    wide_w.writeAll(&([_]u8{'a'} ** 120)) catch unreachable;
+    wide_w.writeAll("@localhost/") catch unreachable;
+    wide_w.writeByte('<') catch unreachable;
+    wide_w.writeAll(&([_]u8{'b'} ** 120)) catch unreachable;
+    const wide = wide_fbs.getWritten();
+    _ = try room.addOccupant("wide", wide, "wide@localhost", 1, 0, 1, .participant, .member);
+
+    try std.testing.expectEqual(wide.len + 6, fanout.escapedLen(wide));
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // Measure the framing rather than hard-coding it, so a change to either
+    // builder shows up here as a sizing mismatch instead of a silent gap.
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
+    const from_str = "quotaroom@conference.localhost/alice";
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse unreachable;
+    var suffix_buf: [fanout.SUFFIX_CAPACITY]u8 = undefined;
+    const probe_inner = "<body></body>";
+    const probe_suffix_len = fanout.buildSuffix(&suffix_buf, "h5gap", probe_inner) orelse unreachable;
+    // Suffix framing around the inner XML is constant for a fixed id.
+    const suffix_overhead = probe_suffix_len - probe_inner.len;
+
+    // Largest body whose raw framing still fits, so only the escaped width can
+    // push it over the limit.
+    const body_overhead = "<body>".len + "</body>".len;
+    const body_len = connection_mod.WRITE_BUF_SIZE - prefix_len - suffix_overhead - wide.len - body_overhead;
+    const raw_total = prefix_len + wide.len + suffix_overhead + body_overhead + body_len;
+    const escaped_total = prefix_len + fanout.escapedLen(wide) + suffix_overhead + body_overhead + body_len;
+    try std.testing.expectEqual(connection_mod.WRITE_BUF_SIZE, raw_total);
+    try std.testing.expect(escaped_total > connection_mod.WRITE_BUF_SIZE);
+    try std.testing.expect(!fanout.exceedsWriteBuffer(prefix_len, suffix_overhead + body_overhead + body_len, wide.len, connection_mod.WRITE_BUF_SIZE));
+    try std.testing.expect(fanout.exceedsWriteBuffer(prefix_len, suffix_overhead + body_overhead + body_len, fanout.escapedLen(wide), connection_mod.WRITE_BUF_SIZE));
+
+    const inner = try allocator.alloc(u8, body_overhead + body_len);
+    defer allocator.free(inner);
+    @memset(inner, 'x');
+    @memcpy(inner[0..6], "<body>");
+    @memcpy(inner[inner.len - 7 ..], "</body>");
+
+    handleMucGroupchat(&server, alice, "quotaroom", inner, "h5gap", &changes);
+
+    // Rejected at ingress: the sender is told and no session is torn down.
+    try std.testing.expect(!alice.sm_overflow);
+    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
 }

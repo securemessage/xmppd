@@ -217,7 +217,7 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
     return null;
 }
 
-const MAX_DBS = 16;
+const MAX_DBS = 24;
 
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
@@ -234,12 +234,17 @@ pub const LmdbBackend = struct {
     /// readable without any lock after open() (S9).
     dbi_count: std.atomic.Value(u32) = .init(0),
     map_size: usize,
+    compound_mutex: std.Thread.Mutex = .{},
     /// Guards dbi_cache appends only. Never held across a call that begins
     /// an LMDB write txn (txn begin takes the LMDB writer lock while a
     /// WriteBatch holder waits for dbi_lock).
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    /// A read runs inside its own read txn, which LMDB pins to an MVCC
+    /// snapshot, so it cannot observe a half-applied write and does not need
+    /// the store's compound lock (S9).
+    pub const reads_are_snapshot = true;
 
     comptime {
         backend.assertBackend(LmdbBackend);

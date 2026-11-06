@@ -26,6 +26,7 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const generic_roster = @import("roster_store");
+const store_keys = @import("store_keys");
 const backend_mod = @import("backend");
 const Subscription = generic_roster.Subscription;
 const muc_handler = @import("muc_handler.zig");
@@ -191,6 +192,21 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
         }
     }
 
+    // An over-long target would overflow the bounded roster key and fail
+    // silently downstream (S4): reject it at ingress.
+    if (to_str.len > 0) {
+        const bound = session.stream.bound_jid orelse return;
+        var ob_buf: [520]u8 = undefined;
+        var ob_fbs = std.io.fixedBufferStream(&ob_buf);
+        ob_fbs.writer().writeAll(bound.local) catch return;
+        ob_fbs.writer().writeByte('@') catch return;
+        ob_fbs.writer().writeAll(bound.domain) catch return;
+        if (!store_keys.fits2(ob_fbs.getWritten(), session.stanza_to)) {
+            rejectOversizeSubscriptionTo(session, session.stanza_to, changes);
+            return;
+        }
+    }
+
     switch (ptype) {
         .subscribe => handleSubscribe(server, session, inner_xml, changes),
         .subscribed => handleSubscribed(server, session, inner_xml, changes),
@@ -252,7 +268,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
 
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
-                        session.conn.queueSend(query_xml) catch {};
+                        session.queueSendStanza(query_xml) catch {};
                         if (session.conn.hasPendingWrite()) {
                             changes.addWrite(session.conn.fd, session.conn.id) catch {};
                         }
@@ -318,23 +334,31 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     const bare_jid = bare_fbs.getWritten();
 
     // Find subscribers (contacts with "from" or "both" in our roster) — cached (T129)
-    var sub_jid_buf: [16384]u8 = undefined;
+    //
+    // Both buffers below stay live into deliverPresenceToSubscribers: the
+    // subscriber JID pointers index into the first, and the presence XML the
+    // delivery loop copies out is built into the second. So they are separate
+    // leased banks rather than one reused (S18).
+    var sub_lease = server.leaseByteScratch() orelse return;
+    defer sub_lease.release();
+    const sub_jid_buf = sub_lease.buf;
     var sub_jid_ptrs: [256][]const u8 = undefined;
     const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
     const now = std.time.timestamp();
-    const sub_count = server.sub_cache.lookupSubscribers(bare_hash, now, &sub_jid_buf, &sub_jid_ptrs) orelse blk: {
-        const count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf, &sub_jid_ptrs) catch return;
+    const sub_count = server.sub_cache.lookupSubscribers(bare_hash, now, sub_jid_buf, &sub_jid_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(bare_jid, sub_jid_buf, &sub_jid_ptrs) catch return;
         server.sub_cache.storeSubscribers(bare_hash, now, sub_jid_ptrs[0..count]);
         break :blk count;
     };
     const subscriber_jids = sub_jid_ptrs[0..sub_count];
 
     // Build presence stanza with inner XML content
-    var pres_buf: [16896]u8 = undefined;
-    var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+    var pres_lease = server.leaseByteScratch() orelse return;
+    defer pres_lease.release();
+    var pres_fbs = std.io.fixedBufferStream(pres_lease.buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (inner_xml.len > 0) {
         pw.writeByte('>') catch return;
@@ -370,12 +394,17 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     bare_fbs.writer().writeAll(domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
-    var sub_jid_buf2: [16384]u8 = undefined;
+    // Subscriber JID pointers index into this buffer and stay live through
+    // delivery, so it is leased rather than taken on the stack (S18). The
+    // presence stanza below is small enough to keep on the stack.
+    var sub_lease = server.leaseByteScratch() orelse return;
+    defer sub_lease.release();
+    const sub_jid_buf2 = sub_lease.buf;
     var sub_jid_ptrs2: [256][]const u8 = undefined;
     const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
     const now = std.time.timestamp();
-    const sub_count2 = server.sub_cache.lookupSubscribers(bare_hash, now, &sub_jid_buf2, &sub_jid_ptrs2) orelse blk: {
-        const count = roster.getPresenceSubscribersFixed(bare_jid, &sub_jid_buf2, &sub_jid_ptrs2) catch return;
+    const sub_count2 = server.sub_cache.lookupSubscribers(bare_hash, now, sub_jid_buf2, &sub_jid_ptrs2) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(bare_jid, sub_jid_buf2, &sub_jid_ptrs2) catch return;
         server.sub_cache.storeSubscribers(bare_hash, now, sub_jid_ptrs2[0..count]);
         break :blk count;
     };
@@ -385,7 +414,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeAll("' type='unavailable'/>") catch return;
     const presence_xml = pres_fbs.getWritten();
 
@@ -409,12 +438,16 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     const bare_jid = bare_fbs.getWritten();
 
     // Get contacts whose presence we should receive (to/both) — cached (T129)
-    var probe_jid_buf: [16384]u8 = undefined;
+    // Contact JID pointers index into this buffer and stay live across the
+    // loop below, which also builds a probe stanza into a second leased bank.
+    var probe_lease = server.leaseByteScratch() orelse return;
+    defer probe_lease.release();
+    const probe_jid_buf = probe_lease.buf;
     var probe_jid_ptrs: [256][]const u8 = undefined;
     const bare_hash = sub_cache_mod.hashBareJid(bare_jid);
     const now = std.time.timestamp();
-    const probe_count = server.sub_cache.lookupSubscriptions(bare_hash, now, &probe_jid_buf, &probe_jid_ptrs) orelse blk: {
-        const count = roster.getPresenceSubscriptionsFixed(bare_jid, &probe_jid_buf, &probe_jid_ptrs) catch return;
+    const probe_count = server.sub_cache.lookupSubscriptions(bare_hash, now, probe_jid_buf, &probe_jid_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscriptionsFixed(bare_jid, probe_jid_buf, &probe_jid_ptrs) catch return;
         server.sub_cache.storeSubscriptions(bare_hash, now, probe_jid_ptrs[0..count]);
         break :blk count;
     };
@@ -433,8 +466,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
     // For each subscribed contact, check if local or remote. T130: local
     // contacts resolve in chunks of one lock hold instead of one per JID.
-    const SUBS_PER_CHUNK = 32;
-    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
+    // S18: chunk scratch lives on the heap, sized to the session map's
+    // resource cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
+    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
 
     var contact_i: usize = 0;
     while (contact_i < contact_jids.len) {
@@ -454,9 +488,9 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                 var probe_fbs = std.io.fixedBufferStream(&probe_buf);
                 const pbw = probe_fbs.writer();
                 pbw.writeAll("<presence from='") catch continue;
-                pbw.writeAll(bare_jid) catch continue;
+                xml.escapeWrite(pbw, bare_jid) catch continue;
                 pbw.writeAll("' to='") catch continue;
-                pbw.writeAll(contact_bare) catch continue;
+                xml.escapeWrite(pbw, contact_bare) catch continue;
                 pbw.writeAll("' type='probe'/>") catch continue;
                 server.sendPresenceViaS2s(bare_jid, contact_bare, probe_fbs.getWritten(), changes);
                 continue;
@@ -465,9 +499,11 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             parts_len += 1;
         }
 
-        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
-        var jid_idxs: [MAX_CHUNK_ENTRIES]u16 = undefined;
-        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, &jid_idxs);
+        var lease_a = server.leaseScratch(.a);
+        defer lease_a.release();
+        const entries = lease_a.entries;
+        const jid_idxs = server.scratchJidIdxsA();
+        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, jid_idxs);
 
         for (entries[0..target_count], jid_idxs[0..target_count]) |entry, idx| {
             const contact = parts_buf[idx];
@@ -483,13 +519,13 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             var pres_fbs = std.io.fixedBufferStream(&pres_buf);
             const ppw = pres_fbs.writer();
             ppw.writeAll("<presence from='") catch continue;
-            ppw.writeAll(contact.local) catch continue;
+            xml.escapeWrite(ppw, contact.local) catch continue;
             ppw.writeByte('@') catch continue;
-            ppw.writeAll(contact.domain) catch continue;
+            xml.escapeWrite(ppw, contact.domain) catch continue;
             ppw.writeByte('/') catch continue;
-            ppw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(ppw, entry.resource()) catch continue;
             ppw.writeAll("' to='") catch continue;
-            ppw.writeAll(to_str) catch continue;
+            xml.escapeWrite(ppw, to_str) catch continue;
             ppw.writeByte('\'') catch continue;
             if (contact_inner.len > 0) {
                 ppw.writeByte('>') catch continue;
@@ -504,13 +540,41 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             // became available). Deliver locally regardless of which worker
             // the contact is on — we already have their resource from the
             // session map; no need to ask the remote worker.
-            session.conn.queueSend(presence_xml) catch continue;
+            session.queueSendStanza(presence_xml) catch continue;
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
         }
 
         contact_i = end;
+    }
+}
+
+/// RFC 6120 4.9.3.10: a subscription stanza whose over-long `to` would
+/// overflow the 511-byte store key is rejected, not dropped (S4).
+fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: *ChangeList) void {
+    const jid = session.stream.authenticated_jid orelse return;
+    var buf: [4608]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.writeAll("<presence from='") catch return;
+    xml.escapeWrite(w, to_str) catch return;
+    w.writeAll("' to='") catch return;
+    xml.escapeWrite(w, jid.local) catch return;
+    w.writeByte('@') catch return;
+    xml.escapeWrite(w, jid.domain) catch return;
+    w.writeByte('/') catch return;
+    xml.escapeWrite(w, jid.resource) catch return;
+    w.writeAll("' type='error'") catch return;
+    if (session.stanza_id.len > 0) {
+        w.writeAll(" id='") catch return;
+        xml.escapeWrite(w, session.stanza_id) catch return;
+        w.writeByte('\'') catch return;
+    }
+    w.writeAll("><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
+    if (session.conn.hasPendingWrite()) {
+        changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 }
 
@@ -552,14 +616,16 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     // Forward subscribe to the target
     const to_jid = xmpp.Jid.parse(to_str) catch return;
 
-    // Build presence stanza (include extensions from inner_xml)
-    var sub_pres_buf: [16896]u8 = undefined;
-    var sub_pres_fbs = std.io.fixedBufferStream(&sub_pres_buf);
+    // Build presence stanza (include extensions from inner_xml). Stays live
+    // across the delivery or store below, so it is leased (S18).
+    var sub_pres_lease = server.leaseByteScratch() orelse return;
+    defer sub_pres_lease.release();
+    var sub_pres_fbs = std.io.fixedBufferStream(sub_pres_lease.buf);
     const spw = sub_pres_fbs.writer();
     spw.writeAll("<presence from='") catch return;
-    spw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(spw, owner_bare) catch return;
     spw.writeAll("' to='") catch return;
-    spw.writeAll(to_str) catch return;
+    xml.escapeWrite(spw, to_str) catch return;
     spw.writeAll("' type='subscribe'") catch return;
     if (inner_xml.len > 0) {
         spw.writeByte('>') catch return;
@@ -581,12 +647,15 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
             log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
             return;
         };
-        var target_entries: [16]SessionEntry = undefined;
-        const target_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &target_entries);
+        const target_count = blk: {
+            var lease_b = server.leaseScratch(.b);
+            defer lease_b.release();
+            break :blk sm.findAvailableByBareJid(to_jid.local, to_jid.domain, lease_b.entries);
+        };
         if (target_count > 0) {
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
         } else {
-            // Target is offline — store for deferred delivery
+            // Target is offline: store for deferred delivery.
             storePendingSubscription(server, to_str, sub_pres_xml);
         }
     }
@@ -646,9 +715,13 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             @memcpy(contact_name_buf[0..copy_len], existing.name[0..copy_len]);
             contact_name_len = copy_len;
         }
-        roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch {};
+        roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch |err| {
+            log.warn("contact roster update failed for {s}: {s}", .{ to_str, @errorName(err) });
+        };
     } else {
-        roster.setItem(to_str, owner_bare, "", .to, false) catch {};
+        roster.setItem(to_str, owner_bare, "", .to, false) catch |err| {
+            log.warn("contact roster insert failed for {s}: {s}", .{ to_str, @errorName(err) });
+        };
     }
     server.invalidateSubCache(to_str);
 
@@ -666,9 +739,9 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     var sd_pres_fbs = std.io.fixedBufferStream(&sd_pres_buf);
     const sdpw = sd_pres_fbs.writer();
     sdpw.writeAll("<presence from='") catch return;
-    sdpw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(sdpw, owner_bare) catch return;
     sdpw.writeAll("' to='") catch return;
-    sdpw.writeAll(to_str) catch return;
+    xml.escapeWrite(sdpw, to_str) catch return;
     sdpw.writeAll("' type='subscribed'/>") catch return;
     const sd_pres_xml = sd_pres_fbs.getWritten();
 
@@ -693,8 +766,10 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
     // The approver now has 'from' the contact = contact's presence should be visible.
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        var probe_entries: [16]SessionEntry = undefined;
-        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, &probe_entries);
+        var lease_b = server.leaseScratch(.b);
+        defer lease_b.release();
+        const probe_entries = lease_b.entries;
+        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, probe_entries);
         for (probe_entries[0..probe_count]) |pentry| {
             // Look up the contact's session to retrieve their stored presence inner XML.
             const contact_inner = if (pentry.worker_id == server.worker_id) blk: {
@@ -706,11 +781,11 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
             const cpw = cpres_fbs.writer();
             cpw.writeAll("<presence from='") catch continue;
-            cpw.writeAll(to_jid.local) catch continue;
+            xml.escapeWrite(cpw, to_jid.local) catch continue;
             cpw.writeByte('@') catch continue;
-            cpw.writeAll(to_jid.domain) catch continue;
+            xml.escapeWrite(cpw, to_jid.domain) catch continue;
             cpw.writeByte('/') catch continue;
-            cpw.writeAll(pentry.resource()) catch continue;
+            xml.escapeWrite(cpw, pentry.resource()) catch continue;
             cpw.writeByte('\'') catch continue;
             if (contact_inner.len > 0) {
                 cpw.writeByte('>') catch continue;
@@ -720,7 +795,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
                 cpw.writeAll("/>") catch continue;
             }
             // Deliver to the approver's session
-            session.conn.queueSend(cpres_fbs.getWritten()) catch continue;
+            session.queueSendStanza(cpres_fbs.getWritten()) catch continue;
         }
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
@@ -796,9 +871,9 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     var unsub_pres_fbs = std.io.fixedBufferStream(&unsub_pres_buf);
     const usbw = unsub_pres_fbs.writer();
     usbw.writeAll("<presence from='") catch return;
-    usbw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(usbw, owner_bare) catch return;
     usbw.writeAll("' to='") catch return;
-    usbw.writeAll(to_str) catch return;
+    xml.escapeWrite(usbw, to_str) catch return;
     usbw.writeAll("' type='unsubscribe'/>") catch return;
     const unsub_pres_xml = unsub_pres_fbs.getWritten();
 
@@ -877,20 +952,22 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_jid = to_jid_parsed;
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
         const unsub_sm = server.session_map orelse return;
-        var owner_entries: [16]SessionEntry = undefined;
-        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, &owner_entries);
+        var lease_b = server.leaseScratch(.b);
+        defer lease_b.release();
+        const owner_entries = lease_b.entries;
+        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, owner_entries);
         for (owner_entries[0..owner_count]) |oent| {
             var unavail_buf: [512]u8 = undefined;
             var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
             const uw = unavail_fbs.writer();
             uw.writeAll("<presence from='") catch continue;
-            uw.writeAll(bound.local) catch continue;
+            xml.escapeWrite(uw, bound.local) catch continue;
             uw.writeByte('@') catch continue;
-            uw.writeAll(bound.domain) catch continue;
+            xml.escapeWrite(uw, bound.domain) catch continue;
             uw.writeByte('/') catch continue;
-            uw.writeAll(oent.resource()) catch continue;
+            xml.escapeWrite(uw, oent.resource()) catch continue;
             uw.writeAll("' to='") catch continue;
-            uw.writeAll(to_str) catch continue;
+            xml.escapeWrite(uw, to_str) catch continue;
             uw.writeAll("' type='unavailable'/>") catch continue;
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unavail_fbs.getWritten(), changes);
         }
@@ -903,9 +980,9 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     var unsd_pres_fbs = std.io.fixedBufferStream(&unsd_pres_buf);
     const usdw = unsd_pres_fbs.writer();
     usdw.writeAll("<presence from='") catch return;
-    usdw.writeAll(owner_bare) catch return;
+    xml.escapeWrite(usdw, owner_bare) catch return;
     usdw.writeAll("' to='") catch return;
-    usdw.writeAll(to_str) catch return;
+    xml.escapeWrite(usdw, to_str) catch return;
     usdw.writeAll("' type='unsubscribed'/>") catch return;
     const unsd_pres_xml = unsd_pres_fbs.getWritten();
 
@@ -977,7 +1054,7 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
     var delivered: usize = 0;
     while (iter.next()) |kv| {
         // Value is the stored subscribe presence XML
-        session.conn.queueSend(kv.value) catch continue;
+        session.queueSendStanza(kv.value) catch continue;
         delivered += 1;
 
         // Delete after delivery (dequeue)
@@ -1021,16 +1098,18 @@ fn broadcastToOwnResources(
     const from_str = from_fbs.getWritten();
 
     // Build presence stanza including inner XML (priority, show, status, etc.)
+    // Stays live across the delivery loop below, so it is leased (S18).
     const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
-    var pres_buf: [16896]u8 = undefined;
-    var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+    var pres_lease = server.leaseByteScratch() orelse return;
+    defer pres_lease.release();
+    var pres_fbs = std.io.fixedBufferStream(pres_lease.buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (sender_session.stanza_type.len > 0) {
         pw.writeAll(" type='") catch return;
-        pw.writeAll(sender_session.stanza_type) catch return;
+        xml.escapeWrite(pw, sender_session.stanza_type) catch return;
         pw.writeByte('\'') catch return;
     }
     if (inner_xml.len > 0) {
@@ -1042,8 +1121,10 @@ fn broadcastToOwnResources(
     }
     const presence_xml = pres_fbs.getWritten();
 
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findByBareJid(local, domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
@@ -1053,8 +1134,7 @@ fn broadcastToOwnResources(
                 target.smTrackOutbound(presence_xml);
                 continue;
             }
-            target.conn.queueSend(presence_xml) catch continue;
-            target.smTrackOutbound(presence_xml);
+            target.queueSendStanza(presence_xml) catch continue;
             _ = target.conn.flushSend() catch {};
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
@@ -1078,8 +1158,10 @@ fn sendOtherResourcesPresence(
 ) void {
     const sm = server.session_map orelse return;
 
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(local, domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findAvailableByBareJid(local, domain, entries);
 
     for (entries[0..count]) |entry| {
         const entry_resource = entry.resource();
@@ -1091,11 +1173,11 @@ fn sendOtherResourcesPresence(
         var pres_fbs = std.io.fixedBufferStream(&pres_buf);
         const pw = pres_fbs.writer();
         pw.writeAll("<presence from='") catch continue;
-        pw.writeAll(local) catch continue;
+        xml.escapeWrite(pw, local) catch continue;
         pw.writeByte('@') catch continue;
-        pw.writeAll(domain) catch continue;
+        xml.escapeWrite(pw, domain) catch continue;
         pw.writeByte('/') catch continue;
-        pw.writeAll(entry_resource) catch continue;
+        xml.escapeWrite(pw, entry_resource) catch continue;
         pw.writeByte('\'') catch continue;
         if (entry.priority != 0) {
             pw.writeAll("><priority>") catch continue;
@@ -1106,7 +1188,7 @@ fn sendOtherResourcesPresence(
         }
         const presence_xml = pres_fbs.getWritten();
 
-        new_session.conn.queueSend(presence_xml) catch continue;
+        new_session.queueSendStanza(presence_xml) catch continue;
         if (new_session.conn.hasPendingWrite()) {
             changes.addWrite(new_session.conn.fd, new_session.conn.id) catch {};
         }
@@ -1139,17 +1221,19 @@ pub fn dispatchDirectedPresenceToBareJid(
     fw.writeAll(bound.resource) catch return;
     const from_str = from_fbs.getWritten();
 
-    // Build presence stanza with inner XML
+    // Build presence stanza with inner XML. Stays live across the delivery
+    // loop below, so it is leased (S18).
     const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
-    var pres_buf: [16896]u8 = undefined;
-    var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+    var pres_lease = server.leaseByteScratch() orelse return;
+    defer pres_lease.release();
+    var pres_fbs = std.io.fixedBufferStream(pres_lease.buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
-    pw.writeAll(from_str) catch return;
+    xml.escapeWrite(pw, from_str) catch return;
     pw.writeByte('\'') catch return;
     if (sender_session.stanza_type.len > 0) {
         pw.writeAll(" type='") catch return;
-        pw.writeAll(sender_session.stanza_type) catch return;
+        xml.escapeWrite(pw, sender_session.stanza_type) catch return;
         pw.writeByte('\'') catch return;
     }
     if (inner_xml.len > 0) {
@@ -1162,8 +1246,10 @@ pub fn dispatchDirectedPresenceToBareJid(
     const presence_xml = pres_fbs.getWritten();
 
     // Deliver to all available resources of the target bare JID
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(target_local, target_domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findAvailableByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
@@ -1193,8 +1279,9 @@ fn deliverPresenceToSubscribers(
 ) void {
     const sm = server.session_map orelse return;
 
-    const SUBS_PER_CHUNK = 32;
-    const MAX_CHUNK_ENTRIES = SUBS_PER_CHUNK * 16; // 16 = MAX_RESOURCES per account
+    // S18: chunk scratch is heap, sized to the session map's resource
+    // cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
+    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
 
     var i: usize = 0;
     while (i < subscriber_jids.len) {
@@ -1223,8 +1310,10 @@ fn deliverPresenceToSubscribers(
         }
 
         // Resolve the whole chunk under one lock hold.
-        var entries: [MAX_CHUNK_ENTRIES]SessionEntry = undefined;
-        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], &entries, null);
+        var lease_a = server.leaseScratch(.a);
+        defer lease_a.release();
+        const entries = lease_a.entries;
+        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, null);
 
         // Local targets deliver inline.
         for (entries[0..count]) |entry| {
@@ -1241,7 +1330,7 @@ fn deliverPresenceToSubscribers(
                 var pending = false;
                 for (entries[0..count]) |entry| {
                     if (entry.worker_id != w) continue;
-                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml) catch continue;
+                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml, 0) catch continue;
                     pending = true;
                 }
                 if (pending) ds.wakeWorker(w);
@@ -1262,8 +1351,11 @@ pub fn deliverPresenceToTarget(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findByBareJid(target_local, target_domain, &entries);
+    // Leaf delivery: bank C so callers iterating bank B keep their results.
+    var lease_c = server.leaseScratch(.c);
+    defer lease_c.release();
+    const entries = lease_c.entries;
+    const count = sm.findByBareJid(target_local, target_domain, entries);
 
     for (entries[0..count]) |ent| {
         if (ent.worker_id == server.worker_id) {
@@ -1273,4 +1365,165 @@ pub fn deliverPresenceToTarget(
             ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, presence_xml) catch {};
         }
     }
+}
+
+test "S4: subscription presence with an over-long to gets jid-malformed" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = session;
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.authenticated_jid = session.stream.bound_jid;
+
+    // 600-byte target: inside the stanza budget but over a 511-byte store key.
+    var to_buf: [600]u8 = undefined;
+    @memset(&to_buf, 'a');
+    @memcpy(to_buf[588..], "@example.org");
+    session.stanza_to = &to_buf;
+    session.stanza_id = "sess-1";
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, session, .subscribe, "", &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
+    // The error reply echoes the original stanza id so the client can correlate.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-1'") != null);
+}
+
+test "S18: unsubscribed fan-out keeps the owner's own resources" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    // Sender alice has two available resources. Only the sending one needs a
+    // live session; the fan-out targets the contact.
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = alice;
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/desk") catch null;
+    alice.stream.authenticated_jid = alice.stream.bound_jid;
+
+    // Contact bob has two available resources. The second one is what an
+    // aliased bank writes over alice's still-unread slot.
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    server.sessions[2] = bob;
+
+    _ = try sm.bind(0, 1, "alice", "localhost", "desk");
+    _ = try sm.bind(0, 4, "alice", "localhost", "mobile");
+    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
+    _ = try sm.bind(0, 5, "bob", "localhost", "tablet");
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "alice", "desk" }, .{ "alice", "mobile" },
+        .{ "bob", "laptop" }, .{ "bob", "tablet" },
+    }) |jid| {
+        sm.setPresenceAvailable(jid[0], "localhost", jid[1], true);
+    }
+
+    const to = "bob@localhost";
+    alice.stanza_to = to;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, alice, .unsubscribed, "", &changes);
+
+    _ = try bob.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+
+    // One unavailable stanza per available alice resource, each naming that
+    // resource. Reusing one bank for the outer iteration and the delivery
+    // lookup replaced the second resource with one of bob's.
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='alice@localhost/desk'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='alice@localhost/mobile'") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "type='unavailable'"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "laptop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "tablet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "type='unsubscribed'") != null);
+}
+
+test "S1: subscription presence escapes the owner bare JID" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    var owner_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &owner_fds));
+    defer posix.close(owner_fds[1]);
+    const owner = try allocator.create(Session);
+    owner.* = Session.init(owner_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = owner;
+    owner.stream.bound_jid = .{ .local = "o'wner", .domain = "localhost", .resource = "desk" };
+    owner.stanza_to = "bob@localhost";
+
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    server.sessions[2] = bob;
+    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
+    sm.setPresenceAvailable("bob", "localhost", "laptop", true);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchSubscription(&server, owner, .subscribe, "", &changes);
+
+    _ = try bob.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(bob_fds[1], &buf) catch 0;
+    const got = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='o&apos;wner@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='o'wner@localhost'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "type='subscribe'") != null);
 }
