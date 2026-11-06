@@ -588,6 +588,41 @@ test "deluser --raw on a data-only spelling touches only owned rows" {
     try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
 }
 
+test "migrate-precis merges same-second archive and duplicate subscription rows" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+    try archive_store.store("NaplesTB@us.example", "alice@us.example", "id1", 1, "<message><body>one</body></message>");
+    try archive_store.store("naplestb@us.example", "alice@us.example", "id2", 1, "<message><body>two</body></message>");
+    try op.put(NS_PENDING_SUB, "NaplesTB@us.example\x00remote@remote.example", "<presence>one</presence>");
+    try op.put(NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(journal_dir);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+    try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
+    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
+    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message><body>one</body></message>");
+    try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "<message><body>two</body></message>");
+}
+
 test "migrate-precis keeps account-owned data without a users row as a collision" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;

@@ -413,13 +413,19 @@ fn rewriteEntry(
         rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false, .account, .reference);
         if (rewrite.new_key) |new_key| rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
     } else if (std.mem.eql(u8, namespace, NS_PENDING_SUB)) {
-        // The contact half is written by third-party subscription traffic;
-        // only the subscriber is the account.
+        // The contact half is data-only: third parties create it by
+        // subscribing to a spelling. The subscriber is a reference.
         rewrite.new_key = try rewriteTwoParts(allocator, key, ctx, false, false, .data, .reference);
-        if (rewrite.new_key) |new_key| rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
+        if (rewrite.new_key) |new_key| {
+            rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
+            rewrite.data_duplicate = !rewrite.reference_duplicate;
+        }
     } else if (std.mem.eql(u8, namespace, NS_BY_CONTACT)) {
         rewrite.new_key = try rewriteByContact(allocator, key, ctx);
-        if (rewrite.new_key) |new_key| rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
+        if (rewrite.new_key) |new_key| {
+            rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
+            rewrite.data_duplicate = !rewrite.reference_duplicate;
+        }
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
         rewrite.new_key = try rewriteRoomAffiliation(allocator, key, ctx);
         rewrite.reference_duplicate = rewrite.new_key != null;
@@ -435,6 +441,7 @@ fn rewriteEntry(
         else
             .account;
         rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx, ownership);
+        if (ownership == .data) rewrite.data_duplicate = rewrite.new_key != null;
         if (std.mem.eql(u8, namespace, NS_OFFLINE)) {
             rewrite.new_value = try rewriteJid(allocator, value, ctx, .reference);
         }
