@@ -29,10 +29,12 @@
 
 const std = @import("std");
 
-/// Longest iterator prefix honored exactly. Keys are capped at
-/// keys.MAX_KEY_LEN (the LMDB limit), so a longer prefix matches nothing
-/// and is rejected rather than clipped.
-pub const MAX_PREFIX_LEN: usize = @import("keys.zig").MAX_KEY_LEN;
+/// Longest iterator prefix honored exactly. Same bound as
+/// keys.MAX_KEY_LEN (the LMDB MDB_MAXKEYSIZE): a longer prefix can match
+/// no stored key, so iterator() rejects it rather than clipping. The
+/// value is pinned equal to keys.MAX_KEY_LEN by a comptime assert in
+/// roster_store.zig, which sees both modules.
+pub const MAX_PREFIX_LEN: usize = 511;
 
 /// Options for opening a storage backend.
 pub const OpenOptions = struct {
