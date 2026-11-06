@@ -337,6 +337,10 @@ pub const Resolver = struct {
     /// Bounded by CACHE_ENTRIES_MAX and CACHE_BYTES_MAX; a hit hashes
     /// a stack-folded name and never allocates (ADR-13, RFC 8767).
     owners: std.StringHashMapUnmanaged(*OwnerEnt) = .{},
+    /// Owner removals since the last in-place rehash: std's map
+    /// deletes by tombstone and never reclaims them on put, so probe
+    /// lengths grow under churn until rehash clears them.
+    owner_removes: usize = 0,
     lru: std.DoublyLinkedList = .{},
     cache_bytes: usize = 0,
     /// Stale answers served (RFC 8767); counted for observability.
@@ -2235,6 +2239,13 @@ pub const Resolver = struct {
         _ = self.owners.remove(owner.name);
         self.lru.remove(&owner.node);
         self.freeOwner(owner);
+        // One O(capacity) rehash per CACHE_ENTRIES_MAX removals keeps
+        // lookups and inserts O(1) amortized.
+        self.owner_removes += 1;
+        if (self.owner_removes >= CACHE_ENTRIES_MAX) {
+            self.owners.rehash(std.hash_map.StringContext{});
+            self.owner_removes = 0;
+        }
     }
 
     fn freeTypeEnt(self: *Resolver, ent: *TypeEnt) void {
@@ -4755,6 +4766,34 @@ test "dns-async: eviction past the scan window sheds the fresh tail" {
     try std.testing.expect(r.owners.get("e32.test") != null);
     try std.testing.expect(r.owners.get("stale.test") != null);
     try std.testing.expect(r.owners.get("over.test") != null);
+}
+
+test "dns-async: owner churn leaves no tombstone buildup" {
+    // Goal: std's owner map deletes by tombstone and never reclaims
+    // them on put, so churn degrades every probe toward O(capacity);
+    // removeOwner rehashes in place once per CACHE_ENTRIES_MAX
+    // removals. Method: churn 8x the entry bound through the cache,
+    // then count the tombstones left in the map.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 5_000_000;
+
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    var name_buf: [40]u8 = undefined;
+    for (0..8 * CACHE_ENTRIES_MAX) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "t{d}.test", .{i}) catch unreachable;
+        r.cachePut(n, KIND_A, &rrs);
+    }
+    try std.testing.expectEqual(@as(usize, CACHE_ENTRIES_MAX), r.owners.count());
+    var tombstones: usize = 0;
+    const cap = r.owners.capacity();
+    for (r.owners.metadata.?[0..cap]) |m| {
+        if (m.isTombstone()) tombstones += 1;
+    }
+    // A periodic rehash leaves no buildup; without one the churn
+    // leaves about CACHE_ENTRIES_MAX dead slots behind.
+    try std.testing.expect(tombstones < CACHE_ENTRIES_MAX / 4);
 }
 
 test "dns-async: a CNAME answer evicts sibling types at the owner" {
