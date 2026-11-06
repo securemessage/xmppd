@@ -68,8 +68,10 @@ pub const LmdbBackend = struct {
     /// --raw). The exclusive byte-0 lock is taken before the environment
     /// exists and held until after env.deinit(): opening a second descriptor
     /// after env open and closing it would drop every fcntl lock this
-    /// process holds on lock.mdb, including LMDB's own (D5). Holding the
-    /// lock also makes a daemon that starts mid-run block in its env open.
+    /// process holds on lock.mdb, including LMDB's own (D5). A daemon that
+    /// starts mid-run blocks in its env open; when the offline tool exits,
+    /// LMDB on FreeBSD destroys its shared mutexes, so that daemon then
+    /// fails with EINVAL and must be restarted after xmppctl exits.
     pub fn openOffline(path: []const u8, opts: backend.OpenOptions) !LmdbBackend {
         if (opts.create) {
             std.fs.cwd().makePath(path) catch |err| switch (err) {

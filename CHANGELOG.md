@@ -30,7 +30,10 @@
   server. Existing account-bearing keys must be migrated before starting
   xmppd-auth, including the archive database:
   1. Stop every xmppd daemon. `migrate-precis` refuses to run while any
-     daemon pid file is live.
+     daemon pid file is live and holds an exclusive LMDB lock for the whole
+     run. A daemon started during the run blocks in env open, then exits
+     with LMDB EINVAL once xmppctl finishes; restart it after the tool
+     exits.
   2. Dry-run `xmppctl migrate-precis --hosted-domain example.org`
      (repeat `--hosted-domain` for each hosted domain). It prints every
      planned rename and every collision or invalid localpart without

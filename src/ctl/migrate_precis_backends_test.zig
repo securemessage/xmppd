@@ -171,6 +171,79 @@ fn childExclusiveLockProbe(path: []const u8) !u8 {
     return result[0];
 }
 
+test "a daemon starting during an offline hold must be restarted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fs.path.join(allocator, &.{ base, "lmdb-lateopen" });
+    defer allocator.free(path);
+    try tmp.dir.makePath("lmdb-lateopen");
+
+    var seed = try LmdbBackend.open(path, .{});
+    seed.close();
+
+    var auth = try LmdbBackend.openOffline(path, .{});
+    var open = true;
+    defer if (open) auth.close();
+
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        var env = LmdbBackend.open(path, .{}) catch std.posix.exit(2);
+        defer env.close();
+        env.put(NS_LOCKS, "late", "1") catch std.posix.exit(3);
+        std.posix.exit(0);
+    }
+    // The child is blocked in mdb_env_open while the offline lock is held.
+    std.Thread.sleep(250 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.kill(pid, 0));
+    auth.close();
+    open = false;
+    _ = std.posix.waitpid(pid, 0);
+
+    // The late opener may fail with EINVAL after the closer destroys LMDB's
+    // shared mutexes; either way it must not have written.
+    var check = try LmdbBackend.open(path, .{});
+    defer check.close();
+    const marker = try check.get(allocator, NS_LOCKS, "late");
+    defer if (marker) |value| allocator.free(value);
+    try std.testing.expect(marker == null);
+}
+
+/// Child probe: 'A' when it acquired the byte-0 lock, 'B' when refused.
+fn childLockProbe(path: []const u8, lock_type: i16) !u8 {
+    var lock_path_buf: [4096]u8 = undefined;
+    const lock_path = try std.fmt.bufPrint(&lock_path_buf, "{s}/lock.mdb", .{path});
+    const pipe_fds = try std.posix.pipe();
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        std.posix.close(pipe_fds[0]);
+        var file = std.fs.cwd().openFile(lock_path, .{ .mode = .read_write }) catch std.posix.exit(2);
+        defer file.close();
+        var lock: std.posix.Flock = .{
+            .start = 0,
+            .len = 1,
+            .pid = 0,
+            .type = lock_type,
+            .whence = 0,
+            .sysid = 0,
+        };
+        const rc = std.c.fcntl(file.handle, std.c.F.SETLK, &lock);
+        const byte: u8 = if (rc == 0) 'A' else 'B';
+        _ = std.posix.write(pipe_fds[1], &.{byte}) catch {};
+        std.posix.close(pipe_fds[1]);
+        std.posix.exit(0);
+    }
+    std.posix.close(pipe_fds[1]);
+    var result: [1]u8 = undefined;
+    const count = try std.posix.read(pipe_fds[0], &result);
+    std.posix.close(pipe_fds[0]);
+    _ = std.posix.waitpid(pid, 0);
+    if (count != 1) return error.ProbeFailed;
+    return result[0];
+}
+
 test "migrate-precis uses production key models for every namespace" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
