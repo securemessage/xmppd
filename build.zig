@@ -437,6 +437,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // lib/net/frame.zig is self-contained (std only); the F3 codec test
+    // proves FrameWriter.begin/commitEncoded hosts encode() in place.
+    const net_frame_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ipc_protocol_test_mod.addImport("net_frame", net_frame_mod);
 
     const ipc_protocol_tests = b.addTest(.{
         .name = "ipc-protocol-tests",

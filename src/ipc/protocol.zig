@@ -990,3 +990,28 @@ test "MechanismList init and slice" {
     try std.testing.expectEqual(MechanismId.plain, s[0]);
     try std.testing.expectEqual(MechanismId.scram_sha_256, s[1]);
 }
+
+test "lib/net FrameWriter hosts encode() in place" {
+    const frame_mod = @import("net_frame");
+    var w: frame_mod.FrameWriter = .{};
+    defer w.deinit(std.testing.allocator);
+
+    // The whole-frame encoder writes header + payload into the scratch
+    // begin() reserved; commitEncoded takes the return value as the
+    // frame total. The backlog must equal a plain encode, byte for
+    // byte, and parse back as exactly one frame.
+    const msg = Message{ .auth_failure = .{ .conn_id = 7, .reason = "denied" } };
+    const scratch = try w.begin(std.testing.allocator, MAX_PAYLOAD_SIZE, 1 << 20);
+    const total = try encode(msg, scratch);
+    w.commitEncoded(total);
+    try std.testing.expectEqual(total, w.buf.items.len);
+
+    var ref: [1024]u8 = undefined;
+    const n = try encode(msg, &ref);
+    try std.testing.expectEqualSlices(u8, ref[0..n], w.buf.items);
+
+    const frame = readFrame(w.buf.items) orelse return error.NoFrame;
+    try std.testing.expectEqual(w.buf.items.len, frame.consumed);
+    const decoded = try decode(frame.payload);
+    try std.testing.expectEqual(@as(u32, 7), decoded.auth_failure.conn_id);
+}

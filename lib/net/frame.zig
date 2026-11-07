@@ -149,9 +149,12 @@ pub const FrameWriter = struct {
         }
     }
 
-    /// Reserve scratch for one frame and return its payload region:
-    /// `scratch[0..max_payload]` starts after the header slot. Encode
-    /// into it (protocol.encode), then `commit` the real length.
+    /// Reserve scratch for one frame, header slot included:
+    /// `scratch[0..HEADER_SIZE]` is the length slot, the payload region
+    /// is `scratch[HEADER_SIZE..][0..max_payload]`. Encode the payload
+    /// there and `commit` the real length, or run a whole-frame encoder
+    /// that writes its own header (protocol.encode) over `scratch[0..]`
+    /// and `commitEncoded` its return value.
     /// `backlog_cap` bounds total unsent bytes (e.g. CLIENT_SEND_CAP).
     pub fn begin(w: *FrameWriter, alloc: std.mem.Allocator, max_payload: usize, backlog_cap: usize) BeginError![]u8 {
         if (max_payload > MAX_PAYLOAD_SIZE) return BeginError.Oversize;
@@ -159,8 +162,8 @@ pub const FrameWriter = struct {
         const unsent = w.buf.items.len - w.start;
         if (unsent + HEADER_SIZE + max_payload > backlog_cap) return BeginError.BacklogFull;
         try w.buf.ensureUnusedCapacity(alloc, HEADER_SIZE + max_payload);
-        const scratch = w.buf.items.ptr + w.buf.items.len + HEADER_SIZE;
-        return scratch[0..max_payload];
+        const scratch = w.buf.items.ptr + w.buf.items.len;
+        return scratch[0 .. HEADER_SIZE + max_payload];
     }
 
     /// Patch the LE length into the reserved header and queue the frame.
@@ -170,6 +173,19 @@ pub const FrameWriter = struct {
         std.debug.assert(scratch.len >= HEADER_SIZE + payload_len);
         std.mem.writeInt(u32, scratch[0..HEADER_SIZE], @intCast(payload_len), .little);
         w.buf.items.len += HEADER_SIZE + payload_len;
+    }
+
+    /// Queue a frame whose encoder already wrote the length header into
+    /// scratch[0..HEADER_SIZE] (protocol.encode returns header + payload
+    /// as `total`). The embedded length must match `total - HEADER_SIZE`,
+    /// so a caller cannot double-frame or truncate without tripping.
+    pub fn commitEncoded(w: *FrameWriter, total: usize) void {
+        std.debug.assert(total >= HEADER_SIZE and total <= MAX_FRAME_SIZE);
+        const scratch = w.buf.unusedCapacitySlice();
+        std.debug.assert(scratch.len >= total);
+        const embedded = std.mem.readInt(u32, scratch[0..HEADER_SIZE], .little);
+        std.debug.assert(embedded == total - HEADER_SIZE);
+        w.buf.items.len += total;
     }
 
     /// Write the backlog until it empties or the fd says EAGAIN. On a
@@ -225,7 +241,7 @@ test "Frame: roundtrip through a socketpair" {
     defer w.deinit(std.testing.allocator);
     const scratch = try w.begin(std.testing.allocator, 64, 4096);
     const payload = "hello frame";
-    @memcpy(scratch[0..payload.len], payload);
+    @memcpy(scratch[HEADER_SIZE..][0..payload.len], payload);
     w.commit(payload.len);
     try std.testing.expectEqual(.drained, try w.drain(pair[0]));
 
@@ -275,7 +291,7 @@ test "Frame: coalesced frames parse one at a time" {
     defer w.deinit(std.testing.allocator);
     for ([_][]const u8{ "one", "two", "three" }) |p| {
         const scratch = try w.begin(std.testing.allocator, 64, 4096);
-        @memcpy(scratch[0..p.len], p);
+        @memcpy(scratch[HEADER_SIZE..][0..p.len], p);
         w.commit(p.len);
     }
     try std.testing.expectEqual(.drained, try w.drain(pair[0]));
@@ -344,7 +360,7 @@ test "Frame: writer backlog grows past EAGAIN and drains after" {
     defer w.deinit(std.testing.allocator);
     const payload_len: usize = 64 << 10;
     const scratch = try w.begin(std.testing.allocator, payload_len, 1 << 20);
-    @memset(scratch[0..payload_len], 0x5a);
+    @memset(scratch[HEADER_SIZE..][0..payload_len], 0x5a);
     w.commit(payload_len);
     try std.testing.expectEqual(.would_block, try w.drain(pair[0]));
     try std.testing.expect(w.pending() > 0);
@@ -373,7 +389,7 @@ test "Frame: begin/commit produce wire-identical bytes" {
     defer w.deinit(std.testing.allocator);
     const payload = "wire bytes";
     const scratch = try w.begin(std.testing.allocator, payload.len, 4096);
-    @memcpy(scratch[0..payload.len], payload);
+    @memcpy(scratch[HEADER_SIZE..][0..payload.len], payload);
     w.commit(payload.len);
 
     var expected: [HEADER_SIZE + 16]u8 = undefined;
@@ -388,4 +404,28 @@ test "Frame: begin refuses past the backlog cap" {
     _ = try w.begin(std.testing.allocator, 16, 64);
     w.commit(0);
     try std.testing.expectError(BeginError.BacklogFull, w.begin(std.testing.allocator, 64, 64));
+}
+
+test "Frame: commitEncoded accepts a self-encoded frame" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var w: FrameWriter = .{};
+    defer w.deinit(std.testing.allocator);
+    const payload = "self encoded";
+    const scratch = try w.begin(std.testing.allocator, payload.len, 4096);
+    // A whole-frame encoder (protocol.encode) writes its own length
+    // header at scratch[0..4]; commitEncoded adopts it as one frame.
+    std.mem.writeInt(u32, scratch[0..4], @intCast(payload.len), .little);
+    @memcpy(scratch[HEADER_SIZE..][0..payload.len], payload);
+    w.commitEncoded(HEADER_SIZE + payload.len);
+    try std.testing.expectEqual(HEADER_SIZE + payload.len, w.pending());
+
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    var r = FrameReader.init(&buf);
+    try std.testing.expectEqual(.drained, try w.drain(pair[0]));
+    try std.testing.expectEqual(.data, try r.recv(pair[1]));
+    const f = (try r.next()).?;
+    try std.testing.expectEqualStrings(payload, f.payload);
 }
