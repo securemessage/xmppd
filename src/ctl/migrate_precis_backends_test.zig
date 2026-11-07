@@ -463,10 +463,14 @@ test "migrate-precis forced rename moves references into the freed key" {
     var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
     try users.addUser(allocator, "Bob", "pw-a");
     try users.addUser(allocator, "bob", "pw-b");
+    try users.addUser(allocator, "carol", "pw-c");
     var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
     try roster.setItem("carol@us.example", "Bob@us.example", "Bob (real)", .both, false);
     try roster.setItem("carol@us.example", "bob@us.example", "bob (other)", .both, false);
     try roster.setItem("carol@us.example", "BOB@us.example", "stale", .both, false);
+    var blocks = block_store_mod.BlockStore(MemoryBackend).init(&op);
+    try blocks.block("carol@us.example", "Bob@us.example");
+    try blocks.block("carol@us.example", "BOB@us.example");
     var rooms = room_store_mod.RoomStore(MemoryBackend).init(&op, allocator);
     try rooms.setAffiliation("room@conference.us.example", "Bob@us.example", .owner);
     try rooms.setAffiliation("room@conference.us.example", "bob@us.example", .member);
@@ -482,7 +486,7 @@ test "migrate-precis forced rename moves references into the freed key" {
     for (plan.issues.items) |issue| {
         if (issue.kind == .deduplicated) deduplicated += 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), deduplicated);
+    try std.testing.expectEqual(@as(usize, 2), deduplicated);
     try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{});
 
     const real = try roster.getItem(allocator, "carol@us.example", "bob@us.example");
@@ -494,6 +498,7 @@ test "migrate-precis forced rename moves references into the freed key" {
     try std.testing.expect(other != null);
     try std.testing.expectEqualStrings("bob (other)", other.?.name);
     try std.testing.expect((try roster.getItem(allocator, "carol@us.example", "BOB@us.example")) == null);
+    try std.testing.expect(try blocks.isBlocked(allocator, "carol@us.example", "bob@us.example"));
     try std.testing.expectEqual(room_store_mod.Affiliation.owner, try rooms.getAffiliation("room@conference.us.example", "bob@us.example"));
     try std.testing.expectEqual(room_store_mod.Affiliation.member, try rooms.getAffiliation("room@conference.us.example", "bob2@us.example"));
 

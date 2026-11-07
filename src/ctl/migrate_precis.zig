@@ -489,16 +489,20 @@ fn renameHasUsers(ns: []const u8, key: []const u8, set: *const std.StringHashMap
         std.mem.eql(u8, ns, NS_LASTACT) or
         std.mem.eql(u8, ns, NS_PEP) or
         std.mem.eql(u8, ns, NS_OFFLINE) or
+        std.mem.eql(u8, ns, NS_OFFLINE_V2) or
+        std.mem.eql(u8, ns, NS_OFFLINE_SEQ) or
+        std.mem.eql(u8, ns, NS_OFFLINE_HOLD_V2) or
+        std.mem.eql(u8, ns, NS_OFFLINE_HOLD_TOKEN) or
         std.mem.eql(u8, ns, NS_MESSAGES))
     {
         const sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
         return localpartHasUsers(set, key[0..sep]);
     }
     const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return localpartHasUsers(set, key);
-    if (std.mem.eql(u8, ns, NS_ROOM_AFFILIATIONS)) {
-        return localpartHasUsers(set, key[first_sep + 1 ..]);
-    }
-    if (localpartHasUsers(set, key[0..first_sep])) return true;
+    // Only the changed component decides the winner: contact for roster,
+    // blocklist, pending_sub and by_contact, member for room affiliations.
+    // The owner half is often an account itself and must not mask a stale
+    // contact such as BOB.
     const rest = key[first_sep + 1 ..];
     const second_sep = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
     return localpartHasUsers(set, rest[0..second_sep]);
