@@ -1608,6 +1608,147 @@ test "Outbox: pin retries the identical slice across want_write" {
     try std.testing.expectEqualStrings("0123456789abcdefAPPENDED-BEHIND", &tail);
 }
 
+fn streamByte(off: usize) u8 {
+    var x: u64 = off *% 0x9E3779B97F4A7C15;
+    x ^= x >> 29;
+    return @truncate(x);
+}
+
+const PinRow = enum { ktls_tcp, userland_unix };
+
+/// Random gather appends, flushes and peer reads over a live TLS
+/// transport. Two things are proven at once: the byte stream the peer
+/// sees is identical to the generated one (B1 order plus R1/R2
+/// corruption), and every want_* retry presents the identical
+/// (ptr, len) the pin holds (kTLS D3, the mutation SSL relies on).
+/// snd_buf is a row parameter: kTLS TX livelocks below a full record
+/// on this stack (P3c: SO_SNDBUF 2048 stalls, 32768 completes).
+fn pinFuzz(row: PinRow, snd_buf: c_int, seed: u64) !void {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = switch (row) {
+        .ktls_tcp => try tcpPair(),
+        .userland_unix => try socketpair(),
+    };
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var tls: Tls = .{ .conn = try ssl.SslConn.init(pki.ctx, pair[0]), .policy = .prefer };
+    defer tls.conn.deinit();
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    try driveHandshake(&tls.conn, &client);
+    tls.ktls_tx = tls.conn.ktlsSend();
+    tls.ktls_rx = tls.conn.ktlsRecv();
+
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&snd_buf));
+    try posix.setsockopt(pair[1], posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&snd_buf));
+
+    var t: Transport = .{ .tls = &tls };
+    var counters: Counters = .{};
+    const ring = try alloc.alloc(u8, 16 << 10);
+    defer alloc.free(ring);
+    var o = Outbox.init(ring, alloc, 4 << 20, &counters);
+    defer o.deinit();
+
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r = rng.random();
+    var gen_off: usize = 0;
+    var recv_off: usize = 0;
+    var src: [6000]u8 = undefined;
+    var rbuf: [8192]u8 = undefined;
+    var pin_checks: usize = 0;
+    var want_writes: usize = 0;
+
+    var step: usize = 0;
+    while (step < 30000) : (step += 1) {
+        const action = r.intRangeLessThan(u8, 0, 10);
+        if (action < 4) {
+            const len = r.intRangeAtMost(usize, 1, src.len);
+            for (src[0..len], 0..) |*b, i| b.* = streamByte(gen_off + i);
+            const cut = r.intRangeAtMost(usize, 0, len);
+            const parts = [_][]const u8{ src[0..cut], src[cut..len] };
+            switch (o.append(&parts)) {
+                .failed_closed => {},
+                else => gen_off += len,
+            }
+        } else if (action < 8) {
+            const before = o.pin;
+            const bytes_before = o.bytes();
+            const res = o.flush(&t, 64 << 10);
+            if (res == .want_write) want_writes += 1;
+            if (before) |p| {
+                if (o.pin) |q| {
+                    // No bytes moved: this is a retry of the same
+                    // pin, which must present the identical slice
+                    // (kTLS D3). head alone cannot prove it: a
+                    // full-ring write wraps head back to the same
+                    // value before a new pin forms. A re-formed pin
+                    // (R1) or one that grew with new appends (R2)
+                    // fails here or as CORRUPT at the peer.
+                    if (o.bytes() == bytes_before and (res == .want_write or res == .want_read)) {
+                        pin_checks += 1;
+                        try std.testing.expectEqual(p.ptr, q.ptr);
+                        try std.testing.expectEqual(p.len, q.len);
+                    }
+                }
+            }
+            if (res == .err) return error.FlushFailed;
+        } else {
+            const want = r.intRangeAtMost(usize, 1, rbuf.len);
+            switch (try client.read(rbuf[0..want])) {
+                .ok => |n| {
+                    for (rbuf[0..n], 0..) |b, i| {
+                        if (b != streamByte(recv_off + i)) return error.Corrupt;
+                    }
+                    recv_off += n;
+                },
+                else => {},
+            }
+        }
+    }
+    var spins: usize = 0;
+    while (recv_off < gen_off and spins < 1_000_000) : (spins += 1) {
+        switch (o.flush(&t, 64 << 10)) {
+            .err => return error.FlushFailed,
+            else => {},
+        }
+        switch (try client.read(&rbuf)) {
+            .ok => |n| {
+                for (rbuf[0..n], 0..) |b, i| {
+                    if (b != streamByte(recv_off + i)) return error.Corrupt;
+                }
+                recv_off += n;
+            },
+            else => {},
+        }
+    }
+    std.debug.print("pin fuzz row={s} ktls_tx={} ktls_rx={} bytes={d} want_write={d} pin_checks={d}\n", .{ @tagName(row), tls.ktls_tx, tls.ktls_rx, gen_off, want_writes, pin_checks });
+    try std.testing.expectEqual(gen_off, recv_off);
+    try std.testing.expect(want_writes > 0);
+    try std.testing.expect(pin_checks > 0);
+    if (row == .ktls_tcp) {
+        try std.testing.expect(tls.ktls_tx);
+        try std.testing.expect(tls.ktls_rx);
+    }
+}
+
+test "Outbox: pin fuzz on kTLS TX over TCP loopback (userland client)" {
+    // 32 KiB SO_SNDBUF: below a full record kTLS TX livelocks (P3c).
+    try pinFuzz(.ktls_tcp, 32768, 0xA11CE);
+    try pinFuzz(.ktls_tcp, 32768, 0xB0B);
+}
+
+test "Outbox: pin fuzz on userland TLS over a socketpair" {
+    try pinFuzz(.userland_unix, 2048, 0xA11CE);
+    try pinFuzz(.userland_unix, 2048, 0xC0FFEE);
+}
+
 fn mkLoop(alloc: std.mem.Allocator) !Loop {
     var l: Loop = undefined;
     try l.init(alloc, &.{ .handles_max = 8, .timers_max = 4 });
