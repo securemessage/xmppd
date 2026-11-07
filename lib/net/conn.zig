@@ -14,6 +14,7 @@ const posix = std.posix;
 const ssl = @import("ssl");
 const loop_mod = @import("loop.zig");
 const Token = @import("token.zig").Token;
+const SlotMap = @import("slotmap.zig").SlotMap;
 
 pub const Loop = loop_mod.Loop;
 pub const Handle = loop_mod.Handle;
@@ -1867,6 +1868,69 @@ test "Conn: a rejected registration closes through the ConnList" {
     try std.testing.expectEqual(State.closing, c.state);
     try std.testing.expect(c.on_dirty);
     list.service();
+}
+
+test "Conn: an event with a stale ctx generation is dropped at the table" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var counters: Counters = .{};
+    var list: ConnList = .{};
+
+    // The consumer's conn table, capacity 1: c1's free reissues the
+    // same index at the next generation, so t1 can never resolve again
+    // (decision 5).
+    var conns: SlotMap(*Conn) = undefined;
+    try conns.init(alloc, 1, 0x7c);
+    defer conns.deinit(alloc);
+
+    const pair1 = try socketpair();
+    defer posix.close(pair1[1]);
+    var c1: Conn = undefined;
+    const t1 = try conns.insert(&c1);
+    try c1.init(&loop, pair1[0], t1, alloc, .{ .counters = &counters });
+    defer c1.deinit();
+    _ = conns.remove(t1);
+
+    const pair2 = try socketpair();
+    defer posix.close(pair2[1]);
+    var c2: Conn = undefined;
+    const t2 = try conns.insert(&c2);
+    try c2.init(&loop, pair2[0], t2, alloc, .{ .counters = &counters });
+    defer c2.deinit();
+    try std.testing.expectEqual(t1.index, t2.index);
+    try std.testing.expect(t2.gen > t1.gen);
+
+    // A readable event carrying c1's dead ctx must die in the table
+    // lookup; reaching c2 through the reused index is the ABA the
+    // generation exists to kill.
+    const stale: Event = .{ .readable = .{
+        .handle = c2.handle, .ctx = t1, .data = 0, .eof = false, .errno = 0,
+    } };
+    try std.testing.expect(conns.get(stale.readable.ctx) == null);
+
+    // The live generation resolves and drives the real conn.
+    _ = try posix.write(pair2[1], "hi");
+    const live: Event = .{ .readable = .{
+        .handle = c2.handle, .ctx = t2, .data = 0, .eof = false, .errno = 0,
+    } };
+    const owner = conns.get(live.readable.ctx) orelse return error.StaleCtx;
+    try std.testing.expectEqual(&c2, owner.*);
+    try std.testing.expectEqual(Outcome.readable, owner.*.onEvent(live, &list));
+    try std.testing.expectEqualStrings("hi", c2.inbox.unread());
+
+    // A close through the same path: .closed must arrive with the conn
+    // already on the dirty list, or the walk can never tear it down
+    // (markClosing without the link strands fd and SSL).
+    posix.shutdown(pair2[1], .both) catch {};
+    const closing_ev: Event = .{ .readable = .{
+        .handle = c2.handle, .ctx = t2, .data = 0, .eof = true, .errno = 0,
+    } };
+    const out = conns.get(closing_ev.readable.ctx).?.*.onEvent(closing_ev, &list);
+    try std.testing.expect(out == .closed);
+    try std.testing.expect(c2.on_dirty);
+    list.service();
+    try std.testing.expectEqual(@as(?posix.fd_t, null), c2.loop.fdOf(c2.handle));
 }
 
 test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
