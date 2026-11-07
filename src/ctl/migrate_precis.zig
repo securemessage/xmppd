@@ -49,6 +49,9 @@ pub const IssueKind = enum {
     /// Non-blocking: a duplicate reference row was dropped because the
     /// prepared-key row already occupies the target.
     deduplicated,
+    /// Non-blocking: a data row with a colliding key and different value was
+    /// moved to a deterministic stanza-id suffix instead of being deleted.
+    rekeyed,
 };
 
 pub const Issue = struct {
@@ -86,6 +89,8 @@ pub const Plan = struct {
     renames: std.ArrayListUnmanaged(Rename) = .{},
     issues: std.ArrayListUnmanaged(Issue) = .{},
     rename_bytes: usize = 0,
+    rekey_count: usize = 0,
+    recovery_digest: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) Plan {
         return .{ .allocator = allocator };
@@ -94,7 +99,7 @@ pub const Plan = struct {
     /// Deduplicated reference drops are reported but do not block apply.
     pub fn hasBlockingIssues(self: *const Plan) bool {
         for (self.issues.items) |issue| {
-            if (issue.kind != .deduplicated) return true;
+            if (issue.kind != .deduplicated and issue.kind != .rekeyed) return true;
         }
         return false;
     }
@@ -374,6 +379,55 @@ fn rewriteByContact(
     return result;
 }
 
+const REKEY_SEQ_BASE: u64 = 1 << 40;
+const REKEY_SEQ_HIGH: u64 = REKEY_SEQ_BASE + 1_000_000;
+
+fn rekeyV2Key(allocator: std.mem.Allocator, key: []const u8, sequence: u64) !?[]u8 {
+    const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
+    if (key.len < first_sep + 9) return null;
+    const result = try allocator.alloc(u8, key.len);
+    @memcpy(result, key);
+    std.mem.writeInt(u64, result[first_sep + 1 ..][0..8], sequence, .big);
+    return result;
+}
+
+fn sequenceValue(sequence: u64) [8]u8 {
+    var value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value, sequence, .big);
+    return value;
+}
+
+fn rekeyStanzaKey(allocator: std.mem.Allocator, key: []const u8, counter: usize) !?[]u8 {
+    const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
+    const rest = key[first_sep + 1 ..];
+    const second_rel = std.mem.indexOfScalar(u8, rest, 0) orelse return null;
+    const second_sep = first_sep + 1 + second_rel;
+    const stanza_id = key[second_sep + 1 ..];
+    const new_id = try std.fmt.allocPrint(allocator, "{s}-mig-{d}", .{ stanza_id, counter });
+    defer allocator.free(new_id);
+    const result = try allocator.alloc(u8, second_sep + 1 + new_id.len);
+    @memcpy(result[0 .. second_sep + 1], key[0 .. second_sep + 1]);
+    @memcpy(result[second_sep + 1 ..], new_id);
+    return result;
+}
+
+fn rewriteOfflineV2Value(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    ctx: *const RewriteContext,
+) !?[]u8 {
+    if (value.len < 12) return null;
+    const id_len = std.mem.readInt(u32, value[8..12], .big);
+    const from_offset = 12 + @as(usize, id_len);
+    if (from_offset > value.len) return null;
+    const new_from = try rewriteJid(allocator, value[from_offset..], ctx, .reference) orelse return null;
+    defer allocator.free(new_from);
+    const result = try allocator.alloc(u8, from_offset + new_from.len);
+    @memcpy(result[0..from_offset], value[0..from_offset]);
+    @memcpy(result[from_offset..], new_from);
+    return result;
+}
+
 fn firstPartUnchanged(old_key: []const u8, new_key: []const u8) bool {
     const old_sep = std.mem.indexOfScalar(u8, old_key, 0) orelse return false;
     const new_sep = std.mem.indexOfScalar(u8, new_key, 0) orelse return false;
@@ -621,8 +675,111 @@ fn planNamespace(
     }
     std.sort.heap(Rename, pending.items, {}, pendingLessThan);
 
-    for (pending.items) |rename| {
+    for (pending.items) |original| {
+        var rename = original;
+        var equal_data_value = false;
         if (!rename.same_key) {
+            if (std.mem.eql(u8, namespace, NS_OFFLINE_SEQ)) {
+                const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
+                defer if (target_value) |value| plan.allocator.free(value);
+                if (target_value != null) {
+                    try addIssue(plan, db, namespace, .deduplicated, rename.old_key, rename.new_key);
+                    var dropped = rename;
+                    dropped.delete_only = true;
+                    dropped.same_key = false;
+                    try plan.renames.append(plan.allocator, dropped);
+                    transferred += 1;
+                    plan.rename_bytes += dropped.new_key.len + dropped.value_len;
+
+                    const high = sequenceValue(REKEY_SEQ_HIGH);
+                    const same_old = try plan.allocator.dupe(u8, rename.new_key);
+                    const same_new = try plan.allocator.dupe(u8, rename.new_key);
+                    const same_value = try plan.allocator.dupe(u8, &high);
+                    try plan.renames.append(plan.allocator, .{
+                        .db = db,
+                        .namespace = namespace,
+                        .old_key = same_old,
+                        .new_key = same_new,
+                        .new_value = same_value,
+                        .same_key = true,
+                        .value_len = high.len,
+                    });
+                    plan.rename_bytes += same_new.len + same_value.len;
+                    continue;
+                }
+            }
+
+            if (std.mem.eql(u8, namespace, NS_OFFLINE_V2)) {
+                const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
+                defer if (target_value) |value| plan.allocator.free(value);
+                if (target_value != null) {
+                    const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
+                    defer if (old_value) |value| plan.allocator.free(value);
+                    if (old_value != null and std.mem.eql(u8, old_value.?, target_value.?)) {
+                        equal_data_value = true;
+                    } else {
+                        plan.rekey_count += 1;
+                        const new_seq = REKEY_SEQ_BASE + plan.rekey_count;
+                        const rekeyed = try rekeyV2Key(plan.allocator, rename.new_key, new_seq) orelse
+                            return error.InvalidRecoveryPlan;
+                        plan.allocator.free(rename.new_key);
+                        rename.new_key = rekeyed;
+                        rename.same_key = false;
+                        try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
+
+                        const first_sep = std.mem.indexOfScalar(u8, rename.new_key, 0).?;
+                        const owner = rename.new_key[0..first_sep];
+                        const high = sequenceValue(REKEY_SEQ_HIGH);
+                        const seq_old = try plan.allocator.dupe(u8, owner);
+                        const seq_new = try plan.allocator.dupe(u8, owner);
+                        const seq_value = try plan.allocator.dupe(u8, &high);
+                        try plan.renames.append(plan.allocator, .{
+                            .db = .op,
+                            .namespace = NS_OFFLINE_SEQ,
+                            .old_key = seq_old,
+                            .new_key = seq_new,
+                            .new_value = seq_value,
+                            .same_key = true,
+                            .value_len = high.len,
+                        });
+                        plan.rename_bytes += seq_new.len + seq_value.len;
+                    }
+                }
+            }
+
+            // Offline and messages keys contain a sender-controlled stanza id.
+            // Equal keys with different values are re-keyed, never deleted.
+            if (rename.data_duplicate and
+                (std.mem.eql(u8, namespace, NS_OFFLINE) or std.mem.eql(u8, namespace, NS_MESSAGES)))
+            {
+                const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
+                defer if (target_value) |value| plan.allocator.free(value);
+                if (target_value != null) {
+                    const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
+                    defer if (old_value) |value| plan.allocator.free(value);
+                    const same_value = old_value != null and std.mem.eql(u8, old_value.?, target_value.?);
+                    equal_data_value = same_value;
+                    if (!same_value) {
+                        plan.rekey_count += 1;
+                        const rekeyed = try rekeyStanzaKey(plan.allocator, rename.new_key, plan.rekey_count) orelse
+                            return error.InvalidRecoveryPlan;
+                        if (db != .archive and rekeyed.len > 511) {
+                            plan.allocator.free(rekeyed);
+                            try addIssue(plan, db, namespace, .key_too_long, rename.old_key, "");
+                            plan.allocator.free(rename.old_key);
+                            plan.allocator.free(rename.new_key);
+                            if (rename.new_value) |value| plan.allocator.free(value);
+                            transferred += 1;
+                            continue;
+                        }
+                        plan.allocator.free(rename.new_key);
+                        rename.new_key = rekeyed;
+                        rename.same_key = false;
+                        try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
+                    }
+                }
+            }
+
             const id = try targetId(plan.allocator, db, namespace, rename.new_key);
             var id_owned = true;
             defer if (id_owned) plan.allocator.free(id);
@@ -637,7 +794,10 @@ fn planNamespace(
                 }
             }
             if (occupied) {
-                if (rename.reference_duplicate or rename.data_duplicate) {
+                if (rename.reference_duplicate or equal_data_value or
+                    (rename.data_duplicate and
+                        (!std.mem.eql(u8, namespace, NS_OFFLINE) and !std.mem.eql(u8, namespace, NS_MESSAGES))))
+                {
                     // The prepared-key row wins; the duplicate old row is
                     // deleted so it cannot survive the migration.
                     try addIssue(plan, db, namespace, .deduplicated, rename.old_key, rename.new_key);

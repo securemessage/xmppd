@@ -543,6 +543,142 @@ test "migrate-precis merges same-second archive and duplicate subscription rows"
     try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "<message><body>two</body></message>");
 }
 
+test "migrate-precis missing auth source fails before the op commit" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "Bob", "pw");
+    try users.addUser(allocator, "bob", "pw");
+    var roster = roster_store_mod.RosterStore(MemoryBackend).init(&op);
+    try roster.setItem("carol@us.example", "Bob@us.example", "Bob", .both, false);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, .{
+        .old_localpart = "bob",
+        .new_localpart = "bob2",
+    });
+    defer plan.deinit();
+    const before = try op.get(allocator, NS_ROSTERS, "carol@us.example\x00Bob@us.example");
+    defer if (before) |value| allocator.free(value);
+    try std.testing.expect(before != null);
+    try auth.delete(NS_USERS, "Bob");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+    try std.testing.expectError(error.MissingSourceRow, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = dir }));
+    const after = try op.get(allocator, NS_ROSTERS, "carol@us.example\x00Bob@us.example");
+    defer if (after) |value| allocator.free(value);
+    try std.testing.expect(after != null);
+    try std.testing.expectEqualSlices(u8, before.?, after.?);
+}
+
+test "migrate-precis auth dependency cycle fails before the op commit" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+    try auth.put(NS_USERS, "a", "1");
+    try auth.put(NS_USERS, "b", "2");
+    try op.put(NS_ROSTERS, "carol@us.example\x00a@us.example", "old");
+
+    var plan = migrate.Plan.init(allocator);
+    defer plan.deinit();
+    const a_old = try allocator.dupe(u8, "a");
+    const a_new = try allocator.dupe(u8, "b");
+    const b_old = try allocator.dupe(u8, "b");
+    const b_new = try allocator.dupe(u8, "a");
+    const op_old = try allocator.dupe(u8, "carol@us.example\x00a@us.example");
+    const op_new = try allocator.dupe(u8, "carol@us.example\x00b@us.example");
+    try plan.renames.append(allocator, .{ .db = .auth, .namespace = NS_USERS, .old_key = a_old, .new_key = a_new, .new_value = null, .same_key = false, .value_len = 0 });
+    try plan.renames.append(allocator, .{ .db = .auth, .namespace = NS_USERS, .old_key = b_old, .new_key = b_new, .new_value = null, .same_key = false, .value_len = 0 });
+    try plan.renames.append(allocator, .{ .db = .op, .namespace = NS_ROSTERS, .old_key = op_old, .new_key = op_new, .new_value = null, .same_key = false, .value_len = 3 });
+    plan.rename_bytes = 6;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+    try std.testing.expectError(error.RenameCycle, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = dir }));
+    try expectRow(&op, NS_ROSTERS, "carol@us.example\x00a@us.example", "old");
+}
+
+test "migrate-precis rekeys colliding offline and archive rows with different values" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    for ([_][]const u8{ "offline", "1" }) |stanza_id| {
+        var auth = try MemoryBackend.open("", .{});
+        defer auth.close();
+        var op = try MemoryBackend.open("", .{});
+        defer op.close();
+        var archive = try MemoryBackend.open("", .{});
+        defer archive.close();
+
+        var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+        try users.addUser(allocator, "NaplesTB", "pw");
+        try users.addUser(allocator, "alice", "pw");
+        var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+        const key_real = try std.fmt.allocPrint(allocator, "NaplesTB@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
+        defer allocator.free(key_real);
+        const key_spam = try std.fmt.allocPrint(allocator, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
+        defer allocator.free(key_spam);
+        try op.put(NS_OFFLINE, key_real, "alice@us.example/res");
+        try op.put(NS_OFFLINE, key_spam, "remote@remote.example/res");
+        var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+        try archive_store.store("NaplesTB@us.example", "alice@us.example", stanza_id, 1, "<message><body>REAL ACCOUNT MSG</body></message>");
+        try archive_store.store("naplestb@us.example", "remote@remote.example", stanza_id, 1, "<message><body>spam to lowercase spelling</body></message>");
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(journal_dir);
+
+        const domains = [_][]const u8{"us.example"};
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+        defer plan.deinit();
+        try std.testing.expect(!plan.hasBlockingIssues());
+        var rekeyed: usize = 0;
+        for (plan.issues.items) |issue| if (issue.kind == .rekeyed) {
+            rekeyed += 1;
+        };
+        try std.testing.expect(rekeyed >= 2);
+        try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+        const pointers = try offline.getPointers("naplestb@us.example");
+        defer offline.freePointers(pointers);
+        try std.testing.expectEqual(@as(usize, 2), pointers.len);
+        var saw_real_sender = false;
+        var saw_spam_sender = false;
+        for (pointers) |pointer| {
+            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) saw_real_sender = true;
+            if (std.mem.eql(u8, pointer.from_jid, "remote@remote.example/res")) saw_spam_sender = true;
+        }
+        try std.testing.expect(saw_real_sender and saw_spam_sender);
+
+        var messages = try archive.iterator(NS_MESSAGES, "naplestb@us.example\x00");
+        defer messages.deinit();
+        var saw_real_body = false;
+        var saw_spam_body = false;
+        while (messages.next()) |entry| {
+            if (std.mem.indexOf(u8, entry.value, "REAL ACCOUNT MSG") != null) saw_real_body = true;
+            if (std.mem.indexOf(u8, entry.value, "spam to lowercase spelling") != null) saw_spam_body = true;
+        }
+        try std.testing.expect(saw_real_body and saw_spam_body);
+    }
+}
+
 test "deluser --raw on a data-only spelling touches only owned rows" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
