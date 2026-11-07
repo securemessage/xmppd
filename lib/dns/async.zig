@@ -7492,6 +7492,184 @@ test "dns-async: a stale consult moves the owner to the LRU head (M28)" {
     try std.testing.expect(r.lru.first == &owner.node);
 }
 
+test "dns-async: a pinned stale owner at the stale-list head is never evicted (Wf)" {
+    // Goal: the stale scan rotates a pinned head to the tail instead
+    // of evicting it; the next unpinned stale owner sheds. Method:
+    // two 1 s rows go stale in insert order under a full cache, so
+    // the elder sits at the stale head; pin it and insert over
+    // budget.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    r.cacheInsert("pin.test", KIND_A, &rrs, .none, 1);
+    r.cacheInsert("st.test", KIND_A, &rrs, .none, 1);
+    const ent = r.owners.get("pin.test").?.types.items[0];
+    var name_buf: [40]u8 = undefined;
+    for (0..CACHE_ENTRIES_MAX - 2) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "f{d}.test", .{i}) catch unreachable;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 300);
+    }
+    fake_now += 3_000;
+    ent.refreshing = true;
+    defer ent.refreshing = false;
+    r.cacheInsert("new.test", KIND_A, &rrs, .none, 300);
+    try std.testing.expect(r.owners.get("pin.test") != null);
+    try std.testing.expect(r.owners.get("st.test") == null);
+}
+
+test "dns-async: a row expiring inside the cursor's second files the owner stale (Wj)" {
+    // Goal: a wheel slot cannot express a deadline inside the
+    // cursor's own second, so expRelink files that owner on the
+    // stale list directly; dropping the check parks it for a full
+    // lap. Method: drop the longer row so the owner's key lands in
+    // the cursor's current second.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    var t_rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 1, 1, 0xBE } }};
+    fake_now = 999_900;
+    r.cacheInsert("edge.test", KIND_A, &rrs, .none, 10); // expires 1_009_900
+    fake_now = 1_009_400;
+    r.cacheInsert("edge.test", KIND_TLSA, &t_rrs, .none, 300);
+    r.cacheDrop("edge.test", KIND_TLSA);
+    // The remaining key (1_009_900 ms) is ahead of the clock but
+    // inside the cursor's second: the owner belongs on the stale
+    // list, not parked a lap out on the wheel.
+    const owner = r.owners.get("edge.test").?;
+    try std.testing.expect(owner.exp_list == .stale);
+}
+
+test "dns-async: a cache drop re-files the owner under its remaining expiry (Wd)" {
+    // Goal: cacheDrop ends in expRelink like every other row change:
+    // dropping the row that carries the wheel key moves the owner to
+    // the stale list, and it then sheds first under pressure.
+    // Method: drop the fresh row of a two-row owner whose 1 s row is
+    // already stale, then insert over budget.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    var t_rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 1, 1, 0xBE } }};
+    fake_now = 1_000_000;
+    r.cacheInsert("two.test", KIND_A, &rrs, .none, 1);
+    r.cacheInsert("two.test", KIND_TLSA, &t_rrs, .none, 300); // the wheel key
+    var name_buf: [40]u8 = undefined;
+    for (0..CACHE_ENTRIES_MAX - 1) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "f{d}.test", .{i}) catch unreachable;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 300);
+    }
+    fake_now += 3_000;
+    r.cacheDrop("two.test", KIND_TLSA);
+    try std.testing.expect(r.owners.get("two.test").?.exp_list == .stale);
+    r.cacheInsert("new.test", KIND_A, &rrs, .none, 300);
+    try std.testing.expect(r.owners.get("two.test") == null);
+}
+
+test "dns-async: the on-hit prune re-files the owner under its remaining expiry (We)" {
+    // Goal: the miss-path prune of a dead row relinks the owner too:
+    // the row carrying the wheel key leaves and the key must move to
+    // the remaining rows' expiry instead of keeping a slot it no
+    // longer matches. Method: consult a dead 300 s row out of an
+    // owner that also holds a 60 s row.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    var a_rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    var t_rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 1, 1, 0xBE } }};
+    fake_now = 1_000_000;
+    r.cacheInsert("p.test", KIND_A, &a_rrs, .none, 300); // carries the wheel key
+    r.cacheInsert("p.test", KIND_TLSA, &t_rrs, .none, 60);
+    // Both rows dead past the serve-stale window; the consult prunes
+    // only the asked row and re-files the owner under the rest.
+    fake_now += STALE_MAX_MS + 400_000;
+    try std.testing.expect(r.cacheGetClass("p.test", KIND_A) == null);
+    try std.testing.expect(r.owners.get("p.test").?.exp_list == .stale);
+}
+
+test "dns-async: a stale refresh past the serve-stale cap never serves at the deadline (F3d)" {
+    // Goal: onDeadline's stale gate checks stale_ms like every other
+    // serve path: a refresh still running when the row ages past the
+    // one-day cap fails the leg instead of feeding the dead row.
+    // Method: pin a stale NODATA TLSA behind the svc.test chain,
+    // jump to just before the cap, fire the per-query deadline past
+    // it; the leg must fail out to lookup_failed, never "absent".
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    seedStaleTlsa(&r, .nodata);
+    seedSvcChain(&r, false);
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    const job = r.jobs.items[0];
+    if (job.pending_qtype != KIND_TLSA or job.stale == null) return error.TestUnexpectedResult;
+    // 500 ms inside the cap; the deadline then fires 500 ms past it.
+    const ent = job.stale.?.ent;
+    fake_now = ent.stale_ms - 500;
+    fake_now += 1_000;
+    r.onDeadline(job);
+    try std.testing.expect(ctx.status == null);
+    var guard: usize = 0;
+    while (r.jobs.items.len > 0 and ctx.status == null and guard < 64) : (guard += 1) {
+        r.onDeadline(r.jobs.items[0]);
+    }
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+const CacheReplaceCbCtx = struct {
+    r: *Resolver,
+    status: ?Status = null,
+    res: ?Resolution = null,
+
+    fn onResolve(ctx_ptr: ?*anyopaque, _: usize, status: Status, res: ?Resolution) void {
+        const self: *CacheReplaceCbCtx = @ptrCast(@alignCast(ctx_ptr.?));
+        self.status = status;
+        self.res = res;
+        var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_TLSA, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 3, 1, 1, 0xBE } }};
+        self.r.cacheInsert("_15222._tcp.srv.test", KIND_TLSA, &rrs, .none, 60);
+        self.r.cacheDrop("_15222._tcp.srv.test", KIND_TLSA);
+    }
+};
+
+test "dns-async: an in-place replace keeps the feed's borrow on the row (F2b)" {
+    // Goal: replacing a row mid-feed carries borrows forward; a drop
+    // that then found the row unpinned would free it under the feed
+    // that still holds it. Method: serve the stale TLSA row through
+    // the recheck-window borrow path; the resolve callback replaces
+    // and drops the row while the feed still borrows it.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 1_000_000;
+    seedStaleTlsa(&r, .none);
+    seedSvcChain(&r, false);
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    // A recently failed refresh suppresses a new one: the TLSA leg
+    // serves the stale row through the borrow path, not a fresh pin.
+    const tlsa_owner = r.owners.get("_15222._tcp.srv.test").?;
+    tlsa_owner.types.items[0].last_fail_ms = fake_now;
+    var ctx = CacheReplaceCbCtx{ .r = &r };
+    r.setCallback(.{ .ctx = &ctx, .fun = CacheReplaceCbCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 3, true);
+    try std.testing.expectEqual(Status.resolved, ctx.status orelse return error.TestUnexpectedResult);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    // The replace kept the borrow: the drop marked the row
+    // unservable instead of freeing it under the feed.
+    const owner = r.owners.get("_15222._tcp.srv.test") orelse return error.TestUnexpectedResult;
+    const ent = owner.types.items[0];
+    try std.testing.expect(ent.stale_ms <= r.now_ms());
+    try std.testing.expectEqual(@as(u16, 0), ent.borrows);
+}
+
 test "dns-async: a chain deadline serves the stale row it refreshed" {
     // Goal: a per-query deadline on a chain leg refreshing a stale
     // row feeds the row's answer to the phase machine (RFC 8767);
