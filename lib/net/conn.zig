@@ -478,6 +478,12 @@ pub const Options = struct {
     inbox_bytes: usize = 8 << 10,
     outbox_ring_bytes: usize = 16 << 10,
     max_outbound_bytes: usize = 1 << 20,
+    /// Read suppression watermarks on outbox bytes (T110): null
+    /// defaults to 3/4 and 1/2 of max_outbound_bytes. A full outbox
+    /// stops read interest so TCP flow control pushes back on the
+    /// peer instead of failing closed. `high == 0` disables.
+    outbox_suppress_high: ?usize = null,
+    outbox_suppress_low: ?usize = null,
     read_budget_bytes: usize = 64 << 10,
     read_budget_reads: u32 = 16,
     flush_budget_bytes: usize = 64 << 10,
@@ -595,6 +601,10 @@ pub const Conn = struct {
     /// Read is parked: the last drain found the inbox full. Lifted only
     /// by `Conn.consume`; a parked read must not wake the loop.
     inbox_stalled: bool = false,
+    /// Read is suppressed: the outbox sits above the high watermark,
+    /// so flow control pushes back on the peer (M9). Lifted when the
+    /// outbox drains to the low watermark.
+    read_suppressed: bool = false,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
@@ -638,11 +648,32 @@ pub const Conn = struct {
     }
 
     /// Record the wanted interest and reconcile it with the loop. Read
-    /// is armed only while the inbox is not parked: a full inbox cannot
-    /// move, and re-driving it every pass spins the worker.
+    /// is armed only while the inbox is not parked and the outbox is
+    /// not suppressed: a full inbox cannot move, re-driving it every
+    /// pass spins the worker, and a full outbox pushes back on the
+    /// peer through flow control instead of reading more.
     fn interest(c: *Conn, read: bool, write: bool) void {
         c.want_write = write;
-        c.loop.setInterest(c.handle, .{ .read = read and !c.inbox_stalled, .write = write }) catch {};
+        c.loop.setInterest(c.handle, .{ .read = read and !c.inbox_stalled and !c.read_suppressed, .write = write }) catch {};
+    }
+
+    /// Recompute read suppression from the outbox depth and re-arm
+    /// interest when it flipped. Called wherever outbox bytes change:
+    /// after append in `send` and after every flush. Engages at the
+    /// high watermark, releases at the low one. Mid-upgrade the
+    /// handshake drives interest itself, so it returns early.
+    fn updateSuppression(c: *Conn) void {
+        if (c.state == .handshake) return;
+        const high = c.opts.outbox_suppress_high orelse c.opts.max_outbound_bytes * 3 / 4;
+        if (high == 0) return; // suppression disabled
+        const low = c.opts.outbox_suppress_low orelse c.opts.max_outbound_bytes / 2;
+        const was = c.read_suppressed;
+        if (!was and c.outbox.bytes() >= high) {
+            c.read_suppressed = true;
+        } else if (was and c.outbox.bytes() <= low) {
+            c.read_suppressed = false;
+        }
+        if (c.read_suppressed != was) c.interest(true, c.want_write);
     }
 
     fn markClosing(c: *Conn, list: *ConnList) void {
@@ -710,6 +741,7 @@ pub const Conn = struct {
     fn onWritable(c: *Conn, list: *ConnList) Outcome {
         if (c.state == .handshake) return c.driveHandshake(list);
         const r = c.outbox.flush(&c.transport, c.opts.flush_budget_bytes);
+        c.updateSuppression();
         switch (r) {
             .drained => {
                 if (c.requeue_read) {
@@ -889,6 +921,7 @@ pub const Conn = struct {
         if (c.state == .closing) return .none;
         return switch (c.outbox.append(parts)) {
             .queued, .spilled => {
+                c.updateSuppression();
                 list.link(c);
                 return .none;
             },
@@ -970,6 +1003,7 @@ pub const ConnList = struct {
                         continue;
                     },
                 }
+                c.updateSuppression();
             }
             if (c.requeue_read) {
                 c.requeue_read = false;
@@ -2775,6 +2809,62 @@ test "ConnList: a drained flush re-drives the stalled read through service" {
         if (ev == .readable and ev.readable.handle.eql(c.handle)) saw_readable = true;
     }
     try std.testing.expect(saw_readable);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Conn: a full outbox suppresses reads until it drains" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{
+        .counters = &counters,
+        .outbox_suppress_high = 8,
+        .outbox_suppress_low = 4,
+    });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // 8 queued bytes reach the high watermark: read interest drops so
+    // the peer's bytes wait in the kernel instead of piling into an
+    // outbox that cannot leave (T110 flow control, M9).
+    const parts = [_][]const u8{"12345678"};
+    _ = c.send(&list, &parts);
+    try std.testing.expect(c.read_suppressed);
+
+    _ = try posix.write(pair[1], "in");
+    _ = try loop.scheduleIn(20, mkConnCtx(9));
+    try loop.wait();
+    var saw_readable = false;
+    while (loop.next()) |ev| {
+        if (ev == .readable) saw_readable = true;
+    }
+    try std.testing.expect(!saw_readable);
+
+    // The walk drains the outbox below the low watermark; suppression
+    // lifts and the pending peer bytes surface on the next pass.
+    list.service();
+    try std.testing.expect(!c.read_suppressed);
+    _ = try loop.scheduleIn(50, mkConnCtx(9));
+    try loop.wait();
+    saw_readable = false;
+    while (loop.next()) |ev| {
+        switch (ev) {
+            .readable => {
+                saw_readable = true;
+                _ = c.onEvent(ev, &list);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_readable);
+    try std.testing.expectEqualStrings("in", c.inbox.unread());
     c.state = .closing;
     c.teardown();
 }
