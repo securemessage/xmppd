@@ -139,10 +139,14 @@ pub const FrameWriter = struct {
     }
 
     /// Fold the sent prefix away before appending, same shape as
-    /// IpcConn.queueSend.
-    fn reclaim(w: *FrameWriter) void {
+    /// IpcConn.queueSend. Folding is O(unsent), so it runs only when it
+    /// is free work (the sent prefix outweighs the backlog) or the
+    /// frame cannot fit the tail space; folding on every begin after a
+    /// small drain is O(backlog) per call.
+    fn reclaim(w: *FrameWriter, need: usize) void {
+        if (w.start == 0) return;
         const unsent = w.buf.items.len - w.start;
-        if (w.start >= unsent or w.start >= 4096) {
+        if (w.start >= unsent or w.buf.capacity - w.buf.items.len < need) {
             std.mem.copyForwards(u8, w.buf.items, w.buf.items[w.start..]);
             w.buf.items.len = unsent;
             w.start = 0;
@@ -158,12 +162,13 @@ pub const FrameWriter = struct {
     /// `backlog_cap` bounds total unsent bytes (e.g. CLIENT_SEND_CAP).
     pub fn begin(w: *FrameWriter, alloc: std.mem.Allocator, max_payload: usize, backlog_cap: usize) BeginError![]u8 {
         if (max_payload > MAX_PAYLOAD_SIZE) return BeginError.Oversize;
-        w.reclaim();
+        const need = HEADER_SIZE + max_payload;
         const unsent = w.buf.items.len - w.start;
-        if (unsent + HEADER_SIZE + max_payload > backlog_cap) return BeginError.BacklogFull;
-        try w.buf.ensureUnusedCapacity(alloc, HEADER_SIZE + max_payload);
+        if (unsent + need > backlog_cap) return BeginError.BacklogFull;
+        w.reclaim(need);
+        try w.buf.ensureUnusedCapacity(alloc, need);
         const scratch = w.buf.items.ptr + w.buf.items.len;
-        return scratch[0 .. HEADER_SIZE + max_payload];
+        return scratch[0..need];
     }
 
     /// Patch the LE length into the reserved header and queue the frame.
@@ -428,4 +433,28 @@ test "Frame: commitEncoded accepts a self-encoded frame" {
     try std.testing.expectEqual(.data, try r.recv(pair[1]));
     const f = (try r.next()).?;
     try std.testing.expectEqualStrings(payload, f.payload);
+}
+
+test "Frame: begin folds the sent prefix only when needed" {
+    const alloc = std.testing.allocator;
+    var w: FrameWriter = .{};
+    defer w.deinit(alloc);
+    // 4 MiB backlog (IPC CLIENT_SEND_CAP), kernel drains 8 KiB per
+    // pass; a fold on every begin moves the whole backlog each call
+    // (P19 measured 753 MiB over 256 calls).
+    while (w.pending() < (4 << 20) - 70000) {
+        const s = try w.begin(alloc, 1000, 4 << 20);
+        @memset(s[HEADER_SIZE..][0..1000], 0x11);
+        w.commit(1000);
+    }
+    var copied: usize = 0;
+    for (0..256) |_| {
+        w.start += 8192;
+        const before = w.pending();
+        const s = try w.begin(alloc, 100, 8 << 20);
+        _ = s;
+        w.commit(100);
+        if (w.start == 0) copied += before;
+    }
+    try std.testing.expect(copied <= 16 << 20);
 }
