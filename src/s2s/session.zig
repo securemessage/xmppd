@@ -519,9 +519,11 @@ pub const S2sSession = struct {
         if (features.sasl_external) {
             try writer.writeAll("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>");
         }
-        if (features.dialback) {
-            try writer.writeAll("<db:features><db:dialback/></db:features>");
-        }
+        // No dialback stream feature: <db:features><db:dialback/> exists in no
+        // spec, and the standard XEP-0220 2.4.2 dialback-errors feature is
+        // only advertised once dialback error handling is implemented (X1).
+        // Traditional dialback support stays signaled by xmlns:db in the
+        // stream header.
         try writer.writeAll("</stream:features>");
         return fbs.getWritten();
     }
@@ -891,8 +893,13 @@ test "S2sSession: buildFeatures — auth without DANE" {
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
     const out = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") != null);
+    // Neither auth mechanism advertises a feature element: the non-standard
+    // <db:features><db:dialback/> is gone and EXTERNAL needs DANE. Dialback
+    // support remains visible via the xmlns:db stream header declaration.
+    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "db:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "EXTERNAL") == null);
+    try std.testing.expectEqualStrings("<stream:features></stream:features>", out);
 }
 
 test "S2sSession: buildSaslSuccess" {
