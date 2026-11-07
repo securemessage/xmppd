@@ -3,6 +3,9 @@ pub const stanza = @import("stanza.zig");
 pub const stream = @import("stream.zig");
 
 pub const Jid = jid.Jid;
+pub const max_jid_octets = jid.max_jid_octets;
+pub const foldLocalpart = jid.foldLocalpart;
+pub const prepareLocalDomainJid = jid.prepareLocalDomainJid;
 pub const Stanza = stanza.Stanza;
 pub const Stream = stream.Stream;
 pub const StreamState = stream.StreamState;

@@ -243,6 +243,13 @@ pub const Session = struct {
     stanza_to: []const u8 = "",
     stanza_id: []const u8 = "",
     stanza_type: []const u8 = "",
+    /// F6 ingress preparation scratch: stanza-level to/from attr values are
+    /// prepared into session-owned buffers so the folded localpart and the
+    /// configured domain spelling stay valid for the stanza's whole life
+    /// (reader-arena slices do not). prep_attrs rebuilds the attr table.
+    prep_to_buf: [xmpp.max_jid_octets]u8 = undefined,
+    prep_from_buf: [xmpp.max_jid_octets]u8 = undefined,
+    prep_attrs: [64]xml.Attribute = undefined,
 
     /// Bind IQ accumulation — deferred until </iq> so <resource> text is parsed.
     bind_iq_id: []const u8 = "",
@@ -1791,7 +1798,8 @@ pub const Server = struct {
                 session_lifecycle.forceCloseSession(self, session.conn.id, changes);
             },
             .element_start => |elem| {
-                self.handleElementStart(session, elem, changes);
+                var e = elem;
+                self.handleElementStart(session, &e, changes);
             },
             .element_end => |name| {
                 self.handleElementEnd(session, name, changes);
@@ -1855,15 +1863,20 @@ pub const Server = struct {
         var server_addressed = to_attr.len == 0 or std.ascii.eqlIgnoreCase(to_attr, self.server_host);
         if (!server_addressed) {
             if (session.stream.authenticated_jid) |aj| {
-                var acc_buf: [256]u8 = undefined;
-                var acc_fbs = std.io.fixedBufferStream(&acc_buf);
-                const aw = acc_fbs.writer();
-                aw.writeAll(aj.local) catch {};
-                aw.writeByte('@') catch {};
-                aw.writeAll(aj.domain) catch {};
-                const account = acc_fbs.getWritten();
+                // The ingress-prepared 'to' carries a folded localpart, so the
+                // account string folds the authenticated name the same way;
+                // the buffer holds a full-length prepared bare JID (F6).
+                var acc_buf: [router.FULL_JID_MAX]u8 = undefined;
+                var account: []const u8 = "";
+                if (xmpp.foldLocalpart(aj.local, &acc_buf)) |folded| {
+                    var acc_fbs = std.io.fixedBufferStream(acc_buf[folded.len..]);
+                    const aw = acc_fbs.writer();
+                    aw.writeByte('@') catch {};
+                    aw.writeAll(aj.domain) catch {};
+                    account = acc_buf[0 .. folded.len + acc_fbs.pos];
+                } else |_| {}
                 const to_bare = if (std.mem.indexOfScalar(u8, to_attr, '/')) |sp| to_attr[0..sp] else to_attr;
-                server_addressed = std.mem.eql(u8, to_bare, account);
+                server_addressed = account.len > 0 and std.mem.eql(u8, to_bare, account);
             }
         }
         if (server_addressed) return .server_addressed;
@@ -1922,7 +1935,111 @@ pub const Server = struct {
         }
     }
 
-    fn handleElementStart(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+    /// F6: fold local-domain to/from attribute values once at stanza ingress
+    /// into session-owned buffers, then rebuild elem.attributes onto the
+    /// prepared spellings. Remote-domain JIDs pass through unchanged. Returns
+    /// false when a value fails preparation: the caller must stop processing
+    /// the stanza (a jid-malformed reply has already been queued, except for
+    /// type='error' stanzas which are dropped silently per RFC 6120 §8.3.1).
+    fn prepareStanzaAddresses(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) bool {
+        // A table wider than the rebuild buffer cannot be rewritten; the
+        // scanner's own attribute cap keeps this unreachable in practice.
+        if (elem.attributes.len > session.prep_attrs.len) return true;
+
+        // Scan the type first: an early error must still know whether the
+        // stanza itself is type='error', wherever the attribute sits.
+        var type_str: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "type")) type_str = attr.value;
+        }
+        const is_error_stanza = std.mem.eql(u8, type_str, "error");
+
+        for (elem.attributes, 0..) |attr, i| {
+            var a = attr;
+            const buf = if (std.mem.eql(u8, attr.local_name, "to"))
+                &session.prep_to_buf
+            else if (std.mem.eql(u8, attr.local_name, "from"))
+                &session.prep_from_buf
+            else
+                null;
+            if (buf) |b| {
+                a.value = xmpp.prepareLocalDomainJid(attr.value, self.server_host, b) catch {
+                    if (!is_error_stanza) self.sendIngressJidMalformed(session, elem, changes);
+                    return false;
+                };
+            }
+            session.prep_attrs[i] = a;
+        }
+        elem.attributes = session.prep_attrs[0..elem.attributes.len];
+        return true;
+    }
+
+    /// F6: jid-malformed reply for a stanza whose to/from failed ingress
+    /// preparation. message/iq echo the sender's 'to' and 'id' like
+    /// sendPreBindStanzaError; presence also addresses the reply to the
+    /// account's full JID, mirroring rejectOversizeSubscriptionTo.
+    fn sendIngressJidMalformed(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
+        _ = self;
+        var to_attr: []const u8 = "";
+        var id_attr: []const u8 = "";
+        for (elem.attributes) |attr| {
+            if (std.mem.eql(u8, attr.local_name, "to")) to_attr = attr.value;
+            if (std.mem.eql(u8, attr.local_name, "id")) id_attr = attr.value;
+        }
+        var reply_to: []const u8 = "";
+        var full_buf: [router.FULL_JID_MAX]u8 = undefined;
+        if (std.mem.eql(u8, elem.local_name, "presence")) {
+            const jid = session.stream.bound_jid orelse session.stream.authenticated_jid orelse return;
+            var fbs = std.io.fixedBufferStream(&full_buf);
+            const w = fbs.writer();
+            w.writeAll(jid.local) catch return;
+            w.writeByte('@') catch return;
+            w.writeAll(jid.domain) catch return;
+            if (jid.resource.len > 0) {
+                w.writeByte('/') catch return;
+                w.writeAll(jid.resource) catch return;
+            }
+            reply_to = fbs.getWritten();
+        }
+        var buf: [4608]u8 = undefined;
+        const stanza = writeJidMalformedReply(&buf, elem.local_name, to_attr, reply_to, id_attr) orelse
+            // An offending JID that escapes wider than the buffer still gets
+            // its answer; the 'from' echo is optional.
+            writeJidMalformedReply(&buf, elem.local_name, "", reply_to, id_attr) orelse return;
+        session.queueSendStanza(stanza) catch return;
+        if (session.conn.hasPendingWrite()) {
+            changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
+    }
+
+    fn writeJidMalformedReply(buf: []u8, tag_name: []const u8, from: []const u8, to: []const u8, id: []const u8) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        w.writeByte('<') catch return null;
+        w.writeAll(tag_name) catch return null;
+        if (from.len > 0) {
+            w.writeAll(" from='") catch return null;
+            xml.escapeWrite(w, from) catch return null;
+            w.writeByte('\'') catch return null;
+        }
+        if (to.len > 0) {
+            w.writeAll(" to='") catch return null;
+            xml.escapeWrite(w, to) catch return null;
+            w.writeByte('\'') catch return null;
+        }
+        w.writeAll(" type='error'") catch return null;
+        if (id.len > 0) {
+            w.writeAll(" id='") catch return null;
+            xml.escapeWrite(w, id) catch return null;
+            w.writeByte('\'') catch return null;
+        }
+        w.writeAll("><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return null;
+        w.writeAll(tag_name) catch return null;
+        w.writeByte('>') catch return null;
+        return fbs.getWritten();
+    }
+
+    fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
         // If accumulating a message/presence stanza, serialize child elements into buffer
         if (session.stanza_kind != .none) {
             // Detect <priority> child inside presence stanza for RFC 6121 §4.7.2.3
@@ -1930,8 +2047,19 @@ pub const Server = struct {
                 session.pres_priority_collecting = true;
                 session.pres_priority_len = 0;
             }
-            self.accumulateStanzaElement(session, elem);
+            self.accumulateStanzaElement(session, elem.*);
             return;
+        }
+
+        // F6: prepare local-domain to/from once at stanza ingress so every
+        // downstream compare and store key sees the folded localpart and the
+        // configured domain spelling.
+        if (session.reader.depth == 2 and
+            (std.mem.eql(u8, elem.local_name, "message") or
+                std.mem.eql(u8, elem.local_name, "presence") or
+                std.mem.eql(u8, elem.local_name, "iq")))
+        {
+            if (!self.prepareStanzaAddresses(session, elem, changes)) return;
         }
 
         const ns = elem.namespace_uri;
@@ -1954,7 +2082,7 @@ pub const Server = struct {
         // SASL namespace
         if (std.mem.eql(u8, ns, xml.ns.sasl)) {
             if (std.mem.eql(u8, elem.local_name, "auth")) {
-                self.handleSaslAuth(session, elem, changes);
+                self.handleSaslAuth(session, elem.*, changes);
             } else if (std.mem.eql(u8, elem.local_name, "response")) {
                 // Start collecting SCRAM response text
                 session.sasl_collecting = .response;
@@ -1968,18 +2096,18 @@ pub const Server = struct {
             if (std.mem.eql(u8, elem.local_name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
                 // RFC 6120 §7.1 (T182): a pre-auth stanza addressed to a third
                 // party is not processed — the stream is closed instead.
-                if (self.enforcePreBindStanzaPolicy(session, elem, changes) == .third_party_closed) return;
+                if (self.enforcePreBindStanzaPolicy(session, elem.*, changes) == .third_party_closed) return;
                 // Start IQ accumulation for registration
-                iq_handler.handleIq(session, elem, self.server_host);
+                iq_handler.handleIq(session, elem.*, self.server_host);
                 return;
             }
             // IQ child elements during pre-auth registration
             if (session.iq_active) {
                 if (session.vcard_collecting) {
-                    self.accumulateVcardElement(session, elem);
+                    self.accumulateVcardElement(session, elem.*);
                     return;
                 }
-                self.handleIqChild(session, elem);
+                self.handleIqChild(session, elem.*);
                 return;
             }
         }
@@ -2000,7 +2128,7 @@ pub const Server = struct {
         // XEP-0198: SM resume at features_bind — client sends <resume/> instead of <bind/>
         if (session.stream.state == .features_bind and std.mem.eql(u8, ns, xml.ns.sm)) {
             if (std.mem.eql(u8, elem.local_name, "resume")) {
-                self.handleSmResume(session, elem, changes);
+                self.handleSmResume(session, elem.*, changes);
             }
             return;
         }
@@ -2011,7 +2139,7 @@ pub const Server = struct {
             // before resource binding is not processed — the stream closes
             // with a not-authorized stream error. The bind wrapper IQ itself
             // is server-addressed and continues below.
-            switch (self.enforcePreBindStanzaPolicy(session, elem, changes)) {
+            switch (self.enforcePreBindStanzaPolicy(session, elem.*, changes)) {
                 .third_party_closed => return,
                 .not_stanza => return, // presence pre-bind: silently ignored
                 .server_addressed => {},
@@ -2042,7 +2170,7 @@ pub const Server = struct {
             } else if (std.mem.eql(u8, elem.local_name, "message")) {
                 // Server/account-addressed message pre-bind — not processed,
                 // but answered with a not-authorized stanza error.
-                self.sendPreBindStanzaError(session, elem, changes);
+                self.sendPreBindStanzaError(session, elem.*, changes);
             }
             return;
         }
@@ -2061,7 +2189,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, ns, xml.ns.sm)) {
             if (std.mem.eql(u8, elem.local_name, "enable")) {
                 if (session.stream.isActive()) {
-                    self.handleSmEnable(session, elem, changes);
+                    self.handleSmEnable(session, elem.*, changes);
                 } else {
                     // XEP-0198 §3.1: SM enable before resource bind — reject
                     self.sendSmFailed(session, "unexpected-request", changes);
@@ -2107,7 +2235,7 @@ pub const Server = struct {
                     }
                 }
             } else if (std.mem.eql(u8, elem.local_name, "resume") and session.stream.state == .features_bind) {
-                self.handleSmResume(session, elem, changes);
+                self.handleSmResume(session, elem.*, changes);
             }
             return;
         }
@@ -2118,13 +2246,13 @@ pub const Server = struct {
         // stanza error instead (IQs are answered via dispatchIq's pre-bind
         // gate); presence stays silently ignored.
         if (!session.stream.isActive()) {
-            switch (self.enforcePreBindStanzaPolicy(session, elem, changes)) {
+            switch (self.enforcePreBindStanzaPolicy(session, elem.*, changes)) {
                 .third_party_closed, .not_stanza => return,
                 .server_addressed => {
                     // Client-namespace IQs were handled above (registration /
                     // dispatchIq). A server-addressed message is bounced.
                     if (std.mem.eql(u8, elem.local_name, "message")) {
-                        self.sendPreBindStanzaError(session, elem, changes);
+                        self.sendPreBindStanzaError(session, elem.*, changes);
                     }
                     return;
                 },
@@ -2136,22 +2264,22 @@ pub const Server = struct {
             // If we're inside an IQ stanza, handle child elements
             if (session.iq_active) {
                 if (session.vcard_collecting) {
-                    self.accumulateVcardElement(session, elem);
+                    self.accumulateVcardElement(session, elem.*);
                     return;
                 }
-                self.handleIqChild(session, elem);
+                self.handleIqChild(session, elem.*);
                 return;
             }
 
             if (std.mem.eql(u8, elem.local_name, "message")) {
                 if (session.sm_enabled) session.sm_in_h +%= 1;
-                self.handleMessage(session, elem, changes);
+                self.handleMessage(session, elem.*, changes);
             } else if (std.mem.eql(u8, elem.local_name, "presence")) {
                 if (session.sm_enabled) session.sm_in_h +%= 1;
-                self.handlePresence(session, elem, changes);
+                self.handlePresence(session, elem.*, changes);
             } else if (std.mem.eql(u8, elem.local_name, "iq")) {
                 if (session.sm_enabled) session.sm_in_h +%= 1;
-                self.handleIq(session, elem, changes);
+                self.handleIq(session, elem.*, changes);
             }
         }
     }
@@ -5937,6 +6065,202 @@ test "Server: pre-bind stanza to the domain in another case is server-addressed"
     var changes = ChangeList.init(&change_buf);
 
     try std.testing.expectEqual(Server.PreBindVerdict.server_addressed, server.enforcePreBindStanzaPolicy(session, elem, &changes));
+}
+
+test "F6: ingress preparation folds the local 'to' before routing" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+
+    const target_fds = try makeSocketPair();
+    defer posix.close(target_fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.state = .active;
+    target.stream.authenticated = true;
+    target.stream.bound_jid = xmpp.Jid.parse("naplestb@localhost/desk") catch null;
+    // A bodiless message is typing-only under XEP-0352 and is skipped for
+    // CSI-inactive sessions.
+    target.csi_active = true;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "naplestb", "localhost", "desk");
+    sm.setPresenceAvailable("naplestb", "localhost", "desk", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    server.sessions[9] = alice;
+    // Stand in for the reader state at a top-level stanza's element_start.
+    alice.reader.depth = 2;
+
+    const attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = "NaplesTB@LOCALHOST", .prefix = "", .local_name = "to" },
+        .{ .name = "type", .value = "chat", .prefix = "", .local_name = "type" },
+        .{ .name = "id", .value = "m1", .prefix = "", .local_name = "id" },
+    };
+    var elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleElementStart(alice, &elem, &changes);
+
+    // Routed to the folded account and serialized with the prepared spelling.
+    _ = target.conn.flushSend() catch {};
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(target_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "to='naplestb@localhost'") != null);
+}
+
+test "F6: pre-bind stanza to the folded account is server-addressed" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = .{ .local = "NaplesTB", .domain = "localhost" };
+    session.reader.depth = 2;
+
+    const attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = "NaplesTB@localhost", .prefix = "", .local_name = "to" },
+    };
+    var elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleElementStart(session, &elem, &changes);
+
+    // Own-account: answered with a stanza error, the stream stays open.
+    try std.testing.expect(server.sessions[1] != null);
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not-authorized") != null);
+}
+
+test "F6: a 320-octet localpart survives the pre-bind account compare" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var local_upper: [320]u8 = undefined;
+    @memset(&local_upper, 'A');
+    var to_buf: [512]u8 = undefined;
+    const to = try std.fmt.bufPrint(&to_buf, "{s}@localhost", .{&local_upper});
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = .{ .local = &local_upper, .domain = "localhost" };
+    session.reader.depth = 2;
+
+    const attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = to, .prefix = "", .local_name = "to" },
+    };
+    var elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleElementStart(session, &elem, &changes);
+
+    try std.testing.expect(server.sessions[1] != null);
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not-authorized") != null);
+}
+
+test "F6: malformed local 'to' gets jid-malformed for message and iq" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    session.reader.depth = 2;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var buf: [2048]u8 = undefined;
+
+    const msg_attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = "a@b@c", .prefix = "", .local_name = "to" },
+        .{ .name = "type", .value = "chat", .prefix = "", .local_name = "type" },
+        .{ .name = "id", .value = "m2", .prefix = "", .local_name = "id" },
+    };
+    var msg_elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &msg_attrs,
+        .self_closing = true,
+    };
+    server.handleElementStart(session, &msg_elem, &changes);
+    _ = try session.conn.flushSend();
+    var n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "jid-malformed") != null);
+    try std.testing.expect(server.sessions[1] != null);
+
+    const iq_attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = "x@@y", .prefix = "", .local_name = "to" },
+        .{ .name = "type", .value = "get", .prefix = "", .local_name = "type" },
+        .{ .name = "id", .value = "i1", .prefix = "", .local_name = "id" },
+    };
+    var iq_elem = xml.Element{
+        .name = "iq",
+        .prefix = "",
+        .local_name = "iq",
+        .namespace_uri = "jabber:client",
+        .attributes = &iq_attrs,
+        .self_closing = true,
+    };
+    server.handleElementStart(session, &iq_elem, &changes);
+    _ = try session.conn.flushSend();
+    n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "jid-malformed") != null);
+    try std.testing.expect(server.sessions[1] != null);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
