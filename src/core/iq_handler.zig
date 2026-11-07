@@ -1365,7 +1365,7 @@ fn sendLastActivityResult(server: *Server, session: *Session, iq_id: []const u8,
 /// accounts never reach here — dispatchIq's foreign-JID branch handles them.
 fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []const u8) void {
     const iq_to = session.iq_to;
-    if (iq_to.len == 0 or std.mem.eql(u8, iq_to, server.server_host)) {
+    if (iq_to.len == 0 or std.ascii.eqlIgnoreCase(iq_to, server.server_host)) {
         const start = if (server.start_time > 0) server.start_time else std.time.timestamp();
         const uptime: u64 = @intCast(@max(std.time.timestamp() - start, 0));
         sendLastActivityResult(server, session, iq_id, uptime);
@@ -1389,7 +1389,7 @@ fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []c
 fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, to_jid: @import("xmpp").Jid) void {
     const bound = session.stream.bound_jid orelse return;
 
-    if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
+    if (!std.ascii.eqlIgnoreCase(to_jid.domain, server.server_host)) {
         sendIqError(server, session, iq_id, "service-unavailable");
         return;
     }
@@ -2339,4 +2339,56 @@ test "S11: staged reg IQ id survives the reader-arena reset" {
     @memset(&long_buf, 'y');
     try std.testing.expect(!stageRegPendingIq(&server, session, &long_buf));
     try std.testing.expectEqualStrings("pw-change-42", session.reg_pending_iq_id);
+}
+
+test "F6: last-activity query to the domain in another case is server-addressed" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    session.iq_to = "LOCALHOST";
+    handleLastActivitySelfOrServer(&server, session, "la1");
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "jabber:iq:last") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "service-unavailable") == null);
+}
+
+test "F6: last-activity query for a mixed-case local domain is not remote" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    handleLastActivityFor(&server, session, "la2", .{ .local = "bob", .domain = "LOCALHOST" });
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    // Local evaluation continues to the roster check; a remote verdict
+    // short-circuits with service-unavailable.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "item-not-found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "service-unavailable") == null);
 }

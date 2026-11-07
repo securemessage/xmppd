@@ -1852,7 +1852,7 @@ pub const Server = struct {
 
         // Addressed to the server itself (no 'to', or the bare domain) or to
         // the client's own account (its authenticated bare JID)?
-        var server_addressed = to_attr.len == 0 or std.mem.eql(u8, to_attr, self.server_host);
+        var server_addressed = to_attr.len == 0 or std.ascii.eqlIgnoreCase(to_attr, self.server_host);
         if (!server_addressed) {
             if (session.stream.authenticated_jid) |aj| {
                 var acc_buf: [256]u8 = undefined;
@@ -5882,6 +5882,61 @@ test "Server: stream open produces response" {
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:features>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<starttls") != null);
+}
+
+test "Server: stream open with mixed-case 'to' produces response" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='LOCALHOST' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleReadable(1, &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const response = buf[0..n];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<stream:stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "host-unknown") == null);
+}
+
+test "Server: pre-bind stanza to the domain in another case is server-addressed" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    const to_attr = [_]xml.Attribute{
+        .{ .name = "to", .value = "LOCALHOST", .prefix = "", .local_name = "to" },
+    };
+    const elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &to_attr,
+        .self_closing = false,
+    };
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    try std.testing.expectEqual(Server.PreBindVerdict.server_addressed, server.enforcePreBindStanzaPolicy(session, elem, &changes));
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
