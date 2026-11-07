@@ -60,24 +60,30 @@
      data into the surviving account. Any collision makes `--apply` change
      nothing.
   4. Apply with `xmppctl migrate-precis --hosted-domain example.org
-     --apply`, then rerun the dry run; it must report 0 renames. Large
-     migrations write `migrate-precis.plan` and `migrate-precis.journal`
-     in the DB directory and are safe to rerun.
+     --apply`, then rerun the dry run; it must report 0 renames. The plan,
+     a digest and `migrate-precis.pending` are written before the first
+     commit; completion markers are committed with the data they describe.
+     If the run is interrupted, rerun the same `--apply` command: it loads
+     the stored plan and finishes only the unfinished batches. While the
+     marker exists, `--rename` and `deluser --raw` are refused, and
+     xmppd-auth/xmppd-core refuse to start. Do not delete the marker or
+     resume file manually.
   5. Start the daemons. xmppd-auth scans the users namespace once at
      startup and **refuses to start** if any key is not in prepared form,
      logging one error that names `xmppctl migrate-precis`. There is no
      raw-name read fallback.
 
-- **Known gap until PR #9 lands:** local-domain JIDs are not yet prepared
-  at stanza or payload ingress. Mail and presence addressed to the old
-  spelling (for example `NaplesTB@domain`) are stored under that old
-  spelling and stay unreachable, including offline delivery, until PR #9
-  prepares them. Address accounts by their prepared localpart. Roster
-  items, blocklist items, MUC affiliations and MAM `with` filters can also
-  store the old spelling, and JIDs whose domain differs in case from the
-  configured hosted domain are not treated as local. After PR #9 lands,
-  rerun `migrate-precis` to absorb every row written under an old spelling
-  in the meantime.
+- **Ingress preparation is still a tracked follow-up:** PR #9 has merged,
+  but master still prepares no localpart at stanza or payload ingress. The
+  F6 work is PR #46 (in progress). Until it lands, mail and presence
+  addressed to the old spelling (for example `NaplesTB@domain`) are stored
+  under that old spelling and stay unreachable, including offline delivery.
+  Address accounts by their prepared localpart. Roster items, blocklist
+  items, MUC affiliations and MAM `with` filters can also store the old
+  spelling, and JIDs whose domain differs in case from the configured
+  hosted domain are not treated as local. After PR #46 lands, rerun
+  `migrate-precis` to absorb every row written under an old spelling in the
+  meantime.
 
 ## v0.9.0 - 2026-10-04
 
