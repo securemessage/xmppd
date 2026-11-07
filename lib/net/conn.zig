@@ -1022,6 +1022,28 @@ fn socketpair() ![2]posix.fd_t {
     return pair;
 }
 
+/// A connected TCP pair over 127.0.0.1: the only test transport where
+/// kTLS can engage (unix sockets cannot offload). Pair the server end
+/// with a `disableKtls` client: two kTLS ends on loopback hit the
+/// PR 296498 kernel bug.
+fn tcpPair() ![2]posix.fd_t {
+    const l = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(l);
+    var addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try posix.bind(l, &addr.any, addr.getOsSockLen());
+    try posix.listen(l, 1);
+    var sl: posix.socklen_t = addr.getOsSockLen();
+    try posix.getsockname(l, &addr.any, &sl);
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    try posix.connect(cfd, &addr.any, addr.getOsSockLen());
+    const sfd = try posix.accept(l, null, null, posix.SOCK.CLOEXEC);
+    try setNonBlocking(sfd);
+    try setNonBlocking(cfd);
+    try setNoSigpipe(sfd);
+    try setNoSigpipe(cfd);
+    return .{ sfd, cfd };
+}
+
 // ---------------------------------------------------------------------------
 // Test PKI: a throwaway self-signed cert (CN=localhost) generated in memory
 // per test through libcrypto and written to a tmp dir. Nothing key-shaped
@@ -2296,6 +2318,74 @@ test "Conn: an established TLS conn frees the SSL at teardown" {
     try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
     c.deinit();
     try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
+}
+
+test "Conn: prefer records full kTLS on TCP loopback with a userland client" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try tcpPair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    // One userland end over TCP lets both directions offload on the
+    // server: prefer establishes and counts the full ktls token (R16
+    // pinned: the tx/rx flags must both read true).
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    try std.testing.expectEqual(State.established, c.state);
+    try std.testing.expect(c.tls_storage.ktls_tx);
+    try std.testing.expect(c.tls_storage.ktls_rx);
+    try std.testing.expectEqual(KtlsToken.ktls, c.tls_storage.ktlsToken());
+    try std.testing.expectEqual(@as(u64, 1), counters.ktls);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Conn: require establishes when both directions offload" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try tcpPair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters, .ktls = .require });
+    defer c.deinit();
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    // require accepts the conn only when the token is .ktls; on a
+    // socketpair the same policy closes through the list (the H4 test).
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    try std.testing.expectEqual(State.established, c.state);
+    try std.testing.expectEqual(@as(u64, 1), counters.ktls);
+    c.state = .closing;
+    c.teardown();
 }
 
 test "Transport tls: one conn's failure does not poison another conn's read" {
