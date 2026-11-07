@@ -126,6 +126,14 @@ pub const FrameReader = struct {
         std.debug.assert(r.consumed + n <= r.len);
         r.consumed += n;
     }
+
+    /// True when the peer ended the stream with a partial frame
+    /// buffered: eof latched and unconsumed bytes that can never
+    /// complete. Check after `next` returns null; a complete frame
+    /// still buffered is handed out first.
+    pub fn truncated(r: *const FrameReader) bool {
+        return r.eof and r.consumed < r.len;
+    }
 };
 
 /// Buffers frames for one fd as a bounded, growable backlog.
@@ -133,6 +141,9 @@ pub const FrameReader = struct {
 pub const FrameWriter = struct {
     buf: std.ArrayList(u8) = .empty,
     start: usize = 0,
+    /// Backlog capacity kept once `drain` empties the writer (default
+    /// 64 KiB): one burst must not pin megabytes for the conn's life.
+    high_water: usize = 64 << 10,
 
     pub fn deinit(w: *FrameWriter, alloc: std.mem.Allocator) void {
         w.buf.deinit(alloc);
@@ -160,7 +171,12 @@ pub const FrameWriter = struct {
     /// that writes its own header (protocol.encode) over `scratch[0..]`
     /// and `commitEncoded` its return value.
     /// `backlog_cap` bounds total unsent bytes (e.g. CLIENT_SEND_CAP).
-    pub fn begin(w: *FrameWriter, alloc: std.mem.Allocator, max_payload: usize, backlog_cap: usize) BeginError![]u8 {
+    pub fn begin(
+        w: *FrameWriter,
+        alloc: std.mem.Allocator,
+        max_payload: usize,
+        backlog_cap: usize,
+    ) BeginError![]u8 {
         if (max_payload > MAX_PAYLOAD_SIZE) return BeginError.Oversize;
         const need = HEADER_SIZE + max_payload;
         const unsent = w.buf.items.len - w.start;
@@ -193,10 +209,28 @@ pub const FrameWriter = struct {
         w.buf.items.len += total;
     }
 
+    /// Once the backlog drains empty, release capacity above the
+    /// high-water mark (same shape as Outbox.releaseSpill).
+    fn releaseCapacity(w: *FrameWriter, alloc: std.mem.Allocator) void {
+        if (w.buf.capacity <= w.high_water) return;
+        if (alloc.resize(w.buf.allocatedSlice(), w.high_water)) {
+            w.buf.capacity = w.high_water;
+            return;
+        }
+        w.buf.shrinkAndFree(alloc, 0);
+        // Best-effort retention; an alloc failure re-grows next burst.
+        w.buf.ensureTotalCapacityPrecise(alloc, w.high_water) catch {};
+    }
+
     /// Write the backlog until it empties or the fd says EAGAIN. On a
     /// fully drained backlog the buffer resets so a busy conn returns to
-    /// zero live bytes without a copy.
-    pub fn drain(w: *FrameWriter, fd: posix.fd_t) posix.WriteError!WriteResult {
+    /// zero live bytes without a copy, and capacity above `high_water`
+    /// is released.
+    pub fn drain(
+        w: *FrameWriter,
+        alloc: std.mem.Allocator,
+        fd: posix.fd_t,
+    ) posix.WriteError!WriteResult {
         while (w.start < w.buf.items.len) {
             const n = posix.write(fd, w.buf.items[w.start..]) catch |err| {
                 return switch (err) {
@@ -209,6 +243,7 @@ pub const FrameWriter = struct {
         }
         w.buf.clearRetainingCapacity();
         w.start = 0;
+        w.releaseCapacity(alloc);
         return .drained;
     }
 
@@ -248,7 +283,7 @@ test "Frame: roundtrip through a socketpair" {
     const payload = "hello frame";
     @memcpy(scratch[HEADER_SIZE..][0..payload.len], payload);
     w.commit(payload.len);
-    try std.testing.expectEqual(.drained, try w.drain(pair[0]));
+    try std.testing.expectEqual(.drained, try w.drain(std.testing.allocator, pair[0]));
 
     var buf: [MAX_FRAME_SIZE]u8 = undefined;
     var r = FrameReader.init(&buf);
@@ -299,7 +334,7 @@ test "Frame: coalesced frames parse one at a time" {
         @memcpy(scratch[HEADER_SIZE..][0..p.len], p);
         w.commit(p.len);
     }
-    try std.testing.expectEqual(.drained, try w.drain(pair[0]));
+    try std.testing.expectEqual(.drained, try w.drain(std.testing.allocator, pair[0]));
 
     var buf: [MAX_FRAME_SIZE]u8 = undefined;
     var r = FrameReader.init(&buf);
@@ -333,8 +368,9 @@ test "Frame: recv distinguishes would_block, eof, and data" {
     try std.testing.expectEqual(.data, try r.recv(pair[1]));
 
     posix.shutdown(pair[0], .both) catch {};
-    // First call may see the buffered byte plus EOF; the next must report eof.
-    _ = try r.recv(pair[1]);
+    // The first recv after shutdown must report eof: the latch engages
+    // on the EOF read itself, not one call later.
+    try std.testing.expectEqual(.eof, try r.recv(pair[1]));
     try std.testing.expectEqual(.eof, try r.recv(pair[1]));
 }
 
@@ -367,7 +403,7 @@ test "Frame: writer backlog grows past EAGAIN and drains after" {
     const scratch = try w.begin(std.testing.allocator, payload_len, 1 << 20);
     @memset(scratch[HEADER_SIZE..][0..payload_len], 0x5a);
     w.commit(payload_len);
-    try std.testing.expectEqual(.would_block, try w.drain(pair[0]));
+    try std.testing.expectEqual(.would_block, try w.drain(std.testing.allocator, pair[0]));
     try std.testing.expect(w.pending() > 0);
 
     const sink = try std.testing.allocator.alloc(u8, HEADER_SIZE + payload_len);
@@ -376,16 +412,16 @@ test "Frame: writer backlog grows past EAGAIN and drains after" {
     while (got < sink.len) {
         const n = posix.read(pair[1], sink[got..]) catch |err| switch (err) {
             error.WouldBlock => {
-                _ = try w.drain(pair[0]);
+                _ = try w.drain(std.testing.allocator, pair[0]);
                 continue;
             },
             else => return err,
         };
         if (n == 0) break;
         got += n;
-        _ = try w.drain(pair[0]);
+        _ = try w.drain(std.testing.allocator, pair[0]);
     }
-    try std.testing.expectEqual(.drained, try w.drain(pair[0]));
+    try std.testing.expectEqual(.drained, try w.drain(std.testing.allocator, pair[0]));
     try std.testing.expectEqual(HEADER_SIZE + payload_len, got);
 }
 
@@ -429,7 +465,7 @@ test "Frame: commitEncoded accepts a self-encoded frame" {
 
     var buf: [MAX_FRAME_SIZE]u8 = undefined;
     var r = FrameReader.init(&buf);
-    try std.testing.expectEqual(.drained, try w.drain(pair[0]));
+    try std.testing.expectEqual(.drained, try w.drain(std.testing.allocator, pair[0]));
     try std.testing.expectEqual(.data, try r.recv(pair[1]));
     const f = (try r.next()).?;
     try std.testing.expectEqualStrings(payload, f.payload);
@@ -457,4 +493,74 @@ test "Frame: begin folds the sent prefix only when needed" {
         if (w.start == 0) copied += before;
     }
     try std.testing.expect(copied <= 16 << 20);
+}
+
+test "Frame: a max-size payload parses" {
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    var r = FrameReader.init(&buf);
+    // Fill the buffer manually: payload_len == MAX_PAYLOAD_SIZE is the
+    // accepted boundary, not Oversize.
+    std.mem.writeInt(u32, buf[0..HEADER_SIZE], MAX_PAYLOAD_SIZE, .little);
+    r.len = MAX_FRAME_SIZE;
+    const f = (try r.next()).?;
+    try std.testing.expectEqual(@as(usize, MAX_PAYLOAD_SIZE), f.payload.len);
+    try std.testing.expectEqual(@as(usize, MAX_FRAME_SIZE), f.consumed);
+}
+
+test "Frame: recv compacts the consumed prefix before reading" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var buf: [16]u8 = undefined;
+    var r = FrameReader.init(&buf);
+
+    _ = try posix.write(pair[0], "ABCD");
+    try std.testing.expectEqual(.data, try r.recv(pair[1]));
+    r.consume(2);
+
+    _ = try posix.write(pair[0], "EFGH");
+    try std.testing.expectEqual(.data, try r.recv(pair[1]));
+    // The consumed prefix folded away once: "CD" moved to the front.
+    try std.testing.expectEqual(@as(usize, 0), r.consumed);
+    try std.testing.expectEqual(@as(usize, 6), r.len);
+    try std.testing.expectEqualStrings("CDEFGH", r.buf[0..r.len]);
+}
+
+test "Frame: eof mid-frame is reported by truncated()" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    var r = FrameReader.init(&buf);
+
+    // Two bytes of a header, then EOF: the leftover can never complete.
+    _ = try posix.write(pair[0], &[_]u8{ 0x05, 0x00 });
+    posix.shutdown(pair[0], .both) catch {};
+    try std.testing.expectEqual(.data, try r.recv(pair[1]));
+    try std.testing.expectEqual(@as(?Frame, null), try r.next());
+    try std.testing.expect(r.truncated());
+
+    // Consumed leftovers are not truncated, and a clean eof is not.
+    r.consume(r.len);
+    try std.testing.expect(!r.truncated());
+}
+
+test "Frame: drain releases backlog capacity above the high-water mark" {
+    const alloc = std.testing.allocator;
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var w: FrameWriter = .{ .high_water = 64 };
+    defer w.deinit(alloc);
+    const s = try w.begin(alloc, 256, 4096);
+    @memset(s[HEADER_SIZE..][0..200], 0x22);
+    w.commit(200);
+    try std.testing.expect(w.buf.capacity > w.high_water);
+
+    try std.testing.expectEqual(.drained, try w.drain(alloc, pair[0]));
+    try std.testing.expect(w.buf.capacity <= w.high_water);
+    try std.testing.expectEqual(@as(usize, 0), w.pending());
 }

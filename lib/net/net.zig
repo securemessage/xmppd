@@ -47,6 +47,7 @@ pub const Conn = conn.Conn;
 pub const ConnList = conn.ConnList;
 pub const ConnOptions = conn.Options;
 pub const ConnState = conn.State;
+pub const ConnInitError = conn.InitError;
 pub const Outcome = conn.Outcome;
 pub const CloseReason = conn.CloseReason;
 pub const Handshake = conn.Handshake;

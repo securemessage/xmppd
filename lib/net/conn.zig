@@ -47,6 +47,15 @@ pub const Counters = struct {
     ktls_rx: u64 = 0,
     sw: u64 = 0,
     outbox_failed_closed: u64 = 0,
+    /// Loop calls that could not reach the kernel for a conn (stale
+    /// handle, rejected change). The conn still re-drives or tears
+    /// down correctly; a nonzero count means the handle is degrading.
+    interest_failed: u64 = 0,
+    loop_close_failed: u64 = 0,
+    requeue_failed: u64 = 0,
+    /// The spill high-water retention alloc failed after a drain; the
+    /// arena was dropped instead of kept. Best-effort, not silent.
+    spill_release_failed: u64 = 0,
 
     pub fn countKtls(c: *Counters, token: KtlsToken) void {
         switch (token) {
@@ -121,10 +130,10 @@ pub const Transport = union(enum) {
         }
     }
 
-    /// TLS TX is always `SSL_write` (`SSL_MODE_ENABLE_PARTIAL_WRITE` is
-    /// set at ctx setup by the caller; moving-buffer mode is never relied
-    /// on). After `want_*` the retry presents the identical (ptr, len);
-    /// the Outbox pin is what keeps the slice stable (kTLS D3).
+    /// TLS TX is always `SSL_write`. No mode bits are required: after
+    /// `want_*` the retry presents the identical (ptr, len) the Outbox
+    /// pin keeps stable, a short write just advances the head, and
+    /// moving-buffer mode is never relied on (kTLS D3).
     pub fn write(t: *Transport, buf: []const u8) IoResult {
         switch (t.*) {
             .plain => |fd| {
@@ -321,7 +330,12 @@ pub const Outbox = struct {
     counters: *Counters,
     alloc: std.mem.Allocator,
 
-    pub fn init(ring: []u8, alloc: std.mem.Allocator, spill_limit: usize, counters: *Counters) Outbox {
+    pub fn init(
+        ring: []u8,
+        alloc: std.mem.Allocator,
+        spill_limit: usize,
+        counters: *Counters,
+    ) Outbox {
         return .{ .ring = ring, .spill_limit = spill_limit, .counters = counters, .alloc = alloc };
     }
 
@@ -364,12 +378,18 @@ pub const Outbox = struct {
             return .queued;
         }
 
-        if (pending + total > o.spill_limit) {
+        // The bound is ring plus spill (F3-DESIGN): bytes already in
+        // the ring count against max_outbound_bytes the same.
+        if (o.used + pending + total > o.spill_limit) {
             o.counters.outbox_failed_closed += 1;
             return .failed_closed;
         }
+        const before = o.spill.items.len;
         for (parts) |p| {
             o.spill.appendSlice(o.alloc, p) catch {
+                // Roll the partial append back: failed_closed promises
+                // nothing was queued.
+                o.spill.items.len = before;
                 o.counters.outbox_failed_closed += 1;
                 return .failed_closed;
             };
@@ -430,7 +450,9 @@ pub const Outbox = struct {
         o.spill.shrinkAndFree(o.alloc, 0);
         // Best-effort retention of the high-water arena; an alloc
         // failure is not fatal, the spill just re-grows next burst.
-        o.spill.ensureTotalCapacityPrecise(o.alloc, o.spill_high_water) catch {};
+        o.spill.ensureTotalCapacityPrecise(o.alloc, o.spill_high_water) catch {
+            o.counters.spill_release_failed += 1;
+        };
     }
 
     /// Write out until empty, want_*, or the per-call byte budget is
@@ -538,6 +560,10 @@ pub const Handshake = struct {
     /// I/O, so it runs where the fd is registered: the consumer's loop
     /// in F3, a pool thread's own kqueue in F7.
     pub fn step(hs: *Handshake) Done {
+        // A latched failure is final: the driver must not re-enter
+        // SSL_do_handshake after it. OpenSSL may answer err again, but
+        // the F7 contract cannot depend on that.
+        if (hs.done == .err) return hs.done;
         const r = hs.conn.doHandshake() catch |e| {
             hs.done = .{ .err = e };
             return hs.done;
@@ -567,7 +593,17 @@ pub const StartError = error{
     SslInitFailed,
     /// The fd was released to a handshake driver already.
     Detached,
+    /// The conn is on the closing list; no upgrade can start.
+    Closing,
+    /// A handshake is already in flight (`hs` owns the fd).
+    HandshakeActive,
+    /// The transport is already TLS.
+    AlreadyUpgraded,
 };
+
+/// What `Conn.init` can surface: the socket option, the backing
+/// allocations, and the loop attach.
+pub const InitError = posix.SetSockOptError || std.mem.Allocator.Error || loop_mod.AttachError;
 
 /// One connection's I/O state on its owning loop. Must not move after
 /// init: `Transport.tls` points into the struct and ConnList links live
@@ -605,13 +641,24 @@ pub const Conn = struct {
     /// so flow control pushes back on the peer (M9). Lifted when the
     /// outbox drains to the low watermark.
     read_suppressed: bool = false,
+    /// The last flush stalled on `want_read` (a TLS write waiting on a
+    /// read event); the next readable event links the conn so the walk
+    /// retries the flush.
+    flush_want_read: bool = false,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
     /// attaches read interest on the loop. The fd must already be
     /// non-blocking; `alloc` backs inbox, ring and spill for the conn's
     /// lifetime.
-    pub fn init(c: *Conn, loop: *Loop, fd: posix.fd_t, ctx: Token, alloc: std.mem.Allocator, opts: Options) !void {
+    pub fn init(
+        c: *Conn,
+        loop: *Loop,
+        fd: posix.fd_t,
+        ctx: Token,
+        alloc: std.mem.Allocator,
+        opts: Options,
+    ) InitError!void {
         try setNoSigpipe(fd);
         if (builtin.mode == .Debug) {
             const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
@@ -654,7 +701,15 @@ pub const Conn = struct {
     /// peer through flow control instead of reading more.
     fn interest(c: *Conn, read: bool, write: bool) void {
         c.want_write = write;
-        c.loop.setInterest(c.handle, .{ .read = read and !c.inbox_stalled and !c.read_suppressed, .write = write }) catch {};
+        c.loop.setInterest(c.handle, .{
+            .read = read and !c.inbox_stalled and !c.read_suppressed,
+            .write = write,
+        }) catch {
+            // StaleHandle means the fd was released to a handshake
+            // driver; the re-adopt arms read again. Counted, not
+            // silent.
+            c.opts.counters.interest_failed += 1;
+        };
     }
 
     /// Recompute read suppression from the outbox depth and re-arm
@@ -702,7 +757,16 @@ pub const Conn = struct {
 
     fn onReadable(c: *Conn, list: *ConnList) Outcome {
         if (c.state == .handshake) return c.driveHandshake(list);
-        var budget: ReadBudget = .{ .bytes = c.opts.read_budget_bytes, .reads = c.opts.read_budget_reads };
+        if (c.flush_want_read) {
+            // The read a stalled flush was waiting for: the walk
+            // retries the flush once the drain below finishes.
+            c.flush_want_read = false;
+            list.link(c);
+        }
+        var budget: ReadBudget = .{
+            .bytes = c.opts.read_budget_bytes,
+            .reads = c.opts.read_budget_reads,
+        };
         return switch (c.inbox.drain(&c.transport, &budget)) {
             .drained => .readable,
             .full => {
@@ -754,7 +818,12 @@ pub const Conn = struct {
                 return .none;
             },
             .want_write => return .none, // write interest stays armed
-            .want_read => return .none,  // read interest already armed
+            .want_read => {
+                // A TLS write waiting on a read event: the next
+                // readable pass re-drives the flush through the walk.
+                c.flush_want_read = true;
+                return .none;
+            },
             .budget_left => {
                 c.requeue_write = true;
                 list.link(c);
@@ -821,7 +890,10 @@ pub const Conn = struct {
         const token = c.tls_storage.ktlsToken();
         c.opts.counters.countKtls(token);
         std.log.scoped(.net_conn).debug("tls established fd={d} ktls={s} {s}/{s}", .{
-            c.sockFd(), @tagName(token), c.tls_storage.conn.versionName(), c.tls_storage.conn.cipherName(),
+            c.sockFd(),
+            @tagName(token),
+            c.tls_storage.conn.versionName(),
+            c.tls_storage.conn.cipherName(),
         });
         if (c.opts.ktls == .require and token != .ktls) {
             c.state = .closing;
@@ -836,13 +908,21 @@ pub const Conn = struct {
     /// is queued behind the upgrade or buffered past it. On acceptance
     /// the conn moves to `.handshake`; `Handshake` owns the fd and the
     /// SslConn for the upgrade.
-    pub fn startTls(c: *Conn, sctx: ssl.SslContext, mode: enum { accept, connect }, hostname: ?[*:0]const u8, deadline_ctx: Token) StartError!void {
-        if (!c.outbox.empty()) return StartError.OutboxNotEmpty;
-        if (c.inbox.unread().len != 0) return StartError.ReadAhead;
+    pub fn startTls(
+        c: *Conn,
+        sctx: ssl.SslContext,
+        mode: enum { accept, connect },
+        hostname: ?[*:0]const u8,
+        deadline_ctx: Token,
+    ) StartError!void {
+        if (c.state == .closing) return StartError.Closing;
+        if (c.hs != null) return StartError.HandshakeActive;
         const fd = switch (c.transport) {
             .plain => |fd| fd,
-            .tls => return StartError.ReadAhead, // already upgraded
+            .tls => return StartError.AlreadyUpgraded,
         };
+        if (!c.outbox.empty()) return StartError.OutboxNotEmpty;
+        if (c.inbox.unread().len != 0) return StartError.ReadAhead;
         const sc = switch (mode) {
             .accept => ssl.SslConn.init(sctx, fd),
             .connect => ssl.SslConn.initClient(sctx, fd, hostname),
@@ -909,6 +989,10 @@ pub const Conn = struct {
                     posix.close(hs.fd);
                     hs.fd = -1;
                 }
+            } else {
+                // A stale handle with no handshake owner is an
+                // anomaly: counted, not swallowed.
+                c.opts.counters.loop_close_failed += 1;
             },
         };
     }
@@ -982,7 +1066,7 @@ pub const ConnList = struct {
     /// re-driven once on the next pass. Bounded by membership: a conn
     /// links at most once and `pop` unlinks it. A StaleHandle requeue
     /// means the fd was released to a handshake driver and cannot be
-    /// driven anyway.
+    /// driven anyway; it is counted, not swallowed.
     pub fn service(l: *ConnList) void {
         while (l.pop()) |c| {
             if (c.state == .closing) {
@@ -995,7 +1079,10 @@ pub const ConnList = struct {
                 switch (c.outbox.flush(&c.transport, c.opts.flush_budget_bytes)) {
                     .drained => c.interest(true, false),
                     .want_write => c.interest(true, true),
-                    .want_read => c.interest(true, c.want_write),
+                    .want_read => {
+                        c.flush_want_read = true;
+                        c.interest(true, c.want_write);
+                    },
                     .budget_left => c.requeue_write = true,
                     .err => {
                         c.state = .closing;
@@ -1007,11 +1094,15 @@ pub const ConnList = struct {
             }
             if (c.requeue_read) {
                 c.requeue_read = false;
-                c.loop.requeue(c.handle, .read) catch {};
+                c.loop.requeue(c.handle, .read) catch {
+                    c.opts.counters.requeue_failed += 1;
+                };
             }
             if (c.requeue_write) {
                 c.requeue_write = false;
-                c.loop.requeue(c.handle, .write) catch {};
+                c.loop.requeue(c.handle, .write) catch {
+                    c.opts.counters.requeue_failed += 1;
+                };
             }
         }
     }
@@ -1144,7 +1235,8 @@ fn makeTestPki(alloc: std.mem.Allocator) !TestPki {
     {
         const bio = tc.BIO_new(tc.BIO_s_mem()) orelse return error.SslInitFailed;
         defer _ = tc.BIO_free(bio);
-        if (tc.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null) != 1) return error.SslInitFailed;
+        if (tc.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null) != 1)
+            return error.SslInitFailed;
         const f = try tmp.dir.createFile("key.pem", .{});
         defer f.close();
         try f.writeAll(try bioDrain(bio, &pem_buf));
@@ -1762,7 +1854,10 @@ fn pinFuzz(row: PinRow, snd_buf: c_int, seed: u64) !void {
             else => {},
         }
     }
-    std.debug.print("pin fuzz row={s} ktls_tx={} ktls_rx={} bytes={d} want_write={d} pin_checks={d}\n", .{ @tagName(row), tls.ktls_tx, tls.ktls_rx, gen_off, want_writes, pin_checks });
+    std.debug.print(
+        "pin fuzz row={s} ktls_tx={} ktls_rx={} bytes={d} want_write={d} pin_checks={d}\n",
+        .{ @tagName(row), tls.ktls_tx, tls.ktls_rx, gen_off, want_writes, pin_checks },
+    );
     try std.testing.expectEqual(gen_off, recv_off);
     try std.testing.expect(want_writes > 0);
     try std.testing.expect(pin_checks > 0);
@@ -1799,7 +1894,14 @@ var ssl_mark_frees: usize = 0;
 var ssl_mark_byte: u8 = 0;
 var ssl_mark_idx: c_int = -1;
 
-fn sslMarkFree(parent: ?*anyopaque, ptr: ?*anyopaque, ad: [*c]tc.CRYPTO_EX_DATA, idx: c_int, argl: c_long, argp: ?*anyopaque) callconv(.c) void {
+fn sslMarkFree(
+    parent: ?*anyopaque,
+    ptr: ?*anyopaque,
+    ad: [*c]tc.CRYPTO_EX_DATA,
+    idx: c_int,
+    argl: c_long,
+    argp: ?*anyopaque,
+) callconv(.c) void {
     _ = parent;
     _ = ad;
     _ = idx;
@@ -1810,7 +1912,14 @@ fn sslMarkFree(parent: ?*anyopaque, ptr: ?*anyopaque, ad: [*c]tc.CRYPTO_EX_DATA,
 
 fn sslMark(sc: *ssl.SslConn) void {
     if (ssl_mark_idx < 0) {
-        ssl_mark_idx = tc.CRYPTO_get_ex_new_index(tc.CRYPTO_EX_INDEX_SSL, 0, null, null, null, sslMarkFree);
+        ssl_mark_idx = tc.CRYPTO_get_ex_new_index(
+            tc.CRYPTO_EX_INDEX_SSL,
+            0,
+            null,
+            null,
+            null,
+            sslMarkFree,
+        );
     }
     _ = tc.SSL_set_ex_data(@ptrCast(sc.ssl), ssl_mark_idx, @ptrCast(&ssl_mark_byte));
 }
@@ -1818,7 +1927,13 @@ fn sslMark(sc: *ssl.SslConn) void {
 /// Synthetic loop event for a conn, so a test can drive onEvent without
 /// a kevent round trip.
 fn synthIo(c: *Conn, kind: enum { r, w }) Event {
-    const io: loop_mod.Io = .{ .handle = c.handle, .ctx = c.ctx, .data = 0, .eof = false, .errno = 0 };
+    const io: loop_mod.Io = .{
+        .handle = c.handle,
+        .ctx = c.ctx,
+        .data = 0,
+        .eof = false,
+        .errno = 0,
+    };
     return switch (kind) {
         .r => .{ .readable = io },
         .w => .{ .writable = io },
@@ -2102,14 +2217,22 @@ test "Conn: an event with a stale ctx generation is dropped at the table" {
     // lookup; reaching c2 through the reused index is the ABA the
     // generation exists to kill.
     const stale: Event = .{ .readable = .{
-        .handle = c2.handle, .ctx = t1, .data = 0, .eof = false, .errno = 0,
+        .handle = c2.handle,
+        .ctx = t1,
+        .data = 0,
+        .eof = false,
+        .errno = 0,
     } };
     try std.testing.expect(conns.get(stale.readable.ctx) == null);
 
     // The live generation resolves and drives the real conn.
     _ = try posix.write(pair2[1], "hi");
     const live: Event = .{ .readable = .{
-        .handle = c2.handle, .ctx = t2, .data = 0, .eof = false, .errno = 0,
+        .handle = c2.handle,
+        .ctx = t2,
+        .data = 0,
+        .eof = false,
+        .errno = 0,
     } };
     const owner = conns.get(live.readable.ctx) orelse return error.StaleCtx;
     try std.testing.expectEqual(&c2, owner.*);
@@ -2121,7 +2244,11 @@ test "Conn: an event with a stale ctx generation is dropped at the table" {
     // (markClosing without the link strands fd and SSL).
     posix.shutdown(pair2[1], .both) catch {};
     const closing_ev: Event = .{ .readable = .{
-        .handle = c2.handle, .ctx = t2, .data = 0, .eof = true, .errno = 0,
+        .handle = c2.handle,
+        .ctx = t2,
+        .data = 0,
+        .eof = true,
+        .errno = 0,
     } };
     const out = conns.get(closing_ev.readable.ctx).?.*.onEvent(closing_ev, &list);
     try std.testing.expect(out == .closed);
@@ -2215,20 +2342,34 @@ test "Conn: startTls refuses a non-empty outbox and read-ahead" {
     const parts = [_][]const u8{"queued"};
     var list: ConnList = .{};
     _ = c.send(&list, &parts);
-    try std.testing.expectError(StartError.OutboxNotEmpty, c.startTls(pki.ctx, .accept, null, mkConnCtx(2)));
+    try std.testing.expectError(
+        StartError.OutboxNotEmpty,
+        c.startTls(pki.ctx, .accept, null, mkConnCtx(2)),
+    );
     _ = c.outbox.flush(&c.transport, 1 << 20);
 
     // Buffered read-ahead past the upgrade point: refuse.
     _ = try posix.write(pair[1], "GET / HTTP/1.0");
     var budget: ReadBudget = .{};
     _ = c.inbox.drain(&c.transport, &budget);
-    try std.testing.expectError(StartError.ReadAhead, c.startTls(pki.ctx, .accept, null, mkConnCtx(2)));
+    try std.testing.expectError(
+        StartError.ReadAhead,
+        c.startTls(pki.ctx, .accept, null, mkConnCtx(2)),
+    );
     c.inbox.consume(c.inbox.len);
 
     // Clean state: accepted, moves to handshake owning the fd.
     try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
     try std.testing.expectEqual(State.handshake, c.state);
     try std.testing.expectEqual(pair[0], c.hs.?.fd);
+
+    // A second upgrade while the first runs is refused without
+    // overwriting (or leaking) the in-flight Handshake.
+    try std.testing.expectError(
+        StartError.HandshakeActive,
+        c.startTls(pki.ctx, .accept, null, mkConnCtx(3)),
+    );
+    try std.testing.expect(c.hs != null);
 }
 
 const SeamPayload = struct {
@@ -2280,7 +2421,10 @@ fn seamDrive(p: *SeamPayload) void {
                         p.err = e;
                         break :drive;
                     },
-                    .want_write => dloop.setInterest(dh, .{ .read = true, .write = true }) catch |e| {
+                    .want_write => dloop.setInterest(
+                        dh,
+                        .{ .read = true, .write = true },
+                    ) catch |e| {
                         p.err = e;
                         break :drive;
                     },
@@ -2867,4 +3011,302 @@ test "Conn: a full outbox suppresses reads until it drains" {
     try std.testing.expectEqualStrings("in", c.inbox.unread());
     c.state = .closing;
     c.teardown();
+}
+
+test "Conn: startTls refuses closing and already-upgraded conns" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // A conn on the closing list refuses the upgrade before any state
+    // is touched.
+    c.state = .closing;
+    try std.testing.expectError(
+        StartError.Closing,
+        c.startTls(pki.ctx, .accept, null, mkConnCtx(2)),
+    );
+    c.state = .cleartext;
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    try std.testing.expectEqual(State.established, c.state);
+    // Already TLS: the second call is AlreadyUpgraded, not the
+    // read-ahead protocol error.
+    try std.testing.expectError(
+        StartError.AlreadyUpgraded,
+        c.startTls(pki.ctx, .accept, null, mkConnCtx(3)),
+    );
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Handshake: a failed step latches and refuses a re-step" {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var hs: Handshake = .{
+        .conn = try ssl.SslConn.init(pki.ctx, pair[0]),
+        .fd = pair[0],
+        .deadline_ctx = mkConnCtx(2),
+    };
+    defer hs.conn.deinit();
+    _ = try posix.write(pair[1], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const d1 = hs.step();
+    try std.testing.expect(d1 == .err);
+    // The failure latches (R18) and a re-step returns the same error
+    // instead of re-entering SSL_do_handshake (L5).
+    try std.testing.expectEqual(d1.err, hs.done.err);
+    const d2 = hs.step();
+    try std.testing.expect(d2 == .err);
+    try std.testing.expectEqual(d1.err, d2.err);
+
+    // A conn whose done is .err must not touch SSL at all: an
+    // unstepped handshake would answer want_read here.
+    const pair2 = try socketpair();
+    defer posix.close(pair2[0]);
+    defer posix.close(pair2[1]);
+    var hs2: Handshake = .{
+        .conn = try ssl.SslConn.init(pki.ctx, pair2[0]),
+        .fd = pair2[0],
+        .deadline_ctx = mkConnCtx(3),
+    };
+    defer hs2.conn.deinit();
+    hs2.done = .{ .err = error.HandshakeFailed };
+    try std.testing.expectEqual(Done{ .err = error.HandshakeFailed }, hs2.step());
+}
+
+test "Conn: init sets SO_NOSIGPIPE on the fd" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    // Not the socketpair() helper: it sets SO_NOSIGPIPE itself, which
+    // would mask the option Conn.init must apply.
+    var pair: [2]std.c.fd_t = undefined;
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, flags, 0, &pair) != 0) return error.Unexpected;
+    try setNonBlocking(pair[0]);
+    defer posix.close(pair[1]);
+
+    var before_val: c_int = 0;
+    try posix.getsockopt(pair[0], posix.SOL.SOCKET, so_nosigpipe, std.mem.asBytes(&before_val));
+    try std.testing.expectEqual(@as(c_int, 0), before_val);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // SIGPIPE is suppressed per-socket so outbound s2s fds are covered
+    // the same as accepted ones (R9): the option reads back set.
+    var val: c_int = 0;
+    try posix.getsockopt(pair[0], posix.SOL.SOCKET, so_nosigpipe, std.mem.asBytes(&val));
+    try std.testing.expect(val != 0);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Conn: stale-handle loop calls are counted, not swallowed" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // Release the fd: every handle-scoped loop call now fails with
+    // StaleHandle. Each failure is counted instead of swallowed (L2).
+    _ = try c.releaseFd();
+    var list: ConnList = .{};
+    c.inbox_stalled = true;
+    c.consume(&list, 0);
+    try std.testing.expectEqual(@as(u64, 1), counters.interest_failed);
+    try std.testing.expect(c.requeue_read);
+    list.service();
+    try std.testing.expectEqual(@as(u64, 1), counters.requeue_failed);
+
+    c.state = .closing;
+    c.teardown();
+    try std.testing.expectEqual(@as(u64, 1), counters.loop_close_failed);
+}
+
+test "Conn: a flush stalled on want_read is retried on the next readable" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // Queue bytes, then pretend the last flush stalled on want_read (a
+    // TLS write waiting on a read event).
+    const parts = [_][]const u8{"pending flush"};
+    _ = c.send(&list, &parts);
+    list.unlink(&c);
+    c.flush_want_read = true;
+
+    // The read event the flush waited on: the flag clears and the conn
+    // re-links so the walk retries the flush this same pass.
+    _ = c.onEvent(synthIo(&c, .r), &list);
+    try std.testing.expect(!c.flush_want_read);
+    try std.testing.expect(c.on_dirty);
+    list.service();
+
+    var buf: [32]u8 = undefined;
+    const n = try posix.read(pair[1], &buf);
+    try std.testing.expectEqualStrings("pending flush", buf[0..n]);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "ConnList: service drops write interest once the outbox drains" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+    const one_k: c_int = 1024;
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&one_k));
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // Fill the kernel send buffer so the walk's flush stalls.
+    const filler = [_]u8{0x55} ** (1 << 20);
+    while (true) {
+        _ = posix.write(pair[0], &filler) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    const parts = [_][]const u8{"tail"};
+    _ = c.send(&list, &parts);
+    list.service();
+    try std.testing.expect(c.want_write);
+
+    // Peer drains; the next service() flush completes and write
+    // interest must drop with it (R10).
+    var sink: [8192]u8 = undefined;
+    while (true) {
+        _ = posix.read(pair[1], &sink) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    // Re-link so the walk flushes again; the drained result must drop
+    // the armed write interest.
+    list.link(&c);
+    list.service();
+    try std.testing.expect(c.outbox.empty());
+    try std.testing.expect(!c.want_write);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Outbox: the bound counts ring bytes plus spill" {
+    var counters: Counters = .{};
+    var ring: [16]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 70, &counters);
+    defer o.deinit();
+
+    const first = [_][]const u8{"0123456789abcdef"};
+    try std.testing.expectEqual(AppendResult.queued, o.append(&first));
+    const fifty = [_]u8{0x42} ** 50;
+    const second = [_][]const u8{&fifty};
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&second));
+
+    // 16 ring + 50 pending + 10 new = 76 > 70 only because the ring
+    // counts; spill alone would be 60 and still fit.
+    const third = [_][]const u8{"0123456789"};
+    try std.testing.expectEqual(AppendResult.failed_closed, o.append(&third));
+    try std.testing.expectEqual(@as(u64, 1), counters.outbox_failed_closed);
+    try std.testing.expectEqual(@as(usize, 66), o.bytes());
+}
+
+test "Outbox: a mid-append alloc failure rolls back the spill" {
+    var counters: Counters = .{};
+    var ring: [8]u8 = undefined;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const falloc = failing.allocator();
+    var o = Outbox.init(&ring, falloc, 1 << 20, &counters);
+    defer o.deinit();
+
+    // Capacity for the first part only: the second part's growth fails
+    // on both the remap and the alloc path.
+    try o.spill.ensureTotalCapacityPrecise(falloc, 16);
+    failing.resize_fail_index = failing.resize_index;
+    failing.fail_index = failing.alloc_index;
+    const parts = [_][]const u8{ "0123456789abcdef", "second-part" };
+    try std.testing.expectEqual(AppendResult.failed_closed, o.append(&parts));
+    // failed_closed queued nothing: the first part rolls back out of
+    // the spill.
+    try std.testing.expectEqual(@as(usize, 0), o.spill.items.len);
+    try std.testing.expectEqual(@as(usize, 0), o.bytes());
+    try std.testing.expectEqual(@as(u64, 1), counters.outbox_failed_closed);
+}
+
+test "Outbox: a failed high-water retention is counted" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [8]u8 = undefined;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const falloc = failing.allocator();
+    var o = Outbox.init(&ring, falloc, 1 << 20, &counters);
+    defer o.deinit();
+    o.spill_high_water = 8;
+    var t: Transport = .{ .plain = pair[0] };
+
+    const parts = [_][]const u8{"0123456789abcdef0123456789abcdef"};
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&parts));
+    try std.testing.expectEqual(@as(usize, 32), o.spill.items.len);
+    try std.testing.expect(o.spill.capacity > o.spill_high_water);
+
+    // Fail the resize and the retention alloc inside releaseSpill: the
+    // counter proves the error was seen instead of swallowed (L2).
+    failing.resize_fail_index = failing.resize_index;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqual(FlushResult.drained, o.flush(&t, 1 << 20));
+    try std.testing.expectEqual(@as(u64, 1), counters.spill_release_failed);
+    try std.testing.expectEqual(@as(usize, 0), o.spill.capacity);
 }

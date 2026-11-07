@@ -114,10 +114,10 @@ Rules enforced structurally:
 - `SSL_read` may answer `want_write` (post-handshake reply needed): the
   caller arms write interest and re-drives the read on the write event.
   `SSL_write` may answer `want_read` symmetrically.
-- TLS TX is always `SSL_write` with `SSL_MODE_ENABLE_PARTIAL_WRITE` set at
-  ctx setup and `ACCEPT_MOVING_WRITE_BUFFER` **never** relied on: after a
-  `want_*`, the retry presents the identical `(ptr, len)`. The Outbox pin
-  below is what makes that guarantee possible.
+- TLS TX is always `SSL_write`; no mode bits are required. After a
+  `want_*` the retry presents the identical `(ptr, len)`, a short write
+  just advances the head, and `ACCEPT_MOVING_WRITE_BUFFER` is **never**
+  relied on. The Outbox pin below is what makes that guarantee possible.
 - Raw `send()` on a ktls_tx socket is allowed by the kernel but is NOT
   offered by this layer: one write path keeps the pin story single and
   testable. (Sendfile stays an F7+ evaluation, never in this design.)
