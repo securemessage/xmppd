@@ -255,6 +255,11 @@ pub fn main() !void {
     };
     log.info("xmppd-auth starting, db={s} socket={s}", .{ auth_path, socket_path });
 
+    if (try backend_mod.migrationPending(db_path)) {
+        log.err("an interrupted migrate-precis recovery is pending; rerun 'xmppctl migrate-precis --apply' before starting xmppd-auth", .{});
+        return error.MigrationPending;
+    }
+
     // Open storage backend
     var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
     defer backend.close();

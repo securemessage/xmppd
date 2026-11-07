@@ -951,6 +951,8 @@ test "deluser --raw reports data that remains after an incomplete cascade" {
 const FailingCommitBackend = struct {
     inner: backend_mod.MemoryBackend,
     compound_mutex: std.Thread.Mutex = .{},
+    fail_at: usize = 1,
+    commit_count: usize = 0,
 
     pub const Iterator = backend_mod.MemoryBackend.Iterator;
 
@@ -980,6 +982,8 @@ const FailingCommitBackend = struct {
 
     pub const WriteBatch = struct {
         inner: backend_mod.MemoryBackend.WriteBatch,
+        fail_at: usize,
+        commit_count: *usize,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             try self.inner.put(ns, key, value);
@@ -990,8 +994,9 @@ const FailingCommitBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            _ = self;
-            return error.InjectedCommitFailure;
+            self.commit_count.* += 1;
+            if (self.commit_count.* == self.fail_at) return error.InjectedCommitFailure;
+            try self.inner.commit();
         }
 
         pub fn abort(self: *WriteBatch) void {
@@ -1000,7 +1005,11 @@ const FailingCommitBackend = struct {
     };
 
     pub fn writeBatch(self: *FailingCommitBackend) !WriteBatch {
-        return .{ .inner = try self.inner.writeBatch() };
+        return .{
+            .inner = try self.inner.writeBatch(),
+            .fail_at = self.fail_at,
+            .commit_count = &self.commit_count,
+        };
     }
 };
 
@@ -1039,6 +1048,201 @@ test "migrate-precis op commit failure leaves auth unchanged" {
     const new_roster = try op.get(allocator, NS_ROSTERS, "carol@us.example\x00bob@us.example");
     defer if (new_roster) |value| allocator.free(value);
     try std.testing.expect(new_roster == null);
+}
+
+fn dumpBackend(allocator: std.mem.Allocator, backend: anytype) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    for (backend_mod.canonical_namespaces) |ns| {
+        var iter = try backend.iterator(ns, "");
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            try out.appendSlice(allocator, ns);
+            try out.append(allocator, 0);
+            try out.appendSlice(allocator, entry.key);
+            try out.append(allocator, 0);
+            try out.appendSlice(allocator, entry.value);
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn seedBobref(allocator: std.mem.Allocator, auth: anytype, op: anytype, archive: anytype) !void {
+    try auth.put(NS_USERS, "Bob", "pw-a");
+    try auth.put(NS_USERS, "bob", "pw-b");
+    try auth.put(NS_USERS, "carol", "pw-c");
+    var roster = roster_store_mod.RosterStore(@TypeOf(op.*)).init(op);
+    try roster.setItem("carol@us.example", "Bob@us.example", "Bob (real)", .both, false);
+    try roster.setItem("carol@us.example", "bob@us.example", "bob (other)", .both, false);
+    try roster.setItem("carol@us.example", "BOB@us.example", "stale", .both, false);
+    var rooms = room_store_mod.RoomStore(@TypeOf(op.*)).init(op, allocator);
+    try rooms.setAffiliation("room@conference.us.example", "Bob@us.example", .owner);
+    try rooms.setAffiliation("room@conference.us.example", "bob@us.example", .member);
+    var archive_store = archive_store_mod.ArchiveStore(@TypeOf(archive.*)).init(archive, allocator);
+    try archive_store.store("Bob@us.example", "friend@us.example", "id-b1", 1, "<message><body>Bob private</body></message>");
+}
+
+test "migrate-precis resume converges after op, auth and archive commit failures" {
+    const allocator = std.testing.allocator;
+    const FailKind = enum { op, op_batch2, auth, archive };
+    const domains = [_][]const u8{"us.example"};
+
+    for ([_]FailKind{ .op, .auth, .archive, .op_batch2 }) |fail_kind| {
+        var expected_tmp = std.testing.tmpDir(.{});
+        defer expected_tmp.cleanup();
+        const expected_base = try expected_tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(expected_base);
+        var expected_auth = try backend_mod.MemoryBackend.open("", .{});
+        defer expected_auth.close();
+        var expected_op = try backend_mod.MemoryBackend.open("", .{});
+        defer expected_op.close();
+        var expected_archive = try backend_mod.MemoryBackend.open("", .{});
+        defer expected_archive.close();
+        try seedBobref(allocator, &expected_auth, &expected_op, &expected_archive);
+        var expected_plan = try migrate.planMigration(allocator, &expected_auth, &expected_op, &expected_archive, &domains, .{
+            .old_localpart = "bob",
+            .new_localpart = "bob2",
+        });
+        defer expected_plan.deinit();
+        try migrate.applyPlan(allocator, &expected_auth, &expected_op, &expected_archive, &expected_plan, .{ .journal_dir = expected_base });
+        const expected_dump = try dumpBackend(allocator, &expected_auth);
+        defer allocator.free(expected_dump);
+        const expected_op_dump = try dumpBackend(allocator, &expected_op);
+        defer allocator.free(expected_op_dump);
+        const expected_archive_dump = try dumpBackend(allocator, &expected_archive);
+        defer allocator.free(expected_archive_dump);
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const base = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(base);
+        var auth = try FailingCommitBackend.open("", .{});
+        defer auth.close();
+        var op = try FailingCommitBackend.open("", .{});
+        defer op.close();
+        var archive = try FailingCommitBackend.open("", .{});
+        defer archive.close();
+        auth.fail_at = 0;
+        op.fail_at = 0;
+        archive.fail_at = 0;
+        try seedBobref(allocator, &auth, &op, &archive);
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, .{
+            .old_localpart = "bob",
+            .new_localpart = "bob2",
+        });
+        defer plan.deinit();
+
+        auth.commit_count = 0;
+        op.commit_count = 0;
+        archive.commit_count = 0;
+        auth.fail_at = 0;
+        op.fail_at = 0;
+        archive.fail_at = 0;
+        var apply_options = migrate.ApplyOptions{ .journal_dir = base };
+        switch (fail_kind) {
+            .op => op.fail_at = 1,
+            .op_batch2 => {
+                op.fail_at = 2;
+                apply_options.single_txn_budget = 0;
+            },
+            .auth => auth.fail_at = 1,
+            .archive => archive.fail_at = 1,
+        }
+        try std.testing.expectError(error.InjectedCommitFailure, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, apply_options));
+        try std.testing.expect(try migrate.recoveryPending(allocator, base));
+
+        auth.fail_at = 0;
+        op.fail_at = 0;
+        archive.fail_at = 0;
+        auth.commit_count = 0;
+        op.commit_count = 0;
+        archive.commit_count = 0;
+        _ = try migrate.resumeMigration(allocator, &auth, &op, &archive, base);
+        try std.testing.expect(!try migrate.recoveryPending(allocator, base));
+
+        const auth_dump = try dumpBackend(allocator, &auth);
+        defer allocator.free(auth_dump);
+        const op_dump = try dumpBackend(allocator, &op);
+        defer allocator.free(op_dump);
+        const archive_dump = try dumpBackend(allocator, &archive);
+        defer allocator.free(archive_dump);
+        try std.testing.expectEqualStrings(expected_dump, auth_dump);
+        try std.testing.expectEqualStrings(expected_op_dump, op_dump);
+        try std.testing.expectEqualStrings(expected_archive_dump, archive_dump);
+    }
+}
+
+test "migrate-precis resume converges for a plain mixed migration after an auth failure" {
+    const allocator = std.testing.allocator;
+    const domains = [_][]const u8{"us.example"};
+
+    var expected_tmp = std.testing.tmpDir(.{});
+    defer expected_tmp.cleanup();
+    const expected_base = try expected_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(expected_base);
+    var expected_auth = try backend_mod.MemoryBackend.open("", .{});
+    defer expected_auth.close();
+    var expected_op = try backend_mod.MemoryBackend.open("", .{});
+    defer expected_op.close();
+    var expected_archive = try backend_mod.MemoryBackend.open("", .{});
+    defer expected_archive.close();
+    try expected_auth.put(NS_USERS, "NaplesTB", "pw");
+    var expected_roster = roster_store_mod.RosterStore(backend_mod.MemoryBackend).init(&expected_op);
+    try expected_roster.setItem("NaplesTB@us.example", "friend@us.example", "", .both, false);
+    var expected_archive_store = archive_store_mod.ArchiveStore(backend_mod.MemoryBackend).init(&expected_archive, allocator);
+    try expected_archive_store.store("NaplesTB@us.example", "friend@us.example", "id1", 1, "<message/>");
+    var expected_plan = try migrate.planMigration(allocator, &expected_auth, &expected_op, &expected_archive, &domains, null);
+    defer expected_plan.deinit();
+    try migrate.applyPlan(allocator, &expected_auth, &expected_op, &expected_archive, &expected_plan, .{ .journal_dir = expected_base });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    var auth = try FailingCommitBackend.open("", .{});
+    defer auth.close();
+    var op = try FailingCommitBackend.open("", .{});
+    defer op.close();
+    var archive = try FailingCommitBackend.open("", .{});
+    defer archive.close();
+    auth.fail_at = 0;
+    op.fail_at = 0;
+    archive.fail_at = 0;
+    try auth.put(NS_USERS, "NaplesTB", "pw");
+    var roster = roster_store_mod.RosterStore(FailingCommitBackend).init(&op);
+    try roster.setItem("NaplesTB@us.example", "friend@us.example", "", .both, false);
+    var archive_store = archive_store_mod.ArchiveStore(FailingCommitBackend).init(&archive, allocator);
+    try archive_store.store("NaplesTB@us.example", "friend@us.example", "id1", 1, "<message/>");
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+
+    auth.commit_count = 0;
+    op.commit_count = 0;
+    archive.commit_count = 0;
+    auth.fail_at = 1;
+    try std.testing.expectError(error.InjectedCommitFailure, migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = base }));
+    auth.fail_at = 0;
+    auth.commit_count = 0;
+    op.commit_count = 0;
+    archive.commit_count = 0;
+    _ = try migrate.resumeMigration(allocator, &auth, &op, &archive, base);
+
+    const expected_auth_dump = try dumpBackend(allocator, &expected_auth);
+    defer allocator.free(expected_auth_dump);
+    const expected_op_dump = try dumpBackend(allocator, &expected_op);
+    defer allocator.free(expected_op_dump);
+    const expected_archive_dump = try dumpBackend(allocator, &expected_archive);
+    defer allocator.free(expected_archive_dump);
+    const auth_dump = try dumpBackend(allocator, &auth);
+    defer allocator.free(auth_dump);
+    const op_dump = try dumpBackend(allocator, &op);
+    defer allocator.free(op_dump);
+    const archive_dump = try dumpBackend(allocator, &archive);
+    defer allocator.free(archive_dump);
+    try std.testing.expectEqualStrings(expected_auth_dump, auth_dump);
+    try std.testing.expectEqualStrings(expected_op_dump, op_dump);
+    try std.testing.expectEqualStrings(expected_archive_dump, archive_dump);
 }
 
 fn expectMissing(backend: anytype, namespace: []const u8, key: []const u8) !void {

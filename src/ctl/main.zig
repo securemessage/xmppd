@@ -464,6 +464,10 @@ fn runDeleteRaw(
         printErr("xmppd is running; stop all daemons before deluser --raw\n");
         return err;
     };
+    if (try migrate_precis.recoveryPending(allocator, db_path)) {
+        printErr("a migrate-precis recovery is pending; finish it before deluser --raw\n");
+        return error.RecoveryPending;
+    }
     var auth_path_buf: [1024]u8 = undefined;
     const auth_path = try std.fmt.bufPrint(&auth_path_buf, "{s}/auth", .{db_path});
     var op_path_buf: [1024]u8 = undefined;
@@ -544,6 +548,22 @@ fn runMigratePrecis(
     defer op.close();
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
+
+    if (try migrate_precis.recoveryPending(allocator, db_path)) {
+        if (forced != null) {
+            printErr("a migrate-precis recovery is pending; rerun --apply without --rename\n");
+            return error.RecoveryPending;
+        }
+        if (!apply) {
+            printErr("a migrate-precis recovery is pending; rerun with --apply to finish it\n");
+            return error.RecoveryPending;
+        }
+        const resumed = try migrate_precis.resumeMigration(allocator, &auth, &op, &archive, db_path);
+        var resumed_buf: [96]u8 = undefined;
+        const resumed_line = try std.fmt.bufPrint(&resumed_buf, "resumed {d} renames\n", .{resumed});
+        printOut(resumed_line);
+        return;
+    }
 
     var plan = try migrate_precis.planMigration(allocator, &auth, &op, &archive, hosted_domains, forced);
     defer plan.deinit();

@@ -116,6 +116,7 @@ pub const Plan = struct {
             self.allocator.free(issue.target);
         }
         self.issues.deinit(self.allocator);
+        if (self.recovery_digest) |digest| self.allocator.free(digest);
         self.* = undefined;
     }
 };
@@ -125,11 +126,190 @@ pub const ApplyOptions = struct {
     /// instead of one write transaction per DB. The archive always uses one
     /// WriteBatch per prefix.
     single_txn_budget: usize = 64 * 1024 * 1024,
-    /// Required for a journaled pass. The plan is written before any write and
-    /// each committed prefix is appended to the journal; a rerun resumes by
-    /// recomputing the remaining work from the idempotent key rewrites.
+    /// Enables resumable apply. The full fixed plan, a digest and a
+    /// `migrate-precis.pending` marker are written before the first commit;
+    /// per-DB and per-prefix done markers are committed atomically with their
+    /// data. If a commit fails, rerunning `migrate-precis --apply` loads the
+    /// stored plan and replays only unfinished batches. `--rename` and
+    /// `deluser --raw` are refused while the marker exists.
     journal_dir: ?[]const u8 = null,
 };
+
+pub const recovery_pending_file = "migrate-precis.pending";
+pub const recovery_plan_file = "migrate-precis.resume";
+const recovery_header = "xmppd-migrate-precis-v1\n";
+
+fn dbFromTag(tag: []const u8) !Database {
+    if (std.mem.eql(u8, tag, "auth")) return .auth;
+    if (std.mem.eql(u8, tag, "op")) return .op;
+    if (std.mem.eql(u8, tag, "archive")) return .archive;
+    return error.InvalidRecoveryPlan;
+}
+
+fn canonicalNamespace(name: []const u8) ?[]const u8 {
+    const all = [_][]const u8{
+        NS_USERS,             NS_LOCKS,       NS_ROSTERS,         NS_BLOCKLIST,
+        NS_VCARDS,            NS_PEP,         NS_LASTACT,         NS_OFFLINE,
+        NS_OFFLINE_V2,        NS_OFFLINE_SEQ, NS_OFFLINE_HOLD_V2, NS_OFFLINE_HOLD_TOKEN,
+        NS_ROOM_AFFILIATIONS, NS_PENDING_SUB, NS_MESSAGES,        NS_BY_CONTACT,
+    };
+    for (all) |ns| if (std.mem.eql(u8, ns, name)) return ns;
+    return null;
+}
+
+fn hexDecodeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (text.len % 2 != 0) return error.InvalidRecoveryPlan;
+    const result = try allocator.alloc(u8, text.len / 2);
+    errdefer allocator.free(result);
+    for (0..result.len) |i| {
+        result[i] = (try std.fmt.charToDigit(text[i * 2], 16)) << 4 |
+            try std.fmt.charToDigit(text[i * 2 + 1], 16);
+    }
+    return result;
+}
+
+fn artifactPathAbs(allocator: std.mem.Allocator, dir: []const u8, basename: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ dir, basename });
+}
+
+fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex: []const u8) !void {
+    const path = try artifactPathAbs(allocator, dir, recovery_pending_file);
+    defer allocator.free(path);
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(digest_hex);
+    try file.writeAll("\n");
+    try file.sync();
+}
+
+fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const Plan) ![]u8 {
+    const path = try artifactPathAbs(allocator, dir, recovery_plan_file);
+    defer allocator.free(path);
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try file.writeAll(recovery_header);
+    hasher.update(recovery_header);
+    for (plan.renames.items) |rename| {
+        const ns_hex = try hexEncodeAlloc(allocator, rename.namespace);
+        defer allocator.free(ns_hex);
+        const old_hex = try hexEncodeAlloc(allocator, rename.old_key);
+        defer allocator.free(old_hex);
+        const new_hex = try hexEncodeAlloc(allocator, rename.new_key);
+        defer allocator.free(new_hex);
+        const value_hex = if (rename.new_value) |value| try hexEncodeAlloc(allocator, value) else null;
+        defer if (value_hex) |value| allocator.free(value);
+        var flags: u8 = 0;
+        if (rename.same_key) flags |= 1;
+        if (rename.delete_only) flags |= 2;
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n",
+            .{
+                @tagName(rename.db),
+                flags,
+                ns_hex,
+                old_hex,
+                new_hex,
+                value_hex orelse "-",
+            },
+        );
+        defer allocator.free(line);
+        try file.writeAll(line);
+        hasher.update(line);
+    }
+    try file.sync();
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = try hexEncodeAlloc(allocator, &digest);
+    errdefer allocator.free(digest_hex);
+    try writeRecoveryMarker(allocator, dir, digest_hex);
+    return digest_hex;
+}
+
+fn readRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8) !Plan {
+    const pending_path = try artifactPathAbs(allocator, dir, recovery_pending_file);
+    defer allocator.free(pending_path);
+    const plan_path = try artifactPathAbs(allocator, dir, recovery_plan_file);
+    defer allocator.free(plan_path);
+
+    const pending = try std.fs.cwd().readFileAlloc(allocator, pending_path, 256);
+    defer allocator.free(pending);
+    const expected_digest = std.mem.trim(u8, pending, " \t\r\n");
+    const data = try std.fs.cwd().readFileAlloc(allocator, plan_path, 256 * 1024 * 1024);
+    defer allocator.free(data);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(data);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const actual_hex = try hexEncodeAlloc(allocator, &digest);
+    defer allocator.free(actual_hex);
+    if (!std.mem.eql(u8, expected_digest, actual_hex)) return error.RecoveryDigestMismatch;
+
+    var plan = Plan.init(allocator);
+    errdefer plan.deinit();
+    plan.recovery_digest = try allocator.dupe(u8, expected_digest);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    const header = lines.next() orelse return error.InvalidRecoveryPlan;
+    if (!std.mem.eql(u8, header, std.mem.trimRight(u8, recovery_header, "\n"))) return error.InvalidRecoveryPlan;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const db_text = fields.next() orelse return error.InvalidRecoveryPlan;
+        const flags_text = fields.next() orelse return error.InvalidRecoveryPlan;
+        const ns_hex = fields.next() orelse return error.InvalidRecoveryPlan;
+        const old_hex = fields.next() orelse return error.InvalidRecoveryPlan;
+        const new_hex = fields.next() orelse return error.InvalidRecoveryPlan;
+        const value_hex = fields.next() orelse return error.InvalidRecoveryPlan;
+        if (fields.next() != null) return error.InvalidRecoveryPlan;
+
+        const ns_raw = try hexDecodeAlloc(allocator, ns_hex);
+        defer allocator.free(ns_raw);
+        const namespace = canonicalNamespace(ns_raw) orelse return error.InvalidRecoveryPlan;
+        const old_key = try hexDecodeAlloc(allocator, old_hex);
+        errdefer allocator.free(old_key);
+        const new_key = try hexDecodeAlloc(allocator, new_hex);
+        errdefer allocator.free(new_key);
+        const new_value = if (std.mem.eql(u8, value_hex, "-"))
+            null
+        else
+            try hexDecodeAlloc(allocator, value_hex);
+        errdefer if (new_value) |value| allocator.free(value);
+        const flags = try std.fmt.parseInt(u8, flags_text, 10);
+        try plan.renames.append(allocator, .{
+            .db = try dbFromTag(db_text),
+            .namespace = namespace,
+            .old_key = old_key,
+            .new_key = new_key,
+            .new_value = new_value,
+            .same_key = (flags & 1) != 0,
+            .delete_only = (flags & 2) != 0,
+            .value_len = 0,
+        });
+        plan.rename_bytes += new_key.len;
+    }
+    return plan;
+}
+
+fn clearRecovery(allocator: std.mem.Allocator, dir: []const u8) void {
+    const pending = artifactPathAbs(allocator, dir, recovery_pending_file) catch return;
+    defer allocator.free(pending);
+    std.fs.cwd().deleteFile(pending) catch {};
+    const plan = artifactPathAbs(allocator, dir, recovery_plan_file) catch return;
+    defer allocator.free(plan);
+    std.fs.cwd().deleteFile(plan) catch {};
+}
+
+pub fn recoveryPending(allocator: std.mem.Allocator, dir: []const u8) !bool {
+    const path = try artifactPathAbs(allocator, dir, recovery_pending_file);
+    defer allocator.free(path);
+    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
 
 const Rewrite = struct {
     new_key: ?[]u8 = null,
@@ -932,6 +1112,10 @@ pub fn planMigration(
         NS_PEP,
         NS_LASTACT,
         NS_OFFLINE,
+        NS_OFFLINE_V2,
+        NS_OFFLINE_SEQ,
+        NS_OFFLINE_HOLD_V2,
+        NS_OFFLINE_HOLD_TOKEN,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, &ctx);
@@ -1024,7 +1208,41 @@ fn orderForDb(allocator: std.mem.Allocator, plan: *const Plan, db: Database) ![]
     return ordered.toOwnedSlice(allocator);
 }
 
-fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Plan, db: Database, order: []const usize) !void {
+fn stateMatches(backend: anytype, allocator: std.mem.Allocator, key: []const u8, digest: []const u8) !bool {
+    const value = try backend.get(allocator, NS_MIGRATION_STATE, key);
+    defer if (value) |bytes| allocator.free(bytes);
+    return value != null and std.mem.eql(u8, value.?, digest);
+}
+
+fn clearState(backend: anytype, allocator: std.mem.Allocator) !void {
+    var keys: std.ArrayListUnmanaged([]u8) = .{};
+    defer {
+        for (keys.items) |key| allocator.free(key);
+        keys.deinit(allocator);
+    }
+    {
+        var iter = try backend.iterator(NS_MIGRATION_STATE, "");
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            try keys.append(allocator, try allocator.dupe(u8, entry.key));
+        }
+    }
+    if (keys.items.len == 0) return;
+    var batch = try backend.writeBatch();
+    errdefer batch.abort();
+    for (keys.items) |key| try batch.delete(NS_MIGRATION_STATE, key);
+    try batch.commit();
+}
+
+fn applySingleDb(
+    backend: anytype,
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    db: Database,
+    order: []const usize,
+    replay: bool,
+    digest: ?[]const u8,
+) !void {
     var any = false;
     for (plan.renames.items) |rename| {
         if (rename.db == db) {
@@ -1033,6 +1251,7 @@ fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Pl
         }
     }
     if (!any) return;
+    if (replay and digest != null and try stateMatches(backend, allocator, "done", digest.?)) return;
 
     // Fetch source values before opening the write transaction, and retain
     // them through commit so the batch never references freed memory.
@@ -1045,18 +1264,37 @@ fn applySingleDb(backend: anytype, allocator: std.mem.Allocator, plan: *const Pl
     }
     try values.resize(allocator, plan.renames.items.len);
     @memset(values.items, null);
+    const skip = try allocator.alloc(bool, plan.renames.items.len);
+    defer allocator.free(skip);
+    @memset(skip, false);
     for (plan.renames.items, 0..) |rename, i| {
         if (rename.db != db or rename.new_value != null) continue;
         values.items[i] = try backend.get(allocator, rename.namespace, rename.old_key);
-        if (values.items[i] == null) return error.MissingSourceRow;
+        if (values.items[i] == null) {
+            if (replay and rename.delete_only) {
+                skip[i] = true;
+                continue;
+            }
+            if (replay) {
+                const new_value = try backend.get(allocator, rename.namespace, rename.new_key);
+                if (new_value) |value| {
+                    allocator.free(value);
+                    skip[i] = true;
+                    continue;
+                }
+            }
+            return error.MissingSourceRow;
+        }
     }
 
     var batch = try backend.writeBatch();
     errdefer batch.abort();
     for (order) |i| {
+        if (skip[i]) continue;
         const rename = plan.renames.items[i];
         try applyRename(&batch, rename, values.items[i]);
     }
+    if (digest) |run_digest| try batch.put(NS_MIGRATION_STATE, "done", run_digest);
     try batch.commit();
 }
 
@@ -1136,13 +1374,25 @@ fn applyGroupedDb(
     db: Database,
     order: []const usize,
     journal_dir: ?[]const u8,
+    replay: bool,
+    digest: ?[]const u8,
 ) !void {
-    _ = db;
+    if (replay and digest != null and try stateMatches(backend, allocator, "done", digest.?)) return;
     var position: usize = 0;
+    var batch_index: usize = 0;
     while (position < order.len) {
         const first = plan.renames.items[order[position]];
         var end = position + 1;
         while (end < order.len and sameGroup(first, plan.renames.items[order[end]])) : (end += 1) {}
+
+        var marker_buf: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, "done.{s}.{d}", .{ @tagName(db), batch_index }) catch
+            return error.NameTooLong;
+        if (replay and digest != null and try stateMatches(backend, allocator, marker, digest.?)) {
+            position = end;
+            batch_index += 1;
+            continue;
+        }
 
         var values: std.ArrayListUnmanaged(?[]u8) = .{};
         defer {
@@ -1153,32 +1403,89 @@ fn applyGroupedDb(
         }
         try values.resize(allocator, end - position);
         @memset(values.items, null);
+        const skip = try allocator.alloc(bool, end - position);
+        defer allocator.free(skip);
+        @memset(skip, false);
         for (order[position..end], 0..) |rename_index, i| {
             const rename = plan.renames.items[rename_index];
             if (rename.new_value != null) continue;
             values.items[i] = try backend.get(allocator, rename.namespace, rename.old_key);
-            if (values.items[i] == null) return error.MissingSourceRow;
+            if (values.items[i] == null) {
+                if (replay and rename.delete_only) {
+                    skip[i] = true;
+                    continue;
+                }
+                if (replay) {
+                    const new_value = try backend.get(allocator, rename.namespace, rename.new_key);
+                    if (new_value) |value| {
+                        allocator.free(value);
+                        skip[i] = true;
+                        continue;
+                    }
+                }
+                return error.MissingSourceRow;
+            }
         }
 
         var batch = try backend.writeBatch();
         errdefer batch.abort();
         for (order[position..end], 0..) |rename_index, i| {
+            if (skip[i]) continue;
             try applyRename(&batch, plan.renames.items[rename_index], values.items[i]);
         }
+        if (digest) |run_digest| try batch.put(NS_MIGRATION_STATE, marker, run_digest);
         try batch.commit();
 
         if (journal_dir) |dir| {
             for (order[position..end]) |rename_index| try appendJournal(allocator, dir, plan.renames.items[rename_index]);
         }
         position = end;
+        batch_index += 1;
     }
+}
+
+/// Apply a validated plan in dependency order. A replay skips batches whose
+/// done marker matches the stored run digest.
+fn applyValidated(
+    allocator: std.mem.Allocator,
+    auth: anytype,
+    op: anytype,
+    archive: anytype,
+    plan: *const Plan,
+    options: ApplyOptions,
+    replay: bool,
+    digest: ?[]const u8,
+) !void {
+    const auth_order = try orderForDb(allocator, plan, .auth);
+    defer allocator.free(auth_order);
+    const op_order = try orderForDb(allocator, plan, .op);
+    defer allocator.free(op_order);
+    const archive_order = try orderForDb(allocator, plan, .archive);
+    defer allocator.free(archive_order);
+    if (!replay) {
+        // Validate every DB before the first mutation: dependency cycles,
+        // missing source rows and key/order problems must never surface after
+        // another env has committed.
+        try preflightDb(auth, allocator, plan, .auth);
+        try preflightDb(op, allocator, plan, .op);
+        try preflightDb(archive, allocator, plan, .archive);
+    }
+
+    if (plan.rename_bytes <= options.single_txn_budget) {
+        try applySingleDb(op, allocator, plan, .op, op_order, replay, digest);
+        try applySingleDb(auth, allocator, plan, .auth, auth_order, replay, digest);
+    } else {
+        try applyGroupedDb(op, allocator, plan, .op, op_order, options.journal_dir, replay, digest);
+        try applyGroupedDb(auth, allocator, plan, .auth, auth_order, options.journal_dir, replay, digest);
+    }
+    try applyGroupedDb(archive, allocator, plan, .archive, archive_order, options.journal_dir, replay, digest);
 }
 
 /// Apply a collision-free plan. LMDB uses one write transaction per DB when
 /// `rename_bytes` fits the budget; larger plans and every archive pass use one
-/// WriteBatch per key prefix. A journaled pass writes its plan before any
-/// mutation and journals each committed prefix. Nothing is written when the
-/// plan contains any issue.
+/// WriteBatch per key prefix. With `journal_dir`, the plan and a pending
+/// marker are durable before the first commit and completion markers are
+/// written in the same commits as the data they describe.
 pub fn applyPlan(
     allocator: std.mem.Allocator,
     auth: anytype,
@@ -1197,32 +1504,37 @@ pub fn applyPlan(
     const journaled = archive_work or plan.rename_bytes > options.single_txn_budget;
     if (journaled and options.journal_dir == null) return error.JournalRequired;
 
-    // Validate every DB before the first mutation: dependency cycles, missing
-    // source rows and key/order problems must never surface after another env
-    // has committed. Op commits before auth so an op failure leaves auth
-    // untouched; archive is last and its own WriteBatch is atomic.
-    const auth_order = try orderForDb(allocator, plan, .auth);
-    defer allocator.free(auth_order);
-    const op_order = try orderForDb(allocator, plan, .op);
-    defer allocator.free(op_order);
-    const archive_order = try orderForDb(allocator, plan, .archive);
-    defer allocator.free(archive_order);
-    try preflightDb(auth, allocator, plan, .auth);
-    try preflightDb(op, allocator, plan, .op);
-    try preflightDb(archive, allocator, plan, .archive);
-
+    var digest: ?[]u8 = null;
+    defer if (digest) |value| allocator.free(value);
     if (options.journal_dir) |dir| {
-        if (journaled) try writePlanFile(allocator, dir, plan);
+        // The fixed plan and its digest are durable before the first commit.
+        // A failure at any later boundary leaves the marker for replay.
+        try clearState(auth, allocator);
+        try clearState(op, allocator);
+        try clearState(archive, allocator);
+        try writePlanFile(allocator, dir, plan);
+        digest = try writeRecoveryPlan(allocator, dir, plan);
     }
+    try applyValidated(allocator, auth, op, archive, plan, options, false, digest);
+    if (options.journal_dir) |dir| clearRecovery(allocator, dir);
+}
 
-    if (plan.rename_bytes <= options.single_txn_budget) {
-        try applySingleDb(op, allocator, plan, .op, op_order);
-        try applySingleDb(auth, allocator, plan, .auth, auth_order);
-    } else {
-        try applyGroupedDb(op, allocator, plan, .op, op_order, options.journal_dir);
-        try applyGroupedDb(auth, allocator, plan, .auth, auth_order, options.journal_dir);
-    }
-    try applyGroupedDb(archive, allocator, plan, .archive, archive_order, options.journal_dir);
+/// Finish a stored plan after an interrupted apply. Replays are idempotent:
+/// a rename whose old key is gone and whose new key exists is skipped.
+pub fn resumeMigration(
+    allocator: std.mem.Allocator,
+    auth: anytype,
+    op: anytype,
+    archive: anytype,
+    journal_dir: []const u8,
+) !usize {
+    var plan = try readRecoveryPlan(allocator, journal_dir);
+    defer plan.deinit();
+    // Replay in prefix batches so per-batch completion markers are honored.
+    const options = ApplyOptions{ .journal_dir = journal_dir, .single_txn_budget = 0 };
+    try applyValidated(allocator, auth, op, archive, &plan, options, true, plan.recovery_digest);
+    clearRecovery(allocator, journal_dir);
+    return plan.renames.items.len;
 }
 
 const Deletion = struct {

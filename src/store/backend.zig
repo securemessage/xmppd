@@ -37,6 +37,21 @@ const std = @import("std");
 pub const MAX_PREFIX_LEN: usize = 511;
 
 /// Options for opening a storage backend.
+pub const migration_marker_file = "migrate-precis.pending";
+
+/// True while an interrupted migrate-precis apply must be resumed. Daemons
+/// refuse to start on a half-migrated database.
+pub fn migrationPending(dir_path: []const u8) !bool {
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, migration_marker_file }) catch
+        return error.NameTooLong;
+    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub const OpenOptions = struct {
     /// Maximum number of namespaces (LMDB: max_dbs, others: ignored).
     max_namespaces: u32 = 24,
