@@ -301,6 +301,11 @@ pub const Session = struct {
     iq_roster_groups_buf: [2048]u8 = undefined,
     iq_roster_groups_len: usize = 0,
 
+    /// F6: session-owned scratch holding the roster/block item JID prepared
+    /// for the configured domain; the raw attr slice stays in
+    /// iq_roster_item_jid.
+    iq_item_jid_prep_buf: [xmpp.max_jid_octets]u8 = undefined,
+
     /// XEP-0115 §5.3: disco#info query node attribute (for caps verification).
     disco_node: []const u8 = "",
 
@@ -315,6 +320,9 @@ pub const Session = struct {
     mam_after: []const u8 = "",
     mam_before: []const u8 = "",
     mam_max: []const u8 = "",
+    /// F6: session-owned scratch holding the MAM 'with' JID prepared for the
+    /// configured domain; the raw collected text stays in mam_with.
+    mam_with_prep_buf: [xmpp.max_jid_octets]u8 = undefined,
     /// Which MAM text field we're currently collecting (from nested value/max elements).
     mam_collecting: MamCollecting = .none,
     /// Buffer for MAM text content accumulation.
