@@ -114,6 +114,10 @@ pub const S2sSession = struct {
     /// Whether a stream open was already processed; any later open on this
     /// socket is a restart (post-TLS, post-SASL, post-dialback).
     stream_open_seen: bool = false,
+    /// Whether our own <stream:stream> has been written on the current stream.
+    /// A stream error for a peer whose header we never answered must open the
+    /// stream first (RFC 6120 4.9.1), as c2s does.
+    stream_header_sent: bool = false,
     /// Host this stream is addressed to (to= of the stream header: the local
     /// domain or the MUC host). Replies echo it as their from= (S2).
     served_host_buf: [256]u8 = undefined,
@@ -515,9 +519,11 @@ pub const S2sSession = struct {
         if (features.sasl_external) {
             try writer.writeAll("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>");
         }
-        if (features.dialback) {
-            try writer.writeAll("<db:features><db:dialback/></db:features>");
-        }
+        // No dialback stream feature: <db:features><db:dialback/> exists in no
+        // spec, and the standard XEP-0220 2.4.2 dialback-errors feature is
+        // only advertised once dialback error handling is implemented (X1).
+        // Traditional dialback support stays signaled by xmlns:db in the
+        // stream header.
         try writer.writeAll("</stream:features>");
         return fbs.getWritten();
     }
@@ -548,7 +554,9 @@ pub const S2sSession = struct {
         return fbs.getWritten();
     }
 
-    /// Build a stream error response.
+    /// Build a stream error response. The stream header is a separate write so
+    /// an oversized host or domain cannot stop the error itself (RFC 6120
+    /// 4.9.1); see sendStreamError.
     pub fn buildStreamError(_: *const S2sSession, buf: []u8, error_name: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
@@ -685,6 +693,7 @@ pub const S2sSession = struct {
 
     /// Accumulate text content (XML-escaped) into the stanza inner buffer.
     pub fn accumulateText(self: *S2sSession, text: []const u8) void {
+        if (self.stanza_accum_overflowed) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         xmlEscapeWrite(fbs.writer(), text) catch return self.markOverflow();
         self.stanza_inner_len += fbs.pos;
@@ -694,6 +703,7 @@ pub const S2sSession = struct {
     /// An overflow marks the stanza broken so it is dropped, never forwarded
     /// unbalanced (S1).
     pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
+        if (self.stanza_accum_overflowed) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
         w.writeAll("</") catch return self.markOverflow();
@@ -883,8 +893,13 @@ test "S2sSession: buildFeatures — auth without DANE" {
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
     const out = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") != null);
+    // Neither auth mechanism advertises a feature element: the non-standard
+    // <db:features><db:dialback/> is gone and EXTERNAL needs DANE. Dialback
+    // support remains visible via the xmlns:db stream header declaration.
+    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "db:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "EXTERNAL") == null);
+    try std.testing.expectEqualStrings("<stream:features></stream:features>", out);
 }
 
 test "S2sSession: buildSaslSuccess" {
@@ -1320,6 +1335,10 @@ test "S2sSession: accumulateClose overflow marks the stanza broken" {
     try std.testing.expect(session.stanzaBroken());
 }
 
+const test_stream_header =
+    "<stream:stream xmlns='jabber:server' " ++
+    "xmlns:stream='http://etherx.jabber.org/streams'>";
+
 test "S2sSession: prefixed attributes keep their prefix declaration" {
     const alloc = std.testing.allocator;
     var session = S2sSession.init(-1, 1, "us.example");
@@ -1329,8 +1348,12 @@ test "S2sSession: prefixed attributes keep their prefix declaration" {
     // Drive a real reader so the namespace stack holds the binding.
     var reader = xml.Reader.init(alloc);
     defer reader.deinit();
-    const input = "<message xmlns='jabber:server' xmlns:ext='urn:ext'><child ext:a='b' plain='c'/></message>";
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:ext='urn:ext'><child ext:a='b' plain='c'/></message>";
     var pos: usize = 0;
+
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
 
     // Root element: the stanza start.
     const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
@@ -1360,9 +1383,12 @@ test "S2sSession: a self-closing child keeps the prefix it declares on itself" {
 
     var reader = xml.Reader.init(alloc);
     defer reader.deinit();
-    const input = "<message xmlns='jabber:server'><child xmlns:ext='urn:ext' ext:a='b'/></message>";
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server'><child xmlns:ext='urn:ext' ext:a='b'/></message>";
     var pos: usize = 0;
 
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
     const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
     session.startStanza(root_ev.element_start);
 
@@ -1405,12 +1431,18 @@ test "S2sSession: any number of attribute prefixes re-emits each binding once" {
         attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns{d}:a='v{d}'", .{ n, n }) catch return error.Buffer).len;
     }
     attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns9:b='again'", .{}) catch return error.Buffer).len;
-    const input = try std.fmt.allocPrint(alloc, "<message xmlns='jabber:server'{s}><child{s}/></message>", .{ decl_buf[0..decl_len], attrs_buf[0..attrs_len] });
+    const input = try std.fmt.allocPrint(
+        alloc,
+        test_stream_header ++ "<message xmlns='jabber:server'{s}><child{s}/></message>",
+        .{ decl_buf[0..decl_len], attrs_buf[0..attrs_len] },
+    );
     defer alloc.free(input);
     var pos: usize = 0;
 
     var reader = xml.Reader.init(alloc);
     defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
     const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
     session.startStanza(root_ev.element_start);
 
@@ -1441,11 +1473,15 @@ test "S2sSession: the element's own prefix is declared once for its prefixed att
     // The child carries prefix e and two attributes bound to e, plus one
     // bound to f: exactly one xmlns:e and one xmlns:f may be written (a
     // second xmlns:e on the same tag is a duplicate XML attribute).
-    const input = "<message xmlns='jabber:server' xmlns:e='urn:e' xmlns:f='urn:f'><e:child e:a='1' e:b='2' f:c='3'/></message>";
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:e='urn:e' xmlns:f='urn:f'>" ++
+        "<e:child e:a='1' e:b='2' f:c='3'/></message>";
     var pos: usize = 0;
 
     var reader = xml.Reader.init(alloc);
     defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
     const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
     session.startStanza(root_ev.element_start);
 
@@ -1468,11 +1504,14 @@ test "S2sSession: an attribute-prefix declaration escapes its URI" {
 
     // The resolved URI holds an apostrophe and the declaration quotes with
     // single quotes: the URI must be escaped or it closes the value early.
-    const input = "<message xmlns='jabber:server' xmlns:ext=\"urn:a'b\"><child ext:x='1'/></message>";
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:ext=\"urn:a'b\"><child ext:x='1'/></message>";
     var pos: usize = 0;
 
     var reader = xml.Reader.init(alloc);
     defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
     const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
     session.startStanza(root_ev.element_start);
 

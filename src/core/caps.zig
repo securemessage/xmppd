@@ -11,6 +11,7 @@
 //! Each entry stores which +notify PEP nodes the client supports as a bitmap.
 
 const std = @import("std");
+const xml_mod = @import("xml");
 const Sha1 = std.crypto.hash.Sha1;
 
 const log = std.log.scoped(.caps);
@@ -182,18 +183,18 @@ pub fn buildCapsQuery(
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("<iq type='get' from='") catch return null;
-    w.writeAll(server_host) catch return null;
+    xml_mod.escapeWrite(w, server_host) catch return null;
     w.writeAll("' to='") catch return null;
-    w.writeAll(to_jid) catch return null;
+    xml_mod.escapeWrite(w, to_jid) catch return null;
     w.writeAll("' id='caps-") catch return null;
     // Write query_id as decimal
     var id_buf: [10]u8 = undefined;
     const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{query_id}) catch return null;
-    w.writeAll(id_str) catch return null;
+    xml_mod.escapeWrite(w, id_str) catch return null;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return null;
-    w.writeAll(node) catch return null;
+    xml_mod.escapeWrite(w, node) catch return null;
     w.writeByte('#') catch return null;
-    w.writeAll(ver) catch return null;
+    xml_mod.escapeWrite(w, ver) catch return null;
     w.writeAll("'/></iq>") catch return null;
     return fbs.getWritten();
 }
@@ -277,7 +278,7 @@ pub const SERVER_FEATURES = [_][]const u8{
 pub fn writeDiscoFeatures(w: anytype) !void {
     for (SERVER_FEATURES) |feature| {
         try w.writeAll("<feature var='");
-        try w.writeAll(feature);
+        try xml_mod.escapeWrite(w, feature);
         try w.writeAll("'/>");
     }
 }
@@ -318,9 +319,9 @@ pub fn computeServerCaps() ServerCaps {
     var fbs = std.io.fixedBufferStream(&caps.caps_xml);
     const w = fbs.writer();
     w.writeAll("<c xmlns='http://jabber.org/protocol/caps' hash='sha-1' node='") catch {};
-    w.writeAll(SERVER_NODE) catch {};
+    xml_mod.escapeWrite(w, SERVER_NODE) catch {};
     w.writeAll("' ver='") catch {};
-    w.writeAll(caps.getVer()) catch {};
+    xml_mod.escapeWrite(w, caps.getVer()) catch {};
     w.writeAll("'/>") catch {};
     caps.caps_xml_len = @intCast(fbs.pos);
 

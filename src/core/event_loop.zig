@@ -185,16 +185,56 @@ pub const ChangeList = struct {
     purged: [64]posix.fd_t = undefined,
     purged_len: usize = 0,
 
+    /// Slots held back for the per-iteration IPC reconcile (S10), which must
+    /// be able to stage its own changes even when the batch is otherwise full.
+    /// Ordinary appends stop at buf.len - reserved.
+    reserved: usize = 0,
+    /// Set while the reconciler stages, letting it spend the reserved tail.
+    spending_reserved: bool = false,
+
+    /// Stages skipped because the fd was closed (S28). Counted and logged at
+    /// debug level so a caller repeatedly staging a dead fd is observable.
+    closed_fd_skips: u64 = 0,
+
     /// Initialize a changelist backed by the given scratch buffer.
     /// The buffer determines the maximum number of changes per batch.
     pub fn init(buf: []posix.Kevent) ChangeList {
         return .{ .buf = buf };
     }
 
+    /// Guard for every fd-keyed stage. A closed connection keeps fd = -1, so
+    /// @intCast(-1) would panic in a safe build, and even a valid-looking
+    /// number could land on an unrelated connection that reused the fd this
+    /// iteration. Skips are counted and logged at debug rather than swallowed
+    /// silently, so a caller staging dead fds in a loop is visible (S28).
+    fn skipClosedFd(self: *ChangeList, fd: posix.fd_t, comptime op: []const u8) bool {
+        if (fd >= 0) return false;
+        self.closed_fd_skips += 1;
+        std.log.scoped(.xmppd).debug("changelist: skipped {s} on a closed fd", .{op});
+        return true;
+    }
+
+    /// Hold back `n` slots for the reconciler. Must be smaller than the buffer.
+    pub fn reserve(self: *ChangeList, n: usize) void {
+        self.reserved = n;
+    }
+
+    /// Let the following appends spend the reserved tail. Bracket with
+    /// endReserved(); the reconciler is the only intended caller.
+    pub fn beginReserved(self: *ChangeList) void {
+        self.spending_reserved = true;
+    }
+
+    pub fn endReserved(self: *ChangeList) void {
+        self.spending_reserved = false;
+    }
+
     /// Reset the changelist for reuse (zero-cost — just resets the length).
+    /// The reservation survives: it is set once per loop, not per batch.
     pub fn reset(self: *ChangeList) void {
         self.len = 0;
         self.purged_len = 0;
+        self.spending_reserved = false;
     }
 
     /// Returns the accumulated changes as a slice for `submitAndPoll()`.
@@ -209,28 +249,33 @@ pub const ChangeList = struct {
 
     /// Add an fd for read monitoring.
     pub fn addRead(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (self.skipClosedFd(fd, "addRead")) return;
         self.untrackPurged(fd); // fd number legitimately reused by a new owner
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
     /// Add an fd for write monitoring.
     pub fn addWrite(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (self.skipClosedFd(fd, "addWrite")) return;
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE, udata));
     }
 
     /// Remove read monitoring for an fd.
     pub fn removeRead(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "removeRead")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DELETE, 0));
     }
 
     /// Remove write monitoring for an fd.
     pub fn removeWrite(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "removeWrite")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DELETE, 0));
     }
 
     /// Add a one-shot read monitor (fires once when readable, then auto-removes).
     pub fn addReadOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (self.skipClosedFd(fd, "addReadOnce")) return;
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
@@ -239,27 +284,32 @@ pub const ChangeList = struct {
     /// Idiomatic for flush-on-demand: register when data is queued, fires once
     /// kernel send buffer has space.
     pub fn addWriteOnce(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (self.skipClosedFd(fd, "addWriteOnce")) return;
         self.untrackPurged(fd);
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, udata));
     }
 
     /// Enable read monitoring for an fd (must be previously added).
     pub fn enableRead(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "enableRead")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ENABLE, 0));
     }
 
     /// Disable read monitoring for an fd without removing it.
     pub fn disableRead(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "disableRead")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DISABLE, 0));
     }
 
     /// Enable write monitoring for an fd (must be previously added).
     pub fn enableWrite(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "enableWrite")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ENABLE, 0));
     }
 
     /// Disable write monitoring for an fd without removing it.
     pub fn disableWrite(self: *ChangeList, fd: posix.fd_t) !void {
+        if (self.skipClosedFd(fd, "disableWrite")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DISABLE, 0));
     }
 
@@ -278,7 +328,13 @@ pub const ChangeList = struct {
     }
 
     fn append(self: *ChangeList, ev: posix.Kevent) !void {
-        if (self.len >= self.buf.len) return error.ChangeListFull;
+        // Slots held back for the reconciler are off limits until it spends
+        // them, so an arm lost to a full batch cannot drop the auth link.
+        const limit = if (self.spending_reserved)
+            self.buf.len
+        else
+            self.buf.len - @min(self.reserved, self.buf.len);
+        if (self.len >= limit) return error.ChangeListFull;
         self.buf[self.len] = ev;
         self.len += 1;
     }
@@ -293,19 +349,20 @@ pub const ChangeList = struct {
     /// was the visible tip).
     pub fn purgeFd(self: *ChangeList, fd: posix.fd_t) void {
         // A connection closed EARLIER has fd = -1: nothing of it can be
-        // staged (its number went back to the pool at close time) — and
+        // staged (its number went back to the pool at close time) and
         // casting -1 to usize would panic in safe builds.
-        if (fd < 0) return;
+        if (self.skipClosedFd(fd, "purgeFd")) return;
         const target: usize = @intCast(fd);
-        var i: usize = 0;
-        while (i < self.len) {
-            if (self.buf[i].ident == target) {
-                self.len -= 1;
-                self.buf[i] = self.buf[self.len]; // swap-remove; order is per-fd irrelevant
-            } else {
-                i += 1;
-            }
+        // Order-preserving compaction: a swap-remove would move another
+        // fd's newest entry ahead of its older ones, inverting a staged
+        // EV_DELETE/EV_ADD pair (S20).
+        var dst: usize = 0;
+        for (0..self.len) |src| {
+            if (self.buf[src].ident == target) continue;
+            self.buf[dst] = self.buf[src];
+            dst += 1;
         }
+        self.len = dst;
         if (self.purged_len < self.purged.len) {
             self.purged[self.purged_len] = fd;
             self.purged_len += 1;
@@ -1408,4 +1465,86 @@ test "EventLoop: modifyFd disable and enable" {
     const events2 = try loop.poll(50);
     try std.testing.expectEqual(@as(usize, 1), events2.len);
     try std.testing.expect(events2[0] == .fd_readable);
+}
+
+test "S10: removeWrite after the backlog drains lets kevent block again" {
+    var loop = try EventLoop.init(std.testing.allocator, 16);
+    defer loop.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    // Arm a persistent write filter, the way IPC send sites do.
+    var scratch: [4]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    try batch.addWrite(pipe_fds[1], 0x510);
+    const armed = try loop.submitAndPoll(batch.slice(), 100);
+    try std.testing.expectEqual(@as(usize, 1), armed.len);
+    try std.testing.expect(armed[0] == .fd_writable);
+
+    // Without a remove the idle fd stays writable: the pre-fix spin.
+    const spinning = try loop.poll(0);
+    try std.testing.expectEqual(@as(usize, 1), spinning.len);
+    try std.testing.expect(spinning[0] == .fd_writable);
+
+    // Drained backlog: flushIpc/flushS2sIpc stage removeWrite. The next
+    // wait must block instead of re-firing forever.
+    batch.reset();
+    try batch.removeWrite(pipe_fds[1]);
+    const drained = try loop.submitAndPoll(batch.slice(), 50);
+    try std.testing.expectEqual(@as(usize, 0), drained.len);
+    const still_idle = try loop.poll(50);
+    try std.testing.expectEqual(@as(usize, 0), still_idle.len);
+}
+
+test "S20: purgeFd keeps the staged order of other fds' entries" {
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+
+    // Interleave: one entry for fd 30, one for fd 10, then a staged
+    // EV_ADD/EV_DELETE pair for fd 20. Swap-remove would pull fd 20's
+    // newest entry ahead of its older one and invert the pair.
+    try batch.addRead(30, 0xC);
+    try batch.addRead(10, 0xA);
+    try batch.addWrite(20, 0xB1);
+    try batch.removeWrite(20);
+    batch.purgeFd(10);
+
+    const out = batch.slice();
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(usize, 30), out[0].ident);
+    try std.testing.expectEqual(@as(usize, 20), out[1].ident);
+    try std.testing.expectEqual(std.c.EV.ADD | std.c.EV.ENABLE, out[1].flags);
+    try std.testing.expectEqual(@as(usize, 20), out[2].ident);
+    try std.testing.expectEqual(std.c.EV.DELETE, out[2].flags);
+
+    // Purging an fd with no staged entries is a no-op.
+    batch.purgeFd(99);
+    try std.testing.expectEqual(@as(usize, 3), batch.slice().len);
+}
+
+test "S28: staging a closed fd (-1) is a no-op, never a panic" {
+    // An SM-detached session keeps its slot with fd = -1 and possibly
+    // unsent bytes; a stale batch event or a late flush then reaches
+    // staging with the dead fd. @intCast(-1) panicked the whole core
+    // under the M5 SM reconnect storm.
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+
+    try batch.addRead(-1, 0xA);
+    try batch.addWrite(-1, 0xA);
+    try batch.addReadOnce(-1, 0xA);
+    try batch.addWriteOnce(-1, 0xA);
+    try batch.removeRead(-1);
+    try batch.removeWrite(-1);
+    try batch.enableRead(-1);
+    try batch.disableRead(-1);
+    try batch.enableWrite(-1);
+    try batch.disableWrite(-1);
+    batch.purgeFd(-1);
+
+    try std.testing.expectEqual(@as(usize, 0), batch.slice().len);
+    // Every skip is counted, not swallowed: 11 closed-fd stages above.
+    try std.testing.expectEqual(@as(u64, 11), batch.closed_fd_skips);
 }

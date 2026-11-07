@@ -647,6 +647,7 @@ const MigrateProbe = struct {
     var shared: ?backend_mod.MemoryBackend = null;
 
     mem: *backend_mod.MemoryBackend,
+    compound_mutex: std.Thread.Mutex = .{},
 
     fn reset(err: ?anyerror) void {
         done();

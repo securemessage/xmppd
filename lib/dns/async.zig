@@ -163,6 +163,13 @@ const Job = struct {
     /// when neither family yields an address this decides between
     /// .failed and .nxdomain.
     fallback_err: bool = false,
+    /// A per-target address query that hard-failed (timeout, SERVFAIL,
+    /// a dead TCP leg): when every SRV target is consumed without an
+    /// address this decides between .failed and .nxdomain the way
+    /// fallback_err does for the fallback path. NXDOMAIN is reserved
+    /// for authoritative absences; the s2s retry treats it as
+    /// permanent while a wire failure is temporary.
+    target_err: bool = false,
     /// Addresses collected for the current SRV target across the A
     /// and AAAA phases.
     cur_addr4: ?net.Address = null,
@@ -173,6 +180,11 @@ const Job = struct {
     pending_qname: []const u8 = "", // owned
     pending_qtype: u16 = 0,
     request: []u8 = &.{},
+    /// Sends of the outstanding query on its current transport. UDP:
+    /// the first send plus retransmits, one per deadline at
+    /// TIMEOUT_MS. The TC upgrade to TCP resets it to 0 and arms
+    /// TCP_TIMEOUT_MS; a later chain query on the TCP leg starts at 1
+    /// under TIMEOUT_MS, so it retries once, not the full UDP budget.
     tries: u8 = 0,
     use_tcp: bool = false,
     tcp_fd: posix.fd_t = -1,
@@ -182,6 +194,14 @@ const Job = struct {
     tcp_out: std.ArrayListUnmanaged(u8) = .{},
     tcp_out_pos: usize = 0,
     tcp_connected: bool = false,
+    /// Per-socket nonce stamped into TCP knote udata: close() then
+    /// socket() reuses fd numbers, so an event queued for an earlier
+    /// connection is told apart from the new one by this count.
+    tcp_seq: u8 = 0,
+    /// Whether the outstanding query was already re-sent once after
+    /// the peer closed the connection (RFC 7766 close-after-answer);
+    /// a second close on the same query fails the phase instead.
+    tcp_eof_resent: bool = false,
 
     targets: std.ArrayListUnmanaged(Target) = .{},
 };
@@ -231,9 +251,9 @@ pub const Resolver = struct {
     /// instead of the host resolver configuration.
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
     jobs: std.ArrayListUnmanaged(*Job) = .{},
-    /// Slot table for timer udata: a queued deadline event carries
-    /// (gen, slot) so a job freed by an earlier event in the same
-    /// kevent batch is recognized as stale and never touched.
+    /// Slot table for event udata: a queued deadline or TCP socket
+    /// event carries (gen, slot) so a job freed by an earlier event in
+    /// the same kevent batch is recognized as stale and never touched.
     slots: [MAX_JOBS]?*Job = .{null} ** MAX_JOBS,
     slot_gen: [MAX_JOBS]u16 = .{0} ** MAX_JOBS,
     /// Seeded from the CSPRNG; drives only the RFC 2782 weighted picks
@@ -263,6 +283,19 @@ pub const Resolver = struct {
     stale_icmp: usize = 0,
     /// Test seam: report every UDP send as failed (see sendUdp).
     fail_sends: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test seam: refuse the next N TCP connects synchronously (see
+    /// tcpSend); FreeBSD does this on real wire paths.
+    fail_connects: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    /// Test seam: leave every TCP connect pending (see tcpSend); an
+    /// unconnected stream socket is never writable, so the armed
+    /// WRITE knote stays quiet and the connect never races a refusal.
+    pend_connects: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// Test seam: report every knote registration as failed (see
+    /// keventApplyChecked); covers the ensureOpen failure ordering.
+    fail_kevents: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// kevent() errors seen inside step(); the first is logged so a
+    /// dead kqueue cannot fail silently while the caller's loop spins.
+    kevent_errors: usize = 0,
     udp_errors: usize = 0,
     /// The job currently firing completion callbacks, or null. Set
     /// inside a dropJob/complete/completeRaw waiter loop, after the
@@ -335,10 +368,14 @@ pub const Resolver = struct {
     }
 
     /// Raw record query: A, AAAA, SRV or TLSA answered via the query
-    /// callback with owned RRs.
+    /// callback with owned RRs. A cache hit or an unencodable name
+    /// fires that callback inside query() before it returns.
     pub fn query(self: *Resolver, name: []const u8, rtype: RType, session_key: usize) !void {
+        // RFC 7622 3.2, same as resolve(): a trailing dot on a
+        // domainpart is absent, so an FQDN queries like the bare name.
+        const fqdn = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
         const qt: u16 = @intFromEnum(rtype);
-        if (self.cacheGet(name, qt)) |ent| {
+        if (self.cacheGet(fqdn, qt)) |ent| {
             switch (ent.neg) {
                 .nxdomain => self.qcb.fun(self.qcb.ctx, session_key, .nxdomain, null),
                 .nodata => self.qcb.fun(self.qcb.ctx, session_key, .resolved, .{ .rrs = &.{}, .ttl = 0 }),
@@ -352,10 +389,10 @@ pub const Resolver = struct {
         }
         try self.ensureOpen();
         if (self.jobs.items.len >= MAX_JOBS) {
-            try self.enqueueWait(session_key, name, .{ .kind = .query, .rtype = qt });
+            try self.enqueueWait(session_key, fqdn, .{ .kind = .query, .rtype = qt });
             return;
         }
-        const job = try self.allocJob(session_key, name);
+        const job = try self.allocJob(session_key, fqdn);
         job.phase = .raw;
         job.is_raw = true;
         {
@@ -364,7 +401,7 @@ pub const Resolver = struct {
         }
         // A cache hit inside sendQuery can complete and free the job
         // synchronously; after this call `job` may not be touched.
-        self.sendQuery(job, name, qt) catch |err| {
+        self.sendQuery(job, fqdn, qt) catch |err| {
             self.abortJob(job);
             return err;
         };
@@ -480,12 +517,18 @@ pub const Resolver = struct {
 
     /// SRV chain resolve. Literal IPs complete synchronously with one
     /// target (no UDP traffic).
+    /// The callback may fire before resolve() returns: literal IPs,
+    /// cache hits, and names that cannot be encoded or staged (the
+    /// "async nxdomain" paths) all complete inside the call.
     /// want_tlsa: fetch TLSA records per target (_port._tcp.<target>)
     /// when the caller can authenticate with them; false callers get
     /// the same addresses without the extra round trips.
     pub fn resolve(self: *Resolver, name: []const u8, service: Service, default_port: u16, session_key: usize, want_tlsa: bool) !void {
-        if (net.Address.parseIp(name, default_port)) |addr| {
-            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, name), .tlsa = &.{}, .tlsa_status = .absent, .is_direct_tls = false };
+        // RFC 7622 3.2: a trailing dot on a domainpart is absent, so an
+        // FQDN resolves like the bare name.
+        const fqdn = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+        if (net.Address.parseIp(fqdn, default_port)) |addr| {
+            const t = Target{ .addr = addr, .host = try self.alloc.dupe(u8, fqdn), .tlsa = &.{}, .tlsa_status = .absent, .is_direct_tls = false };
             const list = try self.alloc.alloc(Target, 1);
             list[0] = t;
             self.cb.fun(self.cb.ctx, session_key, .resolved, .{ .targets = list });
@@ -501,7 +544,7 @@ pub const Resolver = struct {
             if (job.service_idx != @intFromEnum(service)) continue;
             if (job.default_port != default_port) continue;
             if (job.want_tlsa != want_tlsa) continue;
-            if (!std.ascii.eqlIgnoreCase(job.name, name)) continue;
+            if (!std.ascii.eqlIgnoreCase(job.name, fqdn)) continue;
             // A full job takes no more waiters; the lookup starts a
             // fresh job on the wire instead of failing.
             if (job.waiter_count >= MAX_WAITERS) continue;
@@ -510,10 +553,10 @@ pub const Resolver = struct {
             return;
         }
         if (self.jobs.items.len >= MAX_JOBS) {
-            try self.enqueueWait(session_key, name, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
+            try self.enqueueWait(session_key, fqdn, .{ .kind = .resolve, .service_idx = @intFromEnum(service), .default_port = default_port, .want_tlsa = want_tlsa });
             return;
         }
-        const job = try self.allocJob(session_key, name);
+        const job = try self.allocJob(session_key, fqdn);
         job.phase = .srv_tls;
         job.service_idx = @intFromEnum(service);
         job.default_port = default_port;
@@ -543,10 +586,13 @@ pub const Resolver = struct {
         }
         const fd = try posix.socket(self.server.any.family, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
-        try posix.connect(fd, &self.server.any, self.server.getOsSockLen());
-        self.fd = fd;
+        try rawConnect(fd, &self.server.any, self.server.getOsSockLen());
         var ch = [1]posix.Kevent{.{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 }};
         try self.keventApply(&ch);
+        // Publish only once the knote is armed: an early failure
+        // leaves self.fd holding the socket errdefer just closed, and
+        // a later send or deinit would touch whatever reused it.
+        self.fd = fd;
     }
 
     /// One kevent turn on the resolver's kqueue. `timeout_ms` may be 0
@@ -555,7 +601,11 @@ pub const Resolver = struct {
         if (self.kq < 0) return;
         var events: [16]posix.Kevent = undefined;
         const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(timeout_ms, 1000)), .nsec = @intCast(@rem(timeout_ms, 1000) * 1_000_000) };
-        const n = posix.kevent(self.kq, &.{}, &events, &ts) catch return;
+        const n = rawKevent(self.kq, &.{}, &events, &ts) catch |err| {
+            self.kevent_errors += 1;
+            if (self.kevent_errors == 1) log.warn("dns: kevent failed in step: {}", .{err});
+            return;
+        };
         self.dispatchEvents(events[0..n]);
     }
 
@@ -568,26 +618,35 @@ pub const Resolver = struct {
                 const fd: posix.fd_t = @intCast(ev.ident);
                 if (fd == self.fd) {
                     self.onReadable();
-                } else {
-                    self.onTcpReadable(fd);
+                } else if (self.tcpJobFromEvent(ev)) |job| {
+                    self.onTcpReadable(job);
                 }
             } else if (ev.filter == std.c.EVFILT.WRITE) {
                 // A refused connect also reports writable, so check
                 // SO_ERROR once before the socket is used; a connected
                 // socket arriving here resumes a WouldBlock flush.
-                const fd: posix.fd_t = @intCast(ev.ident);
-                for (self.jobs.items) |job| {
-                    if (job.tcp_fd == fd) {
-                        if (!job.tcp_connected) {
-                            posix.getsockoptError(fd) catch {
-                                self.dropJob(job, .failed);
-                                break;
-                            };
+                if (self.tcpJobFromEvent(ev)) |job| {
+                    if (!job.tcp_connected) {
+                        if (rawSoError(job.tcp_fd)) |_| {
                             job.tcp_connected = true;
+                        } else |_| {
+                            // The connect died; the outstanding query
+                            // is unanswered, so it runs the ordinary
+                            // phase-scoped failure path. The dead
+                            // socket is dropped first or the next
+                            // query would stage on it.
+                            self.tcpClose(job);
+                            self.failQuery(job);
+                            continue;
                         }
-                        self.tcpWrite(job) catch self.dropJob(job, .failed);
-                        break;
                     }
+                    self.tcpWrite(job) catch |err| {
+                        if (err == error.PeerClosed) {
+                            _ = self.tcpPeerClosed(job);
+                        } else {
+                            self.dropJob(job, .failed);
+                        }
+                    };
                 }
             }
         }
@@ -713,6 +772,32 @@ pub const Resolver = struct {
         return job;
     }
 
+    /// TCP knote udata names the connection as well as the job:
+    /// (seq, gen, slot). Bit 0x40 stays clear; that bit marks the
+    /// chain timer in timer udata.
+    fn tcpUdata(job: *const Job) usize {
+        return (@as(usize, job.tcp_seq) << 32) | (@as(usize, job.gen) << 8) | job.slot;
+    }
+
+    /// Resolve a TCP socket event's (seq, gen, slot) udata back to the
+    /// job that armed it; null when the slot is dead or re-used, or
+    /// when the event names a connection already closed (close() then
+    /// socket() reuses fd numbers, so ident alone cannot tell the old
+    /// knote's event from the new connection's). The u16 cast in
+    /// jobFromUdata cannot carry the seq bits, so TCP events must
+    /// never go through it.
+    fn tcpJobFromEvent(self: *Resolver, ev: posix.Kevent) ?*Job {
+        const slot: usize = ev.udata & 0x3F;
+        const gen: u16 = @truncate(ev.udata >> 8);
+        const seq: u8 = @truncate(ev.udata >> 32);
+        if (slot >= MAX_JOBS) return null;
+        const job = self.slots[slot] orelse return null;
+        if (self.slot_gen[slot] != gen) return null;
+        if (job.tcp_fd != @as(posix.fd_t, @intCast(ev.ident))) return null;
+        if (job.tcp_seq != seq) return null;
+        return job;
+    }
+
     /// Connected-UDP send. An ICMP port-unreachable queued from an
     /// earlier datagram surfaces as ECONNREFUSED on a later send; that
     /// error belongs to the earlier packet, so it is consumed and the
@@ -723,10 +808,10 @@ pub const Resolver = struct {
         if (builtin.is_test) {
             if (self.fail_sends) return error.SendFailed;
         }
-        _ = posix.send(self.fd, pkt, 0) catch |err| switch (err) {
-            error.ConnectionRefused => {
+        _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
+            error.Refused => {
                 self.stale_icmp += 1;
-                _ = posix.send(self.fd, pkt, 0) catch return error.SendFailed;
+                _ = rawSend(self.fd, pkt, 0) catch return error.SendFailed;
                 return;
             },
             else => return error.SendFailed,
@@ -751,6 +836,9 @@ pub const Resolver = struct {
     }
 
     fn keventApplyChecked(self: *Resolver, ch: []const posix.Kevent, enoent_ok: bool) !void {
+        if (builtin.is_test) {
+            if (self.fail_kevents) return error.KeventChange;
+        }
         const nonblock = std.c.timespec{ .sec = 0, .nsec = 0 };
         var evbuf: [8]posix.Kevent = undefined;
         var off: usize = 0;
@@ -763,7 +851,7 @@ pub const Resolver = struct {
                 batch[i] = ev;
                 batch[i].flags |= std.c.EV.RECEIPT;
             }
-            const got = try posix.kevent(self.kq, batch[0..n], &evbuf, &nonblock);
+            const got = try rawKevent(self.kq, batch[0..n], &evbuf, &nonblock);
             for (evbuf[0..got]) |ev| {
                 if (ev.data == 0) continue;
                 if (enoent_ok and ev.data == @intFromEnum(std.c.E.NOENT)) continue;
@@ -811,12 +899,30 @@ pub const Resolver = struct {
         job.pending_qtype = qtype;
         job.tries = 1;
         if (job.use_tcp) {
-            // A connection surviving from an earlier query still holds
-            // that query's staged frame; reset it or the new query is
-            // never written and the chain stalls on this socket.
-            job.tcp_out.clearRetainingCapacity();
-            job.tcp_out_pos = 0;
-            try self.tcpSend(job);
+            // A new query re-arms the close-after-answer resend
+            // budget whichever send arm it takes.
+            job.tcp_eof_resent = false;
+            if (job.tcp_out_pos < job.tcp_out.items.len) {
+                // A frame still mid-write cannot share the stream with
+                // a new one: re-open the connection so the new query
+                // stages on an empty tcp_out.
+                self.tcpRestart(job) catch |err| {
+                    if (err == error.PeerClosed) {
+                        if (!self.tcpPeerClosed(job)) return;
+                    } else if (self.tcpConnectFailed(job, err)) return else return err;
+                };
+            } else {
+                // A connection surviving from an earlier query is
+                // reused; its fully flushed frame is cleared so the
+                // new query stages and is written.
+                job.tcp_out.clearRetainingCapacity();
+                job.tcp_out_pos = 0;
+                self.tcpSend(job) catch |err| {
+                    if (err == error.PeerClosed) {
+                        if (!self.tcpPeerClosed(job)) return;
+                    } else if (self.tcpConnectFailed(job, err)) return else return err;
+                };
+            }
         } else {
             try self.sendUdp(pkt);
         }
@@ -825,19 +931,27 @@ pub const Resolver = struct {
 
     fn onDeadline(self: *Resolver, job: *Job) void {
         if (job.tries >= MAX_TRIES) {
-            // tries counts deadline firings: the initial send plus
-            // each re-armed deadline. On UDP a retry retransmits; on
-            // TCP it only retries connect/write progress and the
-            // staged frame is never resent once written.
+            // tries counts sends of the outstanding query on its
+            // current transport: on UDP a retry retransmits the
+            // datagram, on TCP a retry re-opens the connection and
+            // resends the frame.
             log.warn("dns: timeout after {d} tries for {s}", .{ job.tries, job.name });
             self.failQuery(job);
             return;
         }
         job.tries += 1;
         if (job.use_tcp) {
-            self.tcpSend(job) catch {
-                self.dropJob(job, .failed);
-                return;
+            self.tcpRestart(job) catch |err| {
+                if (err == error.PeerClosed) {
+                    if (!self.tcpPeerClosed(job)) return;
+                } else if (err == error.ConnectFailed) {
+                    self.tcpClose(job);
+                    self.failQuery(job);
+                    return;
+                } else {
+                    self.dropJob(job, .failed);
+                    return;
+                }
             };
         } else {
             self.sendUdp(job.request) catch {
@@ -868,10 +982,14 @@ pub const Resolver = struct {
             // and a failed TLSA lookup marks the target lookup_failed
             // (a temporary failure, never PKIX).
             .addr => {
+                job.target_err = true;
                 job.phase = .addr6;
                 self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
             },
-            .addr6 => self.finishTarget(job),
+            .addr6 => {
+                job.target_err = true;
+                self.finishTarget(job);
+            },
             .tlsa => self.failTargetTlsa(job),
             .fallback_addr => {
                 job.fallback_err = true;
@@ -930,31 +1048,119 @@ pub const Resolver = struct {
 
     // -- TCP fallback ----------------------------------------------------
 
+    /// Drop the job's TCP connection and staged frame. close() retires
+    /// the socket's knotes at once; the resolver stages no deletes.
+    /// Events already harvested for the old fd are caught by the seq
+    /// check in tcpJobFromEvent.
+    fn tcpClose(self: *Resolver, job: *Job) void {
+        _ = self;
+        if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
+        job.tcp_fd = -1;
+        job.tcp_connected = false;
+        job.tcp_buf.clearRetainingCapacity();
+        job.tcp_out.clearRetainingCapacity();
+        job.tcp_out_pos = 0;
+    }
+
+    /// Re-open the TCP leg from scratch: a retry is a fresh connection
+    /// carrying the frame again, which covers a dead connection and a
+    /// frame stuck mid-write alike.
+    fn tcpRestart(self: *Resolver, job: *Job) !void {
+        self.tcpClose(job);
+        try self.tcpSend(job);
+    }
+
+    /// A synchronous connect refusal is the same wire failure the
+    /// pending-connect SO_ERROR arm reports: the dead socket is
+    /// dropped and the per-phase failure runs, so a refusal costs
+    /// only the failing phase. Returns true when `err` was the
+    /// refusal (and handled); the job may be freed, so callers must
+    /// not touch it afterwards.
+    fn tcpConnectFailed(self: *Resolver, job: *Job, err: anyerror) bool {
+        if (err != error.ConnectFailed) return false;
+        self.tcpClose(job);
+        self.failQuery(job);
+        return true;
+    }
+
+    /// The peer closed or reset the connection while the outstanding
+    /// query was unanswered: RFC 7766 permits a close after any
+    /// answer, so the query is re-sent once on a fresh connection
+    /// instead of failing. A second close on the same query, or a
+    /// failed reconnect whether it arrives as a send error here or as
+    /// SO_ERROR on the connect's knote, runs the ordinary failQuery
+    /// path which costs only the failing phase. Returns false once
+    /// failQuery ran: the job may already be freed and must not be
+    /// touched again.
+    fn tcpPeerClosed(self: *Resolver, job: *Job) bool {
+        self.tcpClose(job);
+        if (job.tcp_eof_resent) {
+            self.failQuery(job);
+            return false;
+        }
+        job.tcp_eof_resent = true;
+        self.tcpSend(job) catch {
+            self.failQuery(job);
+            return false;
+        };
+        return true;
+    }
+
     /// Open the TCP socket and start connect; the WRITE knote drives the
     /// actual send once connect completes.
     fn tcpSend(self: *Resolver, job: *Job) !void {
-        if (job.tcp_fd >= 0) return self.tcpWrite(job);
+        if (job.tcp_fd >= 0) {
+            // A pending connect owns the armed one-shot WRITE knote:
+            // it stages and flushes the frame once SO_ERROR clears.
+            // Writing now would send on an unconnected socket, whose
+            // ENOTCONN is a panic under std.posix, not an error.
+            if (!job.tcp_connected) return;
+            return self.tcpWrite(job);
+        }
         const fd = try posix.socket(self.server.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
         errdefer posix.close(fd);
+        job.tcp_seq +%= 1;
         var ch: [2]posix.Kevent = undefined;
         var connected = true;
-        posix.connect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
-            error.WouldBlock => connected = false,
-            else => return e,
-        };
-        ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = 0 };
+        if (builtin.is_test) {
+            // FreeBSD refuses connects synchronously on real paths
+            // (loopback ~1%, pf EACCES on a source-port collision), so
+            // the refusal arm is exercised here, not only probed.
+            if (self.fail_connects > 0) {
+                self.fail_connects -= 1;
+                return error.ConnectFailed;
+            }
+            // Skip connect(2): the socket stays unconnected, so the
+            // armed WRITE knote never fires and the connect stays
+            // pending for as long as the test needs it.
+            if (self.pend_connects) connected = false;
+        }
+        if (connected) {
+            rawConnect(fd, &self.server.any, self.server.getOsSockLen()) catch |e| switch (e) {
+                error.WouldBlock => connected = false,
+                error.Failed => return error.ConnectFailed,
+            };
+        }
+        ch[0] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.READ, .flags = std.c.EV.ADD | std.c.EV.ENABLE, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
         var n: usize = 1;
         if (!connected) {
             // Only a pending connect wants the writable event; arming
             // it after an immediate connect would fire a second write
             // of the same frame later.
-            ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = 0 };
+            ch[1] = .{ .ident = @intCast(fd), .filter = std.c.EVFILT.WRITE, .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT, .fflags = 0, .data = 0, .udata = tcpUdata(job) };
             n = 2;
         }
         try self.keventApply(ch[0..n]);
         job.tcp_fd = fd;
         job.tcp_connected = connected;
-        if (connected) return self.tcpWrite(job);
+        if (connected) self.tcpWrite(job) catch |err| {
+            // The errdefer above closes fd on this error path; detach
+            // it from the job so a later tcpClose cannot close a
+            // recycled fd number.
+            job.tcp_fd = -1;
+            job.tcp_connected = false;
+            return err;
+        };
     }
 
     /// Re-arm the one-shot writable event so a flush that hit
@@ -966,13 +1172,17 @@ pub const Resolver = struct {
             .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
             .fflags = 0,
             .data = 0,
-            .udata = 0,
+            .udata = tcpUdata(job),
         }};
         try self.keventApply(&ch);
     }
 
     /// TCP DNS frames are length-prefixed; the frame is staged once in
     /// tcp_out and flushed across partial writes and WouldBlock.
+    /// MSG.NOSIGNAL keeps a write to a dead peer an EPIPE error rather
+    /// than a process-killing SIGPIPE; that error and a reset report
+    /// the same close-after-answer condition as a read-side EOF, so
+    /// they surface as error.PeerClosed.
     fn tcpWrite(self: *Resolver, job: *Job) !void {
         if (job.tcp_out.items.len == 0) {
             var hdr: [2]u8 = undefined;
@@ -981,8 +1191,9 @@ pub const Resolver = struct {
             try job.tcp_out.appendSlice(self.alloc, job.request);
         }
         while (job.tcp_out_pos < job.tcp_out.items.len) {
-            const n = posix.send(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], 0) catch |err| switch (err) {
+            const n = rawSend(job.tcp_fd, job.tcp_out.items[job.tcp_out_pos..], posix.MSG.NOSIGNAL) catch |err| switch (err) {
                 error.WouldBlock => return self.armTcpWrite(job),
+                error.Closed => return error.PeerClosed,
                 else => return error.SendFailed,
             };
             job.tcp_out_pos += n;
@@ -1029,28 +1240,41 @@ pub const Resolver = struct {
         }
     }
 
-    fn onTcpReadable(self: *Resolver, fd: posix.fd_t) void {
-        for (self.jobs.items) |job| {
-            if (job.tcp_fd != fd) continue;
-            var buf: [8192]u8 = undefined;
-            const n = posix.recv(fd, &buf, 0) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => {
+    fn onTcpReadable(self: *Resolver, job: *Job) void {
+        var buf: [8192]u8 = undefined;
+        const n = rawRecv(job.tcp_fd, &buf, 0) catch |err| switch (err) {
+            error.WouldBlock => return,
+            // A reset after the frame was written reports the same
+            // close-after-answer condition as the FIN below.
+            error.Closed => {
+                _ = self.tcpPeerClosed(job);
+                return;
+            },
+            else => {
+                // An error on a socket whose connect never completed
+                // is the refused-connect condition: the outstanding
+                // query runs the ordinary phase failure.
+                if (!job.tcp_connected) {
+                    self.tcpClose(job);
+                    self.failQuery(job);
+                } else {
                     self.dropJob(job, .failed);
-                    return;
-                },
-            };
-            if (n == 0) {
-                self.dropJob(job, .failed);
+                }
                 return;
-            }
-            job.tcp_buf.appendSlice(self.alloc, buf[0..n]) catch {
-                self.dropJob(job, .failed);
-                return;
-            };
-            self.pumpTcpFrames(job);
+            },
+        };
+        if (n == 0) {
+            // RFC 7766 lets a server close after any answer; the
+            // outstanding query is re-sent once on a fresh
+            // connection before the phase is given up.
+            _ = self.tcpPeerClosed(job);
             return;
         }
+        job.tcp_buf.appendSlice(self.alloc, buf[0..n]) catch {
+            self.dropJob(job, .failed);
+            return;
+        };
+        self.pumpTcpFrames(job);
     }
 
     // -- responses --------------------------------------------------------
@@ -1077,11 +1301,11 @@ pub const Resolver = struct {
     pub fn onReadable(self: *Resolver) void {
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = posix.recv(self.fd, &buf, 0) catch |err| switch (err) {
+            const n = rawRecv(self.fd, &buf, 0) catch |err| switch (err) {
                 error.WouldBlock => return,
                 // A refusal queued by an earlier datagram is consumed,
                 // not charged to whichever job receives next.
-                error.ConnectionRefused => {
+                error.Refused => {
                     self.stale_icmp += 1;
                     continue;
                 },
@@ -1108,10 +1332,20 @@ pub const Resolver = struct {
         defer arena_state.deinit();
 
         const msg = wire.parse(arena_state.allocator(), pkt) catch return self.dropJob(job, .failed);
-        if (msg.truncated and !job.use_tcp) {
+        if (msg.truncated) {
+            // A TC message is never an answer. On a job already on
+            // TCP it is a late duplicate of the reply that caused
+            // the upgrade; parsing it as NODATA would forge an empty
+            // answer and, on a TLSA leg, downgrade a failed lookup
+            // to absent (ADR-13).
+            if (job.use_tcp) return;
             job.use_tcp = true;
             job.tries = 0;
-            self.tcpSend(job) catch return self.dropJob(job, .failed);
+            self.tcpSend(job) catch |err| {
+                if (err == error.PeerClosed) {
+                    if (!self.tcpPeerClosed(job)) return;
+                } else if (self.tcpConnectFailed(job, err)) return else return self.dropJob(job, .failed);
+            };
             self.armDeadline(job, TCP_TIMEOUT_MS) catch return self.dropJob(job, .failed);
             return;
         }
@@ -1496,7 +1730,10 @@ pub const Resolver = struct {
                     }
                 }
                 job.phase = .addr6;
-                self.sendAddr(job, KIND_AAAA) catch return self.finishTarget(job);
+                self.sendAddr(job, KIND_AAAA) catch {
+                    job.target_err = true;
+                    return self.finishTarget(job);
+                };
             },
             .addr6 => {
                 const target = &job.srv_list.items[job.srv_pos];
@@ -1625,7 +1862,7 @@ pub const Resolver = struct {
                 for (job.srv_list.items) |e| {
                     if (!e.unavailable) all_dot = false;
                 }
-                return self.dropJob(job, if (all_dot) .service_unavailable else .nxdomain);
+                return self.dropJob(job, if (all_dot) .service_unavailable else if (job.target_err) .failed else .nxdomain);
             }
             return self.complete(job);
         }
@@ -1765,7 +2002,7 @@ pub const Resolver = struct {
     fn freeJob(self: *Resolver, job: *Job) void {
         if (self.slots[job.slot] == job) self.slots[job.slot] = null;
         self.disarmDeadline(job);
-        if (job.tcp_fd >= 0) posix.close(job.tcp_fd);
+        self.tcpClose(job);
         job.tcp_buf.deinit(self.alloc);
         job.tcp_out.deinit(self.alloc);
         self.alloc.free(job.name);
@@ -1792,6 +2029,79 @@ pub const Resolver = struct {
         self.sendFallback(job, KIND_AAAA) catch return self.dropJob(job, .failed);
     }
 };
+
+// -- raw socket calls -------------------------------------------------------
+//
+// std.posix maps several socket errnos to unreachable (ENOTCONN on
+// send, EBADF/EINVAL on recv and kevent, EISCONN/ECONNABORTED on
+// connect). A wire-level event must never panic the process, so the
+// send/recv/connect paths below use std.c directly and their errno
+// tables have no unreachable arm: anything unmapped is a plain
+// failure the caller already handles.
+
+const SockErr = error{ WouldBlock, Refused, Closed, Failed };
+
+fn rawSend(fd: posix.fd_t, buf: []const u8, flags: u32) SockErr!usize {
+    while (true) {
+        const rc = std.c.sendto(fd, buf.ptr, buf.len, flags, null, 0);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNREFUSED => return error.Refused,
+            .PIPE, .CONNRESET => return error.Closed,
+            else => return error.Failed,
+        }
+    }
+}
+
+fn rawRecv(fd: posix.fd_t, buf: []u8, flags: u32) SockErr!usize {
+    while (true) {
+        const rc = std.c.recvfrom(fd, buf.ptr, buf.len, flags, null, null);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNREFUSED => return error.Refused,
+            .CONNRESET => return error.Closed,
+            else => return error.Failed,
+        }
+    }
+}
+
+fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) error{ WouldBlock, Failed }!void {
+    while (true) {
+        const rc = std.c.connect(fd, addr, len);
+        if (rc == 0) return;
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            .AGAIN, .INPROGRESS, .ALREADY => return error.WouldBlock,
+            else => return error.Failed,
+        }
+    }
+}
+
+/// SO_ERROR on a pending connect: a nonzero value means the connect
+/// failed (refused, unreachable, dead socket); the getsockopt call
+/// itself failing is the same dead-socket report.
+fn rawSoError(fd: posix.fd_t) error{Failed}!void {
+    var code: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &code, &len) != 0)
+        return error.Failed;
+    if (code != 0) return error.Failed;
+}
+
+fn rawKevent(kq: posix.fd_t, ch: []const posix.Kevent, events: []posix.Kevent, ts: ?*const std.c.timespec) error{KeventFailed}!usize {
+    while (true) {
+        const rc = std.c.kevent(kq, ch.ptr, @intCast(ch.len), events.ptr, @intCast(events.len), ts);
+        if (rc >= 0) return @intCast(rc);
+        switch (posix.errno(rc)) {
+            .INTR => continue,
+            else => return error.KeventFailed,
+        }
+    }
+}
 
 fn addrFromRdata(rr: wire.Rr, port: u16) !net.Address {
     switch (rr.rtype) {
@@ -2788,11 +3098,13 @@ test "dns-async: the fallback address path honors the requested port" {
 const FreeingCtx = struct {
     calls: usize = 0,
     keys: [8]usize = .{0} ** 8,
+    status: ?Status = null,
 
-    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, _: Status, res: ?Resolution) void {
+    fn onResolve(ctx_ptr: ?*anyopaque, key: usize, status: Status, res: ?Resolution) void {
         const self: *FreeingCtx = @ptrCast(@alignCast(ctx_ptr.?));
         if (self.calls < self.keys.len) self.keys[self.calls] = key;
         self.calls += 1;
+        self.status = status;
         if (res) |r| {
             var v = r;
             v.deinitOn(std.testing.allocator);
@@ -3142,6 +3454,52 @@ test "dns-async: identical resolves merge into one job" {
     try std.testing.expectEqual(@as(usize, 2), ctx.calls);
     // Both session keys were notified exactly once.
     try std.testing.expect((ctx.keys[0] == 1 and ctx.keys[1] == 2) or (ctx.keys[0] == 2 and ctx.keys[1] == 1));
+}
+
+test "dns-async: a trailing dot resolves like the bare name" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // The FQDN must run the same SRV chain as "svc.test" over the wire.
+    try r.resolve("svc.test.", .client, 5222, 3, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expect(res.targets.len >= 1);
+    try std.testing.expectEqualSlices(u8, "srv.test", res.targets[0].host);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
+test "dns-async: an FQDN and the bare name merge into one job" {
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    // The stripped name is the merge key, so both lookups share one
+    // wire exchange and each waiter still gets its own callback.
+    try r.resolve("svc.test.", .client, 5222, 1, false);
+    try r.resolve("svc.test", .client, 5222, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
+
+    var spins: usize = 0;
+    while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
 }
 
 test "dns-async: over-cap requests queue and cancel detaches" {
@@ -3731,6 +4089,8 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
 
     // A non-blocking connect to a closed port reports writable with
     // SO_ERROR set; the engine's EVFILT.WRITE path must drop the job.
+    // The knote carries the (seq, gen, slot) udata the resolver stamps
+    // on its own TCP registrations.
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
     var ch = [1]posix.Kevent{.{
         .ident = @intCast(fd),
@@ -3738,7 +4098,7 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
         .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
         .fflags = 0,
         .data = 0,
-        .udata = 0,
+        .udata = Resolver.tcpUdata(job),
     }};
     _ = posix.kevent(r.kq, &ch, &.{}, null) catch {};
     posix.connect(fd, &r.server.any, r.server.getOsSockLen()) catch {};
@@ -3748,6 +4108,816 @@ test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
     while (ctx.status == null and spins < 100) : (spins += 1) r.step(50);
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a chain query staged while the TCP connect is pending cannot panic" {
+    // Goal: a TC upgrade whose TCP connect stays pending must not
+    // crash when the next phase's query reuses the socket: send(2)
+    // on a pending connect is ENOTCONN, which std maps to
+    // unreachable. The pending WRITE knote owns the send instead.
+    // Method: the pend_connects seam holds every connect pending
+    // without calling connect(2), so the test cannot race a
+    // synchronous refusal; feed the chain a TC answer and run the
+    // retry deadlines so failQuery sends the _xmpp SRV query while
+    // the connect is still pending.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+    try std.testing.expect(job.tcp_fd >= 0);
+    try std.testing.expect(!job.tcp_connected);
+
+    // Retry deadlines re-open the connection each time; the seam
+    // keeps every connect pending.
+    r.onDeadline(job);
+    try std.testing.expect(!job.tcp_connected);
+    r.onDeadline(job);
+    // tries exhausted: failQuery advances to the _xmpp SRV query,
+    // which stages on the still-pending socket instead of writing.
+    r.onDeadline(job);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.srv_plain, r.jobs.items[0].phase);
+
+    // The whole-chain bound then ends the lookup as a failure.
+    r.onChainDeadline(job);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+}
+
+test "dns-async: a duplicate TC reply during a pending connect cannot panic" {
+    // Same pending-connect hazard, reached by a second truncated
+    // answer matching the retransmitted UDP query: the phase machine
+    // must never let a send hit the unconnected socket. The
+    // pend_connects seam keeps the connect pending deterministically.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+
+    var tbuf: [512]u8 = undefined;
+    const tl = buildTruncated(&tbuf, job.request);
+    r.handleResponse(job, tbuf[0..tl]);
+    try std.testing.expect(!job.tcp_connected);
+    r.handleResponse(job, tbuf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    // The next phase's sendQuery reuses the still-pending socket: the
+    // guard in tcpSend leaves the frame to the armed WRITE knote
+    // rather than writing to the unconnected socket.
+    r.handleResponse(job, tbuf[0..answerTcpQuery(&tbuf, job.request)]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.srv_plain, r.jobs.items[0].phase);
+    try std.testing.expect(!r.jobs.items[0].tcp_connected);
+
+    r.onChainDeadline(r.jobs.items[0]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: a late TC reply on the TCP leg is not an answer (per-target TLSA)" {
+    // Goal: a truncated UDP reply arriving after the job upgraded to
+    // TCP must be ignored, never parsed as NODATA: on a TLSA leg
+    // that forged absence would permit PKIX under dane_first
+    // (ADR-13). The leg must stay lookup_failed.
+    // Method: the pend_connects seam holds the TCP connect pending;
+    // feed the chain into the .tlsa phase, upgrade with a TC reply,
+    // feed the same TC again, then run the retry deadlines.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+
+    // _xmpps SRV NODATA, _xmpp SRV, A record, AAAA NODATA: the job
+    // is now in the .tlsa phase with the TLSA query outstanding.
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+
+    // The TC reply upgrades the query to TCP; the connect stays
+    // pending.
+    const tl = buildTruncated(&buf, job.request);
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expect(job.use_tcp);
+    try std.testing.expect(!job.tcp_connected);
+
+    // The retransmit's late TC reply must be ignored: the job keeps
+    // its TLSA phase instead of taking the forged empty answer.
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.tlsa, r.jobs.items[0].phase);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    // The TCP leg can never answer; retry deadlines exhaust into the
+    // ordinary phase failure, which marks the target lookup_failed.
+    // Each deadline may free the job, so it is re-fetched from the
+    // list instead of trusting the stale pointer.
+    for (0..MAX_TRIES + 2) |_| {
+        if (r.jobs.items.len == 0 or ctx.status != null) break;
+        r.onDeadline(r.jobs.items[0]);
+    }
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a late TC reply on the TCP leg is not an answer (fallback TLSA)" {
+    // Same forged-NODATA guard as above, on the no-SRV fallback TLSA
+    // leg: the shared TLSA status of the fallback targets must stay
+    // lookup_failed. The pend_connects seam holds the connect pending.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+
+    // Both SRV names NODATA, AAAA NODATA, A record: the job is now
+    // in the .fallback_tlsa phase with the TLSA query outstanding.
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_tlsa, job.phase);
+
+    const tl = buildTruncated(&buf, job.request);
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expect(!job.tcp_connected);
+
+    r.handleResponse(job, buf[0..tl]);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(Phase.fallback_tlsa, r.jobs.items[0].phase);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    // Each deadline may free the job; re-fetch it from the list.
+    for (0..MAX_TRIES + 2) |_| {
+        if (r.jobs.items.len == 0 or ctx.status != null) break;
+        r.onDeadline(r.jobs.items[0]);
+    }
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a second close on the same TCP query fails the phase (TLSA lookup_failed)" {
+    // Goal: RFC 7766 close-after-answer permits one resend. A second
+    // close while the resent query is unanswered runs failQuery, so
+    // a TLSA leg keeps lookup_failed - never nxdomain, never a
+    // whole-job drop, and never a third connection.
+    // Method: the chain is fed to .tlsa over injected answers, the
+    // TLSA query upgrades to TCP on a test listener, and both
+    // accepted connections read the frame then close unanswered.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    var accepts: usize = 0;
+    while (accepts < 2 and ctx.status == null) : (accepts += 1) {
+        const cfd = try acceptTcpBounded(&r, lfd);
+        try posix.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        var got: usize = 0;
+        var spins: usize = 0;
+        while (got == 0 and spins < 100 and ctx.status == null) : (spins += 1) {
+            r.step(10);
+            if (readFull(cfd, &hdr) == 2) {
+                const want = std.mem.readInt(u16, &hdr, .big);
+                if (readFull(cfd, fbuf[0..want]) == want) got = want;
+            }
+        }
+        try std.testing.expect(got > 0);
+        // FIN without answering: exercises the recv-0 (FIN) arm of
+        // tcpPeerClosed, not the reset arm.
+        posix.close(cfd);
+    }
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+    try std.testing.expectEqual(@as(usize, 2), accepts);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+
+    // The resend bound held: no third connection was opened.
+    try std.testing.expectError(error.WouldBlock, posix.accept(lfd, null, null, 0));
+}
+
+test "dns-async: a partial frame from a closed connection is dropped, not replayed" {
+    // Goal: tcpClose must clear tcp_buf; a fragment received before
+    // the peer closed must not sit in front of the next connection's
+    // stream, where it would corrupt the frame framing.
+    // Method: the first accepted connection is sent half a frame and
+    // closed; the resent query's connection gets a clean answer.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    const cfd1 = try acceptTcpBounded(&r, lfd);
+    try posix.setsockopt(cfd1, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd1, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd1, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expect(got > 0);
+    // Half a foreign frame, then FIN.
+    const frag = [7]u8{ 0, 20, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE };
+    _ = try posix.send(cfd1, &frag, posix.MSG.NOSIGNAL);
+    posix.close(cfd1);
+
+    // The resent query arrives on a second connection; the fragment
+    // must not precede its answer in tcp_buf.
+    const cfd2 = try acceptTcpBounded(&r, lfd);
+    try posix.setsockopt(cfd2, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    got = 0;
+    spins = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd2, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd2, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    var abuf: [1024]u8 = undefined;
+    const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+    var out_hdr: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+    _ = try posix.send(cfd2, &out_hdr, posix.MSG.NOSIGNAL);
+    _ = try posix.send(cfd2, abuf[0..rlen], posix.MSG.NOSIGNAL);
+    spins = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+    posix.close(cfd2);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.rrs.len);
+}
+
+test "dns-async: a stale TCP event on a recycled fd is ignored" {
+    // Goal: TCP knote udata names the connection by (seq, gen, slot);
+    // an event armed for a dead connection on the same fd number must
+    // not reach the job that owns the fd now.
+    // Method: a pending connect held by the pend_connects seam, then
+    // dispatch fabricated READ and WRITE events carrying the previous
+    // seq.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(job.tcp_fd >= 0);
+    try std.testing.expect(!job.tcp_connected);
+
+    const stale_udata = (@as(usize, job.tcp_seq -% 1) << 32) |
+        (@as(usize, job.gen) << 8) | job.slot;
+    var ev = [1]posix.Kevent{.{
+        .ident = @intCast(job.tcp_fd),
+        .filter = std.c.EVFILT.WRITE,
+        .flags = 0,
+        .fflags = 0,
+        .data = 0,
+        .udata = stale_udata,
+    }};
+    r.dispatchEvents(&ev);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expect(!job.tcp_connected);
+
+    ev[0].filter = std.c.EVFILT.READ;
+    r.dispatchEvents(&ev);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+}
+
+test "dns-async: the bare name and its FQDN merge in either order" {
+    // Goal: the merge key is the stripped name, so a bare lookup
+    // started first still shares the FQDN's wire exchange.
+    // Method: bare first, dotted second; one job, two waiters.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = FreeingCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = FreeingCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    try r.resolve("svc.test.", .client, 5222, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.jobs.items[0].waiter_count);
+
+    var spins: usize = 0;
+    while (ctx.calls < 2 and spins < 200) : (spins += 1) r.step(50);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+}
+
+test "dns-async: a raw query strips one trailing dot like resolve" {
+    // Goal: query() takes the same FQDN normalization as resolve();
+    // "host.test." must reach the wire as host.test, not fail on the
+    // empty label an unstripped name would encode.
+    // Method: one dotted A query against FakeDns; resolved not nxdomain.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test.", .a, 7);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.raw.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.rrs.len);
+}
+
+test "dns-async: only one trailing dot is stripped" {
+    // Goal: "svc.test.." keeps a trailing dot after one strip, so the
+    // empty label cannot be encoded and the resolve is a synchronous
+    // nxdomain with no wire traffic.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test..", .client, 5222, 1, false);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a refused TCP connect fails the phase, not the job" {
+    // Goal: a refused connect reports writable with SO_ERROR set; the
+    // outstanding query runs the ordinary phase-scoped failQuery
+    // path (the same condition tcpPeerClosed documents for a failed
+    // reconnect), so a TLSA leg ends lookup_failed and the resolve
+    // completes instead of dropping the whole job.
+    // Method: the chain is fed to .tlsa over injected answers, then
+    // the TC upgrade connects to a port nobody listens on. The UDP
+    // target is a bound socket that absorbs the queries: an
+    // unbound port's ICMP refusals could latch onto the resolver's
+    // own sends and fail the leg before TCP is reached.
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(ufd);
+    const uaddr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen());
+    var uactual: posix.sockaddr = undefined;
+    var uslen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(ufd, &uactual, &uslen);
+    const port = net.Address.initPosix(@alignCast(&uactual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a synchronous connect refusal fails the phase, not the job" {
+    // Goal: a connect refused inside connect(2) - FreeBSD does this on
+    // real paths (loopback ~1%, pf EACCES on a source-port collision) -
+    // runs the same per-phase failQuery the asynchronous SO_ERROR arm
+    // runs, so a TLSA leg ends lookup_failed and the resolve completes.
+    // Method: the chain is fed to .tlsa over injected answers, then the
+    // TC upgrade hits the fail_connects seam inside tcpSend.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, job.phase);
+    r.fail_connects = 4;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a synchronous refusal at the deadline restart fails the phase" {
+    // Goal: onDeadline re-opens a dead TCP leg through tcpRestart; a
+    // connect refused inside connect(2) there must run the same
+    // per-phase failQuery as the asynchronous SO_ERROR arm, so the
+    // TLSA leg ends lookup_failed instead of dropping the job.
+    // Method: the chain is fed to .tlsa over injected answers, the
+    // TLSA query upgrades to TCP on a held-pending connect, and the
+    // retry deadline hits the fail_connects seam for one refusal.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.tlsa, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    r.fail_connects = 1;
+    r.onDeadline(job);
+    // The refusal was consumed by the restart's connect; the TLSA
+    // leg failed the phase and the resolve completed.
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqual(TlsaStatus.lookup_failed, res.targets[0].tlsa_status);
+}
+
+test "dns-async: a synchronous refusal on the TCP reuse arm fails the phase" {
+    // Goal: sendQuery on a TCP job with an empty write buffer takes
+    // the reuse arm; a synchronous refusal there runs failQuery, not
+    // a job drop.
+    // Method: the fallback chain reaches .fallback_addr, upgrades to
+    // TCP on a held connect, then the socket is closed and the AAAA
+    // leg answered: the A sendQuery re-opens TCP through the reuse
+    // arm into the seam's one refusal, and the collected address
+    // still resolves the job.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    r.tcpClose(job);
+    r.fail_connects = 1;
+    r.handleResponse(job, buf[0..buildAaaaAnswer(&buf, job.request)]);
+    // The refusal was consumed by the reuse arm's connect; the A leg
+    // failed but the AAAA answer still emitted the fallback target.
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+}
+
+test "dns-async: a synchronous refusal on the TCP restart arm fails the phase" {
+    // Goal: sendQuery on a TCP job with a mid-write frame takes the
+    // restart arm (tcpClose + tcpSend); a synchronous refusal there
+    // runs failQuery, not a job drop.
+    // Method: same fallback staging; tcp_out is staged mid-write so
+    // the A sendQuery takes the restart arm into the refusal.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    try std.testing.expect(r.jobs.items[0].use_tcp);
+
+    try job.tcp_out.append(std.testing.allocator, 0);
+    job.tcp_out_pos = 0;
+    r.fail_connects = 1;
+    r.handleResponse(job, buf[0..buildAaaaAnswer(&buf, job.request)]);
+    try std.testing.expectEqual(@as(usize, 0), r.fail_connects);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+}
+
+test "dns-async: an A SERVFAIL plus AAAA NODATA is a temporary failure, not nxdomain" {
+    // Goal: a per-target leg that fails marks target_err, so one dead
+    // family plus one empty family is a temporary failure, never an
+    // nxdomain that would end the chain as 'no service'.
+    // Method: an SRV answer, a SERVFAIL on the A leg, NODATA on the
+    // AAAA leg; the resolve must report .failed.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Phase.addr6, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an A NODATA plus AAAA SERVFAIL is a temporary failure, not nxdomain" {
+    // Same pin for the .addr6 setter: the failure marker set by the
+    // second address leg must also produce .failed.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr6, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an AAAA send failure after an empty A leg is a temporary failure, not nxdomain" {
+    // Same pin for the sendAddr(AAAA) catch in .addr: a wire send
+    // failure marks target_err, so the dead family plus the empty A
+    // leg is .failed; without the setter the result is .nxdomain.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..answerTcpQuery(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.addr, r.jobs.items[0].phase);
+    r.fail_sends = true;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.fail_sends = false;
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an AAAA SERVFAIL plus A NODATA fallback is a temporary failure, not nxdomain" {
+    // The fallback_err setter on the first fallback leg: a failed
+    // AAAA leg plus an empty A leg is a temporary failure.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Phase.fallback_addr4, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: an AAAA NODATA plus A SERVFAIL fallback is a temporary failure, not nxdomain" {
+    // The fallback_err setter on the second fallback leg: an empty
+    // AAAA leg plus a failed A leg is a temporary failure.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildNodata(&buf, job.request)]);
+    try std.testing.expectEqual(Phase.fallback_addr4, r.jobs.items[0].phase);
+    r.handleResponse(job, buf[0..buildRcode(&buf, job.request, 2)]);
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+}
+
+test "dns-async: tcp_seq advances on every connection attempt" {
+    // TCP knote udata names a connection by (seq, gen, slot); a seq
+    // that did not advance would let an old connection's events reach
+    // the new one. Every tcpSend must bump it.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.pend_connects = true;
+    r.setServer(try net.Address.parseIp("192.0.2.1", 53));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+    try r.resolve("svc.test", .client, 5222, 1, true);
+    const job = r.jobs.items[0];
+    var buf: [512]u8 = undefined;
+    r.handleResponse(job, buf[0..buildTruncated(&buf, job.request)]);
+    const s0 = r.jobs.items[0].tcp_seq;
+    r.onDeadline(job);
+    try std.testing.expectEqual(s0 +% 1, r.jobs.items[0].tcp_seq);
+    r.onDeadline(r.jobs.items[0]);
+    try std.testing.expectEqual(s0 +% 2, r.jobs.items[0].tcp_seq);
+}
+
+test "dns-async: a kevent error in step is counted" {
+    // A dead kqueue must not fail silently: step() counts each
+    // kevent error so the caller has a signal in the spin.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    const saved = r.kq;
+    // A non-kqueue fd makes kevent(2) fail every time.
+    r.kq = ufd;
+    r.step(0);
+    try std.testing.expectEqual(@as(usize, 1), r.kevent_errors);
+    r.step(0);
+    try std.testing.expectEqual(@as(usize, 2), r.kevent_errors);
+    r.kq = saved;
+    posix.close(ufd);
+}
+
+test "dns-async: a write on a send-shutdown socket reports peer close, not a drop" {
+    // shutdown(.send) sets SBS_CANTSENDMORE locally and at once, so
+    // the next send fails EPIPE with no peer timing; a peer close
+    // would race FIN-vs-RST on loopback. tcpWrite must map EPIPE to
+    // PeerClosed so tcpPeerClosed resends on a fresh connection
+    // instead of dropping the job.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const la = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &la.any, la.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const sa = net.Address.initPosix(@alignCast(&actual));
+
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    try posix.connect(cfd, &sa.any, sa.getOsSockLen());
+    const afd = try posix.accept(lfd, null, null, 0);
+    defer posix.close(afd);
+    try posix.shutdown(cfd, .send);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(sa);
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+    job.tcp_fd = cfd;
+    job.tcp_connected = true;
+    try std.testing.expectError(error.PeerClosed, r.tcpWrite(job));
+    job.tcp_fd = -1;
+    posix.close(cfd);
 }
 
 test "dns-async: a repeat resolve is served by the RR cache without wire" {
@@ -3812,6 +4982,31 @@ test "dns-async: a SERVFAIL on one SRV target skips only that target" {
         try std.testing.expect(!std.mem.eql(u8, t.host, "t0.test"));
     }
     try std.testing.expect(saw_t1 and saw_t2);
+}
+
+test "dns-async: every address family failing is a temporary failure, not nxdomain" {
+    // Goal: when every address query for every SRV target hard-fails
+    // the resolve reports .failed (a temporary failure the s2s retry
+    // may re-attempt), never .nxdomain, which is reserved for
+    // authoritative absences and treated as permanent.
+    // Method: FakeDns answers SERVFAIL for both address families.
+    const srv = try startFakeDns(false, "");
+    defer stopFakeDns(srv);
+    srv.a_fail.store(true, .monotonic);
+    srv.aaaa_fail.store(true, .monotonic);
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", srv.port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    var spins: usize = 0;
+    while (ctx.status == null and spins < 200) : (spins += 1) r.step(50);
+
+    try std.testing.expectEqual(Status.failed, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
 }
 
 test "dns-async: an AAAA SERVFAIL keeps the resolved A address" {
@@ -4176,6 +5371,39 @@ test "dns-async: applying changes never drains the events a parent watches" {
     try std.testing.expect(got >= 1);
 }
 
+test "dns-async: a failed socket registration leaves no dangling fd" {
+    // Goal: when the UDP socket's knote registration fails, self.fd
+    // must not keep the closed descriptor: a stale number would send
+    // on whatever reuses it and deinit would close that stranger's
+    // socket (or panic on EBADF).
+    // Method: fail the registration through the seam, then check the
+    // resolver stays closed and deinit leaves a reused fd alive.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    r.fail_kevents = true;
+
+    try std.testing.expectError(error.KeventChange, r.ensureOpen());
+    try std.testing.expectEqual(@as(posix.fd_t, -1), r.fd);
+
+    // An unrelated socket may now hold the abandoned number; deinit
+    // must not close it.
+    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    r.deinit();
+    // deinit frees but does not reset the struct; a fresh resolver
+    // keeps the deferred deinit off dangling lists.
+    r = Resolver.init(std.testing.allocator);
+    try posix.getsockname(ufd, &actual, &slen);
+    posix.close(ufd);
+
+    // A retry with the seam cleared opens cleanly.
+    r.setServer(try net.Address.parseIp("127.0.0.1", 53));
+    try r.ensureOpen();
+    try std.testing.expect(r.fd >= 0);
+}
+
 var fake_now: i64 = 0;
 fn fakeNow() i64 {
     return fake_now;
@@ -4314,6 +5542,63 @@ fn buildTruncated(out: []u8, qpkt: []const u8) usize {
     return 12 + qlen;
 }
 
+/// A NODATA echo of `qpkt`: NOERROR with no answers, used to feed
+/// the chain one phase at a time in tests.
+fn buildNodata(out: []u8, qpkt: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    return 12 + qlen;
+}
+
+/// An error echo of `qpkt` carrying `rcode` (SERVFAIL is 2): runs the
+/// per-phase failure path for the outstanding query.
+fn buildRcode(out: []u8, qpkt: []const u8, rcode: u16) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180 | rcode, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    @memset(out[6..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    return 12 + qlen;
+}
+
+/// One AAAA answer record for ::1 (owner = the question).
+fn encodeAaaaRr(out: []u8) usize {
+    var off: usize = 0;
+    out[off] = 0xC0;
+    out[off + 1] = 0x0C;
+    off += 2;
+    std.mem.writeInt(u16, out[off..][0..2], wire.TYPE_AAAA, .big);
+    std.mem.writeInt(u16, out[off + 2 ..][0..2], 1, .big);
+    std.mem.writeInt(u32, out[off + 4 ..][0..4], 60, .big);
+    std.mem.writeInt(u16, out[off + 8 ..][0..2], 16, .big);
+    off += 10;
+    @memcpy(out[off .. off + 16], &([1]u8{0} ** 15 ++ [1]u8{1}));
+    return off + 16;
+}
+
+/// An AAAA answer for any question: feeds the fallback chain a real
+/// address where a same-type answer is needed.
+fn buildAaaaAnswer(out: []u8, qpkt: []const u8) usize {
+    const id = std.mem.readInt(u16, qpkt[0..2], .big);
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    std.mem.writeInt(u16, out[2..4], 0x8180, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], 1, .big);
+    @memset(out[8..12], 0);
+    const qlen = qpkt.len - 12;
+    @memcpy(out[12 .. 12 + qlen], qpkt[12..]);
+    var off = 12 + qlen;
+    off += encodeAaaaRr(out[off..]);
+    return off;
+}
+
 /// One SRV answer record (owner = the question via a 0xC00C pointer).
 fn encodeSrvRr(out: []u8, port: u16, target: []const u8) usize {
     var off: usize = 0;
@@ -4435,6 +5720,196 @@ test "dns-async: a kept-open TCP connection carries every chain query" {
     // _xmpps SRV, _xmpp SRV, A, AAAA: four queries share the one
     // connection the TC upgrade opened.
     try std.testing.expectEqual(@as(usize, 4), frames);
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+}
+
+/// Accept one connection on a nonblocking listener, pumping the
+/// resolver between retries so a pending connect can complete; gives
+/// up after a bounded number of spins.
+fn acceptTcpBounded(r: *Resolver, lfd: posix.fd_t) !posix.fd_t {
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        r.step(10);
+        return posix.accept(lfd, null, null, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+    }
+    return error.AcceptTimeout;
+}
+
+test "dns-async: a TCP retry resends the query on a fresh connection" {
+    // Goal: a deadline on the TCP leg re-opens the connection and
+    // resends the query frame; a retry that only re-flushes tcp_out
+    // would send nothing once the first frame is fully written.
+    // Method: test-owned listener takes the real TC upgrade, holds
+    // the first connection unanswered, fires the retry deadline via
+    // onDeadline, and answers on the second connection.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
+
+    try r.query("host.test", .a, 7);
+    const job = r.jobs.items[0];
+
+    // The truncated UDP answer upgrades the query to TCP; the first
+    // connection carries the request as its one frame.
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+
+    const cfd1 = try acceptTcpBounded(&r, lfd);
+    defer posix.close(cfd1);
+    const tv = posix.timeval{ .sec = 0, .usec = 200_000 };
+    try posix.setsockopt(cfd1, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    var got: usize = 0;
+    var spins: usize = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd1, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd1, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    try std.testing.expectEqualSlices(u8, job.request, fbuf[0..got]);
+
+    // The first frame goes unanswered; the retry deadline re-opens
+    // the connection instead of waiting on the dead one.
+    r.onDeadline(job);
+
+    const cfd2 = try acceptTcpBounded(&r, lfd);
+    defer posix.close(cfd2);
+    try posix.setsockopt(cfd2, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
+    // The abandoned first connection reads EOF.
+    var eof = false;
+    spins = 0;
+    while (!eof and spins < 100) : (spins += 1) {
+        const n = posix.recv(cfd1, &hdr, 0) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        eof = n == 0;
+    }
+    try std.testing.expect(eof);
+
+    // The second connection carries exactly one frame: the same
+    // request again, length-prefixed.
+    got = 0;
+    spins = 0;
+    while (got == 0 and spins < 100) : (spins += 1) {
+        r.step(10);
+        if (readFull(cfd2, &hdr) == 2) {
+            const want = std.mem.readInt(u16, &hdr, .big);
+            if (readFull(cfd2, fbuf[0..want]) == want) got = want;
+        }
+    }
+    try std.testing.expectEqual(job.request.len, got);
+    try std.testing.expectEqualSlices(u8, job.request, fbuf[0..got]);
+    const extra = posix.recv(cfd2, fbuf[0..1], posix.MSG.DONTWAIT) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), extra);
+
+    // Answering on the second connection resolves the query.
+    var abuf: [1024]u8 = undefined;
+    const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+    var out_hdr: [2]u8 = undefined;
+    std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+    _ = try posix.send(cfd2, &out_hdr, 0);
+    _ = try posix.send(cfd2, abuf[0..rlen], 0);
+    spins = 0;
+    while (ctx.status == null and spins < 100) : (spins += 1) r.step(10);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var raw = ctx.raw.?;
+    defer raw.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), raw.rrs.len);
+    try std.testing.expectEqual(KIND_A, raw.rrs[0].rtype);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 127, 0, 0, 1 }, raw.rrs[0].rdata);
+}
+
+test "dns-async: a server closing after an answer costs one reconnect, not the job" {
+    // Goal: RFC 7766 lets a server close the connection after any
+    // answer; a chain query written into the dead connection must be
+    // re-sent once on a fresh one instead of failing the resolve.
+    // Method: a test-owned listener answers each chain query on its
+    // own accepted connection and closes it at once, so the resolve
+    // takes one connection per query.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(lfd);
+    const bind_addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &bind_addr.any, bind_addr.getOsSockLen());
+    try posix.listen(lfd, 4);
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &slen);
+    const port = net.Address.initPosix(@alignCast(&actual)).getPort();
+
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", port));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    try r.resolve("svc.test", .client, 5222, 1, false);
+    const job = r.jobs.items[0];
+
+    // The truncated UDP answer upgrades the chain to TCP; the first
+    // connection carries the _xmpps SRV query.
+    var tbuf: [512]u8 = undefined;
+    r.handleResponse(job, tbuf[0..buildTruncated(&tbuf, job.request)]);
+
+    const tv = posix.timeval{ .sec = 0, .usec = 50_000 };
+    var accepts: usize = 0;
+    var fbuf: [1024]u8 = undefined;
+    var hdr: [2]u8 = undefined;
+    while (ctx.status == null and accepts < 8) {
+        // Each accepted connection gets exactly one query frame:
+        // answer it, then close before the next query is written, so
+        // the resolver must notice the EOF and re-connect.
+        const cfd = acceptTcpBounded(&r, lfd) catch break;
+        accepts += 1;
+        try posix.setsockopt(cfd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+        var got: usize = 0;
+        var spins: usize = 0;
+        while (got == 0 and spins < 100 and ctx.status == null) : (spins += 1) {
+            r.step(10);
+            if (readFull(cfd, &hdr) == 2) {
+                const want = std.mem.readInt(u16, &hdr, .big);
+                if (readFull(cfd, fbuf[0..want]) == want) got = want;
+            }
+        }
+        if (got > 0) {
+            var abuf: [1024]u8 = undefined;
+            const rlen = answerTcpQuery(&abuf, fbuf[0..got]);
+            var out_hdr: [2]u8 = undefined;
+            std.mem.writeInt(u16, &out_hdr, @intCast(rlen), .big);
+            _ = try posix.send(cfd, &out_hdr, posix.MSG.NOSIGNAL);
+            _ = try posix.send(cfd, abuf[0..rlen], posix.MSG.NOSIGNAL);
+        }
+        posix.close(cfd);
+    }
+
+    // _xmpps SRV, _xmpp SRV, A, AAAA: one connection per query; the
+    // resolver opens no connection a live chain does not need.
+    try std.testing.expectEqual(@as(usize, 4), accepts);
     try std.testing.expectEqual(Status.resolved, ctx.status.?);
     var res = ctx.res.?;
     defer res.deinitOn(std.testing.allocator);
@@ -4586,6 +6061,13 @@ test "dns-async: resolv.conf zones follow libc ip6_str2scopeid" {
         .{ .conf = "nameserver 2001:db8::1%lo0\n", .scope = null },
         .{ .conf = "nameserver 127.0.0.1%lo0\n", .scope = null },
         .{ .conf = "nameserver fe80::1%\n", .scope = null },
+        // Named zones on non-node/link-local multicast scopes are
+        // rejected: ff09/ff0a also pin the scope mask (& 0x07 would
+        // alias them to scopes 1/2), ff05/ff0e pin scope != 0.
+        .{ .conf = "nameserver ff05::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff0e::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff09::1%lo0\n", .scope = null },
+        .{ .conf = "nameserver ff0a::1%lo0\n", .scope = null },
     };
     for (cases) |c| {
         var tmp = std.testing.tmpDir(.{});
@@ -4804,6 +6286,50 @@ test "dns-async: an over-long per-target TLSA owner is absent" {
     try std.testing.expectEqual(TlsaStatus.absent, res.targets[0].tlsa_status);
 }
 
+test "dns-async: an over-long SRV target is skipped for the good one" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // 282 octets cannot be staged into sendAddr's 280-byte qname
+    // buffer: both family sends take the NXDOMAIN arm, the dead
+    // target yields no address, and the chain moves on to the next
+    // SRV target, which resolves normally.
+    const long_host = "x" ** 63 ++ "." ++ "y" ** 63 ++ "." ++ "z" ** 63 ++ "." ++ "w" ** 63 ++ "." ++ "v" ** 30;
+    try std.testing.expect(long_host.len > 280);
+    r.cacheInsert("_xmpps-client._tcp.svc.test", KIND_SRV, &.{}, .nodata, 60);
+    var bad_rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer bad_rdata.deinit(std.testing.allocator);
+    var good_rdata: std.ArrayListUnmanaged(u8) = .{};
+    defer good_rdata.deinit(std.testing.allocator);
+    // RFC 2782 sorts the lower priority first, so the dead target is
+    // the one tried before srv.test.
+    try bad_rdata.appendSlice(std.testing.allocator, &.{ 0, 5, 0, 100, 0x14, 0x76 });
+    appendEncodedName(std.testing.allocator, &bad_rdata, long_host);
+    try good_rdata.appendSlice(std.testing.allocator, &.{ 0, 10, 0, 100, 0x3B, 0x76 });
+    appendEncodedName(std.testing.allocator, &good_rdata, "srv.test");
+    var srv_rrs = [2]wire.Rr{
+        .{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = bad_rdata.items },
+        .{ .name = "_xmpp-client._tcp.svc.test", .rtype = KIND_SRV, .class = wire.CLASS_IN, .ttl = 60, .rdata = good_rdata.items },
+    };
+    r.cacheInsert("_xmpp-client._tcp.svc.test", KIND_SRV, &srv_rrs, .none, 60);
+    var a_rrs = [1]wire.Rr{.{ .name = "srv.test", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 127, 0, 0, 1 } }};
+    r.cacheInsert("srv.test", KIND_A, &a_rrs, .none, 60);
+    r.cacheInsert("srv.test", KIND_AAAA, &.{}, .nxdomain, 60);
+
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    try r.resolve("svc.test", .client, 5222, 3, false);
+
+    try std.testing.expectEqual(Status.resolved, ctx.status.?);
+    var res = ctx.res.?;
+    defer res.deinitOn(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), res.targets.len);
+    try std.testing.expectEqualStrings("srv.test", res.targets[0].host);
+    try std.testing.expectEqual(@as(u16, posix.AF.INET), res.targets[0].addr.any.family);
+    try std.testing.expectEqual(@as(u16, 15222), res.targets[0].addr.getPort());
+}
+
 test "dns-async: names over 255 wire octets behave as NXDOMAIN" {
     const srv = try startFakeDns(false, "");
     defer stopFakeDns(srv);
@@ -4864,10 +6390,28 @@ test "dns-async: a 262+ character name reports async nxdomain" {
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
     // Too long to stage with an SRV prefix and too long for the wire:
-    // the answer is the async nxdomain, not a synchronous NameTooLong.
+    // the callback reports nxdomain inside resolve() itself rather
+    // than a synchronous NameTooLong error return.
     const d262 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 70;
     try std.testing.expectEqual(@as(usize, 262), d262.len);
     try r.resolve(d262, .client, 5222, 3, true);
+    try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
+    try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
+}
+
+test "dns-async: a name over the staging buffer reports async nxdomain" {
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    var ctx = TestCtx{};
+    r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
+
+    // 300 octets overruns the 280-byte staging buffer in sendFallback
+    // itself, so every arm fails staging and the nxdomain completes
+    // inside resolve() with no step needed.
+    const d300 = "a" ** 63 ++ "." ++ "b" ** 63 ++ "." ++ "c" ** 63 ++ "." ++ "d" ** 63 ++ "." ++ "e" ** 44;
+    try std.testing.expectEqual(@as(usize, 300), d300.len);
+    try r.resolve(d300, .client, 5222, 3, true);
     try std.testing.expectEqual(Status.nxdomain, ctx.status.?);
     try std.testing.expectEqual(@as(usize, 0), r.jobs.items.len);
 }

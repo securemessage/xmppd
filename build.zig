@@ -193,6 +193,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const net_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/net.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -281,6 +287,11 @@ pub fn build(b: *std.Build) void {
         .root_module = conf_mod,
     });
 
+    const net_tests = b.addTest(.{
+        .name = "net-tests",
+        .root_module = net_mod,
+    });
+
     const xml_writer_tests = b.addTest(.{
         .name = "xml-writer-tests",
         .root_module = xml_writer_mod,
@@ -358,6 +369,7 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_conf_tests = b.addRunArtifact(conf_tests);
+    const run_net_tests = b.addRunArtifact(net_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
 
     // F4 escaper microbenchmark; pinned ReleaseFast per the work item.
@@ -377,6 +389,52 @@ pub fn build(b: *std.Build) void {
     });
     const bench_xml_escape_step = b.step("bench-xml-escape", "Run the F4 XML escaper benchmark");
     bench_xml_escape_step.dependOn(&b.addRunArtifact(esc_bench).step);
+
+    // A9 crypto-pool microbenchmark; pool module pinned ReleaseFast per
+    // the work item.
+    const pool_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/crypto_pool_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const pool_bench_sasl_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const pool_bench_pool_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/crypto_pool.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pool_bench_pool_mod.addImport("sasl", pool_bench_sasl_mod);
+    pool_bench_mod.addImport("crypto_pool", pool_bench_pool_mod);
+    pool_bench_mod.addImport("sasl", pool_bench_sasl_mod);
+    const pool_bench = b.addExecutable(.{
+        .name = "crypto-pool-bench",
+        .root_module = pool_bench_mod,
+    });
+    const bench_crypto_pool_step = b.step("bench-crypto-pool", "Run the A9 crypto pool benchmark");
+    bench_crypto_pool_step.dependOn(&b.addRunArtifact(pool_bench).step);
+
+    // F2 lib/net loop microbenchmark; pinned ReleaseFast per the work item.
+    const net_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/net_loop_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    net_bench_mod.addImport("net", b.createModule(.{
+        .root_source_file = b.path("lib/net/net.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const net_bench = b.addExecutable(.{
+        .name = "net-loop-bench",
+        .root_module = net_bench_mod,
+    });
+    const bench_net_loop_step = b.step("bench-net-loop", "Run the F2 lib/net loop benchmark");
+    bench_net_loop_step.dependOn(&b.addRunArtifact(net_bench).step);
+
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
     const run_unicode_tests = b.addRunArtifact(unicode_tests);
     const run_precis_tables_tests = b.addRunArtifact(precis_tables_tests);
@@ -504,12 +562,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const store_keys_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/keys.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const roster_store_mod_for_server = b.createModule(.{
         .root_source_file = b.path("src/store/roster_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     roster_store_mod_for_server.addImport("backend", server_backend_mod);
+    roster_store_mod_for_server.addImport("store_keys", store_keys_mod);
     const session_map_mod_for_server = b.createModule(.{
         .root_source_file = b.path("src/core/session_map.zig"),
         .target = target,
@@ -606,13 +670,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_block_store_mod.addImport("backend", server_backend_mod);
+    server_block_store_mod.addImport("store_keys", store_keys_mod);
     server_test_mod.addImport("block_store", server_block_store_mod);
+    server_test_mod.addImport("store_keys", store_keys_mod);
     const server_pep_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/pep_store.zig"),
         .target = target,
         .optimize = optimize,
     });
     server_pep_store_mod.addImport("backend", server_backend_mod);
+    server_pep_store_mod.addImport("store_keys", store_keys_mod);
     server_test_mod.addImport("pep_store", server_pep_store_mod);
     // The server namespace-registry test sees every store owner constant.
     const server_user_store_mod = b.createModule(.{
@@ -788,6 +855,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     generic_roster_store_test_mod.addImport("backend", backend_test_mod);
+    generic_roster_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const generic_roster_store_tests = b.addTest(.{
         .name = "generic-roster-store-tests",
@@ -896,6 +964,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    s2s_stream_test_mod.addImport("xml", xml_mod);
 
     const s2s_stream_tests = b.addTest(.{
         .name = "s2s-stream-tests",
@@ -1116,6 +1185,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pep_store_test_mod.addImport("backend", backend_test_mod);
+    pep_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const pep_store_tests = b.addTest(.{
         .name = "pep-store-tests",
@@ -1132,6 +1202,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     block_store_test_mod.addImport("backend", backend_test_mod);
+    block_store_test_mod.addImport("store_keys", store_keys_mod);
 
     const block_store_tests = b.addTest(.{
         .name = "block-store-tests",
@@ -1139,6 +1210,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_block_store_tests = b.addRunArtifact(block_store_tests);
+
+    // --- Store keys tests ---
+
+    const store_keys_tests = b.addTest(.{
+        .name = "store-keys-tests",
+        .root_module = store_keys_mod,
+    });
+
+    const run_store_keys_tests = b.addRunArtifact(store_keys_tests);
 
     // --- Room store tests ---
 
@@ -1196,6 +1276,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    fanout_test_mod.addImport("xml", xml_mod);
     fanout_test_mod.addImport("room_registry", room_registry_test_mod);
     fanout_test_mod.addImport("room_store", room_store_test_mod);
 
@@ -1243,6 +1324,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    caps_test_mod.addImport("xml", xml_mod);
 
     const caps_tests = b.addTest(.{
         .name = "caps-tests",
@@ -1270,6 +1352,29 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_rocksdb_backend_tests = b.addRunArtifact(rocksdb_backend_tests);
+
+    // --- Generic offline store over the real backends (H1) ---
+    //
+    // The store's own tests use MemoryBackend, whose iterator honors the
+    // untruncated prefix. LMDB and RocksDB clip the scan prefix to 256 bytes,
+    // so the long-recipient behavior needs a root that links both.
+
+    const generic_offline_real_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/offline_store_real_backend_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    generic_offline_real_test_mod.addImport("generic_offline_store", generic_offline_store_test_mod);
+    generic_offline_real_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    generic_offline_real_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+
+    const generic_offline_real_tests = b.addTest(.{
+        .name = "generic-offline-store-real-tests",
+        .root_module = generic_offline_real_test_mod,
+    });
+
+    const run_generic_offline_real_tests = b.addRunArtifact(generic_offline_real_tests);
 
     // --- SQLite backend tests ---
 
@@ -1423,6 +1528,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
+    core_mod.addImport("store_keys", store_keys_mod);
     core_mod.addImport("session_map", session_map_mod_for_server);
     core_mod.addImport("delivery_queue", delivery_queue_mod);
     core_mod.addImport("generic_offline_store", server_generic_offline_mod);
@@ -1669,6 +1775,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("ipc_server", oidc_ipc_server_mod);
     oidc_main_mod.addImport("handler", oidc_handler_mod);
     oidc_main_mod.addImport("oidc", oidc_store_mod);
+    oidc_main_mod.addImport("policy", oidc_policy_mod);
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
@@ -1902,6 +2009,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
+    test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
     test_step.dependOn(&run_unicode_tests.step);
@@ -1948,6 +2056,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_store_tests.step);
     test_step.dependOn(&run_mam_handler_tests.step);
     test_step.dependOn(&run_generic_offline_store_tests.step);
+    test_step.dependOn(&run_generic_offline_real_tests.step);
     test_step.dependOn(&run_last_activity_store_tests.step);
     test_step.dependOn(&run_rate_limiter_tests.step);
     test_step.dependOn(&run_policy_tests.step);
@@ -1955,6 +2064,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_invite_store_tests.step);
     test_step.dependOn(&run_pep_store_tests.step);
     test_step.dependOn(&run_block_store_tests.step);
+    test_step.dependOn(&run_store_keys_tests.step);
     test_step.dependOn(&run_room_store_tests.step);
     test_step.dependOn(&run_room_registry_tests.step);
     test_step.dependOn(&run_fanout_tests.step);

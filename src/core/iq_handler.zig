@@ -273,6 +273,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         if (std.mem.eql(u8, session.iq_type, "set")) {
             session.vcard_collecting = true;
             session.vcard_buf_len = 0;
+            session.vcard_overflow = false;
             session.vcard_collect_depth = 2; // <iq><vCard>
             // Write the opening <vCard xmlns='vcard-temp'> tag
             var fbs = std.io.fixedBufferStream(&session.vcard_buf);
@@ -379,6 +380,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // Reset vCard/PEP accumulation
         session.vcard_collecting = false;
         session.vcard_buf_len = 0;
+        session.vcard_overflow = false;
         session.pep_collecting = false;
         // Reset XEP-0115 caps disco accumulation
         session.disco_node = "";
@@ -506,7 +508,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 const w = fbs.writer();
                 writeIqHeader(server, w, session, "result", iq_id);
                 w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                session.queueSendStanza(fbs.getWritten()) catch return;
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
@@ -514,7 +516,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 const w = fbs.writer();
                 writeIqHeader(server, w, session, "error", iq_id);
                 w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                session.queueSendStanza(fbs.getWritten()) catch return;
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
@@ -579,7 +581,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         writeIqHeader(server, w, session, "result", iq_id);
         if (disco_node.len > 0) {
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return;
-            w.writeAll(disco_node) catch return;
+            xml.escapeWrite(w, disco_node) catch return;
             w.writeAll("'>") catch return;
         } else {
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
@@ -587,7 +589,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
         caps_mod.writeDiscoFeatures(w) catch return;
         w.writeAll("</query></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -600,11 +602,11 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // Advertise MUC service if configured
         if (server.muc_host) |muc_host| {
             w.writeAll("<item jid='") catch return;
-            w.writeAll(muc_host) catch return;
+            xml.escapeWrite(w, muc_host) catch return;
             w.writeAll("' name='Chat Rooms'/>") catch return;
         }
         w.writeAll("</query></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -614,7 +616,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
         w.writeAll("/>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -626,7 +628,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
         w.writeAll("/>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -649,11 +651,11 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         w.writeAll("><query xmlns='jabber:iq:version'>") catch return;
         w.writeAll("<name>xmppd</name>") catch return;
         w.writeAll("<version>") catch return;
-        w.writeAll(build_options.version) catch return;
+        xml.escapeWrite(w, build_options.version) catch return;
         w.writeAll("</version>") catch return;
         w.writeAll("<os>FreeBSD</os>") catch return;
         w.writeAll("</query></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -680,7 +682,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
         w.writeAll("/>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     }
 
@@ -734,13 +736,13 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         } else if (std.mem.eql(u8, iq_type, "set")) {
             if (session.reg_has_remove) {
                 // Account deletion (post-auth only)
-                handleAccountDelete(server, session, iq_id, changes);
+                handleAccountDelete(server, session, iq_id);
             } else if (session.stream.bound_jid != null) {
                 // Authenticated — password change
-                handlePasswordChange(server, session, iq_id, changes);
+                handlePasswordChange(server, session, iq_id);
             } else {
                 // Pre-auth — in-band registration
-                handleRegisterSubmit(server, session, iq_id, changes);
+                handleRegisterSubmit(server, session, iq_id);
             }
             return;
         }
@@ -761,7 +763,7 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         const w = fbs.writer();
         writeIqHeader(server, w, session, "result", iq_id);
         w.writeAll("><query xmlns='jabber:iq:roster'/></iq>") catch return;
-        session.conn.queueSend(fbs.getWritten()) catch return;
+        session.queueSendStanza(fbs.getWritten()) catch return;
         return;
     };
 
@@ -787,11 +789,11 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
 
     for (items) |item| {
         w.writeAll("<item jid='") catch return;
-        w.writeAll(item.contact_jid) catch return;
+        xml.escapeWrite(w, item.contact_jid) catch return;
         w.writeByte('\'') catch return;
         if (item.entry.name.len > 0) {
             w.writeAll(" name='") catch return;
-            w.writeAll(item.entry.name) catch return;
+            xml.escapeWrite(w, item.entry.name) catch return;
             w.writeByte('\'') catch return;
         }
         w.writeAll(" subscription='") catch return;
@@ -810,7 +812,7 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
     }
 
     w.writeAll("</query></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle IQ roster set — add/update/remove a roster item.
@@ -870,6 +872,14 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     bare_fbs.writer().writeAll(bound.domain) catch return;
     const bare_jid = bare_fbs.getWritten();
 
+    // S4: the store key joins owner + contact into a bounded buffer; a
+    // contact JID that cannot fit must be rejected at ingress instead of
+    // aborting the daemon downstream.
+    if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    }
+
     const item_sub = session.iq_roster_item_sub;
     const Subscription = @import("roster_store").Subscription;
 
@@ -905,9 +915,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                 var unsub_fbs = std.io.fixedBufferStream(&unsub_buf);
                 const uw = unsub_fbs.writer();
                 uw.writeAll("<presence from='") catch {};
-                uw.writeAll(bare_jid) catch {};
+                xml.escapeWrite(uw, bare_jid) catch {};
                 uw.writeAll("' to='") catch {};
-                uw.writeAll(item_jid) catch {};
+                xml.escapeWrite(uw, item_jid) catch {};
                 uw.writeAll("' type='unsubscribe'/>") catch {};
                 if (to_jid_parsed) |to_jid| {
                     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
@@ -927,7 +937,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 .both => .to,
                                 else => contact_entry.subscription,
                             };
-                            roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch {};
+                            roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch |err| {
+                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                            };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
                         }
@@ -941,9 +953,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                 var unsd_fbs = std.io.fixedBufferStream(&unsd_buf);
                 const udw = unsd_fbs.writer();
                 udw.writeAll("<presence from='") catch {};
-                udw.writeAll(bare_jid) catch {};
+                xml.escapeWrite(udw, bare_jid) catch {};
                 udw.writeAll("' to='") catch {};
-                udw.writeAll(item_jid) catch {};
+                xml.escapeWrite(udw, item_jid) catch {};
                 udw.writeAll("' type='unsubscribed'/>") catch {};
                 if (to_jid_parsed) |to_jid| {
                     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
@@ -963,7 +975,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 .both => .from,
                                 else => contact_entry.subscription,
                             };
-                            roster.setItem(item_jid, bare_jid, "", new_sub, false) catch {};
+                            roster.setItem(item_jid, bare_jid, "", new_sub, false) catch |err| {
+                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                            };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
                         }
@@ -993,15 +1007,30 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 
     // RFC 6121 §2.1.6: Send roster push to all interested resources.
     pushRosterItem(server, bound.local, bound.domain, item_jid, session.iq_roster_item_name, result_sub, result_ask, changes);
 }
 
+/// Stage the IQ id for a pending auth-daemon reply. The id borrows the
+/// reader arena, which resets when the next stanza arrives (S11), long
+/// before the reply; copy it into the session. Returns false (after
+/// sending not-acceptable) when the id cannot be tracked.
+fn stageRegPendingIq(server: *Server, session: *Session, iq_id: []const u8) bool {
+    if (iq_id.len > session.reg_pending_iq_buf.len) {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return false;
+    }
+    @memcpy(session.reg_pending_iq_buf[0..iq_id.len], iq_id);
+    session.reg_pending_iq_len = iq_id.len;
+    session.reg_pending_iq_id = session.reg_pending_iq_buf[0..iq_id.len];
+    return true;
+}
+
 /// Handle password change (XEP-0077 §3.3). Sends PasswordChangeRequest to auth daemon.
 /// Only allowed for authenticated sessions with a bound JID.
-fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8) void {
 
     // Must be authenticated
     const bound = session.stream.bound_jid orelse {
@@ -1022,6 +1051,8 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
         return;
     }
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .password_change_request = .{
             .conn_id = session.ipcConnId(),
@@ -1029,17 +1060,11 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8, c
             .new_password = new_password,
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Store the IQ id so we can respond when the result arrives
-    session.reg_pending_iq_id = iq_id;
-
-    // Ensure IPC write is registered
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle registration form query (XEP-0077 §3.1).
@@ -1062,12 +1087,12 @@ fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void
     w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/>") catch return;
     w.writeAll("</x>") catch return;
     w.writeAll("</query></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle registration submission (XEP-0077 §3.1, pre-auth).
 /// Sends RegisterRequest to auth daemon via IPC.
-fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8) void {
     const reg_username = session.reg_username_buf[0..session.reg_username_len];
     const reg_password = session.reg_password_buf[0..session.reg_password_len];
 
@@ -1093,6 +1118,8 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
     // whether an invite is required.
     const reg_invite = session.reg_invite_buf[0..session.reg_invite_len];
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .register_request = .{
             .conn_id = session.ipcConnId(),
@@ -1102,20 +1129,16 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8, c
             .client_ip = session.conn.peerAddr(),
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    session.reg_pending_iq_id = iq_id;
-
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle account deletion (XEP-0077 §3.2). Sends AccountDeleteRequest to auth daemon.
 /// On success, core performs cascade cleanup (roster, vcard, offline, MAM).
-fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, changes: *ChangeList) void {
+fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8) void {
     // Must be authenticated
     const bound = session.stream.bound_jid orelse {
         sendIqError(server, session, iq_id, "not-authorized");
@@ -1128,23 +1151,19 @@ fn handleAccountDelete(server: *Server, session: *Session, iq_id: []const u8, ch
         return;
     }
 
+    if (!stageRegPendingIq(server, session, iq_id)) return;
+
     server.ipc.send(.{
         .account_delete_request = .{
             .conn_id = session.ipcConnId(),
             .username = bound.local,
         },
     }) catch {
+        session.reg_pending_iq_id = "";
+        session.reg_pending_iq_len = 0;
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
-
-    // Store the IQ id so we can respond when the result arrives
-    session.reg_pending_iq_id = iq_id;
-
-    // Ensure IPC write is registered
-    if (server.ipc.hasPendingSend()) {
-        changes.addWrite(server.ipc.fd, server_mod.IPC_AUTH_UDATA) catch {};
-    }
 }
 
 /// Handle MAM query (XEP-0313). Queries the archive store and sends results.
@@ -1197,11 +1216,11 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
 
     // Send each result message
     for (response.messages) |msg| {
-        session.conn.queueSend(msg.xml) catch continue;
+        session.queueSendStanza(msg.xml) catch continue;
     }
 
     // Send the fin IQ
-    session.conn.queueSend(response.fin_iq) catch return;
+    session.queueSendStanza(response.fin_iq) catch return;
 }
 
 /// Handle MAM query for a MUC room (XEP-0313 + XEP-0045).
@@ -1292,11 +1311,11 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
     // Send each result message
     for (response.messages) |msg| {
-        session.conn.queueSend(msg.xml) catch continue;
+        session.queueSendStanza(msg.xml) catch continue;
     }
 
     // Send the fin IQ
-    session.conn.queueSend(response.fin_iq) catch return;
+    session.queueSendStanza(response.fin_iq) catch return;
 }
 
 /// Parse a subset of ISO 8601 timestamps (YYYY-MM-DDThh:mm:ssZ) to unix epoch.
@@ -1350,7 +1369,7 @@ fn sendLastActivityResult(server: *Server, session: *Session, iq_id: []const u8,
     w.writeAll("><query xmlns='jabber:iq:last' seconds='") catch return;
     w.print("{d}", .{seconds}) catch return;
     w.writeAll("'/></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Server-directed queries (uptime, XEP-0012 §2.2) and self queries (the
@@ -1435,28 +1454,28 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
 /// the original stanza was sent (i.e., the 'to' from the request).
 pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []const u8, iq_id: []const u8) void {
     w.writeAll("<iq type='") catch return;
-    w.writeAll(iq_type) catch return;
+    xml.escapeWrite(w, iq_type) catch return;
     w.writeByte('\'') catch return;
     // from = iq_to if set (echo back request's 'to'), otherwise server host
     const from = if (session.iq_to.len > 0) session.iq_to else server.server_host;
     w.writeAll(" from='") catch return;
-    w.writeAll(from) catch return;
+    xml.escapeWrite(w, from) catch return;
     w.writeByte('\'') catch return;
     // to = client's full JID
     if (session.stream.bound_jid) |bound| {
         w.writeAll(" to='") catch return;
-        w.writeAll(bound.local) catch return;
+        xml.escapeWrite(w, bound.local) catch return;
         w.writeByte('@') catch return;
-        w.writeAll(bound.domain) catch return;
+        xml.escapeWrite(w, bound.domain) catch return;
         if (bound.resource.len > 0) {
             w.writeByte('/') catch return;
-            w.writeAll(bound.resource) catch return;
+            xml.escapeWrite(w, bound.resource) catch return;
         }
         w.writeByte('\'') catch return;
     }
     if (iq_id.len > 0) {
         w.writeAll(" id='") catch return;
-        w.writeAll(iq_id) catch return;
+        xml.escapeWrite(w, iq_id) catch return;
         w.writeByte('\'') catch return;
     }
 }
@@ -1483,10 +1502,16 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
         const xml_data = vcard.get(server.allocator, bare_jid) catch null;
         if (xml_data) |data| {
             defer server.allocator.free(data);
-            w.writeByte('>') catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
-            session.conn.queueSend(data) catch return;
-            session.conn.queueSend("</iq>") catch return;
+            // Assemble the complete stanza so SM tracking buffers the whole
+            // thing (S15) — a split send would leave a truncated replay entry.
+            var stanza = std.ArrayListUnmanaged(u8){};
+            defer stanza.deinit(server.allocator);
+            const sw = stanza.writer(server.allocator);
+            sw.writeAll(fbs.getWritten()) catch return;
+            sw.writeByte('>') catch return;
+            sw.writeAll(data) catch return;
+            sw.writeAll("</iq>") catch return;
+            session.queueSendStanza(stanza.items) catch return;
             return;
         }
     }
@@ -1495,7 +1520,7 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
     w.writeAll("><vCard xmlns='vcard-temp'><PHOTO><EXTVAL>https://www.gravatar.com/avatar/") catch return;
     writeGravatarHash(w, bare_jid);
     w.writeAll("?d=mp&amp;s=96</EXTVAL></PHOTO></vCard></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle vCard-temp GET for a specific bare JID (another user).
@@ -1527,12 +1552,17 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
         const xml_data = vcard.get(server.allocator, bare_jid) catch null;
         if (xml_data) |data| {
             defer server.allocator.free(data);
-            // User has a vCard — return it (split send to avoid overflow)
+            // User has a vCard — assemble the complete stanza so SM tracking
+            // buffers the whole thing (S15), then send once.
             writeIqHeader(server, w, session, "result", iq_id);
-            w.writeByte('>') catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
-            session.conn.queueSend(data) catch return;
-            session.conn.queueSend("</iq>") catch return;
+            var stanza = std.ArrayListUnmanaged(u8){};
+            defer stanza.deinit(server.allocator);
+            const sw = stanza.writer(server.allocator);
+            sw.writeAll(fbs.getWritten()) catch return;
+            sw.writeByte('>') catch return;
+            sw.writeAll(data) catch return;
+            sw.writeAll("</iq>") catch return;
+            session.queueSendStanza(stanza.items) catch return;
             return;
         }
     }
@@ -1545,6 +1575,11 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
 fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     const bound = session.stream.bound_jid orelse return;
+    if (session.vcard_overflow) {
+        log.warn("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
+        sendIqErrorWithType(server, session, iq_id, "modify", "not-acceptable");
+        return;
+    }
 
     // Build bare JID
     var bare_buf: [256]u8 = undefined;
@@ -1570,7 +1605,7 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle XEP-0163 PEP publish — store an item in a PEP node.
@@ -1601,6 +1636,12 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     const item_id = if (session.iq_roster_item_jid.len > 0) session.iq_roster_item_jid else "current";
     const payload = session.pep_payload.items;
 
+    // S4: bounded store keys; reject a node/item pair that cannot fit.
+    if (!@import("store_keys").fits3(bare_jid, node, item_id)) {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return;
+    }
+
     ps.publish(bare_jid, node, item_id, payload) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -1615,11 +1656,11 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><publish node='") catch return;
-    w.writeAll(node) catch return;
+    xml.escapeWrite(w, node) catch return;
     w.writeAll("'><item id='") catch return;
-    w.writeAll(item_id) catch return;
+    xml.escapeWrite(w, item_id) catch return;
     w.writeAll("'/></publish></pubsub></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 
     // XEP-0163 §4.3: Send PEP event notification to presence subscribers
     sendPepNotification(server, session, bare_jid, node, item_id, payload, changes);
@@ -1636,7 +1677,7 @@ fn handlePepNodeConfig(server: *Server, session: *Session, iq_id: []const u8) vo
     w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub#owner'><configure") catch return;
     if (node.len > 0) {
         w.writeAll(" node='") catch return;
-        w.writeAll(node) catch return;
+        xml.escapeWrite(w, node) catch return;
         w.writeByte('\'') catch return;
     }
     w.writeAll("><x xmlns='jabber:x:data' type='form'>") catch return;
@@ -1645,7 +1686,7 @@ fn handlePepNodeConfig(server: *Server, session: *Session, iq_id: []const u8) vo
     w.writeAll("<field var='pubsub#access_model' type='list-single'><value>presence</value></field>") catch return;
     w.writeAll("<field var='pubsub#max_items' type='text-single'><value>1</value></field>") catch return;
     w.writeAll("</x></configure></pubsub></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle XEP-0163 PEP items retrieval — get items from a PEP node.
@@ -1707,13 +1748,13 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         const rw = resp.writer(server.allocator);
         writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
         rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
-        rw.writeAll(node) catch return;
+        xml.escapeWrite(rw, node) catch return;
         rw.writeAll("'><item id='") catch return;
-        rw.writeAll(requested_id) catch return;
+        xml.escapeWrite(rw, requested_id) catch return;
         rw.writeAll("'>") catch return;
         rw.writeAll(payload.?) catch return;
         rw.writeAll("</item></items></pubsub></iq>") catch return;
-        session.conn.queueSend(resp.items) catch return;
+        session.queueSendStanza(resp.items) catch return;
     } else {
         // All items retrieval
         const items = ps.getItems(server.allocator, bare_jid, node) catch {
@@ -1734,42 +1775,42 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         const rw = resp.writer(server.allocator);
         writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
         rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
-        rw.writeAll(node) catch return;
+        xml.escapeWrite(rw, node) catch return;
         rw.writeAll("'>") catch return;
         for (items) |item| {
             rw.writeAll("<item id='") catch return;
-            rw.writeAll(item.id) catch return;
+            xml.escapeWrite(rw, item.id) catch return;
             rw.writeAll("'>") catch return;
             rw.writeAll(item.payload) catch return;
             rw.writeAll("</item>") catch return;
         }
         rw.writeAll("</items></pubsub></iq>") catch return;
-        session.conn.queueSend(resp.items) catch return;
+        session.queueSendStanza(resp.items) catch return;
     }
 }
 
 /// Write IQ header for PEP responses with correct 'from' (target user's bare JID).
 fn writePepIqHeader(w: anytype, from_bare: []const u8, session: *Session, iq_type: []const u8, iq_id: []const u8) !void {
     try w.writeAll("<iq type='");
-    try w.writeAll(iq_type);
+    try xml.escapeWrite(w, iq_type);
     try w.writeByte('\'');
     try w.writeAll(" from='");
-    try w.writeAll(from_bare);
+    try xml.escapeWrite(w, from_bare);
     try w.writeByte('\'');
     if (session.stream.bound_jid) |bound_val| {
         try w.writeAll(" to='");
-        try w.writeAll(bound_val.local);
+        try xml.escapeWrite(w, bound_val.local);
         try w.writeByte('@');
-        try w.writeAll(bound_val.domain);
+        try xml.escapeWrite(w, bound_val.domain);
         if (bound_val.resource.len > 0) {
             try w.writeByte('/');
-            try w.writeAll(bound_val.resource);
+            try xml.escapeWrite(w, bound_val.resource);
         }
         try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
         try w.writeAll(" id='");
-        try w.writeAll(iq_id);
+        try xml.escapeWrite(w, iq_id);
         try w.writeByte('\'');
     }
 }
@@ -1799,14 +1840,16 @@ fn sendPepNotification(
     const body_item_mid = "'>";
     const body_suffix = "</item></items></event></message>";
 
-    // Build the shared suffix (everything after the to='...' value) into a buffer
-    var notif_buf: [16384]u8 = undefined;
-    var nfbs = std.io.fixedBufferStream(&notif_buf);
+    // Build the shared suffix (everything after the to='...' value) into a
+    // leased bank: it is read while building every notification below (S18).
+    var notif_lease = server.leaseByteScratch() orelse return;
+    defer notif_lease.release();
+    var nfbs = std.io.fixedBufferStream(notif_lease.buf);
     const nw = nfbs.writer();
     nw.writeAll(body_mid) catch return;
-    nw.writeAll(node) catch return;
+    xml.escapeWrite(nw, node) catch return;
     nw.writeAll(body_item_open) catch return;
-    nw.writeAll(item_id) catch return;
+    xml.escapeWrite(nw, item_id) catch return;
     nw.writeAll(body_item_mid) catch return;
     nw.writeAll(payload) catch return;
     nw.writeAll(body_suffix) catch return;
@@ -1814,59 +1857,78 @@ fn sendPepNotification(
 
     // Deliver to the publisher's own resources (self-notification per XEP-0163 §4.3)
     const bound = session.stream.bound_jid orelse return;
-    var self_entries: [16]SessionEntry = undefined;
-    const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, &self_entries);
-    for (self_entries[0..self_count]) |entry| {
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
-            // XEP-0163 §4.3: notify ALL subscribed resources including the publisher
+    {
+        var lease_self = server.leaseScratch(.b);
+        defer lease_self.release();
+        const self_entries = lease_self.entries;
+        const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, self_entries);
 
-            var msg_buf: [16384]u8 = undefined;
-            var mfbs = std.io.fixedBufferStream(&msg_buf);
-            const mw = mfbs.writer();
-            mw.writeAll(body_prefix_1) catch continue;
-            mw.writeAll(publisher_bare) catch continue;
-            mw.writeAll(body_prefix_2) catch continue;
-            mw.writeAll(bound.local) catch continue;
-            mw.writeByte('@') catch continue;
-            mw.writeAll(bound.domain) catch continue;
-            mw.writeByte('/') catch continue;
-            mw.writeAll(entry.resource()) catch continue;
-            mw.writeAll(body_after_to) catch continue;
+        // One buffer reused per resource: deliverToSession and ds.deliver both
+        // copy, so a resource's stanza is dead before the next is built (S18).
+        var self_msg_lease = server.leaseByteScratch() orelse return;
+        defer self_msg_lease.release();
 
-            fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
-        } else {
-            // Cross-thread: build full stanza and deliver via MPSC
-            if (server.delivery_system) |ds| {
-                var msg_buf: [16384]u8 = undefined;
-                var mfbs = std.io.fixedBufferStream(&msg_buf);
+        for (self_entries[0..self_count]) |entry| {
+            if (entry.worker_id == server.worker_id) {
+                const target = server.sessions[entry.local_session_id] orelse continue;
+                // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
+
+                var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
                 const mw = mfbs.writer();
                 mw.writeAll(body_prefix_1) catch continue;
-                mw.writeAll(publisher_bare) catch continue;
+                xml.escapeWrite(mw, publisher_bare) catch continue;
                 mw.writeAll(body_prefix_2) catch continue;
-                mw.writeAll(bound.local) catch continue;
+                xml.escapeWrite(mw, bound.local) catch continue;
                 mw.writeByte('@') catch continue;
-                mw.writeAll(bound.domain) catch continue;
+                xml.escapeWrite(mw, bound.domain) catch continue;
                 mw.writeByte('/') catch continue;
-                mw.writeAll(entry.resource()) catch continue;
+                xml.escapeWrite(mw, entry.resource()) catch continue;
                 mw.writeAll(body_after_to) catch continue;
 
-                ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+                fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
+            } else {
+                // Cross-thread: build full stanza and deliver via MPSC
+                if (server.delivery_system) |ds| {
+                    var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
+                    const mw = mfbs.writer();
+                    mw.writeAll(body_prefix_1) catch continue;
+                    xml.escapeWrite(mw, publisher_bare) catch continue;
+                    mw.writeAll(body_prefix_2) catch continue;
+                    xml.escapeWrite(mw, bound.local) catch continue;
+                    mw.writeByte('@') catch continue;
+                    xml.escapeWrite(mw, bound.domain) catch continue;
+                    mw.writeByte('/') catch continue;
+                    xml.escapeWrite(mw, entry.resource()) catch continue;
+                    mw.writeAll(body_after_to) catch continue;
+
+                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+                }
             }
         }
     }
 
     // Deliver to presence subscribers (contacts with "from" or "both" subscription) — cached (T129)
-    var pep_sub_buf: [16384]u8 = undefined;
+    // Subscriber JID pointers index into this buffer and stay live across the
+    // loop below, which also builds each notification into a third bank, so
+    // the shared suffix above, this list, and one notification are all live at
+    // once: three banks, which is BYTE_BANK_COUNT (S18).
+    var pep_sub_lease = server.leaseByteScratch() orelse return;
+    defer pep_sub_lease.release();
+    const pep_sub_buf = pep_sub_lease.buf;
     var pep_sub_ptrs: [256][]const u8 = undefined;
     const pep_hash = server_mod.sub_cache_mod.hashBareJid(publisher_bare);
     const pep_now = std.time.timestamp();
-    const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, &pep_sub_buf, &pep_sub_ptrs) orelse blk: {
-        const count = roster.getPresenceSubscribersFixed(publisher_bare, &pep_sub_buf, &pep_sub_ptrs) catch return;
+    const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, pep_sub_buf, &pep_sub_ptrs) orelse blk: {
+        const count = roster.getPresenceSubscribersFixed(publisher_bare, pep_sub_buf, &pep_sub_ptrs) catch return;
         server.sub_cache.storeSubscribers(pep_hash, pep_now, pep_sub_ptrs[0..count]);
         break :blk count;
     };
     const subscriber_jids = pep_sub_ptrs[0..pep_sub_count];
+
+    // One buffer reused for every notification below: both delivery paths
+    // copy, so a stanza is dead before the next subscriber is built (S18).
+    var sub_msg_lease = server.leaseByteScratch() orelse return;
+    defer sub_msg_lease.release();
 
     for (subscriber_jids) |sub_bare_jid| {
         // Skip blocked contacts
@@ -1881,39 +1943,39 @@ fn sendPepNotification(
         // Only deliver to local users for now (S2S PEP notifications are post-V1)
         if (!std.mem.eql(u8, sub_domain, server.server_host)) continue;
 
-        var entries: [16]SessionEntry = undefined;
-        const count = sm.findAvailableByBareJid(sub_local, sub_domain, &entries);
+        var lease_b = server.leaseScratch(.b);
+        defer lease_b.release();
+        const entries = lease_b.entries;
+        const count = sm.findAvailableByBareJid(sub_local, sub_domain, entries);
         for (entries[0..count]) |entry| {
             if (entry.worker_id == server.worker_id) {
                 const target = server.sessions[entry.local_session_id] orelse continue;
 
-                var msg_buf: [16384]u8 = undefined;
-                var mfbs = std.io.fixedBufferStream(&msg_buf);
+                var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                 const mw = mfbs.writer();
                 mw.writeAll(body_prefix_1) catch continue;
-                mw.writeAll(publisher_bare) catch continue;
+                xml.escapeWrite(mw, publisher_bare) catch continue;
                 mw.writeAll(body_prefix_2) catch continue;
-                mw.writeAll(sub_local) catch continue;
+                xml.escapeWrite(mw, sub_local) catch continue;
                 mw.writeByte('@') catch continue;
-                mw.writeAll(sub_domain) catch continue;
+                xml.escapeWrite(mw, sub_domain) catch continue;
                 mw.writeByte('/') catch continue;
-                mw.writeAll(entry.resource()) catch continue;
+                xml.escapeWrite(mw, entry.resource()) catch continue;
                 mw.writeAll(body_after_to) catch continue;
 
                 fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
             } else {
                 if (server.delivery_system) |ds| {
-                    var msg_buf: [16384]u8 = undefined;
-                    var mfbs = std.io.fixedBufferStream(&msg_buf);
+                    var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                     const mw = mfbs.writer();
                     mw.writeAll(body_prefix_1) catch continue;
-                    mw.writeAll(publisher_bare) catch continue;
+                    xml.escapeWrite(mw, publisher_bare) catch continue;
                     mw.writeAll(body_prefix_2) catch continue;
-                    mw.writeAll(sub_local) catch continue;
+                    xml.escapeWrite(mw, sub_local) catch continue;
                     mw.writeByte('@') catch continue;
-                    mw.writeAll(sub_domain) catch continue;
+                    xml.escapeWrite(mw, sub_domain) catch continue;
                     mw.writeByte('/') catch continue;
-                    mw.writeAll(entry.resource()) catch continue;
+                    xml.escapeWrite(mw, entry.resource()) catch continue;
                     mw.writeAll(body_after_to) catch continue;
 
                     ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
@@ -1954,11 +2016,11 @@ fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, cha
     w.writeAll("><blocklist xmlns='urn:xmpp:blocking'>") catch return;
     for (items) |jid| {
         w.writeAll("<item jid='") catch return;
-        w.writeAll(jid) catch return;
+        xml.escapeWrite(w, jid) catch return;
         w.writeAll("'/>") catch return;
     }
     w.writeAll("</blocklist></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Handle XEP-0191 <block/> set — add JIDs to user's block list.
@@ -1982,6 +2044,12 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
         return;
     }
 
+    // S4: bounded store keys; an oversized blocked JID is malformed.
+    if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    }
+
     bs.block(bare_jid, item_jid) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -1994,7 +2062,7 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 
     // Push block list update to all resources of the blocking user (XEP-0191 §3.3)
     pushBlockPush(server, session, bound.local, bound.domain, "block", item_jid, changes);
@@ -2021,6 +2089,11 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
         bs.removeAll(server.allocator, bare_jid) catch {};
         log.info("connection {d} unblocked all", .{session.conn.id});
     } else {
+        // S4: bounded store keys; an oversized blocked JID is malformed.
+        if (!@import("store_keys").fits2(bare_jid, item_jid)) {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        }
         bs.unblock(bare_jid, item_jid) catch {
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
@@ -2033,7 +2106,7 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     const w = fbs.writer();
     writeIqHeader(server, w, session, "result", iq_id);
     w.writeAll("/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 
     // Push unblock update to all resources
     pushBlockPush(server, session, bound.local, bound.domain, "unblock", item_jid, changes);
@@ -2052,8 +2125,10 @@ fn pushBlockPush(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
     for (entries[0..count]) |entry| {
@@ -2066,17 +2141,17 @@ fn pushBlockPush(
             var pfbs = std.io.fixedBufferStream(&push_buf);
             const pw = pfbs.writer();
             pw.writeAll("<iq type='set' to='") catch continue;
-            pw.writeAll(user_local) catch continue;
+            xml.escapeWrite(pw, user_local) catch continue;
             pw.writeByte('@') catch continue;
-            pw.writeAll(user_domain) catch continue;
+            xml.escapeWrite(pw, user_domain) catch continue;
             pw.writeByte('/') catch continue;
-            pw.writeAll(entry.resource()) catch continue;
+            xml.escapeWrite(pw, entry.resource()) catch continue;
             pw.writeAll("'><") catch continue;
             pw.writeAll(action) catch continue;
             pw.writeAll(" xmlns='urn:xmpp:blocking'>") catch continue;
             if (item_jid.len > 0) {
                 pw.writeAll("<item jid='") catch continue;
-                pw.writeAll(item_jid) catch continue;
+                xml.escapeWrite(pw, item_jid) catch continue;
                 pw.writeAll("'/>") catch continue;
             }
             pw.writeAll("</") catch continue;
@@ -2102,7 +2177,7 @@ pub fn sendIqErrorWithType(server: *Server, session: *Session, iq_id: []const u8
     w.writeAll("'><") catch return;
     w.writeAll(condition) catch return;
     w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 /// Write <group>text</group> elements from serialized groups data.
@@ -2118,7 +2193,7 @@ fn writeGroupElements(w: anytype, groups_data: []const u8, group_count: u8) void
         const gtext = groups_data[offset .. offset + glen];
         offset += glen;
         w.writeAll("<group>") catch continue;
-        w.writeAll(gtext) catch continue;
+        xml.escapeWrite(w, gtext) catch continue;
         w.writeAll("</group>") catch continue;
     }
 }
@@ -2137,8 +2212,10 @@ pub fn pushRosterItem(
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
-    var entries: [16]SessionEntry = undefined;
-    const count = sm.findByBareJid(user_local, user_domain, &entries);
+    var lease_b = server.leaseScratch(.b);
+    defer lease_b.release();
+    const entries = lease_b.entries;
+    const count = sm.findByBareJid(user_local, user_domain, entries);
     if (count == 0) return;
 
     // Look up current item to get groups and name for the push.
@@ -2171,11 +2248,11 @@ pub fn pushRosterItem(
     const pw = pfbs.writer();
     // We'll prepend per-target header, so build item portion first
     pw.writeAll("<item jid='") catch return;
-    pw.writeAll(item_jid) catch return;
+    xml.escapeWrite(pw, item_jid) catch return;
     pw.writeByte('\'') catch return;
     if (effective_name.len > 0) {
         pw.writeAll(" name='") catch return;
-        pw.writeAll(effective_name) catch return;
+        xml.escapeWrite(pw, effective_name) catch return;
         pw.writeByte('\'') catch return;
     }
     pw.writeAll(" subscription='") catch return;
@@ -2202,13 +2279,13 @@ pub fn pushRosterItem(
         const push_id = server.generateStanzaId(&id_buf);
 
         fw.writeAll("<iq type='set' to='") catch continue;
-        fw.writeAll(user_local) catch continue;
+        xml.escapeWrite(fw, user_local) catch continue;
         fw.writeByte('@') catch continue;
-        fw.writeAll(user_domain) catch continue;
+        xml.escapeWrite(fw, user_domain) catch continue;
         fw.writeByte('/') catch continue;
-        fw.writeAll(entry.resource()) catch continue;
+        xml.escapeWrite(fw, entry.resource()) catch continue;
         fw.writeAll("' id='") catch continue;
-        fw.writeAll(push_id) catch continue;
+        xml.escapeWrite(fw, push_id) catch continue;
         fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch continue;
         fw.writeAll(item_xml) catch continue;
         fw.writeAll("</query></iq>") catch continue;
@@ -2236,4 +2313,42 @@ fn writeGravatarHash(writer: anytype, bare_jid: []const u8) void {
     std.crypto.hash.Md5.hash(lower_buf[0..len], &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     writer.writeAll(&hex) catch {};
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "S11: staged reg IQ id survives the reader-arena reset" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit(); // closes fds[0]
+
+    // The id arrives as a slice into the connection's reader arena.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_id = try arena.allocator().dupe(u8, "pw-change-42");
+    try std.testing.expect(stageRegPendingIq(&server, session, arena_id));
+
+    // The next stanza resets the arena (S11) and later stanzas reuse the
+    // memory; the staged id must be a session-owned copy.
+    _ = arena.reset(.retain_capacity);
+    _ = try arena.allocator().dupe(u8, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    try std.testing.expectEqualStrings("pw-change-42", session.reg_pending_iq_id);
+
+    // Overlong ids are rejected and leave the staged id untouched.
+    var long_buf: [300]u8 = undefined;
+    @memset(&long_buf, 'y');
+    try std.testing.expect(!stageRegPendingIq(&server, session, &long_buf));
+    try std.testing.expectEqualStrings("pw-change-42", session.reg_pending_iq_id);
 }

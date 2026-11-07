@@ -22,6 +22,8 @@ const NS_VCARDS = backend_mod.registered("vcards");
 const NS_PEP = backend_mod.registered("pep");
 const NS_LASTACT = backend_mod.registered("lastact");
 const NS_OFFLINE = backend_mod.registered("offline");
+const NS_OFFLINE_V2 = backend_mod.registered("offline_v2");
+const NS_OFFLINE_SEQ = backend_mod.registered("offline_seq");
 const NS_ROOM_AFFILIATIONS = backend_mod.registered("room_affiliations");
 const NS_PENDING_SUB = backend_mod.registered("pending_sub");
 const NS_MESSAGES = backend_mod.registered("messages");
@@ -211,7 +213,7 @@ test "migrate-precis uses production key models for every namespace" {
     const domains = [_][]const u8{"us.example"};
     var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
     defer plan.deinit();
-    try std.testing.expectEqual(@as(usize, 15), plan.renames.items.len);
+    try std.testing.expectEqual(@as(usize, 16), plan.renames.items.len);
     try std.testing.expectEqual(@as(usize, 0), plan.issues.items.len);
 
     var tmp = std.testing.tmpDir(.{});
@@ -573,7 +575,11 @@ test "deluser --raw on a data-only spelling touches only owned rows" {
     try std.testing.expectEqual(room_store_mod.Affiliation.admin, try rooms.getAffiliation("room@conference.us.example", "naplestb@us.example"));
     try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
     try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
-    try expectMissing(&op, NS_OFFLINE, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
+    try expectMissing(&op, NS_OFFLINE_SEQ, "naplestb@us.example");
+    try expectMissing(&op, NS_OFFLINE_V2, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
+    const pointers = try offline.getPointers("naplestb@us.example");
+    defer offline.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 0), pointers.len);
     try expectMissing(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
     try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
 }
@@ -729,6 +735,7 @@ test "migrate-precis detects identity collisions on data and raw deletion cascad
 
 const NoDeleteBackend = struct {
     inner: backend_mod.MemoryBackend,
+    compound_mutex: std.Thread.Mutex = .{},
 
     pub const Iterator = backend_mod.MemoryBackend.Iterator;
 
@@ -802,6 +809,7 @@ test "deluser --raw reports data that remains after an incomplete cascade" {
 
 const FailingCommitBackend = struct {
     inner: backend_mod.MemoryBackend,
+    compound_mutex: std.Thread.Mutex = .{},
 
     pub const Iterator = backend_mod.MemoryBackend.Iterator;
 

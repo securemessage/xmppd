@@ -21,10 +21,19 @@ const NS_VCARDS = backend_mod.registered("vcards");
 const NS_PEP = backend_mod.registered("pep");
 const NS_LASTACT = backend_mod.registered("lastact");
 const NS_OFFLINE = backend_mod.registered("offline");
+const NS_OFFLINE_V2 = backend_mod.registered("offline_v2");
+const NS_OFFLINE_SEQ = backend_mod.registered("offline_seq");
+const NS_OFFLINE_HOLD_V2 = backend_mod.registered("offline_hold_v2");
+const NS_OFFLINE_HOLD_TOKEN = backend_mod.registered("offline_hold_token");
 const NS_ROOM_AFFILIATIONS = backend_mod.registered("room_affiliations");
 const NS_PENDING_SUB = backend_mod.registered("pending_sub");
 const NS_MESSAGES = backend_mod.registered("messages");
 const NS_BY_CONTACT = backend_mod.registered("by_contact");
+/// Internal, unregistered namespace for migrate-precis completion markers.
+/// It is written atomically with the data batch it describes.
+const NS_MIGRATION_STATE: []const u8 = &[_]u8{
+    'm', 'i', 'g', 'r', 'a', 't', 'e', '-', 's', 't', 'a', 't', 'e',
+};
 
 pub const Database = enum { auth, op, archive };
 
@@ -429,6 +438,16 @@ fn rewriteEntry(
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
         rewrite.new_key = try rewriteRoomAffiliation(allocator, key, ctx);
         rewrite.reference_duplicate = rewrite.new_key != null;
+    } else if (std.mem.eql(u8, namespace, NS_OFFLINE_SEQ)) {
+        // New offline schema: the sequence key is the recipient JID.
+        rewrite.new_key = try rewriteJid(allocator, key, ctx, .data);
+    } else if (std.mem.eql(u8, namespace, NS_OFFLINE_V2)) {
+        rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx, .data);
+        rewrite.new_value = try rewriteOfflineV2Value(allocator, value, ctx);
+    } else if (std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_V2) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_TOKEN))
+    {
+        rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx, .data);
     } else if (std.mem.eql(u8, namespace, NS_VCARDS) or
         std.mem.eql(u8, namespace, NS_LASTACT) or
         std.mem.eql(u8, namespace, NS_PEP) or
@@ -1063,6 +1082,14 @@ fn firstJidMatchesRaw(key: []const u8, raw: []const u8, hosted_domains: []const 
     return jidMatchesRaw(key[0..sep], raw, hosted_domains);
 }
 
+fn offlineV2ValueMatchesRaw(value: []const u8, raw: []const u8, hosted_domains: []const []const u8) bool {
+    if (value.len < 12) return false;
+    const id_len = std.mem.readInt(u32, value[8..12], .big);
+    const from_offset = 12 + @as(usize, id_len);
+    if (from_offset > value.len) return false;
+    return jidMatchesRaw(value[from_offset..], raw, hosted_domains);
+}
+
 fn entryOwnsRaw(
     namespace: []const u8,
     key: []const u8,
@@ -1085,6 +1112,10 @@ fn entryOwnsRaw(
         std.mem.eql(u8, namespace, NS_LASTACT) or
         std.mem.eql(u8, namespace, NS_PEP) or
         std.mem.eql(u8, namespace, NS_OFFLINE) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_V2) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_SEQ) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_V2) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_TOKEN) or
         std.mem.eql(u8, namespace, NS_MESSAGES))
     {
         return firstJidMatchesRaw(key, raw, hosted_domains);
@@ -1155,10 +1186,16 @@ fn entryMatchesRaw(
         std.mem.eql(u8, namespace, NS_LASTACT) or
         std.mem.eql(u8, namespace, NS_PEP) or
         std.mem.eql(u8, namespace, NS_OFFLINE) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_V2) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_SEQ) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_V2) or
+        std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_TOKEN) or
         std.mem.eql(u8, namespace, NS_MESSAGES))
     {
         if (firstJidMatchesRaw(key, raw, hosted_domains)) return true;
-        return std.mem.eql(u8, namespace, NS_OFFLINE) and jidMatchesRaw(value, raw, hosted_domains);
+        if (std.mem.eql(u8, namespace, NS_OFFLINE)) return jidMatchesRaw(value, raw, hosted_domains);
+        if (std.mem.eql(u8, namespace, NS_OFFLINE_V2)) return offlineV2ValueMatchesRaw(value, raw, hosted_domains);
+        return false;
     }
     return false;
 }
@@ -1238,6 +1275,10 @@ pub fn deleteRawAccount(
             NS_PEP,
             NS_LASTACT,
             NS_OFFLINE,
+            NS_OFFLINE_V2,
+            NS_OFFLINE_SEQ,
+            NS_OFFLINE_HOLD_V2,
+            NS_OFFLINE_HOLD_TOKEN,
             NS_ROOM_AFFILIATIONS,
             NS_PENDING_SUB,
         }, raw, hosted_domains);
@@ -1255,6 +1296,10 @@ pub fn deleteRawAccount(
         NS_PEP,
         NS_LASTACT,
         NS_OFFLINE,
+        NS_OFFLINE_V2,
+        NS_OFFLINE_SEQ,
+        NS_OFFLINE_HOLD_V2,
+        NS_OFFLINE_HOLD_TOKEN,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, raw, hosted_domains, raw_has_users);
@@ -1274,6 +1319,10 @@ pub fn deleteRawAccount(
         NS_PEP,
         NS_LASTACT,
         NS_OFFLINE,
+        NS_OFFLINE_V2,
+        NS_OFFLINE_SEQ,
+        NS_OFFLINE_HOLD_V2,
+        NS_OFFLINE_HOLD_TOKEN,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, raw, hosted_domains, raw_has_users);

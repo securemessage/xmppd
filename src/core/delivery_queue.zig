@@ -27,6 +27,18 @@ const log = std.log.scoped(.delivery_queue);
 /// Maximum stanza payload size per delivery slot.
 pub const MAX_PAYLOAD_SIZE = 4080;
 
+/// Cross-worker stanzas that could not be handed to the delivery system,
+/// most often because they exceeded the 4080-byte slot (S14). Atomic: every
+/// worker increments it; the M1 metrics task can export it later.
+pub var cross_worker_drops = std.atomic.Value(u64).init(0);
+
+/// Delivery outcomes for the metrics work that follows this release (M1,
+/// PR #13). Nothing exports them yet. All are process-wide and incremented by
+/// multiple workers.
+pub var s2s_bounces = std.atomic.Value(u64).init(0);
+pub var offline_not_stored = std.atomic.Value(u64).init(0);
+pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
+
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
@@ -57,14 +69,27 @@ pub const DeliverySlot = struct {
     target_generation: u32 = 0,
     /// Length of the stanza payload in bytes.
     payload_len: u16 = 0,
-    /// Padding for alignment.
-    _pad: [5]u8 = undefined,
+    /// Dispatch identity minted by the producer (see offline_store.HoldToken).
+    /// Carried in the slot so a consumer on another worker holds the message
+    /// under the same identity, and two identical messages stay distinct.
+    /// Zero means the producer did not tag the dispatch.
+    hold_token: u64 = 0,
     /// Set to true by producer AFTER payload memcpy is complete.
     /// Consumer MUST check this before reading payload.
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Serialized XMPP stanza bytes.
     payload: [MAX_PAYLOAD_SIZE]u8 = undefined,
 };
+
+comptime {
+    // Zig reorders struct fields to minimize padding, so declaration order
+    // does not decide the layout: the id bytes, the two-byte length, the flag
+    // and the token pack into a 24-byte header with no filler either way. A
+    // manual filler field is what costs space: six bytes of _pad pushed the
+    // slot to 4112, an eight-byte slab per queue across every worker. Pin the
+    // header so any future field that does not fit the gaps fails here.
+    std.debug.assert(@sizeOf(DeliverySlot) == MAX_PAYLOAD_SIZE + 24); // 4104
+}
 
 /// Per-worker MPSC delivery queue (bounded ring buffer).
 pub const MpscQueue = struct {
@@ -73,6 +98,9 @@ pub const MpscQueue = struct {
     tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Next read position — advanced by consumer only (no atomics needed).
     head: u32 = 0,
+    /// Dispatch identity of the slot the drain is currently handing to the
+    /// handler. Consumer-only, valid for the duration of one handler call.
+    current_slot_token: u64 = 0,
 
     /// Attempt to enqueue a stanza for cross-thread delivery.
     /// Called by any producer thread. Returns error.QueueFull if no slots available.
@@ -81,6 +109,18 @@ pub const MpscQueue = struct {
         target_session_id: u32,
         target_generation: u32,
         payload: []const u8,
+    ) !void {
+        return self.enqueueWithToken(target_session_id, target_generation, payload, 0);
+    }
+
+    /// Enqueue a stanza together with its dispatch identity, for a consumer
+    /// that may have to hold it behind an offline tail.
+    pub fn enqueueWithToken(
+        self: *MpscQueue,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+        hold_token: u64,
     ) !void {
         if (payload.len > MAX_PAYLOAD_SIZE) return error.PayloadTooLarge;
 
@@ -108,6 +148,7 @@ pub const MpscQueue = struct {
             slot.target_session_id = target_session_id;
             slot.target_generation = target_generation;
             slot.payload_len = @intCast(payload.len);
+            slot.hold_token = hold_token;
             @memcpy(slot.payload[0..payload.len], payload);
 
             // Publish: signal to consumer that this slot is fully written
@@ -134,8 +175,11 @@ pub const MpscQueue = struct {
                 break;
             }
 
-            // Read the delivery
+            // Read the delivery. `current_slot_token` is how a handler learns
+            // this dispatch's identity without widening the handler signature.
+            self.current_slot_token = slot.hold_token;
             handler(ctx, slot.target_session_id, slot.target_generation, slot.payload[0..slot.payload_len]);
+            self.current_slot_token = 0;
             processed += 1;
 
             // Reset the slot and advance head
@@ -271,7 +315,19 @@ pub const DeliverySystem = struct {
         target_generation: u32,
         payload: []const u8,
     ) !void {
-        try self.enqueue(target_worker, target_session_id, target_generation, payload);
+        return self.deliverWithToken(target_worker, target_session_id, target_generation, payload, 0);
+    }
+
+    /// Deliver a stanza together with its dispatch identity.
+    pub fn deliverWithToken(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+        hold_token: u64,
+    ) !void {
+        try self.enqueue(target_worker, target_session_id, target_generation, payload, hold_token);
 
         // Always wake the target worker — coalesced signaling is unsafe because
         // the target may finish processing and enter kevent() between our isActive
@@ -289,9 +345,10 @@ pub const DeliverySystem = struct {
         target_session_id: u32,
         target_generation: u32,
         payload: []const u8,
+        hold_token: u64,
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
-        try self.queues[target_worker].enqueue(target_session_id, target_generation, payload);
+        try self.queues[target_worker].enqueueWithToken(target_session_id, target_generation, payload, hold_token);
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). One pipe
@@ -356,6 +413,40 @@ test "MpscQueue: basic enqueue and drain" {
     try std.testing.expectEqual(@as(u32, 42), received_id);
     try std.testing.expectEqual(@as(u32, 7), received_gen);
     try std.testing.expectEqualStrings("hello world", received_payload);
+}
+
+test "MpscQueue: hold token survives the round trip and is cleared after each slot" {
+    var queue = MpscQueue{};
+
+    try queue.enqueueWithToken(42, 7, "tagged", 0xdeadbeef);
+    try queue.enqueue(43, 8, "untagged");
+
+    const Ctx = struct {
+        queue: *MpscQueue,
+        tokens: *[2]u64,
+        seen: *usize,
+    };
+    var tokens = [_]u64{ 0, 0 };
+    var seen: usize = 0;
+    const ctx = Ctx{ .queue = &queue, .tokens = &tokens, .seen = &seen };
+
+    // Each slot reports its own token, and the field is back to zero after the
+    // handler returns so a later untagged slot cannot inherit the previous one.
+    const handler = struct {
+        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
+            _ = gen;
+            _ = pl;
+            c.tokens.*[c.seen.*] = c.queue.current_slot_token;
+            _ = sid;
+            c.seen.* += 1;
+        }
+    }.handle;
+
+    const processed = queue.drain(ctx, handler);
+    try std.testing.expectEqual(@as(u32, 2), processed);
+    try std.testing.expectEqual(@as(u64, 0xdeadbeef), tokens[0]);
+    try std.testing.expectEqual(@as(u64, 0), tokens[1]);
+    try std.testing.expectEqual(@as(u64, 0), queue.current_slot_token);
 }
 
 test "MpscQueue: queue full" {
