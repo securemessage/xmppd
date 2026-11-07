@@ -359,6 +359,9 @@ pub const Resolver = struct {
     cache_bytes: usize = 0,
     /// Stale answers served (RFC 8767); counted for observability.
     stale_serves: usize = 0,
+    /// List nodes evictOne inspected, cumulative; observability for
+    /// the bounded one-pass eviction scan.
+    evict_scans: usize = 0,
     /// Requests queued behind a full in-flight set; promoted FIFO as
     /// jobs complete.
     wait_queue: std.ArrayListUnmanaged(WaitEnt) = .{},
@@ -2216,8 +2219,11 @@ pub const Resolver = struct {
 
     /// Re-file an owner under the second its last fresh row expires;
     /// owners already past that (or inside the cursor's second) go
-    /// straight to the stale list.
+    /// straight to the stale list. The cursor advances first so every
+    /// wheel entry lies within CACHE_TTL_CEIL_S of it: no fresh owner
+    /// is spliced early by slot aliasing or a long-gap sweep.
     fn expRelink(self: *Resolver, owner: *OwnerEnt, now: i64) void {
+        self.expAdvance(now);
         self.expUnlink(owner);
         var latest: i64 = std.math.minInt(i64);
         for (owner.types.items) |ent| {
@@ -2270,13 +2276,16 @@ pub const Resolver = struct {
     /// nothing can be evicted.
     fn evictOne(self: *Resolver, now: i64) bool {
         self.expAdvance(now);
-        var tries = self.expiry_stale.len();
-        while (tries > 0) : (tries -= 1) {
-            const nd = self.expiry_stale.first orelse break;
+        // One pass at most: stop at the first owner rotated to the tail.
+        var first_rotated: ?*std.DoublyLinkedList.Node = null;
+        while (self.expiry_stale.first) |nd| {
+            if (nd == first_rotated) break;
+            self.evict_scans += 1;
             const owner: *OwnerEnt = @fieldParentPtr("exp_node", nd);
             if (Resolver.ownerPinned(owner) or Resolver.ownerHasFresh(owner, now)) {
                 self.expiry_stale.remove(nd);
                 self.expiry_stale.append(nd);
+                if (first_rotated == null) first_rotated = nd;
                 continue;
             }
             self.removeOwner(owner);
@@ -2284,6 +2293,7 @@ pub const Resolver = struct {
         }
         var node = self.lru.last;
         while (node) |nd| : (node = nd.prev) {
+            self.evict_scans += 1;
             const owner: *OwnerEnt = @fieldParentPtr("node", nd);
             if (!Resolver.ownerPinned(owner)) {
                 self.removeOwner(owner);
@@ -4904,6 +4914,48 @@ test "dns-async: an all-pinned run still reaches the one evictable owner" {
     try std.testing.expect(r.evictOne(r.now_ms()));
     try std.testing.expectEqual(@as(usize, 95), r.owners.count());
     try std.testing.expect(r.owners.get("p95.test") == null);
+}
+
+test "dns-async: a cursor jump after long uptime files no fresh owner stale" {
+    // Goal: the wheel cursor tracks the clock in expRelink, not only
+    // inside evictOne, so a gap past the 512-slot lap cannot sweep
+    // fresh owners onto the stale list and an eviction never scans
+    // more than the unevictable head run. Method: CLOCK_MONOTONIC at
+    // 55 days, a full cache of TTL-300 owners, then 1024 over-budget
+    // inserts; count the nodes each evictOne inspects and walk the
+    // stale list for fresh owners at the end.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 4_752_000_000; // 55 days of CLOCK_MONOTONIC uptime
+
+    var rrs = [1]wire.Rr{.{ .name = "x", .rtype = KIND_A, .class = wire.CLASS_IN, .ttl = 60, .rdata = &.{ 10, 1, 1, 1 } }};
+    var name_buf: [40]u8 = undefined;
+    for (0..CACHE_ENTRIES_MAX) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "e{d}.test", .{i}) catch unreachable;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 300);
+    }
+    try std.testing.expectEqual(@as(usize, CACHE_ENTRIES_MAX), r.owners.count());
+    fake_now += 2_000;
+
+    var max_scans: usize = 0;
+    for (0..1024) |i| {
+        const n = std.fmt.bufPrint(&name_buf, "n{d}.test", .{i}) catch unreachable;
+        const scans_before = r.evict_scans;
+        r.cacheInsert(n, KIND_A, &rrs, .none, 300);
+        max_scans = @max(max_scans, r.evict_scans - scans_before);
+    }
+    // Each evict visits the head run of unevictable stale entries
+    // plus the one it sheds; with the cursor current that run is
+    // empty, so a couple of nodes at most.
+    try std.testing.expect(max_scans <= 4);
+    var node = r.expiry_stale.first;
+    var misfiled: usize = 0;
+    while (node) |nd| : (node = nd.next) {
+        const ow: *OwnerEnt = @fieldParentPtr("exp_node", nd);
+        if (Resolver.ownerHasFresh(ow, fake_now)) misfiled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), misfiled);
 }
 
 test "dns-async: owner churn leaves no tombstone buildup" {
