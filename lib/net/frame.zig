@@ -150,14 +150,17 @@ pub const FrameWriter = struct {
     }
 
     /// Fold the sent prefix away before appending, same shape as
-    /// IpcConn.queueSend. Folding is O(unsent), so it runs only when it
-    /// is free work (the sent prefix outweighs the backlog) or the
-    /// frame cannot fit the tail space; folding on every begin after a
-    /// small drain is O(backlog) per call.
+    /// IpcConn.queueSend. Folding is O(unsent), so it runs only when
+    /// it pays: the sent prefix already outweighs the backlog, or the
+    /// tail is short and the sent prefix is at least half of it
+    /// (amortized 2x). Otherwise a short tail lets
+    /// ensureUnusedCapacity grow the buffer geometrically instead of
+    /// moving the whole backlog on every begin near capacity.
     fn reclaim(w: *FrameWriter, need: usize) void {
         if (w.start == 0) return;
         const unsent = w.buf.items.len - w.start;
-        if (w.start >= unsent or w.buf.capacity - w.buf.items.len < need) {
+        const tail_short = w.buf.capacity - w.buf.items.len < need;
+        if (w.start >= unsent or (tail_short and 2 * w.start >= unsent)) {
             std.mem.copyForwards(u8, w.buf.items, w.buf.items[w.start..]);
             w.buf.items.len = unsent;
             w.start = 0;
@@ -493,6 +496,39 @@ test "Frame: begin folds the sent prefix only when needed" {
         if (w.start == 0) copied += before;
     }
     try std.testing.expect(copied <= 16 << 20);
+}
+
+test "Frame: a steady backlog near capacity keeps begin() amortized" {
+    // The IPC sender reaches this state naturally: encode needs
+    // begin(MAX_PAYLOAD_SIZE) each pass while the kernel drains one
+    // small frame, so the backlog settles near the cap and every begin
+    // finds a short tail. Folding the whole backlog there is O(backlog)
+    // per frame again (N2 measured 2.8 MB moved per 8 KiB frame).
+    const alloc = std.heap.c_allocator;
+    var worst: usize = 0;
+    var t: usize = 64 << 10;
+    while (t <= (4 << 20) - 2 * MAX_FRAME_SIZE) : (t += 13 << 10) {
+        var w: FrameWriter = .{};
+        defer w.deinit(alloc);
+        while (w.pending() < t) {
+            _ = try w.begin(alloc, MAX_PAYLOAD_SIZE, 4 << 20);
+            w.commit(8192);
+        }
+        var moved: usize = 0;
+        for (0..512) |_| {
+            w.start += 8192 + HEADER_SIZE;
+            const before = w.pending();
+            const st = w.start;
+            _ = try w.begin(alloc, MAX_PAYLOAD_SIZE, 4 << 20);
+            if (st != 0 and w.start == 0) moved += before;
+            w.commit(8192);
+        }
+        const per = moved / 512;
+        if (per > worst) worst = per;
+    }
+    // A fold may still run, but amortized it moves at most a few frame
+    // lengths per begin.
+    try std.testing.expect(worst <= 4 * (8192 + HEADER_SIZE));
 }
 
 test "Frame: a max-size payload parses" {
