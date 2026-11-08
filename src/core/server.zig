@@ -2061,8 +2061,13 @@ pub const Server = struct {
 
         // F6: prepare local-domain to/from once at stanza ingress so every
         // downstream compare and store key sees the folded localpart and the
-        // configured domain spelling.
-        if (session.reader.depth == 2 and
+        // configured domain spelling. The reader reports a top-level open
+        // stanza at depth 2 but restores depth to 1 before emitting a
+        // self-closing element, so a self-closing element seen at depth 2 is
+        // a stanza child, never a stanza.
+        const stanza_top = (session.reader.depth == 2 and !elem.self_closing) or
+            (session.reader.depth == 1 and elem.self_closing);
+        if (stanza_top and
             (std.mem.eql(u8, elem.local_name, "message") or
                 std.mem.eql(u8, elem.local_name, "presence") or
                 std.mem.eql(u8, elem.local_name, "iq")))
@@ -6108,8 +6113,9 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     alice.stream.authenticated = true;
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
     server.sessions[9] = alice;
-    // Stand in for the reader state at a top-level stanza's element_start.
-    alice.reader.depth = 2;
+    // Stand in for the reader state at a self-closing top-level stanza's
+    // element_start: depth was incremented and restored before the event.
+    alice.reader.depth = 1;
 
     const attrs = [_]xml.Attribute{
         .{ .name = "to", .value = "NaplesTB@LOCALHOST", .prefix = "", .local_name = "to" },
@@ -6147,7 +6153,7 @@ test "F6: pre-bind stanza to the folded account is server-addressed" {
     server.sessions[1] = session;
     session.stream.state = .features_bind;
     session.stream.authenticated_jid = .{ .local = "NaplesTB", .domain = "localhost" };
-    session.reader.depth = 2;
+    session.reader.depth = 1;
 
     const attrs = [_]xml.Attribute{
         .{ .name = "to", .value = "NaplesTB@localhost", .prefix = "", .local_name = "to" },
@@ -6189,7 +6195,7 @@ test "F6: a 320-octet localpart survives the pre-bind account compare" {
     server.sessions[1] = session;
     session.stream.state = .features_bind;
     session.stream.authenticated_jid = .{ .local = &local_upper, .domain = "localhost" };
-    session.reader.depth = 2;
+    session.reader.depth = 1;
 
     const attrs = [_]xml.Attribute{
         .{ .name = "to", .value = to, .prefix = "", .local_name = "to" },
@@ -6226,7 +6232,7 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
-    session.reader.depth = 2;
+    session.reader.depth = 1;
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -6269,6 +6275,148 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
     n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "jid-malformed") != null);
     try std.testing.expect(server.sessions[1] != null);
+}
+
+/// F6 ingress-routing fixture: a bound naplestb target registered in the
+/// session map plus an alice session whose stream opened over a real
+/// socketpair. Stanzas are fed as wire bytes through handleReadable so the
+/// reader's own depth/self-closing state drives the ingress gate.
+const F6WirePair = struct {
+    target: *Session,
+    alice: *Session,
+};
+
+fn f6WireSetup(allocator: std.mem.Allocator, server: *Server, sm: *SessionMap, target_fds: [2]posix.fd_t, alice_fds: [2]posix.fd_t) !F6WirePair {
+    server.worker_id = 0;
+    server.session_map = sm;
+    const target = try allocator.create(Session);
+    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.stream.state = .active;
+    target.stream.authenticated = true;
+    target.stream.bound_jid = .{ .local = "naplestb", .domain = "localhost", .resource = "desk" };
+    target.csi_active = true;
+    server.sessions[5] = target;
+    _ = try sm.bind(0, 5, "naplestb", "localhost", "desk");
+    sm.setPresenceAvailable("naplestb", "localhost", "desk", true);
+
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    server.sessions[9] = alice;
+    var changes_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&changes_buf);
+    _ = try posix.write(alice_fds[1], "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>");
+    server.handleReadable(9, &changes);
+    _ = alice.conn.flushSend() catch {};
+    var drain: [4096]u8 = undefined;
+    _ = posix.read(alice_fds[1], &drain) catch 0;
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mob" };
+    return .{ .target = target, .alice = alice };
+}
+
+fn f6Feed(server: *Server, s: *Session, id: u32, fd: posix.fd_t, bytes: []const u8) !void {
+    var changes_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&changes_buf);
+    _ = try posix.write(fd, bytes);
+    server.handleReadable(id, &changes);
+    _ = s.conn.flushSend() catch {};
+}
+
+fn f6Read(fd: posix.fd_t, buf: []u8) []const u8 {
+    const n = posix.read(fd, buf) catch 0;
+    return buf[0..n];
+}
+
+test "F6: self-closing top-level message with malformed 'to' gets jid-malformed" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='a@b@c' type='chat' id='p1'/>");
+    const r = f6Read(af[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='p1'") != null);
+}
+
+test "F6: self-closing top-level message to a mixed-case local JID is routed folded" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='NaplesTB@LOCALHOST' type='chat' id='b2'/>");
+    _ = s.target.conn.flushSend() catch {};
+    const r = f6Read(tf[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "to='naplestb@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='b2'") != null);
+}
+
+test "F6: self-closing presence subscribe to a mixed-case local JID is routed folded" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try OpBackendMod.Backend.open(db_path, .{});
+    defer db.close();
+    var roster = GenericRosterStore.init(&db);
+    server.roster = &roster;
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<presence to='NaplesTB@LOCALHOST' type='subscribe'/>");
+    _ = s.target.conn.flushSend() catch {};
+    const r = f6Read(tf[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "<presence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "type='subscribe'") != null);
+    // The pending subscription was filed under the folded contact spelling.
+    try std.testing.expect(std.mem.indexOf(u8, r, "to='naplestb@localhost'") != null);
+}
+
+test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<iq type='get' id='q1'><query xmlns='jabber:iq:roster'/><message to='a@b@c'/></iq>");
+    const r = f6Read(af[1], &buf);
+    // The child's 'to' is not a stanza address: the IQ must be answered
+    // normally, never with a jid-malformed stanza error.
+    try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='q1'") != null);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
