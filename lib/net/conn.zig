@@ -956,9 +956,12 @@ pub const Conn = struct {
     /// detaches it (immediate EV_DELETE per filter) so a pool thread can
     /// register it on its own kqueue. The conn keeps `ctx`; the driver
     /// posts `Done` back through `loop.wake` and the consumer re-adopts.
-    pub fn releaseFd(c: *Conn) loop_mod.DetachError!posix.fd_t {
+    /// Refuses without a Handshake: only a Handshake owns a released
+    /// fd, and teardown would have nothing to close it through.
+    pub fn releaseFd(c: *Conn) (loop_mod.DetachError || error{NoHandshake})!posix.fd_t {
+        const hs = if (c.hs) |*h| h else return error.NoHandshake;
         const fd = try c.loop.detach(c.handle);
-        if (c.hs) |*hs| hs.fd = fd;
+        hs.fd = fd;
         return fd;
     }
 
@@ -3403,9 +3406,9 @@ test "Conn: stale-handle loop calls are counted, not swallowed" {
     try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
     defer c.deinit();
 
-    // Release the fd: every handle-scoped loop call now fails with
+    // Detach the fd: every handle-scoped loop call now fails with
     // StaleHandle. Each failure is counted instead of swallowed (L2).
-    _ = try c.releaseFd();
+    _ = try c.loop.detach(c.handle);
     var list: ConnList = .{};
     c.inbox_stalled = true;
     c.consume(&list, 0);
@@ -3417,6 +3420,29 @@ test "Conn: stale-handle loop calls are counted, not swallowed" {
     c.state = .closing;
     c.teardown();
     try std.testing.expectEqual(@as(u64, 1), counters.loop_close_failed);
+}
+
+test "Conn: releaseFd without a handshake refuses instead of leaking the fd" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // With no Handshake to own the fd a release would detach it and
+    // teardown could never close it: refuse instead, so the walk's
+    // loop.close still reaches it.
+    try std.testing.expectError(error.NoHandshake, c.releaseFd());
+    var list: ConnList = .{};
+    c.close(&list);
+    list.service();
+    try std.testing.expect(std.c.fcntl(pair[0], posix.F.GETFL, @as(c_int, 0)) == -1);
 }
 
 test "Conn: a flush stalled on want_read is retried on the next readable" {
