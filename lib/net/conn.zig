@@ -482,7 +482,9 @@ pub const Outbox = struct {
                     o.head = (o.head + n) % o.ring.len;
                     o.used -= n;
                     o.pin = null;
-                    left -= n;
+                    // A retained pin can outrun this call's budget:
+                    // saturate rather than underflow.
+                    left -|= n;
                 },
                 .want_write => return .want_write,
                 .want_read => return .want_read,
@@ -3527,6 +3529,38 @@ test "ConnList: service drops write interest once the outbox drains" {
     try std.testing.expect(!c.want_write);
     c.state = .closing;
     c.teardown();
+}
+
+test "Outbox: a retained pin larger than the next budget cannot underflow" {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var ring: [4096]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+    defer o.deinit();
+    var t: Transport = .{ .plain = pair[0] };
+
+    // Fill the kernel send buffer, then queue a full ring: the flush
+    // retains a 4096-byte pin on want_write.
+    var filler: [4096]u8 = undefined;
+    @memset(&filler, 'z');
+    while (true) _ = posix.write(pair[0], &filler) catch |err| switch (err) {
+        error.WouldBlock => break,
+        else => return err,
+    };
+    const parts = [_][]const u8{&filler};
+    _ = o.append(&parts);
+    try std.testing.expect(o.flush(&t, 4096) == .want_write);
+    try std.testing.expectEqual(@as(usize, 4096), o.pin.?.len);
+
+    // The peer frees space and the next call arrives with a smaller
+    // budget: the write still moves the whole retained pin, so left
+    // would underflow without the saturating subtraction.
+    var sink: [65536]u8 = undefined;
+    while ((posix.read(pair[1], &sink) catch 0) > 0) {}
+    try std.testing.expect(o.flush(&t, 100) == .drained);
 }
 
 test "Outbox: the bound counts ring bytes plus spill" {
