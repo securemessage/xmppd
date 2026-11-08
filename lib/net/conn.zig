@@ -767,6 +767,13 @@ pub const Conn = struct {
 
     fn onReadable(c: *Conn, list: *ConnList) Outcome {
         if (c.state == .handshake) return c.driveHandshake(list);
+        if (c.read_suppressed and !c.flush_want_read) {
+            // A re-drive queued before suppression engaged: keep it
+            // pending instead of draining; the lift re-drives it
+            // through the walk.
+            c.requeue_read = true;
+            return .none;
+        }
         if (c.flush_want_read) {
             // The read a stalled flush was waiting for: the walk
             // retries the flush once the drain below finishes.
@@ -816,14 +823,12 @@ pub const Conn = struct {
         if (c.state == .handshake) return c.driveHandshake(list);
         const r = c.outbox.flush(&c.transport, c.opts.flush_budget_bytes);
         c.updateSuppression();
+        // A read re-drive deferred while suppressed fires once the
+        // lift happens: the walk turns the pending flag into a
+        // Loop.requeue this same pass.
+        if (c.requeue_read and !c.read_suppressed) list.link(c);
         switch (r) {
             .drained => {
-                if (c.requeue_read) {
-                    // The write the TLS read was waiting for happened:
-                    // the walk re-drives the stalled read. The flag
-                    // stays set so the walk can see it.
-                    list.link(c);
-                }
                 c.interest(true, false);
                 return .none;
             },
@@ -1144,7 +1149,9 @@ pub const ConnList = struct {
                 }
                 c.updateSuppression();
             }
-            if (c.requeue_read) {
+            // A suppressed or parked read keeps its pending re-drive:
+            // it fires when the lift (or consume) re-arms the read.
+            if (c.requeue_read and !c.read_suppressed and !c.inbox_stalled) {
                 c.requeue_read = false;
                 c.loop.requeue(c.handle, .read) catch {
                     c.opts.counters.requeue_failed += 1;
@@ -3192,6 +3199,80 @@ test "Conn: a full outbox suppresses reads until it drains" {
     try std.testing.expectEqualStrings("in", c.inbox.unread());
     c.state = .closing;
     c.teardown();
+}
+
+test "ConnList: read suppression holds while a budget re-drive is pending" {
+    const alloc = std.testing.allocator;
+    var list: ConnList = .{};
+    var loop: Loop = undefined;
+    try loop.init(alloc, &.{
+        .handles_max = 8,
+        .timers_max = 1024,
+        .on_flush = list.flushHook(),
+    });
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{
+        .counters = &counters,
+        .read_budget_bytes = 1024,
+        .max_outbound_bytes = 64 << 10,
+        .outbox_suppress_high = 32 << 10,
+        .outbox_suppress_low = 16 << 10,
+    });
+    defer c.deinit();
+
+    // The peer floods and never reads; the consumer echoes every byte
+    // back. Once the outbox crosses the high watermark every queued
+    // read re-drive must stay parked, or the suppression never
+    // engages: a fast sender keeps being read and the outbox hits
+    // fail-closed instead of pushing back through flow control.
+    var junk: [4096]u8 = undefined;
+    @memset(&junk, 'x');
+    var read_while_suppressed: usize = 0;
+    var suppressed_seen = false;
+    var closed_full = false;
+    var passes: usize = 0;
+    while (passes < 400 and !closed_full) : (passes += 1) {
+        while (true) _ = posix.write(pair[1], &junk) catch break;
+        _ = try loop.scheduleIn(2, mkConnCtx(9));
+        try loop.wait();
+        while (loop.next()) |ev| switch (ev) {
+            .readable, .writable => {
+                const sup = c.read_suppressed;
+                if (sup) suppressed_seen = true;
+                const o = c.onEvent(ev, &list);
+                const u = c.inbox.unread();
+                if (sup and ev == .readable) read_while_suppressed += u.len;
+                switch (o) {
+                    .closed => |r| if (r == .outbox_full) {
+                        closed_full = true;
+                    },
+                    else => {},
+                }
+                if (u.len > 0 and c.state != .closing) {
+                    const parts = [_][]const u8{ u, u };
+                    switch (c.send(&list, &parts)) {
+                        .closed => |r| if (r == .outbox_full) {
+                            closed_full = true;
+                        },
+                        else => {},
+                    }
+                    c.consume(&list, u.len);
+                }
+            },
+            else => {},
+        };
+    }
+    if (c.state != .closing) c.close(&list);
+    list.service();
+    try std.testing.expect(suppressed_seen);
+    try std.testing.expectEqual(@as(usize, 0), read_while_suppressed);
+    try std.testing.expect(!closed_full);
 }
 
 test "Conn: startTls refuses closing and already-upgraded conns" {
