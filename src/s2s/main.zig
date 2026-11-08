@@ -53,6 +53,7 @@ const stream_mod = @import("stream.zig");
 const S2sStreamAction = stream_mod.S2sStreamAction;
 const StreamError = stream_mod.StreamError;
 const dialback = @import("dialback.zig");
+const xmpp = @import("xmpp");
 
 const log = std.log.scoped(.@"xmppd-s2s");
 
@@ -1382,6 +1383,39 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         return;
     }
 
+    // Ingress preparation (F6): a local-domain to= is rewritten to the
+    // configured spelling with its localpart folded, so IPC forwarding and
+    // every downstream compare see one spelling; remote-domain JIDs pass
+    // through unchanged. to= runs first: a malformed recipient drops only
+    // this stanza, while a malformed from= fails the stream invalid-from
+    // because the peer authenticated for that domain.
+    var prep_buf: [session.stanza_to_buf.len]u8 = undefined;
+    const prepared_to = xmpp.prepareLocalDomainJid(to, daemon.local_domain, &prep_buf) catch |err| {
+        log.warn("inbound S2S stanza dropped: cannot prepare to={s} ({s})", .{ to, @errorName(err) });
+        session.resetStanza();
+        return;
+    };
+    // A passthrough result aliases the session buffer itself; copying it
+    // over itself is illegal, so copy only when the result is in prep_buf.
+    if (prepared_to.ptr != to.ptr) @memcpy(session.stanza_to_buf[0..prepared_to.len], prepared_to);
+    session.stanza_to_len = prepared_to.len;
+
+    const prepared_from = xmpp.prepareLocalDomainJid(from, daemon.local_domain, &prep_buf) catch |err| {
+        log.warn("inbound S2S stanza rejected: cannot prepare from={s} ({s})", .{ from, @errorName(err) });
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    };
+    if (prepared_from.ptr != from.ptr) @memcpy(session.stanza_from_buf[0..prepared_from.len], prepared_from);
+    session.stanza_from_len = prepared_from.len;
+
+    // buildStanzaXml reads the session buffers, so the forwarded XML and
+    // the IPC fields below both carry the prepared spellings.
+    const fwd_from = session.getStanzaFrom();
+    const fwd_to = session.getStanzaTo();
+
     // Build the complete stanza XML
     var stanza_buf: [20480]u8 = undefined;
     const stanza_xml = session.buildStanzaXml(&stanza_buf) catch {
@@ -1391,14 +1425,14 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
     };
     defer session.resetStanza();
 
-    log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), from, to });
+    log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), fwd_from, fwd_to });
 
     // Send to ONE core IPC client (round-robin). The receiving worker uses
     // the shared SessionMap to route — if the target is on a different worker,
     // it delivers via MPSC. Sending to all workers would cause N duplicates.
     const msg = protocol.Message{ .s2s_inbound = .{
-        .from_jid = from,
-        .to_jid = to,
+        .from_jid = fwd_from,
+        .to_jid = fwd_to,
         .stanza_xml = stanza_xml,
     } };
 
@@ -2880,6 +2914,106 @@ test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
     });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, msg.s2s_inbound.stanza_xml);
+}
+
+test "F6: inbound S2S stanza to= on the local domain is prepared before forwarding" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='Peer@Remote.Example' to='NaplesTB@LOCALHOST'><body>hi</body></message>");
+
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("naplestb@localhost", msg.s2s_inbound.to_jid);
+    try std.testing.expectEqualStrings("Peer@Remote.Example", msg.s2s_inbound.from_jid);
+    try std.testing.expect(std.mem.indexOf(u8, msg.s2s_inbound.stanza_xml, "to='naplestb@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.s2s_inbound.stanza_xml, "from='Peer@Remote.Example'") != null);
+}
+
+test "F6: an unprepareable inbound to= drops only that stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // to='@localhost' passes address validation (its domain is served) but
+    // fails preparation on the empty localpart: drop the stanza only.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='@localhost'><body>x</body></message>");
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+
+    // The stream still forwards a following valid stanza.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
+}
+
+test "F6: an unprepareable inbound from= fails the stream invalid-from" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // from='@remote.example' names an authenticated domain so validation
+    // passes, but the empty localpart fails preparation: invalid-from.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='@remote.example' to='juliet@localhost'><body>x</body></message>");
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "invalid-from") != null);
 }
 
 test "extractDomain: user@domain" {
