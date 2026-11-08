@@ -91,6 +91,7 @@ pub const Plan = struct {
     rename_bytes: usize = 0,
     rekey_count: usize = 0,
     recovery_digest: ?[]u8 = null,
+    seq_targets: std.StringHashMapUnmanaged(void) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Plan {
         return .{ .allocator = allocator };
@@ -117,6 +118,9 @@ pub const Plan = struct {
         }
         self.issues.deinit(self.allocator);
         if (self.recovery_digest) |digest| self.allocator.free(digest);
+        var seq_keys = self.seq_targets.keyIterator();
+        while (seq_keys.next()) |key| self.allocator.free(key.*);
+        self.seq_targets.deinit(self.allocator);
         self.* = undefined;
     }
 };
@@ -577,6 +581,27 @@ fn sequenceValue(sequence: u64) [8]u8 {
     return value;
 }
 
+fn addSeqHighWater(plan: *Plan, owner: []const u8) !void {
+    if (plan.seq_targets.contains(owner)) return;
+    const owner_key = try plan.allocator.dupe(u8, owner);
+    errdefer plan.allocator.free(owner_key);
+    try plan.seq_targets.put(plan.allocator, owner_key, {});
+    const high = sequenceValue(REKEY_SEQ_HIGH);
+    const seq_old = try plan.allocator.dupe(u8, owner);
+    const seq_new = try plan.allocator.dupe(u8, owner);
+    const seq_value = try plan.allocator.dupe(u8, &high);
+    try plan.renames.append(plan.allocator, .{
+        .db = .op,
+        .namespace = NS_OFFLINE_SEQ,
+        .old_key = seq_old,
+        .new_key = seq_new,
+        .new_value = seq_value,
+        .same_key = true,
+        .value_len = high.len,
+    });
+    plan.rename_bytes += seq_new.len + seq_value.len;
+}
+
 fn rekeyStanzaKey(allocator: std.mem.Allocator, key: []const u8, counter: usize) !?[]u8 {
     const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     const rest = key[first_sep + 1 ..];
@@ -871,20 +896,7 @@ fn planNamespace(
                     transferred += 1;
                     plan.rename_bytes += dropped.new_key.len + dropped.value_len;
 
-                    const high = sequenceValue(REKEY_SEQ_HIGH);
-                    const same_old = try plan.allocator.dupe(u8, rename.new_key);
-                    const same_new = try plan.allocator.dupe(u8, rename.new_key);
-                    const same_value = try plan.allocator.dupe(u8, &high);
-                    try plan.renames.append(plan.allocator, .{
-                        .db = db,
-                        .namespace = namespace,
-                        .old_key = same_old,
-                        .new_key = same_new,
-                        .new_value = same_value,
-                        .same_key = true,
-                        .value_len = high.len,
-                    });
-                    plan.rename_bytes += same_new.len + same_value.len;
+                    try addSeqHighWater(plan, rename.new_key);
                     continue;
                 }
             }
@@ -909,20 +921,7 @@ fn planNamespace(
 
                         const first_sep = std.mem.indexOfScalar(u8, rename.new_key, 0).?;
                         const owner = rename.new_key[0..first_sep];
-                        const high = sequenceValue(REKEY_SEQ_HIGH);
-                        const seq_old = try plan.allocator.dupe(u8, owner);
-                        const seq_new = try plan.allocator.dupe(u8, owner);
-                        const seq_value = try plan.allocator.dupe(u8, &high);
-                        try plan.renames.append(plan.allocator, .{
-                            .db = .op,
-                            .namespace = NS_OFFLINE_SEQ,
-                            .old_key = seq_old,
-                            .new_key = seq_new,
-                            .new_value = seq_value,
-                            .same_key = true,
-                            .value_len = high.len,
-                        });
-                        plan.rename_bytes += seq_new.len + seq_value.len;
+                        try addSeqHighWater(plan, owner);
                     }
                 }
             }
@@ -1481,6 +1480,24 @@ fn applyValidated(
     try applyGroupedDb(archive, allocator, plan, .archive, archive_order, options.journal_dir, replay, digest);
 }
 
+fn validatePlan(
+    allocator: std.mem.Allocator,
+    auth: anytype,
+    op: anytype,
+    archive: anytype,
+    plan: *const Plan,
+) !void {
+    const auth_order = try orderForDb(allocator, plan, .auth);
+    defer allocator.free(auth_order);
+    const op_order = try orderForDb(allocator, plan, .op);
+    defer allocator.free(op_order);
+    const archive_order = try orderForDb(allocator, plan, .archive);
+    defer allocator.free(archive_order);
+    try preflightDb(auth, allocator, plan, .auth);
+    try preflightDb(op, allocator, plan, .op);
+    try preflightDb(archive, allocator, plan, .archive);
+}
+
 /// Apply a collision-free plan. LMDB uses one write transaction per DB when
 /// `rename_bytes` fits the budget; larger plans and every archive pass use one
 /// WriteBatch per key prefix. With `journal_dir`, the plan and a pending
@@ -1503,6 +1520,10 @@ pub fn applyPlan(
     }
     const journaled = archive_work or plan.rename_bytes > options.single_txn_budget;
     if (journaled and options.journal_dir == null) return error.JournalRequired;
+
+    // Everything that can fail without I/O runs before the pending marker is
+    // written: a validation failure must never leave an install locked.
+    try validatePlan(allocator, auth, op, archive, plan);
 
     var digest: ?[]u8 = null;
     defer if (digest) |value| allocator.free(value);
