@@ -38,6 +38,10 @@ pub var cross_worker_drops = std.atomic.Value(u64).init(0);
 pub var s2s_bounces = std.atomic.Value(u64).init(0);
 pub var offline_not_stored = std.atomic.Value(u64).init(0);
 pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
+/// Stored stanzas the offline drain dropped because they cannot fit one
+/// connection write even unstamped. Dropping keeps one oversized row from
+/// parking the user's whole queue.
+pub var offline_drain_drops = std.atomic.Value(u64).init(0);
 
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast

@@ -23,6 +23,8 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 const lastact_store = @import("last_activity_store");
+const connection_mod = @import("connection.zig");
+const delivery_queue_mod = @import("delivery_queue");
 
 const log = std.log.scoped(.lifecycle);
 
@@ -513,6 +515,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     defer if (delay_lease) |*lease| lease.release();
 
     var delivered: usize = 0;
+    var dropped: usize = 0;
     var completed = true;
     for (pointers) |ptr| {
         // The held copy comes first. A message parked behind a draining tail
@@ -573,6 +576,26 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                     };
                 }
             }
+            // The send has to fit the write buffer including the stamp: a
+            // single queue that can never take the stanza fails every drain
+            // at 0/N and parks the whole tail behind it. When only the stamp
+            // pushed it over, the stored bytes still go out. When the stored
+            // bytes themselves cannot fit, the pointer is dropped, counted,
+            // and the drain moves on.
+            if (wire.len > connection_mod.WRITE_BUF_SIZE) {
+                if (xml_data.len <= connection_mod.WRITE_BUF_SIZE) {
+                    log.warn("offline message to {s} does not fit once stamped ({d} bytes); sending unstamped", .{ bare_jid, wire.len });
+                    wire = xml_data;
+                } else {
+                    _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
+                    log.warn("offline message to {s} is {d} bytes and can never fit the {d}-byte send buffer; dropping it", .{ bare_jid, xml_data.len, connection_mod.WRITE_BUF_SIZE });
+                    store.deletePointer(ptr) catch |err| {
+                        log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+                    };
+                    dropped += 1;
+                    continue;
+                }
+            }
             session.queueSendStanza(wire) catch {
                 // Send buffer full: stop here and let the writable handler
                 // drain the tail at the low-water mark. This message and the
@@ -618,9 +641,9 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         };
         // A row another worker committed after this drain read its list would
         // otherwise wait for the next login. Re-arming needs progress to be
-        // safe: with nothing delivered, the rows left are ones this pass could
-        // not read, and re-arming would spin the event loop on them.
-        const arrived_mid_drain = remaining > 0 and delivered > 0;
+        // safe: with nothing delivered or dropped, the rows left are ones this
+        // pass could not read, and re-arming would spin the event loop on them.
+        const arrived_mid_drain = remaining > 0 and (delivered + dropped) > 0;
         session.offline_store_stalls = 0;
         if (arrived_mid_drain) {
             session.offline_pending = true;
@@ -641,6 +664,13 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
+}
+
+comptime {
+    // The stamp scratch bank always holds the largest stanza a connection
+    // can still send plus its delay element and a synthesized root close
+    // tag, so a sendable input never reports BufferTooSmall.
+    std.debug.assert(Server.BYTE_BANK_SIZE >= connection_mod.WRITE_BUF_SIZE + 512);
 }
 
 /// XEP-0203: insert a <delay/> as a direct child of a stored stanza's root
@@ -2160,4 +2190,117 @@ test "S35: stampOfflineDelay covers self-closing roots and quoted '>'" {
     // A buffer too small reports the error instead of truncating.
     var tiny: [8]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, stampOfflineDelay("<message><body/></message>", "x.test", stamp, &tiny));
+}
+
+test "S35: a stanza that only fits unstamped is sent without a stamp" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // Stored bytes fit the write buffer; the stamp on top would not.
+    const total = connection_mod.WRITE_BUF_SIZE - 40;
+    const head = "<message from='alice@localhost' to='bob@localhost' id='big'><body>";
+    const tail = "</body></message>";
+    const stanza = try allocator.alloc(u8, total);
+    defer allocator.free(stanza);
+    @memcpy(stanza[0..head.len], head);
+    @memset(stanza[head.len .. total - tail.len], 'x');
+    @memcpy(stanza[total - tail.len ..], tail);
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "big", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // The stored bytes went out untouched and the pointer is gone: the drain
+    // neither stalls on the stamp nor loses the message.
+    const pending = session.conn.write_buf[0..session.conn.write_end];
+    try std.testing.expectEqualStrings(stanza, pending);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.offline_pending);
+}
+
+test "S35: an unsendable stored stanza is dropped and the drain continues" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // Even unstamped this cannot fit one connection write.
+    const total = connection_mod.WRITE_BUF_SIZE + 40;
+    const head = "<message from='alice@localhost' to='bob@localhost' id='big'><body>";
+    const tail = "</body></message>";
+    const stanza = try allocator.alloc(u8, total);
+    defer allocator.free(stanza);
+    @memcpy(stanza[0..head.len], head);
+    @memset(stanza[head.len .. total - tail.len], 'x');
+    @memcpy(stanza[total - tail.len ..], tail);
+    const small = "<message from='alice@localhost' to='bob@localhost' id='s1'><body>small</body></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "big", 1000, stanza);
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "s1", 2000, small);
+
+    const drops_before = delivery_queue_mod.offline_drain_drops.load(.monotonic);
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    // The oversized pointer is counted and deleted, and the message behind it
+    // was still delivered: one bad row cannot park the queue.
+    try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.offline_drain_drops.load(.monotonic));
+    const pending = session.conn.write_buf[0..session.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, pending, "<body>small</body>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "id='big'") == null);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expect(!session.offline_pending);
 }
