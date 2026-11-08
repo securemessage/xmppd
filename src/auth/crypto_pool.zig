@@ -797,6 +797,13 @@ test "CryptoPool: stop wipes queued slots before freeing them" {
     }
 }
 
+test "CryptoPool: stop drops the queued jobs" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    _ = try putTestJob(&pool, "wipe-marker-q4", @splat(7), 1, @splat(8));
+    pool.stop();
+    try std.testing.expectEqual(pool.job_tail, pool.job_head);
+}
+
 /// Count occurrences of `needle` inside the mapped region containing
 /// `anchor`. procstat -v reports the grown extents, so the scan never
 /// reads outside a live mapping (the worker's stack extent is only a
