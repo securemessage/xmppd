@@ -286,6 +286,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // dispatch and never two dispatches with identical bytes.
     const hold_token = server.mintHoldToken();
 
+    // Single timestamp for all archive operations in this dispatch (T123);
+    // also the receipt time carried into cross-worker slots for the stamp.
+    const archive_timestamp: u64 = @intCast(std.time.timestamp());
+
     var delivery_failed = false;
     for (entries_buf[0..route_count]) |entry| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
@@ -307,6 +311,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 delivery_inner_xml,
                 session.stanza_kind,
                 hold_token,
+                archive_timestamp,
             )) {
                 remote_delivered = true;
             } else {
@@ -325,9 +330,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         log.warn("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
         break :blk null;
     };
-
-    // Single timestamp for all archive operations in this dispatch (T123)
-    const archive_timestamp: u64 = @intCast(std.time.timestamp());
 
     // One serialization buffer for this dispatch. The archive form is built
     // and consumed (copied by the writer queue, or stored) before the
@@ -766,6 +768,7 @@ fn enqueueCrossThreadStanza(
     inner_xml: []const u8,
     kind: StanzaKind,
     hold_token: offline_store.HoldToken,
+    receipt_ts: u64,
 ) bool {
     const ds = server.delivery_system orelse return false;
 
@@ -793,7 +796,7 @@ fn enqueueCrossThreadStanza(
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token) catch |err| {
+    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;

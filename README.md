@@ -47,7 +47,7 @@ polymorphism for performance at scale.
 | XEP-0191 | Blocking Command | Full | E2E, Unit |
 | XEP-0198 | Stream Management | Full | Interop, E2E, Unit |
 | XEP-0199 | XMPP Ping | Full | Interop |
-| XEP-0203 | Delayed Delivery | Partial⁶ | E2E |
+| XEP-0203 | Delayed Delivery | Full⁶ | E2E |
 | XEP-0220 | Server Dialback | Partial⁷ | E2E |
 | XEP-0280 | Message Carbons | Full | E2E, Unit |
 | XEP-0308 | Last Message Correction | Pass-through | E2E |
@@ -93,8 +93,8 @@ workers), gated to presence-sharing contacts (roster from/both, else
 proxy answer would risk double results against XEP-aware clients. Shipped in
 v0.9.0 (T164).
 
-⁶ Delay stamps are written on MAM replay and MUC history. Missing: stamps on
-offline-delivered messages (the primary XEP-0160 + XEP-0203 offline case).
+⁶ Delay stamps are written on MAM replay, MUC history, and offline-delivered
+messages (queue time as stamp, server domain as from).
 
 ⁷ Core dialback (db:result / db:verify in both directions) is complete and
 Prosody interop-tested, used where SASL EXTERNAL or DANE is unavailable.

@@ -3260,7 +3260,7 @@ pub const Server = struct {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token) catch {
+                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token, s2s_archive_ts) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -3871,7 +3871,12 @@ pub const Server = struct {
                 // same way.
                 if (target_session.offline_pending and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
                     const hold_id = if (parts.msg_id.len > 0) parts.msg_id else "offline";
-                    const timestamp: u64 = @intCast(std.time.timestamp());
+                    // Stamp the producer's receipt time, not the time a busy
+                    // consumer worker got to the slot.
+                    const timestamp: u64 = if (c.queue.current_slot_receipt_ts != 0)
+                        c.queue.current_slot_receipt_ts
+                    else
+                        @intCast(std.time.timestamp());
                     const from_jid = extractAttrValue(payload, "from");
                     const bound = target_session.stream.bound_jid orelse {
                         log.warn("cross-worker message to session {d} has no bound recipient for its offline hold", .{local_session_id});
@@ -6468,6 +6473,60 @@ test "cross-thread delivery: enqueue and drain" {
     try std.testing.expect(std.mem.indexOf(u8, received, "cross-thread!") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "alice@localhost/mobile") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
+}
+
+test "S35: the cross-worker hold stamps the producer receipt time" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    session.offline_pending = true;
+    server.sessions[5] = session;
+    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+
+    // The producer tags the slot with its own receipt time; the hold on the
+    // consuming worker must store that time, not the time the drain ran.
+    try delivery_sys.deliverWithToken(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345);
+    server.drainDeliveryQueue(&changes);
+
+    session_lifecycle.drainOfflinePending(&server, session, &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const wire = buf[0..n];
+    // 12345 seconds past the epoch, not the consumer-side wall clock.
+    try std.testing.expect(std.mem.indexOf(u8, wire, "stamp='1970-01-01T03:25:45Z'") != null);
 }
 
 test "cross-thread delivery: generation mismatch drops stanza" {
