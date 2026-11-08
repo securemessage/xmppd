@@ -12324,6 +12324,7 @@ test "Server: every advertised pubsub feature is dispatched" {
         const children = [_]xml.Element{testElem("query", xml.ns.disco_info, &.{})};
         const resp = try driveTestIq(&server, &session, &changes, fds[1], "get", "disco-1", &children, null, &wire);
         try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "<identity category='pubsub' type='pep'/>") != null);
         var rest = resp;
         while (std.mem.indexOf(u8, rest, "<feature var='")) |i| {
             const start = i + "<feature var='".len;

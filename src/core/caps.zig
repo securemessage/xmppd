@@ -289,7 +289,7 @@ pub fn computeServerCaps() ServerCaps {
     var caps = ServerCaps{};
 
     // XEP-0115 §5.1:
-    // 1. Sort identities by category/type/lang/name (server has one identity)
+    // 1. Sort identities by category/type/lang/name (pubsub sorts before server)
     // 2. For each identity: S += "category/type/lang/name<"
     // 3. Sort features alphabetically (SERVER_FEATURES is already sorted)
     // 4. For each feature: S += "feature<"
@@ -297,7 +297,9 @@ pub fn computeServerCaps() ServerCaps {
 
     var hasher = Sha1.init(.{});
 
-    // Step 2: Server identity — category=server, type=im, lang=(empty), name=xmppd
+    // Step 2: identities advertised in disco#info (category/type/lang/name
+    // with empty lang, and empty name on the PEP service identity).
+    hasher.update("pubsub/pep//<");
     hasher.update("server/im//xmppd<");
 
     // Step 4: Features (already sorted)
@@ -428,6 +430,27 @@ test "computeServerCaps: produces valid base64 SHA-1 hash" {
                 ch == '+' or ch == '/' or ch == '=',
         );
     }
+}
+
+test "computeServerCaps: identities hash in XEP-0115 order" {
+    // disco#info advertises pubsub/pep plus server/im; the §5.1 string takes
+    // identities sorted by category, so pubsub hashes first. Recomputing S
+    // here catches an identity dropped from the hash input or added in the
+    // wrong order.
+    const identities = [_][]const u8{ "pubsub/pep//<", "server/im//xmppd<" };
+    var hasher = Sha1.init(.{});
+    for (identities) |ident| hasher.update(ident);
+    for (SERVER_FEATURES) |feature| {
+        hasher.update(feature);
+        hasher.update("<");
+    }
+    const digest = hasher.finalResult();
+    const encoder = std.base64.standard.Encoder;
+    var expected_buf: [64]u8 = undefined;
+    const expected = encoder.encode(&expected_buf, &digest);
+
+    const caps = computeServerCaps();
+    try std.testing.expectEqualStrings(expected, caps.getVer());
 }
 
 test "computeServerCaps: deterministic" {

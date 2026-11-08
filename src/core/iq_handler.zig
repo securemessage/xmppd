@@ -591,6 +591,8 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         } else {
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
         }
+        // XEP-0163 §6.1: the service also answers as a PEP pubsub service.
+        w.writeAll("<identity category='pubsub' type='pep'/>") catch return;
         w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
         caps_mod.writeDiscoFeatures(w) catch return;
         w.writeAll("</query></iq>") catch return;
