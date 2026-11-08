@@ -960,6 +960,10 @@ pub const Conn = struct {
     /// posts `Done` back through `loop.wake` and the consumer re-adopts.
     /// Refuses without a Handshake: only a Handshake owns a released
     /// fd, and teardown would have nothing to close it through.
+    /// While the fd is released, a close still tears the conn down
+    /// (teardown closes the fd through `hs`), but the consumer must
+    /// wait for the `Done` post before deinit: the driver may still be
+    /// stepping `hs.conn` on its own thread.
     pub fn releaseFd(c: *Conn) (loop_mod.DetachError || error{NoHandshake})!posix.fd_t {
         const hs = if (c.hs) |*h| h else return error.NoHandshake;
         const fd = try c.loop.detach(c.handle);
@@ -1001,6 +1005,9 @@ pub const Conn = struct {
     /// Idempotent: once it has run, the fd number may already be reused
     /// by an unrelated socket, so a late close must not act again.
     /// `ConnList.popClosed` hands the conn back for the consumer's free.
+    /// While the fd is released to a driver, teardown still closes it
+    /// (through `hs`); freeing the Conn is a `Done`-gated consumer
+    /// decision, not part of teardown.
     pub fn teardown(c: *Conn) void {
         std.debug.assert(c.state == .closing);
         if (c.torn_down) return;
@@ -1008,8 +1015,8 @@ pub const Conn = struct {
         c.transport.shutdown();
         c.loop.close(c.handle) catch |err| switch (err) {
             // A released fd freed its handle slot at detach, so the loop
-            // cannot close it. The Handshake still owns it: close it
-            // here or a conn torn down mid-upgrade leaks the fd.
+            // cannot close it. The Handshake still carries the number:
+            // close it here or a conn torn down mid-upgrade leaks the fd.
             error.StaleHandle => if (c.hs) |*hs| {
                 if (hs.fd >= 0) {
                     posix.close(hs.fd);

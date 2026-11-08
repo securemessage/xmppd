@@ -311,9 +311,12 @@ Outbox flush; `eof`/`err` surfaces `.closed`. When the outbox has data
 
 Close is deferred by construction: `Conn.close` (or a `.closed` outcome
 the consumer acts on) marks the conn `.closing` and links it on the
-`ConnList`. `SSL_shutdown` (once), the fd close and the consumer's free
-all run in the end-of-iteration walk, after every event for that conn in
-the batch has been handled. A batch that holds both a read and a write
+`ConnList`. `SSL_shutdown` (once) and the fd close run in the
+end-of-iteration walk, after every event for that conn in the batch has
+been handled, and the walk hands each torn-down conn back through
+`ConnList.popClosed` (FIFO, `close_reason` attached) for the consumer's
+free: a `.closed` outcome reports the close, `popClosed` reports the
+point where deinit is safe. A batch that holds both a read and a write
 event for a conn closed by the first skips the second two ways, both
 tested: `onEvent` on a `.closing` conn returns `.none` without touching
 I/O, and the consumer's ctx -> conn resolution is generation-checked
@@ -368,6 +371,12 @@ step 1-3, restated for this API):
    records the kTLS flags once (token plus counter, section 2), applies
    the `require|prefer` check and moves to `.established`.
 
+While the fd is released, `Conn.close` still runs teardown (the fd is
+closed through `hs`), but the consumer must not deinit or free the Conn
+until the `Done` post arrives: a live driver may still be stepping
+`hs.conn` on its own thread. F3 has no production driver, so the rule is
+contract-only until F7.
+
 ```zig
 pub const Handshake = struct {
     conn: ssl.SslConn,
@@ -378,7 +387,7 @@ pub const Handshake = struct {
 
 pub const Done = union(enum) { ok, want_read, want_write, err: SslError };
 
-pub fn releaseFd(c: *Conn) error{StaleHandle}!posix.fd_t;
+pub fn releaseFd(c: *Conn) (DetachError || error{NoHandshake})!posix.fd_t;
 pub fn adoptFd(c: *Conn, fd: posix.fd_t) error{StaleHandle}!void;
 ```
 
