@@ -573,8 +573,18 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // delivery_inner_xml out of the augmented bank, can take it.
         out_lease.release();
 
-        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
-        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
+        // XEP-0280 section 7: a <received> copy goes only to a resource that
+        // did not already get the original under RFC 6121 delivery rules.
+        // This server delivers a bare-JID message to every available
+        // non-negative-priority resource, so those are exactly the ones to
+        // skip; a full-JID message reached only the routed resource.
+        const delivered: ReceivedSet = if (to_jid.resource.len == 0)
+            .all_non_negative
+        else
+            .{ .entries = entries_buf[0..route_count] };
+
+        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, .none, changes);
+        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, delivered, changes);
     }
 }
 
@@ -807,6 +817,19 @@ fn dropOversize(inner_len: usize, route: SessionEntry) bool {
     return false;
 }
 
+/// Which of a bare JID's resources already received the original stanza
+/// under RFC 6121 delivery rules, so a <received> carbon to them would
+/// deliver the same message twice (XEP-0280 section 7).
+const ReceivedSet = union(enum) {
+    /// A <sent> fan-out: no recipient-side delivery to exclude.
+    none,
+    /// A bare-JID message: every available non-negative-priority resource
+    /// received the original.
+    all_non_negative,
+    /// A full-JID message (or its chat fallback): only these resources did.
+    entries: []const SessionEntry,
+};
+
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
 fn sendCarbons(
     server: *Server,
@@ -819,6 +842,7 @@ fn sendCarbons(
     type_str: []const u8,
     id_str: []const u8,
     delivery_inner_xml: []const u8,
+    delivered: ReceivedSet,
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
@@ -836,6 +860,21 @@ fn sendCarbons(
     const cbuf = carbon_lease.buf;
 
     for (entries[0..count]) |entry| {
+        // A resource that already received the original under RFC 6121
+        // delivery rules gets no <received> copy of it (XEP-0280 section 7).
+        const was_delivered = switch (delivered) {
+            .none => false,
+            .all_non_negative => entry.priority >= 0,
+            .entries => |targets| blk: {
+                for (targets) |t| {
+                    if (t.worker_id == entry.worker_id and
+                        t.local_session_id == entry.local_session_id and
+                        t.generation == entry.generation) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+        if (was_delivered) continue;
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (&target.conn == &sender_session.conn) continue;

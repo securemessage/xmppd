@@ -12082,9 +12082,9 @@ test "c2s: one routed message to two draining workers holds one row" {
     var w0_changes = ChangeList.init(&w0_changes_buf);
     w0.drainDeliveryQueue(&w0_changes);
 
-    // Count the routed message only. A carbon copy of it to bob's other
-    // resource is a separate dispatch, held by the cross-worker carbon path,
-    // which this test does not pin.
+    // Count the routed message only. T-D689B13D: a <received> carbon to a
+    // resource that got the original is never produced, and a carbon is
+    // never held behind an offline tail, so no second row can appear.
     const ptrs = try offline_store.getPointers("bob@localhost");
     defer offline_store.freePointers(ptrs);
     var message_rows: usize = 0;
@@ -12480,6 +12480,124 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     }
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     try std.testing.expectEqual(@as(usize, 0), carbon_rows);
+}
+
+// The bare-JID message already reached the phone under RFC 6121 delivery
+// rules, so a <received> carbon would hand it the same stanza twice. The
+// producer skips delivered resources before the worker split, so the rule
+// holds wherever the resource lives (XEP-0280 section 7).
+test "carbons: a delivered resource gets no received copy on the same dispatch" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = true;
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-dupe";
+    const body = "<body>no dupe</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.drainDeliveryQueue(&w1_changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire[0..wire_len], "<message"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") == null);
+}
+
+// Same rule on the local branch: a phone with carbons on the sending
+// worker also already received the bare-JID original.
+test "carbons: the local received-carbon path skips a resource that got the original" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = true;
+    w0.sessions[6] = phone;
+    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-dupe-local";
+    const body = "<body>no dupe</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire[0..wire_len], "<message"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") == null);
 }
 
 test "N1: two workers draining one bare JID hold a message once" {
