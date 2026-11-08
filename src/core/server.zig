@@ -1972,7 +1972,19 @@ pub const Server = struct {
                 null;
             if (buf) |b| {
                 a.value = xmpp.prepareLocalDomainJid(attr.value, self.server_host, b) catch {
-                    if (!is_error_stanza) self.sendIngressJidMalformed(session, elem, changes);
+                    if (!session.stream.isActive()) {
+                        // RFC 6120 7.1 (T182): a malformed address cannot be
+                        // classified, so the pre-bind policy runs on the raw
+                        // attributes; third party closes the stream with
+                        // not-authorized, server/account-addressed gets the
+                        // stanza error, presence stays silently ignored.
+                        switch (self.enforcePreBindStanzaPolicy(session, elem.*, changes)) {
+                            .third_party_closed, .not_stanza => {},
+                            .server_addressed => self.sendPreBindStanzaError(session, elem.*, changes),
+                        }
+                    } else if (!is_error_stanza) {
+                        self.sendIngressJidMalformed(session, elem, changes);
+                    }
                     return false;
                 };
             }
@@ -6417,6 +6429,34 @@ test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
     // normally, never with a jid-malformed stanza error.
     try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") == null);
     try std.testing.expect(std.mem.indexOf(u8, r, "id='q1'") != null);
+}
+
+test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized (T182)" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(af[0], 9, "localhost", false, allocator);
+    server.sessions[9] = alice;
+
+    var changes_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&changes_buf);
+    _ = try posix.write(af[1], "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>");
+    server.handleReadable(9, &changes);
+    _ = alice.conn.flushSend() catch {};
+    var buf: [8192]u8 = undefined;
+    _ = f6Read(af[1], &buf);
+
+    // RFC 6120 7.1 (T182): an unclassifiable address before bind defers to
+    // the pre-bind policy; third party, so the stream closes with
+    // not-authorized instead of answering jid-malformed.
+    _ = try posix.write(af[1], "<message to='@localhost' type='chat' id='f1'><body>x</body></message>");
+    server.handleReadable(9, &changes);
+    try std.testing.expect(server.sessions[9] == null);
+    const r = f6Read(af[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "not-authorized") != null);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
