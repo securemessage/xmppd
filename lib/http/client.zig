@@ -579,20 +579,37 @@ fn parseResponseHead(head: []const u8) HeadParse {
     _ = it.next(); // status line
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
+        // RFC 9112 5.2: a line starting with SP or HTAB is an obs-fold
+        // continuation of the previous field. This client does not
+        // unfold; rejecting keeps a folded Transfer-Encoding or
+        // Content-Length from degrading the head to EOF framing.
+        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return .invalid;
         // RFC 9112 5.1: no whitespace is allowed between the field name
         // and the colon. "Content-Length : 5" must not fall through to a
-        // looser parse of some other header shape.
+        // looser parse of some other header shape. RFC 9110 5.1 makes
+        // the name one or more tchar, so a colon at index 0 is not a
+        // field line at all.
         if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            if (colon == 0) return .invalid;
             if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
+        } else if (line.len > 0) {
+            // RFC 9112 5: a field line is field-name ":". A non-empty
+            // line without a colon is not a field; an empty one is a
+            // tolerated bare-LF artifact of the line split.
+            return .invalid;
         }
         const te_prefix = "transfer-encoding:";
-        if (line.len > te_prefix.len and
+        // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
+        // declared TE; it rejects like any other TE.
+        if (line.len >= te_prefix.len and
             std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
         {
             return .invalid;
         }
         const cl_prefix = "content-length:";
-        if (line.len <= cl_prefix.len) continue;
+        // A bare "Content-Length:" reaches the value parse and dies on
+        // the empty value (RFC 9112 6.3 rule 5), like every other bad CL.
+        if (line.len < cl_prefix.len) continue;
         if (!std.ascii.eqlIgnoreCase(line[0..cl_prefix.len], cl_prefix)) continue;
         const value = std.mem.trim(u8, line[cl_prefix.len..], " \t");
         const cl = parseContentLengthValue(value) catch |err| switch (err) {
@@ -1220,6 +1237,22 @@ test "responseComplete: duplicate Content-Length headers must agree" {
     );
 }
 
+test "responseComplete: an empty Content-Length value is rejected" {
+    // RFC 9112 6.3 rule 5: an invalid Content-Length in a response is an
+    // unrecoverable error, never EOF framing.
+    const bare = "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bare),
+    );
+    // The invalid first value is not dropped as a duplicate either.
+    const then_valid = "HTTP/1.1 200 OK\r\nContent-Length:\r\nContent-Length: 3\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(then_valid),
+    );
+}
+
 test "responseComplete: Transfer-Encoding is rejected outright" {
     const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
     try std.testing.expectEqual(
@@ -1259,6 +1292,77 @@ test "responseComplete: whitespace before the colon is rejected" {
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(other),
+    );
+    // RFC 9112 5.2 obs-fold: a folded field must not fall back to EOF
+    // framing. The folded line carries no colon, so only the leading-SP
+    // rule catches it.
+    const folded_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_te),
+    );
+    const folded_cl = "HTTP/1.1 200 OK\r\nContent-Length:\r\n 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_cl),
+    );
+    // A fold after an unrelated header is rejected the same way.
+    const folded_bare = "HTTP/1.1 200 OK\r\nX-A: 1\r\n\tchunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_bare),
+    );
+    // An empty Transfer-Encoding value still declares the field.
+    const empty_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(empty_te),
+    );
+}
+
+test "responseComplete: a reason phrase may contain ' : '" {
+    // The status line is skipped before the field rules run, so a
+    // reason phrase with whitespace before a colon stays accepted.
+    const resp = "HTTP/1.1 200 OK : yes\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: an empty field name is rejected" {
+    // RFC 9110 5.1: field-name is one or more tchar; ": v" has none.
+    const resp = "HTTP/1.1 200 OK\r\n: v\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(resp),
+    );
+}
+
+test "responseComplete: an empty line inside the head does not panic" {
+    // A bare-LF blank line sits before the CRLFCRLF terminator. The
+    // line.len > 0 guard on the obs-fold check is what keeps line[0]
+    // in bounds.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\n\nX: 1\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: a one-character field name is accepted" {
+    // tchar allows a single-character name; only the truly empty name
+    // is invalid.
+    const resp = "HTTP/1.1 200 OK\r\nX: 1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: a field line without a colon is rejected" {
+    // RFC 9112 5: a field line is field-name ":". A colonless TE must
+    // not slip past the TE reject as an unknown line either.
+    const garbage = "HTTP/1.1 200 OK\r\ngarbage\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(garbage),
+    );
+    const te = "HTTP/1.1 200 OK\r\nTransfer-Encoding chunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(te),
     );
 }
 

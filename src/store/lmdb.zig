@@ -136,6 +136,20 @@ const madviseCall = if (builtin.is_test) struct {
 
 const log = std.log.scoped(.lmdb_store);
 
+// warn seam: test builds count the exhaustion warning so its distinct
+// message can be checked without scraping stderr.
+const warnCall = struct {
+    var exhausted_calls: usize = 0;
+
+    fn exhausted() void {
+        if (builtin.is_test) exhausted_calls += 1;
+        log.warn(
+            "kern.proc.vmmap lookup failed after {d} attempts: LMDB map stays in core dumps",
+            .{VMMAP_ATTEMPTS_MAX},
+        );
+    }
+};
+
 /// Exclude the env map from core dumps: a crash would otherwise write
 /// every touched LMDB page (SCRAM keys, rosters, archive contents) into
 /// the core file. LMDB reports me_mapaddr only for MDB_FIXEDMAP envs,
@@ -154,7 +168,10 @@ fn excludeMapFromCoreDump(env: lmdb.Environment) void {
         log.warn("fstat on the LMDB data fd failed: map stays in core dumps", .{});
         return;
     };
-    const rec = findVmEntry(st.ino, st.dev) orelse {
+    const rec = (findVmEntry(st.ino, st.dev) catch {
+        warnCall.exhausted();
+        return;
+    }) orelse {
         log.warn("LMDB map not found in kern.proc.vmmap: map stays in core dumps", .{});
         return;
     };
@@ -169,8 +186,9 @@ fn excludeMapFromCoreDump(env: lmdb.Environment) void {
 /// Fixed prefix of the VMA record backed by the vnode (ino, fsid), or
 /// null when kern.proc.vmmap yields no match. Other threads can add
 /// mappings between the size query and the read, so ENOMEM retries are
-/// bounded by VMMAP_ATTEMPTS_MAX.
-fn findVmEntry(ino: u64, fsid: u64) ?KinfoVmentry {
+/// bounded by VMMAP_ATTEMPTS_MAX; exhausting them is reported as
+/// error.AttemptsExhausted so the caller can warn about the bound itself.
+fn findVmEntry(ino: u64, fsid: u64) error{AttemptsExhausted}!?KinfoVmentry {
     var mib = [_]c_int{ 1, 14, 32, std.c.getpid() }; // CTL_KERN, KERN_PROC, KERN_PROC_VMMAP
     var attempt: usize = 0;
     while (attempt < VMMAP_ATTEMPTS_MAX) : (attempt += 1) {
@@ -197,7 +215,7 @@ fn findVmEntry(ino: u64, fsid: u64) ?KinfoVmentry {
         std.heap.page_allocator.free(buf);
         return rec;
     }
-    return null;
+    return error.AttemptsExhausted;
 }
 
 /// First vnode record in a kern.proc.vmmap buffer whose inode and
@@ -217,7 +235,7 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
     return null;
 }
 
-const MAX_DBS = 16;
+const MAX_DBS = 24;
 
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
@@ -234,12 +252,17 @@ pub const LmdbBackend = struct {
     /// readable without any lock after open() (S9).
     dbi_count: std.atomic.Value(u32) = .init(0),
     map_size: usize,
+    compound_mutex: std.Thread.Mutex = .{},
     /// Guards dbi_cache appends only. Never held across a call that begins
     /// an LMDB write txn (txn begin takes the LMDB writer lock while a
     /// WriteBatch holder waits for dbi_lock).
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    /// A read runs inside its own read txn, which LMDB pins to an MVCC
+    /// snapshot, so it cannot observe a half-applied write and does not need
+    /// the store's compound lock (S9).
+    pub const reads_are_snapshot = true;
 
     comptime {
         backend.assertBackend(LmdbBackend);
@@ -405,6 +428,7 @@ pub const LmdbBackend = struct {
     }
 
     pub fn iterator(self: *LmdbBackend, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > backend.MAX_PREFIX_LEN) return error.PrefixTooLong;
         const dbi = try self.getOrCreateDbi(ns);
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
         errdefer txn.abort();
@@ -416,10 +440,10 @@ pub const LmdbBackend = struct {
             .cursor = cur,
             .txn = txn,
             .prefix = undefined,
-            .prefix_len = @min(prefix.len, 256),
+            .prefix_len = prefix.len,
             .started = false,
         };
-        @memcpy(iter.prefix[0..iter.prefix_len], prefix[0..iter.prefix_len]);
+        @memcpy(iter.prefix[0..iter.prefix_len], prefix);
         return iter;
     }
 
@@ -436,7 +460,7 @@ pub const LmdbBackend = struct {
     pub const Iterator = struct {
         cursor: lmdb.Cursor,
         txn: lmdb.Transaction,
-        prefix: [256]u8,
+        prefix: [backend.MAX_PREFIX_LEN]u8,
         prefix_len: usize,
         started: bool,
 
@@ -695,6 +719,54 @@ test "LmdbBackend: iterator prefix-bounded" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "LmdbBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime backend.registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    // The scan is scoped: the iterator's read txn must close before the
+    // deletes open a write txn on this thread.
+    var keys: [4][backend.MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (backend.MAX_PREFIX_LEN + 1)));
 }
 
 test "LmdbBackend: iterator returns key and value" {
@@ -1069,7 +1141,7 @@ test "LmdbBackend: the vmmap lookup retries ENOMEM and re-queries the size" {
     recs[0].kve_vn_fsid = 0xAAAA;
     vmmapCall.records = std.mem.sliceAsBytes(&recs);
 
-    const rec = findVmEntry(4242, 0xAAAA) orelse return error.VmEntryNotFound;
+    const rec = (try findVmEntry(4242, 0xAAAA)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(@as(u64, 0x7000), rec.kve_start);
     try std.testing.expectEqual(@as(usize, 2), vmmapCall.size_calls);
     try std.testing.expectEqual(@as(usize, 2), vmmapCall.read_calls);
@@ -1090,9 +1162,50 @@ test "LmdbBackend: the vmmap ENOMEM retry is bounded" {
     recs[0].kve_vn_fsid = 0xAAAA;
     vmmapCall.records = std.mem.sliceAsBytes(&recs);
 
-    try std.testing.expect(findVmEntry(4242, 0xAAAA) == null);
+    try std.testing.expectError(error.AttemptsExhausted, findVmEntry(4242, 0xAAAA));
     try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.size_calls);
     try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
+}
+
+test "LmdbBackend: vmmap lookup exhaustion does not fail the open" {
+    // Goal: a lookup that exhausts its ENOMEM retries warns and leaves
+    // the map in core dumps; it is never a verdict against the open
+    // itself. Method: the seam fails every read; the open must still
+    // succeed and no madvise can be attempted without a record.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = VMMAP_ATTEMPTS_MAX;
+
+    const calls0 = madviseCall.calls;
+    const warns0 = warnCall.exhausted_calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, VMMAP_ATTEMPTS_MAX), vmmapCall.read_calls);
+    try std.testing.expectEqual(warns0 + 1, warnCall.exhausted_calls);
+}
+
+test "LmdbBackend: vmmap exhaustion is reported, a miss returns null" {
+    // Goal: the caller can tell a lookup that ran out of attempts from
+    // one that found no matching VMA. Method: the seam fails every read
+    // (error.AttemptsExhausted), then returns records that match nothing
+    // (null).
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+    vmmapCall.read_fails = VMMAP_ATTEMPTS_MAX;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 4242;
+    recs[0].kve_vn_fsid = 0xAAAA;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    try std.testing.expectError(error.AttemptsExhausted, findVmEntry(4242, 0xAAAA));
+    try std.testing.expect((try findVmEntry(4242, 0xCCCC)) == null);
 }
 
 test "LmdbBackend: the real madvise marks the env VMA nocore" {
@@ -1109,7 +1222,7 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     var fd: c_int = 0;
     try std.testing.expectEqual(@as(c_int, 0), mdb_env_get_fd(db.env.ptr, &fd));
     const st = try std.posix.fstat(fd);
-    const rec = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    const rec = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     const start: usize = @intCast(rec.kve_start);
     const len: usize = @intCast(rec.kve_end - rec.kve_start);
 
@@ -1122,7 +1235,7 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     const addr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(start);
     try std.testing.expectEqual(@as(c_int, 0), std.c.madvise(addr, len, std.c.MADV.NOCORE));
 
-    const after = findVmEntry(st.ino, st.dev) orelse return error.VmEntryNotFound;
+    const after = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(rec.kve_start, after.kve_start);
     try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
 }

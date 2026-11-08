@@ -75,6 +75,10 @@ pub const SmUnackedQueue = struct {
     /// The sm_out_seq value corresponding to the entry at `head`.
     /// This is the sequence number of the oldest unacked stanza.
     base_seq: u32 = 1,
+    /// Highest `h` ever acknowledged on this queue (S24). Sequences wrap at
+    /// 2^32, so a report counts as forward only when it is within 2^31 ahead
+    /// of last_h; a duplicate or backwards report discards nothing.
+    last_h: u32 = 0,
     /// Allocator used for heap-allocated stanza copies.
     allocator: std.mem.Allocator,
 
@@ -120,27 +124,54 @@ pub const SmUnackedQueue = struct {
         return result;
     }
 
+    /// Outcome of an <a/> or <resume/> handled-count report (S24).
+    pub const AckResult = enum {
+        ok,
+        /// h claims more handled stanzas than were ever sent; nothing was
+        /// discarded and last_h was not touched. XEP-0198 §3: the stream
+        /// must fail with handled-count-too-high.
+        too_high,
+        /// h moved backwards from the previous report; nothing was
+        /// discarded. On <resume/> this must fail the resume.
+        backwards,
+    };
+
     /// Acknowledge stanzas up to and including sequence number `h`.
     /// Discards all entries with sequence ≤ h.
-    pub fn ack(self: *SmUnackedQueue, h: u32) void {
-        // How many stanzas are being acknowledged?
+    pub fn ack(self: *SmUnackedQueue, h: u32) AckResult {
+        // A duplicate or backwards report (client bug, replayed SM-ID, or a
+        // hostile `<resume h='0'/>` after `<a h='5'/>`) must never discard:
+        // the naive `h -% (base_seq -% 1)` wraps above count and discardAll()
+        // would empty the replay queue (S24).
+        const delta = h -% self.last_h;
+        if (delta == 0) return .ok;
+        if (delta >= 0x8000_0000) {
+            log.warn("SM ack moved backwards (h={d}, last_h={d}); ignoring", .{ h, self.last_h });
+            return .backwards;
+        }
+
         // h is the client's report of total stanzas received.
         // base_seq is the sequence of our oldest buffered stanza.
         // Stanzas to discard = h - (base_seq - 1)
         const acked_count = h -% (self.base_seq -% 1);
 
-        if (acked_count == 0) return;
+        // A client reporting more handled stanzas than were sent is lying
+        // or out of sync. Emptying the queue and storing the bogus last_h
+        // would ignore every later legitimate ack and kill the session at
+        // overflow (S24); report it and change nothing instead.
         if (acked_count > self.count) {
-            // Client acked more than we have buffered — clear everything
-            self.discardAll();
-            self.base_seq = h +% 1;
-            return;
+            log.warn("SM ack too high (h={d}, {d} unacked from seq {d}); not discarding", .{ h, self.count, self.base_seq });
+            return .too_high;
         }
+
+        self.last_h = h;
+        if (acked_count == 0) return .ok;
 
         var i: u32 = 0;
         while (i < acked_count) : (i += 1) {
             self.discardHead();
         }
+        return .ok;
     }
 
     /// Return all unacked stanza entries for replay.
@@ -210,6 +241,20 @@ pub fn workerIdFromSmId(sm_id: []const u8) ?u16 {
     return (@as(u16, high) << 8) | @as(u16, low);
 }
 
+/// Classify an outbound handled-count report when there is no unacked queue
+/// (SM enabled without resume) (S24). The sent count is still tracked, so a
+/// peer claiming more than was sent must fail the same way the queue path
+/// does. Wrap-aware at 2^32, matching `SmUnackedQueue.ack`.
+pub fn classifyAck(h: u32, last_h: u32, sent: u32) SmUnackedQueue.AckResult {
+    const from_last = h -% last_h;
+    if (from_last == 0) return .ok;
+    if (from_last >= 0x8000_0000) return .backwards;
+    // h is ahead of the last accepted count; it must not exceed what was sent.
+    const ahead = h -% sent;
+    if (ahead != 0 and ahead < 0x8000_0000) return .too_high;
+    return .ok;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -227,7 +272,7 @@ test "SmUnackedQueue: push and ack" {
     try std.testing.expectEqual(@as(u32, 1), queue.base_seq);
 
     // Ack first 2 stanzas (h=2 means client received stanzas 1 and 2)
-    queue.ack(2);
+    _ = queue.ack(2);
     try std.testing.expectEqual(@as(u32, 1), queue.count);
     try std.testing.expectEqual(@as(u32, 3), queue.base_seq);
 
@@ -273,21 +318,84 @@ test "SmUnackedQueue: ack all" {
     _ = queue.push("b");
     _ = queue.push("c");
 
-    queue.ack(3);
+    _ = queue.ack(3);
     try std.testing.expectEqual(@as(u32, 0), queue.count);
     try std.testing.expectEqual(@as(u32, 4), queue.base_seq);
 }
 
-test "SmUnackedQueue: ack beyond buffered" {
+test "SmUnackedQueue: ack above the sent count changes nothing (S24)" {
     const allocator = std.testing.allocator;
     var queue = SmUnackedQueue.init(allocator);
     defer queue.deinit();
 
     _ = queue.push("a");
-    // Ack more than we have (client saw stanzas we already dropped)
-    queue.ack(10);
+    // h greater than the number of stanzas sent is a protocol violation:
+    // the queue must NOT be emptied and last_h must NOT advance, or every
+    // later legitimate ack is ignored (S24).
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, queue.ack(10));
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 1), queue.base_seq);
+    try std.testing.expectEqual(@as(u32, 0), queue.last_h);
+
+    // A legitimate ack afterwards still works.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, queue.ack(1));
+    try std.testing.expectEqual(@as(u32, 0), queue.count);
+    try std.testing.expectEqual(@as(u32, 1), queue.last_h);
+}
+
+test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
+    const allocator = std.testing.allocator;
+    var queue = SmUnackedQueue.init(allocator);
+    defer queue.deinit();
+
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        _ = queue.push("s");
+    }
+
+    _ = queue.ack(5);
+    try std.testing.expectEqual(@as(u32, 5), queue.count);
+
+    // A replayed `<resume h='0'/>` (or any backwards h) must not touch the
+    // replay queue: the ack would wrap acked_count above count and discardAll
+    // would drop everything (S24).
+    _ = queue.ack(0);
+    try std.testing.expectEqual(@as(u32, 5), queue.count);
+    try std.testing.expectEqual(@as(u32, 6), queue.base_seq);
+
+    _ = queue.ack(3);
+    try std.testing.expectEqual(@as(u32, 5), queue.count);
+
+    // Duplicate of the last h is a no-op, forward progress still works.
+    _ = queue.ack(5);
+    try std.testing.expectEqual(@as(u32, 5), queue.count);
+    _ = queue.ack(10);
     try std.testing.expectEqual(@as(u32, 0), queue.count);
     try std.testing.expectEqual(@as(u32, 11), queue.base_seq);
+}
+
+test "SmUnackedQueue: ack across the u32 wrap (S24)" {
+    const allocator = std.testing.allocator;
+    var queue = SmUnackedQueue.init(allocator);
+    defer queue.deinit();
+
+    // Sequences wrap at 2^32: a forward h that numerically decreased must
+    // still ack, not be mistaken for backwards.
+    queue.base_seq = 0xFFFF_FFF0;
+    queue.last_h = 0xFFFF_FFEF;
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        _ = queue.push("s");
+    }
+
+    _ = queue.ack(2); // seqs 0xFFFFFFF0..0xFFFFFFFF, 0, 1, 2 = 19 stanzas
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 3), queue.base_seq);
+    try std.testing.expectEqual(@as(u32, 2), queue.last_h);
+
+    // A genuinely backwards h just under the wrap is still rejected.
+    _ = queue.ack(0xFFFF_FFFE);
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
 }
 
 test "generateSmId: format and worker extraction" {
@@ -303,4 +411,52 @@ test "generateSmId: format and worker extraction" {
 test "workerIdFromSmId: invalid length" {
     try std.testing.expect(workerIdFromSmId("short") == null);
     try std.testing.expect(workerIdFromSmId("") == null);
+}
+
+test "classifyAck: reports too high and backwards without a queue (S24)" {
+    // SM without resume tracks only the sent count and last accepted h, so a
+    // report of more than was sent is too_high and a lower one is backwards.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(10, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(8, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(3, 0, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(5, 5, 8));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.backwards, classifyAck(2, 5, 8));
+
+    // Wrap-aware: a report near the 2^32 boundary still counts as forward.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFF0));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FFFF));
+
+    // A report that has passed 2^32 is numerically BELOW the sent count but
+    // ahead of last_h. A plain `h > sent` comparison accepts it and the peer
+    // gets credit for stanzas that were never sent; only the wrap-aware
+    // subtraction reports too_high.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(1, 0xFFFF_FFFD, 0xFFFF_FFFF));
+    // Same shape at the low end of the wrap window, and the exact match.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, classifyAck(3, 0xFFFF_FFFE, 2));
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, classifyAck(2, 0xFFFF_FFFE, 2));
+    // Backwards across the boundary is still backwards, not a huge forward jump.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.backwards, classifyAck(0xFFFF_FFFC, 0xFFFF_FFFE, 0xFFFF_FFFE));
+}
+
+test "SmUnackedQueue: ack above the sent count across the u32 wrap (S24)" {
+    const allocator = std.testing.allocator;
+    var queue = SmUnackedQueue.init(allocator);
+    defer queue.deinit();
+
+    // One stanza outstanding at the top of the sequence space, client already
+    // acked up to just below it. An h that has wrapped past 2^32 lands above
+    // the sent count while reading as numerically smaller than base_seq.
+    queue.base_seq = 0xFFFF_FFFF;
+    queue.last_h = 0xFFFF_FFFD;
+    _ = queue.push("s");
+
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.too_high, queue.ack(1));
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFD), queue.last_h);
+
+    // The honest report still acks, so the rejection above is not a blanket
+    // refusal of every wrapped h.
+    try std.testing.expectEqual(SmUnackedQueue.AckResult.ok, queue.ack(0xFFFF_FFFF));
+    try std.testing.expectEqual(@as(u32, 0), queue.count);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), queue.last_h);
 }

@@ -22,15 +22,24 @@
 //!
 //! Iterators are prefix-bounded. `next()` returns null when the cursor key
 //! no longer starts with the prefix passed to `iterator()`. Each backend
-//! enforces this internally — callers never leak data from adjacent
-//! namespaces.
+//! enforces this internally: callers never leak data from adjacent
+//! namespaces. The full caller prefix is honored up to `MAX_PREFIX_LEN`;
+//! a longer prefix can match no stored key, so `iterator()` rejects it
+//! with `error.PrefixTooLong` instead of truncating.
 
 const std = @import("std");
+
+/// Longest iterator prefix honored exactly. Same bound as
+/// keys.MAX_KEY_LEN (the LMDB MDB_MAXKEYSIZE): a longer prefix can match
+/// no stored key, so iterator() rejects it rather than clipping. The
+/// value is pinned equal to keys.MAX_KEY_LEN by a comptime assert in
+/// roster_store.zig, which sees both modules.
+pub const MAX_PREFIX_LEN: usize = 511;
 
 /// Options for opening a storage backend.
 pub const OpenOptions = struct {
     /// Maximum number of namespaces (LMDB: max_dbs, others: ignored).
-    max_namespaces: u32 = 16,
+    max_namespaces: u32 = 24,
 
     /// LMDB map size in bytes (ignored by other backends). Never resized at
     /// runtime (S9: LMDB forbids env resize with concurrent readers); a
@@ -60,6 +69,11 @@ pub const canonical_namespaces = [_][]const u8{
     "invites",
     "blocklist",
     "offline",
+    "offline_hold",
+    "offline_v2",
+    "offline_hold_v2",
+    "offline_seq",
+    "offline_hold_token",
     "rooms",
     "messages",
     "by_contact",
@@ -98,11 +112,15 @@ pub const Entry = struct {
 ///   fn put(self: *B, ns: []const u8, key: []const u8, value: []const u8) !void
 ///   fn delete(self: *B, ns: []const u8, key: []const u8) !void
 ///
-///   // Prefix-bounded iteration
+///   // Prefix-bounded iteration; error.PrefixTooLong when
+///   // prefix.len > MAX_PREFIX_LEN
 ///   fn iterator(self: *B, ns: []const u8, prefix: []const u8) !B.Iterator
 ///
 ///   // Atomic batch writes
 ///   fn writeBatch(self: *B) !B.WriteBatch
+///
+///   // Shared lock for compound domain-store operations
+///   compound_mutex: std.Thread.Mutex
 ///
 /// Required on B.Iterator:
 ///   fn next(self: *Iterator) ?Entry
@@ -132,6 +150,8 @@ pub fn assertBackend(comptime B: type) void {
             @compileError("StorageBackend missing: put(*B, []const u8, []const u8, []const u8) !void");
         if (!@hasDecl(B, "delete"))
             @compileError("StorageBackend missing: delete(*B, []const u8, []const u8) !void");
+        if (!@hasField(B, "compound_mutex"))
+            @compileError("StorageBackend missing: compound_mutex: std.Thread.Mutex");
 
         if (!@hasDecl(B, "Iterator"))
             @compileError("StorageBackend missing: const Iterator type");
@@ -169,6 +189,7 @@ pub const MemoryBackend = struct {
     namespaces: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
     arena: std.heap.ArenaAllocator,
     backing: std.mem.Allocator,
+    compound_mutex: std.Thread.Mutex = .{},
 
     pub fn open(path: []const u8, opts: OpenOptions) !Self {
         _ = path;
@@ -232,6 +253,7 @@ pub const MemoryBackend = struct {
     };
 
     pub fn iterator(self: *Self, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > MAX_PREFIX_LEN) return error.PrefixTooLong;
         const map = self.namespaces.get(ns) orelse return .{ .entries = &.{}, .pos = 0 };
         const alloc = self.arena.allocator();
 
@@ -333,6 +355,7 @@ pub const FailBatchBackend = struct {
     fail_ops: bool = true,
     fail_commit: bool = false,
     iter_entries: []const Entry = &.{},
+    compound_mutex: std.Thread.Mutex = .{},
 
     const Self = @This();
 
@@ -482,6 +505,51 @@ test "MemoryBackend: iterator prefix-bounded" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "MemoryBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    var keys: [4][MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (MAX_PREFIX_LEN + 1)));
+}
+
 test "MemoryBackend: iterator on missing namespace" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
@@ -587,7 +655,7 @@ test "MemoryBackend: separate namespaces" {
 
 test "OpenOptions defaults" {
     const opts = OpenOptions{};
-    try std.testing.expectEqual(@as(u32, 16), opts.max_namespaces);
+    try std.testing.expectEqual(@as(u32, 24), opts.max_namespaces);
     // 8 GiB default (S9): headroom for existing production DBs that
     // already exceed 64 MiB; sparse maps cost address space only.
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), opts.map_size);
@@ -600,15 +668,15 @@ test "canonical_namespaces are unique, within the LMDB name bound, and ratcheted
     // name would collide in the DBI cache lookups, and a name over 64
     // bytes fails mdb_dbi_open (name_buf is [64]u8 plus NUL). The count
     // ratchets the set: additions must be deliberate, removals break the
-    // stores that own them (pending_sub = presence_handler,
-    // room_affiliations = room_store).
+    // stores that own them (offline_* = offline_store,
+    // pending_sub = presence_handler, room_affiliations = room_store).
     for (canonical_namespaces, 0..) |ns, i| {
         try std.testing.expect(ns.len > 0 and ns.len <= 64);
         for (canonical_namespaces[i + 1 ..]) |other| {
             try std.testing.expect(!std.mem.eql(u8, ns, other));
         }
     }
-    try std.testing.expectEqual(@as(usize, 14), canonical_namespaces.len);
+    try std.testing.expectEqual(@as(usize, 19), canonical_namespaces.len);
 }
 
 const TokenKind = enum { str, chr, comment };

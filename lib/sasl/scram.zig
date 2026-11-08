@@ -133,6 +133,14 @@ pub const CbMode = enum {
 /// 2. Server sends server-first-message (combined nonce + salt + iteration count)
 /// 3. Client sends client-final-message (channel binding + proof)
 /// 4. Server validates proof and sends server-final-message (verifier)
+/// Scratch bytes for the OpaqueString prep inside derive(): the raw
+/// input and the prepped output share one buffer.
+const prep_buf_len = 2048;
+
+/// Maximum plaintext password length StoredCredentials.derive accepts:
+/// the raw input may occupy at most half the prep buffer.
+pub const password_len_max = prep_buf_len / 2;
+
 /// Stored credentials for a user (what the server keeps in the database).
 /// These are derived from the password at registration time.
 pub const StoredCredentials = struct {
@@ -148,10 +156,10 @@ pub const StoredCredentials = struct {
     /// the client applies the same prep before Hi().
     pub fn derive(password: []const u8, salt: [32]u8, iteration_count: u32) stringprep.PrepError!StoredCredentials {
         // SaltedPassword := Hi(Normalize(password), salt, i)
-        var prep_buf: [2048]u8 = undefined;
+        var prep_buf: [prep_buf_len]u8 = undefined;
         var prep_cps: [3072]u21 = undefined;
         var prep_cccs: [3072]u8 = undefined;
-        if (password.len > prep_buf.len / 2) return error.NoSpaceLeft;
+        if (password.len > password_len_max) return error.NoSpaceLeft;
         defer std.crypto.secureZero(u8, &prep_buf);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&prep_cps));
         defer std.crypto.secureZero(u8, &prep_cccs);
