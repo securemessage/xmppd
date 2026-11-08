@@ -33,6 +33,7 @@ const Session = server_mod.Session;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
+const router = @import("router.zig");
 const PendingFanout = fanout.PendingFanout;
 const actor_message = @import("message.zig");
 const delivery_queue = @import("delivery_queue");
@@ -61,14 +62,14 @@ pub fn handleMucPresence(
     }
 
     // Build room JID for ownership check
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
     const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
         const bound = session.stream.bound_jid orelse return;
-        var real_jid_buf: [256]u8 = undefined;
+        var real_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
 
@@ -118,14 +119,14 @@ pub fn handleMucGroupchat(
     const muc_host = server.muc_host orelse return;
 
     // Build room JID
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
     const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
         const bound = session.stream.bound_jid orelse return;
-        var sender_jid_buf: [256]u8 = undefined;
+        var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         server.enqueueRoomActorMessage(owner, .{ .room_message = .{
             .room_jid = room_jid,
@@ -143,7 +144,7 @@ pub fn handleMucGroupchat(
 
     // Find sender's occupant entry by full JID (globally unique, no worker awareness needed)
     const bound = session.stream.bound_jid orelse return;
-    var sender_jid_buf: [256]u8 = undefined;
+    var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     const sender_idx = room.findByRealJid(sender_jid) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "not-acceptable", changes);
@@ -159,7 +160,7 @@ pub fn handleMucGroupchat(
 
     // Build the from JID: room@conference.host/sender_nick. Kept raw here;
     // buildPrefix escapes the whole from_str once on emit (S1).
-    var from_buf: [384]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(room_jid) catch return;
@@ -468,12 +469,12 @@ pub fn handleRoomDiscoInfo(
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
     const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
 
     if (owner != server.worker_id and server.delivery_system != null) {
-        var reply_jid_buf: [256]u8 = undefined;
+        var reply_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const bound = session.stream.bound_jid orelse return;
         const reply_jid = buildFullJid(&reply_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         // T173: capture the requester's ABA generation here, where its session
@@ -565,7 +566,7 @@ pub fn handleMucAdminIq(
 ) void {
     const muc_host = server.muc_host orelse return;
 
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     // Ownership routing
@@ -573,7 +574,7 @@ pub fn handleMucAdminIq(
     if (owner != server.worker_id) {
         // Route to owning worker
         const req_bound = session.stream.bound_jid orelse return;
-        var req_jid_buf: [256]u8 = undefined;
+        var req_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const req_jid = buildFullJid(&req_jid_buf, req_bound.local, req_bound.domain, req_bound.resource) orelse return;
 
         const target_nick = session.iq_roster_item_jid;
@@ -604,7 +605,7 @@ pub fn handleMucAdminIq(
 
     // Verify requester is moderator+ (for kick) or admin+ (for ban)
     const req_bound = session.stream.bound_jid orelse return;
-    var req_jid_buf: [256]u8 = undefined;
+    var req_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const req_jid = buildFullJid(&req_jid_buf, req_bound.local, req_bound.domain, req_bound.resource) orelse return;
     const requester_idx = room.findByRealJid(req_jid) orelse {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
@@ -671,7 +672,7 @@ pub fn handleMucAdminIq(
     }
 
     // Send IQ result
-    var result_buf: [512]u8 = undefined;
+    var result_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
@@ -709,7 +710,7 @@ fn sendIqErrorFromRoomTyped(
     changes: *ChangeList,
 ) void {
     _ = server;
-    var buf: [1024]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
@@ -744,7 +745,7 @@ pub fn handleMucOwnerGet(
     changes: *ChangeList,
 ) void {
     const muc_host = server.muc_host orelse return;
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const reg = server.room_registry orelse return;
@@ -755,7 +756,7 @@ pub fn handleMucOwnerGet(
 
     // Verify requester is owner
     const bound = session.stream.bound_jid orelse return;
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
     const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
     if (aff != .owner) {
@@ -821,7 +822,7 @@ pub fn handleMucOwnerSet(
     changes: *ChangeList,
 ) void {
     const muc_host = server.muc_host orelse return;
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const reg = server.room_registry orelse return;
@@ -832,7 +833,7 @@ pub fn handleMucOwnerSet(
 
     // Verify requester is owner
     const bound = session.stream.bound_jid orelse return;
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
     const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
 
@@ -872,7 +873,7 @@ pub fn handleMucOwnerSet(
     }
 
     // Send result IQ
-    var result_buf: [512]u8 = undefined;
+    var result_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var result_fbs = std.io.fixedBufferStream(&result_buf);
     const rw = result_fbs.writer();
     rw.writeAll("<iq type='result' from='") catch return;
@@ -959,7 +960,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
         const occ = slot.* orelse continue;
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
-        var buf: [512]u8 = undefined;
+        var buf: [router.JID_STANZA_MAX]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<message from='") catch continue;
@@ -984,13 +985,13 @@ fn handleJoin(
     nick: []const u8,
     changes: *ChangeList,
 ) void {
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     // Get sender's full and bare JID
     const bound = session.stream.bound_jid orelse return;
-    var real_jid_buf: [256]u8 = undefined;
-    var bare_jid_buf: [256]u8 = undefined;
+    var real_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
+    var bare_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     const bare_jid = buildBareJid(&bare_jid_buf, bound.local, bound.domain) orelse return;
 
@@ -1147,12 +1148,12 @@ fn handlePart(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
-    var room_jid_buf: [320]u8 = undefined;
+    var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const room = reg.findByJid(room_jid) orelse return;
     const part_bound = session.stream.bound_jid orelse return;
-    var part_jid_buf: [256]u8 = undefined;
+    var part_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const part_jid = buildFullJid(&part_jid_buf, part_bound.local, part_bound.domain, part_bound.resource) orelse return;
     const removed = room.removeByRealJid(part_jid) orelse return;
 
@@ -1258,7 +1259,7 @@ fn sendOccupantPresence(
     changes: *ChangeList,
 ) void {
     _ = muc_host;
-    var buf: [2048]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
@@ -1300,7 +1301,7 @@ fn sendSelfPresence(
 ) void {
     _ = muc_host;
     _ = server;
-    var buf: [2048]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
@@ -1341,7 +1342,7 @@ fn broadcastOccupantJoin(
     defer if (avatar_hash) |h| server.allocator.free(h);
 
     // Build prefix/suffix for multicast (no status 110 — self is always local)
-    var prefix_buf: [512]u8 = undefined;
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
@@ -1405,7 +1406,7 @@ fn broadcastOccupantLeave(
     _ = muc_host;
 
     // Build prefix/suffix for multicast (no status 110)
-    var prefix_buf: [512]u8 = undefined;
+    var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
     var prefix_fbs = std.io.fixedBufferStream(&prefix_buf);
     const pw = prefix_fbs.writer();
     pw.writeAll("<presence from='") catch return;
@@ -1508,7 +1509,9 @@ fn collapseOccupant(
     return true;
 }
 
-const REPLACED_NOTICE_BUF_LEN = 6 * (256 + 64 + 256) + 256;
+/// Sized for the worst case: room JID, nick and real JID all escaped at 6x,
+/// plus literal markup and the affiliation name.
+const REPLACED_NOTICE_BUF_LEN = 6 * (room_registry.MAX_BARE_JID + 64 + room_registry.MAX_REAL_JID) + 256;
 
 /// Tells a resource replaced by a takeover that it is no longer in the room.
 /// A local target is checked against its bound JID so a reused session slot
@@ -1541,7 +1544,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
     }
     const target = server.sessions[before.session_id] orelse return;
     const bound = target.stream.bound_jid orelse return;
-    var jid_buf: [256]u8 = undefined;
+    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
     fanout.deliverToSession(target, stanza, before.session_id, changes);
@@ -1549,7 +1552,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 
 /// Presence error to a joiner on another worker.
 fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: []const u8) void {
-    var buf: [1024]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
@@ -1711,7 +1714,7 @@ fn sendPresenceError(
     changes: *ChangeList,
 ) void {
     _ = server;
-    var buf: [1024]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
@@ -1741,7 +1744,7 @@ fn sendMessageError(
     changes: *ChangeList,
 ) void {
     _ = server;
-    var buf: [1024]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
@@ -1810,7 +1813,7 @@ pub fn processRemoteJoin(
     // current affiliation and role.
     if (r.findByRealJid(ev.real_jid)) |self_idx| {
         const occ = r.occupants[self_idx].?;
-        var buf: [2048]u8 = undefined;
+        var buf: [router.JID_STANZA_MAX]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
         w.writeAll("<presence from='") catch return;
@@ -1842,7 +1845,7 @@ pub fn processRemoteJoin(
             return;
         } else {
             // Send conflict error back via MPSC
-            var err_buf: [1024]u8 = undefined;
+            var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
@@ -1868,7 +1871,7 @@ pub fn processRemoteJoin(
             affiliation = store.getAffiliation(ev.room_jid, bare_jid) catch .none;
         }
         if (affiliation == .outcast) {
-            var err_buf: [1024]u8 = undefined;
+            var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
             var err_fbs = std.io.fixedBufferStream(&err_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
@@ -1887,7 +1890,7 @@ pub fn processRemoteJoin(
 
     // Members-only check
     if (r.config.members_only and affiliation == .none) {
-        var err_buf: [1024]u8 = undefined;
+        var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
@@ -1901,7 +1904,7 @@ pub fn processRemoteJoin(
 
     // Add occupant to canonical room on owning worker
     _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, role, affiliation) catch {
-        var err_buf: [1024]u8 = undefined;
+        var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
         var err_fbs = std.io.fixedBufferStream(&err_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
@@ -1948,7 +1951,7 @@ fn finishRemoteJoin(
     for (&r.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (std.mem.eql(u8, occ.getRealJid(), ev.real_jid)) continue; // skip self
-        var occ_buf: [2048]u8 = undefined;
+        var occ_buf: [router.JID_STANZA_MAX]u8 = undefined;
         var occ_fbs = std.io.fixedBufferStream(&occ_buf);
         const ow = occ_fbs.writer();
         ow.writeAll("<presence from='") catch continue;
@@ -1972,7 +1975,7 @@ fn finishRemoteJoin(
 
     // Send self-presence with status 110 to the joiner
     {
-        var self_buf: [2048]u8 = undefined;
+        var self_buf: [router.JID_STANZA_MAX]u8 = undefined;
         var self_fbs = std.io.fixedBufferStream(&self_buf);
         const sw = self_fbs.writer();
         sw.writeAll("<presence from='") catch return;
@@ -2058,7 +2061,7 @@ pub fn processRemoteGroupchat(
     if (room.config.moderated and sender.role == .visitor) return;
 
     // Build the from JID: room@conference.host/sender_nick
-    var from_buf: [384]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(ev.room_jid) catch return;
@@ -2440,7 +2443,7 @@ fn sendRoomHistoryRemote(
 // Utility
 // ============================================================================
 
-fn buildRoomJid(buf: *[320]u8, local: []const u8, host: []const u8) ?[]const u8 {
+fn buildRoomJid(buf: []u8, local: []const u8, host: []const u8) ?[]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     for (local) |c| {
@@ -2451,7 +2454,7 @@ fn buildRoomJid(buf: *[320]u8, local: []const u8, host: []const u8) ?[]const u8 
     return fbs.getWritten();
 }
 
-fn buildFullJid(buf: *[256]u8, local: []const u8, domain: []const u8, resource: []const u8) ?[]const u8 {
+fn buildFullJid(buf: []u8, local: []const u8, domain: []const u8, resource: []const u8) ?[]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll(local) catch return null;
@@ -2464,7 +2467,7 @@ fn buildFullJid(buf: *[256]u8, local: []const u8, domain: []const u8, resource: 
     return fbs.getWritten();
 }
 
-fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u8 {
+fn buildBareJid(buf: []u8, local: []const u8, domain: []const u8) ?[]const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll(local) catch return null;
@@ -2561,7 +2564,7 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
             const jid = xmpp.Jid.parse(ev.from_jid) catch return;
             const sm = server.session_map orelse return;
             const entry = sm.findByFullJid(jid.local, jid.domain, jid.resource) orelse return;
-            var buf: [768]u8 = undefined;
+            var buf: [router.JID_STANZA_MAX]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             const w = fbs.writer();
             w.writeAll("<message from='") catch return;
@@ -2578,7 +2581,7 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
             deliverToTriple(server, fbs.getWritten(), entry.worker_id, entry.local_session_id, entry.generation, changes);
         },
         .room_join, .room_part => |ev| {
-            var buf: [640]u8 = undefined;
+            var buf: [router.JID_STANZA_MAX]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             const w = fbs.writer();
             w.writeAll("<presence from='") catch return;
@@ -2602,7 +2605,7 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
 }
 
 fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, worker: u16, session_id: u32, generation: u32, changes: *ChangeList) void {
-    var buf: [512]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='error' from='") catch return;
@@ -2707,7 +2710,7 @@ pub fn processRemoteAdminAction(
     }
 
     // Send IQ result back to requester
-    var buf: [512]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='result' from='") catch return;
@@ -2810,7 +2813,7 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
 /// (T173) — the drain side drops deliveries whose generation doesn't match.
 fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8, target_worker: u16, target_session: u32, target_generation: u32, error_type: []const u8) void {
     const ds = server.delivery_system orelse return;
-    var buf: [512]u8 = undefined;
+    var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
     w.writeAll("<iq type='error' from='") catch return;

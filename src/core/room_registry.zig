@@ -89,7 +89,12 @@ pub const REMOTE_OCCUPANT: usize = std.math.maxInt(usize);
 
 /// Longest real JID an occupant record holds. Fan-out sizing has to assume
 /// the worst case, because one recipient over the limit fails the delivery.
-pub const MAX_REAL_JID = 256;
+/// Matches the daemon's full-JID bound (router FULL_JID_MAX, not importable
+/// from this module).
+pub const MAX_REAL_JID = 1024;
+/// Longest bare JID an occupant, room or directory record holds: every JID
+/// that can be a store key (router BARE_JID_MAX, same caveat).
+pub const MAX_BARE_JID = 512;
 
 /// A single occupant in a room.
 pub const Occupant = struct {
@@ -100,7 +105,7 @@ pub const Occupant = struct {
     real_jid_buf: [MAX_REAL_JID]u8 = [_]u8{0} ** MAX_REAL_JID,
     real_jid_len: u16 = 0,
     /// Bare JID of the real user (user@domain).
-    bare_jid_buf: [256]u8 = [_]u8{0} ** 256,
+    bare_jid_buf: [MAX_BARE_JID]u8 = [_]u8{0} ** MAX_BARE_JID,
     bare_jid_len: u16 = 0,
     /// Session ID (local index into Server.sessions). REMOTE_OCCUPANT for federated.
     session_id: usize = 0,
@@ -147,7 +152,7 @@ pub const Occupant = struct {
 /// An active MUC room with its occupants.
 pub const Room = struct {
     /// Room bare JID (room@conference.example.com).
-    jid_buf: [256]u8 = [_]u8{0} ** 256,
+    jid_buf: [MAX_BARE_JID]u8 = [_]u8{0} ** MAX_BARE_JID,
     jid_len: u16 = 0,
     /// Room configuration.
     config: RoomConfig = .{},
@@ -333,7 +338,7 @@ pub const MAX_DIRECTORY_ENTRIES = 256;
 
 /// An entry in the room directory (local projection of all public rooms across all workers).
 pub const DirectoryEntry = struct {
-    jid_buf: [256]u8 = [_]u8{0} ** 256,
+    jid_buf: [MAX_BARE_JID]u8 = [_]u8{0} ** MAX_BARE_JID,
     jid_len: u16 = 0,
     name_buf: [128]u8 = [_]u8{0} ** 128,
     name_len: u8 = 0,

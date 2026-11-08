@@ -33,6 +33,7 @@ const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const iq_handler = @import("iq_handler.zig");
 const fanout = @import("fanout.zig");
+const router = @import("router.zig");
 const sub_cache_mod = server_mod.sub_cache_mod;
 
 const log = std.log.scoped(.presence);
@@ -102,7 +103,6 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
             session.pres_priority_collecting = false;
             session.pres_priority_len = 0;
             if (elem.self_closing) {
-                const router = @import("router.zig");
                 router.dispatchStanza(server, session, changes);
             }
             return;
@@ -256,7 +256,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             if (server.caps_cache.lookup(ver) == null) {
                 if (caps_mod.extractNodeFromPresence(inner_xml)) |node| {
                     // Build the full JID for the query target
-                    var jid_buf: [512]u8 = undefined;
+                    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
                     var jid_fbs = std.io.fixedBufferStream(&jid_buf);
                     const jw = jid_fbs.writer();
                     jw.writeAll(bound.local) catch {};
@@ -315,7 +315,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     const roster = server.roster orelse return;
 
     // Build the from JID string
-    var from_buf: [256]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(local) catch return;
@@ -326,7 +326,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     const from_str = from_fbs.getWritten();
 
     // Build bare JID for roster lookup
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -377,7 +377,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
 pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
 
-    var from_buf: [256]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(local) catch return;
@@ -387,7 +387,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     fw.writeAll(resource) catch return;
     const from_str = from_fbs.getWritten();
 
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -410,7 +410,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     };
     const subscriber_jids = sub_jid_ptrs2[0..sub_count2];
 
-    var pres_buf: [512]u8 = undefined;
+    var pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var pres_fbs = std.io.fixedBufferStream(&pres_buf);
     const pw = pres_fbs.writer();
     pw.writeAll("<presence from='") catch return;
@@ -430,7 +430,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     const roster = server.roster orelse return;
     const sm = server.session_map orelse return;
 
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -455,7 +455,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
     // Build our full JID as the 'to' attribute for cross-thread deliveries
     const bound = session.stream.bound_jid orelse return;
-    var to_buf: [256]u8 = undefined;
+    var to_buf: [router.FULL_JID_MAX]u8 = undefined;
     var to_fbs = std.io.fixedBufferStream(&to_buf);
     to_fbs.writer().writeAll(bound.local) catch return;
     to_fbs.writer().writeByte('@') catch return;
@@ -484,7 +484,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             // Remote domain? Send a presence probe via S2S.
             // The remote server will respond with the contact's current presence.
             if (!std.mem.eql(u8, contact_domain, server.server_host)) {
-                var probe_buf: [512]u8 = undefined;
+                var probe_buf: [router.JID_STANZA_MAX]u8 = undefined;
                 var probe_fbs = std.io.fixedBufferStream(&probe_buf);
                 const pbw = probe_fbs.writer();
                 pbw.writeAll("<presence from='") catch continue;
@@ -591,7 +591,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     if (to_str.len == 0) return;
 
     // Build owner bare JID
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(bound.local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -673,7 +673,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     if (to_str.len == 0) return;
 
     // Build owner bare JID
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(bound.local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -735,7 +735,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     const to_jid = to_jid_parsed;
 
     // Build presence stanza
-    var sd_pres_buf: [512]u8 = undefined;
+    var sd_pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var sd_pres_fbs = std.io.fixedBufferStream(&sd_pres_buf);
     const sdpw = sd_pres_fbs.writer();
     sdpw.writeAll("<presence from='") catch return;
@@ -814,7 +814,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(bound.local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -867,7 +867,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     const to_jid = to_jid_parsed;
 
     // Build presence stanza
-    var unsub_pres_buf: [512]u8 = undefined;
+    var unsub_pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var unsub_pres_fbs = std.io.fixedBufferStream(&unsub_pres_buf);
     const usbw = unsub_pres_fbs.writer();
     usbw.writeAll("<presence from='") catch return;
@@ -896,7 +896,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(bound.local) catch return;
     bare_fbs.writer().writeByte('@') catch return;
@@ -957,7 +957,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
         const owner_entries = lease_b.entries;
         const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, owner_entries);
         for (owner_entries[0..owner_count]) |oent| {
-            var unavail_buf: [512]u8 = undefined;
+            var unavail_buf: [router.JID_STANZA_MAX]u8 = undefined;
             var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
             const uw = unavail_fbs.writer();
             uw.writeAll("<presence from='") catch continue;
@@ -976,7 +976,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     // Forward unsubscribed
 
     // Build presence stanza
-    var unsd_pres_buf: [512]u8 = undefined;
+    var unsd_pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
     var unsd_pres_fbs = std.io.fixedBufferStream(&unsd_pres_buf);
     const usdw = unsd_pres_fbs.writer();
     usdw.writeAll("<presence from='") catch return;
@@ -1016,13 +1016,11 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
     const from_end = std.mem.indexOfPos(u8, sub_pres_xml, from_value_start, "'") orelse return;
     const subscriber_bare = sub_pres_xml[from_value_start..from_end];
 
-    var key_buf: [512]u8 = undefined;
-    const key_len = contact_bare.len + 1 + subscriber_bare.len;
-    if (key_len > key_buf.len) return;
-    @memcpy(key_buf[0..contact_bare.len], contact_bare);
-    key_buf[contact_bare.len] = 0;
-    @memcpy(key_buf[contact_bare.len + 1 .. key_len], subscriber_bare);
-    const key = key_buf[0..key_len];
+    var key_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
+    const key = store_keys.join2(&key_buf, contact_bare, subscriber_bare) catch {
+        log.warn("pending-subscription key too long for contact {s}: not stored", .{contact_bare});
+        return;
+    };
 
     roster.backend.put(PENDING_SUB_NS, key, sub_pres_xml) catch |e| {
         log.err("storePendingSubscription failed for {s}: {}", .{ contact_bare, e });
@@ -1035,18 +1033,18 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
 pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
 
-    var bare_buf: [256]u8 = undefined;
-    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-    bare_fbs.writer().writeAll(local) catch return;
-    bare_fbs.writer().writeByte('@') catch return;
-    bare_fbs.writer().writeAll(domain) catch return;
-    const bare_jid = bare_fbs.getWritten();
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
+        log.warn("deliverPendingSubscriptions: bare JID too long for {s}@{s}", .{ local, domain });
+        return;
+    };
 
     // Prefix scan: all keys starting with "contact_bare\x00"
-    var prefix_buf: [256]u8 = undefined;
-    @memcpy(prefix_buf[0..bare_jid.len], bare_jid);
-    prefix_buf[bare_jid.len] = 0;
-    const prefix = prefix_buf[0 .. bare_jid.len + 1];
+    var prefix_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
+    const prefix = store_keys.prefix(&prefix_buf, bare_jid) catch {
+        log.warn("deliverPendingSubscriptions: prefix too long for {s}", .{bare_jid});
+        return;
+    };
 
     var iter = roster.backend.iterator(PENDING_SUB_NS, prefix) catch return;
     defer iter.deinit();
@@ -1087,7 +1085,7 @@ fn broadcastToOwnResources(
     const sm = server.session_map orelse return;
 
     // Build the from full JID
-    var from_buf: [256]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(local) catch return;
@@ -1169,7 +1167,7 @@ fn sendOtherResourcesPresence(
         if (std.mem.eql(u8, entry_resource, new_resource)) continue;
 
         // Build presence from the existing resource with its current priority.
-        var pres_buf: [512]u8 = undefined;
+        var pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
         var pres_fbs = std.io.fixedBufferStream(&pres_buf);
         const pw = pres_fbs.writer();
         pw.writeAll("<presence from='") catch continue;
@@ -1211,7 +1209,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     const bound = sender_session.stream.bound_jid orelse return;
 
     // Build the from full JID
-    var from_buf: [256]u8 = undefined;
+    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     var from_fbs = std.io.fixedBufferStream(&from_buf);
     const fw = from_fbs.writer();
     fw.writeAll(bound.local) catch return;
@@ -1526,4 +1524,181 @@ test "S1: subscription presence escapes the owner bare JID" {
     try std.testing.expect(std.mem.indexOf(u8, got, "from='o&apos;wner@localhost'") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "from='o'wner@localhost'") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "type='subscribe'") != null);
+}
+
+test "A62: pending-subscription delivery for a 256-byte bare JID" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    // Bare JID of exactly 256 bytes: 246-byte localpart + "@localhost".
+    var local_buf: [246]u8 = undefined;
+    @memset(&local_buf, 'l');
+    const local = local_buf[0..];
+    var bare_buf: [256]u8 = undefined;
+    const contact_bare = std.fmt.bufPrint(&bare_buf, "{s}@localhost", .{local}) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 256), contact_bare.len);
+
+    // Seed a pending subscription for that contact.
+    const sub_xml = "<presence from='bob@localhost' to='x' type='subscribe'/>";
+    storePendingSubscription(&server, contact_bare, sub_xml);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = session;
+    session.stream.bound_jid = .{ .local = local, .domain = "localhost", .resource = "res" };
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    deliverPendingSubscriptions(&server, session, local, "localhost", &changes);
+
+    _ = try session.conn.flushSend();
+    var rbuf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &rbuf) catch 0;
+    const got = rbuf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "type='subscribe'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "from='bob@localhost'") != null);
+}
+
+test "A62: oversized bare JIDs skip pending-subscription delivery" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
+    server.roster = &roster;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var rbuf: [64]u8 = undefined;
+
+    // 511-byte bare JID: builds, but the bare\x00 prefix exceeds MAX_KEY_LEN.
+    var big_local: [1023]u8 = undefined;
+    @memset(&big_local, 'l');
+    deliverPendingSubscriptions(&server, session, big_local[0..501], "localhost", &changes);
+    const n1 = posix.read(fds[1], &rbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n1);
+
+    // RFC 7622 maximum bare JID (2047 bytes) exceeds BARE_JID_MAX entirely.
+    var big_domain: [1023]u8 = undefined;
+    @memset(&big_domain, 'd');
+    deliverPendingSubscriptions(&server, session, &big_local, &big_domain, &changes);
+    const n2 = posix.read(fds[1], &rbuf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n2);
+}
+
+test "A62: block check sees a >256-byte recipient JID in full" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    var db = try server_mod.OpBackendType.open(db_path, .{});
+    defer db.close();
+    var bs = @import("block_store").BlockStore(server_mod.OpBackendType).init(&db);
+    server.block_store = &bs;
+
+    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    // Sender alice, bound and live.
+    var alice_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
+    defer posix.close(alice_fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(alice_fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = alice;
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+
+    // Two recipients with 300-byte bare JIDs (290-byte localpart).
+    var rbuf: [290]u8 = undefined;
+    @memset(&rbuf, 'r');
+    const recip_local = rbuf[0..];
+    var bare_buf1: [512]u8 = undefined;
+    const blocked_bare = std.fmt.bufPrint(&bare_buf1, "{s}@localhost", .{recip_local}) catch unreachable;
+    var jid_buf1: [600]u8 = undefined;
+    const blocked_full = std.fmt.bufPrint(&jid_buf1, "{s}/one", .{blocked_bare}) catch unreachable;
+
+    var ubuf: [290]u8 = undefined;
+    @memset(&ubuf, 'u');
+    const open_local = ubuf[0..];
+    var jid_buf2: [600]u8 = undefined;
+    const open_full = std.fmt.bufPrint(&jid_buf2, "{s}@localhost/two", .{open_local}) catch unreachable;
+
+    var b_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &b_fds));
+    defer posix.close(b_fds[1]);
+    const bsess = try allocator.create(Session);
+    bsess.* = Session.init(b_fds[0], 2, server.server_host, false, allocator);
+    server.sessions[2] = bsess;
+    _ = try sm.bind(0, 2, recip_local, "localhost", "one");
+
+    var o_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &o_fds));
+    defer posix.close(o_fds[1]);
+    const osess = try allocator.create(Session);
+    osess.* = Session.init(o_fds[0], 3, server.server_host, false, allocator);
+    server.sessions[3] = osess;
+    _ = try sm.bind(0, 3, open_local, "localhost", "two");
+
+    // The 300-byte recipient blocks alice; a truncated block key would miss.
+    try bs.block(blocked_bare, "alice@localhost");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    alice.stanza_kind = .message;
+    alice.stanza_to = blocked_full;
+    alice.stanza_id = "m1";
+    alice.stanza_type = "chat";
+    router.dispatchStanza(&server, alice, &changes);
+
+    _ = try bsess.conn.flushSend();
+    var drain: [4096]u8 = undefined;
+    const n_blocked = posix.read(b_fds[1], &drain) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n_blocked);
+
+    // Control: the unblocked 300-byte recipient still receives the stanza.
+    alice.stanza_kind = .message;
+    alice.stanza_to = open_full;
+    alice.stanza_id = "m2";
+    alice.stanza_type = "chat";
+    router.dispatchStanza(&server, alice, &changes);
+
+    _ = try osess.conn.flushSend();
+    const n_open = posix.read(o_fds[1], &drain) catch 0;
+    try std.testing.expect(n_open > 0);
+    try std.testing.expect(std.mem.indexOf(u8, drain[0..n_open], "from='alice@localhost/res'") != null);
 }

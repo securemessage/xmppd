@@ -23,6 +23,7 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 const lastact_store = @import("last_activity_store");
+const router = @import("router.zig");
 
 const log = std.log.scoped(.lifecycle);
 
@@ -359,7 +360,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
     if (session.stream.bound_jid) |bound| {
-        var close_jid_buf: [256]u8 = undefined;
+        var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         var close_jid_fbs = std.io.fixedBufferStream(&close_jid_buf);
         const cw = close_jid_fbs.writer();
         cw.writeAll(bound.local) catch {};
@@ -410,7 +411,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 /// T164: write the account's last-offline timestamp after its final resource
 /// unbound (best-effort; on error the next teardown retries).
 fn recordLastOffline(roster: anytype, bound: anytype) void {
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&bare_buf);
     fbs.writer().writeAll(bound.local) catch return;
     fbs.writer().writeByte('@') catch return;
@@ -474,7 +475,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     // precondition: a deployment without one still drains what it stored.
     const archive = server.archive;
 
-    var bare_buf: [256]u8 = undefined;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     var bare_fbs = std.io.fixedBufferStream(&bare_buf);
     bare_fbs.writer().writeAll(local) catch return;
     bare_fbs.writer().writeByte('@') catch return;

@@ -37,6 +37,10 @@ pub const BARE_JID_MAX = 512;
 /// Worst-case full JID from bind: two 256-byte parts, the separators, and the
 /// server host. A shorter buffer silently dropped the stanza on overflow.
 pub const FULL_JID_MAX = 1024;
+/// Stack buffer bound for a stanza assembled inline that embeds up to two
+/// JIDs (a sender and a recipient) plus fixed markup. Sized to two maximum
+/// full JIDs so a maximum-length JID can never truncate the stanza.
+pub const JID_STANZA_MAX = 2 * FULL_JID_MAX + 64;
 
 /// Build a bare JID "local@domain" into out. A JID that does not fit returns
 /// NoSpaceLeft rather than a truncated prefix (S4).
@@ -135,14 +139,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // XEP-0191: Block check — silently drop stanzas from blocked contacts.
     if (server.block_store) |bs| {
-        var rblk_buf: [256]u8 = undefined;
+        var rblk_buf: [BARE_JID_MAX]u8 = undefined;
         var rblk_fbs = std.io.fixedBufferStream(&rblk_buf);
         rblk_fbs.writer().writeAll(to_jid.local) catch {};
         rblk_fbs.writer().writeByte('@') catch {};
         rblk_fbs.writer().writeAll(to_jid.domain) catch {};
         const recip_bare = rblk_fbs.getWritten();
 
-        var sblk_buf: [256]u8 = undefined;
+        var sblk_buf: [BARE_JID_MAX]u8 = undefined;
         var sblk_fbs = std.io.fixedBufferStream(&sblk_buf);
         sblk_fbs.writer().writeAll(from_jid.local) catch {};
         sblk_fbs.writer().writeByte('@') catch {};

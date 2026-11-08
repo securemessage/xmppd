@@ -1855,7 +1855,7 @@ pub const Server = struct {
         var server_addressed = to_attr.len == 0 or std.mem.eql(u8, to_attr, self.server_host);
         if (!server_addressed) {
             if (session.stream.authenticated_jid) |aj| {
-                var acc_buf: [256]u8 = undefined;
+                var acc_buf: [router.BARE_JID_MAX]u8 = undefined;
                 var acc_fbs = std.io.fixedBufferStream(&acc_buf);
                 const aw = acc_fbs.writer();
                 aw.writeAll(aj.local) catch {};
@@ -2768,7 +2768,7 @@ pub const Server = struct {
                 if (self.oidc_import_avatar and m.photo_url.len > 0) {
                     if (self.vcard) |vcard| {
                         // Build bare JID for vCard lookup
-                        var jid_buf: [512]u8 = undefined;
+                        var jid_buf: [router.BARE_JID_MAX]u8 = undefined;
                         var jid_fbs = std.io.fixedBufferStream(&jid_buf);
                         const jw = jid_fbs.writer();
                         jw.writeAll(stable_username) catch {};
@@ -2913,7 +2913,7 @@ pub const Server = struct {
     /// Called after auth daemon confirms credential deletion.
     fn cascadeAccountDelete(self: *Server, username: []const u8) void {
         // Build bare JID for store lookups: username@server_host
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
         var bare_fbs = std.io.fixedBufferStream(&bare_buf);
         bare_fbs.writer().writeAll(username) catch return;
         bare_fbs.writer().writeByte('@') catch return;
@@ -3213,7 +3213,7 @@ pub const Server = struct {
                 // Archive S2S inbound messages delivered to online recipients (T81)
                 if (self.archive != null) {
                     if (live_parts.is_message and std.mem.indexOf(u8, live_parts.inner_xml, "<body") != null) {
-                        var recip_buf: [256]u8 = undefined;
+                        var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
                         var recip_fbs = std.io.fixedBufferStream(&recip_buf);
                         recip_fbs.writer().writeAll(to_jid.local) catch {};
                         recip_fbs.writer().writeByte('@') catch {};
@@ -4001,7 +4001,7 @@ pub const Server = struct {
                 muc_handler.handleOccupantMove(self, ev);
             },
             .session_closed => |ev| {
-                var jid_buf: [256]u8 = undefined;
+                var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
                 var jid_fbs = std.io.fixedBufferStream(&jid_buf);
                 const jw = jid_fbs.writer();
                 jw.writeAll(ev.local) catch return;
@@ -4995,7 +4995,7 @@ pub const Server = struct {
     /// full JID everywhere — no ghost occupancy.
     fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, generation: u32, old_worker: u16) void {
         const bound = session.stream.bound_jid orelse return;
-        var jid_buf: [320]u8 = undefined;
+        var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         var jid_fbs = std.io.fixedBufferStream(&jid_buf);
         const jw = jid_fbs.writer();
         jw.writeAll(bound.local) catch return;
