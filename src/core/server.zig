@@ -1997,8 +1997,10 @@ pub const Server = struct {
     /// F6: jid-malformed reply for a stanza whose to/from failed ingress
     /// preparation. message/iq echo the sender's 'to' and 'id' like
     /// sendPreBindStanzaError; presence also addresses the reply to the
-    /// account's full JID, mirroring rejectOversizeSubscriptionTo.
-    fn sendIngressJidMalformed(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
+    /// account's full JID, mirroring rejectOversizeSubscriptionTo. noinline:
+    /// on the per-stanza path only while inlined it cost one probed frame
+    /// inside handleElementStart.
+    noinline fn sendIngressJidMalformed(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
         _ = self;
         var to_attr: []const u8 = "";
         var id_attr: []const u8 = "";
@@ -2021,11 +2023,10 @@ pub const Server = struct {
             }
             reply_to = fbs.getWritten();
         }
-        var buf: [4608]u8 = undefined;
-        const stanza = writeJidMalformedReply(&buf, elem.local_name, to_attr, reply_to, id_attr) orelse
+        const stanza = writeJidMalformedReply(&session.write_scratch, elem.local_name, to_attr, reply_to, id_attr) orelse
             // An offending JID that escapes wider than the buffer still gets
             // its answer; the 'from' echo is optional.
-            writeJidMalformedReply(&buf, elem.local_name, "", reply_to, id_attr) orelse return;
+            writeJidMalformedReply(&session.write_scratch, elem.local_name, "", reply_to, id_attr) orelse return;
         session.queueSendStanza(stanza) catch return;
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};

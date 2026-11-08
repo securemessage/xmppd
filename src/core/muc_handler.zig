@@ -759,7 +759,7 @@ pub fn handleMucOwnerGet(
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
     // F6: the affiliation store key uses the configured spelling; the bound
     // JID itself stays as-typed.
-    var member_key_buf: [xmpp.max_jid_octets]u8 = undefined;
+    var member_key_buf: [256]u8 = undefined;
     const member_key = preparedMemberBare(server, bare_jid, &member_key_buf);
     const aff = if (server.room_store) |store| store.getAffiliation(room_jid, member_key) catch .none else .none;
     if (aff != .owner) {
@@ -840,7 +840,7 @@ pub fn handleMucOwnerSet(
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
     // F6: the affiliation store key uses the configured spelling; the bound
     // JID itself stays as-typed.
-    var member_key_buf: [xmpp.max_jid_octets]u8 = undefined;
+    var member_key_buf: [256]u8 = undefined;
     const member_key = preparedMemberBare(server, bare_jid, &member_key_buf);
     const aff = if (server.room_store) |store| store.getAffiliation(room_jid, member_key) catch .none else .none;
 
@@ -1065,7 +1065,7 @@ fn handleJoin(
         // Look up persistent affiliation from RoomStore; the store key uses
         // the configured spelling (F6) while the occupant stays as-typed.
         if (server.room_store) |store| {
-            var member_key_buf: [xmpp.max_jid_octets]u8 = undefined;
+            var member_key_buf: [256]u8 = undefined;
             affiliation = store.getAffiliation(room_jid, preparedMemberBare(server, bare_jid, &member_key_buf)) catch .none;
         }
         if (affiliation == .outcast) {
@@ -1877,7 +1877,7 @@ pub fn processRemoteJoin(
         // F6: the affiliation store key uses the configured spelling; the
         // occupant's real JID stays as-typed.
         if (server.room_store) |store| {
-            var member_key_buf: [xmpp.max_jid_octets]u8 = undefined;
+            var member_key_buf: [256]u8 = undefined;
             affiliation = store.getAffiliation(ev.room_jid, preparedMemberBare(server, bare_jid, &member_key_buf)) catch .none;
         }
         if (affiliation == .outcast) {
@@ -2491,7 +2491,9 @@ fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u
 /// the store lookup only; remote-domain members pass through unchanged.
 /// A member JID this late cannot practically fail preparation; on error the
 /// raw form is used so the lookup degenerates to a miss, not a wrong key.
-fn preparedMemberBare(server: *Server, bare_jid: []const u8, buf: *[xmpp.max_jid_octets]u8) []const u8 {
+/// The input comes from buildBareJid's 256 B buffer and the prepared output
+/// is never longer than the input, so 256 B is enough.
+fn preparedMemberBare(server: *Server, bare_jid: []const u8, buf: *[256]u8) []const u8 {
     return xmpp.prepareLocalDomainJid(bare_jid, server.server_host, buf) catch bare_jid;
 }
 
