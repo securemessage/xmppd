@@ -237,6 +237,12 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
 
 const MAX_DBS = 24;
 
+comptime {
+    // openCanonicalNamespaces appends every canonical namespace to
+    // dbi_cache without a runtime bound check; the list must fit.
+    std.debug.assert(backend.canonical_namespaces.len <= MAX_DBS);
+}
+
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
     name_len: u8,
