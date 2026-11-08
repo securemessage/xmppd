@@ -650,6 +650,9 @@ pub const Conn = struct {
     /// `ConnList.popClosed`. The first close wins so a late `close`
     /// cannot overwrite the real cause.
     close_reason: ?CloseReason = null,
+    /// teardown ran: the fd is closed and its number may already be
+    /// reused, so a late close or link must not act on it again.
+    torn_down: bool = false,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
@@ -737,6 +740,7 @@ pub const Conn = struct {
     }
 
     fn markClosing(c: *Conn, list: *ConnList, reason: CloseReason) void {
+        if (c.torn_down) return;
         c.state = .closing;
         if (c.close_reason == null) c.close_reason = reason;
         list.link(c);
@@ -983,10 +987,14 @@ pub const Conn = struct {
     }
 
     /// End-of-iteration teardown for a closing conn: `SSL_shutdown`
-    /// once (plain: no-op), then close the loop handle and fd. The
-    /// consumer frees the Conn after this.
+    /// once (plain: no-op), then close the loop handle and fd.
+    /// Idempotent: once it has run, the fd number may already be reused
+    /// by an unrelated socket, so a late close must not act again.
+    /// `ConnList.popClosed` hands the conn back for the consumer's free.
     pub fn teardown(c: *Conn) void {
         std.debug.assert(c.state == .closing);
+        if (c.torn_down) return;
+        c.torn_down = true;
         c.transport.shutdown();
         c.loop.close(c.handle) catch |err| switch (err) {
             // A released fd freed its handle slot at detach, so the loop
@@ -1003,6 +1011,9 @@ pub const Conn = struct {
                 c.opts.counters.loop_close_failed += 1;
             },
         };
+        // The fd is closed whichever path took it; a stale number must
+        // never linger for a second teardown to act on.
+        if (c.hs) |*hs| hs.fd = -1;
     }
 
     /// Queue outbound bytes through the outbox and link the conn so the
@@ -1042,9 +1053,11 @@ pub const ConnList = struct {
     closed_head: ?*Conn = null,
     closed_tail: ?*Conn = null,
 
-    /// Append `c` if it is not linked already (idempotent).
+    /// Append `c` if it is not linked already (idempotent). A
+    /// torn-down conn is never linked again: its dirty links belong to
+    /// the closed list until `popClosed` returns it.
     pub fn link(l: *ConnList, c: *Conn) void {
-        if (c.on_dirty) return;
+        if (c.torn_down or c.on_dirty) return;
         c.on_dirty = true;
         c.dirty_prev = l.tail;
         c.dirty_next = null;
@@ -2607,6 +2620,85 @@ test "Conn: teardown closes the fd while it is released to a driver" {
     list.service();
     try std.testing.expectEqual(@as(posix.fd_t, -1), c.hs.?.fd);
     try std.testing.expect(std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0)) == -1);
+}
+
+test "Conn: a late close of a torn-down conn never acts on a reused fd number" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    var list: ConnList = .{};
+    c.close(&list);
+    list.service(); // teardown: the loop closes the fd
+    try std.testing.expect(list.popClosed() == &c);
+
+    // An unrelated socket takes the lowest free number, i.e. the same
+    // one. A late consumer close (deadline, peer replace) on the
+    // torn-down conn must be a no-op, not a second teardown that
+    // closes the reused number.
+    const other = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(other);
+    c.close(&list);
+    list.service();
+    try std.testing.expect(std.c.fcntl(other, posix.F.GETFL, @as(c_int, 0)) != -1);
+    try std.testing.expect(list.popClosed() == null);
+}
+
+test "Conn: a late close of a torn-down TLS conn does not touch a reused fd number" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    try std.testing.expectEqual(State.established, c.state);
+
+    c.close(&list);
+    list.service(); // teardown: close_notify sent, fd closed
+    try std.testing.expect(list.popClosed() == &c);
+
+    // An unrelated socketpair takes the freed fd number; a second
+    // teardown must not run SSL_shutdown on it, or it writes
+    // close_notify into someone else's stream and eats their bytes.
+    const other = try socketpair();
+    defer posix.close(other[0]);
+    defer posix.close(other[1]);
+    const victim_peer = if (other[0] == pair[0]) other[1] else other[0];
+    _ = try posix.write(victim_peer, "VICTIM-STANZA");
+    c.close(&list); // the late second close
+    list.service();
+    var buf: [256]u8 = undefined;
+    const wrote = posix.read(victim_peer, &buf) catch 0;
+    const left = posix.read(pair[0], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), wrote);
+    try std.testing.expectEqual(@as(usize, "VICTIM-STANZA".len), left);
 }
 
 test "Conn: a require-policy failure closes through ConnList and frees the SSL" {
