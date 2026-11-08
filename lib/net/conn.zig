@@ -2063,6 +2063,9 @@ test "Conn: a second batched event on a closing conn is skipped" {
     const parts = [_][]const u8{"x"};
     var list: ConnList = .{};
     _ = c.send(&list, &parts);
+    // send only links the conn now (M1); arm write explicitly so the
+    // batch really carries the second event this test exists for.
+    try loop.setInterest(c.handle, .{ .read = true, .write = true });
     _ = try posix.write(pair[1], "last");
     posix.shutdown(pair[1], .both) catch {};
 
@@ -2073,6 +2076,7 @@ test "Conn: a second batched event on a closing conn is skipped" {
         outcomes[n] = c.onEvent(ev, &list);
         n += 1;
     }
+    try std.testing.expect(n >= 2);
     // The first event that reached the conn closed it; every later
     // event in the batch must be absorbed, never driven to I/O.
     var saw_closed = false;
