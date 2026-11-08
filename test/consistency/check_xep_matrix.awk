@@ -31,7 +31,6 @@ BEGIN {
     known["urn:xmpp:blocking"]=1;                      xep["urn:xmpp:blocking"]="XEP-0191"
     known["urn:xmpp:sm:3"]=1;                          xep["urn:xmpp:sm:3"]="XEP-0198"
     known["http://jabber.org/protocol/pubsub#publish"]=1;         xep["http://jabber.org/protocol/pubsub#publish"]="XEP-0163"
-    known["http://jabber.org/protocol/pubsub#subscribe"]=1;       xep["http://jabber.org/protocol/pubsub#subscribe"]="XEP-0163"
     known["http://jabber.org/protocol/pubsub#auto-subscribe"]=1;  xep["http://jabber.org/protocol/pubsub#auto-subscribe"]="XEP-0163"
     known["http://jabber.org/protocol/pubsub#auto-create"]=1;     xep["http://jabber.org/protocol/pubsub#auto-create"]="XEP-0163"
     known["http://jabber.org/protocol/pubsub#persistent-items"]=1; xep["http://jabber.org/protocol/pubsub#persistent-items"]="XEP-0163"
