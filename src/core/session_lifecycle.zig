@@ -676,13 +676,14 @@ comptime {
 /// XEP-0203: insert a <delay/> as a direct child of a stored stanza's root
 /// element, written in the same pass as the stanza (no second parse, no
 /// allocation). `stamp` is the pointer's queue time in XEP-0082 form.
-/// Returns the wire bytes: a slice of `buf` when stamped, or `stanza`
-/// unchanged when it already carries a delay with our `from` (a re-stored
-/// or redelivered copy is never stamped twice) or when it has no writable
-/// root element. error.BufferTooSmall when the stamped copy exceeds `buf`.
+/// Existing top-level <delay/> elements carrying our `from` are stripped
+/// first: senders can forge that attribute, so the copy that ships always
+/// carries the real queue time. Delays nested inside payloads and stamps
+/// from other domains are preserved.
+/// Returns the wire bytes: a slice of `buf`, or `stanza` unchanged when it
+/// has no writable root element. error.BufferTooSmall when the stamped
+/// copy exceeds `buf`.
 fn stampOfflineDelay(stanza: []const u8, domain: []const u8, stamp: []const u8, buf: []u8) error{BufferTooSmall}![]const u8 {
-    if (hasDelayFrom(stanza, domain)) return stanza;
-
     // Malformed input goes back unstamped, never dropped.
     if (stanza.len < 3 or stanza[0] != '<' or !std.ascii.isAlphabetic(stanza[1])) return stanza;
     const gt_idx = quoteAwareTagEnd(stanza, 0) orelse return stanza;
@@ -703,8 +704,21 @@ fn stampOfflineDelay(stanza: []const u8, domain: []const u8, stamp: []const u8, 
         w.writeAll("</") catch return error.BufferTooSmall;
         w.writeAll(stanza[1..name_end]) catch return error.BufferTooSmall;
         w.writeByte('>') catch return error.BufferTooSmall;
+        w.writeAll(stanza[gt_idx + 1 ..]) catch return error.BufferTooSmall;
+    } else {
+        // Copy the children, dropping top-level <delay/> elements stamped
+        // with our domain; everything else, including the text between
+        // children, goes out verbatim.
+        var it = RootChildIter.init(stanza, gt_idx + 1);
+        var cursor = gt_idx + 1;
+        while (it.next()) |child| {
+            if (isDelayFrom(stanza, child, domain)) {
+                w.writeAll(stanza[cursor..child.start]) catch return error.BufferTooSmall;
+                cursor = child.end;
+            }
+        }
+        w.writeAll(stanza[cursor..]) catch return error.BufferTooSmall;
     }
-    w.writeAll(stanza[gt_idx + 1 ..]) catch return error.BufferTooSmall;
     return fbs.getWritten();
 }
 
@@ -862,14 +876,6 @@ const RootChildIter = struct {
     }
 };
 
-/// Index one past the '>' closing the stanza's root open tag, quote-aware.
-/// null when the stanza has no well-formed root open tag.
-fn rootOpenEnd(stanza: []const u8) ?usize {
-    if (stanza.len < 3 or stanza[0] != '<' or !std.ascii.isAlphabetic(stanza[1])) return null;
-    const gt = quoteAwareTagEnd(stanza, 0) orelse return null;
-    return gt + 1;
-}
-
 /// The local part of a qualified element name (text after any prefix ':').
 fn localName(qname: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, qname, ':')) |i| return qname[i + 1 ..];
@@ -908,19 +914,6 @@ fn isDelayFrom(s: []const u8, child: RootChild, domain: []const u8) bool {
     const tag = s[child.start..child.open_end];
     if (std.mem.indexOf(u8, tag, xml.ns.delay) == null) return false;
     return tagFromEquals(tag, domain);
-}
-
-/// Whether a direct child of the stanza's root already carries a
-/// <delay xmlns='urn:xmpp:delay'> element whose from is `domain`. Delays
-/// nested inside payloads (a forwarded stanza, a comment) do not count:
-/// only a top-level stamp can stand in for ours.
-fn hasDelayFrom(stanza: []const u8, domain: []const u8) bool {
-    const open_end = rootOpenEnd(stanza) orelse return false;
-    var it = RootChildIter.init(stanza, open_end);
-    while (it.next()) |child| {
-        if (isDelayFrom(stanza, child, domain)) return true;
-    }
-    return false;
 }
 
 fn isStanzaNameChar(c: u8) bool {
@@ -2155,7 +2148,7 @@ test "S35: a foreign delay stamp is kept and ours is added once" {
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "from='localhost'"));
 }
 
-test "S35: a stanza already stamped by us is not stamped twice" {
+test "S35: a stale stamp of ours is replaced by the queue time" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2188,7 +2181,8 @@ test "S35: a stanza already stamped by us is not stamped twice" {
         destroySession(&server, 1, session, &changes);
     }
 
-    // A re-stored copy (e.g. a resent message) already carries our stamp.
+    // A re-stored copy (e.g. a resent message) already carries our stamp;
+    // the shipped copy gets the current queue time, not the stored one.
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><delay xmlns='urn:xmpp:delay' from='localhost' stamp='1999-12-31T23:59:59Z'/><body>held</body></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
@@ -2197,8 +2191,58 @@ test "S35: a stanza already stamped by us is not stamped twice" {
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
-    try std.testing.expect(std.mem.indexOf(u8, wire, "1999-12-31T23:59:59Z") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wire, "1970-01-01T00:16:40Z") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "1970-01-01T00:16:40Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "1999-12-31T23:59:59Z") == null);
+}
+
+test "S35: a forged top-level delay from our domain is stripped" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
+    server.sessions[1] = session;
+    defer {
+        session.sm_resume_enabled = false;
+        destroySession(&server, 1, session, &changes);
+    }
+
+    // The stored bytes carry two delays claiming our domain, one in each
+    // form; both are forged (held bytes are never stamped at store time),
+    // so the wire copy must carry only the real queue-time stamp.
+    const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>backdated</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2002-02-02T00:00:00Z'></delay></message>";
+    _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
+
+    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+
+    var buf: [2048]u8 = undefined;
+    const wire = readSent(fds, session, &buf);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(wire, "urn:xmpp:delay"));
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<delay xmlns='urn:xmpp:delay' from='localhost' stamp='1970-01-01T00:16:40Z'/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "2001-01-01") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "2002-02-02") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "<body>backdated</body>") != null);
 }
 
 test "S35: SM replay resends the stamped stanza unchanged" {
@@ -2355,10 +2399,12 @@ test "S35: stampOfflineDelay covers self-closing roots and quoted '>'" {
     try std.testing.expect(std.mem.indexOf(u8, stamped, "to='a>b@x' from='s@x'><delay ") != null);
     try std.testing.expect(std.mem.endsWith(u8, stamped, "<body>hi</body></message>"));
 
-    // Already ours: returned unchanged.
+    // Already ours: the stale stamp is replaced by the new queue time.
     var buf2: [1024]u8 = undefined;
-    const again = try stampOfflineDelay(stamped, "x.test", stamp, &buf2);
-    try std.testing.expectEqualStrings(stamped, again);
+    const again = try stampOfflineDelay(stamped, "x.test", "2099-12-31T00:00:00Z", &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, again, "stamp='2099-12-31T00:00:00Z'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "2026-01-01") == null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(again, "urn:xmpp:delay"));
 
     // A buffer too small reports the error instead of truncating.
     var tiny: [8]u8 = undefined;
@@ -2382,10 +2428,14 @@ test "S35: a delay nested in a forwarded payload does not suppress the stamp" {
     const fwd = std.mem.indexOf(u8, stamped, "<forwarded").?;
     try std.testing.expect(ours < fwd);
 
-    // A depth-1 delay of ours still suppresses a second stamp.
+    // Re-stamping replaces our top-level stamp; the nested one is depth 2
+    // and untouched.
     var buf2: [4096]u8 = undefined;
     const again = try stampOfflineDelay(stamped, "x.test", "2099-01-01T00:00:00Z", &buf2);
-    try std.testing.expectEqualStrings(stamped, again);
+    try std.testing.expect(std.mem.indexOf(u8, again, "stamp='2099-01-01T00:00:00Z'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "stamp='2001-01-01T00:00:00Z'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "2026-11-07") == null);
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(again, "urn:xmpp:delay"));
 
     // A delay inside a comment or CDATA is markup, not a child element.
     const commented = "<message><body>x</body><!-- <delay xmlns='urn:xmpp:delay' from='x.test' stamp='1999-01-01T00:00:00Z'/> --></message>";
