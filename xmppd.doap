@@ -140,7 +140,7 @@
       <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0160.html"/>
         <xmpp:status>complete</xmpp:status>
-        <xmpp:note xml:lang="en">Store-and-forward while offline, delivered on next login with an XEP-0203 delay stamp (queue time, server domain as from) per XEP-0160 section 3.</xmpp:note>
+        <xmpp:note xml:lang="en">Store-and-forward while offline, delivered on next login with an XEP-0203 delay stamp (queue time, server domain as from) per XEP-0160 section 2.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

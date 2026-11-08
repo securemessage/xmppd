@@ -560,11 +560,11 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 delivered += 1;
                 continue;
             }
-            // XEP-0203 (XEP-0160 section 3): stamp the queue time so the
+            // XEP-0203 (XEP-0160 section 2): stamp the queue time so the
             // client renders when the message was stored, not when it
             // arrived. Only the wire copy is stamped; the held bytes are
             // never modified. SM replay resends these exact bytes and a
-            // stanza that already carries our delay goes out as stored,
+            // stored delay claiming our domain is replaced, not kept,
             // so the stamp is never duplicated.
             var wire: []const u8 = xml_data;
             var delay_buf: [64]u8 = undefined;
