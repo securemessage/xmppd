@@ -540,8 +540,9 @@ pub const Outcome = union(enum) {
     /// Handshake completed: `.handshake` -> `.established`; the kTLS
     /// token was recorded.
     handshake_done,
-    /// The conn is on the closing list; the consumer frees it in the
-    /// end-of-iteration walk.
+    /// The conn is on the closing list; the walk tears it down and
+    /// `ConnList.popClosed` hands it back for the free. A `.closed`
+    /// outcome alone is never a license to free: the fd is still open.
     closed: CloseReason,
 };
 
@@ -645,6 +646,10 @@ pub const Conn = struct {
     /// read event); the next readable event links the conn so the walk
     /// retries the flush.
     flush_want_read: bool = false,
+    /// Why the conn moved to `.closing`; the consumer reads it through
+    /// `ConnList.popClosed`. The first close wins so a late `close`
+    /// cannot overwrite the real cause.
+    close_reason: ?CloseReason = null,
 
     /// Adopt `fd` (accepted or connect()ed): asserts SO_NOSIGPIPE so
     /// outbound s2s fds are covered the same as accepted ones, and
@@ -731,8 +736,9 @@ pub const Conn = struct {
         if (c.read_suppressed != was) c.interest(true, c.want_write);
     }
 
-    fn markClosing(c: *Conn, list: *ConnList) void {
+    fn markClosing(c: *Conn, list: *ConnList, reason: CloseReason) void {
         c.state = .closing;
+        if (c.close_reason == null) c.close_reason = reason;
         list.link(c);
     }
 
@@ -748,7 +754,7 @@ pub const Conn = struct {
             // The loop marked the handle broken: its kevent changes can
             // no longer reach the kernel, so the conn cannot be driven.
             .change_failed => {
-                c.markClosing(list);
+                c.markClosing(list, .{ .err = error.ChangeFailed });
                 return .{ .closed = .{ .err = error.ChangeFailed } };
             },
             else => .none,
@@ -792,11 +798,11 @@ pub const Conn = struct {
                 return .readable;
             },
             .eof => {
-                c.markClosing(list);
+                c.markClosing(list, .eof);
                 return .{ .closed = .eof };
             },
             .err => |e| {
-                c.markClosing(list);
+                c.markClosing(list, .{ .err = e });
                 return .{ .closed = .{ .err = e } };
             },
         };
@@ -830,7 +836,7 @@ pub const Conn = struct {
                 return .none;
             },
             .err => |e| {
-                c.markClosing(list);
+                c.markClosing(list, .{ .err = e });
                 return .{ .closed = .{ .err = e } };
             },
         }
@@ -865,7 +871,7 @@ pub const Conn = struct {
                 return .none;
             },
             .err => |e| {
-                c.markClosing(list);
+                c.markClosing(list, .{ .err = e });
                 return .{ .closed = .{ .err = e } };
             },
         }
@@ -897,6 +903,7 @@ pub const Conn = struct {
         });
         if (c.opts.ktls == .require and token != .ktls) {
             c.state = .closing;
+            if (c.close_reason == null) c.close_reason = .{ .err = error.KtlsRequired };
             return;
         }
         c.transport = .{ .tls = &c.tls_storage };
@@ -954,10 +961,11 @@ pub const Conn = struct {
     }
 
     /// Consumer-initiated close: marks `.closing` and links the conn on
-    /// the ConnList; the fd close and the consumer's free happen in the
-    /// end-of-iteration walk, after every batched event ran.
+    /// the ConnList; the fd close runs in the end-of-iteration walk,
+    /// after every batched event ran, and the walk hands the conn back
+    /// through `popClosed` for the consumer's free.
     pub fn close(c: *Conn, list: *ConnList) void {
-        c.markClosing(list);
+        c.markClosing(list, .consumer);
     }
 
     /// Mark `n` inbox bytes parsed (the only supported consume path).
@@ -1010,7 +1018,7 @@ pub const Conn = struct {
                 return .none;
             },
             .failed_closed => {
-                c.markClosing(list);
+                c.markClosing(list, .outbox_full);
                 return .{ .closed = .outbox_full };
             },
         };
@@ -1021,11 +1029,18 @@ pub const Conn = struct {
 /// order-preserving). The consumer walks it at end-of-iteration for
 /// outbox flushes, inbox-budget re-drives and deferred closes; the
 /// walk is what makes the ADR-2 end-of-iteration flush rule
-/// mechanical.
+/// mechanical. Conns the walk tears down move to the closed list and
+/// the consumer drains them through `popClosed` to deinit and free:
+/// a `.closed` Outcome only reports the close, it is never a signal
+/// to free (the fd is still open at that point).
 pub const ConnList = struct {
     head: ?*Conn = null,
     tail: ?*Conn = null,
     count: usize = 0,
+    /// Torn-down conns wait here for the consumer's free; reuses the
+    /// dirty links (a torn-down conn is never dirty again).
+    closed_head: ?*Conn = null,
+    closed_tail: ?*Conn = null,
 
     /// Append `c` if it is not linked already (idempotent).
     pub fn link(l: *ConnList, c: *Conn) void {
@@ -1060,17 +1075,39 @@ pub const ConnList = struct {
         return l.head == null;
     }
 
+    fn pushClosed(l: *ConnList, c: *Conn) void {
+        c.dirty_next = null;
+        c.dirty_prev = l.closed_tail;
+        if (l.closed_tail) |t| t.dirty_next = c else l.closed_head = c;
+        l.closed_tail = c;
+    }
+
+    /// Next conn `service` tore down, in teardown order, or null. The
+    /// consumer drains this after `wait()`: a conn on this list has its
+    /// fd closed and its reason in `close_reason`, and is now safe to
+    /// deinit and free.
+    pub fn popClosed(l: *ConnList) ?*Conn {
+        const c = l.closed_head orelse return null;
+        l.closed_head = c.dirty_next;
+        if (l.closed_head == null) l.closed_tail = null;
+        c.dirty_next = null;
+        c.dirty_prev = null;
+        return c;
+    }
+
     /// The end-of-iteration walk (ADR-2): tear down closing conns,
     /// flush dirty outboxes (the flush `send` defers to), and turn
     /// deferred work flags into `Loop.requeue` calls so each conn is
     /// re-driven once on the next pass. Bounded by membership: a conn
-    /// links at most once and `pop` unlinks it. A StaleHandle requeue
+    /// links at most once and `pop` unlinks it. Torn-down conns move
+    /// to the closed list for `popClosed`. A StaleHandle requeue
     /// means the fd was released to a handshake driver and cannot be
     /// driven anyway; it is counted, not swallowed.
     pub fn service(l: *ConnList) void {
         while (l.pop()) |c| {
             if (c.state == .closing) {
                 c.teardown();
+                l.pushClosed(c);
                 continue;
             }
             // Mid-upgrade the transport is still plain: queued bytes
@@ -1084,9 +1121,11 @@ pub const ConnList = struct {
                         c.interest(true, c.want_write);
                     },
                     .budget_left => c.requeue_write = true,
-                    .err => {
+                    .err => |e| {
                         c.state = .closing;
+                        if (c.close_reason == null) c.close_reason = .{ .err = e };
                         c.teardown();
+                        l.pushClosed(c);
                         continue;
                     },
                 }
@@ -2919,6 +2958,56 @@ test "ConnList: service re-drives a budget-stopped read once per pass" {
     try std.testing.expectEqual(passes - 1, loop.stats().synthetic_events - syn0);
     c.state = .closing;
     c.teardown();
+}
+
+test "ConnList: a flush error inside service reaches the consumer through popClosed" {
+    const alloc = std.testing.allocator;
+    var list: ConnList = .{};
+    var loop: Loop = undefined;
+    try loop.init(alloc, &.{
+        .handles_max = 8,
+        .timers_max = 4,
+        .on_flush = list.flushHook(),
+    });
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+
+    // The peer is gone: the flush the walk runs inside wait() fails
+    // before any eof event can be dispatched, and the teardown drops
+    // the handle so no event can ever report the close. popClosed is
+    // the only channel left for the consumer.
+    posix.close(pair[1]);
+    const parts = [_][]const u8{"<message/>"};
+    try std.testing.expect(c.send(&list, &parts) == .none);
+    var notified = false;
+    var passes: usize = 0;
+    while (passes < 3 and !notified) : (passes += 1) {
+        _ = try loop.scheduleIn(5, mkConnCtx(9));
+        try loop.wait();
+        while (loop.next()) |ev| switch (ev) {
+            .readable, .writable => |io| {
+                if (io.ctx.eql(mkConnCtx(1))) {
+                    if (c.onEvent(ev, &list) == .closed) notified = true;
+                }
+            },
+            .change_failed => if (c.onEvent(ev, &list) == .closed) {
+                notified = true;
+            },
+            else => {},
+        };
+        while (list.popClosed()) |p| {
+            if (p == &c) notified = true;
+        }
+    }
+    try std.testing.expect(notified);
+    try std.testing.expectEqual(State.closing, c.state);
+    const reason = c.close_reason orelse return error.NoCloseReason;
+    try std.testing.expect(reason == .err);
 }
 
 test "ConnList: a drained flush re-drives the stalled read through service" {
