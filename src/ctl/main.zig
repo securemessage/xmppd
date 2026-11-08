@@ -118,6 +118,17 @@ pub fn main() !void {
 
     const command = remaining_args.items[0];
 
+    const is_db_write = std.mem.eql(u8, command, "adduser") or
+        std.mem.eql(u8, command, "deluser") or
+        std.mem.eql(u8, command, "passwd") or
+        std.mem.eql(u8, command, "lock") or
+        std.mem.eql(u8, command, "unlock") or
+        std.mem.eql(u8, command, "invite");
+    if (is_db_write and try migrate_precis.recoveryPending(allocator, db_path)) {
+        printErr("a migrate-precis recovery is pending; finish it with 'xmppctl migrate-precis --apply' before any other write\n");
+        return error.RecoveryPending;
+    }
+
     if (std.mem.eql(u8, command, "migrate-precis")) {
         const forced: ?migrate_precis.ForcedRename = if (rename_old != null and rename_new != null)
             .{ .old_localpart = rename_old.?, .new_localpart = rename_new.? }
