@@ -26,6 +26,8 @@ const SslConn = ssl_mod.SslConn;
 const SslContext = ssl_mod.SslContext;
 const session_mod = @import("session.zig");
 const TlsState = session_mod.TlsState;
+const dns_async = @import("dns_async");
+const dns_mod = @import("dns");
 
 /// Outbound connection establishment state.
 pub const OutboundState = enum {
@@ -165,6 +167,20 @@ pub const OutboundConnection = struct {
     /// buffer across WANT_READ/WANT_WRITE (AGENTS.md identical pointer and
     /// length rule), so bytes queued after the stall wait behind it (S23).
     pinned_tls_len: usize = 0,
+    /// Connect targets from the last completed resolution, in RFC 2782
+    /// try order (AAAA then A per SRV target). The conn owns every slice;
+    /// empty until a resolution arrives.
+    targets: []dns_async.Target = &.{},
+    /// Index of the target the live or in-flight connect is bound to.
+    target_idx: usize = 0,
+    /// Next untried target; advances on connect failure or deadline.
+    next_idx: usize = 0,
+    /// Socket address of the current target (IP:port already resolved).
+    target_addr: std.net.Address = undefined,
+    /// Resolver session_key while a resolve is in flight; 0 when none.
+    dns_key: usize = 0,
+    /// Ident of the armed per-target connect deadline; 0 when none.
+    deadline_ident: usize = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
@@ -207,6 +223,35 @@ pub const OutboundConnection = struct {
             posix.close(self.fd);
             self.fd = -1;
         }
+        self.dropTargets();
+    }
+
+    /// The target the live or in-flight connect is bound to: addr, host,
+    /// TLSA records and tlsa_status for that target alone. Null before the
+    /// first resolution completes; the TLSA result is the seam consumed by
+    /// the outbound DANE check (X2b, ADR-13).
+    pub fn curTarget(self: *const OutboundConnection) ?*const dns_async.Target {
+        if (self.target_idx >= self.targets.len) return null;
+        return &self.targets[self.target_idx];
+    }
+
+    /// Take ownership of a resolution's target list for this connection.
+    pub fn adoptTargets(self: *OutboundConnection, targets: []dns_async.Target) void {
+        self.dropTargets();
+        self.targets = targets;
+        self.target_idx = 0;
+        self.next_idx = 0;
+    }
+
+    /// Free every adopted target and the list itself.
+    pub fn dropTargets(self: *OutboundConnection) void {
+        for (self.targets) |t| {
+            self.alloc.free(t.host);
+            for (t.tlsa) |r| self.alloc.free(r.association_data);
+            if (t.tlsa.len > 0) self.alloc.free(t.tlsa);
+        }
+        if (self.targets.len > 0) self.alloc.free(self.targets);
+        self.targets = &.{};
     }
 
     /// Whether TLS handshake is in progress.

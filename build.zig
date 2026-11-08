@@ -929,6 +929,8 @@ pub fn build(b: *std.Build) void {
     });
     s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
     s2s_connector_test_mod.addImport("xml", xml_mod);
+    s2s_connector_test_mod.addImport("dns", dns_mod);
+    s2s_connector_test_mod.addImport("dns_async", dns_async_mod);
     s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
     s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1020,7 +1022,8 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("event_loop", s2s_event_loop_mod);
     s2s_main_test_mod.addImport("xml", xml_mod);
     s2s_main_test_mod.addImport("ssl", ssl_test_mod);
-    s2s_main_test_mod.addImport("dns", dns_test_mod);
+    s2s_main_test_mod.addImport("dns", dns_mod);
+    s2s_main_test_mod.addImport("dns_async", dns_async_mod);
     s2s_main_test_mod.linkSystemLibrary("ssl", .{});
     s2s_main_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1761,7 +1764,8 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("event_loop", s2s_event_loop_exe_mod);
     s2s_main_mod.addImport("xml", xml_mod);
     s2s_main_mod.addImport("ssl", ssl_test_mod);
-    s2s_main_mod.addImport("dns", dns_test_mod);
+    s2s_main_mod.addImport("dns", dns_mod);
+    s2s_main_mod.addImport("dns_async", dns_async_mod);
     s2s_main_mod.addImport("xmppd_log", xmppd_log_mod);
     s2s_main_mod.linkSystemLibrary("ssl", .{});
     s2s_main_mod.linkSystemLibrary("crypto", .{});
