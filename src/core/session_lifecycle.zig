@@ -683,24 +683,9 @@ comptime {
 fn stampOfflineDelay(stanza: []const u8, domain: []const u8, stamp: []const u8, buf: []u8) error{BufferTooSmall}![]const u8 {
     if (hasDelayFrom(stanza, domain)) return stanza;
 
-    // End of the root element's open tag, quote-aware: an attribute value
-    // may contain '>'. Malformed input goes back unstamped, never dropped.
+    // Malformed input goes back unstamped, never dropped.
     if (stanza.len < 3 or stanza[0] != '<' or !std.ascii.isAlphabetic(stanza[1])) return stanza;
-    var gt: ?usize = null;
-    var in_quote: u8 = 0;
-    var i: usize = 1;
-    while (i < stanza.len) : (i += 1) {
-        const c = stanza[i];
-        if (in_quote != 0) {
-            if (c == in_quote) in_quote = 0;
-        } else if (c == '\'' or c == '"') {
-            in_quote = c;
-        } else if (c == '>') {
-            gt = i;
-            break;
-        }
-    }
-    const gt_idx = gt orelse return stanza;
+    const gt_idx = quoteAwareTagEnd(stanza, 0) orelse return stanza;
     const self_closing = stanza[gt_idx - 1] == '/';
     var name_end: usize = 1;
     while (name_end < stanza.len and isStanzaNameChar(stanza[name_end])) : (name_end += 1) {}
@@ -723,29 +708,217 @@ fn stampOfflineDelay(stanza: []const u8, domain: []const u8, stamp: []const u8, 
     return fbs.getWritten();
 }
 
-/// Whether the stanza already carries a <delay xmlns='urn:xmpp:delay'>
-/// element whose from is `domain`. Both attribute quote forms match.
-fn hasDelayFrom(stanza: []const u8, domain: []const u8) bool {
-    var sq_buf: [280]u8 = undefined;
-    const sq_from = std.fmt.bufPrint(&sq_buf, "from='{s}'", .{domain}) catch return false;
-    var dq_buf: [280]u8 = undefined;
-    const dq_from = std.fmt.bufPrint(&dq_buf, "from=\"{s}\"", .{domain}) catch return false;
+/// Index of the '>' closing the tag that starts at `lt` (`s[lt] == '<'`),
+/// skipping over quoted attribute values so a '>' inside one does not end
+/// the tag early. null when the tag never closes.
+fn quoteAwareTagEnd(s: []const u8, lt: usize) ?usize {
+    var in_quote: u8 = 0;
+    var i = lt + 1;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_quote != 0) {
+            if (c == in_quote) in_quote = 0;
+        } else if (c == '\'' or c == '"') {
+            in_quote = c;
+        } else if (c == '>') {
+            return i;
+        }
+    }
+    return null;
+}
 
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, stanza, pos, "<delay")) |idx| {
-        const boundary = if (idx + "<delay".len < stanza.len) stanza[idx + "<delay".len] else ' ';
-        if (boundary == ' ' or boundary == '\t' or boundary == '/' or boundary == '>') {
-            const gt = std.mem.indexOfScalarPos(u8, stanza, idx, '>') orelse return false;
-            const tag = stanza[idx..gt];
-            if (std.mem.indexOf(u8, tag, xml.ns.delay) != null and
-                (std.mem.indexOf(u8, tag, sq_from) != null or std.mem.indexOf(u8, tag, dq_from) != null))
-            {
-                return true;
-            }
+/// Index one past the `<!...` construct starting at `lt`: a comment
+/// `<!-- ... -->`, a CDATA section `<![CDATA[ ... ]]>`, or any other
+/// `<!...>` declaration. null when unterminated.
+fn skipBangConstruct(s: []const u8, lt: usize) ?usize {
+    if (std.mem.startsWith(u8, s[lt..], "<!--")) {
+        const e = std.mem.indexOfPos(u8, s, lt + 4, "-->") orelse return null;
+        return e + 3;
+    }
+    if (std.mem.startsWith(u8, s[lt..], "<![CDATA[")) {
+        const e = std.mem.indexOfPos(u8, s, lt + 9, "]]>") orelse return null;
+        return e + 3;
+    }
+    const gt = std.mem.indexOfScalarPos(u8, s, lt, '>') orelse return null;
+    return gt + 1;
+}
+
+/// Index one past the matching close tag of an element whose open tag ends
+/// at `content_start`. The same skip rules as the root-child scan apply so
+/// markup inside comments, CDATA or PIs cannot fake depth. s.len when the
+/// element never closes.
+fn elementEnd(s: []const u8, content_start: usize) usize {
+    var depth: usize = 1;
+    var pos = content_start;
+    while (pos < s.len) {
+        const lt = std.mem.indexOfScalarPos(u8, s, pos, '<') orelse return s.len;
+        if (lt + 1 >= s.len) return s.len;
+        const c = s[lt + 1];
+        if (c == '/') {
+            const gt = std.mem.indexOfScalarPos(u8, s, lt, '>') orelse return s.len;
+            depth -= 1;
+            pos = gt + 1;
+            if (depth == 0) return pos;
+        } else if (c == '!') {
+            pos = skipBangConstruct(s, lt) orelse return s.len;
+        } else if (c == '?') {
+            const e = std.mem.indexOfPos(u8, s, lt, "?>") orelse return s.len;
+            pos = e + 2;
+        } else if (std.ascii.isAlphabetic(c)) {
+            const gt = quoteAwareTagEnd(s, lt) orelse return s.len;
+            if (s[gt - 1] != '/') depth += 1;
             pos = gt + 1;
         } else {
-            pos = idx + 1;
+            pos = lt + 1;
         }
+    }
+    return s.len;
+}
+
+/// One direct child element of a stanza's root.
+const RootChild = struct {
+    /// Qualified name as written (may carry a prefix).
+    name: []const u8,
+    /// Index of the child's '<'.
+    start: usize,
+    /// Index one past the open tag's '>'; attributes live in
+    /// s[start..open_end].
+    open_end: usize,
+    /// Index one past the child's close tag (or its own self-closing tag).
+    end: usize,
+};
+
+/// Yields each direct child element of a stanza's root in order.
+/// Comments, CDATA sections and processing instructions are skipped, so
+/// markup inside them is never read as a child.
+const RootChildIter = struct {
+    s: []const u8,
+    pos: usize,
+    depth: usize = 1,
+    done: bool = false,
+
+    /// `open_end` is the index just past the root open tag's '>'.
+    fn init(s: []const u8, open_end: usize) RootChildIter {
+        // A self-closing or truncated root has no children.
+        const done = open_end < 2 or open_end >= s.len or s[open_end - 2] == '/';
+        return .{ .s = s, .pos = open_end, .done = done };
+    }
+
+    fn next(self: *RootChildIter) ?RootChild {
+        while (!self.done) {
+            const lt = std.mem.indexOfScalarPos(u8, self.s, self.pos, '<') orelse {
+                self.done = true;
+                return null;
+            };
+            if (lt + 1 >= self.s.len) {
+                self.done = true;
+                return null;
+            }
+            const c = self.s[lt + 1];
+            if (c == '/') {
+                const gt = std.mem.indexOfScalarPos(u8, self.s, lt, '>') orelse {
+                    self.done = true;
+                    return null;
+                };
+                self.depth -= 1;
+                self.pos = gt + 1;
+                if (self.depth == 0) self.done = true;
+            } else if (c == '!') {
+                self.pos = skipBangConstruct(self.s, lt) orelse {
+                    self.done = true;
+                    return null;
+                };
+            } else if (c == '?') {
+                const e = std.mem.indexOfPos(u8, self.s, lt, "?>") orelse {
+                    self.done = true;
+                    return null;
+                };
+                self.pos = e + 2;
+            } else if (std.ascii.isAlphabetic(c)) {
+                const gt = quoteAwareTagEnd(self.s, lt) orelse {
+                    self.done = true;
+                    return null;
+                };
+                const self_closing = self.s[gt - 1] == '/';
+                var name_end = lt + 1;
+                while (name_end < gt and isStanzaNameChar(self.s[name_end])) : (name_end += 1) {}
+                if (self.depth == 1) {
+                    const child: RootChild = .{
+                        .name = self.s[lt + 1 .. name_end],
+                        .start = lt,
+                        .open_end = gt + 1,
+                        .end = if (self_closing) gt + 1 else elementEnd(self.s, gt + 1),
+                    };
+                    self.pos = child.end;
+                    return child;
+                }
+                if (!self_closing) self.depth += 1;
+                self.pos = gt + 1;
+            } else {
+                self.pos = lt + 1;
+            }
+        }
+        return null;
+    }
+};
+
+/// Index one past the '>' closing the stanza's root open tag, quote-aware.
+/// null when the stanza has no well-formed root open tag.
+fn rootOpenEnd(stanza: []const u8) ?usize {
+    if (stanza.len < 3 or stanza[0] != '<' or !std.ascii.isAlphabetic(stanza[1])) return null;
+    const gt = quoteAwareTagEnd(stanza, 0) orelse return null;
+    return gt + 1;
+}
+
+/// The local part of a qualified element name (text after any prefix ':').
+fn localName(qname: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, qname, ':')) |i| return qname[i + 1 ..];
+    return qname;
+}
+
+/// Whether `tag` (an open tag's text, starting at '<') carries a `from`
+/// attribute whose quoted value is exactly `domain`. The leading '<' makes
+/// the attribute-name boundary check safe, so xfrom= never matches.
+fn tagFromEquals(tag: []const u8, domain: []const u8) bool {
+    var pos: usize = 1;
+    while (std.mem.indexOfPos(u8, tag, pos, "from=")) |i| {
+        if (!std.ascii.isWhitespace(tag[i - 1])) {
+            pos = i + 1;
+            continue;
+        }
+        const q = i + "from=".len;
+        if (q >= tag.len) return false;
+        const quote = tag[q];
+        if (quote != '\'' and quote != '"') {
+            pos = i + 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u8, tag, q + 1, quote) orelse return false;
+        if (std.mem.eql(u8, tag[q + 1 .. end], domain)) return true;
+        pos = end + 1;
+    }
+    return false;
+}
+
+/// Whether `child` is a <delay xmlns='urn:xmpp:delay'> stamped by `domain`.
+/// A prefixed element name still matches; the namespace check stays a
+/// substring scan so both xmlns= and xmlns:p= declarations count.
+fn isDelayFrom(s: []const u8, child: RootChild, domain: []const u8) bool {
+    if (!std.mem.eql(u8, localName(child.name), "delay")) return false;
+    const tag = s[child.start..child.open_end];
+    if (std.mem.indexOf(u8, tag, xml.ns.delay) == null) return false;
+    return tagFromEquals(tag, domain);
+}
+
+/// Whether a direct child of the stanza's root already carries a
+/// <delay xmlns='urn:xmpp:delay'> element whose from is `domain`. Delays
+/// nested inside payloads (a forwarded stanza, a comment) do not count:
+/// only a top-level stamp can stand in for ours.
+fn hasDelayFrom(stanza: []const u8, domain: []const u8) bool {
+    const open_end = rootOpenEnd(stanza) orelse return false;
+    var it = RootChildIter.init(stanza, open_end);
+    while (it.next()) |child| {
+        if (isDelayFrom(stanza, child, domain)) return true;
     }
     return false;
 }
@@ -2190,6 +2363,34 @@ test "S35: stampOfflineDelay covers self-closing roots and quoted '>'" {
     // A buffer too small reports the error instead of truncating.
     var tiny: [8]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, stampOfflineDelay("<message><body/></message>", "x.test", stamp, &tiny));
+}
+
+test "S35: a delay nested in a forwarded payload does not suppress the stamp" {
+    var buf: [4096]u8 = undefined;
+    const stamp = "2026-11-07T00:00:00Z";
+
+    // XEP-0297: a forwarded stanza carries the original's delay inside the
+    // <forwarded> payload. It is not a stamp from us on this stanza, so the
+    // drain must still add one, and the nested copy rides along untouched.
+    const stanza = "<message from='alice@x' to='bob@x'><forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' from='x.test' stamp='2001-01-01T00:00:00Z'/><message from='alice@x' to='bob@x'><body>backdated</body></message></forwarded></message>";
+    const stamped = try stampOfflineDelay(stanza, "x.test", stamp, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "stamp='2026-11-07T00:00:00Z'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "stamp='2001-01-01T00:00:00Z'") != null);
+
+    // Ours lands as a direct child of the root, ahead of <forwarded>.
+    const ours = std.mem.indexOf(u8, stamped, "<delay xmlns='urn:xmpp:delay' from='x.test'").?;
+    const fwd = std.mem.indexOf(u8, stamped, "<forwarded").?;
+    try std.testing.expect(ours < fwd);
+
+    // A depth-1 delay of ours still suppresses a second stamp.
+    var buf2: [4096]u8 = undefined;
+    const again = try stampOfflineDelay(stamped, "x.test", "2099-01-01T00:00:00Z", &buf2);
+    try std.testing.expectEqualStrings(stamped, again);
+
+    // A delay inside a comment or CDATA is markup, not a child element.
+    const commented = "<message><body>x</body><!-- <delay xmlns='urn:xmpp:delay' from='x.test' stamp='1999-01-01T00:00:00Z'/> --></message>";
+    const restamped = try stampOfflineDelay(commented, "x.test", stamp, &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, restamped, stamp) != null);
 }
 
 test "S35: a stanza that only fits unstamped is sent without a stamp" {
