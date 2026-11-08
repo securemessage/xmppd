@@ -17,12 +17,18 @@ const S2sFeatureSet = stream_mod.S2sFeatureSet;
 const Role = stream_mod.Role;
 const connector_mod = @import("connector.zig");
 const DaneStatus = connector_mod.DaneStatus;
+const dns = @import("dns");
+const dns_async = @import("dns_async");
 const ssl = @import("ssl");
 const SslConn = ssl.SslConn;
 const SslContext = ssl.SslContext;
 const dialback_mod = @import("dialback.zig");
 
 const log = std.log.scoped(.s2s_session);
+
+/// Phase of the async inbound DANE chain (X2b): which record query the
+/// pending dane_key refers to.
+pub const InboundDanePhase = enum { none, srv_tls, srv_plain, tlsa };
 
 /// TLS handshake state for non-blocking integration with kqueue.
 pub const TlsState = enum {
@@ -111,6 +117,21 @@ pub const S2sSession = struct {
     /// it succeeds (executeAction .send_sasl_success).
     dane_domain_buf: [256]u8 = undefined,
     dane_domain_len: usize = 0,
+    /// Async inbound DANE lookup state (X2b): resolver session_key, the
+    /// chain phase it refers to, and whether the auth features wait on it.
+    dane_key: usize = 0,
+    dane_lookup_pending: bool = false,
+    dane_phase: InboundDanePhase = .none,
+    /// SRV target chosen for the TLSA owner name (empty = _5269 fallback
+    /// on the bare domain).
+    dane_target_buf: [256]u8 = undefined,
+    dane_target_len: usize = 0,
+    dane_target_port: u16 = 0,
+    /// TLSA outcome for this TLS stream (records + status per ADR-13):
+    /// the seam the handshake-side DANE check consumes. Records are owned
+    /// and freed at deinit; tlsa_status is authoritative over record count.
+    dane_tlsa_records: []dns.TlsaRecord = &.{},
+    dane_tlsa_status: dns_async.TlsaStatus = .absent,
     /// Whether a stream open was already processed; any later open on this
     /// socket is a restart (post-TLS, post-SASL, post-dialback).
     stream_open_seen: bool = false,
@@ -188,6 +209,41 @@ pub const S2sSession = struct {
     pub fn promoteDaneCandidate(self: *S2sSession) bool {
         if (self.dane_domain_len == 0) return true;
         return self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
+    }
+
+    /// The domain under DANE verification (the candidate).
+    pub fn daneDomain(self: *const S2sSession) []const u8 {
+        return self.dane_domain_buf[0..self.dane_domain_len];
+    }
+
+    /// Record the SRV target the TLSA owner name is built from; an empty
+    /// target selects the _5269 fallback on the bare domain.
+    pub fn setDaneTarget(self: *S2sSession, target: []const u8, port: u16) void {
+        const n = @min(target.len, self.dane_target_buf.len);
+        @memcpy(self.dane_target_buf[0..n], target[0..n]);
+        self.dane_target_len = n;
+        self.dane_target_port = port;
+    }
+
+    pub fn daneTarget(self: *const S2sSession) []const u8 {
+        return self.dane_target_buf[0..self.dane_target_len];
+    }
+
+    /// Move parsed TLSA records onto the session (the inbound DANE seam);
+    /// the caller's list storage is released but the record contents are
+    /// adopted. Frees any previously adopted set first.
+    pub fn adoptDaneTlsa(self: *S2sSession, recs: []dns.TlsaRecord, alloc: std.mem.Allocator) void {
+        self.dropDaneTlsa(alloc);
+        const owned = alloc.alloc(dns.TlsaRecord, recs.len) catch return;
+        @memcpy(owned, recs);
+        self.dane_tlsa_records = owned;
+    }
+
+    /// Free the adopted TLSA set.
+    pub fn dropDaneTlsa(self: *S2sSession, alloc: std.mem.Allocator) void {
+        for (self.dane_tlsa_records) |r| alloc.free(r.association_data);
+        if (self.dane_tlsa_records.len > 0) alloc.free(self.dane_tlsa_records);
+        self.dane_tlsa_records = &.{};
     }
 
     /// Whether a stream-restart from= is lawful: post-auth it must already

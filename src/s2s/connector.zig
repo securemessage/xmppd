@@ -121,7 +121,8 @@ pub const OutboundConnection = struct {
     stream: S2sStream,
     /// Socket file descriptor (-1 if not yet connected).
     fd: posix.fd_t = -1,
-    /// Target host we connected to (from SRV resolution).
+    /// Target host we connected to (borrowed from the adopted target
+    /// list; empty before the first connect attempt).
     target_host: []const u8 = "",
     /// Target port.
     target_port: u16 = 0,
@@ -210,10 +211,6 @@ pub const OutboundConnection = struct {
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
-        if (self.target_host.len > 0) {
-            allocator.free(self.target_host);
-            self.target_host = "";
-        }
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();
@@ -252,6 +249,15 @@ pub const OutboundConnection = struct {
         }
         if (self.targets.len > 0) self.alloc.free(self.targets);
         self.targets = &.{};
+        self.target_host = "";
+    }
+
+    /// Hostname of the current target, for logs and TLSA owner names.
+    /// Borrows from the adopted target list; "" before the first attempt.
+    pub fn targetHost(self: *const OutboundConnection) []const u8 {
+        if (self.target_host.len > 0) return self.target_host;
+        const t = self.curTarget() orelse return "";
+        return t.host;
     }
 
     /// Whether TLS handshake is in progress.
