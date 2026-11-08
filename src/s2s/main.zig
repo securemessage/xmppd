@@ -1408,6 +1408,10 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         daemon.closeInbound(batch, session.id);
         return;
     };
+    // Unreachable by construction: validateInboundAddress already required
+    // from= to name an authenticated remote domain, so preparation always
+    // passes it through and the pointers are equal. The guard stays in case
+    // that invariant ever weakens.
     if (prepared_from.ptr != from.ptr) @memcpy(session.stanza_from_buf[0..prepared_from.len], prepared_from);
     session.stanza_from_len = prepared_from.len;
 
@@ -5441,4 +5445,30 @@ test "S2sDaemon: db:verify for the MUC host is answered as that host" {
     var rbuf2: [1024]u8 = undefined;
     const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
+}
+
+test "F6: inbound S2S to= on the MUC host passes through unchanged" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.localhost";
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) return error.SocketPairFailed;
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{ .fd = ipc_fds[0], .alloc = alloc, .active = true };
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>");
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+    // A remote-domain to= is a passthrough: the prepared slice aliases the
+    // session buffer, so nothing may be copied over itself (M17 would panic
+    // in @memcpy).
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='Peer@remote.example' to='BigRoom@conference.localhost/Nick' type='groupchat'><body>hi</body></message>");
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("BigRoom@conference.localhost/Nick", msg.s2s_inbound.to_jid);
 }

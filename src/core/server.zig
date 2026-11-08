@@ -6432,6 +6432,87 @@ test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
     try std.testing.expect(std.mem.indexOf(u8, r, "id='q1'") != null);
 }
 
+test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='a@b@c' type='error' id='e1'><body>x</body></message>");
+    const r = f6Read(af[1], &buf);
+    // RFC 6120 8.3.1: an error stanza is never answered, even when its own
+    // address is malformed.
+    try std.testing.expectEqual(@as(usize, 0), r.len);
+}
+
+test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JID" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<presence to='@localhost' type='subscribe' id='pr1'></presence>");
+    const r = f6Read(af[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "<presence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "to='alice@localhost/mob'") != null);
+    // The reply's 'from' echoes the offending address.
+    try std.testing.expect(std.mem.indexOf(u8, r, "from='@localhost'") != null);
+}
+
+test "F6: a malformed 'from' gets jid-malformed" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message from='a@b@c' to='naplestb@localhost' type='chat' id='m3'/>");
+    const r = f6Read(af[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='m3'") != null);
+}
+
+test "F6: jid-malformed reply echoes the offending 'to' in its 'from'" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='a@b@c' type='chat' id='m15'/>");
+    const r = f6Read(af[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "jid-malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "from='a@b@c'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='m15'") != null);
+}
+
 test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized (T182)" {
     const allocator = std.testing.allocator;
     var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);

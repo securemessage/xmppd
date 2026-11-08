@@ -2608,3 +2608,50 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='rm-1'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "<count>1</count>") != null);
 }
+
+var f6_with_seen: [512]u8 = undefined;
+var f6_with_len: usize = 0;
+fn f6Drain(_: void, _: u32, _: u32, payload: []const u8) void {
+    const m = actor_message.decode(payload) orelse return;
+    switch (m) {
+        .room_mam_query => |q| {
+            @memcpy(f6_with_seen[0..q.with.len], q.with);
+            f6_with_len = q.with.len;
+        },
+        else => {},
+    }
+}
+
+test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var ds = try @import("delivery_queue").DeliverySystem.init(allocator, 2);
+    defer ds.deinit();
+    server.delivery_system = &ds;
+    var name_buf: [64]u8 = undefined;
+    var room_local: []const u8 = "";
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        room_local = try std.fmt.bufPrint(&name_buf, "r{d}", .{i});
+        var jb: [128]u8 = undefined;
+        const rj = try std.fmt.bufPrint(&jb, "{s}@conference.localhost", .{room_local});
+        if (room_registry_mod.roomOwner(rj, 2) == 1) break;
+    }
+    server.worker_id = 0;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.mam_with = "NaplesTB@LOCALHOST";
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucMamQuery(&server, session, room_local, "conference.localhost", "mamx", &changes);
+    _ = ds.getQueue(1).drain({}, f6Drain);
+    try std.testing.expectEqualStrings("naplestb@localhost", f6_with_seen[0..f6_with_len]);
+}
