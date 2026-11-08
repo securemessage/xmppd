@@ -269,6 +269,9 @@ pub const Session = struct {
     iq_child_name: []const u8 = "",
     /// PEP node name from <publish node='...'> or <items node='...'> (XEP-0163).
     iq_pep_node: []const u8 = "",
+    /// First pubsub-namespaced child of <pubsub> seen this IQ: the set verb
+    /// dispatchIq routes on (XEP-0060).
+    iq_pubsub_verb: []const u8 = "",
     /// Roster item attributes from <item> inside roster query.
     iq_roster_item_jid: []const u8 = "",
     iq_roster_item_name: []const u8 = "",
@@ -12380,4 +12383,92 @@ test "Server: every advertised pubsub feature is dispatched" {
             try std.testing.expect(std.mem.indexOf(u8, resp, "v1") != null);
         }
     }
+}
+
+test "Server: pubsub set routes on the verb, not blindly to publish" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var pep_store = GenericPepStore.init(&op_db);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    defer server.deinit();
+    server.pep_store = &pep_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var wire: [8192]u8 = undefined;
+
+    const node = "urn:test:verbs";
+    const publish_children = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("publish", xml.ns.pubsub, &.{testAttr("node", node)}),
+        testElem("item", xml.ns.pubsub, &.{testAttr("id", "i1")}),
+    };
+    const payload = "<data xmlns='urn:test'>v1</data>";
+
+    // A real publish first: the stored item must survive the verb probes.
+    var resp = try driveTestIq(&server, &session, &changes, fds[1], "set", "pub-0", &publish_children, payload, &wire);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+
+    // <items> in a set is not a write verb: bad-request, and the stored item
+    // keeps its payload (the review probe: a verb-blind dispatch upserts an
+    // empty item).
+    const items_set = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("items", xml.ns.pubsub, &.{testAttr("node", node)}),
+    };
+    resp = try driveTestIq(&server, &session, &changes, fds[1], "set", "items-0", &items_set, null, &wire);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bad-request") != null);
+    const stored = try pep_store.getItem(allocator, "alice@localhost", node, "i1");
+    try std.testing.expect(stored != null);
+    defer allocator.free(stored.?);
+    try std.testing.expect(std.mem.indexOf(u8, stored.?, "v1") != null);
+
+    // Recognized but unimplemented verbs answer feature-not-implemented with
+    // the XEP-0060 <unsupported> feature token.
+    const unsupported_cases = [_]struct { verb: []const u8, feature: []const u8 }{
+        .{ .verb = "subscribe", .feature = "subscribe" },
+        .{ .verb = "unsubscribe", .feature = "subscribe" },
+        .{ .verb = "retract", .feature = "retract-items" },
+        .{ .verb = "create", .feature = "create-nodes" },
+        .{ .verb = "delete", .feature = "delete-nodes" },
+        .{ .verb = "purge", .feature = "purge-nodes" },
+        .{ .verb = "configure", .feature = "config-node" },
+        .{ .verb = "options", .feature = "subscription-options" },
+    };
+    for (unsupported_cases, 0..) |case, i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "verb-{d}", .{i});
+        const children = [_]xml.Element{
+            testElem("pubsub", xml.ns.pubsub, &.{}),
+            testElem(case.verb, xml.ns.pubsub, &.{testAttr("node", node)}),
+        };
+        resp = try driveTestIq(&server, &session, &changes, fds[1], "set", id, &children, null, &wire);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "feature-not-implemented") != null);
+        var feat_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&feat_buf, "feature='{s}'", .{case.feature});
+        try std.testing.expect(std.mem.indexOf(u8, resp, needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "pubsub#errors") != null);
+    }
+
+    // The retract probe above must not have deleted the stored item.
+    const still = try pep_store.getItem(allocator, "alice@localhost", node, "i1");
+    try std.testing.expect(still != null);
+    defer allocator.free(still.?);
+    try std.testing.expect(std.mem.indexOf(u8, still.?, "v1") != null);
 }
