@@ -146,6 +146,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
         }
     } else if (std.mem.eql(u8, elem.local_name, "publish") and std.mem.eql(u8, ns, xml.ns.pubsub)) {
         // <publish node='...'> inside <pubsub>
+        session.iq_pubsub_verb = elem.local_name;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "node")) {
                 session.iq_pep_node = attr.value;
@@ -155,6 +156,7 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     } else if (std.mem.eql(u8, elem.local_name, "items") and std.mem.eql(u8, ns, xml.ns.pubsub)) {
         // <items node='...'> inside <pubsub>
         session.iq_child_name = elem.local_name;
+        session.iq_pubsub_verb = elem.local_name;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "node")) {
                 session.iq_pep_node = attr.value;
@@ -299,6 +301,13 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
     {
         // <remove/> inside <query xmlns='jabber:iq:register'> — account deletion
         session.reg_has_remove = true;
+    } else if (std.mem.eql(u8, ns, xml.ns.pubsub) and
+        std.mem.eql(u8, session.iq_child_ns, xml.ns.pubsub) and
+        session.iq_pubsub_verb.len == 0)
+    {
+        // First child of <pubsub> in no other branch: record the set verb so
+        // dispatchIq can route it instead of assuming publish.
+        session.iq_pubsub_verb = elem.local_name;
     } else if (session.iq_child_ns.len == 0) {
         // First child element determines the IQ payload namespace
         session.iq_child_ns = ns;
@@ -350,6 +359,7 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         session.iq_child_ns = "";
         session.iq_child_name = "";
         session.iq_pep_node = "";
+        session.iq_pubsub_verb = "";
         session.iq_roster_item_jid = "";
         session.iq_roster_item_name = "";
         session.iq_roster_item_sub = "";
@@ -581,6 +591,8 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         } else {
             w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
         }
+        // XEP-0163 §6.1: the service also answers as a PEP pubsub service.
+        w.writeAll("<identity category='pubsub' type='pep'/>") catch return;
         w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
         caps_mod.writeDiscoFeatures(w) catch return;
         w.writeAll("</query></iq>") catch return;
@@ -690,8 +702,19 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     // XEP-0163: PEP (simplified PubSub)
     if (std.mem.eql(u8, child_ns, xml.ns.pubsub)) {
         if (std.mem.eql(u8, iq_type, "set")) {
-            // Publish
-            handlePepPublish(server, session, iq_id, changes);
+            if (std.mem.eql(u8, session.iq_pubsub_verb, "publish")) {
+                // Publish
+                handlePepPublish(server, session, iq_id, changes);
+                return;
+            }
+            // The other pubsub set verbs name XEP-0060 features this PEP
+            // subset does not implement; each answers with its feature token
+            // so the sender can tell unsupported from malformed.
+            if (pubsubUnsupportedFeature(session.iq_pubsub_verb)) |feature| {
+                sendPubsubUnsupported(server, session, iq_id, feature);
+            } else {
+                sendIqError(server, session, iq_id, "bad-request");
+            }
             return;
         } else if (std.mem.eql(u8, iq_type, "get") and std.mem.eql(u8, session.iq_child_name, "items")) {
             // Items retrieval
@@ -2154,6 +2177,39 @@ fn pushBlockPush(
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
     sendIqErrorWithType(server, session, iq_id, "cancel", condition);
+}
+
+/// XEP-0060 §10.2.1: the <unsupported feature='...'> token naming the pubsub
+/// feature a set verb would exercise. Verbs without a listed feature are
+/// malformed rather than unimplemented and get bad-request instead.
+fn pubsubUnsupportedFeature(verb: []const u8) ?[]const u8 {
+    const map = .{
+        .{ "subscribe", "subscribe" },
+        .{ "unsubscribe", "subscribe" },
+        .{ "options", "subscription-options" },
+        .{ "configure", "config-node" },
+        .{ "create", "create-nodes" },
+        .{ "delete", "delete-nodes" },
+        .{ "purge", "purge-nodes" },
+        .{ "retract", "retract-items" },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, verb, entry[0])) return entry[1];
+    }
+    return null;
+}
+
+/// feature-not-implemented carrying the pubsub#error <unsupported> element
+/// for the feature the verb maps to (XEP-0060 §10.2.1).
+fn sendPubsubUnsupported(server: *Server, session: *Session, iq_id: []const u8, feature: []const u8) void {
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    writeIqHeader(server, w, session, "error", iq_id);
+    w.writeAll("><error type='cancel'><feature-not-implemented xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>") catch return;
+    w.writeAll("<unsupported xmlns='http://jabber.org/protocol/pubsub#errors' feature='") catch return;
+    w.writeAll(feature) catch return;
+    w.writeAll("'/></error></iq>") catch return;
+    session.queueSendStanza(fbs.getWritten()) catch return;
 }
 
 pub fn sendIqErrorWithType(server: *Server, session: *Session, iq_id: []const u8, err_type: []const u8, condition: []const u8) void {
