@@ -3643,3 +3643,267 @@ test "Outbox: a failed high-water retention is counted" {
     try std.testing.expectEqual(@as(u64, 1), counters.spill_release_failed);
     try std.testing.expectEqual(@as(usize, 0), o.spill.capacity);
 }
+
+test "Conn: read suppression lifts at the low watermark exactly" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{
+        .counters = &counters,
+        .outbox_suppress_high = 8,
+        .outbox_suppress_low = 4,
+        .flush_budget_bytes = 4,
+    });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // 8 queued bytes reach the high watermark; one service pass writes
+    // the 4-byte flush budget and leaves exactly the low watermark.
+    const parts = [_][]const u8{"12345678"};
+    _ = c.send(&list, &parts);
+    try std.testing.expect(c.read_suppressed);
+    list.service();
+    try std.testing.expectEqual(@as(usize, 4), c.outbox.bytes());
+    try std.testing.expect(!c.read_suppressed);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "ConnList: a deferred read re-drive links after the outbox drains on writable" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+    const one_k: c_int = 1024;
+    try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&one_k));
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    // Stall the outbox flush on a full kernel send buffer so the conn
+    // is popped unlinked, then park a read re-drive on it.
+    var filler: [4096]u8 = undefined;
+    @memset(&filler, 0x55);
+    while (true) _ = posix.write(pair[0], &filler) catch |err| switch (err) {
+        error.WouldBlock => break,
+        else => return err,
+    };
+    const parts = [_][]const u8{"tail"};
+    _ = c.send(&list, &parts);
+    list.service();
+    try std.testing.expect(c.want_write);
+    try std.testing.expect(!c.on_dirty);
+    c.requeue_read = true;
+
+    // Peer drains: the writable pass flushes the outbox and the
+    // pending re-drive must link so the walk fires it this pass.
+    var sink: [8192]u8 = undefined;
+    while ((posix.read(pair[1], &sink) catch 0) > 0) {}
+    _ = c.onEvent(synthIo(&c, .w), &list);
+    try std.testing.expect(c.on_dirty);
+    list.service();
+    try std.testing.expect(!c.requeue_read);
+
+    _ = try loop.scheduleIn(50, mkConnCtx(9));
+    try loop.wait();
+    var saw_readable = false;
+    while (loop.next()) |ev| {
+        if (ev == .readable) saw_readable = true;
+    }
+    try std.testing.expect(saw_readable);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "ConnList: a flush stalled on want_read inside service re-arms the read retry" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+
+    // Put the SSL back into accept state so SSL_write wants a read:
+    // the same WANT_READ shape a post-handshake write can take (L11).
+    tc.SSL_set_accept_state(@ptrCast(c.tls_storage.conn.ssl));
+    const parts = [_][]const u8{"queued"};
+    _ = c.send(&list, &parts);
+    list.service();
+    try std.testing.expect(c.flush_want_read);
+
+    // The readable event the flush waits on clears the flag and links
+    // the conn so the walk retries the flush this same pass.
+    _ = c.onEvent(synthIo(&c, .r), &list);
+    try std.testing.expect(!c.flush_want_read);
+    try std.testing.expect(c.on_dirty);
+    c.state = .closing;
+    c.teardown();
+}
+
+test "Transport tls: a peer reset marks the conn fatal and captures the errno" {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try tcpPair();
+    defer posix.close(pair[0]);
+    var srv = try ssl.SslConn.init(pki.ctx, pair[0]);
+    defer srv.deinit();
+    var cli = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    try driveHandshake(&srv, &cli);
+
+    // RST on close: the read must surface ECONNRESET via syscall_errno
+    // (the counter/logging path keys on it), not a bare failure.
+    const lg = extern struct { onoff: c_int, linger: c_int }{ .onoff = 1, .linger = 0 };
+    try posix.setsockopt(pair[1], posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&lg));
+    cli.deinit();
+    posix.close(pair[1]);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    var buf: [64]u8 = undefined;
+    _ = srv.read(&buf) catch {};
+    try std.testing.expect(srv.fatal);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(posix.E.CONNRESET)), srv.syscall_errno);
+}
+
+/// Push a stale entry onto the thread's OpenSSL error queue: a closed
+/// conn's failed record read leaves exactly the kind of residue the
+/// per-call ERR_clear_error in read/write exists to drop (D7).
+fn poisonErrQueue(pki: *TestPki, client_ctx: ssl.SslContext) !void {
+    const pa = try socketpair();
+    defer posix.close(pa[0]);
+    defer posix.close(pa[1]);
+    var a = try ssl.SslConn.init(pki.ctx, pa[0]);
+    defer a.deinit();
+    var ac = try ssl.SslConn.initClient(client_ctx, pa[1], null);
+    defer ac.deinit();
+    try driveHandshake(&a, &ac);
+    _ = try posix.write(pa[1], "\x17\x03\x03\x00\x20" ++ ("\x00" ** 32));
+    var buf: [64]u8 = undefined;
+    _ = a.read(&buf) catch {};
+}
+
+test "Transport tls: a foreign error entry does not poison another conn's write or handshake" {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    // Write side: a full socket must still report want_write, not the
+    // stale entry left on the shared error queue.
+    const pb = try socketpair();
+    defer posix.close(pb[0]);
+    defer posix.close(pb[1]);
+    var b = try ssl.SslConn.init(pki.ctx, pb[0]);
+    defer b.deinit();
+    var bc = try ssl.SslConn.initClient(client_ctx, pb[1], null);
+    defer bc.deinit();
+    try driveHandshake(&b, &bc);
+    var big: [16384]u8 = undefined;
+    @memset(&big, 'w');
+    var spins: usize = 0;
+    while (spins < 10000) : (spins += 1) {
+        const r = try b.write(&big);
+        if (r == .want_write) break;
+    }
+    try poisonErrQueue(&pki, client_ctx);
+    const wr = b.write(&big);
+    try std.testing.expect((wr catch return error.WritePoisoned) == .want_write);
+
+    // Handshake side: a fresh server conn with no ClientHello yet must
+    // report want_read, not the stale entry.
+    const ph = try socketpair();
+    defer posix.close(ph[0]);
+    defer posix.close(ph[1]);
+    var h = try ssl.SslConn.init(pki.ctx, ph[0]);
+    defer h.deinit();
+    try poisonErrQueue(&pki, client_ctx);
+    const hr = h.doHandshake();
+    try std.testing.expect((hr catch return error.HandshakePoisoned) == .want_read);
+}
+
+test "Transport tls: shutdown after a fatal read adds nothing to the error queue" {
+    const alloc = std.testing.allocator;
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pa = try socketpair();
+    defer posix.close(pa[0]);
+    defer posix.close(pa[1]);
+    var a = try ssl.SslConn.init(pki.ctx, pa[0]);
+    defer a.deinit();
+    var ac = try ssl.SslConn.initClient(client_ctx, pa[1], null);
+    defer ac.deinit();
+    try driveHandshake(&a, &ac);
+
+    // A bad record fails the read and latches fatal; SSL_shutdown on a
+    // fatal conn would only push more entries onto the shared queue.
+    _ = try posix.write(pa[1], "\x17\x03\x03\x00\x20" ++ ("\x00" ** 32));
+    var buf: [64]u8 = undefined;
+    _ = a.read(&buf) catch {};
+    try std.testing.expect(a.fatal);
+    tc.ERR_clear_error();
+    a.shutdown();
+    try std.testing.expectEqual(@as(c_ulong, 0), tc.ERR_peek_error());
+}
+
+test "Conn: bytes queued mid-handshake never leave as cleartext" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    var list: ConnList = .{};
+
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+    const parts = [_][]const u8{"<plaintext-secret/>"};
+    _ = c.send(&list, &parts);
+    list.service(); // .handshake: the walk must not flush
+    var buf: [64]u8 = undefined;
+    const n = posix.read(pair[1], &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+    c.close(&list);
+    list.service();
+}
