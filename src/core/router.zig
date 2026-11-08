@@ -255,6 +255,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         std.mem.indexOf(u8, inner_xml, "<no-store") != null;
     const has_no_copy = std.mem.indexOf(u8, inner_xml, "urn:xmpp:hints") != null and
         std.mem.indexOf(u8, inner_xml, "<no-copy") != null;
+    // XEP-0280 section 6: a <private/> child in the carbons namespace asks
+    // the server not to carbon copy this message to any resource.
+    const has_private = std.mem.indexOf(u8, inner_xml, "urn:xmpp:carbons:2") != null and
+        std.mem.indexOf(u8, inner_xml, "<private") != null;
 
     // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
     const is_archivable = session.stanza_kind == .message and
@@ -564,8 +568,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     // XEP-0280: Message Carbons - send copies to sender's and recipient's other resources.
-    // XEP-0334: Skip carbons if <no-copy xmlns='urn:xmpp:hints'/> is present
-    if (session.stanza_kind == .message and !has_no_copy and
+    // XEP-0334 and XEP-0280 section 6: a <no-copy/> hint or a <private/>
+    // child suppresses every copy on both delivery paths.
+    if (session.stanza_kind == .message and !has_no_copy and !has_private and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
     {
         // The serialized stanza is dead now that the delivery loop above has

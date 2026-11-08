@@ -12600,6 +12600,85 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") == null);
 }
 
+// A <private/> child asks the server not to carbon copy the message at all
+// (XEP-0280 section 6), and a <no-copy/> hint does the same (XEP-0334).
+// Both suppress the copy on the cross-worker path, so the phone's wire
+// stays empty.
+test "carbons: private and no-copy hints suppress the cross-worker carbon" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.stream.state = .active;
+    desk.stream.authenticated = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w0.sessions[5] = desk;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = true;
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_type = "chat";
+
+    const inners = [_][]const u8{
+        "<body>shh</body><private xmlns='urn:xmpp:carbons:2'/>",
+        "<body>shh</body><no-copy xmlns='urn:xmpp:hints'/>",
+    };
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+
+    for (inners, 0..) |inner, round| {
+        alice.stanza_to = "bob@localhost/desktop";
+        alice.stanza_id = if (round == 0) "carb-priv" else "carb-nocopy";
+        @memcpy(alice.stanza_buf[0..inner.len], inner);
+        alice.stanza_buf_len = inner.len;
+        router.dispatchStanza(&w0, &alice, &w0_changes);
+        w1.drainDeliveryQueue(&w1_changes);
+    }
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), wire_len);
+}
+
 test "N1: two workers draining one bare JID hold a message once" {
     const allocator = std.testing.allocator;
 
