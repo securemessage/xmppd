@@ -563,7 +563,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    // XEP-0280: Message Carbons — send copies to sender's and recipient's other resources
+    // XEP-0280: Message Carbons - send copies to sender's and recipient's other resources.
     // XEP-0334: Skip carbons if <no-copy xmlns='urn:xmpp:hints'/> is present
     if (session.stanza_kind == .message and !has_no_copy and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
@@ -939,7 +939,10 @@ fn sendCarbons(
             cw.writeAll(carbon_type) catch continue;
             cw.writeAll("></message>") catch continue;
 
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
+            // The slot carries the carbon class so the receiving worker can
+            // apply carbons_enabled and the live-only rules; this worker
+            // cannot see them on the remote Session.
+            ds.deliverKinded(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, .carbon) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
                 _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             };

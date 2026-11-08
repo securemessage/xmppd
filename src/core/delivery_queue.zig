@@ -61,6 +61,20 @@ pub const SM_ACTOR_SENTINEL: u32 = 0xFFFFFFFD;
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
 
+/// Delivery class of a slot payload (the ADR-3 `class` field). The receiving
+/// worker applies the class's per-session policy to a remote target exactly
+/// as the local path applies it, because session flags like carbons_enabled
+/// live on the consumer's Session and the producer cannot see them.
+pub const DeliveryKind = enum(u8) {
+    /// A stanza under RFC 6121 delivery rules: it may be held behind a
+    /// draining offline tail and it may be replayed on SM resume.
+    stanza = 0,
+    /// A XEP-0280 carbon copy: only a Carbons-enabled session receives it,
+    /// and only live. A carbon is never held behind an offline tail, never
+    /// stored and never bounced.
+    carbon = 1,
+};
+
 /// A single delivery slot in the MPSC ring buffer.
 pub const DeliverySlot = struct {
     /// Target session ID (index into shared registry / Server.sessions).
@@ -69,6 +83,8 @@ pub const DeliverySlot = struct {
     target_generation: u32 = 0,
     /// Length of the stanza payload in bytes.
     payload_len: u16 = 0,
+    /// Delivery class the consumer applies to this slot.
+    kind: DeliveryKind = .stanza,
     /// Dispatch identity minted by the producer (see offline_store.HoldToken).
     /// Carried in the slot so a consumer on another worker holds the message
     /// under the same identity, and two identical messages stay distinct.
@@ -83,11 +99,12 @@ pub const DeliverySlot = struct {
 
 comptime {
     // Zig reorders struct fields to minimize padding, so declaration order
-    // does not decide the layout: the id bytes, the two-byte length, the flag
-    // and the token pack into a 24-byte header with no filler either way. A
-    // manual filler field is what costs space: six bytes of _pad pushed the
-    // slot to 4112, an eight-byte slab per queue across every worker. Pin the
-    // header so any future field that does not fit the gaps fails here.
+    // does not decide the layout: the id bytes, the two-byte length, the
+    // kind, the ready flag and the token pack 20 bytes into a 24-byte
+    // header with 4 bytes of tail padding. A manual filler field is what
+    // costs space: six bytes of _pad pushed the slot to 4112, an
+    // eight-byte slab per queue across every worker. Pin the header so
+    // any future field that does not fit the gaps fails here.
     std.debug.assert(@sizeOf(DeliverySlot) == MAX_PAYLOAD_SIZE + 24); // 4104
 }
 
@@ -101,6 +118,9 @@ pub const MpscQueue = struct {
     /// Dispatch identity of the slot the drain is currently handing to the
     /// handler. Consumer-only, valid for the duration of one handler call.
     current_slot_token: u64 = 0,
+    /// Delivery class of the slot the drain is currently handing to the
+    /// handler. Consumer-only, valid for the duration of one handler call.
+    current_slot_kind: DeliveryKind = .stanza,
 
     /// Attempt to enqueue a stanza for cross-thread delivery.
     /// Called by any producer thread. Returns error.QueueFull if no slots available.
@@ -121,6 +141,18 @@ pub const MpscQueue = struct {
         target_generation: u32,
         payload: []const u8,
         hold_token: u64,
+    ) !void {
+        return self.enqueueKinded(target_session_id, target_generation, payload, hold_token, .stanza);
+    }
+
+    /// Enqueue a stanza with its dispatch identity and delivery class.
+    pub fn enqueueKinded(
+        self: *MpscQueue,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+        hold_token: u64,
+        kind: DeliveryKind,
     ) !void {
         if (payload.len > MAX_PAYLOAD_SIZE) return error.PayloadTooLarge;
 
@@ -149,6 +181,7 @@ pub const MpscQueue = struct {
             slot.target_generation = target_generation;
             slot.payload_len = @intCast(payload.len);
             slot.hold_token = hold_token;
+            slot.kind = kind;
             @memcpy(slot.payload[0..payload.len], payload);
 
             // Publish: signal to consumer that this slot is fully written
@@ -175,11 +208,14 @@ pub const MpscQueue = struct {
                 break;
             }
 
-            // Read the delivery. `current_slot_token` is how a handler learns
-            // this dispatch's identity without widening the handler signature.
+            // Read the delivery. `current_slot_token` and `current_slot_kind`
+            // are how a handler learns this dispatch's identity and class
+            // without widening the handler signature.
             self.current_slot_token = slot.hold_token;
+            self.current_slot_kind = slot.kind;
             handler(ctx, slot.target_session_id, slot.target_generation, slot.payload[0..slot.payload_len]);
             self.current_slot_token = 0;
+            self.current_slot_kind = .stanza;
             processed += 1;
 
             // Reset the slot and advance head
@@ -327,9 +363,22 @@ pub const DeliverySystem = struct {
         payload: []const u8,
         hold_token: u64,
     ) !void {
-        try self.enqueue(target_worker, target_session_id, target_generation, payload, hold_token);
+        return self.deliverKinded(target_worker, target_session_id, target_generation, payload, hold_token, .stanza);
+    }
 
-        // Always wake the target worker — coalesced signaling is unsafe because
+    /// Deliver a stanza with its dispatch identity and delivery class.
+    pub fn deliverKinded(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+        hold_token: u64,
+        kind: DeliveryKind,
+    ) !void {
+        try self.enqueueKinded(target_worker, target_session_id, target_generation, payload, hold_token, kind);
+
+        // Always wake the target worker: coalesced signaling is unsafe because
         // the target may finish processing and enter kevent() between our isActive
         // check and the pipe write. The pipe drainPipe() handles duplicate wakes.
         self.wakeWorker(target_worker);
@@ -347,8 +396,22 @@ pub const DeliverySystem = struct {
         payload: []const u8,
         hold_token: u64,
     ) !void {
+        return self.enqueueKinded(target_worker, target_session_id, target_generation, payload, hold_token, .stanza);
+    }
+
+    /// Enqueue a delivery-class payload without waking the target worker.
+    /// The caller MUST call wakeWorker() once after the batch.
+    pub fn enqueueKinded(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target_session_id: u32,
+        target_generation: u32,
+        payload: []const u8,
+        hold_token: u64,
+        kind: DeliveryKind,
+    ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
-        try self.queues[target_worker].enqueueWithToken(target_session_id, target_generation, payload, hold_token);
+        try self.queues[target_worker].enqueueKinded(target_session_id, target_generation, payload, hold_token, kind);
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). One pipe
@@ -447,6 +510,40 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
     try std.testing.expectEqual(@as(u64, 0xdeadbeef), tokens[0]);
     try std.testing.expectEqual(@as(u64, 0), tokens[1]);
     try std.testing.expectEqual(@as(u64, 0), queue.current_slot_token);
+}
+
+// A slot's delivery class reaches the consumer unchanged: the receiving
+// worker applies it to the remote session exactly as the local path would.
+test "MpscQueue: delivery kind survives the round trip and is cleared after each slot" {
+    var queue = MpscQueue{};
+
+    try queue.enqueueKinded(42, 7, "carbon copy", 0, .carbon);
+    try queue.enqueue(43, 8, "plain stanza");
+
+    const Ctx = struct {
+        queue: *MpscQueue,
+        kinds: *[2]DeliveryKind,
+        seen: *usize,
+    };
+    var kinds = [_]DeliveryKind{ .stanza, .stanza };
+    var seen: usize = 0;
+    const ctx = Ctx{ .queue = &queue, .kinds = &kinds, .seen = &seen };
+
+    const handler = struct {
+        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
+            _ = sid;
+            _ = gen;
+            _ = pl;
+            c.kinds.*[c.seen.*] = c.queue.current_slot_kind;
+            c.seen.* += 1;
+        }
+    }.handle;
+
+    const processed = queue.drain(ctx, handler);
+    try std.testing.expectEqual(@as(u32, 2), processed);
+    try std.testing.expectEqual(DeliveryKind.carbon, kinds[0]);
+    try std.testing.expectEqual(DeliveryKind.stanza, kinds[1]);
+    try std.testing.expectEqual(DeliveryKind.stanza, queue.current_slot_kind);
 }
 
 test "MpscQueue: queue full" {

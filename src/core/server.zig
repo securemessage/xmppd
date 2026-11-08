@@ -3861,12 +3861,21 @@ pub const Server = struct {
 
                 const target_session = c.server.sessions[local_session_id] orelse return;
                 const parts = extractStanzaParts(payload);
+                // XEP-0280 sections 2 and 7: a carbon copy reaches only a
+                // Carbons-enabled resource, live or not at all. The producer
+                // tags the slot so the same per-session policy the local
+                // carbon path applies (sendCarbons -> deliverToSession,
+                // which never holds) applies to a remote target: it is
+                // never held behind a draining offline tail, never stored
+                // and never bounced.
+                const is_carbon = c.queue.current_slot_kind == .carbon;
+                if (is_carbon and !target_session.carbons_enabled) return;
                 // The hold check comes before the SM-detach check: a detached
                 // session may still have an undrained offline tail, and a
                 // message pushed into its replay queue would be replayed
                 // ahead of that tail (H3). The c2s router orders them the
                 // same way.
-                if (target_session.offline_pending and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
+                if (target_session.offline_pending and !is_carbon and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
                     const hold_id = if (parts.msg_id.len > 0) parts.msg_id else "offline";
                     const timestamp: u64 = @intCast(std.time.timestamp());
                     const from_jid = extractAttrValue(payload, "from");
@@ -12158,6 +12167,319 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     w0.drainDeliveryQueue(&w0_changes);
 
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+}
+
+// A bare-JID dispatch routes the message to bob's phone on the other worker
+// and queues a <received> carbon for it in the same drain. The phone never
+// enabled carbons, so the consumer drops the copy and the wire carries only
+// the routed stanza (XEP-0280 section 2).
+test "carbons: a phone with carbons off on another worker gets only the routed message" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-off";
+    const body = "<body>once</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.drainDeliveryQueue(&w1_changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire[0..wire_len], "<message"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") == null);
+}
+
+// The message went to bob's desktop full JID, so the phone on the other
+// worker did not receive it under RFC 6121 rules: its <received> carbon is
+// the only stanza the cross-worker path owes it. A carbon is an outer
+// <message> wrapping a <forwarded> inner one, so the wire carries exactly
+// two <message opens for the single copy.
+test "carbons: a Carbons-enabled resource on another worker gets exactly one carbon" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.stream.state = .active;
+    desk.stream.authenticated = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w0.sessions[5] = desk;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = true;
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost/desktop";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-on";
+    const body = "<body>copy me</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.drainDeliveryQueue(&w1_changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire[0..wire_len], "<received xmlns='urn:xmpp:carbons:2'"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wire[0..wire_len], "<message"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "copy me") != null);
+}
+
+// The same dispatch, but the phone never enabled carbons: it was not a
+// delivery target, so the producer queued a carbon for it, and the
+// receiving worker applies carbons_enabled and drops it on the floor.
+test "carbons: a cross-worker carbon to a disabled resource is dropped" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.stream.state = .active;
+    desk.stream.authenticated = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w0.sessions[5] = desk;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = false;
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost/desktop";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-drop";
+    const body = "<body>not for you</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.drainDeliveryQueue(&w1_changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), wire_len);
+}
+
+// A carbon is delivered live or not at all: while the phone drains its
+// offline tail, the original (held for the desktop's tail) is the only row
+// the store ever sees. The carbon itself reaches the phone's wire; it is
+// never held behind the tail and never bounced.
+test "carbons: a draining worker delivers the carbon live and stores no carbon row" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+    w0.delivery_system = &delivery_sys;
+    w0.offline = &offline_store;
+
+    const desk_fds = try makeSocketPair();
+    defer posix.close(desk_fds[1]);
+    const desk = try allocator.create(Session);
+    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.offline_pending = true;
+    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    w0.sessions[5] = desk;
+    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
+
+    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w1.deinit();
+    w1.worker_id = 1;
+    w1.session_map = &sm;
+    w1.delivery_system = &delivery_sys;
+    w1.offline = &offline_store;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.offline_pending = true;
+    phone.carbons_enabled = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    w1.sessions[6] = phone;
+    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost/desktop";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-drain";
+    const body = "<body>held for desk</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var w0_changes_buf: [64]posix.Kevent = undefined;
+    var w0_changes = ChangeList.init(&w0_changes_buf);
+    router.dispatchStanza(&w0, &alice, &w0_changes);
+
+    var w1_changes_buf: [32]posix.Kevent = undefined;
+    var w1_changes = ChangeList.init(&w1_changes_buf);
+    w1.drainDeliveryQueue(&w1_changes);
+
+    // The carbon went out live; the draining tail never owned it.
+    _ = phone.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const wire_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(wire_len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") != null);
+
+    // Only the routed message is held, for the desktop's tail. No row
+    // anywhere carries the carbon namespace.
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    var carbon_rows: usize = 0;
+    for (ptrs) |ptr| {
+        const held = try offline_store.getHeldStanza(ptr) orelse continue;
+        defer allocator.free(held);
+        if (std.mem.indexOf(u8, held, "urn:xmpp:carbons:2") != null) carbon_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    try std.testing.expectEqual(@as(usize, 0), carbon_rows);
 }
 
 test "N1: two workers draining one bare JID hold a message once" {
