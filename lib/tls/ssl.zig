@@ -15,8 +15,15 @@
 //!
 //! ## DANE Integration
 //!
-//! After handshake completes, extract the peer certificate chain with
-//! `getPeerCertDer()` / `getPeerChainDer()` and pass to `tls.validateDane()`.
+//! Verification runs inside the handshake. Build the state with `initDane()`,
+//! arm it on the connection with `prepareDane()` before `doHandshake()`, and
+//! read the outcome with `daneVerdict()` afterwards. The records, the
+//! usability filter, digest agility and the verdict all come from the shared
+//! `pacyworld/dane-zig` module; this file only bridges it to `SSL_CTX`/`SSL`.
+//!
+//! Inbound S2S learns the peer domain only after TLS, so it cannot arm the
+//! handshake. `verifyPeerDane()` verifies the presented chain afterwards on a
+//! dedicated context from `initDaneVerifier()`.
 //!
 //! ## Build Requirements
 //!
@@ -33,6 +40,11 @@ const c = @cImport({
     @cInclude("openssl/err.h");
     @cInclude("openssl/x509.h");
 });
+
+// The DANE backend keeps its own extern declarations and opaque types, so
+// every crossing between the two type worlds happens in this file.
+const dane = @import("dane");
+const dane_openssl = @import("dane-openssl");
 
 /// Result of a non-blocking TLS handshake attempt.
 pub const HandshakeResult = enum {
@@ -86,6 +98,100 @@ pub const SslError = error{
 fn alwaysAcceptVerify(_: c_int, _: ?*c.X509_STORE_CTX) callconv(.c) c_int {
     return 1; // Always OK
 }
+
+/// One TLSA record as the caller sees it: the fields of the DNSSEC RR that
+/// participate in verification (RFC 6698 section 2.1).
+pub const DaneRecord = struct {
+    usage: u8,
+    selector: u8,
+    matching_type: u8,
+    data: []const u8,
+};
+
+/// DANE policy for a single handshake. XMPP disables the DANE-EE name check
+/// (RFC 7671 section 5.1) and supplies the service domain plus the SRV target
+/// as reference identifiers (RFC 7673 section 4).
+pub const DanePolicy = struct {
+    /// First entry is the SNI value and the base domain for OpenSSL.
+    names: []const []const u8,
+};
+
+/// A prepared DANE handshake: the record set plus the identifier copies the
+/// handshake needs. Owns one allocation, released by `deinit`.
+pub const DaneState = struct {
+    arena: std.heap.ArenaAllocator,
+    set: dane.RecordSet,
+    names: []const []const u8,
+    policy: dane.Policy,
+
+    pub fn deinit(self: *DaneState) void {
+        self.arena.deinit();
+    }
+
+    /// Reference identifiers in the form the backend wants them.
+    fn refs(self: *const DaneState) dane.ReferenceIds {
+        return .{ .names = self.names };
+    }
+};
+
+/// Upper bound on records and identifiers per handshake, matching the
+/// module's own limits so an oversized RRset is rejected, never truncated.
+pub const dane_max_records = dane.max_records;
+pub const dane_max_names = dane.max_names;
+
+/// Build the DANE state for a handshake from raw TLSA records.
+///
+/// `records` may contain unusable entries: the module filters them and
+/// applies digest agility. The caller decides what an empty surviving set
+/// means; `prepare` reports it as `.no_usable_records`.
+pub fn initDane(alloc: std.mem.Allocator, policy: DanePolicy, records: []const DaneRecord) DaneError!DaneState {
+    if (records.len > dane.max_records) return error.TooManyRecords;
+    if (policy.names.len == 0) return error.NoReferenceIds;
+    if (policy.names.len > dane.max_names) return error.TooManyReferenceIds;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const names = a.alloc([]const u8, policy.names.len) catch return error.OutOfMemory;
+    for (policy.names, 0..) |n, i| names[i] = a.dupe(u8, n) catch return error.OutOfMemory;
+
+    const recs = a.alloc(dane.Record, records.len) catch return error.OutOfMemory;
+    for (records, 0..) |r, i| {
+        recs[i] = .{
+            .usage = @enumFromInt(r.usage),
+            .selector = @enumFromInt(r.selector),
+            .matching_type = @enumFromInt(r.matching_type),
+            .data = a.dupe(u8, r.data) catch return error.OutOfMemory,
+        };
+    }
+    const set = dane.RecordSet.init(recs) catch return error.TooManyRecords;
+
+    return .{
+        .arena = arena,
+        .set = set,
+        .names = names,
+        .policy = .{ .dane_ee_name_check = false },
+    };
+}
+
+pub const DaneError = error{
+    OutOfMemory,
+    TooManyRecords,
+    NoReferenceIds,
+    TooManyReferenceIds,
+    DaneUnavailable,
+};
+
+/// Outcome of `SslConn.daneVerdict`: verified, or failed with a named
+/// failure. Re-exported so callers need not import the module directly.
+pub const DaneVerdict = dane.Verdict;
+pub const Outcome = dane.Outcome;
+pub const Failure = dane.Failure;
+pub const Usage = dane.Usage;
+pub const Selector = dane.Selector;
+pub const MatchingType = dane.MatchingType;
+pub const DanePrepared = dane_openssl.Prepared;
 
 /// An OpenSSL `SSL_CTX` wrapper. Create once at server startup, share across
 /// all connections. Thread-safe after initialization (OpenSSL 3.x guarantee).
@@ -163,6 +269,63 @@ pub const SslContext = struct {
         if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
             return SslError.SslInitFailed;
         }
+        return .{ .ctx = ctx };
+    }
+
+    /// Initialize a client-side TLS context that verifies through DANE.
+    ///
+    /// SSL_VERIFY_PEER makes the handshake fail unless a TLSA record matches,
+    /// and the store is left empty so no traditional anchor can satisfy it
+    /// (the TLSA match is the only possible anchor). No verify callback is
+    /// installed: nothing may override the result. Kernel TLS is armed as in
+    /// `initClient`; callers disable it when the peer may also offload.
+    pub fn initClientDane() SslError!SslContext {
+        return initClientDaneWithCert(null, null);
+    }
+
+    /// Initialize a client-side TLS context that verifies through DANE and
+    /// presents our certificate (SASL EXTERNAL needs it).
+    ///
+    /// `SSL_VERIFY_PEER` makes the handshake fail unless a TLSA record
+    /// matches, and the store is left empty so no traditional anchor can
+    /// satisfy it. No verify callback is installed: nothing may override the
+    /// result. Kernel TLS is armed as in `initClient`; callers disable it when
+    /// the peer may also offload.
+    pub fn initClientDaneWithCert(cert_path: ?[*:0]const u8, key_path: ?[*:0]const u8) SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        dane_openssl.enableContext(@ptrCast(ctx)) catch return SslError.SslInitFailed;
+
+        if (cert_path) |cp| {
+            if (c.SSL_CTX_use_certificate_chain_file(ctx, cp) != 1) {
+                return SslError.CertLoadFailed;
+            }
+        }
+        if (key_path) |kp| {
+            if (c.SSL_CTX_use_PrivateKey_file(ctx, kp, c.SSL_FILETYPE_PEM) != 1) {
+                return SslError.KeyLoadFailed;
+            }
+            if (c.SSL_CTX_check_private_key(ctx) != 1) {
+                return SslError.KeyMismatch;
+            }
+        }
+
+        _ = c.SSL_CTX_set_options(ctx, 0x8);
+        return .{ .ctx = ctx };
+    }
+
+    /// Initialize a context used only to verify a peer chain after the
+    /// handshake (`SslConn.verifyPeerDane`). It carries the DANE settings and
+    /// an empty store; it is never used for a connection.
+    pub fn initDaneVerifier() SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        dane_openssl.enableContext(@ptrCast(ctx)) catch return SslError.SslInitFailed;
         return .{ .ctx = ctx };
     }
 
@@ -326,6 +489,32 @@ pub const SslConn = struct {
                 return SslError.HandshakeFailed;
             },
         };
+    }
+
+    /// Arm DANE on this connection before the handshake runs. Must be called
+    /// after `initClient` and before the first `doHandshake`.
+    ///
+    /// Returns `.no_usable_records` when the module kept no record; OpenSSL
+    /// then verifies against traditional trust anchors, so the caller applies
+    /// its own fallback instead of reading a DANE result.
+    pub fn prepareDane(self: *SslConn, state: *const DaneState) SslError!dane_openssl.Prepared {
+        return dane_openssl.prepare(@ptrCast(self.ssl), &state.set, state.refs(), state.policy) catch
+            return SslError.SslInitFailed;
+    }
+
+    /// Map the completed handshake's verification state to a verdict.
+    /// `prepared` is what `prepareDane` returned.
+    pub fn daneVerdict(self: *SslConn, prepared: dane_openssl.Prepared, state: *const DaneState) dane.Verdict {
+        return dane_openssl.verdict(@ptrCast(self.ssl), prepared, &state.set, state.policy);
+    }
+
+    /// Verify this connection's peer chain against DANE records after the
+    /// handshake (inbound S2S: the peer domain arrives after TLS, so the
+    /// handshake could not be armed). `verify_ctx` must be a dedicated
+    /// context from `initDaneVerifier`; it carries the DANE settings and an
+    /// empty store, so nothing but a TLSA record can anchor the chain.
+    pub fn verifyPeerDane(self: *SslConn, verify_ctx: *const SslContext, state: *const DaneState) dane.Verdict {
+        return dane_openssl.verifyPeer(@ptrCast(self.ssl), @ptrCast(verify_ctx.ctx), &state.set, state.refs(), state.policy);
     }
 
     /// Read decrypted data from the TLS connection.

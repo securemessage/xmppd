@@ -175,9 +175,20 @@ pub const Session = struct {
     /// TLSA records to authenticate with when no resolution is attached
     /// (test seam; hostname sessions get records per target from DNS).
     dane_records: []const dns.TlsaRecord = &.{},
-    /// True while the handshake runs in DANE mode (VERIFY_NONE context):
-    /// the TLSA match runs on this thread the moment it completes.
+    /// True while the handshake runs under DANE: the TLSA records are armed
+    /// on the connection before the handshake and the verdict is read when it
+    /// completes (fail closed).
     pending_dane: bool = false,
+    /// DANE handshake state for the current target (owned; released on
+    /// destroy and when a new target is dialed).
+    dane_state: ?ssl.DaneState = null,
+    dane_prepared: ssl.DanePrepared = .dane,
+    /// Reference identifiers for the current target, copied here because the
+    /// DANE state only borrows them. [0] is the service domain (SNI), [1] the
+    /// SRV target when it differs.
+    dane_name_buf: [2][256]u8 = undefined,
+    dane_names: [2][]const u8 = undefined,
+    dane_name_count: usize = 0,
 
     /// Requested TCP port for direct connects (kept for target iteration).
     port: u16 = 0,
@@ -305,6 +316,7 @@ pub const Session = struct {
             }
         }
         if (self.resolution) |*r| r.deinitOn(allocator);
+        self.releaseDane();
         if (self.fd >= 0) posix.close(self.fd);
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
@@ -371,6 +383,15 @@ pub const Session = struct {
                 break :blk tp.tlsConn() orelse return self.fail(engine.allocator, "tls-missing");
             };
             const res = tc.doHandshake() catch {
+                // A DANE handshake that fails did so because the TLSA record
+                // did not authenticate the peer (the context has no other
+                // anchor). Name the actual cause before failing closed.
+                if (self.pending_dane) {
+                    self.pending_dane = false;
+                    self.logDaneHandshakeFailure(tc);
+                    self.fail(engine.allocator, "tls-dane-mismatch");
+                    return;
+                }
                 self.fail(engine.allocator, "tls-handshake-failed");
                 return;
             };
@@ -395,11 +416,12 @@ pub const Session = struct {
                         };
                         self.fsm.cb_available = self.cb_mode.isPlus();
                     }
-                    // DANE mode authenticated nothing yet: match the peer
-                    // chain against the TLSA records now, fail closed.
+                    // DANE verified the peer inside the handshake
+                    // (SSL_VERIFY_PEER with only TLSA anchors); read the
+                    // verdict and fail closed.
                     if (self.pending_dane) {
                         self.pending_dane = false;
-                        self.verifyDane(engine, tc) orelse return;
+                        self.finishDane(engine, tc) orelse return;
                     }
                     // Reset the reader, then tell the FSM TLS is up; the FSM
                     // action re-sends <stream:stream> (RFC 6120 §4.6).
@@ -576,54 +598,114 @@ pub const Session = struct {
         return buf[0..domain.len :0].ptr;
     }
 
-    /// DANE match of the just-presented peer chain against the TLSA records
-    /// (engine thread, at handshake completion). Fails the session and
-    /// returns null on mismatch; logs which path validated (T202).
-    fn verifyDane(self: *Session, engine: *Engine, tc: *ssl.SslConn) ?void {
+    /// Read the DANE verdict of a handshake that just completed under
+    /// `SSL_VERIFY_PEER` (engine thread). Fails the session and returns null
+    /// on anything but a verified peer; logs which DANE usage matched.
+    fn finishDane(self: *Session, engine: *Engine, tc: *ssl.SslConn) ?void {
         const allocator = engine.allocator;
-        const leaf = (tc.getPeerCertDer(allocator) catch null) orelse {
-            log.warn("fd={d} tls: no peer certificate for DANE match", .{self.fd});
+        const state = if (self.dane_state) |*s| s else {
+            log.warn("fd={d} tls: DANE armed without state for {s}", .{ self.fd, self.domain });
             self.fail(allocator, "tls-dane-mismatch");
             return null;
         };
-        defer allocator.free(leaf);
-        const chain = tc.getPeerChainDer(allocator) catch &.{};
-        defer {
-            for (chain) |cert| allocator.free(cert);
-            if (chain.len > 0) allocator.free(chain);
-        }
-
-        // Convert lib/dns records to lib/tls records, dropping any with
-        // out-of-range fields (their bytes never authenticate anything).
-        var converted: [16]tls.TlsaRecord = undefined;
-        var n: usize = 0;
-        for (self.currentTlsa()) |r| {
-            if (n == converted.len) break;
-            converted[n] = .{
-                .usage = std.enums.fromInt(tls.TlsaCertUsage, r.usage) orelse continue,
-                .selector = std.enums.fromInt(tls.TlsaSelector, r.selector) orelse continue,
-                .matching_type = std.enums.fromInt(tls.TlsaMatchingType, r.matching_type) orelse continue,
-                .association_data = r.association_data,
-            };
-            n += 1;
-        }
-        if (n == 0) {
-            log.warn("fd={d} tls: TLSA present for {s} but none usable — refusing", .{ self.fd, self.domain });
+        // A set that emptied out means OpenSSL verified against traditional
+        // anchors: the handshake proved no DANE assertion, so it fails closed
+        // rather than silently downgrade (ADR-13).
+        if (self.dane_prepared == .no_usable_records) {
+            log.warn("fd={d} tls: TLSA for {s} held no usable record — refusing", .{ self.fd, self.domain });
             self.fail(allocator, "tls-dane-mismatch");
             return null;
         }
-
-        switch (tls.validateDane(leaf, chain, converted[0..n])) {
-            .dane_ee_match => log.info("fd={d} tls: DANE-EE match for {s}", .{ self.fd, self.domain }),
-            .dane_ta_match => log.info("fd={d} tls: DANE-TA match for {s}", .{ self.fd, self.domain }),
-            .no_tlsa_records => unreachable, // n > 0 above
-            .dane_failed => {
-                log.warn("fd={d} tls: DANE mismatch for {s} — refusing connection", .{ self.fd, self.domain });
+        const v = tc.daneVerdict(self.dane_prepared, state);
+        switch (v.outcome) {
+            .verified => log.info("fd={d} tls: DANE {s} match for {s}", .{ self.fd, @tagName(v.matched.?.usage), self.domain }),
+            .no_usable_records => {
+                log.warn("fd={d} tls: TLSA for {s} held no usable record — refusing", .{ self.fd, self.domain });
+                self.fail(allocator, "tls-dane-mismatch");
+                return null;
+            },
+            .failed => {
+                log.warn("fd={d} tls: DANE failed for {s}: {s}", .{ self.fd, self.domain, @tagName(v.failure orelse .backend_error) });
                 self.fail(allocator, "tls-dane-mismatch");
                 return null;
             },
         }
     }
+
+    /// Log why a DANE handshake was rejected. The verdict is read off the
+    /// failed SSL: OpenSSL leaves the verification result in place, so the
+    /// named failure survives a handshake that never completed.
+    fn logDaneHandshakeFailure(self: *Session, tc: *ssl.SslConn) void {
+        const state = if (self.dane_state) |*s| s else {
+            log.warn("fd={d} tls: DANE handshake failed for {s}, no state to report", .{ self.fd, self.domain });
+            return;
+        };
+        const v = tc.daneVerdict(self.dane_prepared, state);
+        switch (v.outcome) {
+            .failed => log.warn("fd={d} tls: DANE rejected {s}: {s}", .{ self.fd, self.domain, @tagName(v.failure orelse .backend_error) }),
+            .no_usable_records => log.warn("fd={d} tls: TLSA for {s} held no usable record", .{ self.fd, self.domain }),
+            // A completed handshake cannot land here, but the API allows the
+            // call: report it rather than claim a match.
+            .verified => log.warn("fd={d} tls: DANE reported a match but the handshake failed for {s}", .{ self.fd, self.domain }),
+        }
+    }
+
+    /// Build and arm the DANE state for the current target. Called between
+    /// the TCP connect and the STARTTLS upgrade, where the TLSA records and
+    /// the reference identifiers are both known.
+    fn armDane(self: *Session) bool {
+        const allocator = self.engine.allocator;
+        self.releaseDane();
+        const tlsa = self.currentTlsa();
+        // Reference identifiers: the service domain first (SNI), then the
+        // SRV target host when it differs (RFC 7673 section 4).
+        self.dane_name_count = 0;
+        if (self.domain.len > 0 and self.domain.len < self.dane_name_buf[0].len) {
+            @memcpy(self.dane_name_buf[0][0..self.domain.len], self.domain);
+            self.dane_names[0] = self.dane_name_buf[0][0..self.domain.len];
+            self.dane_name_count = 1;
+        }
+        if (self.resolution) |*r| {
+            if (self.target_index < r.targets.len) {
+                const host = r.targets[self.target_index].host;
+                const differs = self.dane_name_count == 0 or !std.mem.eql(u8, host, self.domain);
+                if (differs and host.len > 0 and host.len < self.dane_name_buf[1].len) {
+                    @memcpy(self.dane_name_buf[1][0..host.len], host);
+                    self.dane_names[self.dane_name_count] = self.dane_name_buf[1][0..host.len];
+                    self.dane_name_count += 1;
+                }
+            }
+        }
+        if (self.dane_name_count == 0) {
+            log.warn("fd={d} tls: no reference identifier for DANE on {s}", .{ self.fd, self.domain });
+            return false;
+        }
+
+        var records: [ssl.dane_max_records]ssl.DaneRecord = undefined;
+        var n: usize = 0;
+        for (tlsa) |r| {
+            if (n == records.len) break;
+            records[n] = .{
+                .usage = r.usage,
+                .selector = r.selector,
+                .matching_type = r.matching_type,
+                .data = r.association_data,
+            };
+            n += 1;
+        }
+        self.dane_state = ssl.initDane(allocator, .{ .names = self.dane_names[0..self.dane_name_count] }, records[0..n]) catch |err| {
+            log.warn("fd={d} tls: cannot arm DANE for {s}: {}", .{ self.fd, self.domain, err });
+            return false;
+        };
+        return true;
+    }
+
+    fn releaseDane(self: *Session) void {
+        if (self.dane_state) |*s| s.deinit();
+        self.dane_state = null;
+        self.pending_dane = false;
+    }
+
     fn disarmWrite(self: *Session, engine: *Engine) void {
         if (!self.write_registered) return;
         engine.removeWrite(self.fd);
@@ -1063,13 +1145,23 @@ pub const Session = struct {
                 const use_dane = self.useDane();
                 var sni_buf: [256]u8 = undefined;
                 const sni = domainZ(&sni_buf, self.domain);
-                const ctx = if (use_dane or self.tls_policy == .none)
+                const ctx = if (use_dane)
+                    engine.clientDaneTlsContext() catch return error.TlsNotConfigured
+                else if (self.tls_policy == .none)
                     engine.tls_ctx orelse return error.TlsNotConfigured
                 else
                     engine.clientCaTlsContext() catch return error.TlsNotConfigured;
                 self.mark(.tls_start);
                 tp.upgradeToTls(ctx, sni) catch return error.TlsInitFailed;
-                if (!use_dane and self.tls_policy != .none) {
+                if (use_dane) {
+                    // Arm DANE before the handshake: only a TLSA match can
+                    // authenticate the peer, so the handshake itself fails
+                    // closed (no post-handshake window on this thread).
+                    const tc = tp.tlsConn() orelse return error.TlsMissing;
+                    if (!self.armDane()) return error.TlsInitFailed;
+                    const state = if (self.dane_state) |*s| s else return error.TlsInitFailed;
+                    self.dane_prepared = tc.prepareDane(state) catch return error.TlsInitFailed;
+                } else if (self.tls_policy != .none) {
                     const tc = tp.tlsConn() orelse return error.TlsMissing;
                     const host = sni orelse return error.TlsDomainTooLong;
                     tc.setHostname(host) catch return error.TlsInitFailed;

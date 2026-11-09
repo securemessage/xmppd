@@ -1,4 +1,5 @@
 const std = @import("std");
+const dane = @import("dane");
 pub const resolver = @import("resolver.zig");
 
 /// DNS record types relevant to XMPP.
@@ -23,7 +24,9 @@ pub const SrvRecord = struct {
     }
 };
 
-/// A parsed TLSA record (RFC 6698).
+/// A parsed TLSA record (RFC 6698). Field values are raw wire bytes: this is
+/// the transport representation. `pacyworld/dane-zig` owns the semantics
+/// (usability, digest agility, matching); use `toDaneRecord` to convert.
 pub const TlsaRecord = struct {
     /// Certificate usage (0-3)
     usage: u8,
@@ -83,20 +86,39 @@ pub fn parseSrvRdata(rdata: []const u8, alloc: std.mem.Allocator) !SrvRecord {
 }
 
 /// Parse a DNS TLSA record from wire format (RDATA section).
+///
+/// Delegates the field parsing to `pacyworld/dane-zig` so the wire rules are
+/// stated once; the association data is copied because the RDATA buffer is
+/// transient. A record whose fields are out of range is not a parse error:
+/// the module's `Record.isUsable` rejects it later.
+///
 /// Wire format: usage(1) + selector(1) + matching_type(1) + association_data(...)
 pub fn parseTlsaRdata(rdata: []const u8, alloc: std.mem.Allocator) !TlsaRecord {
-    if (rdata.len < 4) return error.InvalidTlsaRecord; // Minimum: 3 header bytes + 1 data byte
-
-    const usage = rdata[0];
-    const selector = rdata[1];
-    const matching_type = rdata[2];
-    const association_data = try alloc.dupe(u8, rdata[3..]);
+    const parsed = dane.parseRdata(rdata) catch |err| switch (err) {
+        error.Truncated => return error.InvalidTlsaRecord,
+        error.EmptyData => return error.InvalidTlsaRecord,
+    };
+    const association_data = try alloc.dupe(u8, parsed.data);
 
     return TlsaRecord{
-        .usage = usage,
-        .selector = selector,
-        .matching_type = matching_type,
+        .usage = @intFromEnum(parsed.usage),
+        .selector = @intFromEnum(parsed.selector),
+        .matching_type = @intFromEnum(parsed.matching_type),
         .association_data = association_data,
+    };
+}
+
+/// Convert a transport record into the module's typed record.
+///
+/// Every u8 maps: the module's enums are non-exhaustive, and `Record.isUsable`
+/// rejects values outside the registered ranges, so an out-of-range record is
+/// skipped by the filter instead of being dropped here.
+pub fn toDaneRecord(rec: TlsaRecord) dane.Record {
+    return .{
+        .usage = @enumFromInt(rec.usage),
+        .selector = @enumFromInt(rec.selector),
+        .matching_type = @enumFromInt(rec.matching_type),
+        .data = rec.association_data,
     };
 }
 

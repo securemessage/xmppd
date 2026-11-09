@@ -155,6 +155,12 @@ pub const OutboundConnection = struct {
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
     tls_state: ?TlsState = null,
+    /// DANE state armed before the handshake. Present only when the TLSA
+    /// lookup found usable records, in which case the handshake itself
+    /// fails unless a record matches; null means the dialback fallback.
+    dane_state: ?ssl_mod.DaneState = null,
+    /// What `prepareDane` installed, read back for the verdict.
+    dane_prepared: ssl_mod.DanePrepared = .dane,
     /// Persistent read buffer (survives across kqueue events).
     read_buf: [READ_BUF_SIZE]u8 = undefined,
     read_start: usize = 0,
@@ -211,6 +217,10 @@ pub const OutboundConnection = struct {
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
+        if (self.dane_state) |*state| {
+            state.deinit();
+            self.dane_state = null;
+        }
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();

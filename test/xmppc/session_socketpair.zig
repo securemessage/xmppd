@@ -21,6 +21,8 @@ const xmppc = @import("xmppc");
 const ssl_mod = @import("ssl");
 const tls_mod = @import("tls");
 const dns_mod = @import("dns");
+const dane_mod = @import("dane");
+const test_support = @import("test_support");
 const sasl_mod = @import("sasl");
 
 const posix = std.posix;
@@ -317,6 +319,18 @@ fn setup(alloc: std.mem.Allocator, use_tls: bool) !SetupCtx {
 /// pass .none, the DANE/PKIX tests pass .dane_first with (or without)
 /// TLSA records injected through the session's test seam.
 fn setupPolicy(alloc: std.mem.Allocator, use_tls: bool, tls_policy: tls_mod.VerifyMode, dane_records: []const dns_mod.TlsaRecord) !SetupCtx {
+    return setupPolicyNamed(alloc, use_tls, "localhost", tls_policy, dane_records);
+}
+
+/// setupPolicy with an explicit stream domain, for the DANE name-check
+/// vectors: the peer must be dialed as a name its certificate does not carry.
+fn setupPolicyNamed(
+    alloc: std.mem.Allocator,
+    use_tls: bool,
+    domain: []const u8,
+    tls_policy: tls_mod.VerifyMode,
+    dane_records: []const dns_mod.TlsaRecord,
+) !SetupCtx {
     cur_mutex.lock();
     cur_outcome = .{};
     cur_stanzas.clearRetainingCapacity();
@@ -333,7 +347,7 @@ fn setupPolicy(alloc: std.mem.Allocator, use_tls: bool, tls_policy: tls_mod.Veri
         return error.Socketpair;
 
     const idx = try engine.attachFd(fds[0], .{
-        .domain = "localhost",
+        .domain = domain,
         .user = "alice",
         .password = "pass1",
         .resource = "smoke",
@@ -1016,12 +1030,14 @@ test "socketpair: partial writes under a tiny send buffer all arrive" {
 // ---------------------------------------------------------------------------
 
 const TlsServer = struct {
-    tmp: std.testing.TmpDir,
+    /// Only set when this rig owns a tmp dir (the embedded-cert case); a
+    /// caller-generated rig owns its directory and passes an empty one.
+    tmp: ?std.testing.TmpDir,
     server_ctx: ssl_mod.SslContext,
 
     fn deinit(self: *TlsServer) void {
         self.server_ctx.deinit();
-        self.tmp.cleanup();
+        if (self.tmp) |*t| t.cleanup();
     }
 };
 
@@ -1050,6 +1066,34 @@ fn makeTlsServer(alloc: std.mem.Allocator) !TlsServer {
     defer alloc.free(key_path);
     return .{ .tmp = tmp, .server_ctx = try ssl_mod.SslContext.initServer(cert_path, key_path) };
 }
+
+/// As `makeTlsServer`, over a cert/key pair the caller generated (the DANE
+/// chain rigs, which need a CA the client's TLSA record can name).
+fn makeTlsServerFrom(alloc: std.mem.Allocator, dir: std.fs.Dir) !TlsServer {
+    const cert_pre = try dir.realpathAlloc(alloc, "cert.pem");
+    defer alloc.free(cert_pre);
+    const key_pre = try dir.realpathAlloc(alloc, "key.pem");
+    defer alloc.free(key_pre);
+    const cert_path = try alloc.dupeZ(u8, cert_pre);
+    defer alloc.free(cert_path);
+    const key_path = try alloc.dupeZ(u8, key_pre);
+    defer alloc.free(key_path);
+    return .{ .tmp = null, .server_ctx = try ssl_mod.SslContext.initServer(cert_path, key_path) };
+}
+
+/// SHA-256 of the whole cert, as a TLSA 3 0 1 association.
+fn testCertSha256(buf: *[32]u8, der: []const u8) []const u8 {
+    std.crypto.hash.sha2.Sha256.hash(der, buf, .{});
+    return buf;
+}
+
+/// SHA-256 of the cert's SubjectPublicKeyInfo, as a TLSA 3 1 1 association.
+fn testSpkiSha256(buf: *[32]u8, der: []const u8) ![]const u8 {
+    const spki = try dane_mod.extractSpki(der);
+    std.crypto.hash.sha2.Sha256.hash(spki, buf, .{});
+    return buf;
+}
+
 
 /// Base64-decode the embedded throwaway cert's DER (association data for
 /// the DANE tests' TLSA records).
@@ -1203,9 +1247,9 @@ test "socketpair: DANE-EE TLSA match authenticates the TLS peer" {
     // TLSA 3 0 1: DANE-EE, full cert, SHA-256 of the throwaway cert's DER.
     var der_buf: [4096]u8 = undefined;
     const der = try testCertDer(&der_buf);
-    const fp = tls_mod.CertFingerprint.fromDer(der);
+    var hash_buf: [32]u8 = undefined;
     const records = [_]dns_mod.TlsaRecord{
-        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = &fp.full },
+        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, der) },
     };
 
     var ctx = try setupPolicy(alloc, true, .dane_first, &records);
@@ -1231,10 +1275,10 @@ test "socketpair: DANE-EE TLSA SPKI (selector 1) match authenticates the TLS pee
     // cert-rotation-friendly records.
     var der_buf: [4096]u8 = undefined;
     const der = try testCertDer(&der_buf);
-    const fp = tls_mod.CertFingerprint.fromDer(der);
-    try std.testing.expect(fp.spki_der.len > 0);
+    var hash_buf: [32]u8 = undefined;
+    const spki_hash = try testSpkiSha256(&hash_buf, der);
     const records = [_]dns_mod.TlsaRecord{
-        .{ .usage = 3, .selector = 1, .matching_type = 1, .association_data = &fp.spki },
+        .{ .usage = 3, .selector = 1, .matching_type = 1, .association_data = spki_hash },
     };
 
     var ctx = try setupPolicy(alloc, true, .dane_first, &records);
@@ -1264,11 +1308,13 @@ test "socketpair: DANE mismatch fails closed" {
     var ctx = try setupPolicy(alloc, true, .dane_first, &records);
     defer teardown(alloc, &ctx.rig, ctx.engine);
 
-    try driveTlsUpgrade(&server, &ctx.rig, false);
+    // DANE now runs inside the handshake, so the client aborts it and the
+    // server side sees the alert: tolerate that here.
+    try driveTlsUpgrade(&server, &ctx.rig, true);
     defer if (ctx.rig.tls_conn) |*t| t.deinit();
 
-    // The client must refuse the moment the handshake completes — before
-    // any post-TLS traffic.
+    // The client must refuse before any post-TLS traffic: the handshake
+    // itself carries the verdict, so it never establishes.
     const out = waitTerminal(5000);
     try std.testing.expect(!out.established);
     try std.testing.expect(out.failed);
@@ -1292,6 +1338,166 @@ test "socketpair: no TLSA falls back to PKIX and rejects the self-signed rig cer
     try std.testing.expect(!out.established);
     try std.testing.expect(out.failed);
     try std.testing.expectEqualStrings("tls-handshake-failed", out.reason);
+}
+
+test "socketpair: DANE-TA match on a real chain authenticates the TLS peer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    // TLSA 2 0 1: DANE-TA over the issuing CA, not the leaf.
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, ca_der) },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
+
+    const out = waitTerminal(5000);
+    if (!out.established) std.debug.print("dane-ta not established: failed={} reason='{s}'\n", .{ out.failed, out.reason });
+    try std.testing.expect(out.established);
+    try std.testing.expectEqualStrings("alice@localhost/smoke", out.bound_jid);
+}
+
+test "socketpair: DANE refuses a forged anchor (case 6)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    // The record names the real CA and the peer presents it, but the leaf
+    // was signed by another key under the same subject DN. Only the
+    // signature check can tell them apart, so the handshake must die.
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, ca_der) },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
+}
+
+test "socketpair: the forged-anchor rig is otherwise a valid DANE peer" {
+    // Guard for the test above: rejection must come from the signature, not
+    // from a rig that presents the wrong bytes. The same server, authenticated
+    // as DANE-EE over the leaf it actually sends, must be accepted.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "leaf.pem");
+    defer alloc.free(leaf_der);
+    var hash_buf: [32]u8 = undefined;
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, leaf_der) },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(out.established);
+}
+
+test "socketpair: DANE-TA name mismatch on a matching anchor fails (vector 8)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, ca_der) },
+    };
+
+    // The TLSA record matches the issuing CA, so the anchor is right, but the
+    // stream is dialed as a domain the leaf does not carry. A DANE-TA match
+    // still runs the name check (RFC 7671 section 5.1).
+    var ctx = try setupPolicyNamed(alloc, true, "other.example", .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
+}
+
+test "socketpair: DANE-TA no match never falls back to PKIX (vector 23)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    const ca_hash = testCertSha256(&hash_buf, ca_der);
+
+    // A usable record over a different CA: the chain itself is well formed,
+    // so only the failed TLSA match stands between the peer and the session.
+    // Nothing may quietly re-anchor it on traditional trust.
+    var other_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("not a certificate", &other_hash, .{});
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = &other_hash },
+    };
+    // Guard: the record above is not the CA's digest, so the test cannot pass
+    // by accidentally matching.
+    try std.testing.expect(!std.mem.eql(u8, ca_hash, &other_hash));
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
 }
 
 // ---------------------------------------------------------------------------

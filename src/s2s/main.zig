@@ -45,6 +45,7 @@ const SslContext = ssl.SslContext;
 const SslConn = ssl.SslConn;
 const dns = @import("dns");
 const dns_async = @import("dns_async");
+const test_support = @import("test_support");
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
@@ -119,6 +120,21 @@ pub const S2sDaemon = struct {
     /// TLS context for outbound connections (client-side).
     tls_client_ctx: ?SslContext = null,
 
+    /// TLS context for outbound connections that verify through DANE. Built
+    /// lazily; the TLSA match is the only accepted anchor and our own
+    /// certificate is still presented for SASL EXTERNAL.
+    tls_client_ctx_dane: ?SslContext = null,
+
+    /// Paths of our own certificate and key, kept so the DANE client context
+    /// can be built on first use. Empty when none was configured.
+    cert_path: ?[:0]const u8 = null,
+    key_path: ?[:0]const u8 = null,
+
+    /// DANE verification context for inbound peers, whose domain is known
+    /// only after the TLS handshake. Built lazily; carries DANE settings and
+    /// an empty store, so it never falls back to traditional anchors.
+    dane_verify_ctx: ?SslContext = null,
+
     /// Inbound session table.
     inbound: [MAX_INBOUND_SESSIONS]?*S2sSession = [_]?*S2sSession{null} ** MAX_INBOUND_SESSIONS,
     /// Per-session XML readers (parallel to inbound table).
@@ -141,10 +157,9 @@ pub const S2sDaemon = struct {
     /// served locally even though it is a different domain.
     muc_host: ?[]const u8 = null,
 
-    /// Test seam (T277 regression): when set, performOutboundDane
-    /// applies this verdict without a TLSA query or chain verification, so
-    /// the DANE-failed teardown path can run without live DNS and TLS.
-    /// Always null in production.
+    /// Test seam (T277 regression): when set, recordOutboundDane applies this
+    /// verdict instead of reading the handshake's, so the DANE-failed teardown
+    /// path can run without live DNS and TLS. Always null in production.
     dane_verdict_override: ?connector_mod.DaneStatus = null,
 
     /// Inbound listener port.
@@ -222,6 +237,8 @@ pub const S2sDaemon = struct {
         self.resolver.deinit();
         if (self.tls_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
+        if (self.tls_client_ctx_dane) |*ctx| ctx.deinit();
+        if (self.dane_verify_ctx) |*ctx| ctx.deinit();
         self.ipc.deinit();
         self.allocator.destroy(self.ipc);
 
@@ -1027,6 +1044,9 @@ pub fn main() !void {
         log.err("failed to initialize client TLS context: {}", .{err});
         return err;
     };
+    // The DANE client context is built on first use from the same pair.
+    daemon.cert_path = cert_path;
+    daemon.key_path = key_path;
 
     // Start inbound listener (from pre-bound fd or bind ourselves)
     if (listen_fd) |fd| {
@@ -2485,28 +2505,133 @@ fn processOutboundEvent(
 }
 
 /// Start an outbound TLS handshake using the client context.
+///
+/// The TLSA lookup runs here, before the SSL object exists: with records in
+/// hand the handshake itself verifies through DANE and fails closed, so there
+/// is no post-handshake window in which an unverified peer could be spoken to.
 fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
-    const ctx = daemon.tls_client_ctx orelse {
-        conn.fail("no-client-tls-context");
-        daemon.closeOutbound(batch, slot);
-        return;
-    };
-
-    conn.upgradeToTls(ctx) catch {
-        conn.fail("tls-init-failed");
-        daemon.closeOutbound(batch, slot);
-        return;
-    };
+    if (armOutboundDane(daemon, conn)) {
+        const dane_ctx = daneClientCtx(daemon) orelse {
+            conn.fail("no-dane-tls-context");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        conn.upgradeToTls(dane_ctx) catch {
+            conn.fail("tls-init-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        // DANE must be armed before the first handshake step; SSL_dane_enable
+        // afterwards cannot influence this handshake.
+        const state = if (conn.dane_state) |*s| s else unreachable;
+        const tls = if (conn.tls_conn) |*t| t else {
+            conn.fail("tls-init-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        conn.dane_prepared = tls.prepareDane(state) catch {
+            log.err("outbound {s}: cannot arm DANE", .{conn.remote_domain});
+            conn.fail("dane-arm-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+    } else {
+        const ctx = daemon.tls_client_ctx orelse {
+            conn.fail("no-client-tls-context");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        conn.upgradeToTls(ctx) catch {
+            conn.fail("tls-init-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+    }
 
     conn.state = .tls_handshake;
     continueOutboundTls(daemon, batch, slot, conn);
 }
 
+/// The DANE-verifying client context, built on first use. Returns a copy of
+/// the context handle: the daemon owns the pointer and frees it at deinit.
+fn daneClientCtx(daemon: *S2sDaemon) ?SslContext {
+    if (daemon.tls_client_ctx_dane == null) {
+        const cert: ?[*:0]const u8 = if (daemon.cert_path) |p| p.ptr else null;
+        const key: ?[*:0]const u8 = if (daemon.key_path) |p| p.ptr else null;
+        daemon.tls_client_ctx_dane = SslContext.initClientDaneWithCert(cert, key) catch |err| {
+            log.err("cannot initialize DANE client TLS context: {}", .{err});
+            return null;
+        };
+    }
+    return daemon.tls_client_ctx_dane;
+}
+
+/// Query the peer's TLSA records and build the connection's DANE state.
+///
+/// Returns true only when at least one usable record survived, which is the
+/// only case in which the handshake can authenticate the peer. No records,
+/// an empty usable set, or a failed lookup all leave the connection with no
+/// DANE state: the stream then proceeds unauthenticated and the peer must
+/// prove itself by dialback.
+fn armOutboundDane(daemon: *S2sDaemon, conn: *OutboundConnection) bool {
+    // Test seam (T277 regression): the forced verdict stands in for the
+    // handshake result, so no live lookup and no DANE context is used.
+    if (daemon.dane_verdict_override != null) return false;
+
+    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, conn.target_port, conn.target_host) catch |err| {
+        log.warn("TLSA query failed for {s}:{d}: {}", .{ conn.target_host, conn.target_port, err });
+        return false;
+    };
+    defer {
+        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
+        if (tlsa_records.len > 0) daemon.allocator.free(tlsa_records);
+    }
+    if (tlsa_records.len == 0) {
+        log.info("no TLSA records for {s}:{d} — will use dialback", .{ conn.target_host, conn.target_port });
+        return false;
+    }
+
+    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch {
+        log.warn("out of memory converting TLSA for {s}", .{conn.remote_domain});
+        return false;
+    };
+    defer daemon.allocator.free(records);
+
+    // RFC 7673 section 4: the service domain and the SRV target it resolved
+    // to are both valid reference identifiers. The first entry is also the
+    // SNI value, so the service domain leads.
+    var names_buf: [2][]const u8 = undefined;
+    var names_len: usize = 0;
+    names_buf[names_len] = conn.remote_domain;
+    names_len += 1;
+    if (!std.mem.eql(u8, conn.target_host, conn.remote_domain)) {
+        names_buf[names_len] = conn.target_host;
+        names_len += 1;
+    }
+
+    conn.dane_state = ssl.initDane(daemon.allocator, .{ .names = names_buf[0..names_len] }, records) catch {
+        log.warn("outbound {s}: cannot build DANE state", .{conn.remote_domain});
+        return false;
+    };
+    if (conn.dane_state.?.set.len() == 0) {
+        log.info("TLSA for {s}:{d} held no usable record — will use dialback", .{ conn.target_host, conn.target_port });
+        conn.dane_state.?.deinit();
+        conn.dane_state = null;
+        return false;
+    }
+    return true;
+}
+
 /// Continue a non-blocking outbound TLS handshake.
 fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
     const complete = conn.continueHandshake() catch {
+        // A DANE-armed handshake fails at the certificate step; report which
+        // record or chain rule rejected the peer rather than a bare alert.
+        if (conn.dane_state != null) {
+            logDaneHandshakeFailure(conn);
+        }
         log.err("outbound TLS handshake failed for {s}", .{conn.remote_domain});
-        conn.fail("tls-handshake-failed");
+        conn.fail(if (conn.dane_state != null) "dane-verification-failed" else "tls-handshake-failed");
         daemon.closeOutbound(batch, slot);
         return;
     };
@@ -2529,10 +2654,10 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         conn.read_start = 0;
         conn.read_end = 0;
 
-        // DANE verification. performOutboundDane may closeOutbound (frees
-        // conn and clears the slot): read the slot table afterwards, never
-        // the possibly-freed pointer (T277).
-        performOutboundDane(daemon, batch, slot, conn);
+        // DANE verification. This may closeOutbound (frees conn and clears
+        // the slot): read the slot table afterwards, never the possibly-freed
+        // pointer (T277).
+        recordOutboundDane(daemon, batch, slot, conn);
 
         // If DANE failed, connection was closed
         if (daemon.outbound[slot] == null) return;
@@ -2570,10 +2695,24 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
     }
 }
 
-/// Perform DANE verification after outbound TLS handshake.
-fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
-    // Test seam: a forced verdict skips the live TLSA query and chain
-    // verification (T277 regression rig); production leaves it null.
+/// Log why a DANE handshake was rejected. OpenSSL leaves the verification
+/// result on the SSL after a failed handshake, so the named failure survives.
+fn logDaneHandshakeFailure(conn: *OutboundConnection) void {
+    const state = if (conn.dane_state) |*s| s else return;
+    const tls = if (conn.tls_conn) |*t| t else return;
+    const v = tls.daneVerdict(conn.dane_prepared, state);
+    log.warn("DANE rejected outbound handshake to {s}: {s}", .{
+        conn.remote_domain,
+        @tagName(v.failure orelse .backend_error),
+    });
+}
+
+/// Read the handshake's verification state and set the connection's DANE
+/// result. Nothing reaches the wire before this runs: the handshake already
+/// failed if a TLSA record did not match.
+fn recordOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
+    // Test seam: a forced verdict stands in for the handshake result
+    // (T277 regression rig); production leaves it null.
     if (daemon.dane_verdict_override) |verdict| {
         conn.setDaneResult(verdict);
         if (conn.isFailed()) {
@@ -2581,8 +2720,6 @@ fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         }
         return;
     }
-
-    const dane_mod = @import("dane.zig");
 
     // The connected target carries its own TLSA result, fetched during
     // resolution (X2b): no DNS runs at handshake time. A lookup_failed
@@ -2604,63 +2741,53 @@ fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         },
         .present => {},
     }
-    const tlsa_records = target.tlsa;
 
-    // Extract peer certificate chain from TLS connection
-    if (conn.tls_conn) |*tls| {
-        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        if (leaf_der == null) {
-            log.warn("no peer certificate for {s}", .{conn.remote_domain});
-            conn.setDaneResult(.no_records);
-            return;
-        }
-        defer daemon.allocator.free(leaf_der.?);
-
-        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        defer {
-            for (chain_der) |cert| daemon.allocator.free(cert);
-            daemon.allocator.free(chain_der);
-        }
-
-        // Convert dns.TlsaRecord → dane.DnsTlsaRecord for the bridge
-        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        defer daemon.allocator.free(dane_records);
-        for (tlsa_records, 0..) |rec, i| {
-            dane_records[i] = .{
-                .usage = rec.usage,
-                .selector = rec.selector,
-                .matching_type = rec.matching_type,
-                .association_data = rec.association_data,
-            };
-        }
-
-        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
-        log.info("DANE result for {s}: {s}", .{
-            conn.remote_domain,
-            switch (status) {
-                .verified => "verified",
-                .no_records => "no-records",
-                .failed => "FAILED",
-                .pending => "pending",
-            },
-        });
-        conn.setDaneResult(status);
-
-        if (conn.isFailed()) {
-            daemon.closeOutbound(batch, slot);
-        }
-    } else {
+    const state = if (conn.dane_state) |*s| s else {
         conn.setDaneResult(.no_records);
+        return;
+    };
+    const tls = if (conn.tls_conn) |*t| t else {
+        conn.setDaneResult(.no_records);
+        return;
+    };
+
+    const status: connector_mod.DaneStatus = switch (tls.daneVerdict(conn.dane_prepared, state).outcome) {
+        .verified => .verified,
+        .no_usable_records => .no_records,
+        .failed => blk: {
+            logDaneHandshakeFailure(conn);
+            break :blk .failed;
+        },
+    };
+    log.info("DANE result for {s}: {s}", .{
+        conn.remote_domain,
+        switch (status) {
+            .verified => "verified",
+            .no_records => "no-records",
+            .failed => "FAILED",
+            .pending => "pending",
+        },
+    });
+    conn.setDaneResult(status);
+    if (conn.isFailed()) {
+        daemon.closeOutbound(batch, slot);
     }
+}
+
+/// Convert transport TLSA records into `ssl.DaneRecord`. Both carry the raw
+/// wire fields, so this is a field copy; out-of-range values stay, and the
+/// module drops them in `RecordSet.init` through `Record.isUsable`.
+fn convertTlsaRecords(alloc: std.mem.Allocator, tlsa_records: []const dns.TlsaRecord) ![]ssl.DaneRecord {
+    const records = try alloc.alloc(ssl.DaneRecord, tlsa_records.len);
+    for (tlsa_records, 0..) |rec, i| {
+        records[i] = .{
+            .usage = rec.usage,
+            .selector = rec.selector,
+            .matching_type = rec.matching_type,
+            .data = rec.association_data,
+        };
+    }
+    return records;
 }
 
 /// Kick the async DANE lookup for an inbound S2S session after the
@@ -2877,36 +3004,45 @@ fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.T
     handleInboundReadable(self, batch, session.id);
 }
 
-/// Extract the peer chain and verify it against the session's stored
-/// TLSA records; identical semantics to the old blocking path.
-fn verifyInboundDane(daemon: *S2sDaemon, session: *S2sSession) bool {
-    const dane_mod = @import("dane.zig");
-    const tls = &(session.tls_conn orelse return false);
-
-    const leaf_der = tls.getPeerCertDer(daemon.allocator) catch return false;
-    if (leaf_der == null) return false;
-    defer daemon.allocator.free(leaf_der.?);
-
-    const chain_der = tls.getPeerChainDer(daemon.allocator) catch return false;
-    defer {
-        for (chain_der) |cert| daemon.allocator.free(cert);
-        daemon.allocator.free(chain_der);
-    }
-
-    const tlsa_records = session.dane_tlsa_records;
-    var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch return false;
-    defer daemon.allocator.free(dane_records);
-    for (tlsa_records, 0..) |rec, i| {
-        dane_records[i] = .{
-            .usage = rec.usage,
-            .selector = rec.selector,
-            .matching_type = rec.matching_type,
-            .association_data = rec.association_data,
+/// Verify an inbound peer against the TLSA records DANE resolved for its
+/// domain. Null means DANE could not run at all (no usable record, no
+/// verification context, no TLS connection); the caller keeps dialback.
+///
+/// The peer chain is already on the live connection, so the same
+/// `X509_verify_cert` path the outbound handshake uses runs in place. That
+/// work runs on the loop thread today; plan section 4 moves it to the
+/// handshake pool with ADR-11/F7.
+fn verifyInboundPeer(daemon: *S2sDaemon, session: *S2sSession, tlsa_records: []const dns.TlsaRecord) ?ssl.DaneVerdict {
+    if (daemon.dane_verify_ctx == null) {
+        daemon.dane_verify_ctx = SslContext.initDaneVerifier() catch |err| {
+            log.warn("inbound: cannot build DANE verifier context: {}", .{err});
+            return null;
         };
     }
+    const verify_ctx = if (daemon.dane_verify_ctx) |*c| c else return null;
+    const tls = if (session.tls_conn) |*t| t else return null;
 
-    const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
-    return status == .verified;
+    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch return null;
+    defer daemon.allocator.free(records);
+
+    // The stream's from-domain is the only identifier known before the
+    // session authenticates; the SRV target is not ours to assume inbound.
+    var names_buf: [1][]const u8 = undefined;
+    names_buf[0] = session.daneDomain();
+    var state = ssl.initDane(daemon.allocator, .{ .names = &names_buf }, records) catch |err| {
+        log.warn("inbound {s}: cannot build DANE state: {}", .{ session.daneDomain(), err });
+        return null;
+    };
+    defer state.deinit();
+    if (state.set.len() == 0) return null;
+
+    return tls.verifyPeerDane(verify_ctx, &state);
+}
+
+/// True only for a verified peer; every other outcome keeps dialback.
+fn verifyInboundDane(daemon: *S2sDaemon, session: *S2sSession) bool {
+    const verdict = verifyInboundPeer(daemon, session, session.dane_tlsa_records) orelse return false;
+    return verdict.outcome == .verified;
 }
 
 // ============================================================================
@@ -4080,27 +4216,423 @@ fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeL
     processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
 }
 
-// --- T277 regression rig: real TLS handshake over loopback ----------
+// --- DANE handshake rigs: real TLS over loopback ---------------------
 
-/// Self-signed throwaway cert for "localhost" via the openssl CLI (no key
-/// material in the tree). error.SkipZigTest when the tool is missing.
-/// openssl writes key-generation progress to stderr, which can exceed a
-/// small output cap under load, so allow generous room for it.
-fn genS2sTestCert(dir: std.fs.Dir) !void {
-    const r = std.process.Child.run(.{
-        .allocator = std.testing.allocator,
-        .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
-        .cwd_dir = dir,
-        .max_output_bytes = 64 * 1024,
-    }) catch return error.SkipZigTest;
-    defer std.testing.allocator.free(r.stdout);
-    defer std.testing.allocator.free(r.stderr);
-    switch (r.term) {
-        .Exited => |code| {
-            if (code != 0) return error.SkipZigTest;
-        },
-        else => return error.SkipZigTest,
+/// Outcome of a driven outbound handshake: the connection (whose DANE state
+/// stays owned by the pool), whether the handshake finished, and the verdict
+/// read before that state is torn down.
+const TestDaneResult = struct {
+    conn: *OutboundConnection,
+    completed: bool,
+    verdict: ?ssl.DaneVerdict,
+};
+
+/// Drive a real outbound handshake with DANE armed from `records`, the way
+/// `startOutboundTls` does after its TLSA lookup. Returns whether the
+/// handshake completed; on completion the caller reads the DANE result.
+///
+/// The records come from the test, not from DNS, so the TLSA lookup itself is
+/// out of scope here; everything downstream of it (arming, the in-handshake
+/// verification, the verdict) is the production path. `cert_dir` holds the
+/// cert and key the loopback peer presents, so a test can build its TLSA
+/// record from the exact certificate the peer will send.
+fn runTestDaneHandshake(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    records: []const ssl.DaneRecord,
+) !TestDaneResult {
+    return runTestDaneHandshakeNamed(daemon, cert_dir, &.{"us.example"}, records);
+}
+
+/// Give a test connection the target X2b would have adopted from a
+/// resolution: the TLSA records the test supplied, marked `.present`, so
+/// `curTarget().tlsa_status` reads as a peer that published an RRset.
+fn adoptTestTarget(conn: *OutboundConnection, records: []const ssl.DaneRecord) !void {
+    const alloc = conn.alloc;
+    const tlsa = try alloc.alloc(dns.TlsaRecord, records.len);
+    for (records, 0..) |r, i| {
+        tlsa[i] = .{
+            .usage = r.usage,
+            .selector = r.selector,
+            .matching_type = r.matching_type,
+            .association_data = try alloc.dupe(u8, r.data),
+        };
     }
+    const targets = try alloc.alloc(dns_async.Target, 1);
+    targets[0] = .{
+        .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5269),
+        .host = try alloc.dupe(u8, "localhost"),
+        .tlsa = tlsa,
+        .tlsa_status = .present,
+        .is_direct_tls = true,
+    };
+    conn.adoptTargets(targets);
+}
+
+/// As `runTestDaneHandshake`, with the reference identifiers spelled out so a
+/// test can name the peer certificate's own name (a DANE-TA match runs the
+/// name check, RFC 7671 section 5.1, unlike DANE-EE).
+fn runTestDaneHandshakeNamed(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    names: []const []const u8,
+    records: []const ssl.DaneRecord,
+) !TestDaneResult {
+    const alloc = daemon.allocator;
+    try initTestTlsContextsFrom(daemon, cert_dir);
+
+    const fds = try makeS2sTestTcpPair();
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    try adoptTestTarget(conn, records);
+    conn.tls_conn = try SslConn.initClient(daemon.tls_client_ctx_dane.?, fds[0], "localhost");
+
+    // DANE is armed from the connection's own state so there is exactly one
+    // owner of the arena: the connection frees it at deinit.
+    conn.dane_state = try ssl.initDane(alloc, .{ .names = names }, records);
+    conn.dane_prepared = try conn.tls_conn.?.prepareDane(&conn.dane_state.?);
+
+    var completed = false;
+    var peer_done = false;
+    var failed = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!completed and !failed and std.time.milliTimestamp() < deadline) {
+        // Drive the peer first: the client's next step is usually a read the
+        // peer must satisfy.
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch {
+                failed = true;
+                break;
+            }) == .complete;
+        }
+        completed = conn.continueHandshake() catch {
+            failed = true;
+            break;
+        };
+    }
+    // Read the verdict while the state is still alive: after a failed
+    // handshake it carries the named reason, and after a successful one it
+    // is what the production path records.
+    const verdict: ?ssl.DaneVerdict = if (conn.tls_conn) |*tls| tls.daneVerdict(conn.dane_prepared, &conn.dane_state.?) else null;
+    return .{ .conn = conn, .completed = completed, .verdict = verdict };
+}
+
+test "S2sDaemon: outbound DANE accepts a handshake matching the TLSA record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // DANE-EE, Full selector: the association data is the certificate itself.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(result.completed);
+    // A completed DANE handshake names the record that authenticated the peer.
+    try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ee, result.verdict.?.matched.?.usage);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.outbound[0] = result.conn;
+    recordOutboundDane(&daemon, &cl, 0, result.conn);
+    try std.testing.expect(daemon.outbound[0] != null);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, result.conn.dane_status);
+}
+
+test "S2sDaemon: outbound DANE refuses a TLSA digest that fits no certificate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Well-formed but wrong: a usable SHA-256 record over different bytes.
+    // An unusable record would only exercise the fallback path.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(leaf_der, &digest, .{});
+    digest[0] ^= 0xFF;
+
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(!result.completed);
+    try std.testing.expectEqual(ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match }, result.verdict.?);
+}
+
+test "S2sDaemon: outbound DANE admits a DANE-TA record for the issuing CA" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // TLSA 2 0 0: DANE-TA over the full CA cert. The peer presents
+    // [leaf, CA], so the anchor sits at depth 1. Unlike DANE-EE, a DANE-TA
+    // match still runs the name check (RFC 7671 section 5.1), so the
+    // reference identifier has to be the leaf's own name.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = ca_der,
+    }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"localhost"}, &tlsa);
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ta, result.verdict.?.matched.?.usage);
+}
+
+test "S2sDaemon: outbound DANE refuses a forged anchor (case 6)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // The record names the real CA and is usable, so the only way to pass
+    // is for the chain to validate: the attacker leaf claims the real CA as
+    // its issuer but is signed by another key, so the signature check fails.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = ca_der,
+    }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"localhost"}, &tlsa);
+    try std.testing.expect(!result.completed);
+    // A matching anchor whose chain fails is a signature failure, never a
+    // silent fallback to traditional anchors.
+    try std.testing.expectEqual(ssl.Outcome.failed, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Failure.signature_invalid, result.verdict.?.failure.?);
+}
+
+test "S2sDaemon: a DANE-TA record never authenticates the leaf" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A DANE-TA record names an anchor above the leaf. The peer presents a
+    // self-signed leaf only, so nothing sits above it to match.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(!result.completed);
+    // The record is usable but matches nothing in the presented chain; that
+    // is a plain no-match, never a silent fallback to traditional anchors.
+    try std.testing.expectEqual(ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match }, result.verdict.?);
+}
+
+test "S2sDaemon: inbound DANE rejects a peer whose TLSA names another cert" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const forged = try alloc.dupe(u8, leaf_der);
+    defer alloc.free(forged);
+    forged[forged.len - 1] ^= 0xFF;
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = forged,
+    }};
+
+    try std.testing.expectEqual(
+        ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match },
+        (try runTestInboundDane(&daemon, tmp.dir, "them.example", &tlsa)).?,
+    );
+}
+
+test "S2sDaemon: inbound DANE accepts a peer whose TLSA matches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = leaf_der,
+    }};
+
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "them.example", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ee, verdict.matched.?.usage);
+}
+
+test "S2sDaemon: inbound DANE refuses a forged anchor (case 6)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Same rig as the outbound case: the peer's TLSA names the real CA and
+    // the presented chain claims it, but the leaf was signed by another key.
+    // Inbound verification has no handshake to fail, so the rejection is the
+    // only thing standing between the peer and the dialback fallback: it must
+    // be a signature failure, not a missing record.
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = ca_der,
+    }};
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.failed, verdict.outcome);
+    try std.testing.expectEqual(ssl.Failure.signature_invalid, verdict.failure.?);
+}
+
+test "S2sDaemon: the forged-anchor rig is otherwise a valid DANE peer" {
+    // Guard for the two forged-anchor tests: they must fail on the signature,
+    // not on a rig that presents the wrong bytes. Against a DANE-EE record
+    // over the leaf it actually sends, the same peer verifies in both
+    // directions.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "leaf.pem");
+    defer alloc.free(leaf_der);
+
+    // Outbound: the module's DANE-EE record over the presented leaf.
+    {
+        var daemon = try S2sDaemon.init(alloc, "us.example");
+        defer daemon.deinit();
+
+        const tlsa = [_]ssl.DaneRecord{.{ .usage = 3, .selector = 0, .matching_type = 0, .data = leaf_der }};
+        const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+        try std.testing.expect(result.completed);
+        try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    }
+
+    // Inbound: the same leaf as wire-format TLSA data.
+    {
+        var daemon = try S2sDaemon.init(alloc, "us.example");
+        defer daemon.deinit();
+
+        const tlsa = [_]dns.TlsaRecord{.{ .usage = 3, .selector = 0, .matching_type = 0, .association_data = leaf_der }};
+        const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+        try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    }
+}
+
+/// Drive a real inbound handshake and run `verifyInboundPeer` on the
+/// resulting server-side connection, the way `performInboundDane` does once
+/// the stream header names the peer domain. `tlsa_records` stands in for the
+/// TLSA lookup, which is out of scope here. Null means DANE did not run.
+fn runTestInboundDane(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    remote_domain: []const u8,
+    tlsa_records: []const dns.TlsaRecord,
+) !?ssl.DaneVerdict {
+    const alloc = std.testing.allocator;
+    try initTestTlsContextsFrom(daemon, cert_dir);
+
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    // The inbound side requests the peer's certificate (SSL_VERIFY_PEER in
+    // initServer), so the peer must present one.
+    var peer_ctx = try SslContext.initClientWithCert(cert_path, key_path);
+    defer peer_ctx.deinit();
+    peer_ctx.disableKtls();
+
+    const fds = try makeS2sTestTcpPair();
+    var peer = try SslConn.initClient(peer_ctx, fds[1], "localhost");
+    defer {
+        peer.shutdown();
+        peer.deinit();
+        posix.close(fds[1]);
+    }
+
+    var session = S2sSession.init(fds[0], 0, daemon.local_domain);
+    defer session.deinit();
+    session.tls_conn = SslConn.init(daemon.tls_ctx.?, fds[0]) catch |err| {
+        posix.close(fds[0]);
+        session.closed = true;
+        return err;
+    };
+    try completeTestTlsHandshake(&peer, &session.tls_conn.?);
+
+    session.setDaneCandidate(remote_domain);
+    return verifyInboundPeer(daemon, &session, tlsa_records);
 }
 
 /// Connected non-blocking TCP loopback pair (AF_UNIX socketpairs do not
@@ -4137,7 +4669,7 @@ fn makeS2sTestTcpPair() ![2]posix.fd_t {
 test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)" {
     // Poison-on-free makes any post-closeOutbound read of the conn visible.
     // The caller must consult the slot table (daemon.outbound[slot]), never
-    // the conn pointer performOutboundDane may have freed. The verdict
+    // the conn pointer recordOutboundDane may have freed. The verdict
     // override is the test seam; everything else is the real
     // handshake-complete path.
     var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
@@ -4150,7 +4682,7 @@ test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    genS2sTestCert(tmp.dir) catch return error.SkipZigTest;
+    try test_support.genSelfSigned(alloc, tmp.dir);
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
     const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
@@ -4221,21 +4753,39 @@ fn ensureTestTlsContexts(daemon: *S2sDaemon) !void {
     if (daemon.tls_ctx != null and daemon.tls_client_ctx != null) return;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    genS2sTestCert(tmp.dir) catch return error.SkipZigTest;
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(base);
-    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
-    defer std.testing.allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
-    defer std.testing.allocator.free(key_path);
-    var server_ctx = try SslContext.initServer(cert_path, key_path);
-    errdefer server_ctx.deinit();
-    server_ctx.disableKtls();
-    var client_ctx = try SslContext.initClient();
-    errdefer client_ctx.deinit();
-    client_ctx.disableKtls();
-    daemon.tls_ctx = server_ctx;
-    daemon.tls_client_ctx = client_ctx;
+    try test_support.genSelfSigned(std.testing.allocator, tmp.dir);
+    try initTestTlsContextsFrom(daemon, tmp.dir);
+}
+
+/// Build the loopback rig's contexts: a server context from `cert_dir`, the
+/// plain client context, and the DANE client context the outbound path uses.
+fn initTestTlsContextsFrom(daemon: *S2sDaemon, cert_dir: std.fs.Dir) !void {
+    const alloc = std.testing.allocator;
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    if (daemon.tls_ctx == null) {
+        var server_ctx = try SslContext.initServer(cert_path, key_path);
+        errdefer server_ctx.deinit();
+        server_ctx.disableKtls();
+        daemon.tls_ctx = server_ctx;
+    }
+    if (daemon.tls_client_ctx == null) {
+        var client_ctx = try SslContext.initClient();
+        errdefer client_ctx.deinit();
+        client_ctx.disableKtls();
+        daemon.tls_client_ctx = client_ctx;
+    }
+    if (daemon.tls_client_ctx_dane == null) {
+        var dane_ctx = try SslContext.initClientDaneWithCert(null, null);
+        errdefer dane_ctx.deinit();
+        dane_ctx.disableKtls();
+        daemon.tls_client_ctx_dane = dane_ctx;
+    }
 }
 
 /// Drive both ends of a non-blocking TLS handshake to completion.
