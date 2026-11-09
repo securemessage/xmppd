@@ -2335,12 +2335,14 @@ test "Conn: an event with a stale ctx generation is dropped at the table" {
 test "ConnList: FIFO order, unlink preserves the rest, fuzz invariants" {
     const alloc = std.testing.allocator;
     var conns: [8]Conn = undefined;
-    // ConnList only touches the link fields; initialize those alone so
-    // an undefined on_dirty in non-Debug builds cannot fake "linked".
+    // ConnList only touches the link fields plus torn_down (link refuses
+    // a torn-down conn); initialize those alone so an undefined field in
+    // non-Debug builds cannot fake "linked" or "torn down".
     for (&conns) |*c| {
         c.on_dirty = false;
         c.dirty_next = null;
         c.dirty_prev = null;
+        c.torn_down = false;
     }
     var list: ConnList = .{};
 
