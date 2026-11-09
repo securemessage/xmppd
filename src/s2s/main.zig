@@ -1145,73 +1145,86 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
 
     const reader = daemon.readers[slot] orelse return;
 
-    const n = session.recv() catch |err| {
-        switch (err) {
-            error.WouldBlock => return,
-            else => {
-                daemon.closeInbound(batch, slot);
-                return;
-            },
-        }
-    };
-
-    if (n == 0) {
-        daemon.closeInbound(batch, slot);
-        return;
-    }
-
-    // T250: while a <proceed/> is parked behind a partial flush, NO plaintext
-    // event may run: even one parsed event would cross the TLS record boundary
-    // as clear text. Any byte received while pending is a protocol error.
-    if (session.tls_upgrade_pending) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
-        sendStreamError(session, .policy_violation);
-        _ = session.flushWrite() catch {};
-        daemon.closeInbound(batch, slot);
-        return;
-    }
-
-    // Parse XML from the read buffer and drive the S2S stream FSM
-    const data = session.readableSlice();
-    var pos: usize = 0;
-
+    // Bytes left buffered by a mid-read DANE defer drain before any new
+    // socket data (X2b): the lookup's completion re-enters here and a
+    // WouldBlock recv must not strand them.
+    var recvd = false;
     while (true) {
-        // The item cap follows the stream's authentication state, checked
-        // before each item so a stanza that arrives in the same read as the
-        // auth that permits it is still accepted (H6).
-        reader.setMaxItemBytes(if (session.stream.isEstablished())
-            xml.max_item_bytes_authenticated
-        else
-            xml.max_item_bytes_pre_auth);
-        const event = reader.next(data, &pos) catch |err| {
-            log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
+        // T250: plaintext bytes on the wire while a <proceed/> is parked
+        // behind a partial flush are a protocol error, parsed or not.
+        if (session.tls_upgrade_pending and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // Parse XML from the read buffer and drive the S2S stream FSM
+        const data = session.readableSlice();
+        var pos: usize = 0;
+        var want_recv = data.len == 0;
+
+        while (!want_recv) {
+            // The item cap follows the stream's authentication state, checked
+            // before each item so a stanza that arrives in the same read as the
+            // auth that permits it is still accepted (H6).
+            reader.setMaxItemBytes(if (session.stream.isEstablished())
+                xml.max_item_bytes_authenticated
+            else
+                xml.max_item_bytes_pre_auth);
+            const event = reader.next(data, &pos) catch |err| {
+                log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
+                closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
+                return;
+            };
+            if (event == null) {
+                want_recv = true;
+                break;
+            }
+
+            processInboundEvent(daemon, session, reader, event.?, batch);
+
+            // Session may have been closed by processInboundEvent
+            if (daemon.getInbound(slot) == null) return;
+
+            // After STARTTLS, stop processing pre-TLS buffer: also when the
+            // upgrade merely pends behind a partially-flushed <proceed/> (T250).
+            if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
+            // A DANE lookup that just started defers the rest of this read:
+            // the unparsed tail stays buffered for the completion (X2b).
+            if (session.dane_lookup_pending) break;
+        }
+
+        // Mark consumed bytes
+        if (pos > 0) session.consume(pos);
+
+        // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
+        // mean the peer spoke before receiving it; they are a protocol error,
+        // never silently discarded at handshake completion.
+        if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // A lookup or handshake that started mid-read leaves the tail for
+        // the completion; a parked <proceed/> still takes the recv pass so
+        // plaintext arriving while pending trips the T250 check above.
+        if (session.isTlsHandshaking() or session.dane_lookup_pending) break;
+        if (!want_recv or recvd) break;
+        recvd = true;
+        const n = session.recv() catch |err| {
+            if (err == error.WouldBlock) break;
+            daemon.closeInbound(batch, slot);
             return;
         };
-        if (event == null) break;
-
-        processInboundEvent(daemon, session, reader, event.?, batch);
-
-        // Session may have been closed by processInboundEvent
-        if (daemon.getInbound(slot) == null) return;
-
-        // After STARTTLS, stop processing pre-TLS buffer: also when the
-        // upgrade merely pends behind a partially-flushed <proceed/> (T250).
-        if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
-    }
-
-    // Mark consumed bytes
-    if (pos > 0) session.consume(pos);
-
-    // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
-    // mean the peer spoke before receiving it; they are a protocol error,
-    // never silently discarded at handshake completion.
-    if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
-        sendStreamError(session, .policy_violation);
-        _ = session.flushWrite() catch {};
-        daemon.closeInbound(batch, slot);
-        return;
+        if (n == 0) {
+            daemon.closeInbound(batch, slot);
+            return;
+        }
     }
 
     // After SASL success, flush <success/> and drain any OpenSSL-buffered
@@ -6045,4 +6058,63 @@ test "S2sDaemon: the inbound DANE wait holds then releases read interest" {
             (ev.flags & std.c.EV.ADD) == 0) saw_enable = true;
     }
     try std.testing.expect(saw_enable);
+}
+
+test "S2sDaemon: bytes pipelined behind the post-TLS stream open wait for the DANE lookup" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    try ensureTestTlsContexts(&daemon);
+
+    // Bound but never answered: the chain stays in flight while the
+    // pipelined bytes must wait.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The post-TLS stream open only kicks the chain when tls_conn is
+    // set, so the session needs a real link on both ends.
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(daemon.tls_client_ctx.?, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+    in1.session.tls_state = .established;
+    in1.session.stream.state = .awaiting_stream_open_tls;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // One write carries the stream open and a db:verify behind it. The
+    // open starts the lookup; the verify must not parse while it runs.
+    const payload =
+        "<stream:stream xmlns='jabber:server' xmlns:db='jabber:server:dialback'" ++
+        " xmlns:stream='http://etherx.jabber.org/streams' from='them.example' to='us.example' version='1.0'>" ++
+        "<db:verify from='them.example' to='us.example' id='v1'>not-the-key</db:verify>";
+    const wr = try peer.write(payload);
+    try std.testing.expectEqual(@as(usize, payload.len), wr.ok);
+
+    handleInboundReadable(&daemon, &cl, 1);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    // The verify element is unparsed: only the stream-open reply was
+    // queued, and the pipelined bytes stay buffered for the completion.
+    const queued = in1.session.write_buf[in1.session.write_start..in1.session.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, queued, "db:verify") == null);
+    try std.testing.expect(in1.session.read_end > in1.session.read_start);
+
+    // Land the chain as absent; the completion sends the features and
+    // then parses the buffered verify exactly once.
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    _ = try in1.session.flushWrite();
+    var rbuf: [4096]u8 = undefined;
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
 }
