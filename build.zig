@@ -38,11 +38,19 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_mod.addImport("xml", xml_mod);
 
+    // Shared Unicode NFC engine + generated tables (lib/sasl and lib/precis).
+    const unicode_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sasl_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
         .target = target,
         .optimize = optimize,
     });
+    sasl_mod.addImport("unicode", unicode_mod);
 
     // T121: crypto offload thread pool (auth daemon, handler tests). Created
     // early because both binary and test module sections import it.
@@ -198,11 +206,31 @@ pub fn build(b: *std.Build) void {
     });
     xmpp_test_mod.addImport("xml", xml_mod);
 
+    const unicode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const precis_tables_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/precis/precis_tables.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const precis_username_mod = b.createModule(.{
+        .root_source_file = b.path("lib/precis/username.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    precis_username_mod.addImport("unicode", unicode_mod);
+
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
         .target = target,
         .optimize = optimize,
     });
+    sasl_test_mod.addImport("unicode", unicode_mod);
 
     const tls_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
@@ -272,6 +300,21 @@ pub fn build(b: *std.Build) void {
     const xmpp_tests = b.addTest(.{
         .name = "xmpp-tests",
         .root_module = xmpp_test_mod,
+    });
+
+    const unicode_tests = b.addTest(.{
+        .name = "unicode-tests",
+        .root_module = unicode_test_mod,
+    });
+
+    const precis_tables_tests = b.addTest(.{
+        .name = "precis-tables-tests",
+        .root_module = precis_tables_test_mod,
+    });
+
+    const precis_username_tests = b.addTest(.{
+        .name = "precis-username-tests",
+        .root_module = precis_username_mod,
     });
 
     const sasl_tests = b.addTest(.{
@@ -393,6 +436,9 @@ pub fn build(b: *std.Build) void {
     bench_net_loop_step.dependOn(&b.addRunArtifact(net_bench).step);
 
     const run_xmpp_tests = b.addRunArtifact(xmpp_tests);
+    const run_unicode_tests = b.addRunArtifact(unicode_tests);
+    const run_precis_tables_tests = b.addRunArtifact(precis_tables_tests);
+    const run_precis_username_tests = b.addRunArtifact(precis_username_tests);
     const run_sasl_tests = b.addRunArtifact(sasl_tests);
     const run_tls_tests = b.addRunArtifact(tls_tests);
     const run_ssl_tests = b.addRunArtifact(ssl_tests);
@@ -580,6 +626,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
+    server_test_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("ssl", ssl_test_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
@@ -642,6 +689,7 @@ pub fn build(b: *std.Build) void {
     });
     server_user_store_mod.addImport("backend", server_backend_mod);
     server_user_store_mod.addImport("sasl", sasl_mod);
+    server_user_store_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("user_store", server_user_store_mod);
     const server_lock_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/lock_store.zig"),
@@ -649,6 +697,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_lock_store_mod.addImport("backend", server_backend_mod);
+    server_lock_store_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("lock_store", server_lock_store_mod);
     const server_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -685,6 +734,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     user_store_test_mod.addImport("sasl", sasl_mod);
+    user_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const user_store_tests = b.addTest(.{
         .name = "user-store-tests",
@@ -701,6 +751,7 @@ pub fn build(b: *std.Build) void {
     });
     generic_user_store_test_mod.addImport("sasl", sasl_mod);
     generic_user_store_test_mod.addImport("backend", backend_test_mod);
+    generic_user_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const generic_user_store_tests = b.addTest(.{
         .name = "generic-user-store-tests",
@@ -728,6 +779,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lock_store_test_mod.addImport("backend", backend_test_mod);
+    lock_store_test_mod.addImport("precis_username", precis_username_mod);
 
     const lock_store_tests = b.addTest(.{
         .name = "lock-store-tests",
@@ -757,6 +809,7 @@ pub fn build(b: *std.Build) void {
     });
     policy_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
     policy_test_mod.addImport("lock_store", lock_store_test_mod);
+    policy_test_mod.addImport("backend", backend_test_mod);
 
     const policy_tests = b.addTest(.{
         .name = "policy-tests",
@@ -770,6 +823,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     auth_handler_test_mod.addImport("sasl", sasl_mod);
+    auth_handler_test_mod.addImport("precis_username", precis_username_mod);
     auth_handler_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     auth_handler_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
     auth_handler_test_mod.addImport("lock_store", lock_store_test_mod);
@@ -1479,6 +1533,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("xml", xml_mod);
     core_mod.addImport("xmpp", xmpp_mod);
     core_mod.addImport("sasl", sasl_mod);
+    core_mod.addImport("precis_username", precis_username_mod);
     core_mod.addImport("ssl", ssl_test_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
@@ -1572,6 +1627,7 @@ pub fn build(b: *std.Build) void {
     });
     auth_user_store_mod.addImport("sasl", sasl_mod);
     auth_user_store_mod.addImport("backend", auth_backend_mod);
+    auth_user_store_mod.addImport("precis_username", precis_username_mod);
 
     const auth_rate_limiter_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/rate_limiter.zig"),
@@ -1590,6 +1646,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     auth_lock_store_mod.addImport("backend", auth_backend_mod);
+    auth_lock_store_mod.addImport("precis_username", precis_username_mod);
 
     const auth_policy_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/policy.zig"),
@@ -1598,8 +1655,10 @@ pub fn build(b: *std.Build) void {
     });
     auth_policy_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_policy_mod.addImport("lock_store", auth_lock_store_mod);
+    auth_policy_mod.addImport("backend", auth_backend_mod);
 
     auth_handler_mod.addImport("sasl", sasl_mod);
+    auth_handler_mod.addImport("precis_username", precis_username_mod);
     auth_handler_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
     auth_handler_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
@@ -1646,6 +1705,14 @@ pub fn build(b: *std.Build) void {
         .root_module = auth_mod,
     });
     b.installArtifact(auth_exe);
+    const auth_main_tests = b.addTest(.{
+        .name = "auth-main-tests",
+        .root_module = auth_mod,
+    });
+    const run_auth_main_tests = b.addRunArtifact(auth_main_tests);
+    // This test spawns the installed xmppd-auth binary; wait for install so
+    // it never exercises a stale executable from the previous build.
+    run_auth_main_tests.step.dependOn(b.getInstallStep());
 
     // xmppd-auth-oidc: the OIDC authentication daemon
     const oidc_ipc_protocol_mod = b.createModule(.{
@@ -1691,8 +1758,10 @@ pub fn build(b: *std.Build) void {
     });
     oidc_policy_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_policy_mod.addImport("lock_store", auth_lock_store_mod);
+    oidc_policy_mod.addImport("backend", auth_backend_mod);
 
     oidc_handler_mod.addImport("sasl", sasl_mod);
+    oidc_handler_mod.addImport("precis_username", precis_username_mod);
     oidc_handler_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_handler_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_handler_mod.addImport("lock_store", auth_lock_store_mod);
@@ -1731,6 +1800,16 @@ pub fn build(b: *std.Build) void {
         .root_module = oidc_main_mod,
     });
     b.installArtifact(oidc_exe);
+
+    const precis_frame_check = b.addSystemCommand(&.{ "sh", "tools/check_precis_frames.sh" });
+    precis_frame_check.addArtifactArg(auth_exe);
+    precis_frame_check.addArtifactArg(oidc_exe);
+    precis_frame_check.addArtifactArg(core_exe);
+    const precis_frame_self_test = b.addSystemCommand(&.{
+        "sh",
+        "tools/check_precis_frames.sh",
+        "--self-test",
+    });
 
     // The OIDC daemon's start path is only under test when the daemon source
     // is compiled by the test step.
@@ -1791,6 +1870,18 @@ pub fn build(b: *std.Build) void {
     });
 
     const ctl_op_backend_mod = createBackendMod(b, op_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_archive_backend_mod = if (std.mem.eql(u8, archive_storage, op_storage))
+        ctl_op_backend_mod
+    else
+        createBackendMod(b, archive_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_migrate_precis_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_migrate_precis_mod.addImport("backend", ctl_backend_mod);
+    ctl_migrate_precis_mod.addImport("precis_username", precis_username_mod);
 
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -1799,6 +1890,7 @@ pub fn build(b: *std.Build) void {
     });
     ctl_user_store_mod.addImport("sasl", sasl_mod);
     ctl_user_store_mod.addImport("backend", ctl_backend_mod);
+    ctl_user_store_mod.addImport("precis_username", precis_username_mod);
 
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
@@ -1812,6 +1904,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ctl_lock_store_mod.addImport("backend", ctl_backend_mod);
+    ctl_lock_store_mod.addImport("precis_username", precis_username_mod);
 
     ctl_mod.addImport("user_store", ctl_user_store_mod);
     const ctl_invite_store_mod = b.createModule(.{
@@ -1824,6 +1917,10 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
+    ctl_mod.addImport("precis_username", precis_username_mod);
+    ctl_mod.addImport("backend", ctl_backend_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_mod.addImport("xmppd_log", xmppd_log_mod);
 
@@ -1844,6 +1941,10 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("lock_store", ctl_lock_store_mod);
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
+    ctl_test_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_test_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
+    ctl_test_mod.addImport("precis_username", precis_username_mod);
+    ctl_test_mod.addImport("backend", ctl_backend_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
 
@@ -1853,6 +1954,46 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
+
+    const migrate_precis_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_precis_test_mod.addImport("backend", backend_test_mod);
+    migrate_precis_test_mod.addImport("precis_username", precis_username_mod);
+    const migrate_precis_tests = b.addTest(.{
+        .name = "migrate-precis-tests",
+        .root_module = migrate_precis_test_mod,
+    });
+    const run_migrate_precis_tests = b.addRunArtifact(migrate_precis_tests);
+
+    const migrate_precis_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_precis_backends_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_precis_backend_test_mod.addImport("backend", backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("migrate_precis", migrate_precis_test_mod);
+    migrate_precis_backend_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+    migrate_precis_backend_test_mod.addImport("user_store", generic_user_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("roster_store", generic_roster_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("archive_store", archive_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("block_store", block_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("vcard_store", vcard_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("pep_store", pep_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("last_activity_store", last_activity_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("offline_store", generic_offline_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("room_store", room_store_test_mod);
+    migrate_precis_backend_test_mod.addImport("lock_store", lock_store_test_mod);
+    const migrate_precis_backend_tests = b.addTest(.{
+        .name = "migrate-precis-backend-tests",
+        .root_module = migrate_precis_backend_test_mod,
+    });
+    const run_migrate_precis_backend_tests = b.addRunArtifact(migrate_precis_backend_tests);
 
     // T87: archive write queue tests. A separate module on the same root
     // file carries the store/backend imports; archive_queue_mod itself
@@ -1875,11 +2016,16 @@ pub fn build(b: *std.Build) void {
     // --- Test step ---
 
     const test_step = b.step("test", "Run all library tests");
+    // A green test suite must also prove every install artifact compiles.
+    test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
     test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
+    test_step.dependOn(&run_unicode_tests.step);
+    test_step.dependOn(&run_precis_tables_tests.step);
+    test_step.dependOn(&run_precis_username_tests.step);
     test_step.dependOn(&run_sasl_tests.step);
     test_step.dependOn(&run_tls_tests.step);
     test_step.dependOn(&run_ssl_tests.step);
@@ -1944,6 +2090,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_oidc_main_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
+    test_step.dependOn(&run_migrate_precis_tests.step);
+    test_step.dependOn(&run_migrate_precis_backend_tests.step);
+    test_step.dependOn(&run_auth_main_tests.step);
+    test_step.dependOn(&precis_frame_check.step);
+    test_step.dependOn(&precis_frame_self_test.step);
 }
 
 /// Create a storage backend module based on the given storage flag value.

@@ -29,6 +29,11 @@ const log = std.log.scoped(.xmppd);
 
 // Types from server.zig — imported via the parent module's compilation unit.
 const server_mod = @import("server.zig");
+const precis = @import("precis_username");
+
+/// Per-thread registration preparation scratch, shared by this worker's
+/// sequential registrations without allocating on each request.
+threadlocal var register_precis_scratch: precis.Scratch = undefined;
 const Session = server_mod.Session;
 const Server = server_mod.Server;
 const MamCollecting = server_mod.MamCollecting;
@@ -1119,6 +1124,13 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8) v
         return;
     }
 
+    // RFC 7622 Section 3.3 localparts are stored and compared in canonical
+    // form only, so the auth daemon is asked about the prepared name.
+    const canon_username = register_precis_scratch.localpart(reg_username) catch {
+        sendIqError(server, session, iq_id, "not-acceptable");
+        return;
+    };
+
     if (!server.ipc.connected) {
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
@@ -1134,7 +1146,7 @@ fn handleRegisterSubmit(server: *Server, session: *Session, iq_id: []const u8) v
     server.ipc.send(.{
         .register_request = .{
             .conn_id = session.ipcConnId(),
-            .username = reg_username,
+            .username = canon_username,
             .password = reg_password,
             .invite_code = reg_invite,
             .client_ip = session.conn.peerAddr(),

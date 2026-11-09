@@ -16,6 +16,7 @@
 const std = @import("std");
 const rate_limiter = @import("rate_limiter");
 const lock_store_mod = @import("lock_store");
+const backend_mod = @import("backend");
 
 const log = std.log.scoped(.auth_policy);
 
@@ -56,7 +57,12 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
         var ctx: Ctx = undefined;
 
         fn check(_: *anyopaque, username: []const u8) LockCheckResult {
-            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch return .store_error;
+            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch |err| switch (err) {
+                // An unpreparable name cannot have a lock row; that is not a
+                // storage fault and must not become a temporary-auth oracle.
+                error.InvalidAccountName => return .unlocked,
+                else => return .store_error,
+            };
             return if (result != null) .locked else .unlocked;
         }
     };
@@ -70,12 +76,16 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
 /// Longest supported account key, the limiter's key bound.
 pub const account_key_max = rate_limiter.max_key_len;
 
-/// Canonical account key: the identity localpart, ASCII-lowercased, with
-/// U+212A KELVIN SIGN folded to "k" to match the IdP's case folding. The one
-/// function the limiter and the permanent lock store share. An untrackable
-/// (overlong) key is returned unfolded so admission fails closed on it.
+/// Canonical account key: the identity localpart prepared by the one RFC 7622
+/// function shared with the permanent lock store. A name that fails
+/// preparation has no account key and can never match an account. An
+/// untrackable (overlong) prepared key is returned unfolded so admission
+/// fails closed on it.
 pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
-    return lock_store_mod.canonicalKey(identity, buf[0..]) orelse localpartOf(identity);
+    return lock_store_mod.prepareAccountKey(identity, buf[0..]) catch |err| switch (err) {
+        error.InvalidAccountName => "",
+        error.KeyTooLong => localpartOf(identity),
+    };
 }
 
 fn permanentLockReason(checker: LockChecker, username: []const u8) ?[]const u8 {
@@ -337,6 +347,75 @@ test "Policy: check folds case against a temporary lock" {
 
     // The folded ALICE@x must hit the same temporary lock as alice.
     try std.testing.expectEqualStrings("account-disabled", policy.check("ALICE@x", "10.0.0.2") orelse return error.ExpectedDenial);
+}
+
+test "Policy: RFC 7622 variants share the account budget" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordOutcome("\u{039F}\u{0394}\u{039F}\u{03A3}", "10.0.0.1", .failure);
+    policy.recordOutcome("\u{03BF}\u{03B4}\u{03BF}\u{03C3}@us.example", "10.0.0.2", .failure);
+
+    // Greek capitals and the domain form prepare to the same localpart.
+    try std.testing.expectEqualStrings("account-disabled", policy.admit("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", "10.0.0.3") orelse return error.ExpectedDenial);
+}
+
+test "Policy: invalid names get no account key but charge the IP" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    policy.recordOutcome("bad name", "10.0.0.9", .failure);
+
+    // No account key was created, so the account side admits; the failed
+    // attempt still charged and locked the IP key.
+    try std.testing.expect(policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", policy.admitIp("10.0.0.9") orelse return error.ExpectedDenial);
+}
+
+test "Policy: an untrackable prepared key fails closed" {
+    var limiter = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    const policy = Policy{ .limiter = &limiter };
+
+    var big: [account_key_max + 1]u8 = undefined;
+    @memset(&big, 'a');
+    try std.testing.expectEqualStrings("temporary-auth-failure", policy.admitAccount(&big) orelse return error.ExpectedDenial);
+}
+
+test "Policy: an unpreparable name is unlocked, not a store error" {
+    const allocator = std.testing.allocator;
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var locks = lock_store_mod.LockStore(backend_mod.MemoryBackend).init(&db);
+    const checker = makeLockChecker(backend_mod.MemoryBackend, &locks, allocator);
+    const policy = Policy{ .lock_checker = checker };
+
+    // A raw invalid name cannot own a lock row, so policy.check must not
+    // surface temporary-auth-failure.
+    try std.testing.expect(policy.check("bad name", "10.0.0.1") == null);
 }
 
 test "Policy: account keys fold case and domain to one localpart" {
