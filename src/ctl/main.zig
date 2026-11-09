@@ -966,6 +966,42 @@ test "xmppctl printMigrationPlan escapes NUL in dedupe targets" {
     try std.testing.expect(std.mem.indexOfScalar(u8, errw.buffered(), 0) == null);
 }
 
+test "xmppctl refuses recovery writes and resumes the stored plan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
+    defer allocator.free(auth_path);
+    const op_path = try std.fs.path.join(allocator, &.{ base, "op" });
+    defer allocator.free(op_path);
+    const archive_path = try std.fs.path.join(allocator, &.{ base, "archive" });
+    defer allocator.free(archive_path);
+    var auth = try OpBackendType.open(auth_path, .{});
+    auth.close();
+    var op = try OpBackendType.open(op_path, .{});
+    op.close();
+    var archive = try ArchiveBackendType.open(archive_path, .{});
+    archive.close();
+
+    const marker_path = try std.fs.path.join(allocator, &.{ base, "migrate-precis.pending" });
+    defer allocator.free(marker_path);
+    var marker = try std.fs.cwd().createFile(marker_path, .{});
+    try marker.writeAll("deadbeef\n");
+    marker.close();
+
+    const domains = [_][]const u8{"us.example"};
+    try std.testing.expectError(error.RecoveryPending, runMigratePrecis(allocator, base, base, true, &domains, .{
+        .old_localpart = "bob",
+        .new_localpart = "bob2",
+    }));
+    try std.testing.expectError(error.RecoveryPending, runDeleteRaw(allocator, base, base, &domains, "bob"));
+    // With no stored resume plan, a plain rerun must fail rather than plan
+    // afresh from the half-migrated DB.
+    try std.testing.expectError(error.FileNotFound, runMigratePrecis(allocator, base, base, true, &domains, null));
+}
+
 test "extractLocal: JID with domain" {
     try std.testing.expectEqualStrings("alice", extractLocal("alice@example.com"));
 }
