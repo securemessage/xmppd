@@ -92,6 +92,7 @@ pub const Plan = struct {
     rekey_count: usize = 0,
     recovery_digest: ?[]u8 = null,
     seq_targets: std.StringHashMapUnmanaged(void) = .{},
+    rekey_ids: std.StringHashMapUnmanaged([]u8) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Plan {
         return .{ .allocator = allocator };
@@ -121,6 +122,12 @@ pub const Plan = struct {
         var seq_keys = self.seq_targets.keyIterator();
         while (seq_keys.next()) |key| self.allocator.free(key.*);
         self.seq_targets.deinit(self.allocator);
+        var rekey_it = self.rekey_ids.iterator();
+        while (rekey_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.rekey_ids.deinit(self.allocator);
         self.* = undefined;
     }
 };
@@ -602,6 +609,43 @@ fn addSeqHighWater(plan: *Plan, owner: []const u8) !void {
     plan.rename_bytes += seq_new.len + seq_value.len;
 }
 
+fn rekeyComposite(allocator: std.mem.Allocator, owner: []const u8, ts8: []const u8, id: []const u8) ![]u8 {
+    const key = try allocator.alloc(u8, owner.len + 1 + ts8.len + 1 + id.len);
+    @memcpy(key[0..owner.len], owner);
+    key[owner.len] = 0;
+    @memcpy(key[owner.len + 1 ..][0..ts8.len], ts8);
+    key[owner.len + 1 + ts8.len] = 0;
+    @memcpy(key[owner.len + 1 + ts8.len + 1 ..], id);
+    return key;
+}
+
+fn lookupRekeyId(plan: *const Plan, owner: []const u8, ts8: []const u8, id: []const u8) ?[]const u8 {
+    const key = rekeyComposite(plan.allocator, owner, ts8, id) catch return null;
+    defer plan.allocator.free(key);
+    return plan.rekey_ids.get(key);
+}
+
+fn getOrCreateRekeyId(plan: *Plan, owner: []const u8, ts8: []const u8, id: []const u8) ![]const u8 {
+    const key = try rekeyComposite(plan.allocator, owner, ts8, id);
+    if (plan.rekey_ids.get(key)) |existing| {
+        plan.allocator.free(key);
+        return existing;
+    }
+    const stored = try std.fmt.allocPrint(plan.allocator, "~mig-{x:0>16}", .{std.crypto.random.int(u64)});
+    try plan.rekey_ids.put(plan.allocator, key, stored);
+    return stored;
+}
+
+fn rekeyStanzaKeyWithId(allocator: std.mem.Allocator, key: []const u8, new_id: []const u8) !?[]u8 {
+    const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
+    if (key.len < first_sep + 10 or key[first_sep + 9] != 0) return null;
+    const prefix_len = first_sep + 10;
+    const result = try allocator.alloc(u8, prefix_len + new_id.len);
+    @memcpy(result[0..prefix_len], key[0..prefix_len]);
+    @memcpy(result[prefix_len..], new_id);
+    return result;
+}
+
 fn rekeyStanzaKey(allocator: std.mem.Allocator, key: []const u8, counter: usize) !?[]u8 {
     const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse return null;
     const rest = key[first_sep + 1 ..];
@@ -620,17 +664,26 @@ fn rewriteOfflineV2Value(
     allocator: std.mem.Allocator,
     value: []const u8,
     ctx: *const RewriteContext,
+    target_owner: []const u8,
 ) !?[]u8 {
     if (value.len < 12) return null;
     const id_len = std.mem.readInt(u32, value[8..12], .big);
     const from_offset = 12 + @as(usize, id_len);
     if (from_offset > value.len) return null;
+    const ts8 = value[0..8];
+    const old_id = value[12..from_offset];
+    const new_id = lookupRekeyId(ctx.identities.plan, target_owner, ts8, old_id) orelse old_id;
     const new_from = try rewriteJid(allocator, value[from_offset..], ctx, .reference) orelse return null;
     defer allocator.free(new_from);
-    const result = try allocator.alloc(u8, from_offset + new_from.len);
-    @memcpy(result[0..from_offset], value[0..from_offset]);
-    @memcpy(result[from_offset..], new_from);
-    return result;
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, value[0..8]);
+    var id_len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &id_len_buf, @intCast(new_id.len), .big);
+    try out.appendSlice(allocator, &id_len_buf);
+    try out.appendSlice(allocator, new_id);
+    try out.appendSlice(allocator, new_from);
+    return try out.toOwnedSlice(allocator);
 }
 
 fn firstPartUnchanged(old_key: []const u8, new_key: []const u8) bool {
@@ -693,6 +746,15 @@ fn rewriteEntry(
         if (rewrite.new_key) |new_key| {
             rewrite.reference_duplicate = firstPartUnchanged(key, new_key);
             rewrite.data_duplicate = !rewrite.reference_duplicate;
+            const first_sep = std.mem.indexOfScalar(u8, new_key, 0) orelse 0;
+            const rest = new_key[first_sep + 1 ..];
+            const second_rel = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+            const second_sep = first_sep + 1 + second_rel;
+            const owner = new_key[0..first_sep];
+            const ts8 = new_key[second_sep + 1 ..];
+            if (lookupRekeyId(ctx.identities.plan, owner, ts8, value)) |new_id| {
+                rewrite.new_value = try allocator.dupe(u8, new_id);
+            }
         }
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
         rewrite.new_key = try rewriteRoomAffiliation(allocator, key, ctx);
@@ -702,7 +764,11 @@ fn rewriteEntry(
         rewrite.new_key = try rewriteJid(allocator, key, ctx, .data);
     } else if (std.mem.eql(u8, namespace, NS_OFFLINE_V2)) {
         rewrite.new_key = try rewriteFirstAndSuffix(allocator, key, ctx, .data);
-        rewrite.new_value = try rewriteOfflineV2Value(allocator, value, ctx);
+        const target_owner = if (rewrite.new_key) |new_key|
+            new_key[0 .. std.mem.indexOfScalar(u8, new_key, 0) orelse new_key.len]
+        else
+            key[0 .. std.mem.indexOfScalar(u8, key, 0) orelse key.len];
+        rewrite.new_value = try rewriteOfflineV2Value(allocator, value, ctx, target_owner);
     } else if (std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_V2) or
         std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_TOKEN))
     {
@@ -931,31 +997,41 @@ fn planNamespace(
             if (rename.data_duplicate and
                 (std.mem.eql(u8, namespace, NS_OFFLINE) or std.mem.eql(u8, namespace, NS_MESSAGES)))
             {
+                const key = rename.new_key;
+                const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse
+                    return error.InvalidRecoveryPlan;
+                if (key.len < first_sep + 10 or key[first_sep + 9] != 0)
+                    return error.InvalidRecoveryPlan;
+                const owner = key[0..first_sep];
+                const ts8 = key[first_sep + 1 .. first_sep + 9];
+                const old_id = key[first_sep + 10 ..];
                 const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
                 defer if (target_value) |value| plan.allocator.free(value);
+                var must_rekey = lookupRekeyId(plan, owner, ts8, old_id) != null;
                 if (target_value != null) {
                     const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
                     defer if (old_value) |value| plan.allocator.free(value);
                     const same_value = old_value != null and std.mem.eql(u8, old_value.?, target_value.?);
                     equal_data_value = same_value;
-                    if (!same_value) {
-                        plan.rekey_count += 1;
-                        const rekeyed = try rekeyStanzaKey(plan.allocator, rename.new_key, plan.rekey_count) orelse
-                            return error.InvalidRecoveryPlan;
-                        if (db != .archive and rekeyed.len > 511) {
-                            plan.allocator.free(rekeyed);
-                            try addIssue(plan, db, namespace, .key_too_long, rename.old_key, "");
-                            plan.allocator.free(rename.old_key);
-                            plan.allocator.free(rename.new_key);
-                            if (rename.new_value) |value| plan.allocator.free(value);
-                            transferred += 1;
-                            continue;
-                        }
+                    must_rekey = !same_value;
+                }
+                if (must_rekey) {
+                    const new_id = try getOrCreateRekeyId(plan, owner, ts8, old_id);
+                    const rekeyed = try rekeyStanzaKeyWithId(plan.allocator, key, new_id) orelse
+                        return error.InvalidRecoveryPlan;
+                    if (db != .archive and rekeyed.len > 511) {
+                        plan.allocator.free(rekeyed);
+                        try addIssue(plan, db, namespace, .key_too_long, rename.old_key, "");
+                        plan.allocator.free(rename.old_key);
                         plan.allocator.free(rename.new_key);
-                        rename.new_key = rekeyed;
-                        rename.same_key = false;
-                        try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
+                        if (rename.new_value) |value| plan.allocator.free(value);
+                        transferred += 1;
+                        continue;
                     }
+                    plan.allocator.free(rename.new_key);
+                    rename.new_key = rekeyed;
+                    rename.same_key = false;
+                    try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
                 }
             }
 
@@ -1104,6 +1180,9 @@ pub fn planMigration(
         .users_sources = &users_sources,
     };
 
+    // Archive messages first: their rekey assignments are consumed by the
+    // offline pointers and by_contact values planned below.
+    try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, &ctx);
     try planDb(&plan, &targets, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -1118,7 +1197,6 @@ pub fn planMigration(
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, &ctx);
-    try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, &ctx);
 
     std.sort.heap(Rename, plan.renames.items, {}, renameLessThan);
     std.sort.heap(Issue, plan.issues.items, {}, issueLessThan);

@@ -666,6 +666,25 @@ test "migrate-precis rekeys colliding offline and archive rows with different va
             if (std.mem.eql(u8, pointer.from_jid, "remote@remote.example/res")) saw_spam_sender = true;
         }
         try std.testing.expect(saw_real_sender and saw_spam_sender);
+        for (pointers) |pointer| {
+            const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+            defer if (body) |value| allocator.free(value);
+            try std.testing.expect(body != null);
+            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) {
+                try std.testing.expect(std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null);
+            } else {
+                try std.testing.expect(std.mem.indexOf(u8, body.?, "spam to lowercase spelling") != null);
+            }
+        }
+        var by_contact = try archive.iterator(NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00");
+        defer by_contact.deinit();
+        var saw_alice_index = false;
+        while (by_contact.next()) |entry| {
+            const body = try archive_store.getMessage("naplestb@us.example", 1, entry.value);
+            defer if (body) |value| allocator.free(value);
+            if (body != null and std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null) saw_alice_index = true;
+        }
+        try std.testing.expect(saw_alice_index);
 
         var messages = try archive.iterator(NS_MESSAGES, "naplestb@us.example\x00");
         defer messages.deinit();
