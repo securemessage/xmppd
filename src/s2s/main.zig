@@ -3130,13 +3130,12 @@ fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.T
 /// work runs on the loop thread today; plan section 4 moves it to the
 /// handshake pool with ADR-11/F7.
 fn verifyInboundPeer(daemon: *S2sDaemon, session: *S2sSession, tlsa_records: []const dns.TlsaRecord) ?ssl.DaneVerdict {
-    if (daemon.dane_verify_ctx == null) {
-        daemon.dane_verify_ctx = SslContext.initDaneVerifier() catch |err| {
-            log.warn("inbound: cannot build DANE verifier context: {}", .{err});
-            return null;
-        };
-    }
-    const verify_ctx = if (daemon.dane_verify_ctx) |*c| c else return null;
+    // Built at startup with the other contexts; a missing one is a bug, not
+    // a runtime condition, but DANE stays unavailable rather than asserting.
+    const verify_ctx = if (daemon.dane_verify_ctx) |*c| c else {
+        log.err("inbound: DANE verifier context missing (not built at startup)", .{});
+        return null;
+    };
     const tls = if (session.tls_conn) |*t| t else return null;
 
     const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch return null;
@@ -5143,6 +5142,33 @@ test "S2sDaemon: inbound DANE accepts a peer whose TLSA matches" {
     try std.testing.expectEqual(ssl.Usage.dane_ee, verdict.matched.?.usage);
 }
 
+test "S2sDaemon: inbound DANE admits a chain anchored at the TLSA DANE-TA" {
+    // The inbound counterpart of the outbound DANE-TA case: a two-level
+    // chain whose trust root is the TLSA record itself, verified after the
+    // handshake because the peer domain arrives with the stream header.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = ca_der,
+    }};
+
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ta, verdict.matched.?.usage);
+}
+
 test "S2sDaemon: inbound DANE refuses a forged anchor (case 6)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5404,6 +5430,32 @@ fn initTestTlsContextsFrom(daemon: *S2sDaemon, cert_dir: std.fs.Dir) !void {
         dane_ctx.disableKtls();
         daemon.tls_client_ctx_dane = dane_ctx;
     }
+    if (daemon.tls_client_ctx_ca == null) {
+        var ca_ctx = try SslContext.initClientVerified();
+        errdefer ca_ctx.deinit();
+        ca_ctx.disableKtls();
+        daemon.tls_client_ctx_ca = ca_ctx;
+    }
+    if (daemon.dane_verify_ctx == null) {
+        var verify_ctx = try SslContext.initDaneVerifier();
+        errdefer verify_ctx.deinit();
+        verify_ctx.disableKtls();
+        daemon.dane_verify_ctx = verify_ctx;
+    }
+}
+
+/// A client context for the test peer: it presents `cert_dir`'s certificate,
+/// which the inbound side requests (SSL_VERIFY_PEER in initServer).
+fn initTestPeerCtx(alloc: std.mem.Allocator, cert_dir: std.fs.Dir) !SslContext {
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+    var ctx = try SslContext.initClientWithCert(cert_path, key_path);
+    ctx.disableKtls();
+    return ctx;
 }
 
 /// Drive both ends of a non-blocking TLS handshake to completion.
