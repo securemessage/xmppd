@@ -12662,6 +12662,95 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     try std.testing.expect(std.mem.indexOf(u8, wire[0..wire_len], "urn:xmpp:carbons:2") == null);
 }
 
+// The delivered set is what the delivery loop actually handed the stanza
+// to, not a recompute of the routing rule. A CSI-inactive phone is skipped
+// for a typing-only message, so it never saw the original: a <received>
+// carbon to it is the only copy it gets, on the bare-JID fan-out and on a
+// full-JID dispatch alike.
+test "carbons: a resource the delivery loop skipped still gets the received carbon" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+
+    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer w0.deinit();
+    w0.worker_id = 0;
+    w0.session_map = &sm;
+
+    const phone_fds = try makeSocketPair();
+    defer posix.close(phone_fds[1]);
+    const phone = try allocator.create(Session);
+    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.stream.state = .active;
+    phone.stream.authenticated = true;
+    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.carbons_enabled = true;
+    phone.csi_active = false;
+    w0.sessions[6] = phone;
+    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const laptop_fds = try makeSocketPair();
+    defer posix.close(laptop_fds[1]);
+    const laptop = try allocator.create(Session);
+    laptop.* = Session.init(laptop_fds[0], 5, "localhost", false, allocator);
+    laptop.stream.state = .active;
+    laptop.stream.authenticated = true;
+    laptop.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "laptop" };
+    laptop.carbons_enabled = true;
+    w0.sessions[5] = laptop;
+    _ = try sm.bind(0, 5, "bob", "localhost", "laptop");
+    sm.setPresenceAvailable("bob", "localhost", "laptop", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-csi";
+    const body = "<composing xmlns='http://jabber.org/protocol/chatstates'/>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var changes_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&changes_buf);
+    router.dispatchStanza(&w0, &alice, &changes);
+
+    // Bare JID: the laptop got the original and no carbon; the phone was
+    // skipped in delivery so the carbon is its only copy.
+    _ = laptop.conn.flushSend() catch 0;
+    var wire: [8192]u8 = undefined;
+    const laptop_len = posix.read(laptop_fds[1], &wire) catch 0;
+    try std.testing.expect(laptop_len > 0);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire[0..laptop_len], "<message"));
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..laptop_len], "urn:xmpp:carbons:2") == null);
+
+    _ = phone.conn.flushSend() catch 0;
+    const phone_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(phone_len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..phone_len], "<received xmlns='urn:xmpp:carbons:2'>") != null);
+
+    // Full JID to the same skipped phone: the routed set is not the
+    // delivered set here either, so the phone again gets the carbon.
+    // dispatchStanza resets the stanza fields, so rebuild them all.
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost/phone";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "carb-csi-full";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+    router.dispatchStanza(&w0, &alice, &changes);
+
+    _ = phone.conn.flushSend() catch 0;
+    const full_len = posix.read(phone_fds[1], &wire) catch 0;
+    try std.testing.expect(full_len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..full_len], "<received xmlns='urn:xmpp:carbons:2'>") != null);
+}
+
 // A <private/> child asks the server not to carbon copy the message at all
 // (XEP-0280 section 6), and a <no-copy/> hint does the same (XEP-0334).
 // Both suppress the copy on the cross-worker path, so the phone's wire

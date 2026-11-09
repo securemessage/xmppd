@@ -180,6 +180,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     var remote_delivered: bool = false;
 
+    // The resources the stanza is actually handed to, so a <received> carbon
+    // later skips exactly those. Bank .c is free for the whole dispatch:
+    // sendCarbons nests under .b and nothing else down here claims .c.
+    var lease_c = server.leaseScratch(.c);
+    defer lease_c.release();
+    const delivered_buf = lease_c.entries;
+    var delivered_count: usize = 0;
+
     const route_count = if (to_jid.resource.len > 0) blk: {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
         if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
@@ -295,13 +303,13 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
 
     var delivery_failed = false;
-    for (entries_buf[0..route_count]) |entry| {
+    for (entries_buf[0..route_count], 0..) |entry, ei| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
         if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
 
         if (entry.worker_id == server.worker_id) {
             if (target_count < local_ids.len) {
-                local_ids[target_count] = entry.local_session_id;
+                local_ids[target_count] = ei;
                 target_count += 1;
             }
         } else {
@@ -318,6 +326,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 archive_timestamp,
             )) {
                 remote_delivered = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
             } else {
                 // Other local and remote resources still get their copies;
                 // the sender gets an error if no resource accepts the stanza.
@@ -477,8 +489,11 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var hold_bounced = false;
     var hold_stored = false;
     var local_delivery_succeeded = false;
-    // Forward to each local target session
-    for (local_ids[0..target_count]) |tid| {
+    // Forward to each local target session. local_ids indexes entries_buf so
+    // each resource that accepts the stanza can join the delivered set.
+    for (local_ids[0..target_count]) |ei| {
+        const entry = entries_buf[ei];
+        const tid = entry.local_session_id;
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
         const sent_data = built orelse {
@@ -494,6 +509,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             // add a second row, and the drain would then deliver both.
             if (hold_stored) {
                 local_delivery_succeeded = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
                 continue;
             }
             const hold_id = if (is_archivable)
@@ -505,6 +524,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data, hold_token)) {
                 hold_stored = true;
                 local_delivery_succeeded = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
                 log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
                 continue;
             }
@@ -532,6 +555,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         if (target_session.sm_detached) {
             target_session.smTrackOutbound(sent_data);
             local_delivery_succeeded = true;
+            if (delivered_count < delivered_buf.len) {
+                delivered_buf[delivered_count] = entry;
+                delivered_count += 1;
+            }
             continue;
         }
         // Apply the MUC fan-out policy here too. A stanza that fits an empty
@@ -554,6 +581,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         };
         target_session.smTrackOutbound(sent_data);
         local_delivery_succeeded = true;
+        if (delivered_count < delivered_buf.len) {
+            delivered_buf[delivered_count] = entry;
+            delivered_count += 1;
+        }
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, tid) catch {};
         }
@@ -581,17 +612,12 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         out_lease.release();
 
         // XEP-0280 section 7: a <received> copy goes only to a resource that
-        // did not already get the original under RFC 6121 delivery rules.
-        // This server delivers a bare-JID message to every available
-        // non-negative-priority resource, so those are exactly the ones to
-        // skip; a full-JID message reached only the routed resource.
-        const delivered: ReceivedSet = if (to_jid.resource.len == 0)
-            .all_non_negative
-        else
-            .{ .entries = entries_buf[0..route_count] };
-
-        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, .none, changes);
-        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, delivered, changes);
+        // did not already get the original. The delivered set is what the
+        // loops above actually handed off, queued, held or tracked, not a
+        // recomputation of the routing rule: when the routed set filters on
+        // more than priority the two stay in lockstep.
+        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, &[_]SessionEntry{}, changes);
+        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, delivered_buf[0..delivered_count], changes);
     }
 }
 
@@ -825,20 +851,10 @@ fn dropOversize(inner_len: usize, route: SessionEntry) bool {
     return false;
 }
 
-/// Which of a bare JID's resources already received the original stanza
-/// under RFC 6121 delivery rules, so a <received> carbon to them would
-/// deliver the same message twice (XEP-0280 section 7).
-const ReceivedSet = union(enum) {
-    /// A <sent> fan-out: no recipient-side delivery to exclude.
-    none,
-    /// A bare-JID message: every available non-negative-priority resource
-    /// received the original.
-    all_non_negative,
-    /// A full-JID message (or its chat fallback): only these resources did.
-    entries: []const SessionEntry,
-};
-
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
+/// `delivered` lists the resources the dispatch already handed the original
+/// to; a <received> copy to one of them would deliver the same message
+/// twice (XEP-0280 section 7). A <sent> fan-out passes an empty slice.
 fn sendCarbons(
     server: *Server,
     carbon_type: []const u8,
@@ -850,7 +866,7 @@ fn sendCarbons(
     type_str: []const u8,
     id_str: []const u8,
     delivery_inner_xml: []const u8,
-    delivered: ReceivedSet,
+    delivered: []const SessionEntry,
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
@@ -868,20 +884,18 @@ fn sendCarbons(
     const cbuf = carbon_lease.buf;
 
     for (entries[0..count]) |entry| {
-        // A resource that already received the original under RFC 6121
-        // delivery rules gets no <received> copy of it (XEP-0280 section 7).
-        const was_delivered = switch (delivered) {
-            .none => false,
-            .all_non_negative => entry.priority >= 0,
-            .entries => |targets| blk: {
-                for (targets) |t| {
-                    if (t.worker_id == entry.worker_id and
-                        t.local_session_id == entry.local_session_id and
-                        t.generation == entry.generation) break :blk true;
-                }
-                break :blk false;
-            },
-        };
+        // A resource that already received the original gets no <received>
+        // copy of it (XEP-0280 section 7).
+        var was_delivered = false;
+        for (delivered) |t| {
+            if (t.worker_id == entry.worker_id and
+                t.local_session_id == entry.local_session_id and
+                t.generation == entry.generation)
+            {
+                was_delivered = true;
+                break;
+            }
+        }
         if (was_delivered) continue;
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
