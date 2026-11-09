@@ -1651,7 +1651,8 @@ fn sendRoomHistory(
 }
 
 /// Format a unix timestamp as ISO 8601 (XEP-0203): YYYY-MM-DDThh:mm:ssZ
-fn formatDelayStamp(buf: []u8, timestamp: u64) ?[]const u8 {
+/// Shared with the offline-delivery stamper (session_lifecycle).
+pub fn formatDelayStamp(buf: []u8, timestamp: u64) ?[]const u8 {
     const ts: i64 = @intCast(timestamp);
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
     const day = es.getEpochDay();
