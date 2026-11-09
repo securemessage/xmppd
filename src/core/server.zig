@@ -3260,7 +3260,7 @@ pub const Server = struct {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token, s2s_archive_ts) catch {
+                        ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .stanza) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -6525,7 +6525,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
 
     // The producer tags the slot with its own receipt time; the hold on the
     // consuming worker must store that time, not the time the drain ran.
-    try delivery_sys.deliverWithToken(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345);
+    try delivery_sys.deliverDelivery(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
     server.drainDeliveryQueue(&changes);
 
     session_lifecycle.drainOfflinePending(&server, session, &changes);

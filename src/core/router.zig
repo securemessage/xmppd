@@ -811,7 +811,7 @@ fn enqueueCrossThreadStanza(
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts) catch |err| {
+    ds.deliverDelivery(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts, .stanza) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;
@@ -989,7 +989,7 @@ fn sendCarbons(
             // The slot carries the carbon class so the receiving worker can
             // apply carbons_enabled and the live-only rules; this worker
             // cannot see them on the remote Session.
-            ds.deliverKinded(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, .carbon) catch |err| {
+            ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, 0, .carbon) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
                 _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             };
