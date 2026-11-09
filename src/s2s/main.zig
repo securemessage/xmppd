@@ -2650,6 +2650,13 @@ fn performInboundDane(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSessi
         session.stream.setDaneVerified(false);
         return false;
     };
+    // A synchronous completion (cache hit) already landed through
+    // finishInboundDane; only an in-flight lookup holds the read.
+    // Inbound read interest is level-triggered: left armed while the
+    // lookup pends, any peer byte spins the loop until the chain lands.
+    if (session.dane_lookup_pending) {
+        batch.disableRead(session.fd) catch {};
+    }
     daemon.armDnsRegistration(batch);
     return true;
 }
@@ -2779,6 +2786,8 @@ fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.T
     session.dane_phase = .none;
     session.dane_key = 0;
     session.dane_tlsa_status = status;
+    // Re-arm the read interest performInboundDane held for the wait.
+    batch.enableRead(session.fd) catch {};
 
     var verified = false;
     if (status == .present) {
@@ -5987,4 +5996,53 @@ test "S2sDaemon: a deadline on the last target releases the outbound slot" {
     daemon.handleConnectDeadline(&cl, conn.deadline_ident);
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
     try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: the inbound DANE wait holds then releases read interest" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    // Bound but never answered: the lookup stays in flight for the whole
+    // window the read hold is checked.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // Inbound reads are level-triggered: left armed, any peer byte spins
+    // the loop on reads handleInboundReadable refuses to take.
+    var saw_disable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.DISABLE) != 0) saw_disable = true;
+    }
+    try std.testing.expect(saw_disable);
+
+    // Walk the chain to completion; the last hop lands the result.
+    cl.reset();
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    var saw_enable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.ENABLE) != 0 and
+            (ev.flags & std.c.EV.ADD) == 0) saw_enable = true;
+    }
+    try std.testing.expect(saw_enable);
 }
