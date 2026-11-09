@@ -4365,6 +4365,13 @@ fn runTestDaneHandshake(
 /// resolution: the TLSA records the test supplied, marked `.present`, so
 /// `curTarget().tlsa_status` reads as a peer that published an RRset.
 fn adoptTestTarget(conn: *OutboundConnection, records: []const ssl.DaneRecord) !void {
+    return adoptTestTargetNamed(conn, "localhost", 5269, records);
+}
+
+/// As `adoptTestTarget`, with the SRV target host and port spelled out: a
+/// DANE-TA match runs the name check, so the target name decides whether the
+/// reference identifier set can accept the peer.
+fn adoptTestTargetNamed(conn: *OutboundConnection, host: []const u8, port: u16, records: []const ssl.DaneRecord) !void {
     const alloc = conn.alloc;
     const tlsa = try alloc.alloc(dns.TlsaRecord, records.len);
     for (records, 0..) |r, i| {
@@ -4377,8 +4384,8 @@ fn adoptTestTarget(conn: *OutboundConnection, records: []const ssl.DaneRecord) !
     }
     const targets = try alloc.alloc(dns_async.Target, 1);
     targets[0] = .{
-        .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5269),
-        .host = try alloc.dupe(u8, "localhost"),
+        .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port),
+        .host = try alloc.dupe(u8, host),
         .tlsa = tlsa,
         .tlsa_status = .present,
         .is_direct_tls = true,
@@ -4474,6 +4481,137 @@ test "S2sDaemon: outbound DANE accepts a handshake matching the TLSA record" {
     recordOutboundDane(&daemon, &cl, 0, result.conn);
     try std.testing.expect(daemon.outbound[0] != null);
     try std.testing.expectEqual(connector_mod.DaneStatus.verified, result.conn.dane_status);
+}
+
+test "S2sDaemon: startOutboundTls arms DANE from the adopted target" {
+    // Drives the real production entry point, not the rig: the arm decision,
+    // the context choice and the pre-handshake `prepareDane` are all inside
+    // startOutboundTls, so a regression that skips any of them shows up here
+    // as a handshake that completes without a DANE verdict.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    try adoptTestTarget(conn, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // A fresh conn is in .connecting: the STARTTLS path flips it to TLS.
+    startOutboundTls(&daemon, &cl, 0, conn);
+    // A failed arm closes the slot and frees the conn, so read the table
+    // before dereferencing anything (T277).
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+    try std.testing.expectEqual(connector_mod.DaneStatus.pending, conn.dane_status);
+
+    // Drive both ends until the handshake settles. `startOutboundTls` has
+    // already run the first step, so the loop starts from there.
+    var peer_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and conn.tls_state != .established and !conn.isFailed() and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        if (conn.tls_state != .established and !conn.isFailed()) {
+            continueOutboundTls(&daemon, &cl, 0, conn);
+        }
+    }
+    if (conn.isFailed()) std.debug.print("startOutboundTls rig failed: {s}\n", .{conn.error_msg});
+    try std.testing.expect(conn.tls_state == .established);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, conn.dane_status);
+}
+
+test "S2sDaemon: startOutboundTls refuses a peer the TLSA record does not match" {
+    // The negative half of the production-path test above, and the only way
+    // to tell the DANE context from the plain one: a `VERIFY_NONE` client
+    // context completes this handshake, so a regression that picks it shows
+    // up as a completed handshake instead of a refusal.
+    //
+    // The handshake is driven through `conn.continueHandshake` rather than
+    // `continueOutboundTls`: the latter closes and frees the conn on failure.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    // Well-formed but wrong digest: the peer is not the one the record names.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(leaf_der, &digest, .{});
+    digest[0] ^= 0xFF;
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    try adoptTestTarget(conn, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    startOutboundTls(&daemon, &cl, 0, conn);
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+
+    var peer_done = false;
+    var refused = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and !refused and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        _ = conn.continueHandshake() catch {
+            refused = true;
+            break;
+        };
+    }
+    try std.testing.expect(refused);
+    try std.testing.expect(conn.tls_state != .established);
 }
 
 test "S2sDaemon: outbound DANE refuses a TLSA digest that fits no certificate" {

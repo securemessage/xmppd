@@ -898,7 +898,6 @@ test "socketpair: rejected resume surfaces sm_failed and drops the queue (T-9BC4
     try std.testing.expect(ctx.engine.sm_queues.getPtr("sm-test-42") == null);
 }
 
-
 /// Flip the attached session into its resume configuration (test seam:
 /// the real consumer restarts with SessionConfig.sm_resume_*; attachFd
 /// already stored a config, so re-set it through the public surface).
@@ -1093,7 +1092,6 @@ fn testSpkiSha256(buf: *[32]u8, der: []const u8) ![]const u8 {
     std.crypto.hash.sha2.Sha256.hash(spki, buf, .{});
     return buf;
 }
-
 
 /// Base64-decode the embedded throwaway cert's DER (association data for
 /// the DANE tests' TLSA records).
@@ -1319,6 +1317,34 @@ test "socketpair: DANE mismatch fails closed" {
     try std.testing.expect(!out.established);
     try std.testing.expect(out.failed);
     try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
+}
+
+test "socketpair: an RRset with no usable record falls back to PKIX" {
+    const alloc = std.testing.allocator;
+    var server = try makeTlsServer(alloc);
+    defer server.deinit();
+
+    // A present RRset whose only record is unusable (SHA-256 must be 32
+    // bytes). The module reports `.pkix`, so the client must verify against
+    // the system store instead of the empty-store DANE context, which could
+    // never match. The rig cert is self-signed, so PKIX rejects it:
+    // a DANE refusal would say tls-dane-mismatch instead.
+    var short_hash: [31]u8 = undefined;
+    @memset(&short_hash, 0xa5);
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = &short_hash },
+    };
+
+    var ctx = try setupPolicy(alloc, true, .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true); // client aborts mid-handshake
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-handshake-failed", out.reason);
 }
 
 test "socketpair: no TLSA falls back to PKIX and rejects the self-signed rig cert" {
