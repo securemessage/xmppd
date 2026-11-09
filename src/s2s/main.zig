@@ -4727,6 +4727,369 @@ test "S2sDaemon: a DANE-TA record never authenticates the leaf" {
     try std.testing.expectEqual(ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match }, result.verdict.?);
 }
 
+test "S2sDaemon: outbound DANE-TA accepts a leaf named only for the SRV target" {
+    // RFC 7673 section 4: the SRV target is a reference identifier in its
+    // own right. The peer's leaf names only that target, so the handshake
+    // can pass only if the production path hands both names to the module.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.them.example");
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    const tlsa = [_]ssl.DaneRecord{.{ .usage = 2, .selector = 0, .matching_type = 0, .data = ca_der }};
+    try adoptTestTargetNamed(conn, "srv.them.example", 5269, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    startOutboundTls(&daemon, &cl, 0, conn);
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+    try std.testing.expectEqual(@as(usize, 2), conn.dane_state.?.names.len);
+
+    var peer_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and conn.tls_state != .established and !conn.isFailed() and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        if (conn.tls_state != .established and !conn.isFailed()) {
+            continueOutboundTls(&daemon, &cl, 0, conn);
+        }
+    }
+    if (conn.isFailed()) std.debug.print("SRV-target rig failed: {s}\n", .{conn.error_msg});
+    try std.testing.expect(conn.tls_state == .established);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, conn.dane_status);
+}
+
+test "S2sDaemon: DANE-TA refuses a leaf whose name no identifier covers" {
+    // Same rig, one name short: the leaf is valid for the SRV target and
+    // the lookup names only the service domain, so the name check fails.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.them.example");
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]ssl.DaneRecord{.{ .usage = 2, .selector = 0, .matching_type = 0, .data = ca_der }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"them.example"}, &tlsa);
+    try std.testing.expect(!result.completed);
+    try std.testing.expectEqual(ssl.Outcome.failed, result.verdict.?.outcome);
+}
+
+test "S2sDaemon: armOutboundDane decides from the target's TLSA status" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A failed lookup is a temporary failure of that target: never a
+    // dialback fallback (ADR-13).
+    {
+        const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+        conn.adoptTargets((try fabricateResolution(alloc, &.{.{
+            .addr = "127.0.0.1",
+            .status = .lookup_failed,
+        }})).targets);
+        conn.alloc.free(conn.targets[0].host);
+        conn.targets[0].host = try alloc.dupe(u8, "them.example");
+        try std.testing.expectEqual(OutboundDaneArm.temporary_failure, armOutboundDane(&daemon, conn));
+        try std.testing.expect(conn.dane_state == null);
+    }
+    // Absent (NXDOMAIN/NODATA) permits dialback.
+    {
+        const conn = try daemon.pool.getOrCreate("us.example", "absent.example");
+        conn.adoptTargets((try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }})).targets);
+        try std.testing.expectEqual(OutboundDaneArm.none, armOutboundDane(&daemon, conn));
+    }
+}
+
+test "S2sDaemon: an RRset with no usable record arms PKIX, not DANE" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    // SHA-256 with 31 bytes is unusable, so nothing survives filtering.
+    var short_hash: [31]u8 = undefined;
+    @memset(&short_hash, 0x5a);
+    const records = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &short_hash,
+    }};
+    try adoptTestTarget(conn, &records);
+
+    try std.testing.expectEqual(OutboundDaneArm.pkix, armOutboundDane(&daemon, conn));
+    // The state stays so the caller can install the identifiers; its mode is
+    // what told us to take the PKIX path.
+    try std.testing.expectEqual(ssl.DaneMode.pkix, conn.dane_state.?.mode());
+}
+
+test "S2sDaemon: a matching record past the 64-record cap is never truncated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+
+    // 65 usable records: the module rejects the set instead of dropping the
+    // last one, which could be the only match. A permanent failure means no
+    // unverified handshake and no dialback.
+    const n = ssl.dane_max_records + 1;
+    const records = try alloc.alloc(ssl.DaneRecord, n);
+    defer alloc.free(records);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("no-such-cert", &digest, .{});
+    for (records) |*r| r.* = .{ .usage = 3, .selector = 0, .matching_type = 1, .data = &digest };
+    try adoptTestTarget(conn, records);
+
+    try std.testing.expectEqual(OutboundDaneArm.permanent_failure, armOutboundDane(&daemon, conn));
+    try std.testing.expect(conn.dane_state == null);
+}
+
+test "S2sDaemon: an inbound DANE lookup failure keeps EXTERNAL closed" {
+    // A failed TLSA query is a temporary failure of the peer's DANE data,
+    // never proof that the peer authenticated. The stream must reach the
+    // features tail with EXTERNAL closed and dialback offered.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    in1.session.dane_phase = .tlsa;
+
+    applyInboundDaneResult(&daemon, in1.session, .failed, null);
+
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(!features.sasl_external);
+    try std.testing.expect(features.dialback);
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: an inbound DANE failure keeps EXTERNAL closed and rejects it" {
+    // The production link the review asked for: the verdict landed by
+    // finishInboundDane decides whether the stream offers EXTERNAL, and an
+    // EXTERNAL attempt on an unverified stream is refused. A peer that
+    // presents a certificate the TLSA record does not name must not be able
+    // to authenticate with it.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+    // Same certificate, one flipped byte: verified only if the module
+    // compares the association data at all.
+    const forged = try alloc.dupe(u8, leaf_der);
+    defer alloc.free(forged);
+    forged[forged.len - 1] ^= 0xFF;
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    // A real TLS link on both ends: the inbound verifier reads the peer
+    // certificate off the session's connection, so the peer must present one.
+    var peer_ctx = try initTestPeerCtx(alloc, tmp.dir);
+    defer peer_ctx.deinit();
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(peer_ctx, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+
+    // Land the TLSA hop directly: the DNSSEC chain is out of scope here.
+    in1.session.dane_phase = .tlsa;
+    const wire = @import("wire");
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 1,
+        .ttl = 300,
+        // TLSA 3 0 0 over the forged bytes.
+        .rdata = try std.mem.concat(alloc, u8, &.{ &.{ 3, 0, 0 }, forged }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+
+    // Unverified: EXTERNAL is not advertised, dialback is.
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(!features.sasl_external);
+    try std.testing.expect(features.dialback);
+
+    // And an EXTERNAL attempt anyway is refused, not accepted.
+    var attrs = [_]xml.Attribute{testAttr("mechanism", "EXTERNAL")};
+    const auth = xml.Element{
+        .name = "auth",
+        .prefix = "",
+        .local_name = "auth",
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    _ = drainTlsPeer(&peer, &rbuf);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = auth }, &cl);
+    _ = try in1.session.flushWrite();
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "not-authorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: an inbound DANE match opens EXTERNAL to the verified domain" {
+    // Positive control for the gate above: with a record that names the
+    // presented certificate the same path offers EXTERNAL, and the exchange
+    // records the peer domain.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var peer_ctx = try initTestPeerCtx(alloc, tmp.dir);
+    defer peer_ctx.deinit();
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(peer_ctx, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+
+    in1.session.dane_phase = .tlsa;
+    const wire = @import("wire");
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try std.mem.concat(alloc, u8, &.{ &.{ 3, 0, 0 }, leaf_der }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(features.sasl_external);
+    try std.testing.expect(!features.dialback);
+
+    var attrs = [_]xml.Attribute{testAttr("mechanism", "EXTERNAL")};
+    const auth = xml.Element{
+        .name = "auth",
+        .prefix = "",
+        .local_name = "auth",
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    _ = drainTlsPeer(&peer, &rbuf);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = auth }, &cl);
+    _ = try in1.session.flushWrite();
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") == null);
+    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: outbound DANE reference identifiers name the SRV target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("some-cert", &digest, .{});
+    const records = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    try adoptTestTarget(conn, &records);
+    // The SRV target differs from the service domain (RFC 7673 section 4).
+    alloc.free(conn.targets[0].host);
+    conn.targets[0].host = try alloc.dupe(u8, "srv.them.example");
+
+    try std.testing.expectEqual(OutboundDaneArm.armed, armOutboundDane(&daemon, conn));
+    const names = conn.dane_state.?.names;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("them.example", names[0]);
+    try std.testing.expectEqualStrings("srv.them.example", names[1]);
+}
+
 test "S2sDaemon: inbound DANE rejects a peer whose TLSA names another cert" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

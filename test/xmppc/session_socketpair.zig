@@ -21,6 +21,7 @@ const xmppc = @import("xmppc");
 const ssl_mod = @import("ssl");
 const tls_mod = @import("tls");
 const dns_mod = @import("dns");
+const dns_async_mod = @import("dns_async");
 const dane_mod = @import("dane");
 const test_support = @import("test_support");
 const sasl_mod = @import("sasl");
@@ -374,6 +375,58 @@ fn teardown(alloc: std.mem.Allocator, rig: *Rig, engine: *Engine) void {
     if (rig.fake_fd >= 0) posix.close(rig.fake_fd);
     engine.deinit();
     alloc.destroy(engine);
+}
+
+/// setupPolicy with a resolved SRV target that differs from the stream
+/// domain: the DANE reference identifiers become the domain plus that target
+/// (RFC 7673 section 4). TLSA records still come from the `dane_records`
+/// seam. The resolution is installed before the loop starts, so the first
+/// target dial uses it.
+fn setupPolicySrv(
+    alloc: std.mem.Allocator,
+    domain: []const u8,
+    srv_target: []const u8,
+    dane_records: []const dns_mod.TlsaRecord,
+) !SetupCtx {
+    cur_mutex.lock();
+    cur_outcome = .{};
+    cur_stanzas.clearRetainingCapacity();
+    cur_mutex.unlock();
+
+    const engine = try alloc.create(Engine);
+    engine.* = try Engine.init(alloc);
+    engine.setEventHandler(onEvent, null);
+    try engine.useTls(null);
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.Socketpair;
+
+    const idx = try engine.attachFd(fds[0], .{
+        .domain = domain,
+        .user = "alice",
+        .password = "pass1",
+        .resource = "smoke",
+    });
+    const s = engine.sessionAt(idx) orelse return error.NoSession;
+    s.fsm.tls_required = false;
+    s.fsm.allow_plain = true;
+    s.tls_policy = .dane_first;
+    s.dane_records = dane_records;
+
+    const targets = try alloc.alloc(dns_async_mod.Target, 1);
+    targets[0] = .{
+        .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5222),
+        .host = try alloc.dupe(u8, srv_target),
+        .tlsa = &.{},
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+    s.target_index = 0;
+
+    try engine.run();
+    return .{ .rig = .{ .fake_fd = fds[1] }, .engine = engine, .handle = idx };
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,6 +1530,68 @@ test "socketpair: DANE-TA name mismatch on a matching anchor fails (vector 8)" {
     // stream is dialed as a domain the leaf does not carry. A DANE-TA match
     // still runs the name check (RFC 7671 section 5.1).
     var ctx = try setupPolicyNamed(alloc, true, "other.example", .dane_first, &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, true);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+
+    const out = waitTerminal(5000);
+    try std.testing.expect(!out.established);
+    try std.testing.expect(out.failed);
+    try std.testing.expectEqualStrings("tls-dane-mismatch", out.reason);
+}
+
+test "socketpair: DANE-TA accepts a leaf named only for the SRV target (vector 24)" {
+    // RFC 7673 section 4: the SRV target is a reference identifier in its
+    // own right. The leaf carries only that name, so the handshake passes
+    // only if the client hands both identifiers to the module.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.example");
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, ca_der) },
+    };
+
+    var ctx = try setupPolicySrv(alloc, "localhost", "srv.example", &records);
+    defer teardown(alloc, &ctx.rig, ctx.engine);
+
+    try driveTlsUpgrade(&server, &ctx.rig, false);
+    defer if (ctx.rig.tls_conn) |*t| t.deinit();
+    try drivePostAuthPlain(&ctx.rig);
+
+    const out = waitTerminal(5000);
+    if (!out.established) std.debug.print("srv-target not established: failed={} reason='{s}'\n", .{ out.failed, out.reason });
+    try std.testing.expect(out.established);
+}
+
+test "socketpair: DANE-TA refuses a leaf named only for the SRV target when only the domain is offered" {
+    // Same rig and same anchor, one identifier short: with the SRV target
+    // equal to the stream domain the only identifier is `localhost`, which
+    // the leaf does not carry.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.example");
+
+    var server = try makeTlsServerFrom(alloc, tmp.dir);
+    defer server.deinit();
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+    var hash_buf: [32]u8 = undefined;
+    const records = [_]dns_mod.TlsaRecord{
+        .{ .usage = 2, .selector = 0, .matching_type = 1, .association_data = testCertSha256(&hash_buf, ca_der) },
+    };
+
+    var ctx = try setupPolicySrv(alloc, "localhost", "localhost", &records);
     defer teardown(alloc, &ctx.rig, ctx.engine);
 
     try driveTlsUpgrade(&server, &ctx.rig, true);

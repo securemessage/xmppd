@@ -336,6 +336,7 @@ pub fn build(b: *std.Build) void {
     socketpair_test_mod.addImport("sasl", sasl_mod);
     socketpair_test_mod.addImport("tls", tls_mod);
     socketpair_test_mod.addImport("dns", dns_mod);
+    socketpair_test_mod.addImport("dns_async", dns_async_mod);
     socketpair_test_mod.addImport("dane", dane_mod);
     socketpair_test_mod.addImport("test_support", test_support_mod);
 
