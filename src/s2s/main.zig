@@ -541,6 +541,7 @@ pub const S2sDaemon = struct {
 
             batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {
                 self.abortSlotFd(batch, sock);
+                conn.fd = -1;
                 self.failOutboundInitiation(batch, conn, "internal-error");
                 return;
             };
@@ -647,6 +648,23 @@ pub const S2sDaemon = struct {
         return null;
     }
 
+    /// Release the conn's slot-table entry when it owns one: the fd's
+    /// staged knote entries are purged (a same-iteration socket can
+    /// reuse the number, T238/T277), the reader is destroyed and the
+    /// slot becomes allocatable again. The one teardown every path that
+    /// destroys a conn must run: leaving the slot set after pool.remove
+    /// would dangle the conn pointer for every later slot scan.
+    fn releaseOutboundSlot(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        const slot = self.findOutboundSlot(conn) orelse return;
+        if (conn.fd >= 0) batch.purgeFd(conn.fd);
+        if (self.outbound_readers[slot]) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+            self.outbound_readers[slot] = null;
+        }
+        self.outbound[slot] = null;
+    }
+
     /// Close an outbound connection slot. Purges its staged kevent entries
     /// first: a same-iteration accept can reuse the fd number (T238/T277).
     /// Every exchange the conn still carries is answered before teardown,
@@ -658,22 +676,16 @@ pub const S2sDaemon = struct {
             for (0..conn.db_pending.len) |idx| {
                 if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
             }
-        }
-        if (self.outbound[slot]) |conn| {
             self.cancelResolve(conn);
             self.clearConnectDeadline(batch, conn);
-            batch.purgeFd(conn.fd);
-        }
-        if (self.outbound_readers[slot]) |reader| {
+            self.releaseOutboundSlot(batch, conn);
+            log.info("closing outbound S2S to {s}", .{conn.remote_domain});
+            self.pool.remove(conn.remote_domain);
+        } else if (self.outbound_readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
             self.outbound_readers[slot] = null;
         }
-        if (self.outbound[slot]) |conn| {
-            log.info("closing outbound S2S to {s}", .{conn.remote_domain});
-            self.pool.remove(conn.remote_domain);
-        }
-        self.outbound[slot] = null;
     }
 
     /// Fail an outbound connection that never reached the wire. Every
@@ -690,7 +702,7 @@ pub const S2sDaemon = struct {
         for (0..conn.db_pending.len) |idx| {
             if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
         }
-        if (conn.fd >= 0) batch.purgeFd(conn.fd);
+        self.releaseOutboundSlot(batch, conn);
         self.pool.remove(conn.remote_domain);
     }
 
@@ -5940,4 +5952,39 @@ test "S2sDaemon: an inbound DANE lookup defers then releases features" {
     var rbuf: [2048]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+}
+
+test "S2sDaemon: SO_ERROR on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    // A closed loopback port: nonblocking connect pends, then SO_ERROR=ECONNREFUSED.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 1 }}));
+    if (daemon.pool.connections.get("them.example") == null) return error.SkipZigTest; // refused synchronously
+    const slot = daemon.findOutboundSlot(conn).?;
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    handleOutboundWritable(&daemon, &cl, slot);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: a deadline on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    const slot = daemon.findOutboundSlot(conn).?;
+    daemon.handleConnectDeadline(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
 }
