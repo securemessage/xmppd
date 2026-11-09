@@ -863,7 +863,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
 
     // F6: fold a local contact JID once so every key and push below uses the
     // configured spelling; remote-domain JIDs pass through unchanged.
-    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_item_jid_prep_buf) catch {
+    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_jid_prep_buf) catch {
         sendIqError(server, session, iq_id, "jid-malformed");
         return;
     };
@@ -1195,7 +1195,7 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
     // the spelling messages were archived under; remote JIDs pass through.
     var with_prepared: ?[]const u8 = null;
     if (session.mam_with.len > 0) {
-        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.mam_with_prep_buf) catch {
+        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.iq_jid_prep_buf) catch {
             sendIqError(server, session, iq_id, "jid-malformed");
             return;
         };
@@ -1248,7 +1248,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     // owning one; remote JIDs pass through.
     var with_prepared: ?[]const u8 = null;
     if (session.mam_with.len > 0) {
-        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.mam_with_prep_buf) catch {
+        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.iq_jid_prep_buf) catch {
             sendIqError(server, session, iq_id, "jid-malformed");
             return;
         };
@@ -2064,7 +2064,7 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
 
     // F6: fold a local blocked JID once so the block key and the push below
     // use the configured spelling; remote-domain JIDs pass through.
-    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_item_jid_prep_buf) catch {
+    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_jid_prep_buf) catch {
         sendIqError(server, session, iq_id, "jid-malformed");
         return;
     };
@@ -2116,7 +2116,7 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     } else {
         // F6: fold a local blocked JID once so the unblock key and the push
         // below use the configured spelling; remote JIDs pass through.
-        item_jid = @import("xmpp").prepareLocalDomainJid(item_jid, server.server_host, &session.iq_item_jid_prep_buf) catch {
+        item_jid = @import("xmpp").prepareLocalDomainJid(item_jid, server.server_host, &session.iq_jid_prep_buf) catch {
             sendIqError(server, session, iq_id, "jid-malformed");
             return;
         };

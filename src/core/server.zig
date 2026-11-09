@@ -301,10 +301,11 @@ pub const Session = struct {
     iq_roster_groups_buf: [2048]u8 = undefined,
     iq_roster_groups_len: usize = 0,
 
-    /// F6: session-owned scratch holding the roster/block item JID prepared
-    /// for the configured domain; the raw attr slice stays in
-    /// iq_roster_item_jid.
-    iq_item_jid_prep_buf: [xmpp.max_jid_octets]u8 = undefined,
+    /// F6: session-owned scratch holding the IQ payload JID prepared for the
+    /// configured domain. Shared by the roster/block item JID
+    /// (iq_roster_item_jid) and the MAM 'with' JID (mam_with): one IQ
+    /// dispatch prepares only one of them, so they are never live together.
+    iq_jid_prep_buf: [xmpp.max_jid_octets]u8 = undefined,
 
     /// XEP-0115 §5.3: disco#info query node attribute (for caps verification).
     disco_node: []const u8 = "",
@@ -320,9 +321,6 @@ pub const Session = struct {
     mam_after: []const u8 = "",
     mam_before: []const u8 = "",
     mam_max: []const u8 = "",
-    /// F6: session-owned scratch holding the MAM 'with' JID prepared for the
-    /// configured domain; the raw collected text stays in mam_with.
-    mam_with_prep_buf: [xmpp.max_jid_octets]u8 = undefined,
     /// Which MAM text field we're currently collecting (from nested value/max elements).
     mam_collecting: MamCollecting = .none,
     /// Buffer for MAM text content accumulation.
@@ -6611,6 +6609,12 @@ test "F6: disco info to the MUC host in another case is the conference service" 
     // case-sensitive compare falls to the server identity instead.
     try std.testing.expect(std.mem.indexOf(u8, r, "category='conference'") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "category='server'") == null);
+}
+
+test "F6: Session carries one shared IQ payload prep buffer" {
+    // LOW-3: the roster/block item JID and the MAM 'with' JID share
+    // iq_jid_prep_buf; a second 3071-octet payload buffer must not return.
+    try std.testing.expect(@sizeOf(Session) <= 79504);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
