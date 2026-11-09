@@ -1457,6 +1457,49 @@ test "migrate-precis reports malformed offline_v2 rows" {
     }
 }
 
+test "migrate-precis keeps offline_seq above the stored counter" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+    _ = try offline.storePointer("naplestb@us.example", "seed@remote.example/x", "seed", 1);
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter, 100, .big);
+    try op.put(NS_OFFLINE_SEQ, "naplestb@us.example", &counter);
+    _ = try offline.storePointer("NaplesTB@us.example", "alice@us.example/a", "offline", 2);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(journal_dir);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+    const stored = try op.get(allocator, NS_OFFLINE_SEQ, "naplestb@us.example");
+    defer if (stored) |value| allocator.free(value);
+    try std.testing.expect(stored != null);
+    try std.testing.expectEqual(@as(u64, 101), std.mem.readInt(u64, stored.?[0..8], .big));
+
+    const pointers = try offline.getPointers("naplestb@us.example");
+    defer offline.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 2), pointers.len);
+    var moved_seq: u64 = 0;
+    for (pointers) |pointer| {
+        if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/a")) moved_seq = pointer.sequence;
+    }
+    try std.testing.expectEqual(@as(u64, 101), moved_seq);
+}
+
 test "migrate-precis separates two source spellings folding to one target" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;

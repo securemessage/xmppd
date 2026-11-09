@@ -1375,6 +1375,16 @@ fn planV2Queues(
         });
     }
     for (queues.items) |*queue| {
+        const stored_counter = try backend.get(allocator, NS_OFFLINE_SEQ, queue.target);
+        if (stored_counter) |value| {
+            defer allocator.free(value);
+            if (value.len != 8) {
+                try addIssue(plan, .op, NS_OFFLINE_SEQ, .invalid_value, queue.target, "");
+            } else {
+                const counter = std.mem.readInt(u64, value[0..8], .big);
+                if (counter > queue.target_max) queue.target_max = counter;
+            }
+        }
         for (all.items) |row| {
             if (std.mem.eql(u8, row.owner, queue.target) and row.seq > queue.target_max)
                 queue.target_max = row.seq;
