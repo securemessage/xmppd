@@ -571,6 +571,30 @@ const HeadParse = union(enum) {
     too_large,
 };
 
+/// RFC 9110 5.6.2 tchar: the field-name alphabet.
+fn isTchar(ch: u8) bool {
+    return switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        else => false,
+    };
+}
+
+/// RFC 9110 5.1 field-line grammar: field-name is 1*tchar, then ":",
+/// then field-value bytes (VCHAR / SP / HTAB / obs-text). A bare CR
+/// (RFC 9112 2.2), NUL or any other CTL is never a field-value byte.
+fn validFieldLine(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    if (colon == 0) return false;
+    for (line[0..colon]) |ch| {
+        if (!isTchar(ch)) return false;
+    }
+    for (line[colon + 1 ..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return false;
+    }
+    return true;
+}
+
 /// Parse the response head: strict Content-Length (decimal digits only,
 /// duplicates must agree) and no Transfer-Encoding at all.
 fn parseResponseHead(head: []const u8) HeadParse {
@@ -579,25 +603,13 @@ fn parseResponseHead(head: []const u8) HeadParse {
     _ = it.next(); // status line
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
-        // RFC 9112 5.2: a line starting with SP or HTAB is an obs-fold
-        // continuation of the previous field. This client does not
-        // unfold; rejecting keeps a folded Transfer-Encoding or
-        // Content-Length from degrading the head to EOF framing.
-        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return .invalid;
-        // RFC 9112 5.1: no whitespace is allowed between the field name
-        // and the colon. "Content-Length : 5" must not fall through to a
-        // looser parse of some other header shape. RFC 9110 5.1 makes
-        // the name one or more tchar, so a colon at index 0 is not a
-        // field line at all.
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            if (colon == 0) return .invalid;
-            if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
-        } else if (line.len > 0) {
-            // RFC 9112 5: a field line is field-name ":". A non-empty
-            // line without a colon is not a field; an empty one is a
-            // tolerated bare-LF artifact of the line split.
-            return .invalid;
-        }
+        // One grammar check for every field line: name 1*tchar, value
+        // bytes VCHAR / SP / HTAB / obs-text. It subsumes the obs-fold
+        // (RFC 9112 5.2), empty-name, no-colon and
+        // whitespace-before-colon rejections, and keeps a bare CR, NUL
+        // or other CTL from hiding a field (RFC 9112 2.2). An empty
+        // line is a tolerated bare-LF artifact of the line split.
+        if (line.len > 0 and !validFieldLine(line)) return .invalid;
         const te_prefix = "transfer-encoding:";
         // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
         // declared TE; it rejects like any other TE.
@@ -1338,8 +1350,8 @@ test "responseComplete: an empty field name is rejected" {
 
 test "responseComplete: an empty line inside the head does not panic" {
     // A bare-LF blank line sits before the CRLFCRLF terminator. The
-    // line.len > 0 guard on the obs-fold check is what keeps line[0]
-    // in bounds.
+    // line.len > 0 guard keeps the field-line grammar check from
+    // treating it as a malformed field.
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\n\nX: 1\r\n\r\nhello";
     try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
 }
@@ -1364,6 +1376,36 @@ test "responseComplete: a field line without a colon is rejected" {
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(te),
     );
+}
+
+test "responseComplete: field lines follow the grammar, not a blocklist" {
+    // RFC 9110 5.6.2 and RFC 9112 2.2: a bare CR, NUL or other CTL in a
+    // field line must not hide a field or reframe the body. Both shapes
+    // below used to degrade to EOF framing with the field gone.
+    const nul_te = "HTTP/1.1 200 OK\r\n\x00Transfer-Encoding: chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(nul_te),
+    );
+    const cr_cl = "HTTP/1.1 200 OK\r\nX-A: a\rContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(cr_cl),
+    );
+    // A CTL in the name is not tchar and DEL is a CTL byte in the value.
+    const vt_cl = "HTTP/1.1 200 OK\r\n\x0bContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(vt_cl),
+    );
+    const del = "HTTP/1.1 200 OK\r\nX-A: a\x7fb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(del),
+    );
+    // HTAB in a value is a field-value byte (RFC 9110 5.5).
+    const htab = "HTTP/1.1 200 OK\r\nX-A: a\tb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = htab.len }, responseComplete(htab));
 }
 
 test "responseComplete: framing ends the body at Content-Length" {
