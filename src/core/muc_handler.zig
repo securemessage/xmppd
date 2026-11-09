@@ -1801,6 +1801,11 @@ pub fn processRemoteJoin(
     if (server.muc_host == null) return;
     const ds = server.delivery_system orelse return;
 
+    // One buffer serves every sibling branch that assembles a presence
+    // stanza for the joiner; the branches are mutually exclusive, so
+    // sharing it cannot overwrite a stanza that is still in use.
+    var stanza_buf: [router.JID_STANZA_MAX]u8 = undefined;
+
     // Extract bare JID from real JID (everything before '/')
     const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
     const bare_jid = ev.real_jid[0..slash_pos];
@@ -1824,8 +1829,7 @@ pub fn processRemoteJoin(
     // current affiliation and role.
     if (r.findByRealJid(ev.real_jid)) |self_idx| {
         const occ = r.occupants[self_idx].?;
-        var buf: [router.JID_STANZA_MAX]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var fbs = std.io.fixedBufferStream(&stanza_buf);
         const w = fbs.writer();
         w.writeAll("<presence from='") catch return;
         xml.escapeWrite(w, ev.room_jid) catch return;
@@ -1856,8 +1860,7 @@ pub fn processRemoteJoin(
             return;
         } else {
             // Send conflict error back via MPSC
-            var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
-            var err_fbs = std.io.fixedBufferStream(&err_buf);
+            var err_fbs = std.io.fixedBufferStream(&stanza_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
             xml.escapeWrite(ew, ev.room_jid) catch return;
@@ -1882,8 +1885,7 @@ pub fn processRemoteJoin(
             affiliation = store.getAffiliation(ev.room_jid, bare_jid) catch .none;
         }
         if (affiliation == .outcast) {
-            var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
-            var err_fbs = std.io.fixedBufferStream(&err_buf);
+            var err_fbs = std.io.fixedBufferStream(&stanza_buf);
             const ew = err_fbs.writer();
             ew.writeAll("<presence from='") catch return;
             xml.escapeWrite(ew, ev.room_jid) catch return;
@@ -1901,8 +1903,7 @@ pub fn processRemoteJoin(
 
     // Members-only check
     if (r.config.members_only and affiliation == .none) {
-        var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
-        var err_fbs = std.io.fixedBufferStream(&err_buf);
+        var err_fbs = std.io.fixedBufferStream(&stanza_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
         xml.escapeWrite(ew, ev.room_jid) catch return;
@@ -1915,8 +1916,7 @@ pub fn processRemoteJoin(
 
     // Add occupant to canonical room on owning worker
     _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, role, affiliation) catch {
-        var err_buf: [router.JID_STANZA_MAX]u8 = undefined;
-        var err_fbs = std.io.fixedBufferStream(&err_buf);
+        var err_fbs = std.io.fixedBufferStream(&stanza_buf);
         const ew = err_fbs.writer();
         ew.writeAll("<presence from='") catch return;
         xml.escapeWrite(ew, ev.room_jid) catch return;
