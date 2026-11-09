@@ -1014,40 +1014,39 @@ fn planNamespace(
                 (std.mem.eql(u8, namespace, NS_OFFLINE) or std.mem.eql(u8, namespace, NS_MESSAGES)))
             {
                 const key = rename.new_key;
-                const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse
-                    return error.InvalidRecoveryPlan;
-                if (key.len < first_sep + 10 or key[first_sep + 9] != 0)
-                    return error.InvalidRecoveryPlan;
-                const owner = key[0..first_sep];
-                const ts8 = key[first_sep + 1 .. first_sep + 9];
-                const old_id = key[first_sep + 10 ..];
-                const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
-                defer if (target_value) |value| plan.allocator.free(value);
-                var must_rekey = lookupRekeyId(plan, owner, ts8, old_id) != null;
-                if (target_value != null) {
-                    const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
-                    defer if (old_value) |value| plan.allocator.free(value);
-                    const same_value = old_value != null and std.mem.eql(u8, old_value.?, target_value.?);
-                    equal_data_value = same_value;
-                    must_rekey = !same_value;
-                }
-                if (must_rekey) {
-                    const new_id = try getOrCreateRekeyId(plan, owner, ts8, old_id);
-                    const rekeyed = try rekeyStanzaKeyWithId(plan.allocator, key, new_id) orelse
-                        return error.InvalidRecoveryPlan;
-                    if (db != .archive and rekeyed.len > 511) {
-                        plan.allocator.free(rekeyed);
-                        try addIssue(plan, db, namespace, .key_too_long, rename.old_key, "");
-                        plan.allocator.free(rename.old_key);
-                        plan.allocator.free(rename.new_key);
-                        if (rename.new_value) |value| plan.allocator.free(value);
-                        transferred += 1;
-                        continue;
+                const first_sep = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+                if (key.len >= first_sep + 10 and key[first_sep + 9] == 0) {
+                    const owner = key[0..first_sep];
+                    const ts8 = key[first_sep + 1 .. first_sep + 9];
+                    const old_id = key[first_sep + 10 ..];
+                    const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
+                    defer if (target_value) |value| plan.allocator.free(value);
+                    var must_rekey = lookupRekeyId(plan, owner, ts8, old_id) != null;
+                    if (target_value != null) {
+                        const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
+                        defer if (old_value) |value| plan.allocator.free(value);
+                        const same_value = old_value != null and std.mem.eql(u8, old_value.?, target_value.?);
+                        equal_data_value = same_value;
+                        must_rekey = !same_value;
                     }
-                    plan.allocator.free(rename.new_key);
-                    rename.new_key = rekeyed;
-                    rename.same_key = false;
-                    try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
+                    if (must_rekey) {
+                        const new_id = try getOrCreateRekeyId(plan, owner, ts8, old_id);
+                        const rekeyed = try rekeyStanzaKeyWithId(plan.allocator, key, new_id) orelse
+                            return error.InvalidRecoveryPlan;
+                        if (db != .archive and rekeyed.len > 511) {
+                            plan.allocator.free(rekeyed);
+                            try addIssue(plan, db, namespace, .key_too_long, rename.old_key, "");
+                            plan.allocator.free(rename.old_key);
+                            plan.allocator.free(rename.new_key);
+                            if (rename.new_value) |value| plan.allocator.free(value);
+                            transferred += 1;
+                            continue;
+                        }
+                        plan.allocator.free(rename.new_key);
+                        rename.new_key = rekeyed;
+                        rename.same_key = false;
+                        try addIssue(plan, db, namespace, .rekeyed, rename.old_key, rename.new_key);
+                    }
                 }
             }
 
