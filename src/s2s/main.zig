@@ -125,6 +125,10 @@ pub const S2sDaemon = struct {
     /// certificate is still presented for SASL EXTERNAL.
     tls_client_ctx_dane: ?SslContext = null,
 
+    /// PKIX-verifying client context, used when a target publishes an RRset
+    /// whose records are all unusable. Built on first use.
+    tls_client_ctx_ca: ?SslContext = null,
+
     /// Paths of our own certificate and key, kept so the DANE client context
     /// can be built on first use. Empty when none was configured.
     cert_path: ?[:0]const u8 = null,
@@ -238,6 +242,7 @@ pub const S2sDaemon = struct {
         if (self.tls_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx_dane) |*ctx| ctx.deinit();
+        if (self.tls_client_ctx_ca) |*ctx| ctx.deinit();
         if (self.dane_verify_ctx) |*ctx| ctx.deinit();
         self.ipc.deinit();
         self.allocator.destroy(self.ipc);
@@ -1044,9 +1049,25 @@ pub fn main() !void {
         log.err("failed to initialize client TLS context: {}", .{err});
         return err;
     };
-    // The DANE client context is built on first use from the same pair.
     daemon.cert_path = cert_path;
     daemon.key_path = key_path;
+
+    // The DANE and PKIX client contexts and the inbound verifier context are
+    // built here, not on first use: the certificate chain and key are read
+    // from disk now, so a bad path fails at startup instead of stalling the
+    // loop on the first DANE connection.
+    daemon.tls_client_ctx_dane = SslContext.initClientDaneWithCert(client_cert, client_key) catch |err| {
+        log.err("failed to initialize DANE client TLS context: {}", .{err});
+        return err;
+    };
+    daemon.tls_client_ctx_ca = SslContext.initClientVerified() catch |err| {
+        log.err("failed to initialize PKIX client TLS context: {}", .{err});
+        return err;
+    };
+    daemon.dane_verify_ctx = SslContext.initDaneVerifier() catch |err| {
+        log.err("failed to initialize inbound DANE verifier context: {}", .{err});
+        return err;
+    };
 
     // Start inbound listener (from pre-bound fd or bind ourselves)
     if (listen_fd) |fd| {
