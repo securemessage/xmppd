@@ -237,6 +237,12 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
 
 const MAX_DBS = 24;
 
+comptime {
+    // openCanonicalNamespaces appends every canonical namespace to
+    // dbi_cache without a runtime bound check; the list must fit.
+    std.debug.assert(backend.canonical_namespaces.len <= MAX_DBS);
+}
+
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
     name_len: u8,
@@ -1238,4 +1244,77 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     const after = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(rec.kve_start, after.kve_start);
     try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
+}
+
+test "LmdbBackend: a vmmap miss uses the not-found warning, not the exhaustion one" {
+    // Goal: a lookup that returns records but no matching VMA is a miss,
+    // not retry exhaustion: the open warns with the distinct not-found
+    // message, the exhaustion counter stays put, and no madvise is
+    // attempted without a record. Method: the seam returns one vnode
+    // record whose inode and filesystem cannot match the env map.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 1;
+    recs[0].kve_vn_fsid = 1;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const calls0 = madviseCall.calls;
+    const warns0 = warnCall.exhausted_calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, 1), vmmapCall.read_calls);
+    try std.testing.expectEqual(warns0, warnCall.exhausted_calls);
+}
+
+fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
+    // The iterator holds this thread's read txn: it is opened, drained and
+    // deinit'd inside the call so later puts can open a write txn.
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+    var n: usize = 0;
+    while (iter.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key, prefix));
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "LmdbBackend: iterator scan over 0xFF tails, empty prefix, a shared-head owner and the exact cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    const ns = comptime backend.registered("rosters");
+
+    // Keys that stress the lexicographic edges of a prefix scan: trailing
+    // 0xFF bytes, a key sitting on the computed upper bound, and all-0xFF
+    // prefixes. The counts pin the sorted order the scan must honor.
+    const ks = [_][]const u8{ "ab\xFE\xFF", "ab\xFF", "ab\xFF\x00x", "ab\xFF\xFF", "ac", "\xFF\xFE", "\xFF\xFF", "\xFF\xFF\x01" };
+    for (ks) |k| try db.put(ns, k, "v");
+    try expectPrefixScan(&db, ns, "ab\xFF", 3);
+    try expectPrefixScan(&db, ns, "ab\xFE", 1);
+    try expectPrefixScan(&db, ns, "\xFF\xFF", 2);
+    try expectPrefixScan(&db, ns, "\xFF", 3);
+    try expectPrefixScan(&db, ns, "", 8);
+
+    // Two owners sharing a 296-byte head: a clipped seek or compare merges
+    // their rows.
+    const owner_a = ("a" ** 290) ++ "-first\x00";
+    const owner_b = ("a" ** 290) ++ "-other\x00";
+    try db.put(ns, owner_a ++ "i", "a");
+    try db.put(ns, owner_b ++ "i", "b");
+    try expectPrefixScan(&db, ns, owner_b, 1);
+    try expectPrefixScan(&db, ns, owner_a, 1);
+
+    // An exact-cap prefix must be accepted and matched, not rejected.
+    const cap = "c" ** backend.MAX_PREFIX_LEN;
+    try db.put(ns, cap, "c");
+    try expectPrefixScan(&db, ns, cap, 1);
+    try expectPrefixScan(&db, ns, cap[0 .. backend.MAX_PREFIX_LEN - 1], 1);
 }

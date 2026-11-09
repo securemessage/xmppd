@@ -467,6 +467,14 @@ pub const Resolver = struct {
         return self.kq;
     }
 
+    /// Create the kqueue eagerly so an embedding loop can register
+    /// kqFd() once at startup instead of after the first query. The
+    /// UDP socket still opens lazily in ensureOpen.
+    pub fn openKq(self: *Resolver) !posix.fd_t {
+        if (self.kq < 0) self.kq = try posix.kqueue();
+        return self.kq;
+    }
+
     /// Raw record query: A, AAAA, SRV or TLSA answered via the query
     /// callback with owned RRs. A cache hit or an unencodable name
     /// fires that callback inside query() before it returns.
@@ -728,7 +736,7 @@ pub const Resolver = struct {
     // -- kqueue pump -----------------------------------------------------
 
     fn ensureOpen(self: *Resolver) !void {
-        if (self.kq < 0) self.kq = try posix.kqueue();
+        _ = try self.openKq();
         if (self.fd >= 0) return;
         if (!self.server_configured) {
             log.warn("dns: no nameserver configured", .{});
