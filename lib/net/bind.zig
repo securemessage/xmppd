@@ -786,6 +786,15 @@ test "Listener: bad descriptor and non-listener surface as ListenerInvalid" {
 }
 
 test "Listener: accept_batch_max requeues for the rest of the backlog" {
+    // This test needs ~2*total descriptors on top of whatever earlier
+    // tests still hold, which can exceed the default soft NOFILE under
+    // load. At the cap socket()/accept() returns EMFILE, the listener
+    // pauses its read interest, and the queue fills while the loop
+    // sleeps forever. Raise the soft cap to the hard one so EMFILE
+    // cannot pause the drain.
+    const rl = try posix.getrlimit(.NOFILE);
+    if (rl.cur < rl.max) try posix.setrlimit(.NOFILE, .{ .cur = rl.max, .max = rl.max });
+
     var loop = try testLoop();
     defer loop.deinit(std.testing.allocator);
 
@@ -841,6 +850,9 @@ test "Listener: accept_batch_max requeues for the rest of the backlog" {
                         );
                         return error.ConnectBacklogDeadline;
                     }
+                    // The listener's own fallback deadline: let it lift a
+                    // transient pause (ENOBUFS and friends) before ours ends.
+                    _ = listener.onDeadline(d);
                 },
                 else => {},
             }
