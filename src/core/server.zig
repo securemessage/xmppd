@@ -90,6 +90,10 @@ const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd);
 
+/// Per-thread scratch for the pre-bind account compare's localpart
+/// preparation; the prepared name is copied into acc_buf before use.
+threadlocal var prebind_precis_scratch: precis.Scratch = undefined;
+
 /// Default maximum simultaneous connections (configurable via init).
 pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 
@@ -1873,17 +1877,19 @@ pub const Server = struct {
         var server_addressed = to_attr.len == 0 or std.ascii.eqlIgnoreCase(to_attr, self.server_host);
         if (!server_addressed) {
             if (session.stream.authenticated_jid) |aj| {
-                // The ingress-prepared 'to' carries a folded localpart, so the
-                // account string folds the authenticated name the same way;
-                // the buffer holds a full-length prepared bare JID (F6).
+                // The ingress-prepared 'to' carries a prepared localpart, so
+                // the account string prepares the authenticated name under
+                // the same profile; the buffer holds a full-length prepared
+                // bare JID (F6).
                 var acc_buf: [router.FULL_JID_MAX]u8 = undefined;
                 var account: []const u8 = "";
-                if (xmpp.foldLocalpart(aj.local, &acc_buf)) |folded| {
-                    var acc_fbs = std.io.fixedBufferStream(acc_buf[folded.len..]);
+                if (prebind_precis_scratch.localpart(aj.local)) |prepared| {
+                    var acc_fbs = std.io.fixedBufferStream(&acc_buf);
                     const aw = acc_fbs.writer();
+                    aw.writeAll(prepared) catch {};
                     aw.writeByte('@') catch {};
                     aw.writeAll(aj.domain) catch {};
-                    account = acc_buf[0 .. folded.len + acc_fbs.pos];
+                    account = acc_buf[0..acc_fbs.pos];
                 } else |_| {}
                 const to_bare = if (std.mem.indexOfScalar(u8, to_attr, '/')) |sp| to_attr[0..sp] else to_attr;
                 server_addressed = account.len > 0 and std.mem.eql(u8, to_bare, account);
@@ -6316,17 +6322,21 @@ const F6WirePair = struct {
 };
 
 fn f6WireSetup(allocator: std.mem.Allocator, server: *Server, sm: *SessionMap, target_fds: [2]posix.fd_t, alice_fds: [2]posix.fd_t) !F6WirePair {
+    return f6WireSetupBound(allocator, server, sm, target_fds, alice_fds, "naplestb");
+}
+
+fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *SessionMap, target_fds: [2]posix.fd_t, alice_fds: [2]posix.fd_t, bound_local: []const u8) !F6WirePair {
     server.worker_id = 0;
     server.session_map = sm;
     const target = try allocator.create(Session);
     target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = .{ .local = "naplestb", .domain = "localhost", .resource = "desk" };
+    target.stream.bound_jid = .{ .local = bound_local, .domain = "localhost", .resource = "desk" };
     target.csi_active = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "naplestb", "localhost", "desk");
-    sm.setPresenceAvailable("naplestb", "localhost", "desk", true);
+    _ = try sm.bind(0, 5, bound_local, "localhost", "desk");
+    sm.setPresenceAvailable(bound_local, "localhost", "desk", true);
 
     const alice = try allocator.create(Session);
     alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
@@ -6395,6 +6405,53 @@ test "F6: self-closing top-level message to a mixed-case local JID is routed fol
     const r = f6Read(tf[1], &buf);
     try std.testing.expect(std.mem.indexOf(u8, r, "to='naplestb@localhost'") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "id='b2'") != null);
+}
+
+test "F6: a non-ASCII localpart reaches the account under its prepared spelling" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    // The target binds the UsernameCaseMapped form of the address, exactly
+    // the spelling registration and SASL store and authenticate.
+    const s = try f6WireSetupBound(allocator, &server, &sm, tf, af, "\xCE\xBF\xCE\xB4\xCE\xBF\xCF\x83");
+
+    var buf: [8192]u8 = undefined;
+    // to='\xCE\x9F\xCE\x94\xCE\x9F\xCE\xA3@localhost' is the typed form
+    // U+039F U+0394 U+039F U+03A3, preparing to "οδοσ@localhost".
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='\xCE\x9F\xCE\x94\xCE\x9F\xCE\xA3@localhost' type='chat' id='g1'/>");
+    _ = s.target.conn.flushSend() catch {};
+    const r = f6Read(tf[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "to='\xCE\xBF\xCE\xB4\xCE\xBF\xCF\x83@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='g1'") != null);
+}
+
+test "F6: a migrated account receives mail addressed to its legacy spelling" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    // After `xmppctl migrate-precis` the account exists only under the
+    // prepared key "naplestb"; a stanza addressed with the pre-migration
+    // spelling must still reach it.
+    const s = try f6WireSetupBound(allocator, &server, &sm, tf, af, "naplestb");
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='NaplesTB@localhost' type='chat' id='m9'><body>hi</body></message>");
+    _ = s.target.conn.flushSend() catch {};
+    const r = f6Read(tf[1], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, r, "to='naplestb@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "id='m9'") != null);
 }
 
 test "F6: self-closing presence subscribe to a mixed-case local JID is routed folded" {

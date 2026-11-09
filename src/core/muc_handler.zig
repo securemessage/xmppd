@@ -2492,8 +2492,9 @@ fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u
 /// the store lookup only; remote-domain members pass through unchanged.
 /// A member JID this late cannot practically fail preparation; on error the
 /// raw form is used so the lookup degenerates to a miss, not a wrong key.
-/// The input comes from buildBareJid's 256 B buffer and the prepared output
-/// is never longer than the input, so 256 B is enough.
+/// The input comes from buildBareJid's 256 B buffer and is already the
+/// prepared bound identity, so re-preparing is idempotent and cannot grow;
+/// 256 B is enough.
 fn preparedMemberBare(server: *Server, bare_jid: []const u8, buf: *[256]u8) []const u8 {
     return xmpp.prepareLocalDomainJid(bare_jid, server.server_host, buf) catch bare_jid;
 }

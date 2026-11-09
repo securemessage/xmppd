@@ -224,6 +224,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     precis_username_mod.addImport("unicode", unicode_mod);
+    xmpp_mod.addImport("precis_username", precis_username_mod);
+    xmpp_test_mod.addImport("precis_username", precis_username_mod);
 
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),

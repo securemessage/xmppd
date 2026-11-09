@@ -4,7 +4,7 @@ pub const stream = @import("stream.zig");
 
 pub const Jid = jid.Jid;
 pub const max_jid_octets = jid.max_jid_octets;
-pub const foldLocalpart = jid.foldLocalpart;
+pub const max_part_octets = jid.max_part_octets;
 pub const prepareLocalDomainJid = jid.prepareLocalDomainJid;
 pub const Stanza = stanza.Stanza;
 pub const Stream = stream.Stream;
