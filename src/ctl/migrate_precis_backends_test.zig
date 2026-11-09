@@ -698,6 +698,53 @@ test "migrate-precis rekeys colliding offline and archive rows with different va
     }
 }
 
+test "migrate-precis merges held offline queues in receipt order" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+    try users.addUser(allocator, "NaplesTB", "pw");
+    var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+    _ = try offline.storeHeldPointer("naplestb@us.example", "spam@remote.example/x", "spam", 1, "<message><body>spam</body></message>");
+    _ = try offline.storeHeldPointer("NaplesTB@us.example", "alice@us.example/a", "alice1", 1, "<message><body>alice1</body></message>");
+    _ = try offline.storeHeldPointer("NaplesTB@us.example", "alice@us.example/a", "alice2", 2, "<message><body>alice2</body></message>");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(journal_dir);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+    const pointers = try offline.getPointers("naplestb@us.example");
+    defer offline.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 3), pointers.len);
+    try std.testing.expectEqualStrings("spam@remote.example/x", pointers[0].from_jid);
+    try std.testing.expectEqualStrings("alice@us.example/a", pointers[1].from_jid);
+    try std.testing.expectEqualStrings("alice@us.example/a", pointers[2].from_jid);
+    const expected = [_][]const u8{
+        "<message><body>spam</body></message>",
+        "<message><body>alice1</body></message>",
+        "<message><body>alice2</body></message>",
+    };
+    for (pointers, expected) |pointer, want| {
+        const held = try offline.getHeldStanza(pointer);
+        defer if (held) |value| allocator.free(value);
+        try std.testing.expect(held != null);
+        try std.testing.expectEqualStrings(want, held.?);
+    }
+}
+
 test "deluser --raw on a data-only spelling touches only owned rows" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;

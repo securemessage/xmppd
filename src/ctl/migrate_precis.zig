@@ -1118,6 +1118,218 @@ fn issueLessThan(_: void, a: Issue, b: Issue) bool {
     return std.mem.lessThan(u8, a.key, b.key);
 }
 
+const V2QueueRow = struct {
+    owner: []u8,
+    seq: u64,
+    value: []u8,
+};
+
+const V2Queue = struct {
+    target: []u8,
+    rows: std.ArrayListUnmanaged(V2QueueRow) = .{},
+    target_max: u64 = 0,
+};
+
+fn prepareQueueOwner(ctx: *const RewriteContext, owner: []const u8) !?[]u8 {
+    const at = std.mem.indexOfScalar(u8, owner, '@') orelse return null;
+    const local = owner[0..at];
+    const suffix = owner[at..];
+    var prepared: []const u8 = local;
+    if (ctx.forced) |rename| {
+        if (std.mem.eql(u8, local, rename.old_localpart)) {
+            prepared = rename.new_localpart;
+        } else {
+            prepared = migrate_precis_scratch.localpart(local) catch return error.InvalidAccountName;
+        }
+    } else {
+        prepared = migrate_precis_scratch.localpart(local) catch return error.InvalidAccountName;
+    }
+    if (std.mem.eql(u8, prepared, local)) return null;
+    const result = try ctx.identities.plan.allocator.alloc(u8, prepared.len + suffix.len);
+    @memcpy(result[0..prepared.len], prepared);
+    @memcpy(result[prepared.len..], suffix);
+    return result;
+}
+
+fn stripV2QueueRenames(plan: *Plan) void {
+    var i: usize = 0;
+    while (i < plan.renames.items.len) {
+        const ns = plan.renames.items[i].namespace;
+        const strip = std.mem.eql(u8, ns, NS_OFFLINE_V2) or
+            std.mem.eql(u8, ns, NS_OFFLINE_SEQ) or
+            std.mem.eql(u8, ns, NS_OFFLINE_HOLD_V2) or
+            std.mem.eql(u8, ns, NS_OFFLINE_HOLD_TOKEN);
+        if (!strip) {
+            i += 1;
+            continue;
+        }
+        const rename = plan.renames.orderedRemove(i);
+        plan.allocator.free(rename.old_key);
+        plan.allocator.free(rename.new_key);
+        if (rename.new_value) |value| plan.allocator.free(value);
+    }
+    var j: usize = 0;
+    while (j < plan.issues.items.len) {
+        const ns = plan.issues.items[j].namespace;
+        if (std.mem.eql(u8, ns, NS_OFFLINE_V2) or std.mem.eql(u8, ns, NS_OFFLINE_SEQ) or
+            std.mem.eql(u8, ns, NS_OFFLINE_HOLD_V2) or std.mem.eql(u8, ns, NS_OFFLINE_HOLD_TOKEN))
+        {
+            const issue = plan.issues.orderedRemove(j);
+            plan.allocator.free(issue.key);
+            plan.allocator.free(issue.target);
+        } else {
+            j += 1;
+        }
+    }
+}
+
+fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void {
+    const allocator = plan.allocator;
+    var all: std.ArrayListUnmanaged(V2QueueRow) = .{};
+    defer {
+        for (all.items) |row| {
+            allocator.free(row.owner);
+            allocator.free(row.value);
+        }
+        all.deinit(allocator);
+    }
+    {
+        var iter = try backend.iterator(NS_OFFLINE_V2, "");
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse continue;
+            if (entry.key.len < sep + 9) continue;
+            const seq = std.mem.readInt(u64, entry.key[sep + 1 ..][0..8], .big);
+            try all.append(allocator, .{
+                .owner = try allocator.dupe(u8, entry.key[0..sep]),
+                .seq = seq,
+                .value = try allocator.dupe(u8, entry.value),
+            });
+        }
+    }
+    var queues: std.ArrayListUnmanaged(V2Queue) = .{};
+    defer {
+        for (queues.items) |*queue| {
+            allocator.free(queue.target);
+            for (queue.rows.items) |row| {
+                allocator.free(row.owner);
+                allocator.free(row.value);
+            }
+            queue.rows.deinit(allocator);
+        }
+        queues.deinit(allocator);
+    }
+    for (all.items) |row| {
+        const target_opt = prepareQueueOwner(ctx, row.owner) catch continue;
+        const target = target_opt orelse continue;
+        errdefer allocator.free(target);
+        var queue: ?*V2Queue = null;
+        for (queues.items) |*candidate| {
+            if (std.mem.eql(u8, candidate.target, target)) {
+                queue = candidate;
+                break;
+            }
+        }
+        if (queue == null) {
+            try queues.append(allocator, .{ .target = target });
+            queue = &queues.items[queues.items.len - 1];
+        } else {
+            allocator.free(target);
+        }
+        try queue.?.rows.append(allocator, .{
+            .owner = try allocator.dupe(u8, row.owner),
+            .seq = row.seq,
+            .value = try allocator.dupe(u8, row.value),
+        });
+    }
+    for (queues.items) |*queue| {
+        for (all.items) |row| {
+            if (std.mem.eql(u8, row.owner, queue.target) and row.seq > queue.target_max)
+                queue.target_max = row.seq;
+        }
+        std.sort.heap(V2QueueRow, queue.rows.items, {}, struct {
+            fn less(_: void, a: V2QueueRow, b: V2QueueRow) bool {
+                const at = std.mem.readInt(u64, a.value[0..8], .big);
+                const bt = std.mem.readInt(u64, b.value[0..8], .big);
+                if (at != bt) return at < bt;
+                return a.seq < b.seq;
+            }
+        }.less);
+        for (queue.rows.items, 0..) |row, i| {
+            const new_seq = queue.target_max + @as(u64, @intCast(i)) + 1;
+            const old_key = try std.fmt.allocPrint(allocator, "{s}\x00", .{row.owner});
+            defer allocator.free(old_key);
+            var old_key_buf = try allocator.alloc(u8, old_key.len + 8);
+            defer allocator.free(old_key_buf);
+            @memcpy(old_key_buf[0..old_key.len], old_key);
+            std.mem.writeInt(u64, old_key_buf[old_key.len..][0..8], row.seq, .big);
+            var new_key_buf = try allocator.alloc(u8, queue.target.len + 1 + 8);
+            defer allocator.free(new_key_buf);
+            @memcpy(new_key_buf[0..queue.target.len], queue.target);
+            new_key_buf[queue.target.len] = 0;
+            std.mem.writeInt(u64, new_key_buf[queue.target.len + 1 ..][0..8], new_seq, .big);
+
+            const ts8 = row.value[0..8];
+            const id_len = std.mem.readInt(u32, row.value[8..12], .big);
+            const id = row.value[12 .. 12 + @as(usize, id_len)];
+            const sender = row.value[12 + @as(usize, id_len) ..];
+            const new_id = lookupRekeyId(plan, queue.target, ts8, id) orelse id;
+            const new_sender = try rewriteJid(allocator, sender, ctx, .reference) orelse try allocator.dupe(u8, sender);
+            defer allocator.free(new_sender);
+            var value_out: std.ArrayListUnmanaged(u8) = .{};
+            defer value_out.deinit(allocator);
+            try value_out.appendSlice(allocator, ts8);
+            var id_len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &id_len_buf, @intCast(new_id.len), .big);
+            try value_out.appendSlice(allocator, &id_len_buf);
+            try value_out.appendSlice(allocator, new_id);
+            try value_out.appendSlice(allocator, new_sender);
+            const new_value = try value_out.toOwnedSlice(allocator);
+            try plan.renames.append(allocator, .{
+                .db = .op,
+                .namespace = NS_OFFLINE_V2,
+                .old_key = try allocator.dupe(u8, old_key_buf),
+                .new_key = try allocator.dupe(u8, new_key_buf),
+                .new_value = new_value,
+                .same_key = false,
+                .value_len = row.value.len,
+            });
+            plan.rename_bytes += new_key_buf.len + row.value.len;
+
+            for ([_][]const u8{ NS_OFFLINE_HOLD_V2, NS_OFFLINE_HOLD_TOKEN }) |hold_ns| {
+                const hold = try backend.get(allocator, hold_ns, old_key_buf);
+                if (hold) |hold_value| {
+                    defer allocator.free(hold_value);
+                    try plan.renames.append(allocator, .{
+                        .db = .op,
+                        .namespace = hold_ns,
+                        .old_key = try allocator.dupe(u8, old_key_buf),
+                        .new_key = try allocator.dupe(u8, new_key_buf),
+                        .new_value = try allocator.dupe(u8, hold_value),
+                        .same_key = false,
+                        .value_len = hold_value.len,
+                    });
+                    plan.rename_bytes += new_key_buf.len + hold_value.len;
+                }
+            }
+        }
+        if (queue.rows.items.len > 0) {
+            const final_seq = queue.target_max + @as(u64, @intCast(queue.rows.items.len));
+            const seq_value = sequenceValue(final_seq);
+            try plan.renames.append(allocator, .{
+                .db = .op,
+                .namespace = NS_OFFLINE_SEQ,
+                .old_key = try allocator.dupe(u8, queue.target),
+                .new_key = try allocator.dupe(u8, queue.target),
+                .new_value = try allocator.dupe(u8, &seq_value),
+                .same_key = true,
+                .value_len = seq_value.len,
+            });
+            plan.rename_bytes += queue.target.len + seq_value.len;
+        }
+    }
+}
+
 /// Compute every planned rename and every collision or invalid localpart.
 /// `forced`, when present, maps one exact stored localpart to an explicitly
 /// chosen prepared replacement for collision resolution.
@@ -1183,6 +1395,8 @@ pub fn planMigration(
     // Archive messages first: their rekey assignments are consumed by the
     // offline pointers and by_contact values planned below.
     try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, &ctx);
+    stripV2QueueRenames(&plan);
+    try planV2Queues(&plan, op, &ctx);
     try planDb(&plan, &targets, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -1190,10 +1404,6 @@ pub fn planMigration(
         NS_PEP,
         NS_LASTACT,
         NS_OFFLINE,
-        NS_OFFLINE_V2,
-        NS_OFFLINE_SEQ,
-        NS_OFFLINE_HOLD_V2,
-        NS_OFFLINE_HOLD_TOKEN,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, &ctx);
