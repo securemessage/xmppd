@@ -127,6 +127,11 @@ pub const S2sDaemon = struct {
     /// dialback callback can never land on a reused slot (S2).
     inbound_gens: [MAX_INBOUND_SESSIONS]u32 = [_]u32{0} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
+    /// Inbound sessions closed because a kevent change could not be
+    /// staged (L5): a lost EV_DISABLE spins the loop on a held read and
+    /// a lost EV_ENABLE strands the session with reads off, so each
+    /// failure closes rather than lies.
+    inbound_kevent_closes: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
     listener_fd: posix.fd_t = -1,
@@ -2686,7 +2691,16 @@ fn performInboundDane(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSessi
     // Inbound read interest is level-triggered: left armed while the
     // lookup pends, any peer byte spins the loop until the chain lands.
     if (session.dane_lookup_pending) {
-        batch.disableRead(session.fd) catch {};
+        batch.disableRead(session.fd) catch {
+            // A lost EV_DISABLE leaves the read armed on a lookup that
+            // refuses every byte: the loop spins (L5). Close rather
+            // than lie; returning true keeps the caller off the freed
+            // session exactly as a still-pending lookup would.
+            daemon.inbound_kevent_closes += 1;
+            log.warn("inbound S2S id={d}: kevent disable failed; closing session", .{session.id});
+            daemon.closeInbound(batch, session.id);
+            return true;
+        };
     }
     return true;
 }
@@ -2837,7 +2851,14 @@ fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.T
     session.dane_key = 0;
     session.dane_tlsa_status = status;
     // Re-arm the read interest performInboundDane held for the wait.
-    batch.enableRead(session.fd) catch {};
+    batch.enableRead(session.fd) catch {
+        // A lost EV_ENABLE strands the session with reads held off
+        // forever (L5): close rather than lie.
+        self.inbound_kevent_closes += 1;
+        log.warn("inbound S2S id={d}: kevent re-enable failed; closing session", .{session.id});
+        self.closeInbound(batch, session.id);
+        return;
+    };
 
     var verified = false;
     if (status == .present) {
@@ -6297,6 +6318,75 @@ test "S2sDaemon: an oversized SRV target is skipped, not a panic" {
     applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
     try std.testing.expect(!in1.session.dane_lookup_pending);
     try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a failed read-hold on the DANE wait closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    // A full changelist cannot stage the EV_DISABLE: the lookup would
+    // pend with reads still armed and spin the loop on every peer byte.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+}
+
+test "S2sDaemon: a failed read re-arm on DANE completion closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // The completion re-arms the read interest the wait held. A full
+    // changelist loses the EV_ENABLE and strands the session with reads
+    // off forever, so it closes instead.
+    var full_scratch: [4]posix.Kevent = undefined;
+    var full_cl = ChangeList.init(&full_scratch);
+    var i: usize = 0;
+    while (true) {
+        full_cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+    daemon.batch = &full_cl;
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+    daemon.batch = null;
 }
 
 test "S2sDaemon: a full changelist cannot stall a pending resolve" {
