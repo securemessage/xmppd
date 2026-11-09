@@ -217,8 +217,10 @@ pub const S2sSession = struct {
     }
 
     /// Record the SRV target the TLSA owner name is built from; an empty
-    /// target selects the _5269 fallback on the bare domain.
+    /// target selects the _5269 fallback on the bare domain. A DNS name
+    /// cannot exceed 255 wire bytes, so truncation is a caller bug.
     pub fn setDaneTarget(self: *S2sSession, target: []const u8, port: u16) void {
+        std.debug.assert(target.len <= 255);
         const n = @min(target.len, self.dane_target_buf.len);
         @memcpy(self.dane_target_buf[0..n], target[0..n]);
         self.dane_target_len = n;

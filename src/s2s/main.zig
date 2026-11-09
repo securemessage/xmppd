@@ -574,9 +574,7 @@ pub const S2sDaemon = struct {
             if (conn.deadline_ident == ident and conn.state == .connecting and conn.fd >= 0) {
                 conn.deadline_ident = 0;
                 log.warn("outbound connect deadline for {s}", .{conn.remote_domain});
-                batch.purgeFd(conn.fd);
-                posix.close(conn.fd);
-                conn.fd = -1;
+                self.abortConnectAttempt(batch, conn);
                 self.connectNextTarget(batch, conn);
                 return;
             }
@@ -5752,8 +5750,10 @@ fn nsAAnswer(a: []u8, ip: [4]u8) usize {
     return 16;
 }
 
-/// Wait up to 500 ms for one query on the fixture socket and answer it
-/// per the test script; false when nothing arrived.
+/// Serve one DNS reply on the fixture socket: wait up to 500 ms for one
+/// query and answer it per the test script; false when nothing arrived.
+/// Test-only: the posix.poll wait is fine here but must never be copied
+/// onto an event loop.
 fn nsServeOnce(fd: posix.fd_t) !bool {
     var pkt: [512]u8 = undefined;
     var pfd = [1]posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
