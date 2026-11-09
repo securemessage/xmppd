@@ -2754,9 +2754,13 @@ fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_as
                 if (srvs.items.len > 0) {
                     std.mem.sort(dns.SrvRecord, srvs.items, {}, dns.SrvRecord.lessThan);
                     const top = srvs.items[0];
-                    session.setDaneTarget(top.target, top.port);
-                    session.dane_phase = .tlsa;
-                    if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+                    // parseDnsName bounds the dotted form at 253, so a
+                    // target that still cannot be staged makes this SRV
+                    // set unusable and the chain walks on (H1).
+                    if (session.setDaneTarget(top.target, top.port)) |_| {
+                        session.dane_phase = .tlsa;
+                        if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+                    } else |_| {}
                 }
             }
             // Empty, absent or failed SRV: walk the chain. A failed
@@ -2767,7 +2771,7 @@ fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_as
                 if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
             } else if (status != .failed) {
                 // Both SRV names absent: the bare-domain fallback.
-                session.setDaneTarget("", 5269);
+                session.setDaneTarget("", 5269) catch unreachable;
                 session.dane_phase = .tlsa;
                 if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
             }
@@ -6224,6 +6228,75 @@ test "S2sDaemon: a TLSA adoption that cannot allocate is lookup_failed" {
 
     try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
     try std.testing.expectEqual(@as(usize, 0), in1.session.dane_tlsa_records.len);
+}
+
+test "S2sDaemon: an oversized SRV target is skipped, not a panic" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // A peer-controlled SRV target of 383 dotted bytes: six 63-octet
+    // labels, which an unbounded parseDnsName accepted (H1's remote
+    // panic on the setDaneTarget assert).
+    var rdata: [6 + 6 * 64 + 1]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], 10, .big);
+    std.mem.writeInt(u16, rdata[2..4], 5, .big);
+    std.mem.writeInt(u16, rdata[4..6], 5269, .big);
+    var rp: usize = 6;
+    for (0..6) |_| {
+        rdata[rp] = 63;
+        @memset(rdata[rp + 1 .. rp + 64], 'a');
+        rp += 64;
+    }
+    rdata[rp] = 0;
+
+    // First hop: the bad record is skipped as a parse error and the
+    // chain walks to _xmpp-server instead of reaching setDaneTarget.
+    var rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpps-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_plain, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    // Second hop the same: both SRV names unusable, so the chain takes
+    // the bare-domain TLSA fallback.
+    rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpp-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(session_mod.InboundDanePhase.tlsa, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
 }
 
 test "S2sDaemon: a full changelist cannot stall a pending resolve" {

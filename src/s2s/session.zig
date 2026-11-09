@@ -217,13 +217,13 @@ pub const S2sSession = struct {
     }
 
     /// Record the SRV target the TLSA owner name is built from; an empty
-    /// target selects the _5269 fallback on the bare domain. A DNS name
-    /// cannot exceed 255 wire bytes, so truncation is a caller bug.
-    pub fn setDaneTarget(self: *S2sSession, target: []const u8, port: u16) void {
-        std.debug.assert(target.len <= 255);
-        const n = @min(target.len, self.dane_target_buf.len);
-        @memcpy(self.dane_target_buf[0..n], target[0..n]);
-        self.dane_target_len = n;
+    /// target selects the _5269 fallback on the bare domain. The target is
+    /// peer-controlled wire data, so an oversized name is an error the
+    /// caller drops the record on, never an assert (H1).
+    pub fn setDaneTarget(self: *S2sSession, target: []const u8, port: u16) !void {
+        if (target.len > self.dane_target_buf.len) return error.InvalidDnsName;
+        @memcpy(self.dane_target_buf[0..target.len], target);
+        self.dane_target_len = target.len;
         self.dane_target_port = port;
     }
 
