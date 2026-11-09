@@ -52,6 +52,9 @@ pub const IssueKind = enum {
     /// Non-blocking: a data row with a colliding key and different value was
     /// moved to a deterministic stanza-id suffix instead of being deleted.
     rekeyed,
+    /// Blocking: a stored row cannot be decoded and must be repaired or
+    /// removed before migration.
+    invalid_value,
 };
 
 pub const Issue = struct {
@@ -1240,8 +1243,23 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         var iter = try backend.iterator(NS_OFFLINE_V2, "");
         defer iter.deinit();
         while (iter.next()) |entry| {
-            const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse continue;
-            if (entry.key.len < sep + 9) continue;
+            const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            };
+            if (entry.key.len < sep + 9) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
+            if (entry.value.len < 12) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
+            const id_len = std.mem.readInt(u32, entry.value[8..12], .big);
+            if (@as(usize, id_len) > entry.value.len - 12) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
             const seq = std.mem.readInt(u64, entry.key[sep + 1 ..][0..8], .big);
             try all.append(allocator, .{
                 .owner = try allocator.dupe(u8, entry.key[0..sep]),

@@ -1386,3 +1386,58 @@ test "migrate-precis plans and applies on real LMDB and RocksDB" {
     defer if (archive_value) |value| allocator.free(value);
     try std.testing.expectEqualStrings("<message><body>private</body></message>", archive_value.?);
 }
+
+test "migrate-precis reports malformed offline_v2 rows" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    const Malformed = enum { short_value, id_past_end };
+    for ([_]Malformed{ .short_value, .id_past_end }) |malformed| {
+        var auth = try MemoryBackend.open("", .{});
+        defer auth.close();
+        var op = try MemoryBackend.open("", .{});
+        defer op.close();
+        var archive = try MemoryBackend.open("", .{});
+        defer archive.close();
+
+        const owner = "naplestb@us.example";
+        const key_prefix = try std.fmt.allocPrint(allocator, "{s}\x00", .{owner});
+        defer allocator.free(key_prefix);
+        const key = try allocator.alloc(u8, key_prefix.len + 8);
+        defer allocator.free(key);
+        @memcpy(key[0..key_prefix.len], key_prefix);
+        std.mem.writeInt(u64, key[key_prefix.len..][0..8], 1, .big);
+
+        switch (malformed) {
+            .short_value => try op.put(NS_OFFLINE_V2, key, &[_]u8{0} ** 5),
+            .id_past_end => {
+                var value: [12]u8 = undefined;
+                @memset(value[0..8], 0);
+                std.mem.writeInt(u32, value[8..12], 10, .big);
+                try op.put(NS_OFFLINE_V2, key, &value);
+            },
+        }
+
+        const domains = [_][]const u8{"us.example"};
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+        defer plan.deinit();
+        try std.testing.expect(plan.hasBlockingIssues());
+        var found = false;
+        for (plan.issues.items) |issue| {
+            if (issue.kind == .invalid_value and
+                std.mem.eql(u8, issue.namespace, NS_OFFLINE_V2) and
+                std.mem.eql(u8, issue.key, key))
+            {
+                found = true;
+            }
+        }
+        try std.testing.expect(found);
+        try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(
+            allocator,
+            &auth,
+            &op,
+            &archive,
+            &plan,
+            .{},
+        ));
+    }
+}
