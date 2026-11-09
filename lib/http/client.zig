@@ -808,14 +808,33 @@ fn initTlsClient(ca_file: ?[]const u8) ?*c.SSL_CTX {
 // Response Parsing
 // ============================================================================
 
+/// RFC 9112 4: status-line = HTTP-version SP status-code SP [ reason-phrase ]
+/// Only HTTP/1.1 and HTTP/1.0 are spoken here. The code is exactly three
+/// DIGIT (never signed, never longer) and is followed by the second SP,
+/// even for an empty reason phrase. Reason-phrase bytes are HTAB / SP /
+/// VCHAR / obs-text, never a CTL.
 fn parseStatusLine(data: []const u8) ?u16 {
-    // "HTTP/1.1 200 OK\r\n" or "HTTP/1.0 200 OK\r\n"
-    if (data.len < 12) return null;
-    if (!std.mem.startsWith(u8, data, "HTTP/1.")) return null;
-
-    // Find the status code (starts at offset 9 after "HTTP/1.X ")
-    if (data[8] != ' ') return null;
-    return std.fmt.parseInt(u16, data[9..12], 10) catch null;
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return null;
+    const line = data[0..line_end];
+    // "HTTP/1.X " + 3 DIGIT + " " is the shortest accepted shape.
+    if (line.len < 13) return null;
+    const version = line[0..8];
+    if (!std.mem.eql(u8, version, "HTTP/1.1") and
+        !std.mem.eql(u8, version, "HTTP/1.0"))
+    {
+        return null;
+    }
+    if (line[8] != ' ') return null;
+    var code: u16 = 0;
+    for (line[9..12]) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        code = code * 10 + @as(u16, ch - '0');
+    }
+    if (line[12] != ' ') return null;
+    for (line[13..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return null;
+    }
+    return code;
 }
 
 // ============================================================================
@@ -868,6 +887,29 @@ test "parseStatusLine: invalid" {
     try std.testing.expect(parseStatusLine("") == null);
     try std.testing.expect(parseStatusLine("GARBAGE") == null);
     try std.testing.expect(parseStatusLine("HTTP/1.1") == null);
+}
+
+test "parseStatusLine: strict RFC 9112 4 shape" {
+    // The code is exactly three DIGIT followed by the second SP; the
+    // reason phrase may be empty but is never a CTL. The old
+    // fixed-offset parse accepted most shapes below silently.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 2000 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 +12 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 -00 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 20a OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.9 200 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/2.0 200 OK\r\n") == null);
+    // The second SP is required even for an empty reason phrase.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 204\r\n") == null);
+    try std.testing.expectEqual(@as(u16, 204), parseStatusLine("HTTP/1.1 204 \r\n").?);
+    // Reason phrases may carry VCHAR, SP, HTAB and obs-text.
+    try std.testing.expectEqual(
+        @as(u16, 200),
+        parseStatusLine("HTTP/1.1 200 fine : yes\ttab\r\n").?,
+    );
+    // A bare CR inside the reason phrase is a CTL, not a phrase byte.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200 bad\rph\r\n") == null);
 }
 
 /// Loopback TCP listener that accepts connections into a hold array and
