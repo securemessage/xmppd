@@ -237,6 +237,12 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
 
 const MAX_DBS = 24;
 
+comptime {
+    // openCanonicalNamespaces appends every canonical namespace to
+    // dbi_cache without a runtime bound check; the list must fit.
+    std.debug.assert(backend.canonical_namespaces.len <= MAX_DBS);
+}
+
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
     name_len: u8,
@@ -1238,6 +1244,33 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     const after = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(rec.kve_start, after.kve_start);
     try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
+}
+
+test "LmdbBackend: a vmmap miss uses the not-found warning, not the exhaustion one" {
+    // Goal: a lookup that returns records but no matching VMA is a miss,
+    // not retry exhaustion: the open warns with the distinct not-found
+    // message, the exhaustion counter stays put, and no madvise is
+    // attempted without a record. Method: the seam returns one vnode
+    // record whose inode and filesystem cannot match the env map.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 1;
+    recs[0].kve_vn_fsid = 1;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const calls0 = madviseCall.calls;
+    const warns0 = warnCall.exhausted_calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, 1), vmmapCall.read_calls);
+    try std.testing.expectEqual(warns0, warnCall.exhausted_calls);
 }
 
 fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
