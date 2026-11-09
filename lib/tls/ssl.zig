@@ -132,20 +132,31 @@ pub const DaneState = struct {
     fn refs(self: *const DaneState) dane.ReferenceIds {
         return .{ .names = self.names };
     }
+
+    /// Whether the usable records demand DANE or, with none surviving
+    /// filtering, PKIX against the reference identifiers (module plan
+    /// section 7). An empty set never means "skip verification".
+    pub fn mode(self: *const DaneState) dane.Mode {
+        return dane.set.mode(&self.set);
+    }
 };
+
+/// Verification mode an RRset implies: `.pkix` when no record survives
+/// filtering, so a caller can fall back to the system store instead of
+/// treating an unusable-only RRset as a match or as a hard failure.
+pub const DaneMode = dane.Mode;
 
 /// Upper bound on records and identifiers per handshake, matching the
 /// module's own limits so an oversized RRset is rejected, never truncated.
 pub const dane_max_records = dane.max_records;
-pub const dane_max_names = dane.max_names;
 
 /// Build the DANE state for a handshake from raw TLSA records.
 ///
 /// `records` may contain unusable entries: the module filters them and
-/// applies digest agility. The caller decides what an empty surviving set
-/// means; `prepare` reports it as `.no_usable_records`.
+/// applies digest agility. An RRset whose usable survivors exceed the
+/// module's cap is `error.TooManyRecords`, never truncated. The caller
+/// decides what an empty surviving set means; it reads `.pkix` from `mode`.
 pub fn initDane(alloc: std.mem.Allocator, policy: DanePolicy, records: []const DaneRecord) DaneError!DaneState {
-    if (records.len > dane.max_records) return error.TooManyRecords;
     if (policy.names.len == 0) return error.NoReferenceIds;
     if (policy.names.len > dane.max_names) return error.TooManyReferenceIds;
 
