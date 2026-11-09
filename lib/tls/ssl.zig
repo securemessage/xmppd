@@ -528,6 +528,10 @@ pub const SslConn = struct {
     /// handshake could not be armed). `verify_ctx` must be a dedicated
     /// context from `initDaneVerifier`; it carries the DANE settings and an
     /// empty store, so nothing but a TLSA record can anchor the chain.
+    ///
+    /// Chain building and the signature checks run on the calling thread.
+    /// ADR-11/F7 moves that work to the handshake pool; until then this runs
+    /// on the event loop and callers must keep the input bounded.
     pub fn verifyPeerDane(self: *SslConn, verify_ctx: *const SslContext, state: *const DaneState) dane.Verdict {
         return dane_openssl.verifyPeer(@ptrCast(self.ssl), @ptrCast(verify_ctx.ctx), &state.set, state.refs(), state.policy);
     }
