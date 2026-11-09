@@ -77,6 +77,10 @@ const MAX_INBOUND_SESSIONS = 256;
 const MAX_OUTBOUND_CONNS = 128;
 /// Deadline for one connect attempt to a resolved target (X2b).
 const CONNECT_DEADLINE_MS: u32 = 10_000;
+/// Base ident for EVFILT_TIMER connect deadlines, same pattern as the
+/// udata bases: the low range is reserved for X1's lifecycle timers and
+/// the .timer arm dispatches on the boundary.
+const CONNECT_DEADLINE_IDENT_BASE: usize = 0x100000;
 /// Changelist capacity: worst case per loop iteration is one connect
 /// attempt (write arm + deadline) per outbound conn plus one DANE
 /// completion (read enable, write arm) and a few stanza/IPC arms per
@@ -528,7 +532,7 @@ pub const S2sDaemon = struct {
             conn.target_port = t.addr.getPort();
             conn.is_direct_tls = t.is_direct_tls;
             conn.fd = sock;
-            conn.deadline_ident = self.next_deadline_ident;
+            conn.deadline_ident = CONNECT_DEADLINE_IDENT_BASE + self.next_deadline_ident;
             self.next_deadline_ident +%= 1;
 
             log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
@@ -578,6 +582,14 @@ pub const S2sDaemon = struct {
             }
         }
         // Stale ident: the attempt already completed or was cancelled.
+    }
+
+    /// EVFILT_TIMER demux: idents at CONNECT_DEADLINE_IDENT_BASE and
+    /// above are per-target connect deadlines; lower idents belong to the
+    /// X1 lifecycle timers and must not reach the connect path.
+    fn handleTimerEvent(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        if (ident < CONNECT_DEADLINE_IDENT_BASE) return;
+        self.handleConnectDeadline(batch, ident);
     }
 
     /// Flush queued stanzas on an established outbound connection.
@@ -1127,7 +1139,7 @@ pub fn main() !void {
                     }
                 },
                 .timer => |t| {
-                    daemon.handleConnectDeadline(&batch, t.ident);
+                    daemon.handleTimerEvent(&batch, t.ident);
                 },
                 else => {},
             }
@@ -6248,4 +6260,28 @@ test "S2sDaemon: a full changelist cannot stall a pending resolve" {
     // startup, not on entries in this batch.
     daemon.resolver.step(200);
     try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+}
+
+test "S2sDaemon: a timer ident below the deadline base never reaches the connect path" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    try std.testing.expect(conn.deadline_ident >= CONNECT_DEADLINE_IDENT_BASE);
+    try std.testing.expect(conn.fd >= 0);
+
+    // An ident in the lifecycle range must not touch the armed deadline.
+    daemon.handleTimerEvent(&cl, 1);
+    try std.testing.expect(conn.state == .connecting);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+
+    // The real ident still fires.
+    daemon.handleTimerEvent(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null or conn.deadline_ident != 0);
 }
