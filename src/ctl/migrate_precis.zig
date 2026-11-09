@@ -186,10 +186,10 @@ fn artifactPathAbs(allocator: std.mem.Allocator, dir: []const u8, basename: []co
     return std.fs.path.join(allocator, &.{ dir, basename });
 }
 
-fn syncDir(dir_path: []const u8) void {
-    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+fn syncDir(dir_path: []const u8) !void {
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
     defer dir.close();
-    std.posix.fsync(dir.fd) catch {};
+    try std.posix.fsync(dir.fd);
 }
 
 fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex: []const u8) !void {
@@ -205,7 +205,7 @@ fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex
         try file.sync();
     }
     try std.fs.cwd().rename(tmp_path, path);
-    syncDir(dir);
+    try syncDir(dir);
 }
 
 fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const Plan) ![]u8 {
@@ -214,6 +214,7 @@ fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
     var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    defer file.close();
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     try file.writeAll(recovery_header);
     hasher.update(recovery_header);
@@ -246,9 +247,8 @@ fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const
         hasher.update(line);
     }
     try file.sync();
-    file.close();
     try std.fs.cwd().rename(tmp_path, path);
-    syncDir(dir);
+    try syncDir(dir);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     const digest_hex = try hexEncodeAlloc(allocator, &digest);
@@ -2529,6 +2529,19 @@ test "migrate-precis: an explicit rename resolves a collision" {
     try expectRow(&auth, NS_USERS, "naples_tb", "creds-a");
     try expectRow(&auth, NS_USERS, "naplestb", "creds-b");
     try expectRow(&op, NS_ROSTERS, "naples_tb@us.example\x00friend@us.example", "roster");
+}
+
+test "migrate-precis: syncDir reports a missing directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const gone = try std.fs.path.join(allocator, &.{ base, "gone" });
+    defer allocator.free(gone);
+    try tmp.dir.makePath("gone");
+    try std.fs.cwd().deleteDir(gone);
+    try std.testing.expectError(error.FileNotFound, syncDir(gone));
 }
 
 test "migrate-precis: live and stale pid files drive the offline guard" {
