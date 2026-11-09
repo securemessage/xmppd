@@ -220,11 +220,17 @@ pub fn foldLocalpart(local: []const u8, out: []u8) error{NoSpaceLeft}![]const u8
 /// migrate-precis fail to match. Remote-domain JIDs are returned as `raw`,
 /// unchanged; the resource is preserved. `out` must not alias `raw`.
 ///
+/// One trailing dot on the domainpart is ignored for the match (RFC 7622
+/// 3.2), so "user@localhost." names the hosted domain; an unmatched remote
+/// domain keeps its raw spelling, dot included.
+///
 /// The MUC domain gets no special handling: callers pass the account
 /// domain, so room names and the conference host pass through untouched.
 pub fn prepareLocalDomainJid(raw: []const u8, configured_domain: []const u8, out: []u8) PrepareError![]const u8 {
     const parts = try parseParts(raw);
-    if (!std.ascii.eqlIgnoreCase(parts.domain, configured_domain)) return raw;
+    var domain = parts.domain;
+    if (std.mem.endsWith(u8, domain, ".")) domain = domain[0 .. domain.len - 1];
+    if (!std.ascii.eqlIgnoreCase(domain, configured_domain)) return raw;
 
     var pos: usize = 0;
     if (parts.local.len > 0) {
@@ -423,6 +429,22 @@ test "prepareLocalDomainJid: remote domain and MUC-shaped JIDs pass through" {
     const room = "BigRoom@conference.us.example";
     const room_got = try prepareLocalDomainJid(room, "us.example", &out);
     try std.testing.expectEqualStrings(room, room_got);
+}
+
+test "prepareLocalDomainJid strips one trailing dot on a local domain" {
+    var out: [max_jid_octets]u8 = undefined;
+    const got = try prepareLocalDomainJid("NaplesTB@LOCALHOST.", "localhost", &out);
+    try std.testing.expectEqualStrings("naplestb@localhost", got);
+    const with_res = try prepareLocalDomainJid("NaplesTB@LOCALHOST./Phone", "localhost", &out);
+    try std.testing.expectEqualStrings("naplestb@localhost/Phone", with_res);
+    // A remote domain keeps its trailing dot and stays a passthrough.
+    const remote = "user@REMOTE.EXAMPLE.";
+    const remote_got = try prepareLocalDomainJid(remote, "localhost", &out);
+    try std.testing.expectEqualStrings(remote, remote_got);
+    // Two trailing dots are not stripped twice; the domain is remote.
+    const dots = "user@localhost..";
+    const dots_got = try prepareLocalDomainJid(dots, "localhost", &out);
+    try std.testing.expectEqualStrings(dots, dots_got);
 }
 
 test "prepareLocalDomainJid: domain-only local JID takes configured spelling" {
