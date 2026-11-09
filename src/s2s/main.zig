@@ -2768,14 +2768,23 @@ fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_as
                 for (recs.items) |r| self.allocator.free(r.association_data);
                 recs.deinit(self.allocator);
             }
+            // The resolver's own rule (lib/dns/async.zig): parsed records
+            // are .present; an answer whose TLSA records all failed to
+            // parse or append is .lookup_failed (a temporary failure,
+            // never proof of absence); no TLSA records at all is .absent.
+            var saw = false;
             for (res.?.rrs) |rr| {
                 if (rr.rtype != @intFromEnum(dns_async.RType.tlsa)) continue;
+                saw = true;
                 const rec = dns.parseTlsaRdata(rr.rdata, self.allocator) catch continue;
-                recs.append(self.allocator, rec) catch continue;
+                recs.append(self.allocator, rec) catch {
+                    self.allocator.free(rec.association_data);
+                    continue;
+                };
             }
             if (recs.items.len == 0) {
                 recs.deinit(self.allocator);
-                return finishInboundDane(self, session, .absent);
+                return finishInboundDane(self, session, if (saw) .lookup_failed else .absent);
             }
             session.adoptDaneTlsa(recs.items, self.allocator);
             recs.deinit(self.allocator); // items moved to the session
@@ -6117,4 +6126,38 @@ test "S2sDaemon: bytes pipelined behind the post-TLS stream open wait for the DA
     const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+}
+
+test "S2sDaemon: a TLSA answer with only unparsable records is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    // Skip the SRV hops: the rule under test is the TLSA hop's.
+    in1.session.dane_phase = .tlsa;
+
+    // One TLSA RR whose rdata is too short to parse: the resolver's rule
+    // makes this lookup_failed (temporary), never proof of absence.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3, // CH is wrong but harmless; only rtype gates the walk
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01 }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
 }
