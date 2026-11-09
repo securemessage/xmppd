@@ -1879,9 +1879,10 @@ pub const Server = struct {
             if (session.stream.authenticated_jid) |aj| {
                 // The ingress-prepared 'to' carries a prepared localpart, so
                 // the account string prepares the authenticated name under
-                // the same profile; the buffer holds a full-length prepared
-                // bare JID (F6).
-                var acc_buf: [router.FULL_JID_MAX]u8 = undefined;
+                // the same profile. A prepared username can be 1023 octets
+                // and the domain another 1023, so the buffer must hold a
+                // full JID, not just FULL_JID_MAX.
+                var acc_buf: [xmpp.max_jid_octets]u8 = undefined;
                 var account: []const u8 = "";
                 if (prebind_precis_scratch.localpart(aj.local)) |prepared| {
                     var acc_fbs = std.io.fixedBufferStream(&acc_buf);
@@ -6252,6 +6253,52 @@ test "F6: a 320-octet localpart survives the pre-bind account compare" {
     var buf: [2048]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not-authorized") != null);
+}
+
+test "F6: a maximum-length prepared username is not judged third party" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    // 1023-octet localpart + '@localhost' = a 1033-octet bare JID; the
+    // account buffer must hold it whole or the write is silently truncated
+    // and an own-account stanza closes the stream as third party (LOW-5).
+    var local_upper: [1023]u8 = undefined;
+    @memset(&local_upper, 'A');
+    var to_buf: [1200]u8 = undefined;
+    const to = try std.fmt.bufPrint(&to_buf, "{s}@localhost", .{&local_upper});
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    session.stream.state = .features_bind;
+    session.stream.authenticated_jid = .{ .local = &local_upper, .domain = "localhost" };
+    session.reader.depth = 1;
+
+    const attrs = [_]xml.Attribute{
+        .{ .name = "to", .value = to, .prefix = "", .local_name = "to" },
+    };
+    var elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:client",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.handleElementStart(session, &elem, &changes);
+
+    // Own-account: stanza error, the stream stays open.
+    try std.testing.expect(server.sessions[1] != null);
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "not-authorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "</stream:stream>") == null);
 }
 
 test "F6: malformed local 'to' gets jid-malformed for message and iq" {
