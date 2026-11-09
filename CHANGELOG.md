@@ -93,6 +93,18 @@
   `migrate-precis` to absorb every row written under an old spelling in the
   meantime.
 
+### Fixed
+
+- S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`
+  claim from `caps.SERVER_FEATURES` (forge #22). No XEP-0060 `<subscribe/>`
+  or `<unsubscribe/>` handler exists, so the advertisement was false. The
+  remaining pubsub claims are backed: `publish` and `retrieve-items` have
+  iq dispatch branches, `auto-create` and `persistent-items` are covered by
+  the PEP store upsert on publish, and `auto-subscribe` is the XEP-0163
+  roster-derived notify model. A caps.zig consistency test now requires
+  every advertised `pubsub#*` feature to name its dispatch branch. The
+  XEP-0115 `ver` hash changes as a result of the removed feature.
+
 ## v0.9.0 - 2026-10-04
 
 ### Features

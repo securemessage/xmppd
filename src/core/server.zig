@@ -270,6 +270,9 @@ pub const Session = struct {
     iq_child_name: []const u8 = "",
     /// PEP node name from <publish node='...'> or <items node='...'> (XEP-0163).
     iq_pep_node: []const u8 = "",
+    /// First pubsub-namespaced child of <pubsub> seen this IQ: the set verb
+    /// dispatchIq routes on (XEP-0060).
+    iq_pubsub_verb: []const u8 = "",
     /// Roster item attributes from <item> inside roster query.
     iq_roster_item_jid: []const u8 = "",
     iq_roster_item_name: []const u8 = "",
@@ -3258,7 +3261,7 @@ pub const Server = struct {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token) catch {
+                        ds.deliverWithToken(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token, s2s_archive_ts) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -3869,7 +3872,12 @@ pub const Server = struct {
                 // same way.
                 if (target_session.offline_pending and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
                     const hold_id = if (parts.msg_id.len > 0) parts.msg_id else "offline";
-                    const timestamp: u64 = @intCast(std.time.timestamp());
+                    // Stamp the producer's receipt time, not the time a busy
+                    // consumer worker got to the slot.
+                    const timestamp: u64 = if (c.queue.current_slot_receipt_ts != 0)
+                        c.queue.current_slot_receipt_ts
+                    else
+                        @intCast(std.time.timestamp());
                     const from_jid = extractAttrValue(payload, "from");
                     const bound = target_session.stream.bound_jid orelse {
                         log.warn("cross-worker message to session {d} has no bound recipient for its offline hold", .{local_session_id});
@@ -6566,6 +6574,60 @@ test "cross-thread delivery: enqueue and drain" {
     try std.testing.expect(std.mem.indexOf(u8, received, "cross-thread!") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "alice@localhost/mobile") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
+}
+
+test "S35: the cross-worker hold stamps the producer receipt time" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.stream.state = .features_bind;
+    session.stream.authenticated = true;
+    session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
+    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    session.offline_pending = true;
+    server.sessions[5] = session;
+    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+
+    // The producer tags the slot with its own receipt time; the hold on the
+    // consuming worker must store that time, not the time the drain ran.
+    try delivery_sys.deliverWithToken(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345);
+    server.drainDeliveryQueue(&changes);
+
+    session_lifecycle.drainOfflinePending(&server, session, &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const wire = buf[0..n];
+    // 12345 seconds past the epoch, not the consumer-side wall clock.
+    try std.testing.expect(std.mem.indexOf(u8, wire, "stamp='1970-01-01T03:25:45Z'") != null);
 }
 
 test "cross-thread delivery: generation mismatch drops stanza" {
@@ -12313,4 +12375,261 @@ test "N1: two workers draining one bare JID hold a message once" {
     try std.testing.expect(server.holdBehindOfflineTail(phone, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza, token));
 
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+}
+
+// ============================================================================
+// Pubsub feature dispatch coverage (forge #22, S33)
+// ============================================================================
+
+/// Build the xml.Element the reader would produce for a start tag.
+fn testElem(local_name: []const u8, ns: []const u8, attrs: []const xml.Attribute) xml.Element {
+    return .{
+        .name = local_name,
+        .prefix = "",
+        .local_name = local_name,
+        .namespace_uri = ns,
+        .attributes = attrs,
+        .self_closing = false,
+    };
+}
+
+fn testAttr(local_name: []const u8, value: []const u8) xml.Attribute {
+    return .{ .name = local_name, .value = value, .prefix = "", .local_name = local_name };
+}
+
+/// Drive one IQ through the real dispatch path: handleIq for the stanza,
+/// handleIqChild for each child element, then dispatchIq. When `item_payload`
+/// is set it is appended to pep_payload after the <item> child, the way the
+/// server's collection path fills it. Returns the bytes written to the peer.
+fn driveTestIq(
+    server: *Server,
+    session: *Session,
+    changes: *ChangeList,
+    peer_fd: posix.fd_t,
+    iq_type: []const u8,
+    id: []const u8,
+    children: []const xml.Element,
+    item_payload: ?[]const u8,
+    out: []u8,
+) ![]const u8 {
+    const iq_attrs = [_]xml.Attribute{
+        testAttr("type", iq_type),
+        testAttr("id", id),
+    };
+    iq_handler.handleIq(session, testElem("iq", xml.ns.client, &iq_attrs), server.server_host);
+    for (children) |elem| {
+        iq_handler.handleIqChild(session, elem);
+        if (item_payload) |payload| {
+            if (std.mem.eql(u8, elem.local_name, "item") and
+                std.mem.eql(u8, elem.namespace_uri, xml.ns.pubsub))
+            {
+                try session.pep_payload.appendSlice(session.reader.allocator, payload);
+            }
+        }
+    }
+    iq_handler.dispatchIq(server, session, changes);
+    _ = session.conn.flushSend() catch {};
+    const n = posix.read(peer_fd, out) catch 0;
+    return out[0..n];
+}
+
+/// The pubsub element a probe drives for each advertised pubsub#* feature.
+/// publish exercises handlePepPublish, whose store upsert covers auto-create
+/// and whose roster fan-out is the auto-subscribe model; items exercises
+/// handlePepItems, whose returned copy also proves persistent-items.
+const PubsubProbe = struct {
+    feature: []const u8,
+    verb: []const u8,
+};
+
+const PUBSUB_PROBES = [_]PubsubProbe{
+    .{ .feature = "http://jabber.org/protocol/pubsub#publish", .verb = "publish" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#auto-create", .verb = "publish" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#auto-subscribe", .verb = "publish" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#persistent-items", .verb = "items" },
+    .{ .feature = "http://jabber.org/protocol/pubsub#retrieve-items", .verb = "items" },
+};
+
+test "Server: every advertised pubsub feature is dispatched" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var pep_store = GenericPepStore.init(&op_db);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    defer server.deinit();
+    server.pep_store = &pep_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var wire: [8192]u8 = undefined;
+
+    // disco#info get: collect the pubsub#* features the server advertises.
+    var feat_buf: [16][128]u8 = undefined;
+    var feats: [16][]const u8 = undefined;
+    var feat_count: usize = 0;
+    {
+        const children = [_]xml.Element{testElem("query", xml.ns.disco_info, &.{})};
+        const resp = try driveTestIq(&server, &session, &changes, fds[1], "get", "disco-1", &children, null, &wire);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "<identity category='pubsub' type='pep'/>") != null);
+        var rest = resp;
+        while (std.mem.indexOf(u8, rest, "<feature var='")) |i| {
+            const start = i + "<feature var='".len;
+            const end = std.mem.indexOfScalarPos(u8, rest, start, '\'') orelse break;
+            const f = rest[start..end];
+            if (std.mem.startsWith(u8, f, "http://jabber.org/protocol/pubsub#")) {
+                @memcpy(feat_buf[feat_count][0..f.len], f);
+                feats[feat_count] = feat_buf[feat_count][0..f.len];
+                feat_count += 1;
+            }
+            rest = rest[end..];
+        }
+    }
+    try std.testing.expect(feat_count > 0);
+
+    // For every advertised pubsub#* feature, drive the representative IQ
+    // through the real dispatch. A feature with no probe fails the test, and
+    // deleting the pubsub dispatch branch turns every probe into a
+    // service-unavailable error.
+    const node = "urn:test:probe";
+    const publish_children = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("publish", xml.ns.pubsub, &.{testAttr("node", node)}),
+        testElem("item", xml.ns.pubsub, &.{testAttr("id", "i1")}),
+    };
+    const items_children = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("items", xml.ns.pubsub, &.{testAttr("node", node)}),
+    };
+    const payload = "<data xmlns='urn:test'>v1</data>";
+
+    for (feats[0..feat_count], 0..) |feature, i| {
+        const probe = for (PUBSUB_PROBES) |p| {
+            if (std.mem.eql(u8, p.feature, feature)) break p;
+        } else {
+            std.debug.print("pubsub feature advertised with no probe: {s}\n", .{feature});
+            return error.PubsubFeatureUndispatched;
+        };
+
+        var id_buf: [16]u8 = undefined;
+        if (std.mem.eql(u8, probe.verb, "publish")) {
+            const id = try std.fmt.bufPrint(&id_buf, "pub-{d}", .{i});
+            const resp = try driveTestIq(&server, &session, &changes, fds[1], "set", id, &publish_children, payload, &wire);
+            try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+            const stored = try pep_store.getItem(allocator, "alice@localhost", node, "i1");
+            try std.testing.expect(stored != null);
+            defer allocator.free(stored.?);
+            try std.testing.expect(std.mem.indexOf(u8, stored.?, "v1") != null);
+        } else {
+            const set_id = try std.fmt.bufPrint(&id_buf, "pub-{d}", .{i});
+            const set_resp = try driveTestIq(&server, &session, &changes, fds[1], "set", set_id, &publish_children, payload, &wire);
+            try std.testing.expect(std.mem.indexOf(u8, set_resp, "type='result'") != null);
+            const get_id = try std.fmt.bufPrint(&id_buf, "items-{d}", .{i});
+            const resp = try driveTestIq(&server, &session, &changes, fds[1], "get", get_id, &items_children, null, &wire);
+            try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+            try std.testing.expect(std.mem.indexOf(u8, resp, "<items") != null);
+            try std.testing.expect(std.mem.indexOf(u8, resp, "v1") != null);
+        }
+    }
+}
+
+test "Server: pubsub set routes on the verb, not blindly to publish" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try OpBackendMod.Backend.open(op_path, .{});
+    defer op_db.close();
+    var pep_store = GenericPepStore.init(&op_db);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    defer server.deinit();
+    server.pep_store = &pep_store;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    var wire: [8192]u8 = undefined;
+
+    const node = "urn:test:verbs";
+    const publish_children = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("publish", xml.ns.pubsub, &.{testAttr("node", node)}),
+        testElem("item", xml.ns.pubsub, &.{testAttr("id", "i1")}),
+    };
+    const payload = "<data xmlns='urn:test'>v1</data>";
+
+    // A real publish first: the stored item must survive the verb probes.
+    var resp = try driveTestIq(&server, &session, &changes, fds[1], "set", "pub-0", &publish_children, payload, &wire);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='result'") != null);
+
+    // <items> in a set is not a write verb: bad-request, and the stored item
+    // keeps its payload (the review probe: a verb-blind dispatch upserts an
+    // empty item).
+    const items_set = [_]xml.Element{
+        testElem("pubsub", xml.ns.pubsub, &.{}),
+        testElem("items", xml.ns.pubsub, &.{testAttr("node", node)}),
+    };
+    resp = try driveTestIq(&server, &session, &changes, fds[1], "set", "items-0", &items_set, null, &wire);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "bad-request") != null);
+    const stored = try pep_store.getItem(allocator, "alice@localhost", node, "i1");
+    try std.testing.expect(stored != null);
+    defer allocator.free(stored.?);
+    try std.testing.expect(std.mem.indexOf(u8, stored.?, "v1") != null);
+
+    // Recognized but unimplemented verbs answer feature-not-implemented with
+    // the XEP-0060 <unsupported> feature token.
+    const unsupported_cases = [_]struct { verb: []const u8, feature: []const u8 }{
+        .{ .verb = "subscribe", .feature = "subscribe" },
+        .{ .verb = "unsubscribe", .feature = "subscribe" },
+        .{ .verb = "retract", .feature = "retract-items" },
+        .{ .verb = "create", .feature = "create-nodes" },
+        .{ .verb = "delete", .feature = "delete-nodes" },
+        .{ .verb = "purge", .feature = "purge-nodes" },
+        .{ .verb = "configure", .feature = "config-node" },
+        .{ .verb = "options", .feature = "subscription-options" },
+    };
+    for (unsupported_cases, 0..) |case, i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "verb-{d}", .{i});
+        const children = [_]xml.Element{
+            testElem("pubsub", xml.ns.pubsub, &.{}),
+            testElem(case.verb, xml.ns.pubsub, &.{testAttr("node", node)}),
+        };
+        resp = try driveTestIq(&server, &session, &changes, fds[1], "set", id, &children, null, &wire);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "feature-not-implemented") != null);
+        var feat_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&feat_buf, "feature='{s}'", .{case.feature});
+        try std.testing.expect(std.mem.indexOf(u8, resp, needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "pubsub#errors") != null);
+    }
+
+    // The retract probe above must not have deleted the stored item.
+    const still = try pep_store.getItem(allocator, "alice@localhost", node, "i1");
+    try std.testing.expect(still != null);
+    defer allocator.free(still.?);
+    try std.testing.expect(std.mem.indexOf(u8, still.?, "v1") != null);
 }
