@@ -1272,3 +1272,49 @@ test "LmdbBackend: a vmmap miss uses the not-found warning, not the exhaustion o
     try std.testing.expectEqual(@as(usize, 1), vmmapCall.read_calls);
     try std.testing.expectEqual(warns0, warnCall.exhausted_calls);
 }
+
+fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
+    // The iterator holds this thread's read txn: it is opened, drained and
+    // deinit'd inside the call so later puts can open a write txn.
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+    var n: usize = 0;
+    while (iter.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key, prefix));
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "LmdbBackend: iterator scan over 0xFF tails, empty prefix, a shared-head owner and the exact cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    const ns = comptime backend.registered("rosters");
+
+    // Keys that stress the lexicographic edges of a prefix scan: trailing
+    // 0xFF bytes, a key sitting on the computed upper bound, and all-0xFF
+    // prefixes. The counts pin the sorted order the scan must honor.
+    const ks = [_][]const u8{ "ab\xFE\xFF", "ab\xFF", "ab\xFF\x00x", "ab\xFF\xFF", "ac", "\xFF\xFE", "\xFF\xFF", "\xFF\xFF\x01" };
+    for (ks) |k| try db.put(ns, k, "v");
+    try expectPrefixScan(&db, ns, "ab\xFF", 3);
+    try expectPrefixScan(&db, ns, "ab\xFE", 1);
+    try expectPrefixScan(&db, ns, "\xFF\xFF", 2);
+    try expectPrefixScan(&db, ns, "\xFF", 3);
+    try expectPrefixScan(&db, ns, "", 8);
+
+    // Two owners sharing a 296-byte head: a clipped seek or compare merges
+    // their rows.
+    const owner_a = ("a" ** 290) ++ "-first\x00";
+    const owner_b = ("a" ** 290) ++ "-other\x00";
+    try db.put(ns, owner_a ++ "i", "a");
+    try db.put(ns, owner_b ++ "i", "b");
+    try expectPrefixScan(&db, ns, owner_b, 1);
+    try expectPrefixScan(&db, ns, owner_a, 1);
+
+    // An exact-cap prefix must be accepted and matched, not rejected.
+    const cap = "c" ** backend.MAX_PREFIX_LEN;
+    try db.put(ns, cap, "c");
+    try expectPrefixScan(&db, ns, cap, 1);
+    try expectPrefixScan(&db, ns, cap[0 .. backend.MAX_PREFIX_LEN - 1], 1);
+}

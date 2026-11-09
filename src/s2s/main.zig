@@ -44,6 +44,7 @@ const ssl = @import("ssl");
 const SslContext = ssl.SslContext;
 const SslConn = ssl.SslConn;
 const dns = @import("dns");
+const dns_async = @import("dns_async");
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
@@ -66,11 +67,25 @@ const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - (ipc_server_mod.MAX_IPC_CL
 const INBOUND_UDATA_BASE: usize = 0x10000;
 /// Base udata for outbound S2S connections.
 const OUTBOUND_UDATA_BASE: usize = 0x20000;
+/// Udata for the resolver's own kqueue fd: it reads ready whenever the
+/// resolver has pending events (UDP replies, TCP legs, deadlines).
+const DNS_UDATA: usize = INBOUND_UDATA_BASE - 1;
 
 /// Maximum inbound S2S sessions.
 const MAX_INBOUND_SESSIONS = 256;
 /// Maximum outbound S2S connections.
 const MAX_OUTBOUND_CONNS = 128;
+/// Deadline for one connect attempt to a resolved target (X2b).
+const CONNECT_DEADLINE_MS: u32 = 10_000;
+/// Base ident for EVFILT_TIMER connect deadlines, same pattern as the
+/// udata bases: the low range is reserved for X1's lifecycle timers and
+/// the .timer arm dispatches on the boundary.
+const CONNECT_DEADLINE_IDENT_BASE: usize = 0x100000;
+/// Changelist capacity: worst case per loop iteration is one connect
+/// attempt (write arm + deadline) per outbound conn plus one DANE
+/// completion (read enable, write arm) and a few stanza/IPC arms per
+/// inbound session, plus one accept arm each.
+const S2S_CHANGE_BUF: usize = 2 * MAX_OUTBOUND_CONNS + 8 * MAX_INBOUND_SESSIONS + 256;
 
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
@@ -112,6 +127,11 @@ pub const S2sDaemon = struct {
     /// dialback callback can never land on a reused slot (S2).
     inbound_gens: [MAX_INBOUND_SESSIONS]u32 = [_]u32{0} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
+    /// Inbound sessions closed because a kevent change could not be
+    /// staged (L5): a lost EV_DISABLE spins the loop on a held read and
+    /// a lost EV_ENABLE strands the session with reads off, so each
+    /// failure closes rather than lies.
+    inbound_kevent_closes: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
     listener_fd: posix.fd_t = -1,
@@ -127,13 +147,22 @@ pub const S2sDaemon = struct {
     /// Always null in production.
     dane_verdict_override: ?connector_mod.DaneStatus = null,
 
-    /// Test seam: when set, initiateOutbound resolves its targets through
-    /// this function instead of live DNS SRV/A lookups, so the initiation
-    /// failure paths run deterministically. Always null in production.
-    resolve_targets_override: ?*const fn (std.mem.Allocator, []const u8) anyerror![]dns.ConnectionTarget = null,
-
     /// Inbound listener port.
     listener_port: u16 = 5269,
+
+    /// Async resolver driven by this loop (X2b). Owns its own kqueue,
+    /// opened eagerly in bindResolver and registered once on the event
+    /// loop at startup as DNS_UDATA.
+    resolver: dns_async.Resolver,
+    /// Monotonic session_key space shared by outbound resolve() and
+    /// inbound query() waiters.
+    next_dns_key: usize = 1,
+    /// Monotonic ident space for per-target connect deadlines.
+    next_deadline_ident: usize = 1,
+    /// The ChangeList currently being accumulated: resolver callbacks have
+    /// no batch parameter (they can fire inside resolver.step or inside a
+    /// synchronous resolve/query completion), so entry points stash it here.
+    batch: ?*ChangeList = null,
 
     pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) !S2sDaemon {
         const ipc = try allocator.create(IpcServer);
@@ -143,9 +172,22 @@ pub const S2sDaemon = struct {
             .local_domain = local_domain,
             .ipc = ipc,
             .pool = ConnectionPool.init(allocator),
+            .resolver = dns_async.Resolver.init(allocator),
         };
         d.dialback_secret = dialback.generateSecret();
         return d;
+    }
+
+    /// Point the resolver's callbacks at this daemon. Called after init()
+    /// returns, once the daemon's address is stable. Also opens the
+    /// resolver kqueue eagerly so the loop can register kqFd() once at
+    /// startup; a failure here surfaces as a query error later.
+    pub fn bindResolver(self: *S2sDaemon) void {
+        self.resolver.setCallback(.{ .ctx = self, .fun = onResolveDone });
+        self.resolver.setQueryCallback(.{ .ctx = self, .fun = onQueryDone });
+        if (self.resolver.openKq()) |_| {} else |err| {
+            log.warn("dns: resolver kqueue unavailable: {}", .{err});
+        }
     }
 
     pub fn deinit(self: *S2sDaemon) void {
@@ -157,6 +199,7 @@ pub const S2sDaemon = struct {
                 reader_slot.* = null;
             }
             if (slot.*) |session| {
+                session.dropDaneTlsa(self.allocator);
                 session.deinit();
                 self.allocator.destroy(session);
                 slot.* = null;
@@ -176,6 +219,7 @@ pub const S2sDaemon = struct {
         // Connections hold SSL objects created from these contexts; free
         // them first, as SslContext.deinit requires.
         self.pool.deinit();
+        self.resolver.deinit();
         if (self.tls_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
         self.ipc.deinit();
@@ -312,110 +356,243 @@ pub const S2sDaemon = struct {
             self.flushOutboundStanzas(batch, conn);
         } else if (conn.isFailed()) {
             self.sendDeliveryFailed(from, to, conn.error_msg);
-        } else if (conn.state == .connecting and conn.fd < 0) {
+        } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
             // New connection — initiate DNS + TCP connect
             self.initiateOutbound(batch, conn, domain);
         }
         // else: connection is in progress (TLS, auth, etc.) — stanza is queued
     }
 
-    /// Initiate an outbound connection: DNS SRV → TCP connect → kqueue registration.
+    /// Initiate an outbound connection: async SRV/A/AAAA/TLSA resolution
+    /// on the shared resolver (X2b). While the resolve is in flight the
+    /// conn stays .connecting with fd < 0 and dns_key != 0; the completion
+    /// lands in deliverResolution and the connect iterator takes over.
+    /// The callback may fire synchronously inside resolve() (cache hit,
+    /// literal IP), so dns_key is assigned before the call.
     fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
-        // DNS SRV resolution (blocking — acceptable for initial impl)
-        const resolve = self.resolve_targets_override orelse &resolveServerTargets;
-        const targets = resolve(self.allocator, domain) catch {
-            log.warn("DNS SRV resolution failed for {s}", .{domain});
+        self.batch = batch;
+        // A name that cannot appear on the wire fails immediately rather
+        // than spending a resolver job on it (RFC 1035 length bounds).
+        if (!validDomainName(domain)) {
+            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
+            return;
+        }
+        conn.dns_key = self.next_dns_key;
+        self.next_dns_key +%= 1;
+        self.resolver.resolve(domain, .server, 5269, conn.dns_key, true) catch {
+            conn.dns_key = 0;
             self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
         };
-        defer {
-            // Free all target hosts except the one we kept (index 0)
-            for (targets[1..]) |t| self.allocator.free(t.host);
-            self.allocator.free(targets);
+    }
+
+    /// Resolver kq fd reported pending events: drain them. Completion
+    /// callbacks fire inside step and arm follow-up work through `batch`.
+    fn handleResolverEvent(self: *S2sDaemon, batch: *ChangeList) void {
+        self.batch = batch;
+        self.resolver.step(0);
+    }
+
+    /// Resolver completion demux: every outbound resolve carries the
+    /// conn's dns_key; the conn is found by scanning the pool (bounded by
+    /// MAX_OUTBOUND_CONNS). An unknown key means the waiter was cancelled
+    /// or the conn already tore down; the answer is freed and dropped.
+    fn onResolveDone(ctx: ?*anyopaque, session_key: usize, status: dns_async.Status, res: ?dns_async.Resolution) void {
+        const self: *S2sDaemon = @ptrCast(@alignCast(ctx));
+        var it = self.pool.connections.valueIterator();
+        while (it.next()) |conn_ptr| {
+            const conn = conn_ptr.*;
+            if (conn.dns_key == session_key) {
+                conn.dns_key = 0;
+                const batch = self.batch orelse {
+                    if (res) |*r| {
+                        var rr = r.*;
+                        rr.deinitOn(self.allocator);
+                    }
+                    conn.fail("internal-error");
+                    return;
+                };
+                self.deliverResolution(batch, conn, status, res);
+                return;
+            }
         }
-
-        if (targets.len == 0) {
-            log.warn("no SRV targets for {s}", .{domain});
-            self.failOutboundInitiation(batch, conn, "no-srv-records");
-            return;
+        if (res) |*r| {
+            var rr = r.*;
+            rr.deinitOn(self.allocator);
         }
+    }
 
-        // Try the first target — transfer ownership of host string to connection
-        const target = targets[0];
-        conn.target_host = target.host; // ownership transferred, not freed in defer
-        conn.target_port = target.port;
-        conn.is_direct_tls = target.is_direct_tls;
+    /// Apply a finished resolution to an outbound conn. Also the test
+    /// seam: tests call it directly with a fabricated Resolution, which
+    /// exercises the same target adoption and connect iteration as a real
+    /// wire answer. `batch` arms connect write interest and deadlines.
+    pub fn deliverResolution(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, status: dns_async.Status, res: ?dns_async.Resolution) void {
+        self.batch = batch;
+        switch (status) {
+            .resolved => {
+                var r = res.?;
+                if (r.targets.len == 0) {
+                    r.deinitOn(self.allocator);
+                    self.failOutboundInitiation(batch, conn, "remote-server-not-found");
+                    return;
+                }
+                conn.adoptTargets(r.targets);
+                self.connectNextTarget(batch, conn);
+            },
+            .nxdomain, .service_unavailable => {
+                if (res) |*r| {
+                    var rr = r.*;
+                    rr.deinitOn(self.allocator);
+                }
+                self.failOutboundInitiation(batch, conn, "remote-server-not-found");
+            },
+            .failed => {
+                if (res) |*r| {
+                    var rr = r.*;
+                    rr.deinitOn(self.allocator);
+                }
+                // SERVFAIL, timeout, REFUSED, malformed: a wire failure is
+                // temporary per ADR-13, never proof of absence.
+                self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+            },
+        }
+    }
 
-        log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
-            target.host, target.port, domain, target.is_direct_tls,
-        });
+    /// The slot a conn's fd events dispatch through; allocated on the
+    /// first live connect attempt (the conn has no fd while resolving).
+    fn ensureOutboundSlot(self: *S2sDaemon, conn: *OutboundConnection) ?usize {
+        if (self.findOutboundSlot(conn)) |slot| return slot;
+        const slot = self.allocateOutboundSlot() orelse return null;
+        self.outbound[slot] = conn;
+        return slot;
+    }
 
-        // Non-blocking TCP connect
-        const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
-            self.failOutboundInitiation(batch, conn, "socket-creation-failed");
-            return;
-        };
+    /// Tear down the current connect attempt: disarm its deadline and
+    /// purge staged knote entries before closing the fd (a same-iteration
+    /// socket() can reuse the number).
+    fn abortConnectAttempt(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        self.clearConnectDeadline(batch, conn);
+        batch.purgeFd(conn.fd);
+        posix.close(conn.fd);
+        conn.fd = -1;
+    }
 
-        // Resolve hostname to IP (simple A record via getaddrinfo)
-        var addr = std.c.sockaddr.in{
-            .port = std.mem.nativeToBig(u16, target.port),
-            .addr = 0,
-        };
+    /// Disarm the per-target connect deadline if one is armed.
+    fn clearConnectDeadline(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        _ = self;
+        if (conn.deadline_ident == 0) return;
+        batch.removeTimer(conn.deadline_ident) catch {};
+        conn.deadline_ident = 0;
+    }
 
-        // For test infrastructure, handle known addresses
-        if (parseIPv4(target.host)) |ip| {
-            addr.addr = ip;
-        } else {
-            // Use getaddrinfo for hostname resolution
-            const ip = resolveHostnameIPv4(target.host) catch {
+    /// Walk the adopted target list in RFC 2782 order and start the next
+    /// connect attempt: a target whose TLSA lookup failed is a temporary
+    /// failure of that target and is skipped, never connected to (ADR-13).
+    /// Every attempt is nonblocking and carries a one-shot deadline; a
+    /// connect error or the deadline advances to the next target, and an
+    /// exhausted list fails the initiation as temporary.
+    fn connectNextTarget(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        while (conn.next_idx < conn.targets.len) {
+            const idx = conn.next_idx;
+            const t = &conn.targets[idx];
+            conn.next_idx += 1;
+            if (t.tlsa_status == .lookup_failed) {
+                log.warn("outbound {s}: skipping {s}:{d}: TLSA lookup failed (temporary)", .{ conn.remote_domain, t.host, t.addr.getPort() });
+                continue;
+            }
+
+            const sock = posix.socket(t.addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch {
+                continue;
+            };
+            const nodelay_one: c_int = 1;
+            posix.setsockopt(sock, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+            posix.connect(sock, &t.addr.any, t.addr.getOsSockLen()) catch |err| {
+                switch (err) {
+                    error.WouldBlock => {},
+                    else => {
+                        posix.close(sock);
+                        continue;
+                    },
+                }
+            };
+
+            const slot = self.ensureOutboundSlot(conn) orelse {
                 posix.close(sock);
-                self.failOutboundInitiation(batch, conn, "hostname-resolution-failed");
+                self.failOutboundInitiation(batch, conn, "outbound-slots-exhausted");
                 return;
             };
-            addr.addr = ip;
-        }
-
-        // Disable Nagle — S2S stanzas should be sent immediately.
-        // TCP_NODELAY = 1 (netinet/tcp.h), IPPROTO_TCP = 6
-        const nodelay_one: c_int = 1;
-        posix.setsockopt(sock, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
-
-        // Non-blocking connect
-        posix.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
-            switch (err) {
-                error.WouldBlock => {}, // Expected — connect in progress
-                else => {
-                    posix.close(sock);
-                    self.failOutboundInitiation(batch, conn, "tcp-connect-failed");
+            if (self.outbound_readers[slot] == null) {
+                const reader = self.allocator.create(XmlReader) catch {
+                    self.abortSlotFd(batch, sock);
+                    self.failOutboundInitiation(batch, conn, "internal-error");
                     return;
-                },
+                };
+                reader.* = XmlReader.init(self.allocator);
+                self.outbound_readers[slot] = reader;
             }
-        };
 
-        conn.fd = sock;
+            conn.target_idx = idx;
+            conn.target_addr = t.addr;
+            conn.target_host = t.host;
+            conn.target_port = t.addr.getPort();
+            conn.is_direct_tls = t.is_direct_tls;
+            conn.fd = sock;
+            conn.deadline_ident = CONNECT_DEADLINE_IDENT_BASE + self.next_deadline_ident;
+            self.next_deadline_ident +%= 1;
 
-        // Allocate an outbound slot for kqueue dispatch
-        const slot = self.allocateOutboundSlot() orelse {
-            posix.close(sock);
-            conn.fd = -1;
-            self.failOutboundInitiation(batch, conn, "outbound-slots-exhausted");
+            log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
+                t.host, conn.target_port, conn.remote_domain, conn.is_direct_tls,
+            });
+
+            batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {
+                self.abortSlotFd(batch, sock);
+                conn.fd = -1;
+                self.failOutboundInitiation(batch, conn, "internal-error");
+                return;
+            };
+            batch.addTimer(conn.deadline_ident, CONNECT_DEADLINE_MS, true) catch {
+                self.abortConnectAttempt(batch, conn);
+                self.failOutboundInitiation(batch, conn, "internal-error");
+                return;
+            };
             return;
-        };
-        self.outbound[slot] = conn;
+        }
+        // Every target was consumed: connect errors, deadlines and
+        // lookup_failed targets are all temporary (ADR-13).
+        self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+    }
 
-        // Create XML reader for this outbound connection
-        const reader = self.allocator.create(XmlReader) catch {
-            self.outbound[slot] = null;
-            posix.close(sock);
-            conn.fd = -1;
-            self.failOutboundInitiation(batch, conn, "internal-error");
-            return;
-        };
-        reader.* = XmlReader.init(self.allocator);
-        self.outbound_readers[slot] = reader;
+    /// Free a connect fd that never reached the armed state.
+    fn abortSlotFd(self: *S2sDaemon, batch: *ChangeList, sock: posix.fd_t) void {
+        _ = self;
+        batch.purgeFd(sock);
+        posix.close(sock);
+    }
 
-        // Register for one-shot write event (connect completion signals writable)
-        batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {};
+    /// A one-shot connect deadline fired: the attempt was too slow, so it
+    /// is torn down and the next target is tried. The ident no longer
+    /// matches an armed timer (it already fired), only the conn record.
+    fn handleConnectDeadline(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        self.batch = batch;
+        for (&self.outbound) |*slot_conn| {
+            const conn = slot_conn.* orelse continue;
+            if (conn.deadline_ident == ident and conn.state == .connecting and conn.fd >= 0) {
+                conn.deadline_ident = 0;
+                log.warn("outbound connect deadline for {s}", .{conn.remote_domain});
+                self.abortConnectAttempt(batch, conn);
+                self.connectNextTarget(batch, conn);
+                return;
+            }
+        }
+        // Stale ident: the attempt already completed or was cancelled.
+    }
+
+    /// EVFILT_TIMER demux: idents at CONNECT_DEADLINE_IDENT_BASE and
+    /// above are per-target connect deadlines; lower idents belong to the
+    /// X1 lifecycle timers and must not reach the connect path.
+    fn handleTimerEvent(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        if (ident < CONNECT_DEADLINE_IDENT_BASE) return;
+        self.handleConnectDeadline(batch, ident);
     }
 
     /// Flush queued stanzas on an established outbound connection.
@@ -482,6 +659,23 @@ pub const S2sDaemon = struct {
         return null;
     }
 
+    /// Release the conn's slot-table entry when it owns one: the fd's
+    /// staged knote entries are purged (a same-iteration socket can
+    /// reuse the number, T238/T277), the reader is destroyed and the
+    /// slot becomes allocatable again. The one teardown every path that
+    /// destroys a conn must run: leaving the slot set after pool.remove
+    /// would dangle the conn pointer for every later slot scan.
+    fn releaseOutboundSlot(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        const slot = self.findOutboundSlot(conn) orelse return;
+        if (conn.fd >= 0) batch.purgeFd(conn.fd);
+        if (self.outbound_readers[slot]) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+            self.outbound_readers[slot] = null;
+        }
+        self.outbound[slot] = null;
+    }
+
     /// Close an outbound connection slot. Purges its staged kevent entries
     /// first: a same-iteration accept can reuse the fd number (T238/T277).
     /// Every exchange the conn still carries is answered before teardown,
@@ -493,20 +687,16 @@ pub const S2sDaemon = struct {
             for (0..conn.db_pending.len) |idx| {
                 if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
             }
-        }
-        if (self.outbound[slot]) |conn| {
-            batch.purgeFd(conn.fd);
-        }
-        if (self.outbound_readers[slot]) |reader| {
+            self.cancelResolve(conn);
+            self.clearConnectDeadline(batch, conn);
+            self.releaseOutboundSlot(batch, conn);
+            log.info("closing outbound S2S to {s}", .{conn.remote_domain});
+            self.pool.remove(conn.remote_domain);
+        } else if (self.outbound_readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
             self.outbound_readers[slot] = null;
         }
-        if (self.outbound[slot]) |conn| {
-            log.info("closing outbound S2S to {s}", .{conn.remote_domain});
-            self.pool.remove(conn.remote_domain);
-        }
-        self.outbound[slot] = null;
     }
 
     /// Fail an outbound connection that never reached the wire. Every
@@ -514,6 +704,8 @@ pub const S2sDaemon = struct {
     /// pending db:verify is answered invalid, and the conn leaves the pool
     /// so the next delivery starts a fresh attempt.
     fn failOutboundInitiation(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        self.cancelResolve(conn);
+        self.clearConnectDeadline(batch, conn);
         conn.fail(reason);
         for (conn.pending_stanzas.items) |*stanza| {
             self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, reason);
@@ -521,8 +713,16 @@ pub const S2sDaemon = struct {
         for (0..conn.db_pending.len) |idx| {
             if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
         }
-        if (conn.fd >= 0) batch.purgeFd(conn.fd);
+        self.releaseOutboundSlot(batch, conn);
         self.pool.remove(conn.remote_domain);
+    }
+
+    /// Detach a conn's in-flight resolve from the resolver: no callback
+    /// fires for its key afterwards. Idempotent (dns_key 0 means none).
+    fn cancelResolve(self: *S2sDaemon, conn: *OutboundConnection) void {
+        if (conn.dns_key == 0) return;
+        self.resolver.cancel(conn.dns_key);
+        conn.dns_key = 0;
     }
 
     fn allocateOutboundSlot(self: *S2sDaemon) ?usize {
@@ -569,11 +769,31 @@ pub const S2sDaemon = struct {
         }
         if (self.inbound[slot]) |session| {
             log.info("closing inbound S2S session id={d}", .{slot});
+            if (session.dane_key != 0) {
+                self.resolver.cancel(session.dane_key);
+                session.dane_key = 0;
+            }
+            session.dane_lookup_pending = false;
+            session.dropDaneTlsa(self.allocator);
             session.deinit();
             self.allocator.destroy(session);
             self.inbound[slot] = null;
         }
         self.inbound_gens[slot] +%= 1;
+    }
+
+    /// After the stream open response, send the features for the current
+    /// phase. Deferred while an inbound DANE lookup is in flight; the
+    /// completion calls this once the result is known.
+    fn sendInboundFeaturesTail(self: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+        if (session.stream.getFeatures()) |_| {
+            const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
+            executeAction(self, session, features_action, batch);
+        } else if (session.stream.isEstablished()) {
+            // Post-auth stream: send empty features
+            session.queueWrite("<stream:features/>") catch {};
+            log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
+        }
     }
 
     /// Get an inbound session by slot index.
@@ -653,9 +873,21 @@ fn extractDomain(jid: []const u8) []const u8 {
     return jid[domain_start..domain_end];
 }
 
-/// Resolve server-to-server connection targets through live DNS.
-fn resolveServerTargets(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
-    return dns.resolver.resolveXmpp(allocator, domain, true);
+/// Whether a JID domainpart is a DNS name that can exist on the wire:
+/// 253 octets total, each label 1-63 octets (RFC 1035 3.1).
+fn validDomainName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 253) return false;
+    var label_len: usize = 0;
+    for (name) |ch| {
+        if (ch == '.') {
+            if (label_len == 0) return false;
+            label_len = 0;
+        } else {
+            label_len += 1;
+            if (label_len > 63) return false;
+        }
+    }
+    return label_len > 0;
 }
 
 /// Parse an IPv4 address string to network-order u32.
@@ -685,27 +917,6 @@ fn parseIPv4(address: []const u8) ?u32 {
     }
     if (octet_idx != 4) return null;
     return @as(u32, octets[0]) | (@as(u32, octets[1]) << 8) | (@as(u32, octets[2]) << 16) | (@as(u32, octets[3]) << 24);
-}
-
-/// Resolve a hostname to an IPv4 address using getaddrinfo.
-fn resolveHostnameIPv4(hostname: []const u8) !u32 {
-    // Null-terminate the hostname for C API
-    var name_buf: [256]u8 = undefined;
-    if (hostname.len >= name_buf.len) return error.NameTooLong;
-    @memcpy(name_buf[0..hostname.len], hostname);
-    name_buf[hostname.len] = 0;
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.INET;
-    hints.socktype = posix.SOCK.STREAM;
-
-    var result: ?*std.c.addrinfo = null;
-    const rc = std.c.getaddrinfo(@ptrCast(&name_buf), null, &hints, &result);
-    if (@intFromEnum(rc) != 0 or result == null) return error.ResolutionFailed;
-    defer std.c.freeaddrinfo(result.?);
-
-    const addr_in: *const std.c.sockaddr.in = @ptrCast(@alignCast(result.?.addr.?));
-    return addr_in.addr;
 }
 
 pub fn main() !void {
@@ -792,6 +1003,7 @@ pub fn main() !void {
 
     var daemon = try S2sDaemon.init(allocator, host);
     defer daemon.deinit();
+    daemon.bindResolver();
     daemon.muc_host = muc_host;
 
     // Configure TLS if cert and key are provided
@@ -852,6 +1064,14 @@ pub fn main() !void {
         try loop.addFd(daemon.ipc.listen_fd, .read, IPC_LISTEN_UDATA);
     }
 
+    // Register the resolver's kqueue once, level-triggered: pending
+    // resolver events keep it readable until step(0) drains them. A
+    // registration lost to a full changelist would stall every pending
+    // resolve, so it cannot ride the per-iteration batch (X2b).
+    if (daemon.resolver.kqFd() >= 0) {
+        try loop.addFd(daemon.resolver.kqFd(), .read, DNS_UDATA);
+    }
+
     // Register signals (automatically blocked from default delivery)
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
@@ -861,7 +1081,11 @@ pub fn main() !void {
     // Scratch buffer for batching kqueue changes across iterations.
     // Changes accumulated in iteration N are submitted at the top of iteration N+1
     // via submitAndPoll — one syscall both commits changes AND waits for events.
-    var scratch: [32]posix.Kevent = undefined;
+    // Sized for the worst case per iteration: every outbound conn can
+    // stage a write arm and a connect deadline, every inbound session a
+    // DANE completion (read enable, write arm) plus a few stanza writes,
+    // and the accept loop one read arm per session.
+    var scratch: [S2S_CHANGE_BUF]posix.Kevent = undefined;
     var batch = ChangeList.init(&scratch);
 
     // Main event loop
@@ -881,7 +1105,9 @@ pub fn main() !void {
                     }
                 },
                 .fd_readable => |e| {
-                    if (e.udata == LISTENER_UDATA) {
+                    if (e.udata == DNS_UDATA) {
+                        daemon.handleResolverEvent(&batch);
+                    } else if (e.udata == LISTENER_UDATA) {
                         // Accept inbound S2S connections
                         while (true) {
                             const slot = daemon.acceptInbound() catch break;
@@ -915,6 +1141,9 @@ pub fn main() !void {
                         handleInboundWritable(&daemon, &batch, slot);
                     }
                 },
+                .timer => |t| {
+                    daemon.handleTimerEvent(&batch, t.ident);
+                },
                 else => {},
             }
         }
@@ -932,75 +1161,95 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         return;
     }
 
+    // An inbound DANE lookup in flight defers all stream work: the peer
+    // cannot lawfully send anything before our features go out, and the
+    // completion re-enters this function to drain (X2b).
+    if (session.dane_lookup_pending) return;
+
     const reader = daemon.readers[slot] orelse return;
 
-    const n = session.recv() catch |err| {
-        switch (err) {
-            error.WouldBlock => return,
-            else => {
-                daemon.closeInbound(batch, slot);
-                return;
-            },
-        }
-    };
-
-    if (n == 0) {
-        daemon.closeInbound(batch, slot);
-        return;
-    }
-
-    // T250: while a <proceed/> is parked behind a partial flush, NO plaintext
-    // event may run: even one parsed event would cross the TLS record boundary
-    // as clear text. Any byte received while pending is a protocol error.
-    if (session.tls_upgrade_pending) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
-        sendStreamError(session, .policy_violation);
-        _ = session.flushWrite() catch {};
-        daemon.closeInbound(batch, slot);
-        return;
-    }
-
-    // Parse XML from the read buffer and drive the S2S stream FSM
-    const data = session.readableSlice();
-    var pos: usize = 0;
-
+    // Bytes left buffered by a mid-read DANE defer drain before any new
+    // socket data (X2b): the lookup's completion re-enters here and a
+    // WouldBlock recv must not strand them.
+    var recvd = false;
     while (true) {
-        // The item cap follows the stream's authentication state, checked
-        // before each item so a stanza that arrives in the same read as the
-        // auth that permits it is still accepted (H6).
-        reader.setMaxItemBytes(if (session.stream.isEstablished())
-            xml.max_item_bytes_authenticated
-        else
-            xml.max_item_bytes_pre_auth);
-        const event = reader.next(data, &pos) catch |err| {
-            log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
+        // T250: plaintext bytes on the wire while a <proceed/> is parked
+        // behind a partial flush are a protocol error, parsed or not.
+        if (session.tls_upgrade_pending and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // Parse XML from the read buffer and drive the S2S stream FSM
+        const data = session.readableSlice();
+        var pos: usize = 0;
+        var want_recv = data.len == 0;
+
+        while (!want_recv) {
+            // The item cap follows the stream's authentication state, checked
+            // before each item so a stanza that arrives in the same read as the
+            // auth that permits it is still accepted (H6).
+            reader.setMaxItemBytes(if (session.stream.isEstablished())
+                xml.max_item_bytes_authenticated
+            else
+                xml.max_item_bytes_pre_auth);
+            const event = reader.next(data, &pos) catch |err| {
+                log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
+                closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
+                return;
+            };
+            if (event == null) {
+                want_recv = true;
+                break;
+            }
+
+            processInboundEvent(daemon, session, reader, event.?, batch);
+
+            // Session may have been closed by processInboundEvent
+            if (daemon.getInbound(slot) == null) return;
+
+            // After STARTTLS, stop processing pre-TLS buffer: also when the
+            // upgrade merely pends behind a partially-flushed <proceed/> (T250).
+            if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
+            // A DANE lookup that just started defers the rest of this read:
+            // the unparsed tail stays buffered for the completion (X2b).
+            if (session.dane_lookup_pending) break;
+        }
+
+        // Mark consumed bytes
+        if (pos > 0) session.consume(pos);
+
+        // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
+        // mean the peer spoke before receiving it; they are a protocol error,
+        // never silently discarded at handshake completion.
+        if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // A lookup or handshake that started mid-read leaves the tail for
+        // the completion. When this call already recvd, a parked
+        // <proceed/> breaks here instead; the next readable event starts
+        // with an empty slice and recvs, so plaintext arriving while
+        // pending still trips the T250 check above.
+        if (session.isTlsHandshaking() or session.dane_lookup_pending) break;
+        if (!want_recv or recvd) break;
+        recvd = true;
+        const n = session.recv() catch |err| {
+            if (err == error.WouldBlock) break;
+            daemon.closeInbound(batch, slot);
             return;
         };
-        if (event == null) break;
-
-        processInboundEvent(daemon, session, reader, event.?, batch);
-
-        // Session may have been closed by processInboundEvent
-        if (daemon.getInbound(slot) == null) return;
-
-        // After STARTTLS, stop processing pre-TLS buffer: also when the
-        // upgrade merely pends behind a partially-flushed <proceed/> (T250).
-        if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
-    }
-
-    // Mark consumed bytes
-    if (pos > 0) session.consume(pos);
-
-    // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
-    // mean the peer spoke before receiving it; they are a protocol error,
-    // never silently discarded at handshake completion.
-    if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
-        log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
-        sendStreamError(session, .policy_violation);
-        _ = session.flushWrite() catch {};
-        daemon.closeInbound(batch, slot);
-        return;
+        if (n == 0) {
+            daemon.closeInbound(batch, slot);
+            return;
+        }
     }
 
     // After SASL success, flush <success/> and drain any OpenSSL-buffered
@@ -1125,20 +1374,15 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             const action = session.stream.handleStreamOpen(from, to, version);
             executeAction(daemon, session, action, batch);
 
-            // After post-TLS stream open, perform DANE verification on peer cert
+            // After post-TLS stream open, start the async DANE chain on the
+            // peer cert (X2b). While it runs the features defer: the SASL
+            // EXTERNAL advertisement depends on the result.
+            var dane_pending = false;
             if (session.stream.state == .features_auth and session.tls_conn != null and from.len > 0) {
-                performInboundDane(daemon, session, from);
+                dane_pending = performInboundDane(daemon, batch, session, from);
             }
 
-            // After stream open response, send features
-            if (session.stream.getFeatures()) |_| {
-                const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
-                executeAction(daemon, session, features_action, batch);
-            } else if (session.stream.isEstablished()) {
-                // Post-auth stream: send empty features
-                session.queueWrite("<stream:features/>") catch {};
-                log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
-            }
+            if (!dane_pending) daemon.sendInboundFeaturesTail(batch, session);
         },
         .element_start => |elem| {
             // If accumulating a stanza, serialize child elements into inner buffer
@@ -1476,7 +1720,7 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
             if (daemon.findOutboundSlot(conn)) |slot| daemon.closeOutbound(batch, slot);
         }
-    } else if (conn.state == .connecting and conn.fd < 0) {
+    } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
         // New connection: initiate DNS + TCP connect
         daemon.initiateOutbound(batch, conn, origin);
     }
@@ -1852,13 +2096,14 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             var optlen: posix.socklen_t = @sizeOf(c_int);
             const rc = std.c.getsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &optlen);
             if (rc != 0 or err_opt != 0) {
-                log.err("outbound TCP connect failed for {s}", .{conn.remote_domain});
-                conn.fail("tcp-connect-failed");
-                daemon.closeOutbound(batch, slot);
+                log.warn("outbound TCP connect to {s}:{d} failed for {s}; trying next target", .{ conn.targetHost(), conn.target_port, conn.remote_domain });
+                daemon.abortConnectAttempt(batch, conn);
+                daemon.connectNextTarget(batch, conn);
                 return;
             }
 
-            log.info("outbound TCP connected to {s}:{d}", .{ conn.target_host, conn.target_port });
+            daemon.clearConnectDeadline(batch, conn);
+            log.info("outbound TCP connected to {s}:{d}", .{ conn.targetHost(), conn.target_port });
             conn.tcpConnected();
 
             if (conn.is_direct_tls) {
@@ -2339,22 +2584,27 @@ fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
 
     const dane_mod = @import("dane.zig");
 
-    // Query TLSA records for the target host/port
-    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, conn.target_port, conn.target_host) catch |err| {
-        log.warn("TLSA query failed for {s}:{d}: {}", .{ conn.target_host, conn.target_port, err });
+    // The connected target carries its own TLSA result, fetched during
+    // resolution (X2b): no DNS runs at handshake time. A lookup_failed
+    // target never reaches this point (the connect iterator skips it).
+    const target = conn.curTarget() orelse {
         conn.setDaneResult(.no_records);
         return;
     };
-    defer {
-        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
-        daemon.allocator.free(tlsa_records);
+    switch (target.tlsa_status) {
+        .lookup_failed => {
+            conn.fail("dane-lookup-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        },
+        .absent => {
+            log.info("no TLSA records for {s}:{d} — will use dialback", .{ target.host, conn.target_port });
+            conn.setDaneResult(.no_records);
+            return;
+        },
+        .present => {},
     }
-
-    if (tlsa_records.len == 0) {
-        log.info("no TLSA records for {s}:{d} — will use dialback", .{ conn.target_host, conn.target_port });
-        conn.setDaneResult(.no_records);
-        return;
-    }
+    const tlsa_records = target.tlsa;
 
     // Extract peer certificate chain from TLS connection
     if (conn.tls_conn) |*tls| {
@@ -2413,91 +2663,250 @@ fn performOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
     }
 }
 
-/// Perform DANE verification for an inbound S2S session.
-/// Called after post-TLS stream open reveals the remote domain.
-/// Queries TLSA for the standard S2S port of the remote domain and
-/// verifies against the presented peer certificate.
-fn performInboundDane(daemon: *S2sDaemon, session: *S2sSession, remote_domain: []const u8) void {
-    const dane_mod = @import("dane.zig");
-
+/// Kick the async DANE lookup for an inbound S2S session after the
+/// post-TLS stream open revealed the remote domain (X2b). The SRV + TLSA
+/// chain mirrors the old blocking lookup: _xmpps-server then _xmpp-server,
+/// the top target by (priority, weight), then _port._tcp.target TLSA, with
+/// the bare-domain fallback on 5269. Returns true while the lookup is in
+/// flight: the caller defers the auth features until it lands, since the
+/// EXTERNAL advertisement depends on the result.
+fn performInboundDane(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, remote_domain: []const u8) bool {
     // The candidate promotes into the session's authenticated set only if
     // the SASL EXTERNAL exchange succeeds (S2).
     session.setDaneCandidate(remote_domain);
 
-    // Resolve the remote's SRV to find their actual S2S port for TLSA query
-    const targets = dns.resolver.resolveXmpp(daemon.allocator, remote_domain, true) catch {
+    session.dane_key = daemon.next_dns_key;
+    daemon.next_dns_key +%= 1;
+    session.dane_lookup_pending = true;
+    session.dane_phase = .srv_tls;
+    session.dane_tlsa_status = .absent;
+    daemon.batch = batch;
+    issueInboundDaneQuery(daemon, session) catch {
+        session.dane_lookup_pending = false;
+        session.dane_phase = .none;
+        session.dane_key = 0;
         session.stream.setDaneVerified(false);
-        return;
+        return false;
     };
-    defer {
-        for (targets) |t| daemon.allocator.free(t.host);
-        daemon.allocator.free(targets);
-    }
-    const tlsa_port: u16 = if (targets.len > 0) targets[0].port else 5269;
-    const tlsa_host = if (targets.len > 0) targets[0].host else remote_domain;
-
-    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, tlsa_port, tlsa_host) catch {
-        session.stream.setDaneVerified(false);
-        return;
-    };
-    defer {
-        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
-        if (tlsa_records.len > 0) daemon.allocator.free(tlsa_records);
-    }
-
-    if (tlsa_records.len == 0) {
-        log.info("inbound DANE: no TLSA records for {s}", .{remote_domain});
-        session.stream.setDaneVerified(false);
-        return;
-    }
-
-    // Get peer cert from the TLS session
-    if (session.tls_conn) |*tls| {
-        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
-            session.stream.setDaneVerified(false);
-            return;
+    // A synchronous completion (cache hit) already landed through
+    // finishInboundDane; only an in-flight lookup holds the read.
+    // Inbound read interest is level-triggered: left armed while the
+    // lookup pends, any peer byte spins the loop until the chain lands.
+    if (session.dane_lookup_pending) {
+        batch.disableRead(session.fd) catch {
+            // A lost EV_DISABLE leaves the read armed on a lookup that
+            // refuses every byte: the loop spins (L5). Close rather
+            // than lie; returning true keeps the caller off the freed
+            // session exactly as a still-pending lookup would.
+            daemon.inbound_kevent_closes += 1;
+            log.warn("inbound S2S id={d}: kevent disable failed; closing session", .{session.id});
+            daemon.closeInbound(batch, session.id);
+            return true;
         };
-        if (leaf_der == null) {
-            log.info("inbound DANE: no peer certificate from {s}", .{remote_domain});
-            session.stream.setDaneVerified(false);
+    }
+    return true;
+}
+
+/// Send the current phase's record query for an inbound DANE lookup.
+/// srv_tls: _xmpps-server SRV; srv_plain: _xmpp-server SRV; tlsa:
+/// _port._tcp.target TLSA (or the _5269 fallback on the bare domain).
+fn issueInboundDaneQuery(self: *S2sDaemon, session: *S2sSession) !void {
+    var buf: [280]u8 = undefined;
+    const qname = switch (session.dane_phase) {
+        .srv_tls => try dns.srvQueryName(&buf, dns.xmpps_server_srv, session.daneDomain()),
+        .srv_plain => try dns.srvQueryName(&buf, dns.xmpp_server_srv, session.daneDomain()),
+        .tlsa => if (session.dane_target_len > 0)
+            try dns.tlsaQueryName(&buf, session.dane_target_port, session.daneTarget())
+        else
+            try dns.tlsaQueryName(&buf, 5269, session.daneDomain()),
+        .none => return error.NoPhase,
+    };
+    try self.resolver.query(qname, if (session.dane_phase == .tlsa) .tlsa else .srv, session.dane_key);
+}
+
+/// Raw record query completion demux: every inbound DANE hop carries the
+/// session's dane_key; the session is found by scanning the slot table
+/// (bounded by MAX_INBOUND_SESSIONS). An unknown key is a cancelled or
+/// closed session; the result is freed and dropped.
+fn onQueryDone(ctx: ?*anyopaque, session_key: usize, status: dns_async.Status, res: ?dns_async.RecordResult) void {
+    const self: *S2sDaemon = @ptrCast(@alignCast(ctx));
+    for (&self.inbound) |*slot| {
+        const session = slot.* orelse continue;
+        if (session.dane_key == session_key) {
+            applyInboundDaneResult(self, session, status, res);
             return;
         }
-        defer daemon.allocator.free(leaf_der.?);
+    }
+    if (res) |*r| {
+        var rr = r.*;
+        rr.deinitOn(self.allocator);
+    }
+}
 
-        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
-            session.stream.setDaneVerified(false);
-            return;
-        };
-        defer {
-            for (chain_der) |cert| daemon.allocator.free(cert);
-            daemon.allocator.free(chain_der);
-        }
-
-        // Convert and verify
-        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
-            session.stream.setDaneVerified(false);
-            return;
-        };
-        defer daemon.allocator.free(dane_records);
-        for (tlsa_records, 0..) |rec, i| {
-            dane_records[i] = .{
-                .usage = rec.usage,
-                .selector = rec.selector,
-                .matching_type = rec.matching_type,
-                .association_data = rec.association_data,
+/// Consume one hop of the inbound DANE chain. SRV answers are parsed and
+/// ordered (priority asc, weight desc, as resolver.querySrv sorted); the
+/// top target moves the chain to its TLSA query. NXDOMAIN/NODATA walks to
+/// the next phase; a wire failure on the TLSA hop is lookup_failed, never
+/// "no TLSA" (ADR-13).
+fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_async.Status, res: ?dns_async.RecordResult) void {
+    switch (session.dane_phase) {
+        .srv_tls, .srv_plain => {
+            defer if (res) |*r| {
+                var rr = r.*;
+                rr.deinitOn(self.allocator);
             };
-        }
-
-        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
-        const verified = (status == .verified);
-        session.stream.setDaneVerified(verified);
-        log.info("inbound DANE for {s}: {s}", .{
-            remote_domain,
-            if (verified) "verified" else "not verified (will offer dialback)",
-        });
-    } else {
-        session.stream.setDaneVerified(false);
+            if (status == .resolved and res != null) {
+                var srvs: std.ArrayList(dns.SrvRecord) = .empty;
+                defer {
+                    for (srvs.items) |s| self.allocator.free(s.target);
+                    srvs.deinit(self.allocator);
+                }
+                for (res.?.rrs) |rr| {
+                    if (rr.rtype != @intFromEnum(dns_async.RType.srv)) continue;
+                    const rec = dns.parseSrvRdata(rr.rdata, self.allocator) catch continue;
+                    if (std.mem.eql(u8, rec.target, ".")) continue;
+                    srvs.append(self.allocator, rec) catch continue;
+                }
+                if (srvs.items.len > 0) {
+                    std.mem.sort(dns.SrvRecord, srvs.items, {}, dns.SrvRecord.lessThan);
+                    const top = srvs.items[0];
+                    // parseDnsName bounds the dotted form at 253, so a
+                    // target that still cannot be staged makes this SRV
+                    // set unusable and the chain walks on (H1).
+                    if (session.setDaneTarget(top.target, top.port)) |_| {
+                        session.dane_phase = .tlsa;
+                        if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+                    } else |_| {}
+                }
+            }
+            // Empty, absent or failed SRV: walk the chain. A failed
+            // _xmpps hop falls through to _xmpp like "." does; a failed
+            // _xmpp hop is a temporary failure, not proof of absence.
+            if (session.dane_phase == .srv_tls) {
+                session.dane_phase = .srv_plain;
+                if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+            } else if (status != .failed) {
+                // Both SRV names absent: the bare-domain fallback.
+                session.setDaneTarget("", 5269) catch unreachable;
+                session.dane_phase = .tlsa;
+                if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+            }
+            finishInboundDane(self, session, .lookup_failed);
+        },
+        .tlsa => {
+            if (status == .nxdomain) return finishInboundDane(self, session, .absent);
+            if (status != .resolved or res == null) return finishInboundDane(self, session, .lookup_failed);
+            defer {
+                var rr = res.?;
+                rr.deinitOn(self.allocator);
+            }
+            var recs: std.ArrayList(dns.TlsaRecord) = .empty;
+            errdefer {
+                for (recs.items) |r| self.allocator.free(r.association_data);
+                recs.deinit(self.allocator);
+            }
+            // The resolver's own rule (lib/dns/async.zig): parsed records
+            // are .present; an answer whose TLSA records all failed to
+            // parse or append is .lookup_failed (a temporary failure,
+            // never proof of absence); no TLSA records at all is .absent.
+            var saw = false;
+            for (res.?.rrs) |rr| {
+                if (rr.rtype != @intFromEnum(dns_async.RType.tlsa)) continue;
+                saw = true;
+                const rec = dns.parseTlsaRdata(rr.rdata, self.allocator) catch continue;
+                recs.append(self.allocator, rec) catch {
+                    self.allocator.free(rec.association_data);
+                    continue;
+                };
+            }
+            if (recs.items.len == 0) {
+                recs.deinit(self.allocator);
+                return finishInboundDane(self, session, if (saw) .lookup_failed else .absent);
+            }
+            session.adoptDaneTlsa(recs.items, self.allocator) catch {
+                // Adoption failed: the caller still owns the records, and
+                // an unpresentable set is a lookup failure, never "no
+                // TLSA" and never a present-but-empty adoption.
+                for (recs.items) |r| self.allocator.free(r.association_data);
+                recs.deinit(self.allocator);
+                return finishInboundDane(self, session, .lookup_failed);
+            };
+            recs.deinit(self.allocator); // items moved to the session
+            finishInboundDane(self, session, .present);
+        },
+        .none => {
+            if (res) |*r| {
+                var rr = r.*;
+                rr.deinitOn(self.allocator);
+            }
+        },
     }
+}
+
+/// Land the inbound DANE outcome: records + status stay on the session
+/// (the seam PR #49 consumes), the stream learns whether DANE verified,
+/// the deferred features go out, and buffered inbound data drains.
+fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.TlsaStatus) void {
+    const batch = self.batch orelse return;
+    session.dane_lookup_pending = false;
+    session.dane_phase = .none;
+    session.dane_key = 0;
+    session.dane_tlsa_status = status;
+    // Re-arm the read interest performInboundDane held for the wait.
+    batch.enableRead(session.fd) catch {
+        // A lost EV_ENABLE strands the session with reads held off
+        // forever (L5): close rather than lie.
+        self.inbound_kevent_closes += 1;
+        log.warn("inbound S2S id={d}: kevent re-enable failed; closing session", .{session.id});
+        self.closeInbound(batch, session.id);
+        return;
+    };
+
+    var verified = false;
+    if (status == .present) {
+        verified = verifyInboundDane(self, session);
+    }
+    session.stream.setDaneVerified(verified);
+    log.info("inbound DANE for {s}: {s} ({s})", .{
+        session.daneDomain(),
+        if (verified) "verified" else "not verified (will offer dialback)",
+        @tagName(status),
+    });
+
+    self.sendInboundFeaturesTail(batch, session);
+    handleInboundReadable(self, batch, session.id);
+}
+
+/// Extract the peer chain and verify it against the session's stored
+/// TLSA records; identical semantics to the old blocking path.
+fn verifyInboundDane(daemon: *S2sDaemon, session: *S2sSession) bool {
+    const dane_mod = @import("dane.zig");
+    const tls = &(session.tls_conn orelse return false);
+
+    const leaf_der = tls.getPeerCertDer(daemon.allocator) catch return false;
+    if (leaf_der == null) return false;
+    defer daemon.allocator.free(leaf_der.?);
+
+    const chain_der = tls.getPeerChainDer(daemon.allocator) catch return false;
+    defer {
+        for (chain_der) |cert| daemon.allocator.free(cert);
+        daemon.allocator.free(chain_der);
+    }
+
+    const tlsa_records = session.dane_tlsa_records;
+    var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch return false;
+    defer daemon.allocator.free(dane_records);
+    for (tlsa_records, 0..) |rec, i| {
+        dane_records[i] = .{
+            .usage = rec.usage,
+            .selector = rec.selector,
+            .matching_type = rec.matching_type,
+            .association_data = rec.association_data,
+        };
+    }
+
+    const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
+    return status == .verified;
 }
 
 // ============================================================================
@@ -3353,36 +3762,6 @@ test "S2sDaemon: a full pending-verify table answers the submission invalid" {
     try std.testing.expect(daemon.getInbound(1) != null);
 }
 
-/// A resolver override that answers one loopback target: initiation reaches
-/// the socket and slot paths without a live DNS lookup. The returned slice
-/// and host are allocator-owned, exactly like a DNS answer.
-fn testResolveLoopback(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
-    _ = domain;
-    const targets = try allocator.alloc(dns.ConnectionTarget, 1);
-    errdefer allocator.free(targets);
-    targets[0] = .{
-        .host = try allocator.dupe(u8, "127.0.0.1"),
-        .port = 5269,
-        .is_direct_tls = false,
-    };
-    return targets;
-}
-
-/// The same shape with the IPv4 broadcast address, whose connect(2) fails
-/// synchronously (EACCES on FreeBSD): the connect-failure path runs without
-/// waiting for a socket event.
-fn testResolveBroadcast(allocator: std.mem.Allocator, domain: []const u8) anyerror![]dns.ConnectionTarget {
-    _ = domain;
-    const targets = try allocator.alloc(dns.ConnectionTarget, 1);
-    errdefer allocator.free(targets);
-    targets[0] = .{
-        .host = try allocator.dupe(u8, "255.255.255.255"),
-        .port = 5269,
-        .is_direct_tls = false,
-    };
-    return targets;
-}
-
 /// Two inbound sessions plus one pooled outbound conn carrying a pending
 /// dialback exchange. The submission is on slot 1; slot 2 must stay silent.
 fn makeVerifyRig(alloc: std.mem.Allocator, daemon: *S2sDaemon, origin: []const u8) !struct {
@@ -3456,11 +3835,10 @@ test "S2sDaemon: an exhausted outbound slot table answers the pending verify inv
     // conn cannot be registered, so initiation fails after the connect.
     var taken: OutboundConnection = undefined;
     for (&daemon.outbound) |*slot| slot.* = &taken;
-    daemon.resolve_targets_override = &testResolveLoopback;
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.initiateOutbound(&cl, rig.conn, "them.example");
+    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }}));
 
     try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted");
     // The failed conn leaves the pool so the next delivery starts fresh.
@@ -3476,13 +3854,15 @@ test "S2sDaemon: a connect failure answers the pending verify invalid" {
     defer posix.close(rig.submitter_peer);
     defer posix.close(rig.other_peer);
     makeBufferOnlyClient(&daemon, alloc);
-    daemon.resolve_targets_override = &testResolveBroadcast;
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.initiateOutbound(&cl, rig.conn, "them.example");
+    // connect(2) to the broadcast address fails synchronously (EACCES on
+    // FreeBSD): the single target is consumed, the list exhausts, and the
+    // initiation fails as temporary per ADR-13.
+    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "255.255.255.255" }}));
 
-    try expectInitiationFailure(&daemon, rig, "to='them.example'", "tcp-connect-failed");
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout");
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
 
@@ -5307,4 +5687,766 @@ test "S2sDaemon: db:verify for the MUC host is answered as that host" {
     var rbuf2: [1024]u8 = undefined;
     const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
     try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
+}
+
+// ============================================================================
+// X2b: async DNS resolution tests
+// ============================================================================
+
+const TargetSpec = struct {
+    addr: []const u8,
+    port: u16 = 5269,
+    status: dns_async.TlsaStatus = .absent,
+    direct_tls: bool = false,
+};
+
+/// A fabricated resolver answer with the given targets. Slices and hosts
+/// are allocator-owned like a wire answer, so deliverResolution runs the
+/// real adoption and connect iteration without live DNS.
+fn fabricateResolution(alloc: std.mem.Allocator, specs: []const TargetSpec) !dns_async.Resolution {
+    const targets = try alloc.alloc(dns_async.Target, specs.len);
+    for (specs, 0..) |s, i| {
+        targets[i] = .{
+            .addr = try std.net.Address.parseIp(s.addr, s.port),
+            .host = try alloc.dupe(u8, s.addr),
+            .tlsa = &.{},
+            .tlsa_status = s.status,
+            .is_direct_tls = s.direct_tls,
+        };
+    }
+    return .{ .targets = targets };
+}
+
+/// Encode "a.b.c" as a wire-format DNS name into out; returns bytes used.
+fn encodeDnsName(out: []u8, dotted: []const u8) usize {
+    var pos: usize = 0;
+    var start: usize = 0;
+    while (start <= dotted.len) {
+        var end = start;
+        while (end < dotted.len and dotted[end] != '.') : (end += 1) {}
+        out[pos] = @intCast(end - start);
+        pos += 1;
+        @memcpy(out[pos .. pos + end - start], dotted[start..end]);
+        pos += end - start;
+        if (end >= dotted.len) break;
+        start = end + 1;
+    }
+    out[pos] = 0;
+    return pos + 1;
+}
+
+/// Build a DNS reply in out: echo the question, set response flags and
+/// rcode, append the pre-built answer section ("" for NODATA).
+fn nsBuildReply(out: []u8, q: []const u8, rcode: u16, answers: []const u8) usize {
+    @memcpy(out[0..2], q[0..2]);
+    std.mem.writeInt(u16, out[2..4], 0x8180 | rcode, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], if (answers.len > 0) 1 else 0, .big);
+    std.mem.writeInt(u16, out[8..10], 0, .big);
+    std.mem.writeInt(u16, out[10..12], 0, .big);
+    const qlen = q.len - 12;
+    @memcpy(out[12 .. 12 + qlen], q[12..]);
+    @memcpy(out[12 + qlen .. 12 + qlen + answers.len], answers);
+    return 12 + qlen + answers.len;
+}
+
+/// An SRV answer section for priority 10, weight 1, the given target.
+fn nsSrvAnswer(a: []u8, port: u16, target: []const u8) usize {
+    a[0] = 0xC0;
+    a[1] = 0x0C; // compressed name: the question owner
+    std.mem.writeInt(u16, a[2..4], 33, .big);
+    std.mem.writeInt(u16, a[4..6], 1, .big);
+    std.mem.writeInt(u32, a[6..10], 60, .big);
+    std.mem.writeInt(u16, a[12..14], 10, .big); // priority
+    std.mem.writeInt(u16, a[14..16], 1, .big); // weight
+    std.mem.writeInt(u16, a[16..18], port, .big);
+    const nlen = encodeDnsName(a[18..], target);
+    std.mem.writeInt(u16, a[10..12], @intCast(6 + nlen), .big);
+    return 12 + 6 + nlen;
+}
+
+/// An A answer section for one IPv4 address.
+fn nsAAnswer(a: []u8, ip: [4]u8) usize {
+    a[0] = 0xC0;
+    a[1] = 0x0C;
+    std.mem.writeInt(u16, a[2..4], 1, .big);
+    std.mem.writeInt(u16, a[4..6], 1, .big);
+    std.mem.writeInt(u32, a[6..10], 60, .big);
+    std.mem.writeInt(u16, a[10..12], 4, .big);
+    @memcpy(a[12..16], &ip);
+    return 16;
+}
+
+/// Serve one DNS reply on the fixture socket: wait up to 500 ms for one
+/// query and answer it per the test script; false when nothing arrived.
+/// Test-only: the posix.poll wait is fine here but must never be copied
+/// onto an event loop.
+fn nsServeOnce(fd: posix.fd_t) !bool {
+    var pkt: [512]u8 = undefined;
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&pfd, 500) == 0) return false;
+    var peer: posix.sockaddr = undefined;
+    var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const n = posix.recvfrom(fd, &pkt, 0, &peer, &plen) catch return false;
+    const q = pkt[0..n];
+    if (q.len < 16) return false;
+    const qtype = std.mem.readInt(u16, q[q.len - 4 ..][0..2], .big);
+    var out: [512]u8 = undefined;
+    var an: [128]u8 = undefined;
+    var rcode: u16 = 0;
+    var answers: []const u8 = "";
+    switch (qtype) {
+        33 => {
+            if (std.mem.indexOf(u8, q, "_xmpps-server") != null) {
+                // NODATA: no direct TLS on this domain.
+            } else {
+                answers = an[0..nsSrvAnswer(&an, 5269, "srv.them.example")];
+            }
+        },
+        1 => answers = an[0..nsAAnswer(&an, .{ 127, 0, 0, 1 })],
+        52 => rcode = 2, // TLSA SERVFAIL: lookup_failed, never "no TLSA"
+        else => {},
+    }
+    const rlen = nsBuildReply(&out, q, rcode, answers);
+    _ = posix.sendto(fd, out[0..rlen], 0, &peer, plen) catch return false;
+    return true;
+}
+
+/// A UDP socket bound on loopback: the test's nameserver fixture, or a
+/// black hole when no replies are served.
+fn nsFixtureSocket() !struct { fd: posix.fd_t, port: u16 } {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    errdefer posix.close(fd);
+    const any = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(fd, &any.any, any.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &actual, &alen);
+    return .{ .fd = fd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+test "S2sDaemon: a resolution connects the first TLSA-usable target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // Target 0's TLSA lookup failed: a temporary failure of that target,
+    // skipped outright. Target 1 is an IPv6 address: v6 connects too.
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "10.9.9.9", .status = .lookup_failed },
+        .{ .addr = "::1" },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+    try std.testing.expectEqual(posix.AF.INET6, conn.target_addr.any.family);
+    try std.testing.expectEqualStrings("::1", conn.targetHost());
+    const slot = daemon.findOutboundSlot(conn).?;
+    try std.testing.expect(daemon.outbound_readers[slot] != null);
+}
+
+test "S2sDaemon: a connect deadline advances to the next target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "127.0.0.1", .port = 5269 },
+        .{ .addr = "127.0.0.1", .port = 5270 },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+    try std.testing.expectEqual(@as(usize, 0), conn.target_idx);
+    const ident0 = conn.deadline_ident;
+    try std.testing.expect(conn.fd >= 0 and ident0 != 0);
+
+    daemon.handleConnectDeadline(&cl, ident0);
+
+    // The old fd was purged and closed; the kernel may recycle its number.
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0 and conn.deadline_ident != ident0);
+    try std.testing.expectEqual(@as(u16, 5270), conn.target_port);
+}
+
+test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message/>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "10.9.9.9", .status = .lookup_failed },
+        .{ .addr = "10.9.9.8", .status = .lookup_failed },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+
+    // Every target's TLSA lookup failed: a temporary failure, never "no
+    // TLSA" and never a connect to an unverifiable target (ADR-13).
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    const ns = try nsFixtureSocket();
+    defer posix.close(ns.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", ns.port));
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, conn, "gone.example");
+    try std.testing.expect(conn.dns_key != 0);
+    try std.testing.expect(conn.fd < 0);
+
+    // Drive the real wire: the fixture answers SRV (one target), A, and
+    // serves TLSA SERVFAIL, which must mark the target lookup_failed.
+    var done = false;
+    for (0..64) |_| {
+        _ = nsServeOnce(ns.fd) catch false;
+        daemon.resolver.step(25);
+        // The conn leaves the pool on failure, so membership is checked
+        // before the pointer is touched.
+        if (daemon.pool.connections.get("gone.example") == null) {
+            done = true;
+            break;
+        }
+        if (conn.fd >= 0) {
+            done = true;
+            break;
+        }
+    }
+    try std.testing.expect(done);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+}
+
+test "S2sDaemon: a silent nameserver leaves the loop responsive" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Bound but never answered: queries land, nothing replies.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+    daemon.resolver.chain_deadline_ms = 100;
+
+    const conn1 = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn1.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, conn1, "gone.example");
+
+    // The resolve is genuinely in flight on the loop: the conn waits.
+    try std.testing.expect(conn1.dns_key != 0);
+    try std.testing.expect(conn1.fd < 0);
+
+    // The loop stays responsive: a synchronous literal-IP resolve for a
+    // second domain completes inside the same call path, no blocking.
+    const conn2 = try daemon.pool.getOrCreate(daemon.local_domain, "127.0.0.1");
+    daemon.initiateOutbound(&cl, conn2, "127.0.0.1");
+    try std.testing.expect(conn2.dns_key == 0);
+    try std.testing.expect(conn2.fd >= 0);
+
+    // The silent job dies on its chain deadline (temporary), not by
+    // blocking the loop.
+    daemon.resolver.step(200);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+}
+
+test "S2sDaemon: an inbound DANE lookup defers then releases features" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_tls, in1.session.dane_phase);
+    try std.testing.expectEqual(in1.session.write_start, in1.session.write_end);
+
+    // While the lookup pends, inbound reads defer entirely.
+    handleInboundReadable(&daemon, &cl, 1);
+    try std.testing.expectEqual(in1.session.write_start, in1.session.write_end);
+
+    // Both SRV hops come back absent; the fallback TLSA hop too.
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_plain, in1.session.dane_phase);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.tlsa, in1.session.dane_phase);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+
+    // Authenticated absence: unverified, the deferred features go out,
+    // and the seam carries the status.
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+}
+
+test "S2sDaemon: SO_ERROR on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    // A closed loopback port: nonblocking connect pends, then SO_ERROR=ECONNREFUSED.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 1 }}));
+    if (daemon.pool.connections.get("them.example") == null) return error.SkipZigTest; // refused synchronously
+    const slot = daemon.findOutboundSlot(conn).?;
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    handleOutboundWritable(&daemon, &cl, slot);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: a deadline on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    const slot = daemon.findOutboundSlot(conn).?;
+    daemon.handleConnectDeadline(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: the inbound DANE wait holds then releases read interest" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    // Bound but never answered: the lookup stays in flight for the whole
+    // window the read hold is checked.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // Inbound reads are level-triggered: left armed, any peer byte spins
+    // the loop on reads handleInboundReadable refuses to take.
+    var saw_disable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.DISABLE) != 0) saw_disable = true;
+    }
+    try std.testing.expect(saw_disable);
+
+    // Walk the chain to completion; the last hop lands the result.
+    cl.reset();
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    var saw_enable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.ENABLE) != 0 and
+            (ev.flags & std.c.EV.ADD) == 0) saw_enable = true;
+    }
+    try std.testing.expect(saw_enable);
+}
+
+test "S2sDaemon: bytes pipelined behind the post-TLS stream open wait for the DANE lookup" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    try ensureTestTlsContexts(&daemon);
+
+    // Bound but never answered: the chain stays in flight while the
+    // pipelined bytes must wait.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The post-TLS stream open only kicks the chain when tls_conn is
+    // set, so the session needs a real link on both ends.
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(daemon.tls_client_ctx.?, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+    in1.session.tls_state = .established;
+    in1.session.stream.state = .awaiting_stream_open_tls;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // One write carries the stream open and a db:verify behind it. The
+    // open starts the lookup; the verify must not parse while it runs.
+    const payload =
+        "<stream:stream xmlns='jabber:server' xmlns:db='jabber:server:dialback'" ++
+        " xmlns:stream='http://etherx.jabber.org/streams' from='them.example' to='us.example' version='1.0'>" ++
+        "<db:verify from='them.example' to='us.example' id='v1'>not-the-key</db:verify>";
+    const wr = try peer.write(payload);
+    try std.testing.expectEqual(@as(usize, payload.len), wr.ok);
+
+    handleInboundReadable(&daemon, &cl, 1);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    // The verify element is unparsed: only the stream-open reply was
+    // queued, and the pipelined bytes stay buffered for the completion.
+    const queued = in1.session.write_buf[in1.session.write_start..in1.session.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, queued, "db:verify") == null);
+    try std.testing.expect(in1.session.read_end > in1.session.read_start);
+
+    // Land the chain as absent; the completion sends the features and
+    // then parses the buffered verify exactly once.
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    _ = try in1.session.flushWrite();
+    var rbuf: [4096]u8 = undefined;
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+}
+
+test "S2sDaemon: a TLSA answer with only unparsable records is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    // Skip the SRV hops: the rule under test is the TLSA hop's.
+    in1.session.dane_phase = .tlsa;
+
+    // One TLSA RR whose rdata is too short to parse: the resolver's rule
+    // makes this lookup_failed (temporary), never proof of absence.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3, // CH is wrong but harmless; only rtype gates the walk
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01 }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a TLSA adoption that cannot allocate is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    in1.session.dane_phase = .tlsa;
+
+    // A well-formed record: the adoption alloc is what fails. Allocation
+    // order inside the hop: rdata dupe, list append, adoption slice.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01, 0x01, 0xaa }),
+    };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    daemon.allocator = failing.allocator();
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    daemon.allocator = alloc;
+
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.dane_tlsa_records.len);
+}
+
+test "S2sDaemon: an oversized SRV target is skipped, not a panic" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // A peer-controlled SRV target of 383 dotted bytes: six 63-octet
+    // labels, which an unbounded parseDnsName accepted (H1's remote
+    // panic on the setDaneTarget assert).
+    var rdata: [6 + 6 * 64 + 1]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], 10, .big);
+    std.mem.writeInt(u16, rdata[2..4], 5, .big);
+    std.mem.writeInt(u16, rdata[4..6], 5269, .big);
+    var rp: usize = 6;
+    for (0..6) |_| {
+        rdata[rp] = 63;
+        @memset(rdata[rp + 1 .. rp + 64], 'a');
+        rp += 64;
+    }
+    rdata[rp] = 0;
+
+    // First hop: the bad record is skipped as a parse error and the
+    // chain walks to _xmpp-server instead of reaching setDaneTarget.
+    var rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpps-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_plain, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    // Second hop the same: both SRV names unusable, so the chain takes
+    // the bare-domain TLSA fallback.
+    rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpp-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(session_mod.InboundDanePhase.tlsa, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a failed read-hold on the DANE wait closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    // A full changelist cannot stage the EV_DISABLE: the lookup would
+    // pend with reads still armed and spin the loop on every peer byte.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+}
+
+test "S2sDaemon: a failed read re-arm on DANE completion closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // The completion re-arms the read interest the wait held. A full
+    // changelist loses the EV_ENABLE and strands the session with reads
+    // off forever, so it closes instead.
+    var full_scratch: [4]posix.Kevent = undefined;
+    var full_cl = ChangeList.init(&full_scratch);
+    var i: usize = 0;
+    while (true) {
+        full_cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+    daemon.batch = &full_cl;
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+    daemon.batch = null;
+}
+
+test "S2sDaemon: a full changelist cannot stall a pending resolve" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // The resolver kqueue exists before the first query so the loop can
+    // register it once at startup; nothing per-resolve rides the batch.
+    try std.testing.expect(daemon.resolver.kqFd() >= 0);
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+    daemon.resolver.chain_deadline_ms = 100;
+
+    // Fill the changelist completely: nothing further can be staged.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+    daemon.initiateOutbound(&cl, conn, "gone.example");
+    try std.testing.expect(conn.dns_key != 0);
+
+    // The resolve still completes: it depends on the fd registered at
+    // startup, not on entries in this batch.
+    daemon.resolver.step(200);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+}
+
+test "S2sDaemon: a timer ident below the deadline base never reaches the connect path" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    try std.testing.expect(conn.deadline_ident >= CONNECT_DEADLINE_IDENT_BASE);
+    try std.testing.expect(conn.fd >= 0);
+
+    // An ident in the lifecycle range must not touch the armed deadline.
+    daemon.handleTimerEvent(&cl, 1);
+    try std.testing.expect(conn.state == .connecting);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+
+    // The real ident still fires.
+    daemon.handleTimerEvent(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null or conn.deadline_ident != 0);
 }

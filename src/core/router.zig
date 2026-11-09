@@ -73,6 +73,39 @@ test "router: bare JID buffers hold a full store-key JID without truncation" {
     try std.testing.expectError(error.NoSpaceLeft, buildBareJid(&local3, &domain3, &out));
 }
 
+/// True when inner_xml has a top-level `<private xmlns='urn:xmpp:carbons:2'/>`
+/// child (XEP-0280 section 6). The element must sit at depth 0 of the stanza
+/// payload: the same two strings nested inside a forwarded carbon, an
+/// attachment or a body are payload text, not a hint. A parse failure fails
+/// open (false) so copies are still sent rather than silently suppressed.
+/// The substring pre-check keeps the common case allocation-free.
+fn hasPrivateHint(allocator: std.mem.Allocator, inner_xml: []const u8) bool {
+    if (std.mem.indexOf(u8, inner_xml, "urn:xmpp:carbons:2") == null or
+        std.mem.indexOf(u8, inner_xml, "<private") == null) return false;
+
+    var scan = xml.scanner.Scanner.init(allocator);
+    defer scan.deinit();
+    var pos: usize = 0;
+    var in_private_tag = false;
+    while (scan.next(inner_xml, &pos) catch return false) |tok| {
+        switch (tok.type) {
+            .element_open => {
+                // A top-level child opens while the depth is still the
+                // stanza payload's own; attributes and the tag end arrive
+                // before the depth increments.
+                in_private_tag = scan.depth == 0 and std.mem.eql(u8, tok.name, "private");
+            },
+            .namespace_decl => {
+                if (in_private_tag and tok.prefix.len == 0 and
+                    std.mem.eql(u8, tok.value, "urn:xmpp:carbons:2")) return true;
+            },
+            .element_open_end, .element_self_close => in_private_tag = false,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
 /// appends the accumulated child XML, and closes the stanza.
@@ -180,6 +213,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     var remote_delivered: bool = false;
 
+    // The resources the stanza is actually handed to, so a <received> carbon
+    // later skips exactly those. Bank .c is free for the whole dispatch:
+    // sendCarbons nests under .b and nothing else down here claims .c.
+    var lease_c = server.leaseScratch(.c);
+    defer lease_c.release();
+    const delivered_buf = lease_c.entries;
+    var delivered_count: usize = 0;
+
     const route_count = if (to_jid.resource.len > 0) blk: {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
         if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
@@ -255,6 +296,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         std.mem.indexOf(u8, inner_xml, "<no-store") != null;
     const has_no_copy = std.mem.indexOf(u8, inner_xml, "urn:xmpp:hints") != null and
         std.mem.indexOf(u8, inner_xml, "<no-copy") != null;
+    // XEP-0280 section 6: a <private/> child in the carbons namespace asks
+    // the server not to carbon copy this message to any resource.
+    const has_private = hasPrivateHint(server.allocator, inner_xml);
 
     // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
     const is_archivable = session.stanza_kind == .message and
@@ -286,14 +330,18 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // dispatch and never two dispatches with identical bytes.
     const hold_token = server.mintHoldToken();
 
+    // Single timestamp for all archive operations in this dispatch (T123);
+    // also the receipt time carried into cross-worker slots for the stamp.
+    const archive_timestamp: u64 = @intCast(std.time.timestamp());
+
     var delivery_failed = false;
-    for (entries_buf[0..route_count]) |entry| {
+    for (entries_buf[0..route_count], 0..) |entry, ei| {
         // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
         if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
 
         if (entry.worker_id == server.worker_id) {
             if (target_count < local_ids.len) {
-                local_ids[target_count] = entry.local_session_id;
+                local_ids[target_count] = ei;
                 target_count += 1;
             }
         } else {
@@ -307,8 +355,13 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 delivery_inner_xml,
                 session.stanza_kind,
                 hold_token,
+                archive_timestamp,
             )) {
                 remote_delivered = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
             } else {
                 // Other local and remote resources still get their copies;
                 // the sender gets an error if no resource accepts the stanza.
@@ -325,9 +378,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         log.warn("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
         break :blk null;
     };
-
-    // Single timestamp for all archive operations in this dispatch (T123)
-    const archive_timestamp: u64 = @intCast(std.time.timestamp());
 
     // One serialization buffer for this dispatch. The archive form is built
     // and consumed (copied by the writer queue, or stored) before the
@@ -471,8 +521,11 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     var hold_bounced = false;
     var hold_stored = false;
     var local_delivery_succeeded = false;
-    // Forward to each local target session
-    for (local_ids[0..target_count]) |tid| {
+    // Forward to each local target session. local_ids indexes entries_buf so
+    // each resource that accepts the stanza can join the delivered set.
+    for (local_ids[0..target_count]) |ei| {
+        const entry = entries_buf[ei];
+        const tid = entry.local_session_id;
         const target_session = server.sessions[tid] orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
         const sent_data = built orelse {
@@ -488,6 +541,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             // add a second row, and the drain would then deliver both.
             if (hold_stored) {
                 local_delivery_succeeded = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
                 continue;
             }
             const hold_id = if (is_archivable)
@@ -499,6 +556,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (sender_bare != null and server.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data, hold_token)) {
                 hold_stored = true;
                 local_delivery_succeeded = true;
+                if (delivered_count < delivered_buf.len) {
+                    delivered_buf[delivered_count] = entry;
+                    delivered_count += 1;
+                }
                 log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
                 continue;
             }
@@ -526,6 +587,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         if (target_session.sm_detached) {
             target_session.smTrackOutbound(sent_data);
             local_delivery_succeeded = true;
+            if (delivered_count < delivered_buf.len) {
+                delivered_buf[delivered_count] = entry;
+                delivered_count += 1;
+            }
             continue;
         }
         // Apply the MUC fan-out policy here too. A stanza that fits an empty
@@ -548,6 +613,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         };
         target_session.smTrackOutbound(sent_data);
         local_delivery_succeeded = true;
+        if (delivered_count < delivered_buf.len) {
+            delivered_buf[delivered_count] = entry;
+            delivered_count += 1;
+        }
         if (target_session.conn.hasPendingWrite()) {
             changes.addWrite(target_session.conn.fd, tid) catch {};
         }
@@ -563,9 +632,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    // XEP-0280: Message Carbons — send copies to sender's and recipient's other resources
-    // XEP-0334: Skip carbons if <no-copy xmlns='urn:xmpp:hints'/> is present
-    if (session.stanza_kind == .message and !has_no_copy and
+    // XEP-0280: Message Carbons - send copies to sender's and recipient's other resources.
+    // XEP-0334 and XEP-0280 section 6: a <no-copy/> hint or a <private/>
+    // child suppresses every copy on both delivery paths.
+    if (session.stanza_kind == .message and !has_no_copy and !has_private and
         (std.mem.eql(u8, type_str, "chat") or type_str.len == 0))
     {
         // The serialized stanza is dead now that the delivery loop above has
@@ -573,8 +643,13 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // delivery_inner_xml out of the augmented bank, can take it.
         out_lease.release();
 
-        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
-        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, changes);
+        // XEP-0280 section 7: a <received> copy goes only to a resource that
+        // did not already get the original. The delivered set is what the
+        // loops above actually handed off, queued, held or tracked, not a
+        // recomputation of the routing rule: when the routed set filters on
+        // more than priority the two stay in lockstep.
+        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, &[_]SessionEntry{}, changes);
+        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, delivered_buf[0..delivered_count], changes);
     }
 }
 
@@ -766,6 +841,7 @@ fn enqueueCrossThreadStanza(
     inner_xml: []const u8,
     kind: StanzaKind,
     hold_token: offline_store.HoldToken,
+    receipt_ts: u64,
 ) bool {
     const ds = server.delivery_system orelse return false;
 
@@ -793,7 +869,7 @@ fn enqueueCrossThreadStanza(
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverWithToken(route.worker_id, route.local_session_id, route.generation, payload, hold_token) catch |err| {
+    ds.deliverDelivery(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts, .stanza) catch |err| {
         log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
         return false;
@@ -808,6 +884,9 @@ fn dropOversize(inner_len: usize, route: SessionEntry) bool {
 }
 
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
+/// `delivered` lists the resources the dispatch already handed the original
+/// to; a <received> copy to one of them would deliver the same message
+/// twice (XEP-0280 section 7). A <sent> fan-out passes an empty slice.
 fn sendCarbons(
     server: *Server,
     carbon_type: []const u8,
@@ -819,6 +898,7 @@ fn sendCarbons(
     type_str: []const u8,
     id_str: []const u8,
     delivery_inner_xml: []const u8,
+    delivered: []const SessionEntry,
     changes: *ChangeList,
 ) void {
     const sm = server.session_map orelse return;
@@ -836,6 +916,19 @@ fn sendCarbons(
     const cbuf = carbon_lease.buf;
 
     for (entries[0..count]) |entry| {
+        // A resource that already received the original gets no <received>
+        // copy of it (XEP-0280 section 7).
+        var was_delivered = false;
+        for (delivered) |t| {
+            if (t.worker_id == entry.worker_id and
+                t.local_session_id == entry.local_session_id and
+                t.generation == entry.generation)
+            {
+                was_delivered = true;
+                break;
+            }
+        }
+        if (was_delivered) continue;
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (&target.conn == &sender_session.conn) continue;
@@ -939,7 +1032,10 @@ fn sendCarbons(
             cw.writeAll(carbon_type) catch continue;
             cw.writeAll("></message>") catch continue;
 
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten()) catch |err| {
+            // The slot carries the carbon class so the receiving worker can
+            // apply carbons_enabled and the live-only rules; this worker
+            // cannot see them on the remote Session.
+            ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, 0, .carbon) catch |err| {
                 log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
                 _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             };
