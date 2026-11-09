@@ -809,27 +809,44 @@ test "Listener: accept_batch_max requeues for the rest of the backlog" {
         if (fd >= 0) posix.close(fd);
     };
 
+    // A deadline, not a pass count: under load the tail of the backlog can
+    // complete late, and a bare wait() sleeps forever because the loop only
+    // wakes on I/O. The deadline fails the test instead of hanging the suite.
+    const deadline = try loop.scheduleIn(30_000, test_ctx);
     var got: usize = 0;
     var saw_batch_limit = false;
-    for (0..8) |_| {
+    while (got < total) {
         try loop.wait();
         while (loop.next()) |ev| {
-            if (ev != .readable) continue;
-            while (true) {
-                const out = try listener.acceptNext();
-                switch (out) {
-                    .accepted => |a| {
-                        accepted[got] = a.fd;
-                        got += 1;
-                    },
-                    .batch_limit => saw_batch_limit = true,
-                    else => break,
-                }
-                if (out != .accepted) break;
+            switch (ev) {
+                .readable => {
+                    while (true) {
+                        const out = try listener.acceptNext();
+                        switch (out) {
+                            .accepted => |a| {
+                                accepted[got] = a.fd;
+                                got += 1;
+                            },
+                            .batch_limit => saw_batch_limit = true,
+                            else => {},
+                        }
+                        if (out != .accepted) break;
+                    }
+                },
+                .deadline => |d| {
+                    if (d.timer.eql(deadline)) {
+                        std.debug.print(
+                            "accept_batch_max backlog: {d}/{d} connects arrived before the deadline\n",
+                            .{ got, total },
+                        );
+                        return error.ConnectBacklogDeadline;
+                    }
+                },
+                else => {},
             }
         }
-        if (got == total) break;
     }
+    _ = loop.cancelTimer(deadline);
     try std.testing.expect(saw_batch_limit);
     try std.testing.expectEqual(total, got);
 }
