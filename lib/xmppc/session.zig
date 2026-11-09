@@ -561,14 +561,6 @@ pub const Session = struct {
         self.write_registered = true;
     }
 
-    /// DANE drives verification only under dane_first and only when
-    /// the target's TLSA lookup returned records (ADR-13): .absent
-    /// falls back to PKIX, and .lookup_failed never reaches here (the
-    /// target is skipped in connectNextTarget).
-    fn useDane(self: *const Session) bool {
-        return self.tls_policy == .dane_first and self.currentTlsaStatus() == .present;
-    }
-
     /// DANE state of the current connection target (ADR-13): the test
     /// seam's override reads as present; a resolution target reports
     /// its own status word.
@@ -608,9 +600,10 @@ pub const Session = struct {
             self.fail(allocator, "tls-dane-mismatch");
             return null;
         };
-        // A set that emptied out means OpenSSL verified against traditional
-        // anchors: the handshake proved no DANE assertion, so it fails closed
-        // rather than silently downgrade (ADR-13).
+        // The RRset survived the module's filtering but OpenSSL accepted none
+        // of it, so no TLSA assertion was checked. The context's store is
+        // empty, so this cannot be a traditional-anchor success; refuse rather
+        // than report a peer we proved nothing about.
         if (self.dane_prepared == .no_usable_records) {
             log.warn("fd={d} tls: TLSA for {s} held no usable record — refusing", .{ self.fd, self.domain });
             self.fail(allocator, "tls-dane-mismatch");
@@ -650,13 +643,26 @@ pub const Session = struct {
         }
     }
 
+    /// The verification path the current target's TLSA RRset demands.
+    const DanePath = enum { dane, pkix, failed };
+
     /// Build and arm the DANE state for the current target. Called between
     /// the TCP connect and the STARTTLS upgrade, where the TLSA records and
     /// the reference identifiers are both known.
-    fn armDane(self: *Session) bool {
+    ///
+    /// The path comes from the module's `mode()` over the usable set, never
+    /// from the lookup status alone: an RRset whose records are all unusable
+    /// is not an assertion, so the module reports `.pkix` and the caller
+    /// verifies against the system store with `applyPkixFallback`, never
+    /// through an empty-store DANE handshake that cannot match (plan
+    /// sections 3 and 7).
+    ///
+    /// `ignore_records` is `.pkix_only`: the state still carries the
+    /// reference identifiers, but no usable record, so the path is PKIX.
+    fn armDane(self: *Session, ignore_records: bool) DanePath {
         const allocator = self.engine.allocator;
         self.releaseDane();
-        const tlsa = self.currentTlsa();
+        const tlsa: []const dns.TlsaRecord = if (ignore_records) &.{} else self.currentTlsa();
         // Reference identifiers: the service domain first (SNI), then the
         // SRV target host when it differs (RFC 7673 section 4).
         self.dane_name_count = 0;
@@ -678,26 +684,34 @@ pub const Session = struct {
         }
         if (self.dane_name_count == 0) {
             log.warn("fd={d} tls: no reference identifier for DANE on {s}", .{ self.fd, self.domain });
-            return false;
+            return .failed;
         }
 
-        var records: [ssl.dane_max_records]ssl.DaneRecord = undefined;
-        var n: usize = 0;
-        for (tlsa) |r| {
-            if (n == records.len) break;
-            records[n] = .{
+        // Hand the whole RRset to the module: it owns the per-set cap and
+        // rejects an oversized set, so a matching record is never dropped
+        // here (plan section 4, no truncation).
+        const records = allocator.alloc(ssl.DaneRecord, tlsa.len) catch {
+            log.warn("fd={d} tls: cannot allocate {d} TLSA records for {s}", .{ self.fd, tlsa.len, self.domain });
+            return .failed;
+        };
+        defer allocator.free(records);
+        for (tlsa, 0..) |r, i| {
+            records[i] = .{
                 .usage = r.usage,
                 .selector = r.selector,
                 .matching_type = r.matching_type,
                 .data = r.association_data,
             };
-            n += 1;
         }
-        self.dane_state = ssl.initDane(allocator, .{ .names = self.dane_names[0..self.dane_name_count] }, records[0..n]) catch |err| {
+        self.dane_state = ssl.initDane(allocator, .{ .names = self.dane_names[0..self.dane_name_count] }, records) catch |err| {
             log.warn("fd={d} tls: cannot arm DANE for {s}: {}", .{ self.fd, self.domain, err });
-            return false;
+            return .failed;
         };
-        return true;
+        const state = if (self.dane_state) |*s| s else return .failed;
+        return switch (state.mode()) {
+            .dane => .dane,
+            .pkix => .pkix,
+        };
     }
 
     fn releaseDane(self: *Session) void {
@@ -1133,40 +1147,58 @@ pub const Session = struct {
             },
             .begin_tls => {
                 const tp = if (self.tport) |*t| t else return error.TlsMissing;
-                // T202 verification decision (before the handshake, since
-                // the PKIX path must verify during it):
-                //   dane_first + tlsa_status .present -> VERIFY_NONE ctx,
-                //     manual TLSA match at completion (fail closed);
-                //   dane_first + tlsa_status .absent  -> PKIX ctx (system
-                //     CA) + hostname check on the stream domain;
-                //   tlsa_status .lookup_failed        -> never reaches
-                //     here; the target is skipped in connectNextTarget;
-                //   none                     -> lab path, no verification.
-                const use_dane = self.useDane();
+                // Verification decision, taken before the handshake because
+                // both real paths must verify during it:
+                //   usable TLSA records -> empty-store DANE context; only a
+                //     TLSA match can authenticate the peer;
+                //   none usable (absent RRset or every record unusable) ->
+                //     PKIX context (system store) with the module's fallback
+                //     identifiers, which never match a subject CN (plan
+                //     rules 2, 6 and 7);
+                //   tlsa_status .lookup_failed       -> never reaches here;
+                //     the target is skipped in connectNextTarget;
+                //   tls_policy .none                 -> lab path, no
+                //     verification and no identifiers.
+                //
+                // Both verified paths need the DANE state: it carries the
+                // reference identifiers the fallback installs.
+                const path: DanePath = if (self.tls_policy == .none) blk: {
+                    self.releaseDane();
+                    break :blk .pkix;
+                } else self.armDane(self.tls_policy == .pkix_only);
                 var sni_buf: [256]u8 = undefined;
                 const sni = domainZ(&sni_buf, self.domain);
-                const ctx = if (use_dane)
-                    engine.clientDaneTlsContext() catch return error.TlsNotConfigured
-                else if (self.tls_policy == .none)
-                    engine.tls_ctx orelse return error.TlsNotConfigured
-                else
-                    engine.clientCaTlsContext() catch return error.TlsNotConfigured;
+                const ctx = switch (path) {
+                    .dane => engine.clientDaneTlsContext() catch return error.TlsNotConfigured,
+                    .pkix => if (self.tls_policy == .none)
+                        engine.tls_ctx orelse return error.TlsNotConfigured
+                    else
+                        engine.clientCaTlsContext() catch return error.TlsNotConfigured,
+                    .failed => return error.TlsInitFailed,
+                };
                 self.mark(.tls_start);
                 tp.upgradeToTls(ctx, sni) catch return error.TlsInitFailed;
-                if (use_dane) {
-                    // Arm DANE before the handshake: only a TLSA match can
-                    // authenticate the peer, so the handshake itself fails
-                    // closed (no post-handshake window on this thread).
-                    const tc = tp.tlsConn() orelse return error.TlsMissing;
-                    if (!self.armDane()) return error.TlsInitFailed;
-                    const state = if (self.dane_state) |*s| s else return error.TlsInitFailed;
-                    self.dane_prepared = tc.prepareDane(state) catch return error.TlsInitFailed;
-                } else if (self.tls_policy != .none) {
-                    const tc = tp.tlsConn() orelse return error.TlsMissing;
-                    const host = sni orelse return error.TlsDomainTooLong;
-                    tc.setHostname(host) catch return error.TlsInitFailed;
+                switch (path) {
+                    .dane => {
+                        // Arm DANE before the handshake: only a TLSA match
+                        // can authenticate the peer, so the handshake itself
+                        // fails closed (no post-handshake window here).
+                        const tc = tp.tlsConn() orelse return error.TlsMissing;
+                        const state = if (self.dane_state) |*s| s else return error.TlsInitFailed;
+                        self.dane_prepared = tc.prepareDane(state) catch return error.TlsInitFailed;
+                    },
+                    .pkix => {
+                        // No usable record: verify against the system store
+                        // with the module's identifiers, so a certificate
+                        // without a DNS SAN cannot match on its subject CN.
+                        if (self.dane_state) |*state| {
+                            const tc = tp.tlsConn() orelse return error.TlsMissing;
+                            tc.applyPkixFallback(state) catch return error.TlsInitFailed;
+                        }
+                    },
+                    .failed => unreachable,
                 }
-                self.pending_dane = use_dane;
+                self.pending_dane = path == .dane;
                 self.tls_handshake = true;
                 _ = self.onRead(engine) catch return error.TlsDriveFailed;
             },
@@ -1548,7 +1580,7 @@ test "connect: a later connect failure keeps the tlsa-lookup-failed reason" {
     try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
 }
 
-test "tls policy: only dane_first with a present TLSA set uses DANE" {
+test "tls policy: the verification path comes from the usable record set" {
     const a = std.testing.allocator;
     var engine = try Engine.init(a);
     defer engine.deinit();
@@ -1556,7 +1588,7 @@ test "tls policy: only dane_first with a present TLSA set uses DANE" {
     s.engine = &engine;
     defer s.destroy(a);
 
-    const targets = try a.alloc(resolver_mod.Target, 2);
+    const targets = try a.alloc(resolver_mod.Target, 3);
     targets[0] = .{
         .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
         .host = try a.dupe(u8, "absent.test"),
@@ -1564,24 +1596,79 @@ test "tls policy: only dane_first with a present TLSA set uses DANE" {
         .tlsa_status = .absent,
         .is_direct_tls = false,
     };
+    // A SERVFAIL is never a fallback: the target is skipped in
+    // connectNextTarget, so armDane is not reached for it.
     targets[1] = .{
         .addr = try std.net.Address.parseIp("127.0.0.1", 5223),
-        .host = try a.dupe(u8, "present.test"),
+        .host = try a.dupe(u8, "failed.test"),
         .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    var digest: [32]u8 = undefined;
+    @memset(&digest, 0x11);
+    // Owned like a real resolution: deinitOn frees the set and its data.
+    const present_tlsa = try a.alloc(dns.TlsaRecord, 1);
+    present_tlsa[0] = .{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .association_data = try a.dupe(u8, &digest),
+    };
+    targets[2] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5224),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = present_tlsa,
         .tlsa_status = .present,
         .is_direct_tls = false,
     };
     s.resolution = .{ .targets = targets };
 
-    // An authenticated absence of TLSA falls back to PKIX; it must
-    // never be read as DANE.
+    // An authenticated absence of TLSA falls back to PKIX; it must never be
+    // read as DANE. The state is still built, because the PKIX fallback
+    // needs the module's reference identifiers.
     s.tls_policy = .dane_first;
     s.target_index = 0;
-    try std.testing.expect(!s.useDane());
-    s.target_index = 1;
-    try std.testing.expect(s.useDane());
+    try std.testing.expectEqual(Session.DanePath.pkix, s.armDane(false));
+    try std.testing.expect(s.dane_state != null);
+    s.target_index = 2;
+    try std.testing.expectEqual(Session.DanePath.dane, s.armDane(false));
+    // pkix_only ignores the records but keeps the identifiers.
     s.tls_policy = .pkix_only;
-    try std.testing.expect(!s.useDane());
+    try std.testing.expectEqual(Session.DanePath.pkix, s.armDane(true));
+    try std.testing.expect(s.dane_state != null);
+}
+
+test "tls policy: an RRset past the module cap fails instead of truncating" {
+    // A matching record may sit past any local cap, so the whole set must
+    // reach the module: it rejects an oversized set, and a rejection fails
+    // the session rather than handshaking over a truncated one.
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .dane_first;
+
+    const n = ssl.dane_max_records + 1;
+    const tlsa = try a.alloc(dns.TlsaRecord, n);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("no-such-cert", &digest, .{});
+    for (tlsa) |*r| r.* = .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = try a.dupe(u8, &digest) };
+
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = tlsa,
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    try std.testing.expectEqual(Session.DanePath.failed, s.armDane(false));
+    try std.testing.expect(s.dane_state == null);
 }
 
 test "connect: none dials a lookup_failed TLSA target" {
