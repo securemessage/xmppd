@@ -510,6 +510,13 @@ pub const SslConn = struct {
             return SslError.SslInitFailed;
     }
 
+    /// Install PKIX verification for a target whose RRset held no usable
+    /// record: the reference identifiers are checked against DNS names only
+    /// (never a subject CN), and SNI is set when the connection has none.
+    pub fn applyPkixFallback(self: *SslConn, state: *const DaneState) SslError!void {
+        dane_openssl.pkixFallback(@ptrCast(self.ssl), state.refs()) catch return SslError.SslInitFailed;
+    }
+
     /// Map the completed handshake's verification state to a verdict.
     /// `prepared` is what `prepareDane` returned.
     pub fn daneVerdict(self: *SslConn, prepared: dane_openssl.Prepared, state: *const DaneState) dane.Verdict {
