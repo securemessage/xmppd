@@ -1513,15 +1513,25 @@ fn collapseOccupant(
 /// plus literal markup and the affiliation name.
 const REPLACED_NOTICE_BUF_LEN = 6 * (room_registry.MAX_BARE_JID + 64 + room_registry.MAX_REAL_JID) + 256;
 
+comptime {
+    std.debug.assert(REPLACED_NOTICE_BUF_LEN <= Server.BYTE_BANK_SIZE);
+}
+
 /// Tells a resource replaced by a takeover that it is no longer in the room.
 /// A local target is checked against its bound JID so a reused session slot
 /// never receives it; a target on another worker goes through the
 /// generation-checked unicast.
 fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
     // Every variable byte may become a six-byte XML entity; the remaining
-    // 256 bytes cover the literal markup and affiliation name.
-    var buf: [REPLACED_NOTICE_BUF_LEN]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    // 256 bytes cover the literal markup and affiliation name. The worst
+    // case is ~10 KB, so the notice is built in a leased scratch bank, not
+    // on the stack.
+    var lease = server.leaseByteScratch() orelse {
+        log.warn("replaced-resource notice to {s} skipped: byte scratch unavailable", .{before.getRealJid()});
+        return;
+    };
+    defer lease.release();
+    var fbs = std.io.fixedBufferStream(lease.buf);
     const w = fbs.writer();
     w.writeAll("<presence from='") catch return;
     xml.escapeWrite(w, r.getJid()) catch return;
@@ -3441,6 +3451,52 @@ test "S16: local replaced-resource notice overflow fails the session" {
     notifyReplacedResource(&server, room, &before, &changes);
 
     try std.testing.expect(target.sm_overflow);
+}
+
+test "S16: a maximum-length escape-heavy replaced-resource notice is built in a leased bank and delivered whole" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+
+    // Worst case for the notice: a 512-byte room JID, 64-byte nick and
+    // 1024-byte real JID made entirely of apostrophes. Every byte escapes
+    // to a six-character entity, which is what sized the old stack buffer.
+    const room = try registry.createRoom("'" ** 512, .{});
+    const real_jid = "'" ** 1024;
+    _ = try room.addOccupant("'" ** 64, real_jid, "'" ** 512, 0, 0, 1, .participant, .member);
+    const before = room.occupants[0].?;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    // The local check compares raw (unescaped) bytes, so the bound parts
+    // must concatenate to the same 1024-byte real JID: 511+1+500+1+11.
+    target.stream.bound_jid = .{ .local = "'" ** 511, .domain = "'" ** 500, .resource = "'" ** 11 };
+    server.sessions[0] = target;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    notifyReplacedResource(&server, room, &before, &changes);
+
+    // The notice came out of a scratch bank, not a stack buffer; the lease
+    // is released once the stanza is queued.
+    try std.testing.expect(server.byte_scratch.len > 0);
+    for (server.byte_scratch_in_use) |in_use| try std.testing.expect(!in_use);
+
+    const queued = target.conn.write_buf[target.conn.write_start..target.conn.write_end];
+    const expected = "<presence from='" ++ ("&apos;" ** 512) ++ "/" ++ ("&apos;" ** 64) ++
+        "' to='" ++ ("&apos;" ** 1024) ++
+        "' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='none'/><status code='110'/></x></presence>";
+    try std.testing.expectEqualStrings(expected, queued);
+    try std.testing.expect(!target.sm_overflow);
 }
 
 test "S16: local delivery refuses a stale session generation" {
