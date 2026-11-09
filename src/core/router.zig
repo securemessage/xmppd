@@ -73,6 +73,39 @@ test "router: bare JID buffers hold a full store-key JID without truncation" {
     try std.testing.expectError(error.NoSpaceLeft, buildBareJid(&local3, &domain3, &out));
 }
 
+/// True when inner_xml has a top-level `<private xmlns='urn:xmpp:carbons:2'/>`
+/// child (XEP-0280 section 6). The element must sit at depth 0 of the stanza
+/// payload: the same two strings nested inside a forwarded carbon, an
+/// attachment or a body are payload text, not a hint. A parse failure fails
+/// open (false) so copies are still sent rather than silently suppressed.
+/// The substring pre-check keeps the common case allocation-free.
+fn hasPrivateHint(allocator: std.mem.Allocator, inner_xml: []const u8) bool {
+    if (std.mem.indexOf(u8, inner_xml, "urn:xmpp:carbons:2") == null or
+        std.mem.indexOf(u8, inner_xml, "<private") == null) return false;
+
+    var scan = xml.scanner.Scanner.init(allocator);
+    defer scan.deinit();
+    var pos: usize = 0;
+    var in_private_tag = false;
+    while (scan.next(inner_xml, &pos) catch return false) |tok| {
+        switch (tok.type) {
+            .element_open => {
+                // A top-level child opens while the depth is still the
+                // stanza payload's own; attributes and the tag end arrive
+                // before the depth increments.
+                in_private_tag = scan.depth == 0 and std.mem.eql(u8, tok.name, "private");
+            },
+            .namespace_decl => {
+                if (in_private_tag and tok.prefix.len == 0 and
+                    std.mem.eql(u8, tok.value, "urn:xmpp:carbons:2")) return true;
+            },
+            .element_open_end, .element_self_close => in_private_tag = false,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
 /// appends the accumulated child XML, and closes the stanza.
@@ -265,8 +298,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         std.mem.indexOf(u8, inner_xml, "<no-copy") != null;
     // XEP-0280 section 6: a <private/> child in the carbons namespace asks
     // the server not to carbon copy this message to any resource.
-    const has_private = std.mem.indexOf(u8, inner_xml, "urn:xmpp:carbons:2") != null and
-        std.mem.indexOf(u8, inner_xml, "<private") != null;
+    const has_private = hasPrivateHint(server.allocator, inner_xml);
 
     // Determine if this message should be archived (XEP-0313) and get a stanza-id (XEP-0359).
     const is_archivable = session.stanza_kind == .message and
