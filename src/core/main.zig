@@ -244,6 +244,13 @@ pub fn main() !void {
         host, address, port, worker_count, per_worker_sessions,
     });
 
+    if (db_path) |db| {
+        if (try @import("backend").migrationPending(db)) {
+            log.err("an interrupted migrate-precis recovery is pending; rerun 'xmppctl migrate-precis --apply' before starting xmppd-core", .{});
+            return error.MigrationPending;
+        }
+    }
+
     // Open storage backends (shared across workers — backends are thread-safe)
     var op_backend: ?OpBackendType = null;
     var roster_store: ?GenericRosterStore = null;

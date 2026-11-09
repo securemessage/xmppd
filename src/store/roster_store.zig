@@ -23,6 +23,12 @@ const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.roster_store);
 
+// Iterator prefixes share the key budget: the backend cap and the key
+// builder cap must never drift apart.
+comptime {
+    std.debug.assert(backend_mod.MAX_PREFIX_LEN == store_keys.MAX_KEY_LEN);
+}
+
 pub const NAMESPACE = backend_mod.registered("rosters");
 
 pub const Subscription = enum(u8) {

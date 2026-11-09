@@ -126,13 +126,6 @@ pub const CbMode = enum {
     }
 };
 
-/// SCRAM-SHA-256 server-side implementation per RFC 5802 and RFC 7677.
-///
-/// Implements the server side of the SCRAM exchange:
-/// 1. Client sends client-first-message (username + nonce)
-/// 2. Server sends server-first-message (combined nonce + salt + iteration count)
-/// 3. Client sends client-final-message (channel binding + proof)
-/// 4. Server validates proof and sends server-final-message (verifier)
 /// Scratch bytes for the OpaqueString prep inside derive(): the raw
 /// input and the prepped output share one buffer.
 const prep_buf_len = 2048;
@@ -197,7 +190,13 @@ pub const StoredCredentials = struct {
     }
 };
 
-/// Server-side SCRAM-SHA-256 state machine.
+/// SCRAM-SHA-256 server-side implementation per RFC 5802 and RFC 7677.
+///
+/// Implements the server side of the SCRAM exchange:
+/// 1. Client sends client-first-message (username + nonce)
+/// 2. Server sends server-first-message (combined nonce + salt + iteration count)
+/// 3. Client sends client-final-message (channel binding + proof)
+/// 4. Server validates proof and sends server-final-message (verifier)
 pub const ScramServer = struct {
     state: State = .awaiting_client_first,
     /// The client's username (from client-first-message)

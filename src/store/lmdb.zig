@@ -237,6 +237,12 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
 
 const MAX_DBS = 24;
 
+comptime {
+    // openCanonicalNamespaces appends every canonical namespace to
+    // dbi_cache without a runtime bound check; the list must fit.
+    std.debug.assert(backend.canonical_namespaces.len <= MAX_DBS);
+}
+
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
     name_len: u8,
@@ -259,6 +265,12 @@ pub const LmdbBackend = struct {
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    /// Offline tools hold an exclusive byte-0 lock on lock.mdb for the whole
+    /// environment lifetime. Closing any descriptor of the file while the
+    /// env is open would release every fcntl lock this process holds on it,
+    /// including LMDB's own (D5), so this is closed only after env.deinit().
+    lock_file: ?std.fs.File = null,
+
     /// A read runs inside its own read txn, which LMDB pins to an MVCC
     /// snapshot, so it cannot observe a half-applied write and does not need
     /// the store's compound lock (S9).
@@ -269,6 +281,32 @@ pub const LmdbBackend = struct {
     }
 
     pub fn open(path: []const u8, opts: backend.OpenOptions) !LmdbBackend {
+        return openInternal(path, opts, null);
+    }
+
+    /// Open an environment for an offline tool (migrate-precis, deluser
+    /// --raw). The exclusive byte-0 lock is taken before the environment
+    /// exists and held until after env.deinit(): opening a second descriptor
+    /// after env open and closing it would drop every fcntl lock this
+    /// process holds on lock.mdb, including LMDB's own (D5). A daemon that
+    /// starts mid-run blocks in its env open; when the offline tool exits,
+    /// LMDB on FreeBSD destroys its shared mutexes, so that daemon then
+    /// fails with EINVAL and must be restarted after xmppctl exits.
+    pub fn openOffline(path: []const u8, opts: backend.OpenOptions) !LmdbBackend {
+        if (opts.create) {
+            std.fs.cwd().makePath(path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+        const lock_file = try acquireOfflineLock(path, opts.create);
+        return openInternal(path, opts, lock_file);
+    }
+
+    fn openInternal(path: []const u8, opts: backend.OpenOptions, lock_file: ?std.fs.File) !LmdbBackend {
+        var owned_lock = lock_file;
+        errdefer if (owned_lock) |file| file.close();
+
         if (opts.create) {
             std.fs.cwd().makePath(path) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
@@ -296,15 +334,58 @@ pub const LmdbBackend = struct {
         errdefer env.deinit();
         excludeMapFromCoreDump(env);
 
+        // Env open may briefly downgrade byte 0 to a shared lock. Re-take
+        // the exclusive lock before any namespace write and keep it for the
+        // whole run.
+        if (owned_lock) |file| try setExclusiveLock(file.handle);
+
         var self: LmdbBackend = .{
             .env = env,
             .dbi_cache = undefined,
             .dbi_count = .init(0),
             .map_size = opts.map_size,
+            .lock_file = owned_lock,
         };
         if (!opts.read_only) try self.openCanonicalNamespaces() else try self.openCanonicalNamespacesReadOnly();
+        owned_lock = null;
         self.warnIfNearlyFull();
         return self;
+    }
+
+    fn acquireOfflineLock(path: []const u8, create: bool) !std.fs.File {
+        var lock_path_buf: [4096]u8 = undefined;
+        const lock_path = std.fmt.bufPrint(&lock_path_buf, "{s}/lock.mdb", .{path}) catch
+            return error.NameTooLong;
+        var file = std.fs.cwd().openFile(lock_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => if (create)
+                std.fs.cwd().createFile(lock_path, .{ .read = true, .truncate = false }) catch
+                    return error.LmdbCheckFailed
+            else
+                return error.LmdbCheckFailed,
+            error.AccessDenied => return error.LmdbCheckFailed,
+            else => return err,
+        };
+        errdefer file.close();
+        try setExclusiveLock(file.handle);
+        return file;
+    }
+
+    fn setExclusiveLock(handle: std.posix.fd_t) !void {
+        var lock: std.posix.Flock = .{
+            .start = 0,
+            .len = 1,
+            .pid = 0,
+            .type = std.c.F.WRLCK,
+            .whence = 0,
+            .sysid = 0,
+        };
+        const rc = std.c.fcntl(handle, std.c.F.SETLK, &lock);
+        if (rc == -1) {
+            return switch (std.posix.errno(rc)) {
+                .ACCES, .AGAIN => error.DaemonsRunning,
+                else => error.LmdbCheckFailed,
+            };
+        }
     }
 
     /// Open every canonical namespace in one write transaction (S9): no
@@ -367,7 +448,14 @@ pub const LmdbBackend = struct {
     }
 
     pub fn close(self: *LmdbBackend) void {
+        // env.deinit() closes LMDB's descriptor first. Closing our held
+        // descriptor after it is safe; doing so before would drop LMDB's
+        // locks (D5).
         self.env.deinit();
+        if (self.lock_file) |file| {
+            file.close();
+            self.lock_file = null;
+        }
     }
 
     pub fn get(self: *LmdbBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
@@ -428,6 +516,7 @@ pub const LmdbBackend = struct {
     }
 
     pub fn iterator(self: *LmdbBackend, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > backend.MAX_PREFIX_LEN) return error.PrefixTooLong;
         const dbi = try self.getOrCreateDbi(ns);
         const txn = try lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly });
         errdefer txn.abort();
@@ -439,10 +528,10 @@ pub const LmdbBackend = struct {
             .cursor = cur,
             .txn = txn,
             .prefix = undefined,
-            .prefix_len = @min(prefix.len, 256),
+            .prefix_len = prefix.len,
             .started = false,
         };
-        @memcpy(iter.prefix[0..iter.prefix_len], prefix[0..iter.prefix_len]);
+        @memcpy(iter.prefix[0..iter.prefix_len], prefix);
         return iter;
     }
 
@@ -459,7 +548,7 @@ pub const LmdbBackend = struct {
     pub const Iterator = struct {
         cursor: lmdb.Cursor,
         txn: lmdb.Transaction,
-        prefix: [256]u8,
+        prefix: [backend.MAX_PREFIX_LEN]u8,
         prefix_len: usize,
         started: bool,
 
@@ -718,6 +807,54 @@ test "LmdbBackend: iterator prefix-bounded" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "LmdbBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime backend.registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    // The scan is scoped: the iterator's read txn must close before the
+    // deletes open a write txn on this thread.
+    var keys: [4][backend.MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (backend.MAX_PREFIX_LEN + 1)));
 }
 
 test "LmdbBackend: iterator returns key and value" {
@@ -1189,4 +1326,77 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     const after = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(rec.kve_start, after.kve_start);
     try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
+}
+
+test "LmdbBackend: a vmmap miss uses the not-found warning, not the exhaustion one" {
+    // Goal: a lookup that returns records but no matching VMA is a miss,
+    // not retry exhaustion: the open warns with the distinct not-found
+    // message, the exhaustion counter stays put, and no madvise is
+    // attempted without a record. Method: the seam returns one vnode
+    // record whose inode and filesystem cannot match the env map.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 1;
+    recs[0].kve_vn_fsid = 1;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const calls0 = madviseCall.calls;
+    const warns0 = warnCall.exhausted_calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, 1), vmmapCall.read_calls);
+    try std.testing.expectEqual(warns0, warnCall.exhausted_calls);
+}
+
+fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
+    // The iterator holds this thread's read txn: it is opened, drained and
+    // deinit'd inside the call so later puts can open a write txn.
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+    var n: usize = 0;
+    while (iter.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key, prefix));
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "LmdbBackend: iterator scan over 0xFF tails, empty prefix, a shared-head owner and the exact cap" {
+    const path = freshTestDir();
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    const ns = comptime backend.registered("rosters");
+
+    // Keys that stress the lexicographic edges of a prefix scan: trailing
+    // 0xFF bytes, a key sitting on the computed upper bound, and all-0xFF
+    // prefixes. The counts pin the sorted order the scan must honor.
+    const ks = [_][]const u8{ "ab\xFE\xFF", "ab\xFF", "ab\xFF\x00x", "ab\xFF\xFF", "ac", "\xFF\xFE", "\xFF\xFF", "\xFF\xFF\x01" };
+    for (ks) |k| try db.put(ns, k, "v");
+    try expectPrefixScan(&db, ns, "ab\xFF", 3);
+    try expectPrefixScan(&db, ns, "ab\xFE", 1);
+    try expectPrefixScan(&db, ns, "\xFF\xFF", 2);
+    try expectPrefixScan(&db, ns, "\xFF", 3);
+    try expectPrefixScan(&db, ns, "", 8);
+
+    // Two owners sharing a 296-byte head: a clipped seek or compare merges
+    // their rows.
+    const owner_a = ("a" ** 290) ++ "-first\x00";
+    const owner_b = ("a" ** 290) ++ "-other\x00";
+    try db.put(ns, owner_a ++ "i", "a");
+    try db.put(ns, owner_b ++ "i", "b");
+    try expectPrefixScan(&db, ns, owner_b, 1);
+    try expectPrefixScan(&db, ns, owner_a, 1);
+
+    // An exact-cap prefix must be accepted and matched, not rejected.
+    const cap = "c" ** backend.MAX_PREFIX_LEN;
+    try db.put(ns, cap, "c");
+    try expectPrefixScan(&db, ns, cap, 1);
+    try expectPrefixScan(&db, ns, cap[0 .. backend.MAX_PREFIX_LEN - 1], 1);
 }

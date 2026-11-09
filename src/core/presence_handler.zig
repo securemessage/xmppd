@@ -1331,7 +1331,7 @@ fn deliverPresenceToSubscribers(
                 var pending = false;
                 for (entries[0..count]) |entry| {
                     if (entry.worker_id != w) continue;
-                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml, 0) catch continue;
+                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml) catch continue;
                     pending = true;
                 }
                 if (pending) ds.wakeWorker(w);

@@ -226,12 +226,15 @@ pub const CryptoPool = struct {
             self.pipe_wr = -1;
         }
 
+        // Undo only what this call allocates: rings a pre-start put()
+        // created hold queued jobs that stop() still has to wipe.
+        const had_rings = self.job_slots.len != 0;
         {
             self.job_mutex.lock();
             defer self.job_mutex.unlock();
             try self.ensureRingsLocked();
         }
-        errdefer self.freeRings();
+        errdefer if (!had_rings) self.freeRings();
 
         const n = @min(thread_count, MAX_THREADS);
         for (0..n) |i| {
@@ -663,6 +666,22 @@ test "CryptoPool: a failed first spawn frees the rings" {
     try std.testing.expect(gpa.deinit() == .ok);
 }
 
+test "CryptoPool: a failed start keeps the jobs queued before it" {
+    // put() may run before start(). A failed start() undoes only what it
+    // allocated: queued slots stay mapped for stop() to wipe.
+    test_spawn_fail = true;
+    defer test_spawn_fail = false;
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    defer pool.stop();
+    _ = try putTestJob(&pool, "pre-start-marker", @splat(7), 1, @splat(8));
+    try std.testing.expectError(error.SystemResources, pool.start(1));
+    try std.testing.expectEqual(@as(usize, MAX_JOBS), pool.job_slots.len);
+    pool.dropQueued();
+    for (pool.job_slots) |*slot| {
+        try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "pre-start-marker") == null);
+    }
+}
+
 test "CryptoPool: a completion left over stop() cannot be popped" {
     // stop() drains the completion ring along with the reservation
     // count, so a straggler pop returns null instead of underflowing
@@ -776,6 +795,13 @@ test "CryptoPool: stop wipes queued slots before freeing them" {
     for (pool.job_slots) |*slot| {
         try std.testing.expect(std.mem.indexOf(u8, slot.password[0..], "wipe-marker-q3") == null);
     }
+}
+
+test "CryptoPool: stop drops the queued jobs" {
+    var pool = CryptoPool{ .allocator = std.testing.allocator };
+    _ = try putTestJob(&pool, "wipe-marker-q4", @splat(7), 1, @splat(8));
+    pool.stop();
+    try std.testing.expectEqual(pool.job_tail, pool.job_head);
 }
 
 /// Count occurrences of `needle` inside the mapped region containing

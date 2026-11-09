@@ -1,5 +1,110 @@
 # Changelog
 
+## v0.9.1 - unreleased
+
+### Upgrade notes
+
+- **Passwords with conjoining jamo or a composable vowel-sign pair prepare
+  differently than in v0.9.0.** The shared Unicode NFC engine gained
+  algorithmic Hangul composition and starter-second pair composition
+  (canonically equivalent passwords used to prepare to different strings).
+  The same engine prepares SASL credentials (RFC 8265 OpaqueString: SCRAM
+  derivation at registration and `xmppctl`, PLAIN verification, xmppc
+  client preparation). Affected inputs: any password containing conjoining
+  jamo (U+1100..U+11FF) that now composes - e.g. L+V jamo now form a
+  precomposed syllable, and a precomposed syllable followed by a trailing
+  jamo now forms an LVT syllable - or a two-part vowel-sign pair that now
+  composes (e.g. U+09C7 U+09BE -> U+09CB). For such a password the prepared
+  form differs from the v0.9.0 form, so its stored SCRAM credentials
+  (derived under the old preparation) stop matching: PLAIN login fails and
+  server-derived SCRAM material no longer lines up. Remedy: reset the
+  password after upgrading. Precomposed Hangul syllables on their own, and
+  every other input, prepare exactly as in v0.9.0 (c1fe1e2).
+
+- **Account names are now RFC 7622 localparts.** Registration, login,
+  locks, rate limiting, `xmppctl`, and the bound JID all use one PRECIS
+  UsernameCaseMapped function plus the eight localpart exclusions of RFC
+  7622 section 3.3.1 (`"`, `&`, `'`, `/`, `:`, `<`, `>`, `@`). Printable
+  ASCII such as `a!` remains valid. A client that logs in as `NaplesTB`
+  is bound as `naplestb@domain/resource`; use the JID returned by the
+  server. Existing account-bearing keys must be migrated before starting
+  xmppd-auth, including the archive database:
+  1. Stop every xmppd daemon. `migrate-precis` refuses to run while any
+     daemon pid file is live and holds an exclusive LMDB lock for the whole
+     run. A daemon started during the run blocks in env open, then exits
+     with LMDB EINVAL once xmppctl finishes; restart it after the tool
+     exits.
+  2. Dry-run `xmppctl migrate-precis --hosted-domain example.org`
+     (repeat `--hosted-domain` for each hosted domain). It prints every
+     planned rename and every collision or invalid localpart without
+     changing anything.
+  3. Resolve each reported identity. A collision exists between distinct
+     accounts: two users rows that fold together, or account-owned data
+     (roster, blocklist, vCard, PEP, lastact) that folds onto another
+     account. Data-only spellings (offline, archive and pending-sub rows
+     written by third parties) merge into the account they fold to, and two
+     data-only spellings with no users row merge with each other. Duplicate
+     reference rows are deduplicated: the prepared-key row wins and the
+     duplicate is printed as `deduplicated`. Offline pointers and archive
+     messages whose sender-chosen id collides with different content get one
+     shared reserved `~mig-...` id across the pointer, message key and
+     by_contact value; they are printed as `rekeyed`. Held payloads and the
+     merged offline queue follow the pointer's final sequence. `--apply`
+     refuses and lists
+     every remaining collision. **Prefer `--rename`** with `xmppctl
+     migrate-precis --hosted-domain example.org --rename OLD NEW --apply`:
+     it moves the account and every reference while preserving locks. If
+     deletion is required, use `xmppctl deluser --raw EXACT-KEY
+     --hosted-domain example.org` offline. If EXACT-KEY is a users row, it
+     deletes rows that spelling owns plus reference rows naming exactly that
+     raw spelling; it never removes another account's prepared lock. If
+     EXACT-KEY is a data-only spelling with no users row, it deletes only
+     rows keyed by that exact spelling and leaves every reference, lock and
+     account intact. It fails if data remains and prints what was removed.
+     Never delete only the users row: that would move the deleted person's
+     data into the surviving account. Any collision makes `--apply` change
+     nothing.
+  4. Apply with `xmppctl migrate-precis --hosted-domain example.org
+     --apply`, then rerun the dry run; it must report 0 renames. The plan,
+     a digest and `migrate-precis.pending` are written before the first
+     commit; completion markers are committed with the data they describe.
+     If the run is interrupted, rerun `xmppctl migrate-precis
+     --hosted-domain example.org --apply`: it loads the stored plan and
+     finishes only the unfinished batches. If the interrupted run used
+     `--rename`, omit it on the resume. While the marker exists,
+     `--rename`, `deluser --raw`, adduser, deluser, passwd, lock, unlock and
+     invite are refused, and xmppd-auth/xmppd-core refuse to start. Do not
+     delete the marker or resume file manually; a torn marker reports that
+     no data was committed and names the safe recovery.
+  5. Start the daemons. xmppd-auth scans the users namespace once at
+     startup and **refuses to start** if any key is not in prepared form,
+     logging one error that names `xmppctl migrate-precis`. There is no
+     raw-name read fallback.
+
+- **Ingress preparation is still a tracked follow-up:** PR #9 has merged,
+  but master still prepares no localpart at stanza or payload ingress. The
+  F6 work is PR #46 (in progress). Until it lands, mail and presence
+  addressed to the old spelling (for example `NaplesTB@domain`) are stored
+  under that old spelling and stay unreachable, including offline delivery.
+  Address accounts by their prepared localpart. Roster items, blocklist
+  items, MUC affiliations and MAM `with` filters can also store the old
+  spelling, and JIDs whose domain differs in case from the configured
+  hosted domain are not treated as local. After PR #46 lands, rerun
+  `migrate-precis` to absorb every row written under an old spelling in the
+  meantime.
+
+### Fixed
+
+- S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`
+  claim from `caps.SERVER_FEATURES` (forge #22). No XEP-0060 `<subscribe/>`
+  or `<unsubscribe/>` handler exists, so the advertisement was false. The
+  remaining pubsub claims are backed: `publish` and `retrieve-items` have
+  iq dispatch branches, `auto-create` and `persistent-items` are covered by
+  the PEP store upsert on publish, and `auto-subscribe` is the XEP-0163
+  roster-derived notify model. A caps.zig consistency test now requires
+  every advertised `pubsub#*` feature to name its dispatch branch. The
+  XEP-0115 `ver` hash changes as a result of the removed feature.
+
 ## v0.9.0 - 2026-10-04
 
 ### Features
