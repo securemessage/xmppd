@@ -29,6 +29,21 @@ const NS_PENDING_SUB = backend_mod.registered("pending_sub");
 const NS_MESSAGES = backend_mod.registered("messages");
 const NS_BY_CONTACT = backend_mod.registered("by_contact");
 
+fn legacyOfflineKey(
+    allocator: std.mem.Allocator,
+    owner: []const u8,
+    timestamp: u64,
+    stanza_id: []const u8,
+) ![]u8 {
+    const key = try allocator.alloc(u8, owner.len + 1 + 8 + 1 + stanza_id.len);
+    @memcpy(key[0..owner.len], owner);
+    key[owner.len] = 0;
+    std.mem.writeInt(u64, key[owner.len + 1 ..][0..8], timestamp, .big);
+    key[owner.len + 1 + 8] = 0;
+    @memcpy(key[owner.len + 1 + 8 + 1 ..], stanza_id);
+    return key;
+}
+
 test "the LMDB offline lock catches an idle holder before env open" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1439,5 +1454,89 @@ test "migrate-precis reports malformed offline_v2 rows" {
             &plan,
             .{},
         ));
+    }
+}
+
+test "migrate-precis separates two source spellings folding to one target" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    const Mode = enum { offline_only, with_archive };
+    for ([_]Mode{ .offline_only, .with_archive }) |mode| {
+        var auth = try MemoryBackend.open("", .{});
+        defer auth.close();
+        var op = try MemoryBackend.open("", .{});
+        defer op.close();
+        var archive = try MemoryBackend.open("", .{});
+        defer archive.close();
+
+        var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+        const timestamp: u64 = 1_700_000_000;
+        const key_upper = try legacyOfflineKey(allocator, "NaplesTB@us.example", timestamp, "offline");
+        defer allocator.free(key_upper);
+        const key_caps = try legacyOfflineKey(allocator, "NAPLESTB@us.example", timestamp, "offline");
+        defer allocator.free(key_caps);
+        try op.put(NS_OFFLINE, key_upper, "alice@us.example/res");
+        try op.put(NS_OFFLINE, key_caps, "bob@us.example/res");
+
+        var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+        if (mode == .with_archive) {
+            try archive_store.store("NaplesTB@us.example", "alice@us.example", "offline", timestamp, "<message><body>NAPLES</body></message>");
+            try archive_store.store("NAPLESTB@us.example", "bob@us.example", "offline", timestamp, "<message><body>UPPER</body></message>");
+        }
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(journal_dir);
+
+        const domains = [_][]const u8{"us.example"};
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+        defer plan.deinit();
+        try std.testing.expect(!plan.hasBlockingIssues());
+        try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+        const pointers = try offline.getPointers("naplestb@us.example");
+        defer offline.freePointers(pointers);
+        try std.testing.expectEqual(@as(usize, 2), pointers.len);
+        try std.testing.expect(!std.mem.eql(u8, pointers[0].stanza_id, pointers[1].stanza_id));
+        var saw_alice = false;
+        var saw_bob = false;
+        for (pointers) |pointer| {
+            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) {
+                saw_alice = true;
+                if (mode == .with_archive) {
+                    const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+                    defer if (body) |value| allocator.free(value);
+                    try std.testing.expect(body != null);
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "NAPLES") != null);
+                }
+            }
+            if (std.mem.eql(u8, pointer.from_jid, "bob@us.example/res")) {
+                saw_bob = true;
+                if (mode == .with_archive) {
+                    const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+                    defer if (body) |value| allocator.free(value);
+                    try std.testing.expect(body != null);
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "UPPER") != null);
+                }
+            }
+        }
+        try std.testing.expect(saw_alice and saw_bob);
+
+        if (mode == .with_archive) {
+            var by_contact = try archive.iterator(NS_BY_CONTACT, "naplestb@us.example\x00");
+            defer by_contact.deinit();
+            var saw_upper = false;
+            var saw_naples = false;
+            while (by_contact.next()) |entry| {
+                const body = try archive_store.getMessage("naplestb@us.example", timestamp, entry.value);
+                defer if (body) |value| allocator.free(value);
+                if (body) |value| {
+                    if (std.mem.indexOf(u8, value, "UPPER") != null) saw_upper = true;
+                    if (std.mem.indexOf(u8, value, "NAPLES") != null) saw_naples = true;
+                }
+            }
+            try std.testing.expect(saw_upper and saw_naples);
+        }
     }
 }
