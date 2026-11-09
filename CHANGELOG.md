@@ -45,7 +45,12 @@
      written by third parties) merge into the account they fold to, and two
      data-only spellings with no users row merge with each other. Duplicate
      reference rows are deduplicated: the prepared-key row wins and the
-     duplicate is printed as `deduplicated`. `--apply` refuses and lists
+     duplicate is printed as `deduplicated`. Offline pointers and archive
+     messages whose sender-chosen id collides with different content get one
+     shared reserved `~mig-...` id across the pointer, message key and
+     by_contact value; they are printed as `rekeyed`. Held payloads and the
+     merged offline queue follow the pointer's final sequence. `--apply`
+     refuses and lists
      every remaining collision. **Prefer `--rename`** with `xmppctl
      migrate-precis --hosted-domain example.org --rename OLD NEW --apply`:
      it moves the account and every reference while preserving locks. If
@@ -63,11 +68,14 @@
      --apply`, then rerun the dry run; it must report 0 renames. The plan,
      a digest and `migrate-precis.pending` are written before the first
      commit; completion markers are committed with the data they describe.
-     If the run is interrupted, rerun the same `--apply` command: it loads
-     the stored plan and finishes only the unfinished batches. While the
-     marker exists, `--rename` and `deluser --raw` are refused, and
-     xmppd-auth/xmppd-core refuse to start. Do not delete the marker or
-     resume file manually.
+     If the run is interrupted, rerun `xmppctl migrate-precis
+     --hosted-domain example.org --apply`: it loads the stored plan and
+     finishes only the unfinished batches. If the interrupted run used
+     `--rename`, omit it on the resume. While the marker exists,
+     `--rename`, `deluser --raw`, adduser, deluser, passwd, lock, unlock and
+     invite are refused, and xmppd-auth/xmppd-core refuse to start. Do not
+     delete the marker or resume file manually; a torn marker reports that
+     no data was committed and names the safe recovery.
   5. Start the daemons. xmppd-auth scans the users namespace once at
      startup and **refuses to start** if any key is not in prepared form,
      logging one error that names `xmppctl migrate-precis`. There is no

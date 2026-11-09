@@ -569,7 +569,12 @@ fn runMigratePrecis(
             printErr("a migrate-precis recovery is pending; rerun with --apply to finish it\n");
             return error.RecoveryPending;
         }
-        const resumed = try migrate_precis.resumeMigration(allocator, &auth, &op, &archive, db_path);
+        const resumed = migrate_precis.resumeMigration(allocator, &auth, &op, &archive, db_path) catch |err| {
+            if (err == error.RecoveryDigestMismatch) {
+                printErr("migration marker is torn or does not match the resume plan; if the interrupted run never committed, delete migrate-precis.pending and migrate-precis.resume and rerun the dry run, otherwise restore from backup\n");
+            }
+            return err;
+        };
         var resumed_buf: [96]u8 = undefined;
         const resumed_line = try std.fmt.bufPrint(&resumed_buf, "resumed {d} renames\n", .{resumed});
         printOut(resumed_line);

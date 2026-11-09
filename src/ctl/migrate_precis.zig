@@ -183,21 +183,34 @@ fn artifactPathAbs(allocator: std.mem.Allocator, dir: []const u8, basename: []co
     return std.fs.path.join(allocator, &.{ dir, basename });
 }
 
+fn syncDir(dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+    defer dir.close();
+    std.posix.fsync(dir.fd) catch {};
+}
+
 fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex: []const u8) !void {
     const path = try artifactPathAbs(allocator, dir, recovery_pending_file);
     defer allocator.free(path);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(digest_hex);
-    try file.writeAll("\n");
-    try file.sync();
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    {
+        var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(digest_hex);
+        try file.writeAll("\n");
+        try file.sync();
+    }
+    try std.fs.cwd().rename(tmp_path, path);
+    syncDir(dir);
 }
 
 fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const Plan) ![]u8 {
     const path = try artifactPathAbs(allocator, dir, recovery_plan_file);
     defer allocator.free(path);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     try file.writeAll(recovery_header);
     hasher.update(recovery_header);
@@ -230,6 +243,9 @@ fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const
         hasher.update(line);
     }
     try file.sync();
+    file.close();
+    try std.fs.cwd().rename(tmp_path, path);
+    syncDir(dir);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     const digest_hex = try hexEncodeAlloc(allocator, &digest);
