@@ -78,6 +78,14 @@ const MAX_INBOUND_SESSIONS = 256;
 const MAX_OUTBOUND_CONNS = 128;
 /// Deadline for one connect attempt to a resolved target (X2b).
 const CONNECT_DEADLINE_MS: u32 = 10_000;
+
+/// Inbound DANE lookups that failed (SERVFAIL, timeout, refused). A lookup
+/// failure is not proof that the peer publishes no TLSA: the session falls
+/// back to dialback, but the count tells an operator the peer's DANE data
+/// was unreachable rather than absent. Process-wide; the M1 metrics task
+/// exports it later, as with the delivery-queue counters.
+pub var inbound_dane_lookup_failures = std.atomic.Value(u64).init(0);
+
 /// Base ident for EVFILT_TIMER connect deadlines, same pattern as the
 /// udata bases: the low range is reserved for X1's lifecycle timers and
 /// the .timer arm dispatches on the boundary.
@@ -3015,11 +3023,19 @@ fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.T
         verified = verifyInboundDane(self, session);
     }
     session.stream.setDaneVerified(verified);
-    log.info("inbound DANE for {s}: {s} ({s})", .{
-        session.daneDomain(),
-        if (verified) "verified" else "not verified (will offer dialback)",
-        @tagName(status),
-    });
+    // A failed lookup is a temporary failure of the peer's DANE data, not
+    // proof of absence: it is logged as such (and never counted as verified)
+    // so an operator can tell it apart from a peer with no TLSA at all.
+    if (status == .lookup_failed) {
+        _ = inbound_dane_lookup_failures.fetchAdd(1, .monotonic);
+        log.warn("inbound DANE lookup failed for {s}: will offer dialback only", .{session.daneDomain()});
+    } else {
+        log.info("inbound DANE for {s}: {s} ({s})", .{
+            session.daneDomain(),
+            if (verified) "verified" else "not verified (will offer dialback)",
+            @tagName(status),
+        });
+    }
 
     self.sendInboundFeaturesTail(batch, session);
     handleInboundReadable(self, batch, session.id);
