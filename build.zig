@@ -72,7 +72,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tls_mod.addImport("dane", dane_mod);
 
     const ssl_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/ssl.zig"),
@@ -220,7 +219,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tls_test_mod.addImport("dane", dane_mod);
 
     const ssl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/ssl.zig"),
