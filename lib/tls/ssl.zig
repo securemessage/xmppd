@@ -180,7 +180,6 @@ pub const DaneError = error{
     TooManyRecords,
     NoReferenceIds,
     TooManyReferenceIds,
-    DaneUnavailable,
 };
 
 /// Outcome of `SslConn.daneVerdict`: verified, or failed with a named
@@ -189,8 +188,6 @@ pub const DaneVerdict = dane.Verdict;
 pub const Outcome = dane.Outcome;
 pub const Failure = dane.Failure;
 pub const Usage = dane.Usage;
-pub const Selector = dane.Selector;
-pub const MatchingType = dane.MatchingType;
 pub const DanePrepared = dane_openssl.Prepared;
 
 /// An OpenSSL `SSL_CTX` wrapper. Create once at server startup, share across
@@ -588,84 +585,6 @@ pub const SslConn = struct {
         const cipher = c.SSL_get_current_cipher(self.ssl) orelse return "";
         const name = c.SSL_CIPHER_get_name(cipher) orelse return "";
         return std.mem.span(name);
-    }
-
-    /// Extract the peer's leaf certificate as DER-encoded bytes.
-    ///
-    /// Returns `null` if no peer certificate is available (server-side,
-    /// peer certs are only available if client certificate auth is enabled).
-    ///
-    /// Caller owns the returned memory.
-    pub fn getPeerCertDer(self: *SslConn, alloc: std.mem.Allocator) SslError!?[]u8 {
-        const x509 = c.SSL_get0_peer_certificate(self.ssl) orelse return null;
-
-        // Get DER-encoded length
-        const der_len = c.i2d_X509(x509, null);
-        if (der_len <= 0) return null;
-
-        const buf = alloc.alloc(u8, @intCast(der_len)) catch return SslError.OutOfMemory;
-        errdefer alloc.free(buf);
-
-        var ptr: [*c]u8 = buf.ptr;
-        const written = c.i2d_X509(x509, &ptr);
-        if (written != der_len) {
-            alloc.free(buf);
-            return null;
-        }
-
-        return buf;
-    }
-
-    /// Extract the peer's certificate chain as DER-encoded bytes.
-    ///
-    /// Returns the intermediate/CA certificates (NOT including the leaf).
-    /// The leaf certificate is obtained separately via `getPeerCertDer()`.
-    ///
-    /// Caller owns the returned slices.
-    pub fn getPeerChainDer(self: *SslConn, alloc: std.mem.Allocator) SslError![][]u8 {
-        const chain = c.SSL_get_peer_cert_chain(self.ssl) orelse return &.{};
-
-        const num: usize = @intCast(c.OPENSSL_sk_num(@ptrCast(chain)));
-        if (num == 0) return &.{};
-
-        const result = alloc.alloc([]u8, num) catch return SslError.OutOfMemory;
-        var count: usize = 0;
-        errdefer {
-            for (result[0..count]) |item| alloc.free(item);
-            alloc.free(result);
-        }
-
-        for (0..num) |i| {
-            // Use OPENSSL_sk_value instead of sk_X509_value to avoid
-            // Zig C translator issue with [*c] pointer to opaque X509 type.
-            const x509_raw = c.OPENSSL_sk_value(@ptrCast(chain), @intCast(i)) orelse continue;
-            const x509: *c.X509 = @ptrCast(@alignCast(x509_raw));
-
-            const der_len = c.i2d_X509(x509, null);
-            if (der_len <= 0) continue;
-
-            const buf = alloc.alloc(u8, @intCast(der_len)) catch return SslError.OutOfMemory;
-
-            var ptr: [*c]u8 = buf.ptr;
-            const written = c.i2d_X509(x509, &ptr);
-            if (written != der_len) {
-                alloc.free(buf);
-                continue;
-            }
-
-            result[count] = buf;
-            count += 1;
-        }
-
-        // Return only the populated portion
-        if (count < num) {
-            const trimmed = alloc.alloc([]u8, count) catch return SslError.OutOfMemory;
-            @memcpy(trimmed, result[0..count]);
-            alloc.free(result);
-            return trimmed;
-        }
-
-        return result;
     }
 
     /// Channel binding type identifiers (matches IPC cb_type field).

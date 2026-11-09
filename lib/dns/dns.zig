@@ -26,7 +26,7 @@ pub const SrvRecord = struct {
 
 /// A parsed TLSA record (RFC 6698). Field values are raw wire bytes: this is
 /// the transport representation. `pacyworld/dane-zig` owns the semantics
-/// (usability, digest agility, matching); use `toDaneRecord` to convert.
+/// (usability, digest agility, matching).
 pub const TlsaRecord = struct {
     /// Certificate usage (0-3)
     usage: u8,
@@ -105,20 +105,6 @@ pub fn parseTlsaRdata(rdata: []const u8, alloc: std.mem.Allocator) !TlsaRecord {
         .selector = @intFromEnum(parsed.selector),
         .matching_type = @intFromEnum(parsed.matching_type),
         .association_data = association_data,
-    };
-}
-
-/// Convert a transport record into the module's typed record.
-///
-/// Every u8 maps: the module's enums are non-exhaustive, and `Record.isUsable`
-/// rejects values outside the registered ranges, so an out-of-range record is
-/// skipped by the filter instead of being dropped here.
-pub fn toDaneRecord(rec: TlsaRecord) dane.Record {
-    return .{
-        .usage = @enumFromInt(rec.usage),
-        .selector = @enumFromInt(rec.selector),
-        .matching_type = @enumFromInt(rec.matching_type),
-        .data = rec.association_data,
     };
 }
 
