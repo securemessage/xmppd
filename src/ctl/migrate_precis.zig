@@ -1343,6 +1343,49 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
             plan.rename_bytes += queue.target.len + seq_value.len;
         }
     }
+
+    // Legacy v0.9.0 offline keys: owner\0ts8\0id -> one target-owned key with
+    // the shared rekey id when the target already holds a different sender.
+    var legacy = try backend.iterator(NS_OFFLINE, "");
+    defer legacy.deinit();
+    while (legacy.next()) |entry| {
+        const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse continue;
+        if (entry.key.len < sep + 10 or entry.key[sep + 9] != 0) continue;
+        const owner = entry.key[0..sep];
+        const ts8 = entry.key[sep + 1 .. sep + 9];
+        const old_id = entry.key[sep + 10 ..];
+        const target_opt = prepareQueueOwner(ctx, owner) catch continue;
+        const target = target_opt orelse continue;
+        defer allocator.free(target);
+        var new_id = lookupRekeyId(plan, target, ts8, old_id) orelse old_id;
+        const candidate = try rekeyComposite(allocator, target, ts8, new_id);
+        defer allocator.free(candidate);
+        const target_value = try backend.get(allocator, NS_OFFLINE, candidate);
+        if (target_value) |value| {
+            defer allocator.free(value);
+            if (!std.mem.eql(u8, value, entry.value)) {
+                new_id = try getOrCreateRekeyId(plan, target, ts8, old_id);
+            }
+        }
+        const new_key = try rekeyComposite(allocator, target, ts8, new_id);
+        defer allocator.free(new_key);
+        if (!std.mem.eql(u8, new_id, old_id)) {
+            try addIssue(plan, .op, NS_OFFLINE, .rekeyed, entry.key, new_key);
+        }
+        const new_value = try rewriteJid(allocator, entry.value, ctx, .reference) orelse
+            try allocator.dupe(u8, entry.value);
+        defer allocator.free(new_value);
+        try plan.renames.append(allocator, .{
+            .db = .op,
+            .namespace = NS_OFFLINE,
+            .old_key = try allocator.dupe(u8, entry.key),
+            .new_key = try allocator.dupe(u8, new_key),
+            .new_value = try allocator.dupe(u8, new_value),
+            .same_key = false,
+            .value_len = entry.value.len,
+        });
+        plan.rename_bytes += new_key.len + new_value.len;
+    }
 }
 
 /// Compute every planned rename and every collision or invalid localpart.
@@ -1418,7 +1461,6 @@ pub fn planMigration(
         NS_VCARDS,
         NS_PEP,
         NS_LASTACT,
-        NS_OFFLINE,
         NS_ROOM_AFFILIATIONS,
         NS_PENDING_SUB,
     }, &ctx);
