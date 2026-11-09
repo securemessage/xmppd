@@ -77,6 +77,11 @@ const MAX_INBOUND_SESSIONS = 256;
 const MAX_OUTBOUND_CONNS = 128;
 /// Deadline for one connect attempt to a resolved target (X2b).
 const CONNECT_DEADLINE_MS: u32 = 10_000;
+/// Changelist capacity: worst case per loop iteration is one connect
+/// attempt (write arm + deadline) per outbound conn plus one DANE
+/// completion (read enable, write arm) and a few stanza/IPC arms per
+/// inbound session, plus one accept arm each.
+const S2S_CHANGE_BUF: usize = 2 * MAX_OUTBOUND_CONNS + 8 * MAX_INBOUND_SESSIONS + 256;
 
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
@@ -137,15 +142,14 @@ pub const S2sDaemon = struct {
     listener_port: u16 = 5269,
 
     /// Async resolver driven by this loop (X2b). Owns its own kqueue,
-    /// exposed via kqFd() and registered once as DNS_UDATA on first use.
+    /// opened eagerly in bindResolver and registered once on the event
+    /// loop at startup as DNS_UDATA.
     resolver: dns_async.Resolver,
     /// Monotonic session_key space shared by outbound resolve() and
     /// inbound query() waiters.
     next_dns_key: usize = 1,
     /// Monotonic ident space for per-target connect deadlines.
     next_deadline_ident: usize = 1,
-    /// The resolver's kq fd is registered on the event loop.
-    dns_registered: bool = false,
     /// The ChangeList currently being accumulated: resolver callbacks have
     /// no batch parameter (they can fire inside resolver.step or inside a
     /// synchronous resolve/query completion), so entry points stash it here.
@@ -166,10 +170,15 @@ pub const S2sDaemon = struct {
     }
 
     /// Point the resolver's callbacks at this daemon. Called after init()
-    /// returns, once the daemon's address is stable.
+    /// returns, once the daemon's address is stable. Also opens the
+    /// resolver kqueue eagerly so the loop can register kqFd() once at
+    /// startup; a failure here surfaces as a query error later.
     pub fn bindResolver(self: *S2sDaemon) void {
         self.resolver.setCallback(.{ .ctx = self, .fun = onResolveDone });
         self.resolver.setQueryCallback(.{ .ctx = self, .fun = onQueryDone });
+        if (self.resolver.openKq()) |_| {} else |err| {
+            log.warn("dns: resolver kqueue unavailable: {}", .{err});
+        }
     }
 
     pub fn deinit(self: *S2sDaemon) void {
@@ -366,19 +375,6 @@ pub const S2sDaemon = struct {
             self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
         };
-        self.armDnsRegistration(batch);
-    }
-
-    /// Register the resolver's kqueue fd as a persistent read interest on
-    /// this loop. The fd only exists after the first query opened it, so
-    /// registration is lazy and level-triggered: pending resolver events
-    /// keep it readable until step(0) drains them.
-    fn armDnsRegistration(self: *S2sDaemon, batch: *ChangeList) void {
-        if (self.dns_registered) return;
-        const kfd = self.resolver.kqFd();
-        if (kfd < 0) return;
-        batch.addRead(kfd, DNS_UDATA) catch return;
-        self.dns_registered = true;
     }
 
     /// Resolver kq fd reported pending events: drain them. Completion
@@ -1053,6 +1049,14 @@ pub fn main() !void {
         try loop.addFd(daemon.ipc.listen_fd, .read, IPC_LISTEN_UDATA);
     }
 
+    // Register the resolver's kqueue once, level-triggered: pending
+    // resolver events keep it readable until step(0) drains them. A
+    // registration lost to a full changelist would stall every pending
+    // resolve, so it cannot ride the per-iteration batch (X2b).
+    if (daemon.resolver.kqFd() >= 0) {
+        try loop.addFd(daemon.resolver.kqFd(), .read, DNS_UDATA);
+    }
+
     // Register signals (automatically blocked from default delivery)
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
@@ -1062,7 +1066,11 @@ pub fn main() !void {
     // Scratch buffer for batching kqueue changes across iterations.
     // Changes accumulated in iteration N are submitted at the top of iteration N+1
     // via submitAndPoll — one syscall both commits changes AND waits for events.
-    var scratch: [32]posix.Kevent = undefined;
+    // Sized for the worst case per iteration: every outbound conn can
+    // stage a write arm and a connect deadline, every inbound session a
+    // DANE completion (read enable, write arm) plus a few stanza writes,
+    // and the accept loop one read arm per session.
+    var scratch: [S2S_CHANGE_BUF]posix.Kevent = undefined;
     var batch = ChangeList.init(&scratch);
 
     // Main event loop
@@ -2670,7 +2678,6 @@ fn performInboundDane(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSessi
     if (session.dane_lookup_pending) {
         batch.disableRead(session.fd) catch {};
     }
-    daemon.armDnsRegistration(batch);
     return true;
 }
 
@@ -6205,4 +6212,40 @@ test "S2sDaemon: a TLSA adoption that cannot allocate is lookup_failed" {
 
     try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
     try std.testing.expectEqual(@as(usize, 0), in1.session.dane_tlsa_records.len);
+}
+
+test "S2sDaemon: a full changelist cannot stall a pending resolve" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // The resolver kqueue exists before the first query so the loop can
+    // register it once at startup; nothing per-resolve rides the batch.
+    try std.testing.expect(daemon.resolver.kqFd() >= 0);
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+    daemon.resolver.chain_deadline_ms = 100;
+
+    // Fill the changelist completely: nothing further can be staged.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+    daemon.initiateOutbound(&cl, conn, "gone.example");
+    try std.testing.expect(conn.dns_key != 0);
+
+    // The resolve still completes: it depends on the fd registered at
+    // startup, not on entries in this batch.
+    daemon.resolver.step(200);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
 }
