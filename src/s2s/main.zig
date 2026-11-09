@@ -2786,7 +2786,14 @@ fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_as
                 recs.deinit(self.allocator);
                 return finishInboundDane(self, session, if (saw) .lookup_failed else .absent);
             }
-            session.adoptDaneTlsa(recs.items, self.allocator);
+            session.adoptDaneTlsa(recs.items, self.allocator) catch {
+                // Adoption failed: the caller still owns the records, and
+                // an unpresentable set is a lookup failure, never "no
+                // TLSA" and never a present-but-empty adoption.
+                for (recs.items) |r| self.allocator.free(r.association_data);
+                recs.deinit(self.allocator);
+                return finishInboundDane(self, session, .lookup_failed);
+            };
             recs.deinit(self.allocator); // items moved to the session
             finishInboundDane(self, session, .present);
         },
@@ -6160,4 +6167,42 @@ test "S2sDaemon: a TLSA answer with only unparsable records is lookup_failed" {
     };
     applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
     try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a TLSA adoption that cannot allocate is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    in1.session.dane_phase = .tlsa;
+
+    // A well-formed record: the adoption alloc is what fails. Allocation
+    // order inside the hop: rdata dupe, list append, adoption slice.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01, 0x01, 0xaa }),
+    };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    daemon.allocator = failing.allocator();
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    daemon.allocator = alloc;
+
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.dane_tlsa_records.len);
 }

@@ -231,10 +231,12 @@ pub const S2sSession = struct {
 
     /// Move parsed TLSA records onto the session (the inbound DANE seam);
     /// the caller's list storage is released but the record contents are
-    /// adopted. Frees any previously adopted set first.
-    pub fn adoptDaneTlsa(self: *S2sSession, recs: []dns.TlsaRecord, alloc: std.mem.Allocator) void {
+    /// adopted. Frees any previously adopted set first. On allocation
+    /// failure the caller still owns `recs` and must finish the lookup as
+    /// failed rather than present.
+    pub fn adoptDaneTlsa(self: *S2sSession, recs: []dns.TlsaRecord, alloc: std.mem.Allocator) !void {
         self.dropDaneTlsa(alloc);
-        const owned = alloc.alloc(dns.TlsaRecord, recs.len) catch return;
+        const owned = try alloc.alloc(dns.TlsaRecord, recs.len);
         @memcpy(owned, recs);
         self.dane_tlsa_records = owned;
     }
