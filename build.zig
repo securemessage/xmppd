@@ -929,6 +929,7 @@ pub fn build(b: *std.Build) void {
     });
     s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
     s2s_connector_test_mod.addImport("xml", xml_mod);
+    s2s_connector_test_mod.addImport("xmpp", xmpp_mod);
     s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
     s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -949,6 +950,7 @@ pub fn build(b: *std.Build) void {
     });
     s2s_dane_test_mod.addImport("ssl", ssl_test_mod);
     s2s_dane_test_mod.addImport("xml", xml_mod);
+    s2s_dane_test_mod.addImport("xmpp", xmpp_mod);
     s2s_dane_test_mod.linkSystemLibrary("ssl", .{});
     s2s_dane_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -971,6 +973,7 @@ pub fn build(b: *std.Build) void {
     // pulls in ssl/xml/connector for the test module.
     s2s_dialback_test_mod.addImport("xml", xml_mod);
     s2s_dialback_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dialback_test_mod.addImport("xmpp", xmpp_mod);
     s2s_dialback_test_mod.linkSystemLibrary("ssl", .{});
     s2s_dialback_test_mod.linkSystemLibrary("crypto", .{});
 
