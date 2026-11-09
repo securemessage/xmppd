@@ -618,83 +618,97 @@ test "migrate-precis auth dependency cycle fails before the op commit" {
 test "migrate-precis rekeys colliding offline and archive rows with different values" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;
-    for ([_][]const u8{ "offline", "1" }) |stanza_id| {
-        var auth = try MemoryBackend.open("", .{});
-        defer auth.close();
-        var op = try MemoryBackend.open("", .{});
-        defer op.close();
-        var archive = try MemoryBackend.open("", .{});
-        defer archive.close();
+    const Shape = enum { legacy, v2 };
+    for ([_]Shape{ .legacy, .v2 }) |shape| {
+        for ([_][]const u8{ "offline", "1", "offline-mig-1" }) |stanza_id| {
+            var auth = try MemoryBackend.open("", .{});
+            defer auth.close();
+            var op = try MemoryBackend.open("", .{});
+            defer op.close();
+            var archive = try MemoryBackend.open("", .{});
+            defer archive.close();
 
-        var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
-        try users.addUser(allocator, "NaplesTB", "pw");
-        try users.addUser(allocator, "alice", "pw");
-        var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
-        const key_real = try std.fmt.allocPrint(allocator, "NaplesTB@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
-        defer allocator.free(key_real);
-        const key_spam = try std.fmt.allocPrint(allocator, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
-        defer allocator.free(key_spam);
-        try op.put(NS_OFFLINE, key_real, "alice@us.example/res");
-        try op.put(NS_OFFLINE, key_spam, "remote@remote.example/res");
-        var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
-        try archive_store.store("NaplesTB@us.example", "alice@us.example", stanza_id, 1, "<message><body>REAL ACCOUNT MSG</body></message>");
-        try archive_store.store("naplestb@us.example", "remote@remote.example", stanza_id, 1, "<message><body>spam to lowercase spelling</body></message>");
-
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
-        defer allocator.free(journal_dir);
-
-        const domains = [_][]const u8{"us.example"};
-        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
-        defer plan.deinit();
-        try std.testing.expect(!plan.hasBlockingIssues());
-        var rekeyed: usize = 0;
-        for (plan.issues.items) |issue| if (issue.kind == .rekeyed) {
-            rekeyed += 1;
-        };
-        try std.testing.expect(rekeyed >= 2);
-        try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
-
-        const pointers = try offline.getPointers("naplestb@us.example");
-        defer offline.freePointers(pointers);
-        try std.testing.expectEqual(@as(usize, 2), pointers.len);
-        var saw_real_sender = false;
-        var saw_spam_sender = false;
-        for (pointers) |pointer| {
-            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) saw_real_sender = true;
-            if (std.mem.eql(u8, pointer.from_jid, "remote@remote.example/res")) saw_spam_sender = true;
-        }
-        try std.testing.expect(saw_real_sender and saw_spam_sender);
-        for (pointers) |pointer| {
-            const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
-            defer if (body) |value| allocator.free(value);
-            try std.testing.expect(body != null);
-            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) {
-                try std.testing.expect(std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null);
-            } else {
-                try std.testing.expect(std.mem.indexOf(u8, body.?, "spam to lowercase spelling") != null);
+            var users = user_store_mod.UserStore(MemoryBackend).init(&auth);
+            try users.addUser(allocator, "NaplesTB", "pw");
+            try users.addUser(allocator, "alice", "pw");
+            var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+            switch (shape) {
+                .legacy => {
+                    const key_real = try std.fmt.allocPrint(allocator, "NaplesTB@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
+                    defer allocator.free(key_real);
+                    const key_spam = try std.fmt.allocPrint(allocator, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00{s}", .{stanza_id});
+                    defer allocator.free(key_spam);
+                    try op.put(NS_OFFLINE, key_real, "alice@us.example/res");
+                    try op.put(NS_OFFLINE, key_spam, "remote@remote.example/res");
+                },
+                .v2 => {
+                    _ = try offline.storePointer("NaplesTB@us.example", "alice@us.example/res", stanza_id, 1);
+                    _ = try offline.storePointer("naplestb@us.example", "remote@remote.example/res", stanza_id, 1);
+                },
             }
-        }
-        var by_contact = try archive.iterator(NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00");
-        defer by_contact.deinit();
-        var saw_alice_index = false;
-        while (by_contact.next()) |entry| {
-            const body = try archive_store.getMessage("naplestb@us.example", 1, entry.value);
-            defer if (body) |value| allocator.free(value);
-            if (body != null and std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null) saw_alice_index = true;
-        }
-        try std.testing.expect(saw_alice_index);
+            var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+            try archive_store.store("NaplesTB@us.example", "alice@us.example", stanza_id, 1, "<message><body>REAL ACCOUNT MSG</body></message>");
+            try archive_store.store("naplestb@us.example", "remote@remote.example", stanza_id, 1, "<message><body>spam to lowercase spelling</body></message>");
 
-        var messages = try archive.iterator(NS_MESSAGES, "naplestb@us.example\x00");
-        defer messages.deinit();
-        var saw_real_body = false;
-        var saw_spam_body = false;
-        while (messages.next()) |entry| {
-            if (std.mem.indexOf(u8, entry.value, "REAL ACCOUNT MSG") != null) saw_real_body = true;
-            if (std.mem.indexOf(u8, entry.value, "spam to lowercase spelling") != null) saw_spam_body = true;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+            defer allocator.free(journal_dir);
+
+            const domains = [_][]const u8{"us.example"};
+            var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+            defer plan.deinit();
+            try std.testing.expect(!plan.hasBlockingIssues());
+            var rekeyed: usize = 0;
+            for (plan.issues.items) |issue| if (issue.kind == .rekeyed) {
+                rekeyed += 1;
+            };
+            try std.testing.expect(rekeyed >= 2);
+            try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+            const pointers = try offline.getPointers("naplestb@us.example");
+            defer offline.freePointers(pointers);
+            try std.testing.expectEqual(@as(usize, 2), pointers.len);
+            var saw_real_sender = false;
+            var saw_spam_sender = false;
+            for (pointers) |pointer| {
+                if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) saw_real_sender = true;
+                if (std.mem.eql(u8, pointer.from_jid, "remote@remote.example/res")) saw_spam_sender = true;
+            }
+            try std.testing.expect(saw_real_sender and saw_spam_sender);
+            for (pointers) |pointer| {
+                const held = try offline.getHeldStanza(pointer);
+                defer if (held) |value| allocator.free(value);
+                try std.testing.expect(held == null);
+                const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+                defer if (body) |value| allocator.free(value);
+                try std.testing.expect(body != null);
+                if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) {
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null);
+                } else {
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "spam to lowercase spelling") != null);
+                }
+            }
+            var by_contact = try archive.iterator(NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00");
+            defer by_contact.deinit();
+            var saw_alice_index = false;
+            while (by_contact.next()) |entry| {
+                const body = try archive_store.getMessage("naplestb@us.example", 1, entry.value);
+                defer if (body) |value| allocator.free(value);
+                if (body != null and std.mem.indexOf(u8, body.?, "REAL ACCOUNT MSG") != null) saw_alice_index = true;
+            }
+            try std.testing.expect(saw_alice_index);
+
+            var messages = try archive.iterator(NS_MESSAGES, "naplestb@us.example\x00");
+            defer messages.deinit();
+            var saw_real_body = false;
+            var saw_spam_body = false;
+            while (messages.next()) |entry| {
+                if (std.mem.indexOf(u8, entry.value, "REAL ACCOUNT MSG") != null) saw_real_body = true;
+                if (std.mem.indexOf(u8, entry.value, "spam to lowercase spelling") != null) saw_spam_body = true;
+            }
+            try std.testing.expect(saw_real_body and saw_spam_body);
         }
-        try std.testing.expect(saw_real_body and saw_spam_body);
     }
 }
 

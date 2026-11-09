@@ -641,15 +641,43 @@ fn lookupRekeyId(plan: *const Plan, owner: []const u8, ts8: []const u8, id: []co
     return plan.rekey_ids.get(key);
 }
 
-fn getOrCreateRekeyId(plan: *Plan, owner: []const u8, ts8: []const u8, id: []const u8) ![]const u8 {
+fn getOrCreateRekeyId(
+    plan: *Plan,
+    backend: anytype,
+    namespace: []const u8,
+    owner: []const u8,
+    ts8: []const u8,
+    id: []const u8,
+) ![]const u8 {
     const key = try rekeyComposite(plan.allocator, owner, ts8, id);
     if (plan.rekey_ids.get(key)) |existing| {
         plan.allocator.free(key);
         return existing;
     }
-    const stored = try std.fmt.allocPrint(plan.allocator, "~mig-{x:0>16}", .{std.crypto.random.int(u64)});
-    try plan.rekey_ids.put(plan.allocator, key, stored);
-    return stored;
+    errdefer plan.allocator.free(key);
+    while (true) {
+        const stored = try std.fmt.allocPrint(plan.allocator, "~mig-{x:0>16}", .{std.crypto.random.int(u64)});
+        const candidate = rekeyComposite(plan.allocator, owner, ts8, stored) catch |err| {
+            plan.allocator.free(stored);
+            return err;
+        };
+        const occupied = backend.get(plan.allocator, namespace, candidate) catch |err| {
+            plan.allocator.free(candidate);
+            plan.allocator.free(stored);
+            return err;
+        };
+        plan.allocator.free(candidate);
+        if (occupied) |value| {
+            plan.allocator.free(value);
+            plan.allocator.free(stored);
+            continue;
+        }
+        plan.rekey_ids.put(plan.allocator, key, stored) catch |err| {
+            plan.allocator.free(stored);
+            return err;
+        };
+        return stored;
+    }
 }
 
 fn rekeyStanzaKeyWithId(allocator: std.mem.Allocator, key: []const u8, new_id: []const u8) !?[]u8 {
@@ -1030,7 +1058,7 @@ fn planNamespace(
                         must_rekey = !same_value;
                     }
                     if (must_rekey) {
-                        const new_id = try getOrCreateRekeyId(plan, owner, ts8, old_id);
+                        const new_id = try getOrCreateRekeyId(plan, backend, namespace, owner, ts8, old_id);
                         const rekeyed = try rekeyStanzaKeyWithId(plan.allocator, key, new_id) orelse
                             return error.InvalidRecoveryPlan;
                         if (db != .archive and rekeyed.len > 511) {
@@ -1289,6 +1317,9 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
             const id = row.value[12 .. 12 + @as(usize, id_len)];
             const sender = row.value[12 + @as(usize, id_len) ..];
             const new_id = lookupRekeyId(plan, queue.target, ts8, id) orelse id;
+            if (!std.mem.eql(u8, new_id, id)) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .rekeyed, old_key_buf, new_key_buf);
+            }
             const new_sender = try rewriteJid(allocator, sender, ctx, .reference) orelse try allocator.dupe(u8, sender);
             defer allocator.free(new_sender);
             var value_out: std.ArrayListUnmanaged(u8) = .{};
@@ -1364,7 +1395,7 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         if (target_value) |value| {
             defer allocator.free(value);
             if (!std.mem.eql(u8, value, entry.value)) {
-                new_id = try getOrCreateRekeyId(plan, target, ts8, old_id);
+                new_id = try getOrCreateRekeyId(plan, backend, NS_OFFLINE, target, ts8, old_id);
             }
         }
         const new_key = try rekeyComposite(allocator, target, ts8, new_id);
