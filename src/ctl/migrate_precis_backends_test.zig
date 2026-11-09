@@ -1457,6 +1457,56 @@ test "migrate-precis reports malformed offline_v2 rows" {
     }
 }
 
+test "migrate-precis reports unpreparable offline_v2 owners" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    const owner = "bad name@us.example";
+    const key_prefix = try std.fmt.allocPrint(allocator, "{s}\x00", .{owner});
+    defer allocator.free(key_prefix);
+    const key = try allocator.alloc(u8, key_prefix.len + 8);
+    defer allocator.free(key);
+    @memcpy(key[0..key_prefix.len], key_prefix);
+    std.mem.writeInt(u64, key[key_prefix.len..][0..8], 1, .big);
+
+    var value: [64]u8 = undefined;
+    @memset(value[0..8], 0);
+    std.mem.writeInt(u32, value[8..12], 4, .big);
+    @memcpy(value[12..16], "bad!");
+    const sender = "alice@us.example/res";
+    @memcpy(value[16..][0..sender.len], sender);
+    try op.put(NS_OFFLINE_V2, key, value[0 .. 16 + sender.len]);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(plan.hasBlockingIssues());
+    var found = false;
+    for (plan.issues.items) |issue| {
+        if (issue.kind == .invalid_name and
+            std.mem.eql(u8, issue.namespace, NS_OFFLINE_V2) and
+            std.mem.eql(u8, issue.key, key))
+        {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(
+        allocator,
+        &auth,
+        &op,
+        &archive,
+        &plan,
+        .{},
+    ));
+}
+
 test "migrate-precis keeps offline_seq above the stored counter" {
     const allocator = std.testing.allocator;
     const MemoryBackend = backend_mod.MemoryBackend;

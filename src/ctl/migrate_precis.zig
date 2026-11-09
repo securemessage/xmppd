@@ -1236,6 +1236,14 @@ const V2QueueRow = struct {
     value: []u8,
 };
 
+fn v2QueueKey(allocator: std.mem.Allocator, owner: []const u8, sequence: u64) ![]u8 {
+    const key = try allocator.alloc(u8, owner.len + 1 + 8);
+    @memcpy(key[0..owner.len], owner);
+    key[owner.len] = 0;
+    std.mem.writeInt(u64, key[owner.len + 1 ..][0..8], sequence, .big);
+    return key;
+}
+
 const V2Queue = struct {
     target: []u8,
     rows: std.ArrayListUnmanaged(V2QueueRow) = .{},
@@ -1352,7 +1360,21 @@ fn planV2Queues(
         queues.deinit(allocator);
     }
     for (all.items) |row| {
-        const target_opt = prepareQueueOwner(ctx, row.owner) catch continue;
+        const target_opt = prepareQueueOwner(ctx, row.owner) catch |err| switch (err) {
+            error.InvalidAccountName => {
+                const key = try v2QueueKey(allocator, row.owner, row.seq);
+                defer allocator.free(key);
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_name, key, "");
+                continue;
+            },
+            else => return err,
+        };
+        if (target_opt == null and std.mem.indexOfScalar(u8, row.owner, '@') == null) {
+            const key = try v2QueueKey(allocator, row.owner, row.seq);
+            defer allocator.free(key);
+            try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_name, key, "");
+            continue;
+        }
         const target = target_opt orelse continue;
         errdefer allocator.free(target);
         var queue: ?*V2Queue = null;
