@@ -1370,6 +1370,24 @@ fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *Chang
         return;
     }
 
+    // An over-long from=/to= overflowed its buffer in startStanza; the
+    // truncated prefix must not reach validation or preparation. Same
+    // outcomes as a preparation failure: to= drops only this stanza,
+    // from= fails the stream invalid-from.
+    if (session.stanza_to_overflowed) {
+        log.warn("inbound S2S stanza dropped: to= exceeds {d} octets", .{session.stanza_to_buf.len});
+        session.resetStanza();
+        return;
+    }
+    if (session.stanza_from_overflowed) {
+        log.warn("inbound S2S stanza rejected: from= exceeds {d} octets", .{session.stanza_from_buf.len});
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
+
     // Authenticated-domain and served-host checks before anything is
     // forwarded (T351/S2): without them any federated peer could speak as
     // any local user. from= must name a domain the session authenticated
@@ -3013,6 +3031,126 @@ test "F6: an unprepareable inbound from= fails the stream invalid-from" {
     // from='@remote.example' names an authenticated domain so validation
     // passes, but the empty localpart fails preparation: invalid-from.
     try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='@remote.example' to='juliet@localhost'><body>x</body></message>");
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "invalid-from") != null);
+}
+
+test "F6: an over-long inbound to= drops only that stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // to= beyond the RFC 7622 wire cap: the truncated prefix must not be
+    // routed, the stanza drops, and the stream survives.
+    var stanza: [4600]u8 = undefined;
+    const prefix = "<message from='peer@remote.example' to='";
+    const suffix = "@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'a');
+    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, &stanza);
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
+}
+
+test "F6: a JID-length inbound to= forwards intact" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // A legal 1033-octet local JID (1023-octet localpart) is over the old
+    // 512 capture; it must forward whole, not drop or truncate.
+    var local: [1023]u8 = undefined;
+    @memset(&local, 'u');
+    var stanza: [1400]u8 = undefined;
+    const prefix = "<message from='peer@remote.example' to='";
+    const mid = "@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memcpy(stanza[prefix.len..][0..local.len], &local);
+    @memcpy(stanza[prefix.len + local.len ..][0..mid.len], mid);
+    const wire = stanza[0 .. prefix.len + local.len + mid.len];
+    try feedInboundForTest(&daemon, &batch, peer_fd, wire);
+
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    var want_buf: [1100]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{s}@localhost", .{&local});
+    try std.testing.expectEqualStrings(want, msg.s2s_inbound.to_jid);
+}
+
+test "F6: an over-long inbound from= fails the stream invalid-from" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // from= beyond the wire cap: validation must never see the truncated
+    // prefix, so the stream fails invalid-from like any bad sender.
+    var stanza: [4600]u8 = undefined;
+    const prefix = "<message from='";
+    const suffix = "@remote.example' to='juliet@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'b');
+    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, &stanza);
 
     try std.testing.expect(daemon.getInbound(0) == null);
     var response: [4096]u8 = undefined;
