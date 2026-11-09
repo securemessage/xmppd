@@ -105,43 +105,48 @@ pub fn readCertDer(alloc: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) 
 /// DANE-EE record over cert.pem authenticates the peer presenting it.
 pub fn genSelfSigned(alloc: std.mem.Allocator, dir: std.fs.Dir) !void {
     try run(alloc, dir, &.{
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   "/CN=localhost",
-        "-addext", "subjectAltName=DNS:localhost",
-        "-days",   "1",
-        "-keyout", "key.pem", "-out", "cert.pem",
+        "openssl", "req",           "-x509",   "-newkey",                      "rsa:2048", "-nodes",
+        "-subj",   "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days",    "1",
+        "-keyout", "key.pem",       "-out",    "cert.pem",
     });
 }
 
 /// A real two-level chain: `ca.pem` signs a `localhost` leaf, cert.pem holds
 /// [leaf, CA] and key.pem the leaf key. The CA's DER is DANE-TA data.
 pub fn genDaneTaRig(alloc: std.mem.Allocator, dir: std.fs.Dir) !void {
+    return genDaneTaRigNamed(alloc, dir, "localhost");
+}
+
+/// As `genDaneTaRig`, with the leaf's only DNS SAN spelled out. A DANE-TA
+/// match runs the name check (RFC 7671 section 5.1 leaves it on for usages
+/// 0-2), so the SAN decides which reference identifiers can accept the peer.
+pub fn genDaneTaRigNamed(alloc: std.mem.Allocator, dir: std.fs.Dir, san: []const u8) !void {
     try run(alloc, dir, &.{
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   "/CN=DANE TA Test Root",
-        "-addext", "basicConstraints=critical,CA:TRUE",
-        "-days",   "1",
-        "-keyout", "ca_key.pem", "-out", "ca.pem",
+        "openssl", "req",                   "-x509",   "-newkey",                           "rsa:2048", "-nodes",
+        "-subj",   "/CN=DANE TA Test Root", "-addext", "basicConstraints=critical,CA:TRUE", "-days",    "1",
+        "-keyout", "ca_key.pem",            "-out",    "ca.pem",
     });
     try run(alloc, dir, &.{
-        "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   "/CN=localhost",
-        "-keyout", "key.pem", "-out", "leaf.csr",
+        "openssl",  "req",                   "-newkey", "rsa:2048", "-nodes",
+        "-subj",    "/CN=DANE TA Test Leaf", "-keyout", "key.pem",  "-out",
+        "leaf.csr",
     });
     // `openssl x509 -req` drops CSR extensions unless an extfile is given,
     // and without a SAN no name check can pass.
-    try writeFile(dir, "leaf.ext",
+    const ext = try std.fmt.allocPrint(alloc,
         \\basicConstraints=critical,CA:FALSE
         \\keyUsage=critical,digitalSignature,keyEncipherment
         \\extendedKeyUsage=serverAuth
-        \\subjectAltName=DNS:localhost
+        \\subjectAltName=DNS:{s}
         \\
-    );
+    , .{san});
+    defer alloc.free(ext);
+    try writeFile(dir, "leaf.ext", ext);
     try run(alloc, dir, &.{
-        "openssl", "x509", "-req", "-in", "leaf.csr",
-        "-CA", "ca.pem", "-CAkey", "ca_key.pem", "-CAcreateserial",
-        "-extfile", "leaf.ext",
-        "-days", "1", "-out", "leaf.pem",
+        "openssl",  "x509",     "-req",   "-in",        "leaf.csr",
+        "-CA",      "ca.pem",   "-CAkey", "ca_key.pem", "-CAcreateserial",
+        "-extfile", "leaf.ext", "-days",  "1",          "-out",
+        "leaf.pem",
     });
     try concatPem(alloc, dir, "cert.pem", &.{ "leaf.pem", "ca.pem" });
 }
@@ -157,18 +162,14 @@ pub fn genForgedAnchorRig(alloc: std.mem.Allocator, dir: std.fs.Dir) !void {
     const ca_subject = "/CN=DANE Forged Anchor Test CA";
 
     try run(alloc, dir, &.{
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   ca_subject,
-        "-addext", "basicConstraints=critical,CA:TRUE",
-        "-days",   "1",
-        "-keyout", "ca_key.pem", "-out", "ca.pem",
+        "openssl", "req",        "-x509",   "-newkey",                           "rsa:2048", "-nodes",
+        "-subj",   ca_subject,   "-addext", "basicConstraints=critical,CA:TRUE", "-days",    "1",
+        "-keyout", "ca_key.pem", "-out",    "ca.pem",
     });
     try run(alloc, dir, &.{
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   ca_subject,
-        "-addext", "basicConstraints=critical,CA:TRUE",
-        "-days",   "1",
-        "-keyout", "attacker_ca_key.pem", "-out", "attacker_ca.pem",
+        "openssl", "req",                 "-x509",   "-newkey",                           "rsa:2048", "-nodes",
+        "-subj",   ca_subject,            "-addext", "basicConstraints=critical,CA:TRUE", "-days",    "1",
+        "-keyout", "attacker_ca_key.pem", "-out",    "attacker_ca.pem",
     });
 
     // The victim leaf carries the real CA's key identifier as its authority
@@ -194,15 +195,15 @@ pub fn genForgedAnchorRig(alloc: std.mem.Allocator, dir: std.fs.Dir) !void {
     try writeFile(dir, "leaf.ext", ext);
 
     try run(alloc, dir, &.{
-        "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-        "-subj",   "/CN=localhost",
-        "-keyout", "key.pem", "-out", "leaf.csr",
+        "openssl",  "req",           "-newkey", "rsa:2048", "-nodes",
+        "-subj",    "/CN=localhost", "-keyout", "key.pem",  "-out",
+        "leaf.csr",
     });
     try run(alloc, dir, &.{
-        "openssl", "x509", "-req", "-in", "leaf.csr",
-        "-CA", "attacker_ca.pem", "-CAkey", "attacker_ca_key.pem", "-CAcreateserial",
-        "-extfile", "leaf.ext",
-        "-days", "1", "-out", "leaf.pem",
+        "openssl",  "x509",            "-req",   "-in",                 "leaf.csr",
+        "-CA",      "attacker_ca.pem", "-CAkey", "attacker_ca_key.pem", "-CAcreateserial",
+        "-extfile", "leaf.ext",        "-days",  "1",                   "-out",
+        "leaf.pem",
     });
     try concatPem(alloc, dir, "cert.pem", &.{ "leaf.pem", "ca.pem" });
 }

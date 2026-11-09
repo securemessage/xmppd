@@ -507,6 +507,21 @@ pub const S2sDaemon = struct {
         conn.fd = -1;
     }
 
+    /// Give up on the current target for a reason found before its TLS
+    /// handshake began (a DANE lookup or state failure). The attempt is torn
+    /// down and the next target is tried; when the list is exhausted the
+    /// initiation fails with `reason`, which the caller chose to reflect
+    /// whether the failure is temporary.
+    fn advanceOrFailOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        if (conn.fd >= 0) self.abortConnectAttempt(batch, conn);
+        self.clearConnectDeadline(batch, conn);
+        if (conn.next_idx < conn.targets.len) {
+            self.connectNextTarget(batch, conn);
+            return;
+        }
+        self.failOutboundInitiation(batch, conn, reason);
+    }
+
     /// Disarm the per-target connect deadline if one is armed.
     fn clearConnectDeadline(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
         _ = self;
@@ -2535,96 +2550,152 @@ fn processOutboundEvent(
 
 /// Start an outbound TLS handshake using the client context.
 ///
-/// The TLSA lookup runs here, before the SSL object exists: with records in
-/// hand the handshake itself verifies through DANE and fails closed, so there
-/// is no post-handshake window in which an unverified peer could be spoken to.
+/// The TLSA outcome is already known from the async resolution (the target
+/// carries its records and status), so the context is chosen before the SSL
+/// object exists: with usable records the handshake itself verifies through
+/// DANE and fails closed, so there is no post-handshake window in which an
+/// unverified peer could be spoken to.
 fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
-    if (armOutboundDane(daemon, conn)) {
-        const dane_ctx = daneClientCtx(daemon) orelse {
-            conn.fail("no-dane-tls-context");
-            daemon.closeOutbound(batch, slot);
+    const arm = armOutboundDane(daemon, conn);
+    switch (arm) {
+        .armed, .pkix => {},
+        // A target whose lookup failed, or whose state could not be built,
+        // is not a peer we may speak to unverified (ADR-13): move on to the
+        // next target, and fail the initiation as temporary once they run
+        // out. A transient allocation failure is retried the same way.
+        .temporary_failure => {
+            conn.dropDaneState();
+            daemon.advanceOrFailOutbound(batch, conn, "remote-server-timeout");
             return;
-        };
-        conn.upgradeToTls(dane_ctx) catch {
+        },
+        .permanent_failure => {
+            conn.dropDaneState();
+            daemon.advanceOrFailOutbound(batch, conn, "policy-violation");
+            return;
+        },
+        .none => {
+            const ctx = daemon.tls_client_ctx orelse {
+                conn.fail("no-client-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+            conn.upgradeToTls(ctx) catch {
+                conn.fail("tls-init-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        },
+    }
+    if (arm != .none) {
+        const use_dane = arm == .armed;
+        const ctx = if (use_dane)
+            daneClientCtx(daemon) orelse {
+                conn.fail("no-dane-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            }
+        else
+            pkixClientCtx(daemon) orelse {
+                conn.fail("no-client-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        conn.upgradeToTls(ctx) catch {
             conn.fail("tls-init-failed");
             daemon.closeOutbound(batch, slot);
             return;
         };
-        // DANE must be armed before the first handshake step; SSL_dane_enable
-        // afterwards cannot influence this handshake.
         const state = if (conn.dane_state) |*s| s else unreachable;
         const tls = if (conn.tls_conn) |*t| t else {
             conn.fail("tls-init-failed");
             daemon.closeOutbound(batch, slot);
             return;
         };
-        conn.dane_prepared = tls.prepareDane(state) catch {
-            log.err("outbound {s}: cannot arm DANE", .{conn.remote_domain});
-            conn.fail("dane-arm-failed");
-            daemon.closeOutbound(batch, slot);
-            return;
-        };
-    } else {
-        const ctx = daemon.tls_client_ctx orelse {
-            conn.fail("no-client-tls-context");
-            daemon.closeOutbound(batch, slot);
-            return;
-        };
-        conn.upgradeToTls(ctx) catch {
-            conn.fail("tls-init-failed");
-            daemon.closeOutbound(batch, slot);
-            return;
-        };
+        if (use_dane) {
+            // DANE must be armed before the first handshake step;
+            // SSL_dane_enable afterwards cannot influence this handshake.
+            conn.dane_prepared = tls.prepareDane(state) catch {
+                log.err("outbound {s}: cannot arm DANE", .{conn.remote_domain});
+                conn.fail("dane-arm-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        } else {
+            // Published but unusable RRset: PKIX against the system store,
+            // with the module's identifiers so a subject CN never matches.
+            tls.applyPkixFallback(state) catch {
+                log.err("outbound {s}: cannot apply the PKIX fallback", .{conn.remote_domain});
+                conn.fail("dane-arm-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+            // The identifiers now live on the SSL; nothing asserts DANE for
+            // this peer, so the state is dropped and the post-handshake
+            // record reads as no-records (dialback decides).
+            conn.dropDaneState();
+        }
     }
 
     conn.state = .tls_handshake;
     continueOutboundTls(daemon, batch, slot, conn);
 }
 
-/// The DANE-verifying client context, built on first use. Returns a copy of
-/// the context handle: the daemon owns the pointer and frees it at deinit.
+/// The DANE-verifying client context built at startup. Returns a copy of the
+/// context handle: the daemon owns the pointer and frees it at deinit.
 fn daneClientCtx(daemon: *S2sDaemon) ?SslContext {
-    if (daemon.tls_client_ctx_dane == null) {
-        const cert: ?[*:0]const u8 = if (daemon.cert_path) |p| p.ptr else null;
-        const key: ?[*:0]const u8 = if (daemon.key_path) |p| p.ptr else null;
-        daemon.tls_client_ctx_dane = SslContext.initClientDaneWithCert(cert, key) catch |err| {
-            log.err("cannot initialize DANE client TLS context: {}", .{err});
-            return null;
-        };
-    }
     return daemon.tls_client_ctx_dane;
 }
 
+/// The PKIX-verifying client context built at startup.
+fn pkixClientCtx(daemon: *S2sDaemon) ?SslContext {
+    return daemon.tls_client_ctx_ca;
+}
+
+/// Outcome of trying to arm DANE for an outbound connection before its
+/// handshake.
+const OutboundDaneArm = enum {
+    /// At least one usable record survived: the handshake verifies via DANE.
+    armed,
+    /// No usable record survived for a target that published an RRset: the
+    /// module's PKIX fallback applies, so peer trust is the system store.
+    pkix,
+    /// Nothing to assert: no records, or a lab seam. Dialback decides.
+    none,
+    /// Building the state failed for a reason that will not clear by
+    /// retrying the same target: an oversized or malformed RRset.
+    permanent_failure,
+    /// Building the state failed transiently (allocation): the target may
+    /// still succeed on a later attempt.
+    temporary_failure,
+};
+
 /// Query the peer's TLSA records and build the connection's DANE state.
 ///
-/// Returns true only when at least one usable record survived, which is the
-/// only case in which the handshake can authenticate the peer. No records,
-/// an empty usable set, or a failed lookup all leave the connection with no
-/// DANE state: the stream then proceeds unauthenticated and the peer must
-/// prove itself by dialback.
-fn armOutboundDane(daemon: *S2sDaemon, conn: *OutboundConnection) bool {
+/// The status word from the async resolution is authoritative (ADR-13): a
+/// failed lookup is a temporary failure of that target and never proof of
+/// absence. A usable record set arms DANE; a set whose records are all
+/// unusable falls back to PKIX; nothing at all leaves the stream to dialback.
+fn armOutboundDane(daemon: *S2sDaemon, conn: *OutboundConnection) OutboundDaneArm {
     // Test seam (T277 regression): the forced verdict stands in for the
     // handshake result, so no live lookup and no DANE context is used.
-    if (daemon.dane_verdict_override != null) return false;
+    if (daemon.dane_verdict_override != null) return .none;
 
-    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, conn.target_port, conn.target_host) catch |err| {
-        log.warn("TLSA query failed for {s}:{d}: {}", .{ conn.target_host, conn.target_port, err });
-        return false;
-    };
-    defer {
-        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
-        if (tlsa_records.len > 0) daemon.allocator.free(tlsa_records);
+    const target = conn.curTarget() orelse return .none;
+    switch (target.tlsa_status) {
+        // Never fall back to dialback for a peer that publishes usable
+        // records: its identity would then rest on DNS alone.
+        .lookup_failed => {
+            log.warn("outbound {s}: TLSA lookup failed for {s} (temporary)", .{ conn.remote_domain, target.host });
+            return .temporary_failure;
+        },
+        .absent => {
+            log.info("no TLSA records for {s} — will use dialback", .{target.host});
+            return .none;
+        },
+        .present => {},
     }
-    if (tlsa_records.len == 0) {
-        log.info("no TLSA records for {s}:{d} — will use dialback", .{ conn.target_host, conn.target_port });
-        return false;
-    }
-
-    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch {
-        log.warn("out of memory converting TLSA for {s}", .{conn.remote_domain});
-        return false;
-    };
-    defer daemon.allocator.free(records);
+    const tlsa_records = target.tlsa;
+    if (tlsa_records.len == 0) return .none;
 
     // RFC 7673 section 4: the service domain and the SRV target it resolved
     // to are both valid reference identifiers. The first entry is also the
@@ -2633,22 +2704,31 @@ fn armOutboundDane(daemon: *S2sDaemon, conn: *OutboundConnection) bool {
     var names_len: usize = 0;
     names_buf[names_len] = conn.remote_domain;
     names_len += 1;
-    if (!std.mem.eql(u8, conn.target_host, conn.remote_domain)) {
-        names_buf[names_len] = conn.target_host;
+    if (!std.mem.eql(u8, target.host, conn.remote_domain)) {
+        names_buf[names_len] = target.host;
         names_len += 1;
     }
 
-    conn.dane_state = ssl.initDane(daemon.allocator, .{ .names = names_buf[0..names_len] }, records) catch {
-        log.warn("outbound {s}: cannot build DANE state", .{conn.remote_domain});
-        return false;
+    // Pass the whole RRset: the module owns the per-set cap and rejects an
+    // oversized set, so a matching record is never dropped here.
+    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch {
+        log.warn("outbound {s}: cannot allocate {d} TLSA records", .{ conn.remote_domain, tlsa_records.len });
+        return .temporary_failure;
     };
-    if (conn.dane_state.?.set.len() == 0) {
-        log.info("TLSA for {s}:{d} held no usable record — will use dialback", .{ conn.target_host, conn.target_port });
-        conn.dane_state.?.deinit();
-        conn.dane_state = null;
-        return false;
-    }
-    return true;
+    defer daemon.allocator.free(records);
+
+    conn.dane_state = ssl.initDane(daemon.allocator, .{ .names = names_buf[0..names_len] }, records) catch |err| {
+        log.warn("outbound {s}: cannot build DANE state: {}", .{ conn.remote_domain, err });
+        return switch (err) {
+            error.OutOfMemory => .temporary_failure,
+            else => .permanent_failure,
+        };
+    };
+    const state = if (conn.dane_state) |*s| s else return .permanent_failure;
+    return switch (state.mode()) {
+        .dane => .armed,
+        .pkix => .pkix,
+    };
 }
 
 /// Continue a non-blocking outbound TLS handshake.
