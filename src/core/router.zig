@@ -154,9 +154,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    // MUC domain? Route to MUC handler for groupchat fan-out.
+    // MUC domain? Route to MUC handler for groupchat fan-out. The host
+    // compare is case-insensitive; the room localpart keeps its spelling.
     if (server.muc_host) |muc_host| {
-        if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+        if (std.ascii.eqlIgnoreCase(to_jid.domain, muc_host)) {
             if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "groupchat")) {
                 muc_handler.handleMucGroupchat(server, session, to_jid.local, inner_xml, id_str, changes);
             }

@@ -6541,6 +6541,78 @@ test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized
     try std.testing.expect(std.mem.indexOf(u8, r, "not-authorized") != null);
 }
 
+test "F6: groupchat message to the MUC host in another case stays local" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+    server.muc_host = "conference.localhost";
+    server.room_registry = &registry;
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<message to='Room@CONFERENCE.localhost' type='groupchat' id='m1'><body>hi</body></message>");
+    const r = f6Read(af[1], &buf);
+    // MUC answers item-not-found for the missing room; a case-sensitive
+    // compare would send the stanza to S2S and bounce service-unavailable.
+    try std.testing.expect(std.mem.indexOf(u8, r, "item-not-found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "service-unavailable") == null);
+}
+
+test "F6: directed presence to the MUC host in another case joins the room" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+    server.muc_host = "conference.localhost";
+    server.room_registry = &registry;
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<presence to='Room@CONFERENCE.localhost/Nick'/>");
+    const r = f6Read(af[1], &buf);
+    // The join creates the room and answers with MUC self-presence
+    // (status 110) addressed from the configured host spelling.
+    try std.testing.expect(std.mem.indexOf(u8, r, "code='110'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "service-unavailable") == null);
+}
+
+test "F6: disco info to the MUC host in another case is the conference service" {
+    const allocator = std.testing.allocator;
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    const tf = try makeSocketPair();
+    defer posix.close(tf[1]);
+    const af = try makeSocketPair();
+    defer posix.close(af[1]);
+    const s = try f6WireSetup(allocator, &server, &sm, tf, af);
+    server.muc_host = "conference.localhost";
+
+    var buf: [8192]u8 = undefined;
+    try f6Feed(&server, s.alice, 9, af[1], "<iq to='CONFERENCE.localhost' type='get' id='i1'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>");
+    const r = f6Read(af[1], &buf);
+    // The MUC service answers with its conference identity; a
+    // case-sensitive compare falls to the server identity instead.
+    try std.testing.expect(std.mem.indexOf(u8, r, "category='conference'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "category='server'") == null);
+}
+
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();

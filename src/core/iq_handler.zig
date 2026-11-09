@@ -437,7 +437,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 sendIqError(server, session, iq_id, "jid-malformed");
                 return;
             };
-            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+            // Case-insensitive host compare; the room localpart keeps
+            // its spelling.
+            if (std.ascii.eqlIgnoreCase(to_jid.domain, muc_host)) {
                 if (to_jid.local.len == 0) {
                     // Bare MUC service JID: disco#info or disco#items for the service
                     if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
