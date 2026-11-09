@@ -1234,8 +1234,10 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         }
 
         // A lookup or handshake that started mid-read leaves the tail for
-        // the completion; a parked <proceed/> still takes the recv pass so
-        // plaintext arriving while pending trips the T250 check above.
+        // the completion. When this call already recvd, a parked
+        // <proceed/> breaks here instead; the next readable event starts
+        // with an empty slice and recvs, so plaintext arriving while
+        // pending still trips the T250 check above.
         if (session.isTlsHandshaking() or session.dane_lookup_pending) break;
         if (!want_recv or recvd) break;
         recvd = true;
