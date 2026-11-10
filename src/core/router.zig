@@ -187,9 +187,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    // MUC domain? Route to MUC handler for groupchat fan-out.
+    // MUC domain? Route to MUC handler for groupchat fan-out. The host
+    // compare is case-insensitive; the room localpart keeps its spelling.
     if (server.muc_host) |muc_host| {
-        if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+        if (std.ascii.eqlIgnoreCase(to_jid.domain, muc_host)) {
             if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "groupchat")) {
                 muc_handler.handleMucGroupchat(server, session, to_jid.local, inner_xml, id_str, changes);
             }
@@ -198,7 +199,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     }
 
     // Remote domain? Forward via S2S IPC instead of local delivery.
-    if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
+    if (!std.ascii.eqlIgnoreCase(to_jid.domain, server.server_host)) {
         forwardToS2s(server, session, from_str, to_str, type_str, id_str, inner_xml, changes);
         return;
     }
@@ -1125,4 +1126,34 @@ fn writeServiceUnavailable(
     w.writeAll(tag_name) catch return null;
     w.writeByte('>') catch return null;
     return fbs.getWritten();
+}
+
+test "dispatchStanza: domain-only mixed-case 'to' stays local" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    session.stanza_kind = .message;
+    session.stanza_to = "LOCALHOST";
+    session.stanza_type = "chat";
+    session.stanza_id = "m1";
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchStanza(&server, session, &changes);
+
+    // The local branch returns early without a session map; the remote branch
+    // would bounce service-unavailable onto the connection.
+    try std.testing.expect(!session.conn.hasPendingWrite());
 }

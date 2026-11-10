@@ -187,8 +187,8 @@ pub const Stream = struct {
     pub fn handleStreamOpen(self: *Stream, to: []const u8, version: []const u8) StreamAction {
         _ = version;
 
-        // Validate the 'to' attribute matches our hostname
-        if (!std.mem.eql(u8, to, self.server_host)) {
+        // Validate the 'to' attribute matches our hostname (case-insensitive)
+        if (!std.ascii.eqlIgnoreCase(to, self.server_host)) {
             return .{ .send_error = .host_unknown };
         }
 
@@ -532,6 +532,15 @@ test "Stream: wrong hostname" {
     const action = stream.handleStreamOpen("wrong.com", "1.0");
     try std.testing.expect(action == .send_error);
     try std.testing.expectEqual(StreamError.host_unknown, action.send_error);
+}
+
+test "Stream: stream-open 'to' compare is case-insensitive" {
+    var stream = Stream.init("localhost", false);
+    const action = stream.handleStreamOpen("LOCALHOST", "1.0");
+    try std.testing.expect(action == .send_stream_open);
+    try std.testing.expectEqualStrings("localhost", action.send_stream_open.from);
+    // The echoed 'to' keeps the client's spelling.
+    try std.testing.expectEqualStrings("LOCALHOST", action.send_stream_open.to.?);
 }
 
 test "Stream: SASL failure allows retry" {

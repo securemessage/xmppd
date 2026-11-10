@@ -60,9 +60,10 @@ pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, cha
         if (!is_subscription) {
             const to_jid = xmpp.Jid.parse(to_str) catch return;
 
-            // MUC domain → MUC join/part
+            // MUC domain → MUC join/part. The host compare is
+            // case-insensitive; the room localpart keeps its spelling.
             if (server.muc_host) |muc_host| {
-                if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+                if (std.ascii.eqlIgnoreCase(to_jid.domain, muc_host)) {
                     muc_handler.handleMucPresence(server, session, to_jid.local, to_jid.resource, type_str, changes);
                     return;
                 }

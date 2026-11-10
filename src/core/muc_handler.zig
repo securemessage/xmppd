@@ -757,7 +757,11 @@ pub fn handleMucOwnerGet(
     const bound = session.stream.bound_jid orelse return;
     var bare_buf: [256]u8 = undefined;
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
-    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
+    // F6: the affiliation store key uses the configured spelling; the bound
+    // JID itself stays as-typed.
+    var member_key_buf: [256]u8 = undefined;
+    const member_key = preparedMemberBare(server, bare_jid, &member_key_buf);
+    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, member_key) catch .none else .none;
     if (aff != .owner) {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "forbidden", changes);
         return;
@@ -834,7 +838,11 @@ pub fn handleMucOwnerSet(
     const bound = session.stream.bound_jid orelse return;
     var bare_buf: [256]u8 = undefined;
     const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
-    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, bare_jid) catch .none else .none;
+    // F6: the affiliation store key uses the configured spelling; the bound
+    // JID itself stays as-typed.
+    var member_key_buf: [256]u8 = undefined;
+    const member_key = preparedMemberBare(server, bare_jid, &member_key_buf);
+    const aff = if (server.room_store) |store| store.getAffiliation(room_jid, member_key) catch .none else .none;
 
     // New rooms allow the creator (first owner) to configure even without stored affiliation
     const is_owner = aff == .owner or room.occupant_count == 1;
@@ -864,7 +872,7 @@ pub fn handleMucOwnerSet(
         if (config.persistent) {
             store.saveRoom(room_jid, &config) catch {};
             // Ensure owner affiliation is persisted
-            store.setAffiliation(room_jid, bare_jid, .owner) catch {};
+            store.setAffiliation(room_jid, member_key, .owner) catch {};
         } else if (was_persistent and !config.persistent) {
             // Room changed from persistent to transient — remove from store
             store.destroyRoom(room_jid) catch {};
@@ -1054,9 +1062,11 @@ fn handleJoin(
         affiliation = .owner;
         role = .moderator;
     } else {
-        // Look up persistent affiliation from RoomStore
+        // Look up persistent affiliation from RoomStore; the store key uses
+        // the configured spelling (F6) while the occupant stays as-typed.
         if (server.room_store) |store| {
-            affiliation = store.getAffiliation(room_jid, bare_jid) catch .none;
+            var member_key_buf: [256]u8 = undefined;
+            affiliation = store.getAffiliation(room_jid, preparedMemberBare(server, bare_jid, &member_key_buf)) catch .none;
         }
         if (affiliation == .outcast) {
             sendPresenceError(server, session, room_local, muc_host, "forbidden", changes);
@@ -1865,8 +1875,11 @@ pub fn processRemoteJoin(
         const room_local = if (std.mem.indexOfScalar(u8, ev.room_jid, '@')) |at| ev.room_jid[0..at] else ev.room_jid;
         broadcastDirectoryUpdate(server, ev.room_jid, room_local, true);
     } else {
+        // F6: the affiliation store key uses the configured spelling; the
+        // occupant's real JID stays as-typed.
         if (server.room_store) |store| {
-            affiliation = store.getAffiliation(ev.room_jid, bare_jid) catch .none;
+            var member_key_buf: [256]u8 = undefined;
+            affiliation = store.getAffiliation(ev.room_jid, preparedMemberBare(server, bare_jid, &member_key_buf)) catch .none;
         }
         if (affiliation == .outcast) {
             var err_buf: [1024]u8 = undefined;
@@ -2472,6 +2485,18 @@ fn buildBareJid(buf: *[256]u8, local: []const u8, domain: []const u8) ?[]const u
     w.writeByte('@') catch return null;
     w.writeAll(domain) catch return null;
     return fbs.getWritten();
+}
+
+/// F6: the affiliation store key must use the configured spelling while the
+/// bound/occupant identity stays as-typed. Prepare the member bare JID for
+/// the store lookup only; remote-domain members pass through unchanged.
+/// A member JID this late cannot practically fail preparation; on error the
+/// raw form is used so the lookup degenerates to a miss, not a wrong key.
+/// The input comes from buildBareJid's 256 B buffer and is already the
+/// prepared bound identity, so re-preparing is idempotent and cannot grow;
+/// 256 B is enough.
+fn preparedMemberBare(server: *Server, bare_jid: []const u8, buf: *[256]u8) []const u8 {
+    return xmpp.prepareLocalDomainJid(bare_jid, server.server_host, buf) catch bare_jid;
 }
 
 fn writeSessionJid(w: anytype, session: *const Session) !void {
@@ -3763,4 +3788,103 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
+}
+
+test "F6: MUC affiliation store keys use the folded local spelling" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const dq_mod = @import("delivery_queue");
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+    var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+
+    const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    var store = room_store.RoomStore(server_mod.OpBackendType).init(&db, allocator);
+    server.room_store = &store;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    // A folded owner affiliation already on disk (as persisted by a prior
+    // prepared write) must be read back by a bound JID typed in another
+    // case: with two occupants the owner check cannot fall back to the
+    // new-room creator rule.
+    try store.setAffiliation("room@conference.localhost", "naplestb@localhost", .owner);
+    _ = try room.addOccupant("naples", "NaplesTB@localhost/desk", "NaplesTB@localhost", 0, 0, 1, .moderator, .owner);
+    _ = try room.addOccupant("other", "other@localhost/x", "other@localhost", 1, 0, 1, .participant, .none);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const owner = try allocator.create(Session);
+    owner.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    owner.stream.bound_jid = .{ .local = "NaplesTB", .domain = "localhost", .resource = "desk" };
+    server.sessions[0] = owner;
+
+    const form = "<query xmlns='http://jabber.org/protocol/muc#owner'>" ++
+        "<x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='muc#roomconfig_persistentroom'><value>1</value></field>" ++
+        "</x></query>";
+    @memcpy(owner.stanza_buf[0..form.len], form);
+    owner.stanza_buf_len = form.len;
+    handleMucOwnerSet(&server, owner, "room", "cfg1", &changes);
+
+    // Read-side: the bound 'NaplesTB@localhost' is the stored owner.
+    const set_out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, set_out, "type='result'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, set_out, "forbidden") == null);
+    // Write-side: the re-persisted affiliation lands under the folded key.
+    try std.testing.expectEqual(Affiliation.owner, try store.getAffiliation("room@conference.localhost", "naplestb@localhost"));
+    try std.testing.expectEqual(Affiliation.none, try store.getAffiliation("room@conference.localhost", "NaplesTB@localhost"));
+
+    handleMucOwnerGet(&server, owner, "room", "cfg2", &changes);
+    const out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "forbidden") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "muc#roomconfig") != null);
+
+    // Local join path: an outcast stored folded still bars an as-typed JID.
+    try store.setAffiliation("room@conference.localhost", "carolx@localhost", .outcast);
+    var cfds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &cfds));
+    defer posix.close(cfds[1]);
+    const carol = try allocator.create(Session);
+    carol.* = Session.init(cfds[0], 1, server.server_host, false, allocator);
+    carol.stream.bound_jid = .{ .local = "CarolX", .domain = "localhost", .resource = "wind" };
+    server.sessions[1] = carol;
+    const join = "<x xmlns='http://jabber.org/protocol/muc'/>";
+    @memcpy(carol.stanza_buf[0..join.len], join);
+    carol.stanza_buf_len = join.len;
+    const occupants_before = room.occupant_count;
+    handleMucPresence(&server, carol, "room", "carolx", "", &changes);
+    try std.testing.expectEqual(occupants_before, room.occupant_count);
+    const cout = carol.conn.write_buf[carol.conn.write_start..carol.conn.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, cout, "forbidden") != null);
+
+    // Remote join path: the same folded lookup applies to a member
+    // arriving over the MPSC room actor.
+    try store.setAffiliation("room@conference.localhost", "davex@localhost", .outcast);
+    processRemoteJoin(&server, .{
+        .room_jid = "room@conference.localhost",
+        .real_jid = "DaveX@localhost/wind",
+        .nick = "davex",
+        .worker_id = 1,
+        .session_id = 7,
+        .generation = 1,
+    }, &changes);
+    try std.testing.expectEqual(occupants_before, room.occupant_count);
 }
