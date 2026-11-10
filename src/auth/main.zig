@@ -679,6 +679,38 @@ test "auth startup: main applies --users-scan-limit" {
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "startup scan bound") != null);
 }
 
+test "auth startup: a pending migrate-precis marker refuses startup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const marker_path = try std.fs.path.join(allocator, &.{ base, "migrate-precis.pending" });
+    defer allocator.free(marker_path);
+    var marker = try std.fs.cwd().createFile(marker_path, .{});
+    defer marker.close();
+    try marker.writeAll("deadbeef\n");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-precis-test/auth.sock",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "migrate-precis recovery is pending") != null);
+}
+
 test "auth startup: an unprepared users key refuses startup" {
     var db = try backend_mod.MemoryBackend.open("", .{});
     defer db.close();
