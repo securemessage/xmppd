@@ -453,7 +453,9 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
                 sendIqError(server, session, iq_id, "jid-malformed");
                 return;
             };
-            if (std.mem.eql(u8, to_jid.domain, muc_host)) {
+            // Case-insensitive host compare; the room localpart keeps
+            // its spelling.
+            if (std.ascii.eqlIgnoreCase(to_jid.domain, muc_host)) {
                 if (to_jid.local.len == 0) {
                     // Bare MUC service JID: disco#info or disco#items for the service
                     if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
@@ -873,8 +875,8 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         return;
     }
 
-    const item_jid = session.iq_roster_item_jid;
-    if (item_jid.len == 0) {
+    const item_jid_raw = session.iq_roster_item_jid;
+    if (item_jid_raw.len == 0) {
         sendIqError(server, session, iq_id, "bad-request");
         return;
     }
@@ -888,6 +890,13 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         sendIqError(server, session, iq_id, "bad-request");
         return;
     }
+
+    // F6: fold a local contact JID once so every key and push below uses the
+    // configured spelling; remote-domain JIDs pass through unchanged.
+    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_jid_prep_buf) catch {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    };
 
     // Build bare JID for roster lookup
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
@@ -1237,12 +1246,22 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
     const start_ts = if (session.mam_start.len > 0) parseTimestamp(session.mam_start) else null;
     const end_ts = if (session.mam_end.len > 0) parseTimestamp(session.mam_end) else null;
 
+    // F6: fold a local 'with' JID once so the by_contact index key matches
+    // the spelling messages were archived under; remote JIDs pass through.
+    var with_prepared: ?[]const u8 = null;
+    if (session.mam_with.len > 0) {
+        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.iq_jid_prep_buf) catch {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        };
+    }
+
     // Build MamQuery from accumulated session state
     const query = mam_handler.MamQuery{
         .iq_id = iq_id,
         .owner = bare_jid,
         .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
-        .with = if (session.mam_with.len > 0) session.mam_with else null,
+        .with = with_prepared,
         .start = start_ts,
         .end = end_ts,
         .after_id = if (session.mam_after.len > 0) session.mam_after else null,
@@ -1279,6 +1298,17 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     room_fbs.writer().writeAll(muc_host) catch return;
     const room_jid = room_fbs.getWritten();
 
+    // F6: fold a local 'with' JID once so the by_contact index key matches
+    // the spelling messages were archived under, on this worker or the
+    // owning one; remote JIDs pass through.
+    var with_prepared: ?[]const u8 = null;
+    if (session.mam_with.len > 0) {
+        with_prepared = @import("xmpp").prepareLocalDomainJid(session.mam_with, server.server_host, &session.iq_jid_prep_buf) catch {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        };
+    }
+
     // Ownership routing (T112): MAM archives live on the owning worker
     const owner = room_registry_mod.roomOwner(room_jid, server.getWorkerCount());
     if (owner != server.worker_id) {
@@ -1302,7 +1332,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
             .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
             .start = session.mam_start,
             .end_field = session.mam_end,
-            .with = session.mam_with,
+            .with = if (with_prepared) |w| w else "",
             .max = session.mam_max,
             .after_id = session.mam_after,
             .before_id = session.mam_before,
@@ -1333,7 +1363,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
         .iq_id = iq_id,
         .owner = room_jid,
         .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,
-        .with = if (session.mam_with.len > 0) session.mam_with else null,
+        .with = with_prepared,
         .start = start_ts,
         .end = end_ts,
         .after_id = if (session.mam_after.len > 0) session.mam_after else null,
@@ -1416,7 +1446,7 @@ fn sendLastActivityResult(server: *Server, session: *Session, iq_id: []const u8,
 /// accounts never reach here — dispatchIq's foreign-JID branch handles them.
 fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []const u8) void {
     const iq_to = session.iq_to;
-    if (iq_to.len == 0 or std.mem.eql(u8, iq_to, server.server_host)) {
+    if (iq_to.len == 0 or std.ascii.eqlIgnoreCase(iq_to, server.server_host)) {
         const start = if (server.start_time > 0) server.start_time else std.time.timestamp();
         const uptime: u64 = @intCast(@max(std.time.timestamp() - start, 0));
         sendLastActivityResult(server, session, iq_id, uptime);
@@ -1440,7 +1470,7 @@ fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []c
 fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, to_jid: @import("xmpp").Jid) void {
     const bound = session.stream.bound_jid orelse return;
 
-    if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
+    if (!std.ascii.eqlIgnoreCase(to_jid.domain, server.server_host)) {
         sendIqError(server, session, iq_id, "service-unavailable");
         return;
     }
@@ -2096,11 +2126,18 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
         return;
     };
 
-    const item_jid = session.iq_roster_item_jid;
-    if (item_jid.len == 0) {
+    const item_jid_raw = session.iq_roster_item_jid;
+    if (item_jid_raw.len == 0) {
         sendIqError(server, session, iq_id, "bad-request");
         return;
     }
+
+    // F6: fold a local blocked JID once so the block key and the push below
+    // use the configured spelling; remote-domain JIDs pass through.
+    const item_jid = @import("xmpp").prepareLocalDomainJid(item_jid_raw, server.server_host, &session.iq_jid_prep_buf) catch {
+        sendIqError(server, session, iq_id, "jid-malformed");
+        return;
+    };
 
     // S4: bounded store keys; an oversized blocked JID is malformed.
     if (!@import("store_keys").fits2(bare_jid, item_jid)) {
@@ -2142,12 +2179,18 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
         return;
     };
 
-    const item_jid = session.iq_roster_item_jid;
+    var item_jid = session.iq_roster_item_jid;
     if (item_jid.len == 0) {
         // Empty <unblock/> means unblock all
         bs.removeAll(server.allocator, bare_jid) catch {};
         log.info("connection {d} unblocked all", .{session.conn.id});
     } else {
+        // F6: fold a local blocked JID once so the unblock key and the push
+        // below use the configured spelling; remote JIDs pass through.
+        item_jid = @import("xmpp").prepareLocalDomainJid(item_jid, server.server_host, &session.iq_jid_prep_buf) catch {
+            sendIqError(server, session, iq_id, "jid-malformed");
+            return;
+        };
         // S4: bounded store keys; an oversized blocked JID is malformed.
         if (!@import("store_keys").fits2(bare_jid, item_jid)) {
             sendIqError(server, session, iq_id, "jid-malformed");
@@ -2494,4 +2537,278 @@ test "A62: roster get for a >256-byte owner bare JID" {
     const n = posix.read(fds[1], &rbuf) catch 0;
     const got = rbuf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, got, "contact@example.org") != null);
+}
+
+test "F6: last-activity query to the domain in another case is server-addressed" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    session.iq_to = "LOCALHOST";
+    handleLastActivitySelfOrServer(&server, session, "la1");
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "jabber:iq:last") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "service-unavailable") == null);
+}
+
+test "F6: last-activity query for a mixed-case local domain is not remote" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    handleLastActivityFor(&server, session, "la2", .{ .local = "bob", .domain = "LOCALHOST" });
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    // Local evaluation continues to the roster check; a remote verdict
+    // short-circuits with service-unavailable.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "item-not-found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "service-unavailable") == null);
+}
+
+test "F6: roster set stores the contact under the configured local spelling" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    var roster = GenericRosterStore.init(&db);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.roster = &roster;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.iq_roster_item_jid = "NaplesTB@LOCALHOST";
+    session.iq_roster_item_count = 1;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleRosterSet(&server, session, "rs1", &changes);
+
+    const entry = try roster.getItem(allocator, "alice@localhost", "naplestb@localhost");
+    try std.testing.expect(entry != null);
+    if (entry) |e| {
+        defer if (e.name.len > 0) allocator.free(e.name);
+        defer if (e.groups.len > 0) allocator.free(e.groups);
+    }
+    // The as-typed spelling is not a second key.
+    try std.testing.expect((try roster.getItem(allocator, "alice@localhost", "NaplesTB@LOCALHOST")) == null);
+}
+
+test "F6: block and unblock use the configured local spelling for the store key" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    const GenericBlockStore = @import("block_store").BlockStore(server_mod.OpBackendType);
+    var bs = GenericBlockStore.init(&db);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.block_store = &bs;
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    session.iq_roster_item_jid = "NaplesTB@LOCALHOST";
+    handleBlock(&server, session, "b1", &changes);
+    try std.testing.expect(try bs.isBlocked(allocator, "alice@localhost", "naplestb@localhost"));
+    try std.testing.expect(!(try bs.isBlocked(allocator, "alice@localhost", "NaplesTB@LOCALHOST")));
+
+    // The unblock path folds too: an entry stored folded comes out.
+    try bs.block("alice@localhost", "carolx@localhost");
+    session.iq_roster_item_jid = "CarolX@LOCALHOST";
+    handleUnblock(&server, session, "u1", &changes);
+    try std.testing.expect(!(try bs.isBlocked(allocator, "alice@localhost", "carolx@localhost")));
+}
+
+test "F6: MAM 'with' matches the folded archive contact key" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    const ArchBackend = @import("archive_backend").Backend;
+    var arch_db = try ArchBackend.open(path, .{});
+    defer arch_db.close();
+    var arch_store = @import("archive_store").ArchiveStore(ArchBackend).init(&arch_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.archive = &arch_store;
+
+    try arch_store.store("alice@localhost", "naplestb@localhost", "m-1", 1700000000, "<message><body>hi</body></message>");
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.mam_with = "NaplesTB@LOCALHOST";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMamQuery(&server, session, "mam1", &changes);
+
+    // The folded 'with' hits the by_contact key the archive wrote.
+    _ = try session.conn.flushSend();
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='m-1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "<count>1</count>") != null);
+}
+
+test "F6: MUC MAM 'with' matches the folded archive contact key" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    const ArchBackend = @import("archive_backend").Backend;
+    var arch_db = try ArchBackend.open(path, .{});
+    defer arch_db.close();
+    var arch_store = @import("archive_store").ArchiveStore(ArchBackend).init(&arch_db, allocator);
+
+    var reg = room_registry_mod.RoomRegistry.init(allocator);
+    defer reg.deinit();
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.archive = &arch_store;
+    server.room_registry = &reg;
+    server.worker_id = 0;
+
+    try arch_store.store("lobby@conference.localhost", "naplestb@localhost", "rm-1", 1700000000, "<message><body>hi</body></message>");
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.mam_with = "NaplesTB@LOCALHOST";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    // A single worker owns every room, so the local query path runs.
+    handleMucMamQuery(&server, session, "lobby", "conference.localhost", "mam2", &changes);
+
+    _ = try session.conn.flushSend();
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    const reply = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, reply, "id='rm-1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "<count>1</count>") != null);
+}
+
+var f6_with_seen: [512]u8 = undefined;
+var f6_with_len: usize = 0;
+fn f6Drain(_: void, _: u32, _: u32, payload: []const u8) void {
+    const m = actor_message.decode(payload) orelse return;
+    switch (m) {
+        .room_mam_query => |q| {
+            @memcpy(f6_with_seen[0..q.with.len], q.with);
+            f6_with_len = q.with.len;
+        },
+        else => {},
+    }
+}
+
+test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var ds = try @import("delivery_queue").DeliverySystem.init(allocator, 2);
+    defer ds.deinit();
+    server.delivery_system = &ds;
+    var name_buf: [64]u8 = undefined;
+    var room_local: []const u8 = "";
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        room_local = try std.fmt.bufPrint(&name_buf, "r{d}", .{i});
+        var jb: [128]u8 = undefined;
+        const rj = try std.fmt.bufPrint(&jb, "{s}@conference.localhost", .{room_local});
+        if (room_registry_mod.roomOwner(rj, 2) == 1) break;
+    }
+    server.worker_id = 0;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.mam_with = "NaplesTB@LOCALHOST";
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    handleMucMamQuery(&server, session, room_local, "conference.localhost", "mamx", &changes);
+    _ = ds.getQueue(1).drain({}, f6Drain);
+    try std.testing.expectEqualStrings("naplestb@localhost", f6_with_seen[0..f6_with_len]);
 }

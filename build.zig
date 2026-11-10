@@ -236,6 +236,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     precis_username_mod.addImport("unicode", unicode_mod);
+    xmpp_mod.addImport("precis_username", precis_username_mod);
+    xmpp_test_mod.addImport("precis_username", precis_username_mod);
 
     const sasl_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/sasl/sasl.zig"),
@@ -1017,6 +1019,7 @@ pub fn build(b: *std.Build) void {
     s2s_connector_test_mod.addImport("xml", xml_mod);
     s2s_connector_test_mod.addImport("dns", dns_mod);
     s2s_connector_test_mod.addImport("dns_async", dns_async_mod);
+    s2s_connector_test_mod.addImport("xmpp", xmpp_mod);
     s2s_connector_test_mod.linkSystemLibrary("ssl", .{});
     s2s_connector_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1041,6 +1044,7 @@ pub fn build(b: *std.Build) void {
     s2s_dialback_test_mod.addImport("ssl", ssl_test_mod);
     s2s_dialback_test_mod.addImport("dns", dns_mod);
     s2s_dialback_test_mod.addImport("dns_async", dns_async_mod);
+    s2s_dialback_test_mod.addImport("xmpp", xmpp_mod);
     s2s_dialback_test_mod.linkSystemLibrary("ssl", .{});
     s2s_dialback_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1063,6 +1067,7 @@ pub fn build(b: *std.Build) void {
     s2s_session_test_mod.addImport("xml", xml_mod);
     s2s_session_test_mod.addImport("dns", dns_mod);
     s2s_session_test_mod.addImport("dns_async", dns_async_mod);
+    s2s_session_test_mod.addImport("xmpp", xmpp_mod);
     s2s_session_test_mod.linkSystemLibrary("ssl", .{});
     s2s_session_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1095,6 +1100,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("dns", dns_mod);
     s2s_main_test_mod.addImport("wire", wire_mod);
     s2s_main_test_mod.addImport("dns_async", dns_async_mod);
+    s2s_main_test_mod.addImport("xmpp", xmpp_mod);
     s2s_main_test_mod.addImport("test_support", test_support_mod);
     s2s_main_test_mod.linkSystemLibrary("ssl", .{});
     s2s_main_test_mod.linkSystemLibrary("crypto", .{});
@@ -1863,6 +1869,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("ssl", ssl_test_mod);
     s2s_main_mod.addImport("dns", dns_mod);
     s2s_main_mod.addImport("dns_async", dns_async_mod);
+    s2s_main_mod.addImport("xmpp", xmpp_mod);
     s2s_main_mod.addImport("xmppd_log", xmppd_log_mod);
     s2s_main_mod.linkSystemLibrary("ssl", .{});
     s2s_main_mod.linkSystemLibrary("crypto", .{});

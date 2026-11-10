@@ -9,6 +9,7 @@
 const std = @import("std");
 const posix = std.posix;
 const xml = @import("xml");
+const xmpp = @import("xmpp");
 const stream_mod = @import("stream.zig");
 const S2sStream = stream_mod.S2sStream;
 const S2sStreamState = stream_mod.S2sStreamState;
@@ -149,9 +150,9 @@ pub const S2sSession = struct {
     stanza_active: bool = false,
     stanza_tag_buf: [32]u8 = undefined,
     stanza_tag_len: usize = 0,
-    stanza_from_buf: [512]u8 = undefined,
+    stanza_from_buf: [xmpp.max_jid_octets]u8 = undefined,
     stanza_from_len: usize = 0,
-    stanza_to_buf: [512]u8 = undefined,
+    stanza_to_buf: [xmpp.max_jid_octets]u8 = undefined,
     stanza_to_len: usize = 0,
     stanza_type_buf: [32]u8 = undefined,
     stanza_type_len: usize = 0,
@@ -168,6 +169,12 @@ pub const S2sSession = struct {
     /// True once any accumulate* call overflowed stanza_inner_buf; polite
     /// dropping of a stanza whose inner buffer can't fit it (not forward).
     stanza_accum_overflowed: bool = false,
+    /// A from=/to= longer than its buffer is an overflow, not a JID: the
+    /// truncated prefix must never reach address validation or
+    /// preparation. dispatch drops the stanza (to=) or fails the stream
+    /// invalid-from (from=).
+    stanza_from_overflowed: bool = false,
+    stanza_to_overflowed: bool = false,
 
     /// Record a domain as authenticated for this session (dedup,
     /// case-insensitive). Returns false when the set is full and the domain
@@ -641,20 +648,26 @@ pub const S2sSession = struct {
         const tl = @min(elem.local_name.len, self.stanza_tag_buf.len);
         @memcpy(self.stanza_tag_buf[0..tl], elem.local_name[0..tl]);
         self.stanza_tag_len = tl;
-        // Extract from/to/type/id attributes
+        // Extract from/to/type/id attributes. An over-long from= or to=
+        // keeps its truncated prefix for logging but flags the overflow so
+        // dispatch rejects the stanza instead of preparing a clipped JID.
         self.stanza_from_len = 0;
         self.stanza_to_len = 0;
         self.stanza_type_len = 0;
         self.stanza_id_len = 0;
+        self.stanza_from_overflowed = false;
+        self.stanza_to_overflowed = false;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "from")) {
                 const fl = @min(attr.value.len, self.stanza_from_buf.len);
                 @memcpy(self.stanza_from_buf[0..fl], attr.value[0..fl]);
                 self.stanza_from_len = fl;
+                self.stanza_from_overflowed = attr.value.len > self.stanza_from_buf.len;
             } else if (std.mem.eql(u8, attr.local_name, "to")) {
                 const tol = @min(attr.value.len, self.stanza_to_buf.len);
                 @memcpy(self.stanza_to_buf[0..tol], attr.value[0..tol]);
                 self.stanza_to_len = tol;
+                self.stanza_to_overflowed = attr.value.len > self.stanza_to_buf.len;
             } else if (std.mem.eql(u8, attr.local_name, "type")) {
                 const tyl = @min(attr.value.len, self.stanza_type_buf.len);
                 @memcpy(self.stanza_type_buf[0..tyl], attr.value[0..tyl]);
@@ -784,6 +797,8 @@ pub const S2sSession = struct {
         self.stanza_root_ns_prefix_len = 0;
         self.stanza_root_ns_uri_len = 0;
         self.stanza_accum_overflowed = false;
+        self.stanza_from_overflowed = false;
+        self.stanza_to_overflowed = false;
     }
 
     /// Get the accumulated stanza tag name.
@@ -1366,6 +1381,38 @@ test "S2sSession: inner buffer overflow marks stanza broken, not truncated" {
 
     session.resetStanza();
     try std.testing.expect(!session.stanzaBroken());
+}
+
+test "S2sSession: an over-long from=/to= flags overflow instead of truncating" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    var big: [xmpp.max_jid_octets + 1]u8 = undefined;
+    @memset(&big, 'a');
+    var exact: [xmpp.max_jid_octets]u8 = undefined;
+    @memset(&exact, 'b');
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = &big },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = &exact },
+        },
+        .self_closing = false,
+    });
+    try std.testing.expect(session.stanza_from_overflowed);
+    try std.testing.expect(!session.stanza_to_overflowed);
+    // The stored prefix is still capped at the buffer for logging only.
+    try std.testing.expectEqual(xmpp.max_jid_octets, session.getStanzaFrom().len);
+    try std.testing.expectEqual(xmpp.max_jid_octets, session.getStanzaTo().len);
+
+    session.resetStanza();
+    try std.testing.expect(!session.stanza_from_overflowed);
+    try std.testing.expect(!session.stanza_to_overflowed);
 }
 
 test "S2sSession: accumulateClose overflow marks the stanza broken" {

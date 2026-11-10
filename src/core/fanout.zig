@@ -22,7 +22,7 @@
 const std = @import("std");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
-const router = @import("router.zig");
+const jid_bounds = @import("jid_bounds.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
 const RoomRegistry = room_registry.RoomRegistry;
@@ -40,7 +40,7 @@ pub const MAX_PENDING: usize = 4;
 /// "<message|presence from='" plus an occupant JID (a maximum-length room
 /// bare JID, '/', and a nick) plus "' to='", so it must hold a full JID in
 /// the worst case rather than truncate the stanza mid-attribute.
-pub const PREFIX_CAPACITY: usize = router.FULL_JID_MAX;
+pub const PREFIX_CAPACITY: usize = jid_bounds.FULL_JID_MAX;
 pub const SUFFIX_CAPACITY: usize = 16500;
 
 /// A pending fan-out operation that delivers a pre-built stanza to room
@@ -52,7 +52,7 @@ pub const PendingFanout = struct {
     next_slot: u8 = 0,
 
     /// Room JID for safe re-lookup (room may have been destroyed between ticks).
-    room_jid_buf: [router.BARE_JID_MAX]u8 = undefined,
+    room_jid_buf: [jid_bounds.BARE_JID_MAX]u8 = undefined,
     room_jid_len: u16 = 0,
 
     /// Pre-built stanza prefix: everything up to and including " to='"
