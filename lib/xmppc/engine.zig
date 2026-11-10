@@ -301,6 +301,9 @@ pub const Engine = struct {
     /// PKIX-verifying client context (lazy): system CA store, per-connection
     /// hostname check. Fallback when DANE brought no TLSA records (T202).
     tls_ctx_ca: ?ssl.SslContext = null,
+    /// DANE-verifying client context (lazy): SSL_VERIFY_PEER with an empty
+    /// store, so only a matched TLSA record can authenticate the peer.
+    tls_ctx_dane: ?ssl.SslContext = null,
     /// Server-authentication policy seeded into each new session
     /// (dane_first default; lab rigs set .none — see xmppc.zig).
     default_tls_policy: tls.VerifyMode = .dane_first,
@@ -562,6 +565,7 @@ pub const Engine = struct {
         self.timers.deinit(self.allocator);
         if (self.tls_ctx) |*c| c.deinit();
         if (self.tls_ctx_ca) |*c| c.deinit();
+        if (self.tls_ctx_dane) |*c| c.deinit();
         // Leftover posted-but-never-applied commands.
         for (self.cmd_active.items) |*c| self.cmdFree(c);
         for (self.cmd_spare.items) |*c| self.cmdFree(c);
@@ -743,6 +747,16 @@ pub const Engine = struct {
             self.tls_ctx_ca = ssl.SslContext.initClientVerified() catch return error.TlsInit;
         }
         return self.tls_ctx_ca.?;
+    }
+
+    /// DANE-verifying client context (lazy). Sessions use it whenever the
+    /// resolution brought usable TLSA records for the target; the TLSA match
+    /// is then the only accepted anchor (T202).
+    pub fn clientDaneTlsContext(self: *Engine) !ssl.SslContext {
+        if (self.tls_ctx_dane == null) {
+            self.tls_ctx_dane = ssl.SslContext.initClientDane() catch return error.TlsInit;
+        }
+        return self.tls_ctx_dane.?;
     }
 
     pub fn sessionCount(self: *const Engine) usize {

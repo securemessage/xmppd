@@ -786,6 +786,15 @@ test "Listener: bad descriptor and non-listener surface as ListenerInvalid" {
 }
 
 test "Listener: accept_batch_max requeues for the rest of the backlog" {
+    // This test needs ~2*total descriptors on top of whatever earlier
+    // tests still hold, which can exceed the default soft NOFILE under
+    // load. At the cap socket()/accept() returns EMFILE, the listener
+    // pauses its read interest, and the queue fills while the loop
+    // sleeps forever. Raise the soft cap to the hard one so EMFILE
+    // cannot pause the drain.
+    const rl = try posix.getrlimit(.NOFILE);
+    if (rl.cur < rl.max) try posix.setrlimit(.NOFILE, .{ .cur = rl.max, .max = rl.max });
+
     var loop = try testLoop();
     defer loop.deinit(std.testing.allocator);
 
@@ -809,27 +818,47 @@ test "Listener: accept_batch_max requeues for the rest of the backlog" {
         if (fd >= 0) posix.close(fd);
     };
 
+    // A deadline, not a pass count: under load the tail of the backlog can
+    // complete late, and a bare wait() sleeps forever because the loop only
+    // wakes on I/O. The deadline fails the test instead of hanging the suite.
+    const deadline = try loop.scheduleIn(30_000, test_ctx);
     var got: usize = 0;
     var saw_batch_limit = false;
-    for (0..8) |_| {
+    while (got < total) {
         try loop.wait();
         while (loop.next()) |ev| {
-            if (ev != .readable) continue;
-            while (true) {
-                const out = try listener.acceptNext();
-                switch (out) {
-                    .accepted => |a| {
-                        accepted[got] = a.fd;
-                        got += 1;
-                    },
-                    .batch_limit => saw_batch_limit = true,
-                    else => break,
-                }
-                if (out != .accepted) break;
+            switch (ev) {
+                .readable => {
+                    while (true) {
+                        const out = try listener.acceptNext();
+                        switch (out) {
+                            .accepted => |a| {
+                                accepted[got] = a.fd;
+                                got += 1;
+                            },
+                            .batch_limit => saw_batch_limit = true,
+                            else => {},
+                        }
+                        if (out != .accepted) break;
+                    }
+                },
+                .deadline => |d| {
+                    if (d.timer.eql(deadline)) {
+                        std.debug.print(
+                            "accept_batch_max backlog: {d}/{d} connects arrived before the deadline\n",
+                            .{ got, total },
+                        );
+                        return error.ConnectBacklogDeadline;
+                    }
+                    // The listener's own fallback deadline: let it lift a
+                    // transient pause (ENOBUFS and friends) before ours ends.
+                    _ = listener.onDeadline(d);
+                },
+                else => {},
             }
         }
-        if (got == total) break;
     }
+    _ = loop.cancelTimer(deadline);
     try std.testing.expect(saw_batch_limit);
     try std.testing.expectEqual(total, got);
 }

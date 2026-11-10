@@ -35,6 +35,7 @@ const posix = std.posix;
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
+const precis = @import("precis_username");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const Connection = @import("connection.zig").Connection;
@@ -56,11 +57,9 @@ const SessionMap = session_map_mod.SessionMap;
 const SessionEntry = session_map_mod.SessionEntry;
 
 comptime {
-    // A bound session's JID must fit the session-map bind buffer, so local
-    // full JIDs stay well under the router JID bounds; keep that true if
-    // either cap moves (S4).
-    std.debug.assert(session_map_mod.LOOKUP_JID_BUF <= router.BARE_JID_MAX);
-    std.debug.assert(session_map_mod.LOOKUP_JID_BUF <= router.FULL_JID_MAX);
+    // The session-map bind bound must stay within the widest router stanza
+    // buffer so an over-long bound JID is counted, never clipped (S4).
+    std.debug.assert(session_map_mod.MAX_JID_OCTETS <= router.JID_STANZA_MAX);
 }
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
@@ -226,7 +225,7 @@ pub const Session = struct {
     /// from applying to a session that reused the same slot.
     auth_ipc_gen: u16 = 0,
     /// Stable copy of authenticated username (IPC message data is transient).
-    auth_username_buf: [256]u8 = undefined,
+    auth_username_buf: [precis.max_username_octets]u8 = undefined,
     auth_username_len: usize = 0,
     /// Which SASL element we're collecting text content for.
     sasl_collecting: SaslCollecting = .none,
@@ -5892,6 +5891,106 @@ test "Server: stream open produces response" {
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<stream:features>") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "<starttls") != null);
+}
+
+test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Stand-in for xmppd-auth on the other end of the IPC socketpair.
+    const ipc_fds = try makeSocketPair();
+    defer posix.close(ipc_fds[1]);
+    server.ipc.fd = ipc_fds[0];
+    server.ipc.connected = true;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Stream handshake: registration IQs are only taken pre-auth in the
+    // features_sasl state.
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    var buf: [4096]u8 = undefined;
+    const n0 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n0], "<stream:stream") != null);
+
+    // Registration is a pre-auth IQ taken in the features_sasl state; the
+    // test skips the STARTTLS+SASL-feature dance and establishes that
+    // precondition directly.
+    session.stream.state = .features_sasl;
+
+    // An invalid PRECIS name is rejected at the call site with
+    // not-acceptable and never reaches the auth daemon.
+    const bad_reg = "<iq type='set' id='r1'><query xmlns='jabber:iq:register'><username>a b</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], bad_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    const n1 = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1], "<not-acceptable") != null);
+    var ipc_buf: [4096]u8 = undefined;
+    try std.testing.expect((posix.read(ipc_fds[1], &ipc_buf) catch 0) == 0);
+
+    // RFC 7622 Section 3.3.1 additionally excludes "@" even though the
+    // IdentifierClass permits it.
+    const excluded_reg = "<iq type='set' id='r1x'><query xmlns='jabber:iq:register'><username>a@b</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], excluded_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+    const n1x = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n1x], "<not-acceptable") != null);
+    try std.testing.expect((posix.read(ipc_fds[1], &ipc_buf) catch 0) == 0);
+
+    // A valid name is forwarded to the auth daemon in canonical form:
+    // "ΟΔΟΣ" (U+039F U+0394 U+039F U+03A3) prepares to "οδοσ" (U+03A3 folds
+    // to U+03C3 unconditionally; no final-sigma rule).
+    const good_reg = "<iq type='set' id='r2'><query xmlns='jabber:iq:register'><username>\u{039F}\u{0394}\u{039F}\u{03A3}</username><password>pw</password></query></iq>";
+    _ = try posix.write(fds[1], good_reg);
+    server.handleReadable(1, &changes);
+    _ = try session.conn.flushSend();
+
+    // One length-prefixed frame lands on the IPC socket: a register_request
+    // carrying the prepared name.
+    const total = posix.read(ipc_fds[1], &ipc_buf) catch 0;
+    try std.testing.expect(total > 4);
+    const payload_len = std.mem.readInt(u32, ipc_buf[0..4], .little);
+    try std.testing.expectEqual(@as(usize, payload_len), total - 4);
+    const msg = try ipc_protocol.decode(ipc_buf[4..total]);
+    try std.testing.expect(msg == .register_request);
+    try std.testing.expectEqualStrings("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", msg.register_request.username);
+}
+
+test "Server: the bound localpart keeps the full prepared auth username" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // A prepared localpart may exceed the old 256-octet session buffer. The
+    // bound identity must contain all of it, without silent truncation.
+    var username: [300]u8 = undefined;
+    @memset(&username, 'n');
+    server.dispatchAuthResponse(.{ .auth_success = .{
+        .conn_id = 1,
+        .username = &username,
+        .server_final = "",
+    } }, &changes);
+    session.stream.state = .features_bind;
+    _ = session.stream.handleBind("res");
+    try std.testing.expectEqualStrings(&username, session.stream.bound_jid.?.local);
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {

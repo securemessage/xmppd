@@ -535,7 +535,8 @@ fn readResponse(
     const body_start = header_end + 4;
 
     // A declared Content-Length bounds the body; a short body at EOF is a
-    // truncated response.
+    // truncated response. A chunked body is validated and decoded in
+    // place; its decoded bytes never outgrow their framing.
     var body_slice = resp_data[body_start..];
     switch (parseResponseHead(resp_data[0..header_end])) {
         .invalid => return HttpError.InvalidResponse,
@@ -544,6 +545,11 @@ fn readResponse(
         .length => |cl| {
             if (body_slice.len < cl) return HttpError.InvalidResponse;
             body_slice = body_slice[0..cl];
+        },
+        .chunked => switch (chunkedScan(body_slice, body_slice)) {
+            .incomplete, .invalid => return HttpError.InvalidResponse,
+            .too_large => return HttpError.ResponseTooLarge,
+            .done => |cs| body_slice = body_slice[0..cs.decoded],
         },
     }
 
@@ -564,47 +570,68 @@ const HeadParse = union(enum) {
     eof_body,
     /// Declared body length within MAX_RESPONSE_SIZE.
     length: usize,
-    /// A malformed Content-Length, disagreeing duplicates, or a
-    /// Transfer-Encoding this client does not implement.
+    /// A sole "chunked" Transfer-Encoding (RFC 9112 6.1).
+    chunked,
+    /// A malformed Content-Length, disagreeing duplicates, a
+    /// Transfer-Encoding that is not a sole "chunked", or a
+    /// Transfer-Encoding alongside a Content-Length.
     invalid,
     /// A declared length above MAX_RESPONSE_SIZE.
     too_large,
 };
 
+/// RFC 9110 5.6.2 tchar: the field-name alphabet.
+fn isTchar(ch: u8) bool {
+    return switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        else => false,
+    };
+}
+
+/// RFC 9110 5.1 field-line grammar: field-name is 1*tchar, then ":",
+/// then field-value bytes (VCHAR / SP / HTAB / obs-text). A bare CR
+/// (RFC 9112 2.2), NUL or any other CTL is never a field-value byte.
+fn validFieldLine(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    if (colon == 0) return false;
+    for (line[0..colon]) |ch| {
+        if (!isTchar(ch)) return false;
+    }
+    for (line[colon + 1 ..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return false;
+    }
+    return true;
+}
+
 /// Parse the response head: strict Content-Length (decimal digits only,
-/// duplicates must agree) and no Transfer-Encoding at all.
+/// duplicates must agree) and Transfer-Encoding only as a sole "chunked".
 fn parseResponseHead(head: []const u8) HeadParse {
     var content_length: ?usize = null;
+    var transfer_chunked = false;
     var it = std.mem.splitScalar(u8, head, '\n');
     _ = it.next(); // status line
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
-        // RFC 9112 5.2: a line starting with SP or HTAB is an obs-fold
-        // continuation of the previous field. This client does not
-        // unfold; rejecting keeps a folded Transfer-Encoding or
-        // Content-Length from degrading the head to EOF framing.
-        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return .invalid;
-        // RFC 9112 5.1: no whitespace is allowed between the field name
-        // and the colon. "Content-Length : 5" must not fall through to a
-        // looser parse of some other header shape. RFC 9110 5.1 makes
-        // the name one or more tchar, so a colon at index 0 is not a
-        // field line at all.
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            if (colon == 0) return .invalid;
-            if (std.mem.indexOfAny(u8, line[0..colon], " \t") != null) return .invalid;
-        } else if (line.len > 0) {
-            // RFC 9112 5: a field line is field-name ":". A non-empty
-            // line without a colon is not a field; an empty one is a
-            // tolerated bare-LF artifact of the line split.
-            return .invalid;
-        }
+        // One grammar check for every field line: name 1*tchar, value
+        // bytes VCHAR / SP / HTAB / obs-text. It subsumes the obs-fold
+        // (RFC 9112 5.2), empty-name, no-colon and
+        // whitespace-before-colon rejections, and keeps a bare CR, NUL
+        // or other CTL from hiding a field (RFC 9112 2.2). An empty
+        // line is a tolerated bare-LF artifact of the line split.
+        if (line.len > 0 and !validFieldLine(line)) return .invalid;
         const te_prefix = "transfer-encoding:";
         // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
-        // declared TE; it rejects like any other TE.
+        // declared TE. The one implemented coding is a sole "chunked"
+        // (RFC 9112 6.1); a stacked coding or "identity" is not, and
+        // the coding is applied only once.
         if (line.len >= te_prefix.len and
             std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
         {
-            return .invalid;
+            const value = std.mem.trim(u8, line[te_prefix.len..], " \t");
+            if (!std.ascii.eqlIgnoreCase(value, "chunked")) return .invalid;
+            if (transfer_chunked) return .invalid;
+            transfer_chunked = true;
         }
         const cl_prefix = "content-length:";
         // A bare "Content-Length:" reaches the value parse and dies on
@@ -623,6 +650,13 @@ fn parseResponseHead(head: []const u8) HeadParse {
             content_length = cl;
         }
     }
+    if (transfer_chunked) {
+        // RFC 9112 6.3 rules 3 and 5: a message carrying both a
+        // Transfer-Encoding and a Content-Length is ambiguous framing;
+        // reject it rather than guess.
+        if (content_length != null) return .invalid;
+        return .chunked;
+    }
     return if (content_length) |cl| .{ .length = cl } else .eof_body;
 }
 
@@ -635,6 +669,132 @@ fn parseContentLengthValue(value: []const u8) error{ Invalid, Overflow }!usize {
         if (ch < '0' or ch > '9') return error.Invalid;
     }
     return std.fmt.parseInt(usize, value, 10) catch return error.Overflow;
+}
+
+/// Longest accepted chunk-size line (size digits plus extensions).
+const MAX_CHUNK_SIZE_LINE: usize = 256;
+
+/// One hex digit of a chunk size.
+fn hexDigit(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
+/// RFC 9112 6.1.1 chunk-ext grammar, strict:
+/// *( ";" token [ "=" ( token / quoted-string ) ] ) with no BWS.
+/// Semantics are ignored; the shape is bounded so an extension cannot
+/// hide framing or grow without limit.
+fn validChunkExtensions(exts: []const u8) bool {
+    var i: usize = 0;
+    while (i < exts.len) {
+        if (exts[i] != ';') return false;
+        i += 1;
+        const name_start = i;
+        while (i < exts.len and isTchar(exts[i])) : (i += 1) {}
+        if (i == name_start) return false;
+        if (i < exts.len and exts[i] == '=') {
+            i += 1;
+            if (i < exts.len and exts[i] == '"') {
+                i += 1;
+                var closed = false;
+                while (i < exts.len) {
+                    const ch = exts[i];
+                    if (ch == '"') {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    if (ch == '\\' and i + 1 < exts.len) {
+                        const esc = exts[i + 1];
+                        if (esc != '\t' and (esc < ' ' or esc == 0x7f)) return false;
+                        i += 2;
+                        continue;
+                    }
+                    if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return false;
+                    i += 1;
+                }
+                if (!closed) return false;
+            } else {
+                const val_start = i;
+                while (i < exts.len and isTchar(exts[i])) : (i += 1) {}
+                if (i == val_start) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Completeness of a partially read chunked body.
+const ChunkScan = union(enum) {
+    incomplete,
+    invalid,
+    too_large,
+    /// Complete stream: `framed` bytes of chunk coding produced
+    /// `decoded` body bytes.
+    done: struct { framed: usize, decoded: usize },
+};
+
+/// Strict RFC 9112 6.1 chunked-body scan: bounded chunk-size lines and
+/// sizes, strictly shaped extensions (ignored), and no trailers (the
+/// last chunk is followed by one empty line). With `out` non-null the
+/// decoded body is copied into it while scanning; `out.len >= data.len`
+/// is the caller's contract, and the decoded body never outgrows its
+/// framing, so `out` may alias `data`.
+fn chunkedScan(data: []const u8, out: ?[]u8) ChunkScan {
+    var pos: usize = 0;
+    var decoded: usize = 0;
+    while (true) {
+        // Chunk-size line: 1*HEXDIT [ chunk-ext ] CRLF, bounded.
+        const line_start = pos;
+        var line_end: usize = pos;
+        while (line_end < data.len and data[line_end] != '\n') : (line_end += 1) {
+            if (line_end - line_start >= MAX_CHUNK_SIZE_LINE) return .invalid;
+        }
+        if (line_end >= data.len) return .incomplete;
+        if (line_end == line_start or data[line_end - 1] != '\r') return .invalid;
+        const content = data[line_start .. line_end - 1];
+
+        var size: usize = 0;
+        var i: usize = 0;
+        while (i < content.len and content[i] != ';') : (i += 1) {
+            const digit = hexDigit(content[i]) orelse return .invalid;
+            // size stays <= MAX_RESPONSE_SIZE, so the multiply cannot
+            // approach usize overflow.
+            size = size * 16 + digit;
+            if (size > MAX_RESPONSE_SIZE) return .too_large;
+        }
+        if (i == 0) return .invalid;
+        if (!validChunkExtensions(content[i..])) return .invalid;
+        pos = line_end + 1;
+
+        if (size == 0) {
+            // Last chunk: trailers are rejected, so the stream ends
+            // with one empty line (RFC 9112 6.1.2).
+            if (pos + 2 > data.len) return .incomplete;
+            if (!std.mem.eql(u8, data[pos..][0..2], "\r\n")) return .invalid;
+            pos += 2;
+            return .{ .done = .{ .framed = pos, .decoded = decoded } };
+        }
+
+        const data_end = std.math.add(usize, pos, size) catch return .too_large;
+        if (data_end + 2 > data.len) return .incomplete;
+        if (!std.mem.eql(u8, data[data_end..][0..2], "\r\n")) return .invalid;
+        if (out) |dst| {
+            const dst_slice = dst[decoded..][0..size];
+            const src_slice = data[pos..data_end];
+            // dst_slice starts at or before src_slice (decoded bytes
+            // never outgrow the framing consumed), so a forward byte
+            // copy is safe even with `out` aliasing `data`.
+            for (dst_slice, src_slice) |*d, s| d.* = s;
+        }
+        decoded += size;
+        if (decoded > MAX_RESPONSE_SIZE) return .too_large;
+        pos = data_end + 2;
+    }
 }
 
 /// Completeness of a partially read response.
@@ -651,16 +811,28 @@ const Complete = union(enum) {
 /// Decide whether `data` holds a complete response.
 fn responseComplete(data: []const u8) Complete {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return .incomplete;
-    const cl = switch (parseResponseHead(data[0..header_end])) {
+    const body_start = header_end + 4;
+    switch (parseResponseHead(data[0..header_end])) {
         .invalid => return .{ .err = HttpError.InvalidResponse },
         .too_large => return .{ .err = HttpError.ResponseTooLarge },
         .eof_body => return .incomplete,
-        .length => |cl| cl,
-    };
-    const need = std.math.add(usize, header_end + 4, cl) catch
-        return .{ .err = HttpError.ResponseTooLarge };
-    if (data.len >= need) return .{ .done = need };
-    return .incomplete;
+        .length => |cl| {
+            const need = std.math.add(usize, body_start, cl) catch
+                return .{ .err = HttpError.ResponseTooLarge };
+            if (data.len >= need) return .{ .done = need };
+            return .incomplete;
+        },
+        .chunked => switch (chunkedScan(data[body_start..], null)) {
+            .incomplete => return .incomplete,
+            .invalid => return .{ .err = HttpError.InvalidResponse },
+            .too_large => return .{ .err = HttpError.ResponseTooLarge },
+            .done => |cs| {
+                const need = std.math.add(usize, body_start, cs.framed) catch
+                    return .{ .err = HttpError.ResponseTooLarge };
+                return .{ .done = need };
+            },
+        },
+    }
 }
 
 // ============================================================================
@@ -796,14 +968,33 @@ fn initTlsClient(ca_file: ?[]const u8) ?*c.SSL_CTX {
 // Response Parsing
 // ============================================================================
 
+/// RFC 9112 4: status-line = HTTP-version SP status-code SP [ reason-phrase ]
+/// Only HTTP/1.1 and HTTP/1.0 are spoken here. The code is exactly three
+/// DIGIT (never signed, never longer) and is followed by the second SP,
+/// even for an empty reason phrase. Reason-phrase bytes are HTAB / SP /
+/// VCHAR / obs-text, never a CTL.
 fn parseStatusLine(data: []const u8) ?u16 {
-    // "HTTP/1.1 200 OK\r\n" or "HTTP/1.0 200 OK\r\n"
-    if (data.len < 12) return null;
-    if (!std.mem.startsWith(u8, data, "HTTP/1.")) return null;
-
-    // Find the status code (starts at offset 9 after "HTTP/1.X ")
-    if (data[8] != ' ') return null;
-    return std.fmt.parseInt(u16, data[9..12], 10) catch null;
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return null;
+    const line = data[0..line_end];
+    // "HTTP/1.X " + 3 DIGIT + " " is the shortest accepted shape.
+    if (line.len < 13) return null;
+    const version = line[0..8];
+    if (!std.mem.eql(u8, version, "HTTP/1.1") and
+        !std.mem.eql(u8, version, "HTTP/1.0"))
+    {
+        return null;
+    }
+    if (line[8] != ' ') return null;
+    var code: u16 = 0;
+    for (line[9..12]) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        code = code * 10 + @as(u16, ch - '0');
+    }
+    if (line[12] != ' ') return null;
+    for (line[13..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return null;
+    }
+    return code;
 }
 
 // ============================================================================
@@ -856,6 +1047,29 @@ test "parseStatusLine: invalid" {
     try std.testing.expect(parseStatusLine("") == null);
     try std.testing.expect(parseStatusLine("GARBAGE") == null);
     try std.testing.expect(parseStatusLine("HTTP/1.1") == null);
+}
+
+test "parseStatusLine: strict RFC 9112 4 shape" {
+    // The code is exactly three DIGIT followed by the second SP; the
+    // reason phrase may be empty but is never a CTL. The old
+    // fixed-offset parse accepted most shapes below silently.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 2000 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 +12 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 -00 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 20a OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.9 200 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/2.0 200 OK\r\n") == null);
+    // The second SP is required even for an empty reason phrase.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 204\r\n") == null);
+    try std.testing.expectEqual(@as(u16, 204), parseStatusLine("HTTP/1.1 204 \r\n").?);
+    // Reason phrases may carry VCHAR, SP, HTAB and obs-text.
+    try std.testing.expectEqual(
+        @as(u16, 200),
+        parseStatusLine("HTTP/1.1 200 fine : yes\ttab\r\n").?,
+    );
+    // A bare CR inside the reason phrase is a CTL, not a phrase byte.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200 bad\rph\r\n") == null);
 }
 
 /// Loopback TCP listener that accepts connections into a hold array and
@@ -1253,17 +1467,120 @@ test "responseComplete: an empty Content-Length value is rejected" {
     );
 }
 
-test "responseComplete: Transfer-Encoding is rejected outright" {
-    const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+test "responseComplete: chunked framing completes at the last chunk" {
+    // RFC 9112 6.1: a sole "chunked" Transfer-Encoding frames the body
+    // by the chunk stream, not by Content-Length or EOF.
+    const resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+    // Declared bytes that have not arrived keep the response in flight.
+    const partial = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhel";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(partial));
+    // A stream without its last chunk never completes.
+    const no_last = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(no_last));
+    // Bytes past the last chunk are not part of the message.
+    const junk = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nNEXT";
+    try std.testing.expectEqual(
+        Complete{ .done = junk.len - 4 },
+        responseComplete(junk),
+    );
+}
+
+test "responseComplete: Transfer-Encoding accepts only a sole chunked" {
+    const identity = "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\nhello";
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
-        responseComplete(chunked),
+        responseComplete(identity),
     );
-    // Even alongside a Content-Length, the TE wins by rejecting.
+    const empty = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(empty),
+    );
+    const stacked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(stacked),
+    );
+    const twice = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(twice),
+    );
+    // RFC 9112 6.3 rules 3 and 5: TE alongside Content-Length is
+    // ambiguous framing; reject rather than guess.
     const both = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello";
     try std.testing.expectEqual(
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(both),
+    );
+}
+
+test "responseComplete: chunked streams are strict and bounded" {
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // Chunk data must sit exactly between its CRLFs.
+    const short_data = head ++ "4\r\nhel\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(short_data),
+    );
+    // A malformed chunk-size digit is invalid.
+    const bad_size = head ++ "z\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bad_size),
+    );
+    // Trailers are rejected: the last chunk is followed by one empty
+    // line, not by trailer fields.
+    const trailer = head ++ "0\r\nX-T: 1\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(trailer),
+    );
+    // A huge declared chunk size is too large, like a huge CL.
+    var huge_buf: [160]u8 = undefined;
+    const huge = try std.fmt.bufPrint(
+        &huge_buf,
+        head ++ "{x}\r\n",
+        .{MAX_RESPONSE_SIZE + 1},
+    );
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(huge),
+    );
+    // Overflowing the size parse is too large, not a wrap.
+    const overflow = head ++ "ffffffffffffffffff\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(overflow),
+    );
+}
+
+test "responseComplete: chunk extensions are bounded and ignored" {
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // Strictly shaped extensions decode as if absent.
+    const ext = head ++ "5;a=b;c=\"x y\"\r\nhello\r\n0;end\r\n\r\n";
+    try std.testing.expectEqual(Complete{ .done = ext.len }, responseComplete(ext));
+    // An unterminated quoted string is not a shape to trust.
+    const bad_ext = head ++ "5;a=\"unterminated\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bad_ext),
+    );
+    // The chunk-size line bound keeps an extension from growing past
+    // MAX_CHUNK_SIZE_LINE.
+    var long_val: [300]u8 = undefined;
+    @memset(&long_val, 'x');
+    var big_buf: [512]u8 = undefined;
+    const big_line = try std.fmt.bufPrint(
+        &big_buf,
+        head ++ "1;a={s}\r\nx\r\n0\r\n\r\n",
+        .{long_val[0..]},
+    );
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(big_line),
     );
 }
 
@@ -1338,8 +1655,8 @@ test "responseComplete: an empty field name is rejected" {
 
 test "responseComplete: an empty line inside the head does not panic" {
     // A bare-LF blank line sits before the CRLFCRLF terminator. The
-    // line.len > 0 guard on the obs-fold check is what keeps line[0]
-    // in bounds.
+    // line.len > 0 guard keeps the field-line grammar check from
+    // treating it as a malformed field.
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\n\nX: 1\r\n\r\nhello";
     try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
 }
@@ -1364,6 +1681,36 @@ test "responseComplete: a field line without a colon is rejected" {
         Complete{ .err = HttpError.InvalidResponse },
         responseComplete(te),
     );
+}
+
+test "responseComplete: field lines follow the grammar, not a blocklist" {
+    // RFC 9110 5.6.2 and RFC 9112 2.2: a bare CR, NUL or other CTL in a
+    // field line must not hide a field or reframe the body. Both shapes
+    // below used to degrade to EOF framing with the field gone.
+    const nul_te = "HTTP/1.1 200 OK\r\n\x00Transfer-Encoding: chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(nul_te),
+    );
+    const cr_cl = "HTTP/1.1 200 OK\r\nX-A: a\rContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(cr_cl),
+    );
+    // A CTL in the name is not tchar and DEL is a CTL byte in the value.
+    const vt_cl = "HTTP/1.1 200 OK\r\n\x0bContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(vt_cl),
+    );
+    const del = "HTTP/1.1 200 OK\r\nX-A: a\x7fb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(del),
+    );
+    // HTAB in a value is a field-value byte (RFC 9110 5.5).
+    const htab = "HTTP/1.1 200 OK\r\nX-A: a\tb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = htab.len }, responseComplete(htab));
 }
 
 test "responseComplete: framing ends the body at Content-Length" {
@@ -1614,4 +1961,43 @@ test "TLS: a Content-Length body comes back exactly" {
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("ok\r\n", resp.body);
+}
+
+test "TLS: a chunked body is decoded exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    );
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("hello world", resp.body);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate lib/sasl/nfc_tables.zig from the host's unicodedata.
+"""Regenerate lib/unicode/nfc_tables.zig from the host's unicodedata.
 
 Emits canonical decomposition pairs, canonical combining class ranges and
 canonical composition pairs (pairs validated against Python's own NFC so the
@@ -8,7 +8,7 @@ points, so regenerating with a newer Unicode version only ever adds entries.
 """
 import unicodedata
 
-OUT = "lib/sasl/nfc_tables.zig"
+OUT = "lib/unicode/nfc_tables.zig"
 
 decomp = {}
 ccc = {}

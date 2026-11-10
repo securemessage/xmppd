@@ -26,12 +26,10 @@ const log = std.log.scoped(.session_map);
 /// Maximum resource length stored inline in SessionEntry.
 /// Covers all practical resources (RFC allows 1023, but clients use ≤32).
 const MAX_RESOURCE_LEN: usize = 64;
-
-/// Stack buffer for JID lookups. Must hold anything bind() accepts: the bind
-/// duplicate check uses the same bound, and a bare JID is at most two bytes
-/// shorter than the full JID it came from, so one constant covers both.
-/// Public so router can assert its JID buffers cover the bind cap.
-pub const LOOKUP_JID_BUF: usize = 384;
+/// Full JIDs may contain a maximum-length RFC 7622 localpart plus domain and
+/// resource, so bare/full lookup buffers cannot cap at the old 320/384 bytes.
+/// Public so router can assert its stanza bound covers the bind cap.
+pub const MAX_JID_OCTETS: usize = 2112;
 
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {
@@ -176,7 +174,7 @@ pub const SessionMap = struct {
         @memcpy(entry.resource_buf[0..resource.len], resource);
 
         // Check for duplicate using stack buffer (no allocation)
-        var check_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var check_buf: [MAX_JID_OCTETS]u8 = undefined;
         const check_jid = buildJidBuf(&check_buf, local, domain, resource) orelse return error.JidTooLong;
         if (self.full_map.contains(check_jid)) {
             return error.AlreadyBound;
@@ -238,7 +236,7 @@ pub const SessionMap = struct {
         defer if (self.multi_worker) self.lock.unlock();
 
         // Build full JID for lookup
-        var full_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return null;
 
         // Remove from full_map
@@ -248,7 +246,7 @@ pub const SessionMap = struct {
         const entry = removed.value;
 
         // Remove from bare_map
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return entry;
 
         if (self.bare_map.getPtr(bare_jid)) |list| {
@@ -288,7 +286,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
         return self.full_map.get(full_jid);
     }
@@ -304,7 +302,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
 
         const list = self.bare_map.get(bare_jid) orelse return 0;
@@ -323,7 +321,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
 
         const list = self.bare_map.get(bare_jid) orelse return 0;
@@ -355,7 +353,7 @@ pub const SessionMap = struct {
 
         var total: usize = 0;
         for (jids, 0..) |jid, jid_idx| {
-            var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+            var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
             const bare_jid = buildBareBuf(&bare_buf, jid.local, jid.domain) orelse continue;
             const list = self.bare_map.get(bare_jid) orelse continue;
             for (list.constSlice()) |entry| {
@@ -374,7 +372,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return false;
 
         const list = self.bare_map.get(bare_jid) orelse return false;
@@ -396,14 +394,14 @@ pub const SessionMap = struct {
         defer if (self.multi_worker) self.lock.unlock();
 
         // Update full_map entry
-        var full_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
         if (self.full_map.getPtr(full_jid)) |entry| {
             entry.presence_available = available;
         }
 
         // Update bare_map entry
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
         if (self.bare_map.getPtr(bare_jid)) |list| {
             for (list.slice()) |*entry| {
@@ -430,13 +428,13 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lock();
         defer if (self.multi_worker) self.lock.unlock();
 
-        var full_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
         if (self.full_map.getPtr(full_jid)) |entry| {
             entry.priority = prio;
         }
 
-        var bare_buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
         if (self.bare_map.getPtr(bare_jid)) |list| {
             if (self.full_map.get(full_jid)) |full_entry| {
@@ -461,7 +459,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var buf: [LOOKUP_JID_BUF]u8 = undefined;
+        var buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
         const entry = self.full_map.get(full_jid) orelse return null;
         return entry.generation;
@@ -873,4 +871,20 @@ test "SessionMap: resource stored in entry" {
     }
     try std.testing.expect(found_mobile);
     try std.testing.expect(found_desktop);
+}
+
+test "SessionMap: a 320-octet localpart binds and resolves" {
+    var map = SessionMap.init(std.testing.allocator, false, 0);
+    defer map.deinit();
+
+    var local: [320]u8 = undefined;
+    @memset(&local, 'n');
+    _ = try map.bind(0, 42, &local, "localhost", "res");
+    map.setPresenceAvailable(&local, "localhost", "res", true);
+    const entry = map.findByFullJid(&local, "localhost", "res");
+    try std.testing.expect(entry != null);
+
+    var buf: [1]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid(&local, "localhost", &buf));
+    try std.testing.expect(map.unbind(&local, "localhost", "res") != null);
 }

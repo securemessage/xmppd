@@ -237,6 +237,12 @@ fn findVmRecord(buf: []const u8, ino: u64, fsid: u64) ?KinfoVmentry {
 
 const MAX_DBS = 24;
 
+comptime {
+    // openCanonicalNamespaces appends every canonical namespace to
+    // dbi_cache without a runtime bound check; the list must fit.
+    std.debug.assert(backend.canonical_namespaces.len <= MAX_DBS);
+}
+
 const DbiCacheEntry = struct {
     name_buf: [64]u8,
     name_len: u8,
@@ -259,6 +265,12 @@ pub const LmdbBackend = struct {
     dbi_lock: std.Thread.Mutex = .{},
     /// Set once the 80% warning has fired.
     usage_warned: std.atomic.Value(bool) = .init(false),
+    /// Offline tools hold an exclusive byte-0 lock on lock.mdb for the whole
+    /// environment lifetime. Closing any descriptor of the file while the
+    /// env is open would release every fcntl lock this process holds on it,
+    /// including LMDB's own (D5), so this is closed only after env.deinit().
+    lock_file: ?std.fs.File = null,
+
     /// A read runs inside its own read txn, which LMDB pins to an MVCC
     /// snapshot, so it cannot observe a half-applied write and does not need
     /// the store's compound lock (S9).
@@ -269,6 +281,32 @@ pub const LmdbBackend = struct {
     }
 
     pub fn open(path: []const u8, opts: backend.OpenOptions) !LmdbBackend {
+        return openInternal(path, opts, null);
+    }
+
+    /// Open an environment for an offline tool (migrate-precis, deluser
+    /// --raw). The exclusive byte-0 lock is taken before the environment
+    /// exists and held until after env.deinit(): opening a second descriptor
+    /// after env open and closing it would drop every fcntl lock this
+    /// process holds on lock.mdb, including LMDB's own (D5). A daemon that
+    /// starts mid-run blocks in its env open; when the offline tool exits,
+    /// LMDB on FreeBSD destroys its shared mutexes, so that daemon then
+    /// fails with EINVAL and must be restarted after xmppctl exits.
+    pub fn openOffline(path: []const u8, opts: backend.OpenOptions) !LmdbBackend {
+        if (opts.create) {
+            std.fs.cwd().makePath(path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+        const lock_file = try acquireOfflineLock(path, opts.create);
+        return openInternal(path, opts, lock_file);
+    }
+
+    fn openInternal(path: []const u8, opts: backend.OpenOptions, lock_file: ?std.fs.File) !LmdbBackend {
+        var owned_lock = lock_file;
+        errdefer if (owned_lock) |file| file.close();
+
         if (opts.create) {
             std.fs.cwd().makePath(path) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
@@ -296,15 +334,58 @@ pub const LmdbBackend = struct {
         errdefer env.deinit();
         excludeMapFromCoreDump(env);
 
+        // Env open may briefly downgrade byte 0 to a shared lock. Re-take
+        // the exclusive lock before any namespace write and keep it for the
+        // whole run.
+        if (owned_lock) |file| try setExclusiveLock(file.handle);
+
         var self: LmdbBackend = .{
             .env = env,
             .dbi_cache = undefined,
             .dbi_count = .init(0),
             .map_size = opts.map_size,
+            .lock_file = owned_lock,
         };
         if (!opts.read_only) try self.openCanonicalNamespaces() else try self.openCanonicalNamespacesReadOnly();
+        owned_lock = null;
         self.warnIfNearlyFull();
         return self;
+    }
+
+    fn acquireOfflineLock(path: []const u8, create: bool) !std.fs.File {
+        var lock_path_buf: [4096]u8 = undefined;
+        const lock_path = std.fmt.bufPrint(&lock_path_buf, "{s}/lock.mdb", .{path}) catch
+            return error.NameTooLong;
+        var file = std.fs.cwd().openFile(lock_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => if (create)
+                std.fs.cwd().createFile(lock_path, .{ .read = true, .truncate = false }) catch
+                    return error.LmdbCheckFailed
+            else
+                return error.LmdbCheckFailed,
+            error.AccessDenied => return error.LmdbCheckFailed,
+            else => return err,
+        };
+        errdefer file.close();
+        try setExclusiveLock(file.handle);
+        return file;
+    }
+
+    fn setExclusiveLock(handle: std.posix.fd_t) !void {
+        var lock: std.posix.Flock = .{
+            .start = 0,
+            .len = 1,
+            .pid = 0,
+            .type = std.c.F.WRLCK,
+            .whence = 0,
+            .sysid = 0,
+        };
+        const rc = std.c.fcntl(handle, std.c.F.SETLK, &lock);
+        if (rc == -1) {
+            return switch (std.posix.errno(rc)) {
+                .ACCES, .AGAIN => error.DaemonsRunning,
+                else => error.LmdbCheckFailed,
+            };
+        }
     }
 
     /// Open every canonical namespace in one write transaction (S9): no
@@ -367,7 +448,14 @@ pub const LmdbBackend = struct {
     }
 
     pub fn close(self: *LmdbBackend) void {
+        // env.deinit() closes LMDB's descriptor first. Closing our held
+        // descriptor after it is safe; doing so before would drop LMDB's
+        // locks (D5).
         self.env.deinit();
+        if (self.lock_file) |file| {
+            file.close();
+            self.lock_file = null;
+        }
     }
 
     pub fn get(self: *LmdbBackend, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
@@ -1238,6 +1326,33 @@ test "LmdbBackend: the real madvise marks the env VMA nocore" {
     const after = (try findVmEntry(st.ino, st.dev)) orelse return error.VmEntryNotFound;
     try std.testing.expectEqual(rec.kve_start, after.kve_start);
     try std.testing.expect(after.kve_flags & KVME_FLAG_NOCOREDUMP != 0);
+}
+
+test "LmdbBackend: a vmmap miss uses the not-found warning, not the exhaustion one" {
+    // Goal: a lookup that returns records but no matching VMA is a miss,
+    // not retry exhaustion: the open warns with the distinct not-found
+    // message, the exhaustion counter stays put, and no madvise is
+    // attempted without a record. Method: the seam returns one vnode
+    // record whose inode and filesystem cannot match the env map.
+    const path = freshTestDir();
+    vmmapCall.reset();
+    defer vmmapCall.reset();
+    vmmapCall.stub = true;
+
+    var recs = [_]KinfoVmentry{std.mem.zeroes(KinfoVmentry)};
+    recs[0].kve_structsize = @sizeOf(KinfoVmentry);
+    recs[0].kve_type = KVME_TYPE_VNODE;
+    recs[0].kve_vn_fileid = 1;
+    recs[0].kve_vn_fsid = 1;
+    vmmapCall.records = std.mem.sliceAsBytes(&recs);
+
+    const calls0 = madviseCall.calls;
+    const warns0 = warnCall.exhausted_calls;
+    var db = try LmdbBackend.open(path, .{});
+    defer db.close();
+    try std.testing.expectEqual(calls0, madviseCall.calls);
+    try std.testing.expectEqual(@as(usize, 1), vmmapCall.read_calls);
+    try std.testing.expectEqual(warns0, warnCall.exhausted_calls);
 }
 
 fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {

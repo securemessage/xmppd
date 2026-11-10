@@ -155,6 +155,12 @@ pub const OutboundConnection = struct {
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
     tls_state: ?TlsState = null,
+    /// DANE state armed before the handshake. Present only when the TLSA
+    /// lookup found usable records, in which case the handshake itself
+    /// fails unless a record matches; null means the dialback fallback.
+    dane_state: ?ssl_mod.DaneState = null,
+    /// What `prepareDane` installed, read back for the verdict.
+    dane_prepared: ssl_mod.DanePrepared = .dane,
     /// Persistent read buffer (survives across kqueue events).
     read_buf: [READ_BUF_SIZE]u8 = undefined,
     read_start: usize = 0,
@@ -211,6 +217,7 @@ pub const OutboundConnection = struct {
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
+        // dropTargets below frees the DANE state too (it borrows target data).
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();
@@ -240,7 +247,7 @@ pub const OutboundConnection = struct {
         self.next_idx = 0;
     }
 
-    /// Free every adopted target and the list itself.
+    /// Free the adopted targets and drop any DANE state built for them.
     pub fn dropTargets(self: *OutboundConnection) void {
         for (self.targets) |t| {
             self.alloc.free(t.host);
@@ -250,6 +257,15 @@ pub const OutboundConnection = struct {
         if (self.targets.len > 0) self.alloc.free(self.targets);
         self.targets = &.{};
         self.target_host = "";
+        self.dropDaneState();
+    }
+
+    /// Release the DANE state alone: it borrows the target's record data, so
+    /// it must never outlive the targets it was built from.
+    pub fn dropDaneState(self: *OutboundConnection) void {
+        if (self.dane_state) |*s| s.deinit();
+        self.dane_state = null;
+        self.dane_prepared = .dane;
     }
 
     /// Hostname of the current target, for logs and TLSA owner names.

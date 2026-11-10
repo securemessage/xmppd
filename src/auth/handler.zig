@@ -12,6 +12,14 @@
 
 const std = @import("std");
 const sasl = @import("sasl");
+const precis = @import("precis_username");
+
+/// Per-thread auth scratch. IdP PLAIN copies the typed authcid into a small
+/// local buffer before reusing it, so nested lock-store preparation stays
+/// independent without a third 64 KiB thread-local instance. The lock store
+/// owns the only other instance: it is called from inside this prepared
+/// authcid and therefore cannot share the same buffer.
+threadlocal var auth_precis_scratch: precis.Scratch = undefined;
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const policy_mod = @import("policy");
@@ -362,10 +370,15 @@ pub fn AuthHandler(comptime Store: type) type {
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
-                // A lock on the supplied localpart must reject before the
-                // IdP call, or a right password for a locked account is
-                // distinguishable from a wrong one.
-                if (self.policy.check(username, req.client_ip)) |reason| {
+                // Prepare the supplied name for its lock pre-check. An
+                // unpreparable name gets the wrong-password reply and an
+                // IP-only charge, never a store-error oracle or an IdP call.
+                const typed_username = auth_precis_scratch.localpart(localpartOf(username)) catch {
+                    log.info("PLAIN auth failed (IdP): invalid supplied name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
+                if (self.policy.check(typed_username, req.client_ip)) |reason| {
                     return .{ .reply = authFailure(req.conn_id, reason) };
                 }
 
@@ -373,11 +386,18 @@ pub fn AuthHandler(comptime Store: type) type {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
-                    // S3: locks bind to the identity the IdP handed
-                    // back, normalized to its localpart ("Alice@domain" and
-                    // "Alice" resolve to the same "alice" admission every
-                    // mechanism enforces).
-                    const identity = localpartOf(validated_user);
+                    // S3: locks and the bound JID use the prepared localpart
+                    // of the identity the IdP handed back, never its domain.
+                    var typed_account_buf: [precis.max_username_octets]u8 = undefined;
+                    @memcpy(typed_account_buf[0..typed_username.len], typed_username);
+                    const typed_stable = typed_account_buf[0..typed_username.len];
+                    const identity = auth_precis_scratch.localpart(
+                        localpartOf(validated_user),
+                    ) catch {
+                        log.info("PLAIN auth failed (IdP): invalid returned identity", .{});
+                        self.policy.recordOutcome("", req.client_ip, .failure);
+                        return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                    };
                     // The pre-check ran on the typed name, which the IdP may
                     // resolve to a different identity. Check the identity's
                     // own lock now and answer it exactly like a wrong
@@ -388,7 +408,7 @@ pub fn AuthHandler(comptime Store: type) type {
                             log.info("PLAIN auth failed (IdP): '{s}' maps to a locked identity", .{username});
                             // Same bookkeeping as a wrong password: the typed
                             // name and the IP, never the locked identity.
-                            self.policy.recordOutcome(username, req.client_ip, .failure);
+                            self.policy.recordOutcome(typed_stable, req.client_ip, .failure);
                             return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                         }
                         return .{ .reply = authFailure(req.conn_id, reason) };
@@ -396,7 +416,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     if (self.policy.admitAccount(identity)) |reason| {
                         return .{ .reply = authFailure(req.conn_id, reason) };
                     }
-                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ username, identity });
+                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ typed_stable, identity });
                     self.policy.recordOutcome(identity, req.client_ip, .success);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
@@ -404,31 +424,44 @@ pub fn AuthHandler(comptime Store: type) type {
                         .server_final = "",
                     } } };
                 } else {
-                    log.info("PLAIN auth failed (IdP): '{s}'", .{username});
-                    self.policy.recordOutcome(username, req.client_ip, .failure);
+                    log.info("PLAIN auth failed (IdP): '{s}'", .{typed_username});
+                    self.policy.recordOutcome(typed_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
             }
 
             // Traditional credential lookup + SCRAM derive
             if (comptime @hasDecl(Store, "lookup")) {
+                // The users namespace is keyed by RFC 7622 localparts. A name
+                // that fails preparation can never match an account: answer
+                // exactly like a wrong password, charge only the IP key, and
+                // create no account key. Buffer contract of xmppLocalpart:
+                // buf 6x input.len, scratch 3x input.len each.
+                const account_username = auth_precis_scratch.localpart(
+                    username,
+                ) catch {
+                    log.info("PLAIN auth failed: invalid account name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
+
                 // Count the account attempt and enforce the lock before the
                 // lookup and KDF. A crypto-pool job also counts against the
                 // lockout threshold while it is in flight.
                 const account_reason = if (self.crypto_pool != null)
-                    self.policy.admitAccountPending(username, self.pendingFor(username))
+                    self.policy.admitAccountPending(account_username, self.pendingFor(account_username))
                 else
-                    self.policy.admitAccount(username);
+                    self.policy.admitAccount(account_username);
                 if (account_reason) |reason| {
                     return .{ .reply = authFailure(req.conn_id, reason) };
                 }
 
-                const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                const maybe_creds = self.store.lookup(self.allocator, account_username) catch {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 const creds = maybe_creds orelse {
-                    log.info("PLAIN auth failed: user '{s}' not found", .{username});
-                    self.policy.recordOutcome(username, req.client_ip, .failure);
+                    log.info("PLAIN auth failed: user '{s}' not found", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
 
@@ -441,7 +474,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     const job_id = pool.put(password, creds.salt, creds.iteration_count, creds.stored_key) catch {
                         return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                     };
-                    const username_owned = self.allocator.dupe(u8, username) catch {
+                    const username_owned = self.allocator.dupe(u8, account_username) catch {
                         log.err("pending auth alloc failed; job {d} completes orphaned", .{job_id});
                         return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                     };
@@ -468,22 +501,22 @@ pub fn AuthHandler(comptime Store: type) type {
                 // A password that fails OpaqueString prep cannot match a
                 // prepped stored credential: treat as a failed auth.
                 const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count) catch {
-                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    self.policy.recordOutcome(username, req.client_ip, .failure);
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
                 // T211 follow-up: constant-time compare for StoredKey.
                 if (!std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, creds.stored_key)) {
-                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    self.policy.recordOutcome(username, req.client_ip, .failure);
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
 
-                log.info("PLAIN auth success: '{s}'", .{username});
-                self.policy.recordOutcome(username, req.client_ip, .success);
+                log.info("PLAIN auth success: '{s}'", .{account_username});
+                self.policy.recordOutcome(account_username, req.client_ip, .success);
                 return .{ .reply = protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
-                    .username = username,
+                    .username = account_username,
                     .server_final = "",
                 } } };
             }
@@ -535,12 +568,19 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             if (result) |validated_user| {
-                // Lock check on the IdP-verified identity (S3).
-                const identity = localpartOf(validated_user);
+                // Policy and the bound JID use the prepared localpart of the
+                // IdP-verified identity, never the full IdP-qualified string.
+                const identity = auth_precis_scratch.localpart(
+                    localpartOf(validated_user),
+                ) catch {
+                    log.info("OAUTHBEARER failed: invalid returned identity", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return authFailure(req.conn_id, "not-authorized");
+                };
                 if (self.policy.admitAccount(identity)) |reason| {
                     return authFailure(req.conn_id, reason);
                 }
-                log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
+                log.info("OAUTHBEARER auth success: '{s}'", .{identity});
                 self.policy.recordOutcome(identity, req.client_ip, .success);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
                     self.store.getPhotoUrl()
@@ -548,7 +588,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     "";
                 return protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
-                    .username = validated_user,
+                    .username = identity,
                     .server_final = "",
                     .photo_url = photo_url,
                 } };
@@ -592,27 +632,40 @@ pub fn AuthHandler(comptime Store: type) type {
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
 
+                // Look up by the RFC 7622 localpart, but keep the raw n= name
+                // in the SCRAM exchange: client-first remains part of the
+                // AuthMessage. An unpreparable name gets the same reply as a
+                // wrong password, with IP-only bookkeeping and no account key.
+                const account_username = auth_precis_scratch.localpart(
+                    username,
+                ) catch {
+                    log.info("SCRAM auth failed: invalid account name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    session.deinit();
+                    return authFailure(req.conn_id, "not-authorized");
+                };
+
                 // Count the account attempt and enforce the lock before any
                 // store lookup or challenge work.
-                if (self.policy.admitAccount(username)) |reason| {
+                if (self.policy.admitAccount(account_username)) |reason| {
                     session.deinit();
                     return authFailure(req.conn_id, reason);
                 }
                 session.setClientIp(req.client_ip);
 
                 // Look up credentials — try cache first, fall back to store
-                const name_hash = hashUsername(username);
+                const name_hash = hashUsername(account_username);
                 const now = std.time.timestamp();
                 const creds = self.cacheLookup(name_hash, now) orelse blk: {
-                    const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                    const maybe_creds = self.store.lookup(self.allocator, account_username) catch {
                         session.deinit();
                         return authFailure(req.conn_id, "temporary-auth-failure");
                     };
                     const c = maybe_creds orelse {
-                        log.info("SCRAM auth failed: user '{s}' not found", .{username});
+                        log.info("SCRAM auth failed: user '{s}' not found", .{account_username});
                         // The attempt was counted at admission; an unknown
                         // user is still a failed authentication.
-                        self.policy.recordOutcome(username, req.client_ip, .failure);
+                        self.policy.recordOutcome(account_username, req.client_ip, .failure);
                         session.deinit();
                         return authFailure(req.conn_id, "not-authorized");
                     };
@@ -651,10 +704,20 @@ pub fn AuthHandler(comptime Store: type) type {
             session.touched_at = std.time.timestamp();
 
             const username = session.server.username;
+            // The SCRAM proof uses the raw n= name above. Account policy and
+            // the bound identity use its RFC 7622 localpart, as at init.
+            const account_username = auth_precis_scratch.localpart(
+                username,
+            ) catch {
+                self.policy.recordOutcome("", session.clientIp(), .failure);
+                session.deinit();
+                return authFailure(resp.conn_id, "not-authorized");
+            };
+
             // S3/A1: re-check both keys without counting before the proof is
             // verified, so a lock that arrived between challenge and final
             // gets the same reply for a right and a wrong password.
-            if (self.policy.check(username, session.clientIp())) |reason| {
+            if (self.policy.check(account_username, session.clientIp())) |reason| {
                 session.deinit();
                 return authFailure(resp.conn_id, reason);
             }
@@ -662,18 +725,18 @@ pub fn AuthHandler(comptime Store: type) type {
             // Process client-final-message
             const server_final = session.server.handleClientFinal(resp.payload) catch {
                 log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
-                self.policy.recordOutcome(username, session.clientIp(), .failure);
+                self.policy.recordOutcome(account_username, session.clientIp(), .failure);
                 session.deinit();
                 return authFailure(resp.conn_id, "not-authorized");
             };
 
-            log.info("SCRAM auth success: '{s}' conn={d}", .{ username, resp.conn_id });
-            self.policy.recordOutcome(username, session.clientIp(), .success);
+            log.info("SCRAM auth success: '{s}' conn={d}", .{ account_username, resp.conn_id });
+            self.policy.recordOutcome(account_username, session.clientIp(), .success);
 
-            // Keep session alive briefly for the username reference, then clean up
+            // Keep session alive for server_final's arena-backed slice.
             const result = protocol.Message{ .auth_success = .{
                 .conn_id = resp.conn_id,
-                .username = username,
+                .username = account_username,
                 .server_final = server_final,
             } };
 
@@ -700,12 +763,23 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            self.store.changePassword(self.allocator, req.username, req.new_password) catch |err| {
+            // Resolve the account through the one RFC 7622 localpart function.
+            const account_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
+            self.store.changePassword(self.allocator, account_username, req.new_password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserNotFound => "item-not-found",
                     else => "internal-server-error",
                 };
-                log.info("password change failed for '{s}': {s}", .{ req.username, reason });
+                log.info("password change failed for '{s}': {s}", .{ account_username, reason });
                 return protocol.Message{ .password_change_result = .{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -713,8 +787,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            self.cacheInvalidate(req.username);
-            log.info("password changed for '{s}'", .{req.username});
+            self.cacheInvalidate(account_username);
+            log.info("password changed for '{s}'", .{account_username});
             return protocol.Message{ .password_change_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -739,12 +813,23 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            // Resolve the account through the one RFC 7622 localpart function.
+            const account_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                return protocol.Message{ .account_delete_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
             // Remove from UserStore (ignore UserNotFound — may be external auth)
-            self.store.removeUser(self.allocator, req.username) catch |err| {
+            self.store.removeUser(self.allocator, account_username) catch |err| {
                 switch (err) {
                     error.UserNotFound => {},
                     else => {
-                        log.err("account delete failed for '{s}': store error", .{req.username});
+                        log.err("account delete failed for '{s}': store error", .{account_username});
                         return protocol.Message{ .account_delete_result = .{
                             .conn_id = req.conn_id,
                             .success = false,
@@ -759,7 +844,7 @@ pub fn AuthHandler(comptime Store: type) type {
             // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
             // or naturally don't apply once the account is gone.
 
-            log.info("account deleted (auth): '{s}'", .{req.username});
+            log.info("account deleted (auth): '{s}'", .{account_username});
             return protocol.Message{ .account_delete_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -815,6 +900,23 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            // RFC 7622 Section 3.3: store and compare canonical localparts
+            // only. Core prepares the name before the IPC hop; preparing
+            // again is idempotent (RFC 8264 Section 7 stability), and the
+            // xmppctl admin path arrives raw. Buffer contract of
+            // xmppLocalpart: buf 6x input.len, scratch 3x input.len each;
+            // input over max_input_octets is rejected by the profile itself.
+            const canon_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                log.info("registration rejected: '{s}' is not a valid UsernameCaseMapped name", .{req.username});
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
             // Validate invitation code if required (skip for admin)
             if (!is_admin and self.reg_config.require_invite) {
                 if (req.invite_code.len == 0) {
@@ -843,13 +945,14 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
             }
 
-            // Create the user
-            self.store.addUser(self.allocator, req.username, req.password) catch |err| {
+            // Create the user (canonical name: conflicts are canonical-name
+            // conflicts).
+            self.store.addUser(self.allocator, canon_username, req.password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserExists => "conflict",
                     else => "internal-server-error",
                 };
-                log.info("registration failed for '{s}': {s}", .{ req.username, reason });
+                log.info("registration failed for '{s}': {s}", .{ canon_username, reason });
                 return protocol.Message{ .register_result = regResult{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -857,7 +960,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            log.info("user registered: '{s}'", .{req.username});
+            log.info("user registered: '{s}'", .{canon_username});
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -1168,6 +1271,60 @@ test "AuthHandler: PLAIN auth success" {
     try std.testing.expectEqualStrings("alice", result.auth_success.username);
 }
 
+test "AuthHandler: PLAIN prepares the authcid for lookup and the bound identity" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "pw");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const result = handleSync(&handler, plainRequest(6, "10.0.0.6", plainPayload(&buf, "NaplesTB", "pw"))) orelse return error.NoResponse;
+
+    // The stored key and the identity returned for the bound JID are both
+    // the prepared localpart, not the typed spelling.
+    try std.testing.expectEqualStrings("naplestb", result.auth_success.username);
+}
+
+test "AuthHandler: PLAIN invalid names are indistinguishable from a wrong password" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    // Even a legacy raw row must not make an invalid name match an account.
+    try store.addUser(allocator, "bad name", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, plainRequest(7, "10.0.0.7", plainPayload(&bad_buf, "bad name", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(bad == .auth_failure);
+    var wrong_buf: [64]u8 = undefined;
+    const wrong = handleSync(&handler, plainRequest(8, "10.0.0.8", plainPayload(&wrong_buf, "ghost", "pw"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", bad.auth_failure.reason);
+    try std.testing.expectEqualStrings(wrong.auth_failure.reason, bad.auth_failure.reason);
+
+    // No account key was created for the invalid name, but its attempt was
+    // charged to the IP key.
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.7") orelse return error.ExpectedDenial);
+}
+
 test "AuthHandler: PLAIN auth wrong password" {
     const allocator = std.testing.allocator;
 
@@ -1309,7 +1466,7 @@ test "AuthHandler: lock store error fails closed (T352)" {
     try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
 }
 
-test "AuthHandler: locks catch case and domain variants of the typed name" {
+test "AuthHandler: locks catch case variants and full-JID authcids are invalid" {
     const allocator = std.testing.allocator;
 
     var db = try MemoryBackend.open("", .{});
@@ -1346,7 +1503,9 @@ test "AuthHandler: locks catch case and domain variants of the typed name" {
         } }) orelse return error.NoResponse;
         try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
     }
-    // Domain form of the locked name.
+    // A full JID is not an authcid localpart: U+0040 fails RFC 7622
+    // preparation, so the reply is the same as for a wrong password rather
+    // than an account-lock oracle.
     {
         const user = "ALICE@us.example";
         const pass = "secret123";
@@ -1364,7 +1523,7 @@ test "AuthHandler: locks catch case and domain variants of the typed name" {
             .username = "",
             .payload = payload[0 .. 2 + user.len + pass.len],
         } }) orelse return error.NoResponse;
-        try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+        try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
     }
 }
 
@@ -1452,7 +1611,117 @@ test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
         .payload = "n,,\x01auth=Bearer tok123\x01\x01",
     } }) orelse return error.NoResponse;
 
-    try std.testing.expectEqualStrings("bob@idp.example", result.auth_success.username);
+    try std.testing.expectEqualStrings("bob", result.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN prepares the supplied and returned identities" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "NaplesTB@idp.example",
+        .password_secret = "right",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, plainRequest(44, "10.0.0.44", plainPayload(&bad_buf, "bad name", "wrong"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", bad.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.44") orelse return error.ExpectedDenial);
+
+    var good_buf: [64]u8 = undefined;
+    const good = handleSync(&handler, plainRequest(45, "10.0.0.45", plainPayload(&good_buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", good.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN accepts an email or JID authcid" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var buf: [96]u8 = undefined;
+    const result = handleSync(&handler, plainRequest(49, "10.0.0.49", plainPayload(&buf, "alice@idp.example", "right"))) orelse return error.NoResponse;
+
+    // The IdP receives the raw login, while the lock key and bound JID use
+    // only its prepared localpart.
+    try std.testing.expectEqualStrings("alice", result.auth_success.username);
+    try std.testing.expectEqual(@as(u32, 1), store.password_calls);
+}
+
+test "AuthHandler: OAUTHBEARER binds the prepared localpart" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "NaplesTB@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 46,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.46",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", result.auth_success.username);
+}
+
+test "AuthHandler: invalid IdP identities get not-authorized with IP-only charge" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "bad name@idp.example",
+        .password_secret = "right",
+        .token_user = "bad name@idp.example",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const plain = handleSync(&handler, plainRequest(47, "10.0.0.47", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", plain.auth_failure.reason);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.47") orelse return error.ExpectedDenial);
+
+    const oauth = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 48,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.48",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", oauth.auth_failure.reason);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.48") orelse return error.ExpectedDenial);
 }
 
 test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER" {
@@ -1707,6 +1976,84 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     handler.cleanupSession(0, 5);
 }
 
+test "AuthHandler: SCRAM prepares the account name but preserves the exchange" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "testuser", "testpassword");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // The client proves the exchange with its typed n= spelling while the
+    // server looks up and returns the prepared localpart.
+    var client = sasl.ScramClient.init(allocator, "TestUser", "testpassword");
+    defer client.deinit();
+    const client_first = try client.clientFirst();
+    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 15,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.15",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "TestUser",
+        .payload = client_first,
+    } }) orelse return error.NoResponse;
+
+    const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
+    const success_msg = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 15,
+        .payload = client_final,
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("testuser", success_msg.auth_success.username);
+    try client.handleServerFinal(success_msg.auth_success.server_final);
+    try std.testing.expect(client.isComplete());
+    handler.cleanupSession(0, 15);
+}
+
+test "AuthHandler: SCRAM invalid names fail closed to not-authorized with IP-only charge" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    // A raw legacy row still cannot make the invalid name match an account.
+    try store.addUser(allocator, "bad name", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var client = sasl.ScramClient.init(allocator, "bad name", "pw");
+    defer client.deinit();
+    const client_first = try client.clientFirst();
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 16,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.16",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "bad name",
+        .payload = client_first,
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expect(result == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.16") orelse return error.ExpectedDenial);
+}
+
 test "AuthHandler: SCRAM unknown user" {
     const allocator = std.testing.allocator;
 
@@ -1926,7 +2273,7 @@ test "AuthHandler: PLAIN auth defers to crypto pool and completes (T121)" {
     handler.enableCryptoPool(&pool);
 
     var buf: [16]u8 = undefined;
-    const res = handleSync(&handler, plainRequest(42, "10.0.0.9", plainPayload(&buf, "dave", "pw123")));
+    const res = handleSync(&handler, plainRequest(42, "10.0.0.9", plainPayload(&buf, "Dave", "pw123")));
     // With a pool attached the sync helper reports no immediate reply...
     try std.testing.expect(res == null);
     // ...because the request went deferred.
@@ -2787,4 +3134,224 @@ test "AuthHandler: a permanently locked IdP identity rejects the Kelvin-sign ali
     try std.testing.expectEqualDeep(right_reply, wrong_reply);
     try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: registration stores the PRECIS canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // "ΟΔΟΣ" prepares to "οδοσ": U+03A3 folds to U+03C3 unconditionally (no
+    // final-sigma rule), so the account is stored under the canonical name
+    // and the typed name is not a key of its own.
+    const reply = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 300,
+        .username = "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.20",
+    } }) orelse return error.NoResponse;
+    if (reply != .register_result or !reply.register_result.success) return error.ExpectedRegisterSuccess;
+
+    try std.testing.expect((try store.lookup(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
+    try std.testing.expect((try store.lookup(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) == null);
+}
+
+test "AuthHandler: registration conflict is on the canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // Case variants of one name collide on the canonical form.
+    const first = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 310,
+        .username = "Alice",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.21",
+    } }) orelse return error.NoResponse;
+    if (first != .register_result or !first.register_result.success) return error.ExpectedRegisterSuccess;
+
+    for ([_][]const u8{ "alice", "ALICE" }) |variant| {
+        const dup = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 311,
+            .username = variant,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.21",
+        } }) orelse return error.NoResponse;
+        if (dup != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!dup.register_result.success);
+        try std.testing.expectEqualStrings("conflict", dup.register_result.reason);
+    }
+
+    // The Kelvin sign folds to 'k': U+212A and "k" are one account name.
+    const kelvin = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 312,
+        .username = "\u{212A}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kelvin != .register_result or !kelvin.register_result.success) return error.ExpectedRegisterSuccess;
+    try std.testing.expect((try store.lookup(allocator, "k")) != null);
+
+    const kdup = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 313,
+        .username = "k",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kdup != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!kdup.register_result.success);
+    try std.testing.expectEqualStrings("conflict", kdup.register_result.reason);
+}
+
+test "AuthHandler: password change resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "oldpw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const changed = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 330,
+        .username = "NaplesTB",
+        .new_password = "newpw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(changed.password_change_result.success);
+
+    var buf: [64]u8 = undefined;
+    const login = handleSync(&handler, plainRequest(331, "10.0.0.31", plainPayload(&buf, "NAPLESTB", "newpw"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", login.auth_success.username);
+
+    const invalid = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 332,
+        .username = "bad name",
+        .new_password = "pw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.password_change_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.password_change_result.reason);
+}
+
+test "AuthHandler: account delete resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "pw");
+    try store.addUser(allocator, "bad name", "pw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const deleted = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 340,
+        .username = "NaplesTB",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(deleted.account_delete_result.success);
+    try std.testing.expect((try store.lookup(allocator, "naplestb")) == null);
+
+    // An invalid name cannot delete even an exact raw legacy row.
+    const invalid = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 341,
+        .username = "bad name",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.account_delete_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.account_delete_result.reason);
+    try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
+}
+
+test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // Spaces and symbols fail the IdentifierClass; "@" is PVALID there but
+    // excluded from XMPP localparts by RFC 7622 Section 3.3.1.
+    for ([_][]const u8{ "a b", "\u{2603}", "\u{00A0}x", "a@b" }) |bad| {
+        const reply = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 320,
+            .username = bad,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.23",
+        } }) orelse return error.NoResponse;
+        if (reply != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!reply.register_result.success);
+        try std.testing.expectEqualStrings("not-acceptable", reply.register_result.reason);
+    }
+    try std.testing.expect((try store.lookup(allocator, "a b")) == null);
+
+    // Printable ASCII punctuation is PVALID (RFC 8264 section 8.2 ASCII7):
+    // "a!" is a valid account name and registers.
+    const ok = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 321,
+        .username = "a!",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (ok != .register_result or !ok.register_result.success) return error.ExpectedRegisterSuccess;
+
+    // An empty name stays a bad request (the form-level check runs first).
+    const empty = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 322,
+        .username = "",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (empty != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!empty.register_result.success);
+    try std.testing.expectEqualStrings("bad-request", empty.register_result.reason);
 }
