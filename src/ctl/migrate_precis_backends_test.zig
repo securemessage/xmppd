@@ -29,6 +29,21 @@ const NS_PENDING_SUB = backend_mod.registered("pending_sub");
 const NS_MESSAGES = backend_mod.registered("messages");
 const NS_BY_CONTACT = backend_mod.registered("by_contact");
 
+fn legacyOfflineKey(
+    allocator: std.mem.Allocator,
+    owner: []const u8,
+    timestamp: u64,
+    stanza_id: []const u8,
+) ![]u8 {
+    const key = try allocator.alloc(u8, owner.len + 1 + 8 + 1 + stanza_id.len);
+    @memcpy(key[0..owner.len], owner);
+    key[owner.len] = 0;
+    std.mem.writeInt(u64, key[owner.len + 1 ..][0..8], timestamp, .big);
+    key[owner.len + 1 + 8] = 0;
+    @memcpy(key[owner.len + 1 + 8 + 1 ..], stanza_id);
+    return key;
+}
+
 test "the LMDB offline lock catches an idle holder before env open" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1385,4 +1400,236 @@ test "migrate-precis plans and applies on real LMDB and RocksDB" {
     const archive_value = try archive.get(allocator, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
     defer if (archive_value) |value| allocator.free(value);
     try std.testing.expectEqualStrings("<message><body>private</body></message>", archive_value.?);
+}
+
+test "migrate-precis reports malformed offline_v2 rows" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    const Malformed = enum { short_value, id_past_end };
+    for ([_]Malformed{ .short_value, .id_past_end }) |malformed| {
+        var auth = try MemoryBackend.open("", .{});
+        defer auth.close();
+        var op = try MemoryBackend.open("", .{});
+        defer op.close();
+        var archive = try MemoryBackend.open("", .{});
+        defer archive.close();
+
+        const owner = "naplestb@us.example";
+        const key_prefix = try std.fmt.allocPrint(allocator, "{s}\x00", .{owner});
+        defer allocator.free(key_prefix);
+        const key = try allocator.alloc(u8, key_prefix.len + 8);
+        defer allocator.free(key);
+        @memcpy(key[0..key_prefix.len], key_prefix);
+        std.mem.writeInt(u64, key[key_prefix.len..][0..8], 1, .big);
+
+        switch (malformed) {
+            .short_value => try op.put(NS_OFFLINE_V2, key, &[_]u8{0} ** 5),
+            .id_past_end => {
+                var value: [12]u8 = undefined;
+                @memset(value[0..8], 0);
+                std.mem.writeInt(u32, value[8..12], 10, .big);
+                try op.put(NS_OFFLINE_V2, key, &value);
+            },
+        }
+
+        const domains = [_][]const u8{"us.example"};
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+        defer plan.deinit();
+        try std.testing.expect(plan.hasBlockingIssues());
+        var found = false;
+        for (plan.issues.items) |issue| {
+            if (issue.kind == .invalid_value and
+                std.mem.eql(u8, issue.namespace, NS_OFFLINE_V2) and
+                std.mem.eql(u8, issue.key, key))
+            {
+                found = true;
+            }
+        }
+        try std.testing.expect(found);
+        try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(
+            allocator,
+            &auth,
+            &op,
+            &archive,
+            &plan,
+            .{},
+        ));
+    }
+}
+
+test "migrate-precis reports unpreparable offline_v2 owners" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    const owner = "bad name@us.example";
+    const key_prefix = try std.fmt.allocPrint(allocator, "{s}\x00", .{owner});
+    defer allocator.free(key_prefix);
+    const key = try allocator.alloc(u8, key_prefix.len + 8);
+    defer allocator.free(key);
+    @memcpy(key[0..key_prefix.len], key_prefix);
+    std.mem.writeInt(u64, key[key_prefix.len..][0..8], 1, .big);
+
+    var value: [64]u8 = undefined;
+    @memset(value[0..8], 0);
+    std.mem.writeInt(u32, value[8..12], 4, .big);
+    @memcpy(value[12..16], "bad!");
+    const sender = "alice@us.example/res";
+    @memcpy(value[16..][0..sender.len], sender);
+    try op.put(NS_OFFLINE_V2, key, value[0 .. 16 + sender.len]);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(plan.hasBlockingIssues());
+    var found = false;
+    for (plan.issues.items) |issue| {
+        if (issue.kind == .invalid_name and
+            std.mem.eql(u8, issue.namespace, NS_OFFLINE_V2) and
+            std.mem.eql(u8, issue.key, key))
+        {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expectError(error.MigrationBlocked, migrate.applyPlan(
+        allocator,
+        &auth,
+        &op,
+        &archive,
+        &plan,
+        .{},
+    ));
+}
+
+test "migrate-precis keeps offline_seq above the stored counter" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    var auth = try MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var archive = try MemoryBackend.open("", .{});
+    defer archive.close();
+
+    var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+    _ = try offline.storePointer("naplestb@us.example", "seed@remote.example/x", "seed", 1);
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter, 100, .big);
+    try op.put(NS_OFFLINE_SEQ, "naplestb@us.example", &counter);
+    _ = try offline.storePointer("NaplesTB@us.example", "alice@us.example/a", "offline", 2);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(journal_dir);
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+    defer plan.deinit();
+    try std.testing.expect(!plan.hasBlockingIssues());
+    try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+    const stored = try op.get(allocator, NS_OFFLINE_SEQ, "naplestb@us.example");
+    defer if (stored) |value| allocator.free(value);
+    try std.testing.expect(stored != null);
+    try std.testing.expectEqual(@as(u64, 101), std.mem.readInt(u64, stored.?[0..8], .big));
+
+    const pointers = try offline.getPointers("naplestb@us.example");
+    defer offline.freePointers(pointers);
+    try std.testing.expectEqual(@as(usize, 2), pointers.len);
+    var moved_seq: u64 = 0;
+    for (pointers) |pointer| {
+        if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/a")) moved_seq = pointer.sequence;
+    }
+    try std.testing.expectEqual(@as(u64, 101), moved_seq);
+}
+
+test "migrate-precis separates two source spellings folding to one target" {
+    const allocator = std.testing.allocator;
+    const MemoryBackend = backend_mod.MemoryBackend;
+    const Mode = enum { offline_only, with_archive };
+    for ([_]Mode{ .offline_only, .with_archive }) |mode| {
+        var auth = try MemoryBackend.open("", .{});
+        defer auth.close();
+        var op = try MemoryBackend.open("", .{});
+        defer op.close();
+        var archive = try MemoryBackend.open("", .{});
+        defer archive.close();
+
+        var offline = offline_store_mod.GenericOfflineStore(MemoryBackend).init(&op, allocator);
+        const timestamp: u64 = 1_700_000_000;
+        const key_upper = try legacyOfflineKey(allocator, "NaplesTB@us.example", timestamp, "offline");
+        defer allocator.free(key_upper);
+        const key_caps = try legacyOfflineKey(allocator, "NAPLESTB@us.example", timestamp, "offline");
+        defer allocator.free(key_caps);
+        try op.put(NS_OFFLINE, key_upper, "alice@us.example/res");
+        try op.put(NS_OFFLINE, key_caps, "bob@us.example/res");
+
+        var archive_store = archive_store_mod.ArchiveStore(MemoryBackend).init(&archive, allocator);
+        if (mode == .with_archive) {
+            try archive_store.store("NaplesTB@us.example", "alice@us.example", "offline", timestamp, "<message><body>NAPLES</body></message>");
+            try archive_store.store("NAPLESTB@us.example", "bob@us.example", "offline", timestamp, "<message><body>UPPER</body></message>");
+        }
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const journal_dir = try tmp.dir.realpathAlloc(allocator, ".");
+        defer allocator.free(journal_dir);
+
+        const domains = [_][]const u8{"us.example"};
+        var plan = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
+        defer plan.deinit();
+        try std.testing.expect(!plan.hasBlockingIssues());
+        try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
+
+        const pointers = try offline.getPointers("naplestb@us.example");
+        defer offline.freePointers(pointers);
+        try std.testing.expectEqual(@as(usize, 2), pointers.len);
+        try std.testing.expect(!std.mem.eql(u8, pointers[0].stanza_id, pointers[1].stanza_id));
+        var saw_alice = false;
+        var saw_bob = false;
+        for (pointers) |pointer| {
+            if (std.mem.eql(u8, pointer.from_jid, "alice@us.example/res")) {
+                saw_alice = true;
+                if (mode == .with_archive) {
+                    const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+                    defer if (body) |value| allocator.free(value);
+                    try std.testing.expect(body != null);
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "NAPLES") != null);
+                }
+            }
+            if (std.mem.eql(u8, pointer.from_jid, "bob@us.example/res")) {
+                saw_bob = true;
+                if (mode == .with_archive) {
+                    const body = try archive_store.getMessage("naplestb@us.example", pointer.timestamp, pointer.stanza_id);
+                    defer if (body) |value| allocator.free(value);
+                    try std.testing.expect(body != null);
+                    try std.testing.expect(std.mem.indexOf(u8, body.?, "UPPER") != null);
+                }
+            }
+        }
+        try std.testing.expect(saw_alice and saw_bob);
+
+        if (mode == .with_archive) {
+            var by_contact = try archive.iterator(NS_BY_CONTACT, "naplestb@us.example\x00");
+            defer by_contact.deinit();
+            var saw_upper = false;
+            var saw_naples = false;
+            while (by_contact.next()) |entry| {
+                const body = try archive_store.getMessage("naplestb@us.example", timestamp, entry.value);
+                defer if (body) |value| allocator.free(value);
+                if (body) |value| {
+                    if (std.mem.indexOf(u8, value, "UPPER") != null) saw_upper = true;
+                    if (std.mem.indexOf(u8, value, "NAPLES") != null) saw_naples = true;
+                }
+            }
+            try std.testing.expect(saw_upper and saw_naples);
+        }
+    }
 }

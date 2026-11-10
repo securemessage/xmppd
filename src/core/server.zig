@@ -6736,9 +6736,9 @@ test "F6: disco info to the MUC host in another case is the conference service" 
 test "F6: Session carries one shared IQ payload prep buffer" {
     // LOW-3: the roster/block item JID and the MAM 'with' JID share
     // iq_jid_prep_buf; a second 3071-octet payload buffer must not return.
-    // 80288 = the pre-PRECIS 79504 bound plus the 1023-octet
-    // auth_username_buf (+767) and iq_pubsub_verb (+16), padded.
-    try std.testing.expect(@sizeOf(Session) <= 80288);
+    // 80296 covers the 1023-octet auth_username_buf, iq_pubsub_verb and the
+    // SslConn DANE fields the shared verifier added (fatal, syscall_errno).
+    try std.testing.expect(@sizeOf(Session) <= 80296);
 }
 
 test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {

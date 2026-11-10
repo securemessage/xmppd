@@ -68,6 +68,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Shared DANE module: core rules plus the OpenSSL backend that performs
+    // verification inside the handshake. The dependency is a pinned archive so
+    // the port can supply it through ZIG_TUPLE.
+    const dane_dep = b.dependency("dane", .{ .target = target, .optimize = optimize });
+    const dane_mod = dane_dep.module("dane");
+    const dane_openssl_mod = dane_dep.module("dane-openssl");
+
     const tls_mod = b.createModule(.{
         .root_source_file = b.path("lib/tls/tls.zig"),
         .target = target,
@@ -82,6 +89,8 @@ pub fn build(b: *std.Build) void {
     });
     ssl_mod.linkSystemLibrary("ssl", .{});
     ssl_mod.linkSystemLibrary("crypto", .{});
+    ssl_mod.addImport("dane", dane_mod);
+    ssl_mod.addImport("dane-openssl", dane_openssl_mod);
 
     const dns_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
@@ -97,6 +106,7 @@ pub fn build(b: *std.Build) void {
     });
     wire_mod.addImport("dns", dns_mod);
     dns_mod.addImport("wire", wire_mod);
+    dns_mod.addImport("dane", dane_mod);
 
     // X2 shared async resolver (lib/dns/async.zig); owns its own kqueue.
     const dns_async_mod = b.createModule(.{
@@ -197,7 +207,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/net/net.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    net_mod.addImport("ssl", ssl_mod);
 
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
@@ -248,6 +260,8 @@ pub fn build(b: *std.Build) void {
     });
     ssl_test_mod.linkSystemLibrary("ssl", .{});
     ssl_test_mod.linkSystemLibrary("crypto", .{});
+    ssl_test_mod.addImport("dane", dane_mod);
+    ssl_test_mod.addImport("dane-openssl", dane_openssl_mod);
 
     const dns_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
@@ -255,6 +269,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    dns_test_mod.addImport("dane", dane_mod);
 
     const wire_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/wire.zig"),
@@ -351,6 +366,12 @@ pub fn build(b: *std.Build) void {
 
     // xmppc socketpair harness: Engine/Session driven against a scripted fake
     // server (T-6871B4C7). Needs xmppc public module + the ssl wrapper.
+    const test_support_mod = b.createModule(.{
+        .root_source_file = b.path("test/support/pki.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const socketpair_test_mod = b.createModule(.{
         .root_source_file = b.path("test/xmppc/session_socketpair.zig"),
         .target = target,
@@ -362,6 +383,9 @@ pub fn build(b: *std.Build) void {
     socketpair_test_mod.addImport("sasl", sasl_mod);
     socketpair_test_mod.addImport("tls", tls_mod);
     socketpair_test_mod.addImport("dns", dns_mod);
+    socketpair_test_mod.addImport("dns_async", dns_async_mod);
+    socketpair_test_mod.addImport("dane", dane_mod);
+    socketpair_test_mod.addImport("test_support", test_support_mod);
 
     const socketpair_tests = b.addTest(.{
         .name = "xmppc-socketpair-tests",
@@ -511,6 +535,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // lib/net/frame.zig is self-contained (std only); the F3 codec test
+    // proves FrameWriter.begin/commitEncoded hosts encode() in place.
+    const net_frame_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ipc_protocol_test_mod.addImport("net_frame", net_frame_mod);
 
     const ipc_protocol_tests = b.addTest(.{
         .name = "ipc-protocol-tests",
@@ -998,29 +1030,6 @@ pub fn build(b: *std.Build) void {
 
     const run_s2s_connector_tests = b.addRunArtifact(s2s_connector_tests);
 
-    // --- S2S DANE tests ---
-
-    const s2s_dane_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/s2s/dane.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    s2s_dane_test_mod.addImport("ssl", ssl_test_mod);
-    s2s_dane_test_mod.addImport("xml", xml_mod);
-    s2s_dane_test_mod.addImport("dns", dns_mod);
-    s2s_dane_test_mod.addImport("dns_async", dns_async_mod);
-    s2s_dane_test_mod.addImport("xmpp", xmpp_mod);
-    s2s_dane_test_mod.linkSystemLibrary("ssl", .{});
-    s2s_dane_test_mod.linkSystemLibrary("crypto", .{});
-
-    const s2s_dane_tests = b.addTest(.{
-        .name = "s2s-dane-tests",
-        .root_module = s2s_dane_test_mod,
-    });
-
-    const run_s2s_dane_tests = b.addRunArtifact(s2s_dane_tests);
-
     // --- S2S dialback tests ---
 
     const s2s_dialback_test_mod = b.createModule(.{
@@ -1092,6 +1101,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("wire", wire_mod);
     s2s_main_test_mod.addImport("dns_async", dns_async_mod);
     s2s_main_test_mod.addImport("xmpp", xmpp_mod);
+    s2s_main_test_mod.addImport("test_support", test_support_mod);
     s2s_main_test_mod.linkSystemLibrary("ssl", .{});
     s2s_main_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -2061,7 +2071,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_offline_store_tests.step);
     test_step.dependOn(&run_s2s_stream_tests.step);
     test_step.dependOn(&run_s2s_connector_tests.step);
-    test_step.dependOn(&run_s2s_dane_tests.step);
     test_step.dependOn(&run_s2s_dialback_tests.step);
     test_step.dependOn(&run_s2s_session_tests.step);
     test_step.dependOn(&run_s2s_main_tests.step);

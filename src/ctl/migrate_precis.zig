@@ -52,6 +52,9 @@ pub const IssueKind = enum {
     /// Non-blocking: a data row with a colliding key and different value was
     /// moved to a deterministic stanza-id suffix instead of being deleted.
     rekeyed,
+    /// Blocking: a stored row cannot be decoded and must be repaired or
+    /// removed before migration.
+    invalid_value,
 };
 
 pub const Issue = struct {
@@ -183,10 +186,10 @@ fn artifactPathAbs(allocator: std.mem.Allocator, dir: []const u8, basename: []co
     return std.fs.path.join(allocator, &.{ dir, basename });
 }
 
-fn syncDir(dir_path: []const u8) void {
-    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+fn syncDir(dir_path: []const u8) !void {
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
     defer dir.close();
-    std.posix.fsync(dir.fd) catch {};
+    try std.posix.fsync(dir.fd);
 }
 
 fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex: []const u8) !void {
@@ -202,7 +205,7 @@ fn writeRecoveryMarker(allocator: std.mem.Allocator, dir: []const u8, digest_hex
         try file.sync();
     }
     try std.fs.cwd().rename(tmp_path, path);
-    syncDir(dir);
+    try syncDir(dir);
 }
 
 fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const Plan) ![]u8 {
@@ -211,6 +214,7 @@ fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
     var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    defer file.close();
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     try file.writeAll(recovery_header);
     hasher.update(recovery_header);
@@ -243,9 +247,8 @@ fn writeRecoveryPlan(allocator: std.mem.Allocator, dir: []const u8, plan: *const
         hasher.update(line);
     }
     try file.sync();
-    file.close();
     try std.fs.cwd().rename(tmp_path, path);
-    syncDir(dir);
+    try syncDir(dir);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     const digest_hex = try hexEncodeAlloc(allocator, &digest);
@@ -635,8 +638,39 @@ fn rekeyComposite(allocator: std.mem.Allocator, owner: []const u8, ts8: []const 
     return key;
 }
 
-fn lookupRekeyId(plan: *const Plan, owner: []const u8, ts8: []const u8, id: []const u8) ?[]const u8 {
-    const key = rekeyComposite(plan.allocator, owner, ts8, id) catch return null;
+fn rekeyKey(
+    allocator: std.mem.Allocator,
+    source_owner: []const u8,
+    target_owner: []const u8,
+    ts8: []const u8,
+    id: []const u8,
+) ![]u8 {
+    const key = try allocator.alloc(u8, source_owner.len + 1 + target_owner.len + 1 + ts8.len + 1 + id.len);
+    var offset: usize = 0;
+    @memcpy(key[offset..][0..source_owner.len], source_owner);
+    offset += source_owner.len;
+    key[offset] = 0;
+    offset += 1;
+    @memcpy(key[offset..][0..target_owner.len], target_owner);
+    offset += target_owner.len;
+    key[offset] = 0;
+    offset += 1;
+    @memcpy(key[offset..][0..ts8.len], ts8);
+    offset += ts8.len;
+    key[offset] = 0;
+    offset += 1;
+    @memcpy(key[offset..], id);
+    return key;
+}
+
+fn lookupRekeyId(
+    plan: *const Plan,
+    source_owner: []const u8,
+    target_owner: []const u8,
+    ts8: []const u8,
+    id: []const u8,
+) ?[]const u8 {
+    const key = rekeyKey(plan.allocator, source_owner, target_owner, ts8, id) catch return null;
     defer plan.allocator.free(key);
     return plan.rekey_ids.get(key);
 }
@@ -644,12 +678,15 @@ fn lookupRekeyId(plan: *const Plan, owner: []const u8, ts8: []const u8, id: []co
 fn getOrCreateRekeyId(
     plan: *Plan,
     backend: anytype,
+    targets: *const std.StringHashMapUnmanaged(void),
+    db: Database,
     namespace: []const u8,
-    owner: []const u8,
+    source_owner: []const u8,
+    target_owner: []const u8,
     ts8: []const u8,
     id: []const u8,
 ) ![]const u8 {
-    const key = try rekeyComposite(plan.allocator, owner, ts8, id);
+    const key = try rekeyKey(plan.allocator, source_owner, target_owner, ts8, id);
     if (plan.rekey_ids.get(key)) |existing| {
         plan.allocator.free(key);
         return existing;
@@ -657,18 +694,30 @@ fn getOrCreateRekeyId(
     errdefer plan.allocator.free(key);
     while (true) {
         const stored = try std.fmt.allocPrint(plan.allocator, "~mig-{x:0>16}", .{std.crypto.random.int(u64)});
-        const candidate = rekeyComposite(plan.allocator, owner, ts8, stored) catch |err| {
+        const candidate = rekeyComposite(plan.allocator, target_owner, ts8, stored) catch |err| {
             plan.allocator.free(stored);
             return err;
         };
-        const occupied = backend.get(plan.allocator, namespace, candidate) catch |err| {
+        const candidate_id = targetId(plan.allocator, db, namespace, candidate) catch |err| {
             plan.allocator.free(candidate);
             plan.allocator.free(stored);
             return err;
         };
+        var occupied = targets.contains(candidate_id);
+        plan.allocator.free(candidate_id);
+        if (!occupied) {
+            const existing = backend.get(plan.allocator, namespace, candidate) catch |err| {
+                plan.allocator.free(candidate);
+                plan.allocator.free(stored);
+                return err;
+            };
+            if (existing) |value| {
+                plan.allocator.free(value);
+                occupied = true;
+            }
+        }
         plan.allocator.free(candidate);
-        if (occupied) |value| {
-            plan.allocator.free(value);
+        if (occupied) {
             plan.allocator.free(stored);
             continue;
         }
@@ -708,6 +757,7 @@ fn rewriteOfflineV2Value(
     allocator: std.mem.Allocator,
     value: []const u8,
     ctx: *const RewriteContext,
+    source_owner: []const u8,
     target_owner: []const u8,
 ) !?[]u8 {
     if (value.len < 12) return null;
@@ -716,7 +766,7 @@ fn rewriteOfflineV2Value(
     if (from_offset > value.len) return null;
     const ts8 = value[0..8];
     const old_id = value[12..from_offset];
-    const new_id = lookupRekeyId(ctx.identities.plan, target_owner, ts8, old_id) orelse old_id;
+    const new_id = lookupRekeyId(ctx.identities.plan, source_owner, target_owner, ts8, old_id) orelse old_id;
     const new_from = try rewriteJid(allocator, value[from_offset..], ctx, .reference) orelse return null;
     defer allocator.free(new_from);
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -796,7 +846,9 @@ fn rewriteEntry(
             const second_sep = first_sep + 1 + second_rel;
             const owner = new_key[0..first_sep];
             const ts8 = new_key[second_sep + 1 ..];
-            if (lookupRekeyId(ctx.identities.plan, owner, ts8, value)) |new_id| {
+            const source_sep = std.mem.indexOfScalar(u8, key, 0) orelse 0;
+            const source_owner = key[0..source_sep];
+            if (lookupRekeyId(ctx.identities.plan, source_owner, owner, ts8, value)) |new_id| {
                 rewrite.new_value = try allocator.dupe(u8, new_id);
             }
         }
@@ -812,7 +864,8 @@ fn rewriteEntry(
             new_key[0 .. std.mem.indexOfScalar(u8, new_key, 0) orelse new_key.len]
         else
             key[0 .. std.mem.indexOfScalar(u8, key, 0) orelse key.len];
-        rewrite.new_value = try rewriteOfflineV2Value(allocator, value, ctx, target_owner);
+        const source_owner = key[0 .. std.mem.indexOfScalar(u8, key, 0) orelse key.len];
+        rewrite.new_value = try rewriteOfflineV2Value(allocator, value, ctx, source_owner, target_owner);
     } else if (std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_V2) or
         std.mem.eql(u8, namespace, NS_OFFLINE_HOLD_TOKEN))
     {
@@ -1047,18 +1100,34 @@ fn planNamespace(
                     const owner = key[0..first_sep];
                     const ts8 = key[first_sep + 1 .. first_sep + 9];
                     const old_id = key[first_sep + 10 ..];
+                    const source_sep = std.mem.indexOfScalar(u8, rename.old_key, 0) orelse 0;
+                    const source_owner = rename.old_key[0..source_sep];
+                    const planned_id = try targetId(plan.allocator, db, namespace, rename.new_key);
+                    defer plan.allocator.free(planned_id);
+                    const planned_occupied = targets.contains(planned_id);
                     const target_value = try backend.get(plan.allocator, namespace, rename.new_key);
                     defer if (target_value) |value| plan.allocator.free(value);
-                    var must_rekey = lookupRekeyId(plan, owner, ts8, old_id) != null;
+                    var must_rekey = planned_occupied or
+                        lookupRekeyId(plan, source_owner, owner, ts8, old_id) != null;
                     if (target_value != null) {
                         const old_value = try backend.get(plan.allocator, namespace, rename.old_key);
                         defer if (old_value) |value| plan.allocator.free(value);
                         const same_value = old_value != null and std.mem.eql(u8, old_value.?, target_value.?);
                         equal_data_value = same_value;
-                        must_rekey = !same_value;
+                        must_rekey = planned_occupied or !same_value;
                     }
                     if (must_rekey) {
-                        const new_id = try getOrCreateRekeyId(plan, backend, namespace, owner, ts8, old_id);
+                        const new_id = try getOrCreateRekeyId(
+                            plan,
+                            backend,
+                            targets,
+                            db,
+                            namespace,
+                            source_owner,
+                            owner,
+                            ts8,
+                            old_id,
+                        );
                         const rekeyed = try rekeyStanzaKeyWithId(plan.allocator, key, new_id) orelse
                             return error.InvalidRecoveryPlan;
                         if (db != .archive and rekeyed.len > 511) {
@@ -1167,6 +1236,14 @@ const V2QueueRow = struct {
     value: []u8,
 };
 
+fn v2QueueKey(allocator: std.mem.Allocator, owner: []const u8, sequence: u64) ![]u8 {
+    const key = try allocator.alloc(u8, owner.len + 1 + 8);
+    @memcpy(key[0..owner.len], owner);
+    key[owner.len] = 0;
+    std.mem.writeInt(u64, key[owner.len + 1 ..][0..8], sequence, .big);
+    return key;
+}
+
 const V2Queue = struct {
     target: []u8,
     rows: std.ArrayListUnmanaged(V2QueueRow) = .{},
@@ -1226,7 +1303,12 @@ fn stripV2QueueRenames(plan: *Plan) void {
     }
 }
 
-fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void {
+fn planV2Queues(
+    plan: *Plan,
+    backend: anytype,
+    targets: *std.StringHashMapUnmanaged(void),
+    ctx: *const RewriteContext,
+) !void {
     const allocator = plan.allocator;
     var all: std.ArrayListUnmanaged(V2QueueRow) = .{};
     defer {
@@ -1240,8 +1322,23 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         var iter = try backend.iterator(NS_OFFLINE_V2, "");
         defer iter.deinit();
         while (iter.next()) |entry| {
-            const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse continue;
-            if (entry.key.len < sep + 9) continue;
+            const sep = std.mem.indexOfScalar(u8, entry.key, 0) orelse {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            };
+            if (entry.key.len < sep + 9) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
+            if (entry.value.len < 12) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
+            const id_len = std.mem.readInt(u32, entry.value[8..12], .big);
+            if (@as(usize, id_len) > entry.value.len - 12) {
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_value, entry.key, "");
+                continue;
+            }
             const seq = std.mem.readInt(u64, entry.key[sep + 1 ..][0..8], .big);
             try all.append(allocator, .{
                 .owner = try allocator.dupe(u8, entry.key[0..sep]),
@@ -1263,7 +1360,21 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         queues.deinit(allocator);
     }
     for (all.items) |row| {
-        const target_opt = prepareQueueOwner(ctx, row.owner) catch continue;
+        const target_opt = prepareQueueOwner(ctx, row.owner) catch |err| switch (err) {
+            error.InvalidAccountName => {
+                const key = try v2QueueKey(allocator, row.owner, row.seq);
+                defer allocator.free(key);
+                try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_name, key, "");
+                continue;
+            },
+            else => return err,
+        };
+        if (target_opt == null and std.mem.indexOfScalar(u8, row.owner, '@') == null) {
+            const key = try v2QueueKey(allocator, row.owner, row.seq);
+            defer allocator.free(key);
+            try addIssue(plan, .op, NS_OFFLINE_V2, .invalid_name, key, "");
+            continue;
+        }
         const target = target_opt orelse continue;
         errdefer allocator.free(target);
         var queue: ?*V2Queue = null;
@@ -1286,6 +1397,16 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         });
     }
     for (queues.items) |*queue| {
+        const stored_counter = try backend.get(allocator, NS_OFFLINE_SEQ, queue.target);
+        if (stored_counter) |value| {
+            defer allocator.free(value);
+            if (value.len != 8) {
+                try addIssue(plan, .op, NS_OFFLINE_SEQ, .invalid_value, queue.target, "");
+            } else {
+                const counter = std.mem.readInt(u64, value[0..8], .big);
+                if (counter > queue.target_max) queue.target_max = counter;
+            }
+        }
         for (all.items) |row| {
             if (std.mem.eql(u8, row.owner, queue.target) and row.seq > queue.target_max)
                 queue.target_max = row.seq;
@@ -1316,7 +1437,7 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
             const id_len = std.mem.readInt(u32, row.value[8..12], .big);
             const id = row.value[12 .. 12 + @as(usize, id_len)];
             const sender = row.value[12 + @as(usize, id_len) ..];
-            const new_id = lookupRekeyId(plan, queue.target, ts8, id) orelse id;
+            const new_id = lookupRekeyId(plan, row.owner, queue.target, ts8, id) orelse id;
             if (!std.mem.eql(u8, new_id, id)) {
                 try addIssue(plan, .op, NS_OFFLINE_V2, .rekeyed, old_key_buf, new_key_buf);
             }
@@ -1388,18 +1509,42 @@ fn planV2Queues(plan: *Plan, backend: anytype, ctx: *const RewriteContext) !void
         const target_opt = prepareQueueOwner(ctx, owner) catch continue;
         const target = target_opt orelse continue;
         defer allocator.free(target);
-        var new_id = lookupRekeyId(plan, target, ts8, old_id) orelse old_id;
+        var new_id = lookupRekeyId(plan, owner, target, ts8, old_id) orelse old_id;
         const candidate = try rekeyComposite(allocator, target, ts8, new_id);
         defer allocator.free(candidate);
+        const candidate_id = try targetId(allocator, .op, NS_OFFLINE, candidate);
+        const planned_occupied = targets.contains(candidate_id);
+        allocator.free(candidate_id);
         const target_value = try backend.get(allocator, NS_OFFLINE, candidate);
+        var must_rekey = planned_occupied;
         if (target_value) |value| {
             defer allocator.free(value);
-            if (!std.mem.eql(u8, value, entry.value)) {
-                new_id = try getOrCreateRekeyId(plan, backend, NS_OFFLINE, target, ts8, old_id);
-            }
+            if (!std.mem.eql(u8, value, entry.value)) must_rekey = true;
+        }
+        if (must_rekey) {
+            new_id = try getOrCreateRekeyId(
+                plan,
+                backend,
+                targets,
+                .op,
+                NS_OFFLINE,
+                owner,
+                target,
+                ts8,
+                old_id,
+            );
         }
         const new_key = try rekeyComposite(allocator, target, ts8, new_id);
         defer allocator.free(new_key);
+        const final_id = try targetId(allocator, .op, NS_OFFLINE, new_key);
+        if (targets.contains(final_id)) {
+            allocator.free(final_id);
+        } else {
+            targets.put(allocator, final_id, {}) catch |err| {
+                allocator.free(final_id);
+                return err;
+            };
+        }
         if (!std.mem.eql(u8, new_id, old_id)) {
             try addIssue(plan, .op, NS_OFFLINE, .rekeyed, entry.key, new_key);
         }
@@ -1485,7 +1630,7 @@ pub fn planMigration(
     // offline pointers and by_contact values planned below.
     try planDb(&plan, &targets, .archive, archive, &.{ NS_MESSAGES, NS_BY_CONTACT }, &ctx);
     stripV2QueueRenames(&plan);
-    try planV2Queues(&plan, op, &ctx);
+    try planV2Queues(&plan, op, &targets, &ctx);
     try planDb(&plan, &targets, .op, op, &.{
         NS_ROSTERS,
         NS_BLOCKLIST,
@@ -2406,6 +2551,19 @@ test "migrate-precis: an explicit rename resolves a collision" {
     try expectRow(&auth, NS_USERS, "naples_tb", "creds-a");
     try expectRow(&auth, NS_USERS, "naplestb", "creds-b");
     try expectRow(&op, NS_ROSTERS, "naples_tb@us.example\x00friend@us.example", "roster");
+}
+
+test "migrate-precis: syncDir reports a missing directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const gone = try std.fs.path.join(allocator, &.{ base, "gone" });
+    defer allocator.free(gone);
+    try tmp.dir.makePath("gone");
+    try std.fs.cwd().deleteDir(gone);
+    try std.testing.expectError(error.FileNotFound, syncDir(gone));
 }
 
 test "migrate-precis: live and stale pid files drive the offline guard" {
