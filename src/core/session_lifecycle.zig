@@ -361,16 +361,13 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
-    if (session.stream.bound_jid) |bound| {
+    if (session.stream.bound_jid) |bound| close_cleanup: {
         var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        var close_jid_fbs = std.io.fixedBufferStream(&close_jid_buf);
-        const cw = close_jid_fbs.writer();
-        cw.writeAll(bound.local) catch {};
-        cw.writeByte('@') catch {};
-        cw.writeAll(bound.domain) catch {};
-        cw.writeByte('/') catch {};
-        cw.writeAll(bound.resource) catch {};
-        muc_handler.handleSessionClose(server, close_jid_fbs.getWritten(), changes);
+        const close_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &close_jid_buf) catch {
+            log.warn("session {d} close: full JID exceeds {d} bytes; room cleanup skipped", .{ id, router.FULL_JID_MAX });
+            break :close_cleanup;
+        };
+        muc_handler.handleSessionClose(server, close_jid, changes);
     }
 
     // Unregister from session map and broadcast unavailable presence
@@ -414,12 +411,12 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 /// unbound (best-effort; on error the next teardown retries).
 fn recordLastOffline(roster: anytype, bound: anytype) void {
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&bare_buf);
-    fbs.writer().writeAll(bound.local) catch return;
-    fbs.writer().writeByte('@') catch return;
-    fbs.writer().writeAll(bound.domain) catch return;
+    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
+        log.warn("last-activity record skipped for {s}@{s}: bare JID exceeds {d} bytes", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        return;
+    };
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
-    lastact_store.record(roster.backend, fbs.getWritten(), now) catch |err| {
+    lastact_store.record(roster.backend, bare_jid, now) catch |err| {
         log.warn("last-activity record failed for {s}@{s}: {}", .{ bound.local, bound.domain, err });
     };
 }
@@ -478,11 +475,10 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     const archive = server.archive;
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-    bare_fbs.writer().writeAll(local) catch return;
-    bare_fbs.writer().writeByte('@') catch return;
-    bare_fbs.writer().writeAll(domain) catch return;
-    const bare_jid = bare_fbs.getWritten();
+    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
+        log.warn("offline delivery for {s}@{s} skipped: bare JID exceeds {d} bytes", .{ local, domain, router.BARE_JID_MAX });
+        return;
+    };
 
     // A failed count is a store failure like any other: without a staged
     // retry the session stays parked with nothing armed to drain it.

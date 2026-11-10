@@ -54,6 +54,14 @@ const Subscription = generic_roster.Subscription;
 const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const SessionEntry = session_map_mod.SessionEntry;
+
+comptime {
+    // A bound session's JID must fit the session-map bind buffer, so local
+    // full JIDs stay well under the router JID bounds; keep that true if
+    // either cap moves (S4).
+    std.debug.assert(session_map_mod.LOOKUP_JID_BUF <= router.BARE_JID_MAX);
+    std.debug.assert(session_map_mod.LOOKUP_JID_BUF <= router.FULL_JID_MAX);
+}
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const offline_store_mod = @import("generic_offline_store");
@@ -1859,12 +1867,10 @@ pub const Server = struct {
         if (!server_addressed) {
             if (session.stream.authenticated_jid) |aj| {
                 var acc_buf: [router.BARE_JID_MAX]u8 = undefined;
-                var acc_fbs = std.io.fixedBufferStream(&acc_buf);
-                const aw = acc_fbs.writer();
-                aw.writeAll(aj.local) catch {};
-                aw.writeByte('@') catch {};
-                aw.writeAll(aj.domain) catch {};
-                const account = acc_fbs.getWritten();
+                const account = router.buildBareJid(aj.local, aj.domain, &acc_buf) catch {
+                    log.warn("connection {d} authenticated JID exceeds {d} bytes; cannot match a self-addressed stanza", .{ session.conn.id, router.BARE_JID_MAX });
+                    return .server_addressed;
+                };
                 const to_bare = if (std.mem.indexOfScalar(u8, to_attr, '/')) |sp| to_attr[0..sp] else to_attr;
                 server_addressed = std.mem.eql(u8, to_bare, account);
             }
@@ -2769,15 +2775,13 @@ pub const Server = struct {
                 // OIDC profile photo import: if enabled and the IdP provided a picture URL
                 // and the user has no stored vCard, create one with the photo.
                 if (self.oidc_import_avatar and m.photo_url.len > 0) {
-                    if (self.vcard) |vcard| {
+                    if (self.vcard) |vcard| vcard_import: {
                         // Build bare JID for vCard lookup
                         var jid_buf: [router.BARE_JID_MAX]u8 = undefined;
-                        var jid_fbs = std.io.fixedBufferStream(&jid_buf);
-                        const jw = jid_fbs.writer();
-                        jw.writeAll(stable_username) catch {};
-                        jw.writeByte('@') catch {};
-                        jw.writeAll(self.server_host) catch {};
-                        const bare_jid = jid_fbs.getWritten();
+                        const bare_jid = router.buildBareJid(stable_username, self.server_host, &jid_buf) catch {
+                            log.warn("OIDC photo import skipped: bare JID for '{s}' exceeds {d} bytes", .{ stable_username, router.BARE_JID_MAX });
+                            break :vcard_import;
+                        };
 
                         const existing = vcard.get(self.allocator, bare_jid) catch null;
                         if (existing) |data| {
@@ -2917,11 +2921,10 @@ pub const Server = struct {
     fn cascadeAccountDelete(self: *Server, username: []const u8) void {
         // Build bare JID for store lookups: username@server_host
         var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-        var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-        bare_fbs.writer().writeAll(username) catch return;
-        bare_fbs.writer().writeByte('@') catch return;
-        bare_fbs.writer().writeAll(self.server_host) catch return;
-        const bare_jid = bare_fbs.getWritten();
+        const bare_jid = router.buildBareJid(username, self.server_host, &bare_buf) catch {
+            log.warn("cascade: bare JID for '{s}' exceeds {d} bytes; store cleanup skipped", .{ username, router.BARE_JID_MAX });
+            return;
+        };
 
         // Remove roster entries (iterate + delete each)
         if (self.roster) |roster| {
@@ -3215,13 +3218,12 @@ pub const Server = struct {
                 const live_parts = extractStanzaParts(m.stanza_xml);
                 // Archive S2S inbound messages delivered to online recipients (T81)
                 if (self.archive != null) {
-                    if (live_parts.is_message and std.mem.indexOf(u8, live_parts.inner_xml, "<body") != null) {
+                    if (live_parts.is_message and std.mem.indexOf(u8, live_parts.inner_xml, "<body") != null) archive_msg: {
                         var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
-                        var recip_fbs = std.io.fixedBufferStream(&recip_buf);
-                        recip_fbs.writer().writeAll(to_jid.local) catch {};
-                        recip_fbs.writer().writeByte('@') catch {};
-                        recip_fbs.writer().writeAll(to_jid.domain) catch {};
-                        const recipient_bare = recip_fbs.getWritten();
+                        const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch {
+                            log.warn("S2S inbound to {s} archived nowhere: recipient bare JID exceeds {d} bytes", .{ m.to_jid, router.BARE_JID_MAX });
+                            break :archive_msg;
+                        };
 
                         var s2s_sid_buf: [32]u8 = undefined;
                         const s2s_stanza_id = self.generateStanzaId(&s2s_sid_buf);
@@ -4019,18 +4021,13 @@ pub const Server = struct {
             },
             .session_closed => |ev| {
                 var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-                var jid_fbs = std.io.fixedBufferStream(&jid_buf);
-                const jw = jid_fbs.writer();
-                jw.writeAll(ev.local) catch return;
-                jw.writeByte('@') catch return;
-                jw.writeAll(ev.domain) catch return;
-                if (ev.resource.len > 0) {
-                    jw.writeByte('/') catch return;
-                    jw.writeAll(ev.resource) catch return;
-                }
+                const real_jid = router.buildFullJid(ev.local, ev.domain, ev.resource, &jid_buf) catch {
+                    log.warn("session_closed for {s}@{s}: full JID exceeds {d} bytes; room cleanup skipped", .{ ev.local, ev.domain, router.FULL_JID_MAX });
+                    return;
+                };
                 // local_only=true: this is already a broadcast from the originating
                 // worker. Do NOT re-broadcast to avoid infinite cascade.
-                muc_handler.handleSessionCloseLocal(self, jid_fbs.getWritten(), changes);
+                muc_handler.handleSessionCloseLocal(self, real_jid, changes);
             },
             else => {
                 log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
@@ -5013,14 +5010,10 @@ pub const Server = struct {
     fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, generation: u32, old_worker: u16) void {
         const bound = session.stream.bound_jid orelse return;
         var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        var jid_fbs = std.io.fixedBufferStream(&jid_buf);
-        const jw = jid_fbs.writer();
-        jw.writeAll(bound.local) catch return;
-        jw.writeByte('@') catch return;
-        jw.writeAll(bound.domain) catch return;
-        jw.writeByte('/') catch return;
-        jw.writeAll(bound.resource) catch return;
-        const real_jid = jid_fbs.getWritten();
+        const real_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
+            log.warn("occupant moves for {s}@{s} not replayed: full JID exceeds {d} bytes", .{ bound.local, bound.domain, router.FULL_JID_MAX });
+            return;
+        };
 
         for (room_jids) |room_jid| {
             const move = actor_message.RoomOccupantMove{

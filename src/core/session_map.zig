@@ -30,7 +30,8 @@ const MAX_RESOURCE_LEN: usize = 64;
 /// Stack buffer for JID lookups. Must hold anything bind() accepts: the bind
 /// duplicate check uses the same bound, and a bare JID is at most two bytes
 /// shorter than the full JID it came from, so one constant covers both.
-const LOOKUP_JID_BUF: usize = 384;
+/// Public so router can assert its JID buffers cover the bind cap.
+pub const LOOKUP_JID_BUF: usize = 384;
 
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {

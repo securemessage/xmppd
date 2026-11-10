@@ -34,13 +34,24 @@ const log = std.log.scoped(.router);
 /// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so
 /// this buffer holds every valid key in full (S4).
 pub const BARE_JID_MAX = 512;
-/// Worst-case full JID from bind: two 256-byte parts, the separators, and the
-/// server host. A shorter buffer silently dropped the stanza on overflow.
+/// Full-JID buffer bound. A bound session's JID is already capped by the
+/// session-map bind buffer (asserted below); remote contact JIDs get
+/// headroom up to this bound instead of truncating (S4).
 pub const FULL_JID_MAX = 1024;
 /// Stack buffer bound for a stanza assembled inline that embeds up to two
 /// JIDs (a sender and a recipient) plus fixed markup. Sized to two maximum
 /// full JIDs so a maximum-length JID can never truncate the stanza.
 pub const JID_STANZA_MAX = 2 * FULL_JID_MAX + 64;
+
+/// Counted reason (S4): bumped once per delivery skipped because a JID or a
+/// JID-bearing stanza did not fit its bounded buffer. Operators can diff the
+/// counter to spot the drop; each site also logs the context.
+pub var jid_overflow_drops = std.atomic.Value(usize).init(0);
+
+/// Record one over-long-JID skip (S4).
+pub fn countJidOverflow() void {
+    _ = jid_overflow_drops.fetchAdd(1, .monotonic);
+}
 
 /// Build a bare JID "local@domain" into out. A JID that does not fit returns
 /// NoSpaceLeft rather than a truncated prefix (S4).
@@ -50,6 +61,21 @@ pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u
     try w.writeAll(local);
     try w.writeByte('@');
     try w.writeAll(domain);
+    return fbs.getWritten();
+}
+
+/// Build a full JID "local@domain/resource" into out (the resource part is
+/// optional). A JID that does not fit returns NoSpaceLeft (S4).
+pub fn buildFullJid(local: []const u8, domain: []const u8, resource: []const u8, out: *[FULL_JID_MAX]u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(out);
+    const w = fbs.writer();
+    try w.writeAll(local);
+    try w.writeByte('@');
+    try w.writeAll(domain);
+    if (resource.len > 0) {
+        try w.writeByte('/');
+        try w.writeAll(resource);
+    }
     return fbs.getWritten();
 }
 
@@ -156,35 +182,30 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // localpart and resource at 256 bytes each, so the full JID can exceed
     // 256 and a smaller buffer would drop the stanza with no answer.
     var from_buf: [FULL_JID_MAX]u8 = undefined;
-    var from_fbs = std.io.fixedBufferStream(&from_buf);
-    const from_w = from_fbs.writer();
-    from_w.writeAll(from_jid.local) catch {
+    const from_str = buildFullJid(from_jid.local, from_jid.domain, from_jid.resource, &from_buf) catch {
+        countJidOverflow();
         log.warn("connection {d} sender JID exceeds {d} bytes, stanza dropped", .{ session.conn.id, FULL_JID_MAX });
         return;
     };
-    from_w.writeByte('@') catch return;
-    from_w.writeAll(from_jid.domain) catch return;
-    if (from_jid.resource.len > 0) {
-        from_w.writeByte('/') catch return;
-        from_w.writeAll(from_jid.resource) catch return;
-    }
-    const from_str = from_fbs.getWritten();
 
     // XEP-0191: Block check — silently drop stanzas from blocked contacts.
-    if (server.block_store) |bs| {
+    // A bare JID longer than BARE_JID_MAX cannot exist in the bounded block
+    // store (store keys cap at 511 bytes), so the check is vacuous for it;
+    // count and log the skip instead of silently passing a truncated JID.
+    if (server.block_store) |bs| block_check: {
         var rblk_buf: [BARE_JID_MAX]u8 = undefined;
-        var rblk_fbs = std.io.fixedBufferStream(&rblk_buf);
-        rblk_fbs.writer().writeAll(to_jid.local) catch {};
-        rblk_fbs.writer().writeByte('@') catch {};
-        rblk_fbs.writer().writeAll(to_jid.domain) catch {};
-        const recip_bare = rblk_fbs.getWritten();
+        const recip_bare = buildBareJid(to_jid.local, to_jid.domain, &rblk_buf) catch {
+            countJidOverflow();
+            log.warn("connection {d} recipient JID exceeds {d} bytes; block check vacuous", .{ session.conn.id, BARE_JID_MAX });
+            break :block_check;
+        };
 
         var sblk_buf: [BARE_JID_MAX]u8 = undefined;
-        var sblk_fbs = std.io.fixedBufferStream(&sblk_buf);
-        sblk_fbs.writer().writeAll(from_jid.local) catch {};
-        sblk_fbs.writer().writeByte('@') catch {};
-        sblk_fbs.writer().writeAll(from_jid.domain) catch {};
-        const sender_bare = sblk_fbs.getWritten();
+        const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sblk_buf) catch {
+            countJidOverflow();
+            log.warn("connection {d} sender bare JID exceeds {d} bytes; block check vacuous", .{ session.conn.id, BARE_JID_MAX });
+            break :block_check;
+        };
 
         if (bs.isBlocked(server.allocator, recip_bare, sender_bare) catch false) {
             return;
