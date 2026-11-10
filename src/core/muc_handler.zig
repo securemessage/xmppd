@@ -3647,10 +3647,10 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     server.worker_id = 0;
 
     // Worst case for the notice: a 512-byte room JID, 64-byte nick and
-    // 1024-byte real JID made entirely of apostrophes. Every byte escapes
+    // 1024-byte real JID built from apostrophes. Every byte escapes
     // to a six-character entity, which is what sized the old stack buffer.
     const room = try registry.createRoom("'" ** 512, .{});
-    const real_jid = "'" ** 1024;
+    const real_jid = "'" ** 511 ++ "@" ++ "'" ** 500 ++ "/" ++ "'" ** 11;
     _ = try room.addOccupant("'" ** 64, real_jid, "'" ** 512, 0, 0, 1, .participant, .member);
     const before = room.occupants[0].?;
 
@@ -3675,7 +3675,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
 
     const queued = target.conn.write_buf[target.conn.write_start..target.conn.write_end];
     const expected = "<presence from='" ++ ("&apos;" ** 512) ++ "/" ++ ("&apos;" ** 64) ++
-        "' to='" ++ ("&apos;" ** 1024) ++
+        "' to='" ++ ("&apos;" ** 511) ++ "@" ++ ("&apos;" ** 500) ++ "/" ++ ("&apos;" ** 11) ++
         "' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='none'/><status code='110'/></x></presence>";
     try std.testing.expectEqualStrings(expected, queued);
     try std.testing.expect(!target.sm_overflow);
