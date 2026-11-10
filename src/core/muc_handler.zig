@@ -155,11 +155,14 @@ pub fn handleMucGroupchat(
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
     const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
 
+    // One sender JID serves both the remote-owner route and the local
+    // lookup; building it twice also doubled the stack buffer.
+    const bound = session.stream.bound_jid orelse return;
+    var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
+    const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
-        const bound = session.stream.bound_jid orelse return;
-        var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         server.enqueueRoomActorMessage(owner, .{ .room_message = .{
             .room_jid = room_jid,
             .from_jid = sender_jid,
@@ -175,9 +178,6 @@ pub fn handleMucGroupchat(
     };
 
     // Find sender's occupant entry by full JID (globally unique, no worker awareness needed)
-    const bound = session.stream.bound_jid orelse return;
-    var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     const sender_idx = room.findByRealJid(sender_jid) orelse {
         sendMessageError(server, session, to_local, muc_host, id_str, "not-acceptable", changes);
         return;
@@ -2514,7 +2514,9 @@ fn shadowCleanOldWorker(server: *Server, ev: actor_message.RoomOccupantMove) voi
 }
 
 /// Send room history to a remote joiner via MPSC unicast.
-fn sendRoomHistoryRemote(
+// noinline: its 4 KiB history buffer must not inflate finishRemoteJoin's
+// frame; the single call site gains nothing from inlining.
+noinline fn sendRoomHistoryRemote(
     server: *Server,
     real_jid: []const u8,
     target_worker: u16,

@@ -29,6 +29,14 @@ const delivery_queue_mod = @import("delivery_queue");
 
 const log = std.log.scoped(.lifecycle);
 
+/// Cold error paths. The helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
 /// Drain all pending connections from the listener socket.
 pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
     while (true) {
@@ -364,7 +372,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     if (session.stream.bound_jid) |bound| close_cleanup: {
         var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const close_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &close_jid_buf) catch {
-            log.warn("session {d} close: full JID exceeds {d} bytes; room cleanup skipped", .{ id, router.FULL_JID_MAX });
+            noteDrop("session {d} close: full JID exceeds {d} bytes; room cleanup skipped", .{ id, router.FULL_JID_MAX });
             break :close_cleanup;
         };
         muc_handler.handleSessionClose(server, close_jid, changes);
@@ -412,7 +420,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 fn recordLastOffline(roster: anytype, bound: anytype) void {
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        log.warn("last-activity record skipped for {s}@{s}: bare JID exceeds {d} bytes", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        noteDrop("last-activity record skipped for {s}@{s}: bare JID exceeds {d} bytes", .{ bound.local, bound.domain, router.BARE_JID_MAX });
         return;
     };
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
@@ -476,7 +484,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        log.warn("offline delivery for {s}@{s} skipped: bare JID exceeds {d} bytes", .{ local, domain, router.BARE_JID_MAX });
+        noteDrop("offline delivery for {s}@{s} skipped: bare JID exceeds {d} bytes", .{ local, domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -568,7 +576,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             if (muc_handler.formatDelayStamp(&delay_buf, ptr.timestamp)) |stamp| {
                 if (delay_lease) |*lease| {
                     wire = stampOfflineDelay(xml_data, domain, stamp, lease.buf) catch |err| blk: {
-                        log.warn("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
+                        noteDrop("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
                         break :blk xml_data;
                     };
                 }
@@ -581,13 +589,13 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             // and the drain moves on.
             if (wire.len > connection_mod.WRITE_BUF_SIZE) {
                 if (xml_data.len <= connection_mod.WRITE_BUF_SIZE) {
-                    log.warn("offline message to {s} does not fit once stamped ({d} bytes); sending unstamped", .{ bare_jid, wire.len });
+                    noteDrop("offline message to {s} does not fit once stamped ({d} bytes); sending unstamped", .{ bare_jid, wire.len });
                     wire = xml_data;
                 } else {
                     _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
-                    log.warn("offline message to {s} is {d} bytes and can never fit the {d}-byte send buffer; dropping it", .{ bare_jid, xml_data.len, connection_mod.WRITE_BUF_SIZE });
+                    noteDrop("offline message to {s} is {d} bytes and can never fit the {d}-byte send buffer; dropping it", .{ bare_jid, xml_data.len, connection_mod.WRITE_BUF_SIZE });
                     store.deletePointer(ptr) catch |err| {
-                        log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+                        noteDrop("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
                     };
                     dropped += 1;
                     continue;

@@ -96,6 +96,14 @@ const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 
 const log = std.log.scoped(.xmppd);
 
+/// Cold error paths. The helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
 /// Per-thread scratch for the pre-bind account compare's localpart
 /// preparation; the prepared name is copied into acc_buf before use.
 threadlocal var prebind_precis_scratch: precis.Scratch = undefined;
@@ -2939,7 +2947,7 @@ pub const Server = struct {
                         // Build bare JID for vCard lookup
                         var jid_buf: [router.BARE_JID_MAX]u8 = undefined;
                         const bare_jid = router.buildBareJid(stable_username, self.server_host, &jid_buf) catch {
-                            log.warn("OIDC photo import skipped: bare JID for '{s}' exceeds {d} bytes", .{ stable_username, router.BARE_JID_MAX });
+                            noteDrop("OIDC photo import skipped: bare JID for '{s}' exceeds {d} bytes", .{ stable_username, router.BARE_JID_MAX });
                             break :vcard_import;
                         };
 
@@ -3082,7 +3090,7 @@ pub const Server = struct {
         // Build bare JID for store lookups: username@server_host
         var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
         const bare_jid = router.buildBareJid(username, self.server_host, &bare_buf) catch {
-            log.warn("cascade: bare JID for '{s}' exceeds {d} bytes; store cleanup skipped", .{ username, router.BARE_JID_MAX });
+            noteDrop("cascade: bare JID for '{s}' exceeds {d} bytes; store cleanup skipped", .{ username, router.BARE_JID_MAX });
             return;
         };
 
@@ -3381,7 +3389,7 @@ pub const Server = struct {
                     if (live_parts.is_message and std.mem.indexOf(u8, live_parts.inner_xml, "<body") != null) archive_msg: {
                         var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
                         const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch {
-                            log.warn("S2S inbound to {s} archived nowhere: recipient bare JID exceeds {d} bytes", .{ m.to_jid, router.BARE_JID_MAX });
+                            noteDrop("S2S inbound to {s} archived nowhere: recipient bare JID exceeds {d} bytes", .{ m.to_jid, router.BARE_JID_MAX });
                             break :archive_msg;
                         };
 
@@ -4182,7 +4190,7 @@ pub const Server = struct {
             .session_closed => |ev| {
                 var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
                 const real_jid = router.buildFullJid(ev.local, ev.domain, ev.resource, &jid_buf) catch {
-                    log.warn("session_closed for {s}@{s}: full JID exceeds {d} bytes; room cleanup skipped", .{ ev.local, ev.domain, router.FULL_JID_MAX });
+                    noteDrop("session_closed for {s}@{s}: full JID exceeds {d} bytes; room cleanup skipped", .{ ev.local, ev.domain, router.FULL_JID_MAX });
                     return;
                 };
                 // local_only=true: this is already a broadcast from the originating
@@ -5171,7 +5179,7 @@ pub const Server = struct {
         const bound = session.stream.bound_jid orelse return;
         var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const real_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-            log.warn("occupant moves for {s}@{s} not replayed: full JID exceeds {d} bytes", .{ bound.local, bound.domain, router.FULL_JID_MAX });
+            noteDrop("occupant moves for {s}@{s} not replayed: full JID exceeds {d} bytes", .{ bound.local, bound.domain, router.FULL_JID_MAX });
             return;
         };
 
