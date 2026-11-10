@@ -40,6 +40,38 @@ const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.muc);
 
+/// Cold error paths. Each helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
+/// Record one over-long-JID skip on the cold path (S4).
+noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    router.countJidOverflow();
+    log.warn(fmt, args);
+}
+
+/// Record one cross-worker delivery drop on the cold path (S14).
+noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn(fmt, args);
+}
+
+/// Record a skip that counts against both counters on the cold path: the
+/// JID overflow that made the stanza unbuildable and the cross-worker
+/// delivery it can no longer take.
+noinline fn noteJidOverflowCrossWorker(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    router.countJidOverflow();
+    _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn(fmt, args);
+}
+
 /// Handle a presence stanza addressed to a MUC room JID.
 /// Called when to_domain matches the MUC service host.
 ///
@@ -169,8 +201,7 @@ pub fn handleMucGroupchat(
         fw.writeAll(sender.getNick()) catch break :jid null;
         break :jid from_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("groupchat sender JID '{s}/{s}' exceeds {d} bytes; message dropped", .{ room_jid, sender.getNick(), router.FULL_JID_MAX });
+        noteJidOverflow("groupchat sender JID '{s}/{s}' exceeds {d} bytes; message dropped", .{ room_jid, sender.getNick(), router.FULL_JID_MAX });
         return;
     };
 
@@ -185,7 +216,7 @@ pub fn handleMucGroupchat(
     if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
         // No occupant could receive it, and queueing it would trip the
         // slow-reader teardown on every session in the room (H5).
-        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ room_jid, prefix_len, suffix_len });
+        noteDrop("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ room_jid, prefix_len, suffix_len });
         sendMessageError(server, session, to_local, muc_host, id_str, "resource-constraint", changes);
         return;
     }
@@ -258,7 +289,7 @@ pub fn handleMucGroupchat(
         // rather than held across the archive build.
         deliver_lease.release();
         var arch_lease = server.leaseByteScratch() orelse {
-            log.warn("byte-scratch exhausted; groupchat in '{s}' not archived", .{room_jid});
+            noteDrop("byte-scratch exhausted; groupchat in '{s}' not archived", .{room_jid});
             return;
         };
         defer arch_lease.release();
@@ -278,8 +309,7 @@ pub fn handleMucGroupchat(
             aw.writeAll("</message>") catch break :stanza null;
             break :stanza arch_fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            log.warn("groupchat stanza in '{s}' exceeds {d} bytes; not archived", .{ room_jid, arch_lease.buf.len });
+            noteJidOverflow("groupchat stanza in '{s}' exceeds {d} bytes; not archived", .{ room_jid, arch_lease.buf.len });
             return;
         };
         server.archiveStore(room_jid, from_str, stanza_id, timestamp, arch_xml);
@@ -701,8 +731,7 @@ pub fn handleMucAdminIq(
         rw.writeAll("'/>") catch break :stanza null;
         break :stanza result_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("admin result for '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
+        noteJidOverflow("admin result for '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
         return;
     };
 
@@ -751,8 +780,7 @@ fn sendIqErrorFromRoomTyped(
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("IQ error '{s}' from '{s}' exceeds {d} bytes; not sent", .{ condition, room_jid, router.JID_STANZA_MAX });
+        noteJidOverflow("IQ error '{s}' from '{s}' exceeds {d} bytes; not sent", .{ condition, room_jid, router.JID_STANZA_MAX });
         return;
     };
 
@@ -924,8 +952,7 @@ pub fn handleMucOwnerSet(
         rw.writeAll("'/>") catch break :stanza null;
         break :stanza result_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("owner-set result for '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
+        noteJidOverflow("owner-set result for '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
         return;
     };
 
@@ -1016,8 +1043,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
             w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch break :stanza null;
             break :stanza fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            log.warn("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.session_id });
+            noteJidOverflow("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.session_id });
             continue;
         };
         fanout.deliverToSession(target, notice_xml, target.conn.id, changes);
@@ -1344,8 +1370,7 @@ fn sendOccupantPresence(
         w.writeAll("</x></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("occupant presence for '{s}/{s}' exceeds {d} bytes; not sent", .{ room.getJid(), occ.getNick(), router.JID_STANZA_MAX });
+        noteJidOverflow("occupant presence for '{s}/{s}' exceeds {d} bytes; not sent", .{ room.getJid(), occ.getNick(), router.JID_STANZA_MAX });
         return;
     };
 
@@ -1380,8 +1405,7 @@ fn sendSelfPresence(
         w.writeAll("'/><status code='110'/></x></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("self presence for '{s}/{s}' exceeds {d} bytes; not sent", .{ room.getJid(), occ.getNick(), router.JID_STANZA_MAX });
+        noteJidOverflow("self presence for '{s}/{s}' exceeds {d} bytes; not sent", .{ room.getJid(), occ.getNick(), router.JID_STANZA_MAX });
         return;
     };
 
@@ -1421,8 +1445,7 @@ fn broadcastOccupantJoin(
         pw.writeAll("' to='") catch break :stanza null;
         break :stanza prefix_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("join prefix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), nick, fanout.PREFIX_CAPACITY });
+        noteJidOverflow("join prefix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), nick, fanout.PREFIX_CAPACITY });
         return;
     };
 
@@ -1491,8 +1514,7 @@ fn broadcastOccupantLeave(
         pw.writeAll("' to='") catch break :stanza null;
         break :stanza prefix_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("leave prefix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), removed.getNick(), fanout.PREFIX_CAPACITY });
+        noteJidOverflow("leave prefix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), removed.getNick(), fanout.PREFIX_CAPACITY });
         return;
     };
 
@@ -1607,7 +1629,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
     // case is ~10 KB, so the notice is built in a leased scratch bank, not
     // on the stack.
     var lease = server.leaseByteScratch() orelse {
-        log.warn("replaced-resource notice to {s} skipped: byte scratch unavailable", .{before.getRealJid()});
+        noteDrop("replaced-resource notice to {s} skipped: byte scratch unavailable", .{before.getRealJid()});
         return;
     };
     defer lease.release();
@@ -1625,16 +1647,14 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
         w.writeAll("' role='none'/><status code='110'/></x></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("replaced-resource notice for '{s}/{s}' exceeds {d} bytes; not sent", .{ r.getJid(), before.getNick(), lease.buf.len });
+        noteJidOverflow("replaced-resource notice for '{s}/{s}' exceeds {d} bytes; not sent", .{ r.getJid(), before.getNick(), lease.buf.len });
         return;
     };
 
     if (before.worker_id != server.worker_id) {
         const ds = server.delivery_system orelse return;
         ds.deliver(before.worker_id, @intCast(before.session_id), before.generation, stanza) catch |err| {
-            log.warn("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.session_id, @errorName(err) });
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+            noteCrossWorkerDrop("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.session_id, @errorName(err) });
         };
         return;
     }
@@ -1661,14 +1681,11 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("remote presence error to '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
-        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        noteJidOverflowCrossWorker("remote presence error to '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
         return;
     };
     ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, stanza_xml) catch |err| {
-        log.warn("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
-        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        noteCrossWorkerDrop("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
     };
 }
 
@@ -1835,8 +1852,7 @@ fn sendPresenceError(
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("presence error '{s}' for '{s}@{s}' exceeds {d} bytes; not sent", .{ condition, room_local, muc_host, router.JID_STANZA_MAX });
+        noteJidOverflow("presence error '{s}' for '{s}@{s}' exceeds {d} bytes; not sent", .{ condition, room_local, muc_host, router.JID_STANZA_MAX });
         return;
     };
 
@@ -1878,8 +1894,7 @@ fn sendMessageError(
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("message error '{s}' for '{s}@{s}' exceeds {d} bytes; not sent", .{ condition, room_local, muc_host, router.JID_STANZA_MAX });
+        noteJidOverflow("message error '{s}' for '{s}@{s}' exceeds {d} bytes; not sent", .{ condition, room_local, muc_host, router.JID_STANZA_MAX });
         return;
     };
 
@@ -1949,9 +1964,7 @@ pub fn processRemoteJoin(
             w.writeAll("'/><status code='110'/></x></presence>") catch break :stanza null;
             break :stanza fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-            log.warn("rejoin presence for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
+            noteJidOverflowCrossWorker("rejoin presence for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, rejoin_xml) catch {};
@@ -2066,9 +2079,7 @@ fn finishRemoteJoin(
             ow.writeAll("'/></x></presence>") catch break :stanza null;
             break :stanza occ_fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-            log.warn("occupant presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; skipped", .{ r.getJid(), occ.getNick(), ev.real_jid, router.JID_STANZA_MAX });
+            noteJidOverflowCrossWorker("occupant presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; skipped", .{ r.getJid(), occ.getNick(), ev.real_jid, router.JID_STANZA_MAX });
             continue;
         };
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, occ_xml) catch continue;
@@ -2098,9 +2109,7 @@ fn finishRemoteJoin(
             sw.writeAll("'/><status code='110'/></x></presence>") catch break :stanza null;
             break :stanza self_fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-            log.warn("self presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; not sent", .{ r.getJid(), ev.nick, ev.real_jid, router.JID_STANZA_MAX });
+            noteJidOverflowCrossWorker("self presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; not sent", .{ r.getJid(), ev.nick, ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
         ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, self_xml) catch {};
@@ -2184,8 +2193,7 @@ pub fn processRemoteGroupchat(
         fw.writeAll(sender.getNick()) catch break :jid null;
         break :jid from_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("remote groupchat sender JID '{s}/{s}' exceeds {d} bytes; message dropped", .{ ev.room_jid, sender.getNick(), router.FULL_JID_MAX });
+        noteJidOverflow("remote groupchat sender JID '{s}/{s}' exceeds {d} bytes; message dropped", .{ ev.room_jid, sender.getNick(), router.FULL_JID_MAX });
         return;
     };
 
@@ -2195,7 +2203,7 @@ pub fn processRemoteGroupchat(
     defer suffix_lease.release();
     const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse return;
     if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
-        log.warn("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ ev.room_jid, prefix_len, suffix_len });
+        noteDrop("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ ev.room_jid, prefix_len, suffix_len });
         bounceRoomMailboxFull(server, .{ .room_message = ev }, ev.room_jid, changes);
         return;
     }
@@ -2265,7 +2273,7 @@ pub fn processRemoteGroupchat(
         deliver_lease.release();
         suffix_lease.release();
         var arch_lease = server.leaseByteScratch() orelse {
-            log.warn("byte-scratch exhausted; remote groupchat in '{s}' not archived", .{ev.room_jid});
+            noteDrop("byte-scratch exhausted; remote groupchat in '{s}' not archived", .{ev.room_jid});
             return;
         };
         defer arch_lease.release();
@@ -2285,8 +2293,7 @@ pub fn processRemoteGroupchat(
             aw.writeAll("</message>") catch break :stanza null;
             break :stanza arch_fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            log.warn("remote groupchat stanza in '{s}' exceeds {d} bytes; not archived", .{ ev.room_jid, arch_lease.buf.len });
+            noteJidOverflow("remote groupchat stanza in '{s}' exceeds {d} bytes; not archived", .{ ev.room_jid, arch_lease.buf.len });
             return;
         };
         server.archiveStore(ev.room_jid, from_str, stanza_id, timestamp, arch_xml);
@@ -2567,9 +2574,7 @@ fn sendRoomHistoryRemote(
             w.writeAll(close_tag) catch break :out null;
             break :out fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-            log.warn("history stanza for '{s}' exceeds {d} bytes; skipped", .{ real_jid, delivery_queue.MAX_PAYLOAD_SIZE });
+            noteJidOverflowCrossWorker("history stanza for '{s}' exceeds {d} bytes; skipped", .{ real_jid, delivery_queue.MAX_PAYLOAD_SIZE });
             continue;
         };
 
@@ -2596,8 +2601,7 @@ fn buildRoomJid(buf: []u8, local: []const u8, host: []const u8) ?[]const u8 {
         break :built true;
     };
     if (!ok) {
-        router.countJidOverflow();
-        log.warn("room JID for '{s}@{s}' exceeds {d} bytes; dropped", .{ local, host, buf.len });
+        noteJidOverflow("room JID for '{s}@{s}' exceeds {d} bytes; dropped", .{ local, host, buf.len });
         return null;
     }
     return fbs.getWritten();
@@ -2617,8 +2621,7 @@ fn buildFullJid(buf: []u8, local: []const u8, domain: []const u8, resource: []co
         break :built true;
     };
     if (!ok) {
-        router.countJidOverflow();
-        log.warn("full JID '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ local, domain, resource, buf.len });
+        noteJidOverflow("full JID '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ local, domain, resource, buf.len });
         return null;
     }
     return fbs.getWritten();
@@ -2634,8 +2637,7 @@ fn buildBareJid(buf: []u8, local: []const u8, domain: []const u8) ?[]const u8 {
         break :built true;
     };
     if (!ok) {
-        router.countJidOverflow();
-        log.warn("bare JID '{s}@{s}' exceeds {d} bytes; dropped", .{ local, domain, buf.len });
+        noteJidOverflow("bare JID '{s}@{s}' exceeds {d} bytes; dropped", .{ local, domain, buf.len });
         return null;
     }
     return fbs.getWritten();
@@ -2758,8 +2760,7 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
                 w.writeAll("><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>") catch break :stanza null;
                 break :stanza fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("mailbox-full bounce for '{s}' exceeds {d} bytes; not sent", .{ ev.from_jid, router.JID_STANZA_MAX });
+                noteJidOverflow("mailbox-full bounce for '{s}' exceeds {d} bytes; not sent", .{ ev.from_jid, router.JID_STANZA_MAX });
                 return;
             };
             deliverToTriple(server, bounce_xml, entry.worker_id, entry.local_session_id, entry.generation, changes);
@@ -2776,8 +2777,7 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
                 w.writeAll("' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch break :stanza null;
                 break :stanza fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("mailbox-full bounce for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
+                noteJidOverflow("mailbox-full bounce for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
                 return;
             };
             deliverToTriple(server, bounce_xml, ev.worker_id, ev.session_id, ev.generation, changes);
@@ -2807,8 +2807,7 @@ fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, wor
         w.writeAll("'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("IQ wait-error from '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
+        noteJidOverflow("IQ wait-error from '{s}' exceeds {d} bytes; not sent", .{ room_jid, router.JID_STANZA_MAX });
         return;
     };
     deliverToTriple(server, err_xml, worker, session_id, generation, changes);
@@ -2826,7 +2825,7 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         session.queueSendStanza(stanza) catch |err| {
             if (err == error.WriteBufferFull) {
                 session.sm_overflow = true;
-                log.warn("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+                noteDrop("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
             }
             return;
         };
@@ -2835,8 +2834,8 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         }
     } else {
         const ds = server.delivery_system orelse return;
-        ds.deliver(worker, @intCast(session_id), generation, stanza) catch {
-            _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+        ds.deliver(worker, @intCast(session_id), generation, stanza) catch |err| {
+            noteCrossWorkerDrop("MUC delivery to worker {d} session {d} failed: {s}", .{ worker, session_id, @errorName(err) });
         };
     }
 }
@@ -2919,9 +2918,7 @@ pub fn processRemoteAdminAction(
         w.writeAll("'/>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-        log.warn("admin result for '{s}' exceeds {d} bytes; not sent", .{ ev.room_jid, router.JID_STANZA_MAX });
+        noteJidOverflowCrossWorker("admin result for '{s}' exceeds {d} bytes; not sent", .{ ev.room_jid, router.JID_STANZA_MAX });
         return;
     };
 
@@ -3006,8 +3003,7 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
         .active = active,
     } };
     const len = actor_message.encode(&buf, msg) orelse {
-        router.countJidOverflow();
-        log.warn("directory update for '{s}' exceeds {d} bytes; not broadcast", .{ room_jid, actor_message.MAX_ENCODED_SIZE });
+        noteJidOverflow("directory update for '{s}' exceeds {d} bytes; not broadcast", .{ room_jid, actor_message.MAX_ENCODED_SIZE });
         return;
     };
 
@@ -3036,9 +3032,7 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
         w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
-        log.warn("IQ error '{s}' for '{s}' exceeds {d} bytes; not sent", .{ error_type, room_jid, router.JID_STANZA_MAX });
+        noteJidOverflowCrossWorker("IQ error '{s}' for '{s}' exceeds {d} bytes; not sent", .{ error_type, room_jid, router.JID_STANZA_MAX });
         return;
     };
     ds.deliver(target_worker, @intCast(target_session), target_generation, err_xml) catch {};

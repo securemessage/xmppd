@@ -38,6 +38,21 @@ const sub_cache_mod = server_mod.sub_cache_mod;
 
 const log = std.log.scoped(.presence);
 
+/// Cold error paths. Each helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
+/// Record one over-long-JID skip on the cold path (S4).
+noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    router.countJidOverflow();
+    log.warn(fmt, args);
+}
+
 /// Handle a presence stanza from a bound session.
 /// Routes to MUC handler for MUC domain, or dispatches by presence type.
 pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
@@ -192,8 +207,7 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
                 bw.writeAll(to_jid.domain) catch break :stripped null;
                 break :stripped bare_fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("subscription target too long to strip its resource; stanza dropped", .{});
+                noteJidOverflow("subscription target too long to strip its resource; stanza dropped", .{});
                 return;
             };
         }
@@ -205,8 +219,7 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
         const bound = session.stream.bound_jid orelse return;
         var ob_buf: [router.BARE_JID_MAX]u8 = undefined;
         const owner_jid = router.buildBareJid(bound.local, bound.domain, &ob_buf) catch {
-            router.countJidOverflow();
-            log.warn("subscription owner JID '{s}@{s}' exceeds {d} bytes; stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+            noteJidOverflow("subscription owner JID '{s}@{s}' exceeds {d} bytes; stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
             return;
         };
         if (!store_keys.fits2(owner_jid, session.stanza_to)) {
@@ -266,8 +279,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
                     // Build the full JID for the query target
                     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
                     const full_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-                        router.countJidOverflow();
-                        log.warn("connection {d} bound full JID exceeds {d} bytes; caps query skipped", .{ session.conn.id, router.FULL_JID_MAX });
+                        noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; caps query skipped", .{ session.conn.id, router.FULL_JID_MAX });
                         break :caps_query;
                     };
 
@@ -322,16 +334,14 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     // Build the from JID string
     var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        router.countJidOverflow();
-        log.warn("presence from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
+        noteJidOverflow("presence from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
         return;
     };
 
     // Build bare JID for roster lookup
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("presence bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
+        noteJidOverflow("presence bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -342,7 +352,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
     // delivery loop copies out is built into the second. So they are separate
     // leased banks rather than one reused (S18).
     var sub_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; presence broadcast for '{s}' skipped", .{bare_jid});
+        noteDrop("byte-scratch exhausted; presence broadcast for '{s}' skipped", .{bare_jid});
         return;
     };
     defer sub_lease.release();
@@ -359,7 +369,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
 
     // Build presence stanza with inner XML content
     var pres_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; presence broadcast for '{s}' skipped", .{bare_jid});
+        noteDrop("byte-scratch exhausted; presence broadcast for '{s}' skipped", .{bare_jid});
         return;
     };
     defer pres_lease.release();
@@ -378,8 +388,7 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
         }
         break :stanza pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("presence stanza for '{s}' exceeds {d} bytes; broadcast skipped", .{ from_str, pres_lease.buf.len });
+        noteJidOverflow("presence stanza for '{s}' exceeds {d} bytes; broadcast skipped", .{ from_str, pres_lease.buf.len });
         return;
     };
 
@@ -393,15 +402,13 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
 
     var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        router.countJidOverflow();
-        log.warn("unavailable from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
+        noteJidOverflow("unavailable from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
         return;
     };
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("unavailable bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
+        noteJidOverflow("unavailable bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -409,7 +416,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
     // delivery, so it is leased rather than taken on the stack (S18). The
     // presence stanza below is small enough to keep on the stack.
     var sub_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; unavailable broadcast for '{s}' skipped", .{bare_jid});
+        noteDrop("byte-scratch exhausted; unavailable broadcast for '{s}' skipped", .{bare_jid});
         return;
     };
     defer sub_lease.release();
@@ -433,8 +440,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
         pw.writeAll("' type='unavailable'/>") catch break :stanza null;
         break :stanza pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("unavailable stanza for '{s}' exceeds {d} bytes; broadcast skipped", .{ from_str, router.JID_STANZA_MAX });
+        noteJidOverflow("unavailable stanza for '{s}' exceeds {d} bytes; broadcast skipped", .{ from_str, router.JID_STANZA_MAX });
         return;
     };
 
@@ -452,8 +458,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("probe source '{s}@{s}' exceeds {d} bytes; probes skipped", .{ local, domain, router.BARE_JID_MAX });
+        noteJidOverflow("probe source '{s}@{s}' exceeds {d} bytes; probes skipped", .{ local, domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -461,7 +466,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     // Contact JID pointers index into this buffer and stay live across the
     // loop below, which also builds a probe stanza into a second leased bank.
     var probe_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; presence probes for '{s}' skipped", .{bare_jid});
+        noteDrop("byte-scratch exhausted; presence probes for '{s}' skipped", .{bare_jid});
         return;
     };
     defer probe_lease.release();
@@ -480,8 +485,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     const bound = session.stream.bound_jid orelse return;
     var to_buf: [router.FULL_JID_MAX]u8 = undefined;
     const to_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &to_buf) catch {
-        router.countJidOverflow();
-        log.warn("bound full JID '{s}@{s}/{s}' exceeds {d} bytes; probes skipped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
+        noteJidOverflow("bound full JID '{s}@{s}/{s}' exceeds {d} bytes; probes skipped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
         return;
     };
 
@@ -516,8 +520,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                     pbw.writeAll("' type='probe'/>") catch break :stanza null;
                     break :stanza probe_fbs.getWritten();
                 } orelse {
-                    router.countJidOverflow();
-                    log.warn("probe stanza to '{s}' exceeds {d} bytes; skipped", .{ contact_bare, router.JID_STANZA_MAX });
+                    noteJidOverflow("probe stanza to '{s}' exceeds {d} bytes; skipped", .{ contact_bare, router.JID_STANZA_MAX });
                     continue;
                 };
                 server.sendPresenceViaS2s(bare_jid, contact_bare, probe_xml, changes);
@@ -565,8 +568,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                 }
                 break :stanza pres_fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("contact presence for '{s}@{s}' exceeds {d} bytes; skipped", .{ contact.local, contact.domain, pres_buf.len });
+                noteJidOverflow("contact presence for '{s}@{s}' exceeds {d} bytes; skipped", .{ contact.local, contact.domain, pres_buf.len });
                 continue;
             };
 
@@ -609,8 +611,7 @@ fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: 
         w.writeAll("><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>") catch break :stanza null;
         break :stanza fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("jid-malformed reply exceeds {d} bytes; over-long subscription target unanswered", .{buf.len});
+        noteJidOverflow("jid-malformed reply exceeds {d} bytes; over-long subscription target unanswered", .{buf.len});
         return;
     };
     session.queueSendStanza(err_xml) catch return;
@@ -634,8 +635,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     // Build owner bare JID
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -660,7 +660,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     // Build presence stanza (include extensions from inner_xml). Stays live
     // across the delivery or store below, so it is leased (S18).
     var sub_pres_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; subscribe forward to '{s}' skipped", .{to_str});
+        noteDrop("byte-scratch exhausted; subscribe forward to '{s}' skipped", .{to_str});
         return;
     };
     defer sub_pres_lease.release();
@@ -681,8 +681,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
         }
         break :stanza sub_pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("subscribe stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, sub_pres_lease.buf.len });
+        noteJidOverflow("subscribe stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, sub_pres_lease.buf.len });
         return;
     };
 
@@ -725,8 +724,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     // Build owner bare JID
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -766,11 +764,11 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             contact_name_len = copy_len;
         }
         roster.setItem(to_str, owner_bare, contact_name_buf[0..contact_name_len], contact_new_sub, false) catch |err| {
-            log.warn("contact roster update failed for {s}: {s}", .{ to_str, @errorName(err) });
+            noteDrop("contact roster update failed for {s}: {s}", .{ to_str, @errorName(err) });
         };
     } else {
         roster.setItem(to_str, owner_bare, "", .to, false) catch |err| {
-            log.warn("contact roster insert failed for {s}: {s}", .{ to_str, @errorName(err) });
+            noteDrop("contact roster insert failed for {s}: {s}", .{ to_str, @errorName(err) });
         };
     }
     server.invalidateSubCache(to_str);
@@ -796,8 +794,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
         sdpw.writeAll("' type='subscribed'/>") catch break :stanza null;
         break :stanza sd_pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("subscribed stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
+        noteJidOverflow("subscribed stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
         return;
     };
 
@@ -853,8 +850,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
                 }
                 break :stanza cpres_fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("contact presence '{s}@{s}' exceeds {d} bytes; skipped", .{ to_jid.local, to_jid.domain, cpres_buf.len });
+                noteJidOverflow("contact presence '{s}@{s}' exceeds {d} bytes; skipped", .{ to_jid.local, to_jid.domain, cpres_buf.len });
                 continue;
             };
             // Deliver to the approver's session
@@ -879,8 +875,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -941,8 +936,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
         usbw.writeAll("' type='unsubscribe'/>") catch break :stanza null;
         break :stanza unsub_pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("unsubscribe stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
+        noteJidOverflow("unsubscribe stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
         return;
     };
 
@@ -967,8 +961,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
         return;
     };
 
@@ -1041,8 +1034,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
                 uw.writeAll("' type='unavailable'/>") catch break :stanza null;
                 break :stanza unavail_fbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("unavailable stanza to '{s}' exceeds {d} bytes; resource skipped", .{ to_str, router.JID_STANZA_MAX });
+                noteJidOverflow("unavailable stanza to '{s}' exceeds {d} bytes; resource skipped", .{ to_str, router.JID_STANZA_MAX });
                 continue;
             };
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unavail_xml, changes);
@@ -1063,8 +1055,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
         usdw.writeAll("' type='unsubscribed'/>") catch break :stanza null;
         break :stanza unsd_pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("unsubscribed stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
+        noteJidOverflow("unsubscribed stanza to '{s}' exceeds {d} bytes; dropped", .{ to_str, router.JID_STANZA_MAX });
         return;
     };
 
@@ -1100,7 +1091,7 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
 
     var key_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
     const key = store_keys.join2(&key_buf, contact_bare, subscriber_bare) catch {
-        log.warn("pending-subscription key too long for contact {s}: not stored", .{contact_bare});
+        noteDrop("pending-subscription key too long for contact {s}: not stored", .{contact_bare});
         return;
     };
 
@@ -1117,14 +1108,14 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        log.warn("deliverPendingSubscriptions: bare JID too long for {s}@{s}", .{ local, domain });
+        noteDrop("deliverPendingSubscriptions: bare JID too long for {s}@{s}", .{ local, domain });
         return;
     };
 
     // Prefix scan: all keys starting with "contact_bare\x00"
     var prefix_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
     const prefix = store_keys.prefix(&prefix_buf, bare_jid) catch {
-        log.warn("deliverPendingSubscriptions: prefix too long for {s}", .{bare_jid});
+        noteDrop("deliverPendingSubscriptions: prefix too long for {s}", .{bare_jid});
         return;
     };
 
@@ -1169,8 +1160,7 @@ fn broadcastToOwnResources(
     // Build the from full JID
     var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        router.countJidOverflow();
-        log.warn("own-resources presence from '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, resource, router.FULL_JID_MAX });
+        noteJidOverflow("own-resources presence from '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, resource, router.FULL_JID_MAX });
         return;
     };
 
@@ -1178,7 +1168,7 @@ fn broadcastToOwnResources(
     // Stays live across the delivery loop below, so it is leased (S18).
     const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
     var pres_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; own-resources presence for '{s}' skipped", .{from_str});
+        noteDrop("byte-scratch exhausted; own-resources presence for '{s}' skipped", .{from_str});
         return;
     };
     defer pres_lease.release();
@@ -1202,8 +1192,7 @@ fn broadcastToOwnResources(
         }
         break :stanza pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("own-resources presence stanza for '{s}' exceeds {d} bytes; skipped", .{ from_str, pres_lease.buf.len });
+        noteJidOverflow("own-resources presence stanza for '{s}' exceeds {d} bytes; skipped", .{ from_str, pres_lease.buf.len });
         return;
     };
 
@@ -1275,8 +1264,7 @@ fn sendOtherResourcesPresence(
             }
             break :stanza pres_fbs.getWritten();
         } orelse {
-            router.countJidOverflow();
-            log.warn("other-resource presence '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, entry_resource, router.JID_STANZA_MAX });
+            noteJidOverflow("other-resource presence '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, entry_resource, router.JID_STANZA_MAX });
             continue;
         };
 
@@ -1305,8 +1293,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     // Build the from full JID
     var from_buf: [router.FULL_JID_MAX]u8 = undefined;
     const from_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &from_buf) catch {
-        router.countJidOverflow();
-        log.warn("directed presence from '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
+        noteJidOverflow("directed presence from '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
         return;
     };
 
@@ -1314,7 +1301,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     // loop below, so it is leased (S18).
     const inner_xml = sender_session.stanza_buf[0..sender_session.stanza_buf_len];
     var pres_lease = server.leaseByteScratch() orelse {
-        log.warn("byte-scratch exhausted; directed presence for '{s}' skipped", .{from_str});
+        noteDrop("byte-scratch exhausted; directed presence for '{s}' skipped", .{from_str});
         return;
     };
     defer pres_lease.release();
@@ -1338,8 +1325,7 @@ pub fn dispatchDirectedPresenceToBareJid(
         }
         break :stanza pres_fbs.getWritten();
     } orelse {
-        router.countJidOverflow();
-        log.warn("directed presence stanza from '{s}' exceeds {d} bytes; dropped", .{ from_str, pres_lease.buf.len });
+        noteJidOverflow("directed presence stanza from '{s}' exceeds {d} bytes; dropped", .{ from_str, pres_lease.buf.len });
         return;
     };
 

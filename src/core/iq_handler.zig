@@ -27,6 +27,21 @@ const actor_message = @import("message.zig");
 
 const log = std.log.scoped(.xmppd);
 
+/// Cold error paths. Each helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
+/// Record one over-long-JID skip on the cold path (S4).
+noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    router.countJidOverflow();
+    log.warn(fmt, args);
+}
+
 // Types from server.zig — imported via the parent module's compilation unit.
 const server_mod = @import("server.zig");
 const precis = @import("precis_username");
@@ -798,8 +813,7 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
     // Build bare JID for roster lookup
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -901,8 +915,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     // Build bare JID for roster lookup
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -966,8 +979,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                         }
                     }
                 } else {
-                    router.countJidOverflow();
-                    log.warn("unsubscribe stanza to '{s}' exceeds {d} bytes; not sent", .{ item_jid, router.JID_STANZA_MAX });
+                    noteJidOverflow("unsubscribe stanza to '{s}' exceeds {d} bytes; not sent", .{ item_jid, router.JID_STANZA_MAX });
                 }
                 // Update contact's roster: remove "to" direction (they lose "from" us)
                 if (to_jid_parsed) |to_jid| {
@@ -981,7 +993,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch |err| {
-                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                                noteDrop("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
                             };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
@@ -1012,8 +1024,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                         }
                     }
                 } else {
-                    router.countJidOverflow();
-                    log.warn("unsubscribed stanza to '{s}' exceeds {d} bytes; not sent", .{ item_jid, router.JID_STANZA_MAX });
+                    noteJidOverflow("unsubscribed stanza to '{s}' exceeds {d} bytes; not sent", .{ item_jid, router.JID_STANZA_MAX });
                 }
                 // Update contact's roster: remove "from" direction (they lose "to" us)
                 if (to_jid_parsed) |to_jid| {
@@ -1027,7 +1038,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                                 else => contact_entry.subscription,
                             };
                             roster.setItem(item_jid, bare_jid, "", new_sub, false) catch |err| {
-                                log.warn("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
+                                noteDrop("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
                             };
                             server.invalidateSubCache(item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
@@ -1230,8 +1241,7 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
     // Build bare JID for archive lookup
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -1317,8 +1327,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
         const bound = session.stream.bound_jid orelse return;
         var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const requester_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-            router.countJidOverflow();
-            log.warn("connection {d} bound full JID exceeds {d} bytes; MAM forward skipped", .{ session.conn.id, router.FULL_JID_MAX });
+            noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; MAM forward skipped", .{ session.conn.id, router.FULL_JID_MAX });
             return;
         };
 
@@ -1477,16 +1486,14 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
 
     var target_buf: [router.BARE_JID_MAX]u8 = undefined;
     const target_bare = router.buildBareJid(to_jid.local, to_jid.domain, &target_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} last-activity target JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} last-activity target JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "jid-malformed");
         return;
     };
 
     var requester_buf: [router.BARE_JID_MAX]u8 = undefined;
     const requester_bare = router.buildBareJid(bound.local, bound.domain, &requester_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -1560,8 +1567,7 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
     // Build bare JID
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -1648,7 +1654,7 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
 fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     const bound = session.stream.bound_jid orelse return;
     if (session.vcard_overflow) {
-        log.warn("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
+        noteDrop("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
         sendIqErrorWithType(server, session, iq_id, "modify", "not-acceptable");
         return;
     }
@@ -1656,8 +1662,7 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     // Build bare JID
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -1694,8 +1699,7 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     // Build bare JID
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -1798,16 +1802,14 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
                 return;
             };
             break :jid router.buildBareJid(bare_src[0..sep], bare_src[sep + 1 ..], &bare_buf) catch {
-                router.countJidOverflow();
-                log.warn("connection {d} PEP target JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
+                noteJidOverflow("connection {d} PEP target JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
                 sendIqError(server, session, iq_id, "jid-malformed");
                 return;
             };
         }
         // Query own PEP node
         break :jid router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-            router.countJidOverflow();
-            log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+            noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
@@ -2082,8 +2084,7 @@ fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, cha
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -2120,8 +2121,7 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -2173,8 +2173,7 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        router.countJidOverflow();
-        log.warn("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
+        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
         sendIqError(server, session, iq_id, "internal-server-error");
         return;
     };
@@ -2262,8 +2261,7 @@ fn pushBlockPush(
                 pw.writeAll("></iq>") catch break :stanza null;
                 break :stanza pfbs.getWritten();
             } orelse {
-                router.countJidOverflow();
-                log.warn("block-push IQ to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ user_local, user_domain, entry.resource(), router.JID_STANZA_MAX });
+                noteJidOverflow("block-push IQ to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ user_local, user_domain, entry.resource(), router.JID_STANZA_MAX });
                 continue;
             };
 
@@ -2367,8 +2365,7 @@ pub fn pushRosterItem(
     if (server.roster) |roster| owner_lookup: {
         var owner_buf: [router.BARE_JID_MAX]u8 = undefined;
         const owner_bare = router.buildBareJid(user_local, user_domain, &owner_buf) catch {
-            router.countJidOverflow();
-            log.warn("roster-push owner '{s}@{s}' exceeds {d} bytes; item lookup skipped", .{ user_local, user_domain, router.BARE_JID_MAX });
+            noteJidOverflow("roster-push owner '{s}@{s}' exceeds {d} bytes; item lookup skipped", .{ user_local, user_domain, router.BARE_JID_MAX });
             break :owner_lookup;
         };
         if (roster.getItem(server.allocator, owner_bare, item_jid) catch null) |existing| {
